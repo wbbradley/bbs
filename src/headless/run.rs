@@ -261,7 +261,11 @@ async fn agent_token(
         let mut backend = Backend::open(config, dir, caller).await?;
         match backend.whoami().await {
             Ok(me) if me.name.eq_ignore_ascii_case(agent) => return Ok((me.name, token)),
-            Ok(_) | Err(_) => {}
+            Ok(_) => {}
+            // Only a definite rejection means there is no valid token. Anything
+            // else (the server restarting, say) must not lead to a takeover.
+            Err(err) if rejected_credential(&err) => {}
+            Err(err) => return Err(err.context("checking the saved agent token")),
         }
     }
     let caller = Caller {
@@ -304,6 +308,15 @@ async fn agent_token(
         }
         Err(err) => Err(err),
     }
+}
+
+/// Whether `err` is the backend rejecting a credential, as opposed to failing.
+fn rejected_credential(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::auth::AuthenticationError>()
+        .is_some()
+        || err
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|s| s.code() == tonic::Code::Unauthenticated)
 }
 
 /// The start of a new session's first prompt.
@@ -376,5 +389,21 @@ async fn wait_for_mail(
                 tokio::time::sleep(MAIL_RETRY).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_rejected_credentials_allow_a_takeover() {
+        let auth = crate::auth::AuthenticationError("unknown or retired token");
+        assert!(rejected_credential(&anyhow::Error::from(auth)));
+        let unauth = tonic::Status::unauthenticated("unknown or retired token");
+        assert!(rejected_credential(&anyhow::Error::from(unauth)));
+        let down = tonic::Status::unavailable("server is shutting down");
+        assert!(!rejected_credential(&anyhow::Error::from(down)));
+        assert!(!rejected_credential(&anyhow::anyhow!("connection refused")));
     }
 }

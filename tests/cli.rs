@@ -2592,7 +2592,18 @@ fn headless_run_takes_over_an_owned_agent(mode: Mode) {
     assert!(hook(&bbs, bind).is_none());
     assert!(hook(&bbs, compact.clone()).is_some());
 
+    // A saved token the server rejects still leads to a takeover; only other
+    // failures (the server restarting, say) stop `run`.
+    let dir = bbs.home.join(".local/state/bbs/headless/zed");
+    std::fs::create_dir_all(&dir).unwrap();
+    let saved = serde_json::json!({
+        "server": bbs.server.as_ref().map(|s| s.addr.clone()),
+        "token": "aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+    std::fs::write(dir.join("state.json"), saved.to_string()).unwrap();
+
     let err = bbs.err(&["headless", "run", "Zed"]);
+    assert!(!err.contains("checking the saved agent token"), "{err}");
     if matches!(mode, Mode::Remote) {
         // The test server runs in trust mode, where owners cannot be verified.
         assert!(err.contains("--require-human-token"), "{err}");
