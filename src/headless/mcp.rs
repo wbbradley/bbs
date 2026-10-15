@@ -128,6 +128,7 @@ impl Tools {
                     .send(proto::SendRequest {
                         to: arg("to")?,
                         body: arg("body")?,
+                        control: None,
                     })
                     .await?;
                 match r.recipients {

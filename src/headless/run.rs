@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -143,7 +143,21 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         let throttled = turn.is_none() && !queue.is_empty();
         tokio::select! {
             mail = mail_rx.recv() => match mail {
-                Some(Ok(batch)) => {
+                Some(Ok(mut batch)) => {
+                    // Control messages act now and are not prompts. The server
+                    // accepts them only from the agent's owner.
+                    let cancels = batch.iter().filter(|m| m.control() == proto::Control::Cancel).count();
+                    batch.retain(|m| m.control.is_none());
+                    if cancels > 0 {
+                        let running = turn.is_some();
+                        if running && let Err(err) = acp.cancel().await {
+                            log.event("error", json!({ "message": format!("cancel: {err:#}") }));
+                        }
+                        log.event("cancel", json!({ "turn_running": running }));
+                    }
+                    if batch.is_empty() {
+                        continue;
+                    }
                     log.event("mail", json!({
                         "count": batch.len(),
                         "from": batch.iter().map(|m| m.sender_display_name()).collect::<Vec<_>>(),
@@ -256,11 +270,22 @@ async fn agent_token(
             Ok((r.name, r.token))
         }
         Err(err) if format!("{err:#}").contains("already reserved") => {
-            // TODO(headless): rotate the token when the calling human owns the agent.
-            bail!(
-                "agent {agent:?} already exists and this machine has no valid token for it; \
-                 retire it (`bbs retire {agent}`) or choose another name"
-            )
+            // The agent exists, but this machine has no valid token for it: take
+            // it over if the calling human owns it.
+            let r = backend
+                .rotate_agent_token(proto::RetireRequest {
+                    agent: agent.to_string(),
+                })
+                .await
+                .with_context(|| {
+                    format!(
+                        "agent {agent:?} already exists and this machine has no valid token for it"
+                    )
+                })?;
+            // Same agent, so its harness session still applies.
+            state.server = config.server.clone();
+            state.token = Some(r.token.clone());
+            Ok((r.name, r.token))
         }
         Err(err) => Err(err),
     }

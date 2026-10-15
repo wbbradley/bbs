@@ -20,6 +20,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0006_group_archive.sql"),
     include_str!("../migrations/0007_group_description.sql"),
     include_str!("../migrations/0008_feed_indexes.sql"),
+    include_str!("../migrations/0009_message_control.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +86,8 @@ pub struct MessageView {
     /// Feed only: when a direct message was read; always `None` for broadcasts.
     pub read_at: Option<String>,
     pub body: String,
+    /// Inbox only: the control kind of a control message.
+    pub control: Option<String>,
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -664,6 +667,24 @@ pub fn insert_message(
     Ok(conn.last_insert_rowid())
 }
 
+/// Mark message `id` as a control message of kind `control`.
+pub fn set_message_control(conn: &Connection, id: i64, control: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET control = ?2 WHERE id = ?1",
+        params![id, control],
+    )?;
+    Ok(())
+}
+
+/// Replace a live agent's token.
+pub fn set_agent_token(conn: &Connection, agent_id: i64, token: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE agents SET token = ?2 WHERE id = ?1 AND retired_at IS NULL",
+        params![agent_id, token],
+    )?;
+    Ok(())
+}
+
 pub fn insert_delivery(conn: &Connection, message_id: i64, kind: Kind, id: i64) -> Result<()> {
     conn.execute(
         "INSERT INTO deliveries (message_id, recipient_kind, recipient_id) VALUES (?1, ?2, ?3)",
@@ -675,7 +696,7 @@ pub fn insert_delivery(conn: &Connection, message_id: i64, kind: Kind, id: i64) 
 const INBOX_SELECT: &str = "
     SELECT m.id, m.created_at, m.from_kind,
            CASE m.from_kind WHEN 'agent' THEN a.name ELSE h.name END,
-           g.name, m.body, owner.name, reader_owner.name
+           g.name, m.body, owner.name, reader_owner.name, m.control
     FROM deliveries d
     JOIN messages m ON m.id = d.message_id
     LEFT JOIN agents a ON m.from_kind = 'agent' AND a.id = m.from_id
@@ -705,6 +726,7 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         to_owner: None,
         read_at: None,
         body: r.get(5)?,
+        control: r.get(8)?,
     })
 }
 
@@ -1158,6 +1180,7 @@ pub fn feed_messages(
                 to_owner: r.get(9)?,
                 read_at: r.get(6)?,
                 body: r.get(7)?,
+                control: None,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -1449,7 +1472,7 @@ mod tests {
             assert!(index_names(&conn).len() < 5);
             migrate(&mut conn).unwrap();
             migrate(&mut conn).unwrap();
-            assert_eq!(schema_version(&conn).unwrap(), 8);
+            assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
             assert_eq!(index_names(&conn).len(), 5, "preexisting: {preexisting}");
             let filter = FeedFilter {
                 group_ids: Some(vec![1]),

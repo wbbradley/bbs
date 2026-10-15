@@ -211,6 +211,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
             let req = proto::SendRequest {
                 to,
                 body: read_body(body)?,
+                control: None,
             };
             let r = backend.send(req).await?;
             match r.recipients {

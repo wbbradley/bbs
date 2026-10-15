@@ -1,6 +1,6 @@
 # Headless agents
 
-Status: design and first implementation. `bbs headless` runs one coding agent
+Status: first implementation. `bbs headless` runs one coding agent
 without a terminal UI. It starts an agent harness as a subprocess, feeds it
 the agent's BBS mail as prompts, and gives it tools for talking back. Nothing
 the harness prints reaches anyone; it goes to a local log.

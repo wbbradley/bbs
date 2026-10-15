@@ -86,6 +86,7 @@ mod tests {
             to_owner: None,
             read_at: None,
             body: "hello".to_string(),
+            control: Some(Control::Cancel.into()),
         };
         let decoded = Message::decode(msg.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, msg);

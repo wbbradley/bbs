@@ -222,7 +222,7 @@ fn version_reports_identity_without_side_effects() {
             );
             assert_eq!(report["protocol"]["epoch"], 2);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
-            assert_eq!(report["schema_version"], 8);
+            assert_eq!(report["schema_version"], 9);
             assert_eq!(report["config_format"], 1);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {
@@ -2366,6 +2366,183 @@ fn view_json_follow_emits_each_message_once(mode: Mode) {
     assert!(extra.is_empty(), "duplicate or stray lines: {extra:?}");
 }
 
+/// Write a headless config whose only harness is `command`.
+fn headless_config(bbs: &Bbs, command: &[&str]) {
+    let dir = bbs.home.join(".config/bbs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let command = command
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        dir.join("headless.toml"),
+        format!("min_turn_interval = \"0s\"\n[harness.fake]\ncommand = [{command}]\n"),
+    )
+    .unwrap();
+}
+
+fn headless_state(bbs: &Bbs, agent: &str) -> serde_json::Value {
+    let path = bbs
+        .home
+        .join(".local/state/bbs/headless")
+        .join(agent.to_lowercase())
+        .join("state.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Poll `f` until it returns `Some`, failing after 20 seconds.
+fn eventually<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn headless_replies_through_tools_and_cancels(mode: Mode) {
+    let bbs = Bbs::with_mode("headless", mode);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");
+    headless_config(&bbs, &["python3", fake]);
+    bbs.ok(&["group", "register", "crew"]);
+    let (peer, tp) = bbs.register();
+    bbs.ok(&["--token", &tp, "group", "join", "crew"]);
+    let run = bbs
+        .command(&[
+            "headless",
+            "run",
+            "Zed",
+            "--cwd",
+            bbs.home.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    eventually("the session", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|l| l.contains("\"event\":\"session\""))
+    });
+    let tz = headless_state(&bbs, "Zed")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    bbs.ok(&["--token", &tz, "group", "join", "crew"]);
+
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "hello"]);
+    let mut seen = String::new();
+    let reply = eventually("the reply", || {
+        seen.push_str(&bbs.ok(&["--token", &tp, "read"]));
+        seen.contains("echo (").then(|| seen.clone())
+    });
+    assert!(
+        reply.contains(&format!("from Zed to {peer}:\necho (yes)")),
+        "{reply}"
+    );
+    let shown = bbs.ok(&["headless", "logs", "Zed"]);
+    assert!(shown.contains("You are Zed"), "{shown}");
+    assert!(shown.contains("text:\nthinking about"), "{shown}");
+    assert!(shown.contains("permission:"), "{shown}");
+
+    // Only the owner may cancel; the running process stops the turn at once.
+    bbs.ok(&["human", "add", "alice"]);
+    assert!(
+        bbs.err(&["--as", "alice", "headless", "cancel", "Zed"])
+            .contains("is not your agent")
+    );
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "WAITCANCEL"]);
+    eventually("the second prompt", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|l| l.contains("WAITCANCEL"))
+    });
+    bbs.ok(&["headless", "cancel", "Zed"]);
+    eventually("the cancelled turn", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|l| l.contains("\"stop_reason\":\"cancelled\""))
+    });
+
+    let killed = Command::new("kill")
+        .args(["-TERM", &run.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let out = run.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("\"event\":\"stop\"")
+    );
+}
+
+fn control_messages_are_for_owned_agents_only(mode: Mode) {
+    let bbs = Bbs::with_mode("control", mode);
+    bbs.ok(&["human", "add", "alice"]);
+    let (a, ta) = bbs.register();
+    bbs.ok(&["headless", "cancel", &a]);
+    let row: Option<String> = bbs
+        .db()
+        .query_row(
+            "SELECT control FROM messages ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(row.as_deref(), Some("cancel"));
+    assert!(
+        bbs.ok(&["--token", &ta, "read"])
+            .contains("Cancel your running turn")
+    );
+    assert!(
+        bbs.err(&["--as", "alice", "headless", "cancel", &a])
+            .contains("is not your agent")
+    );
+    assert!(
+        bbs.err(&["headless", "cancel", "@crew"])
+            .contains("not a group")
+    );
+    assert!(
+        bbs.err(&["headless", "cancel", "alice"])
+            .contains("no live agent")
+    );
+}
+
+fn headless_run_takes_over_an_owned_agent(mode: Mode) {
+    let bbs = Bbs::with_mode("takeover", mode);
+    // A harness that exits at once: `run` fails after settling the token.
+    headless_config(&bbs, &["true"]);
+    let (_, old) = bbs.register_with(&["register", "--name", "Zed"]);
+    bbs.err(&["headless", "run", "Zed"]);
+    let new = headless_state(&bbs, "Zed")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(new, old);
+    assert!(bbs.err(&["--token", &old, "whoami"]).contains("token"));
+    assert_eq!(bbs.ok(&["--token", &new, "whoami"]), "Zed\n");
+
+    bbs.ok(&["human", "add", "alice"]);
+    bbs.register_with(&["--as", "alice", "register", "--name", "Ada"]);
+    assert!(
+        bbs.err(&["headless", "run", "Ada"])
+            .contains("is not your agent")
+    );
+}
+
 both_modes!(
     requested_names_are_validated_and_reserved,
     concurrent_registration_reserves_one_name,
@@ -2400,4 +2577,7 @@ both_modes!(
     view_since_and_until_bound_history,
     view_json_follow_emits_each_message_once,
     view_json_follow_survives_full_windows_and_bursts,
+    headless_replies_through_tools_and_cancels,
+    control_messages_are_for_owned_agents_only,
+    headless_run_takes_over_an_owned_agent,
 );

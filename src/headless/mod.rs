@@ -12,7 +12,11 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::backend::Backend;
 use crate::cli::HeadlessCommand;
+use crate::config::Config;
+use crate::proto;
+use crate::service::Caller;
 pub use settings::MidTurn;
 
 pub async fn run(command: HeadlessCommand, dir: &Path, as_human: Option<&str>) -> Result<()> {
@@ -21,10 +25,26 @@ pub async fn run(command: HeadlessCommand, dir: &Path, as_human: Option<&str>) -
         HeadlessCommand::Logs { agent, follow } => {
             log::print(&state::AgentDir::new(&agent)?.log_path(), follow).await
         }
-        HeadlessCommand::Cancel { agent } => {
-            let _ = agent;
-            todo!("send a cancel control message (server capability agent-control.v1)")
-        }
+        HeadlessCommand::Cancel { agent } => cancel(dir, as_human, agent).await,
         HeadlessCommand::Mcp => mcp::run(dir).await,
     }
+}
+
+/// Ask the agent's running `bbs headless run` to cancel its turn.
+async fn cancel(dir: &Path, as_human: Option<&str>, agent: String) -> Result<()> {
+    let config = Config::load()?;
+    let caller = Caller {
+        human: config.human(as_human),
+        ..Default::default()
+    };
+    let mut backend = Backend::open(&config, dir, caller).await?;
+    let r = backend
+        .send(proto::SendRequest {
+            to: agent,
+            body: "Cancel your running turn (bbs headless cancel).".into(),
+            control: Some(proto::Control::Cancel.into()),
+        })
+        .await?;
+    println!("Asked {} to cancel its running turn.", r.to);
+    Ok(())
 }

@@ -509,6 +509,19 @@ impl Bbs for Server {
             .await
     }
 
+    async fn rotate_agent_token(
+        &self,
+        req: Request<proto::RetireRequest>,
+    ) -> Result<Response<proto::RegisterResponse>, Status> {
+        self.unary(
+            "rotate_agent_token",
+            req,
+            Effect::Write,
+            service::rotate_agent_token,
+        )
+        .await
+    }
+
     async fn group_register(
         &self,
         req: Request<proto::GroupRegisterRequest>,

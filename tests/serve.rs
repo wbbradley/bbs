@@ -144,6 +144,7 @@ async fn incompatible_requests_do_not_touch_state_or_claim_stream_slots() {
             proto::SendRequest {
                 to: agent.name.clone(),
                 body: "unread".into(),
+                control: None,
             },
         ))
         .await
@@ -433,6 +434,7 @@ async fn serve_round_trip_and_wait_for_mail() {
             proto::SendRequest {
                 to: "will".into(),
                 body: "hi".into(),
+                control: None,
             },
         ))
         .await
@@ -462,6 +464,7 @@ async fn serve_round_trip_and_wait_for_mail() {
             proto::SendRequest {
                 to: b.name.clone(),
                 body: "wake up".into(),
+                control: None,
             },
         ))
         .await
@@ -581,6 +584,7 @@ async fn watch_feed_snapshots_on_change_for_humans_only() {
             proto::SendRequest {
                 to: a.name.clone(),
                 body: "hello".into(),
+                control: None,
             },
         ))
         .await
@@ -619,6 +623,7 @@ async fn feed_filters_are_advertised_and_applied_server_side() {
                 proto::SendRequest {
                     to: a.name.clone(),
                     body: body.into(),
+                    control: None,
                 },
             ))
             .await
@@ -699,6 +704,7 @@ async fn feed_filters_are_advertised_and_applied_server_side() {
             proto::SendRequest {
                 to: a.name.clone(),
                 body: "four".into(),
+                control: None,
             },
         ))
         .await
