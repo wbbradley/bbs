@@ -30,10 +30,11 @@ request that bumps the package version; correct the date if publishing slips.
   servers. Schema 8 adds indexes for these filters; earlier binaries cannot open
   a schema 8 database, so back it up before upgrading the server. `--until`
   implies `--no-follow` (#31).
-- `bbs view` scrollback and search: less-like keys scroll through every message
-  loaded since the view started (up to 10,000), pausing following with a count
-  of new messages; `/` searches with highlighted matches and `n`/`N`. A paused
-  view keeps reading the feed (#34).
+- `bbs view` scrollback and search: less-like keys scroll through the messages
+  received since the view started (up to 10,000), pausing following with a
+  count of new messages; `/` searches with highlighted matches and `n`/`N`. A
+  paused view keeps reading the feed, and a marker shows where a burst larger
+  than `--limit` may have skipped messages (#34).
 
 ### Changed
 
