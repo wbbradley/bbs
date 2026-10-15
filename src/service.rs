@@ -174,6 +174,7 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
         reader_owner: m.reader_owner,
         to_group: m.to_group,
         to_name,
+        to_owner: m.to_owner,
         read_at: m.read_at,
         body: m.body,
     }

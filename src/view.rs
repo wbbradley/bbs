@@ -144,6 +144,8 @@ struct MessageJson<'a> {
     from_owner: Option<&'a str>,
     /// Direct recipient; null for broadcasts.
     to: Option<&'a str>,
+    /// The direct recipient agent's human; null otherwise and for unknown owners.
+    to_owner: Option<&'a str>,
     /// Broadcast group; null for direct messages.
     group: Option<&'a str>,
     body: &'a str,
@@ -163,6 +165,7 @@ fn json(m: &Message) -> MessageJson<'_> {
         },
         from_owner: m.from_owner.as_deref(),
         to: m.to_name.as_deref(),
+        to_owner: m.to_owner.as_deref(),
         group: m.to_group.as_deref(),
         body: &m.body,
         read_at: m.read_at.as_deref(),
@@ -176,12 +179,11 @@ fn format_feed(rows: &[Message]) -> String {
         if i > 0 {
             out.push('\n');
         }
-        let from = match (m.from_kind(), &m.from_owner) {
-            (Kind::Human, _) => format!("{} (human)", m.from_name),
-            (_, Some(owner)) => format!("{}@{owner}", m.from_name),
-            (_, None) => m.from_name.clone(),
+        let from = match m.from_kind() {
+            Kind::Human => format!("{} (human)", m.from_name),
+            _ => m.qualified_sender(),
         };
-        let to = match (&m.to_group, &m.to_name) {
+        let to = match (&m.to_group, m.qualified_recipient()) {
             (Some(group), _) => format!("@{group}"),
             (None, to) => {
                 let state = match &m.read_at {
@@ -283,7 +285,7 @@ fn header(row: &Message) -> Line<'static> {
             Style::new().fg(Color::DarkGray),
         ),
         Span::raw("  "),
-        name_span(&row.sender_display_name(), row.from_kind()),
+        name_span(&row.qualified_sender(), row.from_kind()),
         Span::styled(" → ", Style::new().fg(Color::DarkGray)),
     ];
     match (&row.to_group, &row.to_name) {
@@ -291,9 +293,9 @@ fn header(row: &Message) -> Line<'static> {
             format!("@{group}"),
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )),
-        (None, Some(to)) => {
+        (None, Some(_)) => {
             spans.push(Span::styled(
-                to.clone(),
+                row.qualified_recipient().unwrap_or_default(),
                 Style::new().add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw("  "));
@@ -351,6 +353,7 @@ mod tests {
             reader_owner: None,
             to_group: group.map(Into::into),
             to_name: to.map(Into::into),
+            to_owner: None,
             read_at: read_at.map(Into::into),
             body: body.into(),
         }
@@ -396,6 +399,19 @@ mod tests {
         // Broadcasts never show a read time.
         let acme = out.lines().find(|l| l.contains("@acme")).unwrap();
         assert!(!acme.contains("read"), "{acme}");
+    }
+
+    #[test]
+    fn headers_qualify_agents_with_their_humans() {
+        let mut dm = row(None, Some("Mateo"), None, "hi");
+        dm.from_owner = Some("will".into());
+        dm.to_owner = Some("ada".into());
+        let mut from_human = row(Some("acme"), None, None, "hello");
+        from_human.from_kind = Kind::Human.into();
+        from_human.from_name = "ada".into();
+        let out = screen(&[dm, from_human], 20);
+        assert!(out.contains("Juliana@will → Mateo@ada  unread"), "{out}");
+        assert!(out.contains("ada → @acme"), "{out}");
     }
 
     #[test]
