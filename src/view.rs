@@ -288,14 +288,14 @@ fn header(row: &Message) -> Line<'static> {
         name_span(&row.qualified_sender(), row.from_kind()),
         Span::styled(" → ", Style::new().fg(Color::DarkGray)),
     ];
-    match (&row.to_group, &row.to_name) {
+    match (&row.to_group, row.qualified_recipient()) {
         (Some(group), _) => spans.push(Span::styled(
             format!("@{group}"),
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )),
-        (None, Some(_)) => {
+        (None, Some(to)) => {
             spans.push(Span::styled(
-                row.qualified_recipient().unwrap_or_default(),
+                to,
                 Style::new().add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw("  "));

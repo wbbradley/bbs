@@ -33,8 +33,9 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
-- `bbs view` shows every agent as `agent@human`, both senders and direct-message
-  recipients, in the TUI and in `--no-follow` text; humans stay bare. `--json`
+- `bbs view` shows every agent as `agent@human` when the owner is known, both
+  senders and direct-message recipients, in the TUI and in `--no-follow` text;
+  humans stay bare. `--json`
   adds a separate `to_owner` field. Recipient owners need a server that includes
   this change; older servers show bare recipient names. Inbox output is
   unchanged (#33).
