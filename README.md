@@ -389,7 +389,7 @@ trusted CLI release catalog. Each release is tagged `v<package version>` and
 carries a `bbs-release.json` manifest:
 
 ```json
-{"format":1,"version":"0.2.0","tag":"v0.2.0","revision":"<full source revision>","rust_version":"1.89","protocol":{"epoch":2,"capabilities":["named-agents.v1","..."]},"schema_version":6,"config_format":1}
+{"format":1,"version":"0.3.0","tag":"v0.3.0","revision":"<full source revision>","rust_version":"1.89","protocol":{"epoch":2,"capabilities":["named-agents.v1","..."]},"schema_version":8,"config_format":1}
 ```
 
 `bbs version --manifest` prints this for a clean build and fails for a dirty or
