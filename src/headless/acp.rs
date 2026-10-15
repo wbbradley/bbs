@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::{Duration, timeout};
 
 use super::settings::HarnessConfig;
 
@@ -24,6 +25,41 @@ const PROTOCOL_VERSION: u64 = 1;
 const AUTH_REQUIRED: i64 = -32000;
 /// Longest tool input kept in an event.
 const MAX_INPUT_CHARS: usize = 2000;
+/// Longest wait for the harness to initialize and open a session.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the harness's process group gets to exit after SIGTERM.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// The harness process and its process group, which also holds every command
+/// the agent started. Dropping it kills the group.
+pub struct Process {
+    child: Child,
+    pgid: libc::pid_t,
+}
+
+impl Process {
+    /// SIGTERM the group, wait for the harness, then SIGKILL whatever remains.
+    pub async fn stop(&mut self) {
+        signal_group(self.pgid, libc::SIGTERM);
+        let _ = timeout(STOP_GRACE, self.child.wait()).await;
+        signal_group(self.pgid, libc::SIGKILL);
+        let _ = self.child.wait().await;
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        signal_group(self.pgid, libc::SIGKILL);
+    }
+}
+
+fn signal_group(pgid: libc::pid_t, signal: libc::c_int) {
+    // SAFETY: kill(2) with a negative pid signals that process group; it has no
+    // memory-safety preconditions.
+    unsafe {
+        libc::kill(-pgid, signal);
+    }
+}
 
 /// What the harness reported during a session.
 #[derive(Debug)]
@@ -87,7 +123,6 @@ pub struct Acp {
 struct AgentCaps {
     load: bool,
     resume: bool,
-    auth_methods: Vec<String>,
 }
 
 impl Acp {
@@ -99,12 +134,16 @@ impl Acp {
         stderr: &Path,
         mcp: &McpServer,
         resume: Option<&str>,
-    ) -> Result<(Acp, Child, mpsc::UnboundedReceiver<Event>, Vec<String>)> {
+    ) -> Result<(Acp, Process, mpsc::UnboundedReceiver<Event>, Vec<String>)> {
+        use std::os::unix::fs::OpenOptionsExt;
         let stderr = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(stderr)
             .with_context(|| format!("opening {}", stderr.display()))?;
+        // Its own process group: a terminal's Ctrl-C reaches bbs only, and stop
+        // can signal the agent's commands along with the harness.
         let mut child = Command::new(&config.command[0])
             .args(&config.command[1..])
             .envs(&config.env)
@@ -112,9 +151,10 @@ impl Acp {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
-            .kill_on_drop(true)
+            .process_group(0)
             .spawn()
             .with_context(|| format!("starting harness {:?}", config.command))?;
+        let pgid = child.id().context("the harness exited at once")? as libc::pid_t;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let inner = Arc::new(Inner {
@@ -126,11 +166,34 @@ impl Acp {
         let (events, rx) = mpsc::unbounded_channel();
         tokio::spawn(read_loop(inner.clone(), BufReader::new(stdout), events));
 
+        let mut process = Process { child, pgid };
         let mut acp = Acp {
             inner,
             session_id: String::new(),
             session_resumed: false,
         };
+        let setup = timeout(SETUP_TIMEOUT, acp.open_session(config, cwd, mcp, resume)).await;
+        match setup {
+            Ok(Ok(warnings)) => Ok((acp, process, rx, warnings)),
+            Ok(Err(err)) => {
+                process.stop().await;
+                Err(err)
+            }
+            Err(_) => {
+                process.stop().await;
+                bail!("the harness did not open a session within {SETUP_TIMEOUT:?}")
+            }
+        }
+    }
+
+    async fn open_session(
+        &mut self,
+        config: &HarnessConfig,
+        cwd: &Path,
+        mcp: &McpServer,
+        resume: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let acp = self;
         let caps = acp.initialize().await?;
         let cwd = cwd.display().to_string();
         let servers = json!([mcp.to_json()]);
@@ -162,12 +225,12 @@ impl Acp {
             Some(result) => result,
             None => {
                 let params = json!({ "cwd": cwd, "mcpServers": servers });
-                let result = match acp.call("session/new", params.clone()).await {
-                    Err(err) if err.code == AUTH_REQUIRED && !caps.auth_methods.is_empty() => {
-                        acp.request("authenticate", json!({ "methodId": caps.auth_methods[0] }))
-                            .await?;
-                        acp.request("session/new", params).await?
-                    }
+                let result = match acp.call("session/new", params).await {
+                    // Logging in may be interactive; it belongs outside headless.
+                    Err(err) if err.code == AUTH_REQUIRED => bail!(
+                        "the harness needs a login; run it interactively once to log in ({})",
+                        err.message
+                    ),
                     other => other.map_err(|e| anyhow!("session/new: {}", e.message))?,
                 };
                 acp.session_id = result["sessionId"]
@@ -177,8 +240,7 @@ impl Acp {
                 result
             }
         };
-        let warnings = acp.configure(&result, config).await?;
-        Ok((acp, child, rx, warnings))
+        acp.configure(&result, config).await
     }
 
     pub fn session_id(&self) -> &str {
@@ -212,14 +274,6 @@ impl Acp {
         Ok(AgentCaps {
             load: caps["loadSession"].as_bool().unwrap_or(false),
             resume: caps["sessionCapabilities"]["resume"].is_object(),
-            auth_methods: result["authMethods"]
-                .as_array()
-                .map(|m| {
-                    m.iter()
-                        .filter_map(|m| m["id"].as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
         })
     }
 

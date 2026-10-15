@@ -2391,6 +2391,56 @@ fn headless_state(bbs: &Bbs, agent: &str) -> serde_json::Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
+/// A `bbs headless run` child, killed if a test fails while it runs.
+struct RunGuard(Option<std::process::Child>);
+
+impl RunGuard {
+    fn start(bbs: &Bbs, agent: &str) -> RunGuard {
+        let child = bbs
+            .command(&[
+                "headless",
+                "run",
+                agent,
+                "--cwd",
+                bbs.home.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        RunGuard(Some(child))
+    }
+
+    /// SIGTERM the process and return its output.
+    fn stop(mut self) -> std::process::Output {
+        let child = self.0.take().unwrap();
+        let killed = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        child.wait_with_output().unwrap()
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Whether `pid` is a running (not zombie) process.
+fn running(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+        s.rsplit(')')
+            .next()
+            .is_some_and(|rest| !rest.trim_start().starts_with('Z'))
+    })
+}
+
 /// Poll `f` until it returns `Some`, failing after 20 seconds.
 fn eventually<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -2413,18 +2463,7 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
     bbs.ok(&["group", "register", "crew"]);
     let (peer, tp) = bbs.register();
     bbs.ok(&["--token", &tp, "group", "join", "crew"]);
-    let run = bbs
-        .command(&[
-            "headless",
-            "run",
-            "Zed",
-            "--cwd",
-            bbs.home.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let run = RunGuard::start(&bbs, "Zed");
     let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
     eventually("the session", || {
         std::fs::read_to_string(&log)
@@ -2471,12 +2510,16 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
             .filter(|l| l.contains("\"stop_reason\":\"cancelled\""))
     });
 
-    let killed = Command::new("kill")
-        .args(["-TERM", &run.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(killed.success());
-    let out = run.wait_with_output().unwrap();
+    // A second driver for the same agent is refused before it starts a harness.
+    assert!(
+        bbs.err(&["headless", "run", "Zed"])
+            .contains("another `bbs headless run`")
+    );
+
+    // Stopping ends the harness's commands too.
+    let child = std::fs::read_to_string(bbs.home.join("fake-child.pid")).unwrap();
+    assert!(running(child.trim()));
+    let out = run.stop();
     assert!(
         out.status.success(),
         "{}",
@@ -2487,6 +2530,9 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
             .unwrap()
             .contains("\"event\":\"stop\"")
     );
+    eventually("the harness's child to exit", || {
+        (!running(child.trim())).then_some(())
+    });
 }
 
 fn control_messages_are_for_owned_agents_only(mode: Mode) {

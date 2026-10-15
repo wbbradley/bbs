@@ -19,8 +19,10 @@ use crate::service::Caller;
 pub const TOKEN_ENV: &str = "BBS_HEADLESS_TOKEN";
 /// Offered when the client asks for none.
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
-/// History returned when the agent gives no limit.
-const DEFAULT_HISTORY_LIMIT: u32 = 50;
+/// History returned when the agent gives no limit: the newest messages...
+const DEFAULT_HISTORY_LIMIT: usize = 50;
+/// ...from this far back, when it gives no start.
+const DEFAULT_HISTORY_SINCE: &str = "7d";
 
 pub async fn run(dir: &Path) -> Result<()> {
     let token = std::env::var(TOKEN_ENV)
@@ -146,23 +148,22 @@ impl Tools {
                 "Status updated.".to_string()
             }
             "bbs_history" => {
-                let since = match args["since"].as_str() {
-                    Some(s) => Some(parse_time("since", s, Utc::now())?),
-                    None => None,
-                };
+                let since = args["since"].as_str().unwrap_or(DEFAULT_HISTORY_SINCE);
                 let limit = match args["limit"].as_u64() {
-                    Some(n) => u32::try_from(n).context("limit is too large")?,
+                    Some(n) => usize::try_from(n).context("limit is too large")?,
                     None => DEFAULT_HISTORY_LIMIT,
                 };
+                // The server returns the oldest first; keep the newest `limit`.
                 let r = b
                     .read(proto::ReadRequest {
-                        limit: Some(limit),
+                        limit: None,
                         archived: true,
-                        since,
+                        since: Some(parse_time("since", since, Utc::now())?),
                         from_kind: None,
                     })
                     .await?;
-                let text = format_messages(&r.messages, false)?;
+                let skip = r.messages.len().saturating_sub(limit);
+                let text = format_messages(&r.messages[skip..], false)?;
                 if text.is_empty() {
                     "No messages.".to_string()
                 } else {
@@ -219,9 +220,9 @@ fn tool_list() -> Value {
         },
         {
             "name": "bbs_history",
-            "description": "Read messages you already received, oldest first.",
+            "description": "Reread messages you already received: the newest ones (default 50 from the last 7 days), oldest first.",
             "inputSchema": object(json!({
-                "since": string("Only messages sent at or after this time: RFC3339, or a duration like 2h or 7d"),
+                "since": string("Only messages sent at or after this time: RFC3339, or a duration like 2h or 7d (default 7d)"),
                 "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of messages (default 50)" },
             }), &[]),
         },

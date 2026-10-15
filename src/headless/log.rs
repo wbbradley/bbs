@@ -122,7 +122,7 @@ fn render(line: &str) -> String {
             .unwrap_or_default()
     };
     let body = match event.as_str() {
-        "text" | "thought" | "prompt" => {
+        "text" | "thought" | "prompt" | "unprocessed" => {
             let t = text(&mut r, "text");
             format!("\n{}\n", t.trim_end())
         }

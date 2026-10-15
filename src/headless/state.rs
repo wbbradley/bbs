@@ -56,6 +56,26 @@ impl AgentDir {
         Ok(())
     }
 
+    /// Hold an exclusive lock on this agent's directory until the file is dropped.
+    pub fn lock(&self) -> Result<std::fs::File> {
+        let path = self.dir.join("run.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!("another `bbs headless run` is driving this agent on this machine")
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                Err(err).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+    }
+
     pub fn log_path(&self) -> PathBuf {
         self.dir.join("log.jsonl")
     }

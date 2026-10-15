@@ -11,6 +11,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 data-encoding = "2.11.1"
 gethostname = "1.1.0"
 humantime = "2.4.0"
+libc = "0.2.190"
 prost = "0.14.4"
 rand = "0.9"
 rpassword = "7.4"

@@ -3,7 +3,8 @@
 On each prompt it starts (once) the MCP server the client passed in
 session/new, asks for one permission, and replies to the last sender with
 bbs_send. A prompt containing WAITCANCEL waits for session/cancel instead and
-ends the turn as cancelled.
+ends the turn as cancelled. At startup it starts a long `sleep`, standing in for
+an agent's command, and writes its pid to fake-child.pid in its directory.
 """
 
 import json
@@ -51,6 +52,9 @@ def update(session, body):
 
 
 def main():
+    child = subprocess.Popen(["sleep", "300"])
+    with open("fake-child.pid", "w") as f:
+        f.write(str(child.pid))
     mcp = None
     session = "fake-session"
     while (msg := read()) is not None:

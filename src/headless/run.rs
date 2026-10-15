@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::json;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -56,9 +57,19 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     let config = Config::load()?;
     let agent_dir = AgentDir::new(&args.agent)?;
     agent_dir.create()?;
+    // One driver per agent on this machine; the OS releases the lock on exit.
+    let _lock = agent_dir.lock()?;
     let mut state = agent_dir.load()?;
-    let (agent, token) =
-        agent_token(&config, dir, as_human, &args.agent, &harness, &mut state).await?;
+    let (agent, token) = agent_token(
+        &config,
+        dir,
+        as_human,
+        &args.agent,
+        &harness,
+        &cwd,
+        &mut state,
+    )
+    .await?;
     agent_dir.save(&state)?;
 
     let mut log = Log::open(&agent_dir.log_path())?;
@@ -79,7 +90,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         .session_id
         .clone()
         .filter(|_| state.harness.as_deref() == Some(harness.as_str()));
-    let (acp, mut child, mut events, warnings) = Acp::start(
+    let (acp, mut process, mut events, warnings) = Acp::start(
         &harness_config,
         &cwd,
         &agent_dir.stderr_path(),
@@ -123,7 +134,8 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     let mut queue: Vec<proto::Message> = Vec::new();
     let mut turn: Option<JoinHandle<Result<String>>> = None;
     let mut last_start: Option<Instant> = None;
-    let mut sigterm = terminate_signal()?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
     let result = loop {
         let ready_at = last_start
             .map(|t| t + interval)
@@ -161,10 +173,11 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     if batch.is_empty() {
                         continue;
                     }
+                    let waiting = turn.is_some() || Instant::now() < ready_at;
                     log.event("mail", json!({
                         "count": batch.len(),
                         "from": batch.iter().map(|m| m.sender_display_name()).collect::<Vec<_>>(),
-                        "queued": turn.is_some() || throttled,
+                        "queued": waiting,
                     }));
                     if steer && turn.is_some() {
                         todo!("steer mail into the running turn (no harness can yet)");
@@ -187,7 +200,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 Some(event) => record(&mut log, event),
             },
             _ = tokio::time::sleep_until(ready_at), if throttled => {}
-            _ = tokio::signal::ctrl_c() => break Ok(()),
+            _ = sigint.recv() => break Ok(()),
             _ = sigterm.recv() => break Ok(()),
         }
     };
@@ -196,12 +209,18 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         let _ = acp.cancel().await;
     }
     log.flush();
+    if !queue.is_empty() {
+        // Already marked read on the server; keep them where the owner can find them.
+        log.event(
+            "unprocessed",
+            json!({ "text": format_messages(&queue, false)? }),
+        );
+    }
     match &result {
         Ok(()) => log.event("stop", json!({})),
         Err(err) => log.event("stop", json!({ "error": format!("{err:#}") })),
     }
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    process.stop().await;
     result
 }
 
@@ -219,12 +238,6 @@ fn record(log: &mut Log, event: Event) {
     }
 }
 
-fn terminate_signal() -> Result<tokio::signal::unix::Signal> {
-    Ok(tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    )?)
-}
-
 /// The agent's identity and token: the saved token if it is still valid on this
 /// server, else a new registration.
 async fn agent_token(
@@ -233,6 +246,7 @@ async fn agent_token(
     as_human: Option<&str>,
     agent: &str,
     harness: &str,
+    cwd: &Path,
     state: &mut State,
 ) -> Result<(String, String)> {
     if let Some(token) = state
@@ -258,9 +272,7 @@ async fn agent_token(
     let req = proto::RegisterRequest {
         name: Some(agent.to_string()),
         note: Some(format!("headless ({harness})")),
-        pwd: std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default(),
+        pwd: cwd.display().to_string(),
         hostname: gethostname::gethostname().to_string_lossy().into_owned(),
     };
     match backend.register(req).await {
