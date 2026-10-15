@@ -23,6 +23,9 @@ use crate::service::Caller;
 
 /// Wait before retrying after the mail wait fails.
 const MAIL_RETRY: Duration = Duration::from_secs(10);
+/// "already running" retries: after a token takeover the old token's waiter can
+/// hold the inbox briefly. Persisting means another process drives this agent.
+const SLOT_RETRIES: u32 = 3;
 
 pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> Result<()> {
     let settings = Settings::load()?;
@@ -326,6 +329,7 @@ async fn wait_for_mail(
         ..Default::default()
     };
     let mut backend = None;
+    let mut slot_retries = 0;
     loop {
         if backend.is_none() {
             match Backend::open(&config, &dir, caller.clone()).await {
@@ -338,17 +342,22 @@ async fn wait_for_mail(
             }
         }
         match backend.as_mut().unwrap().wait_for_mail(None).await {
-            Ok(batch) if batch.is_empty() => {}
+            Ok(batch) if batch.is_empty() => slot_retries = 0,
             Ok(batch) => {
+                slot_retries = 0;
                 if tx.send(Ok(batch)).is_err() {
                     return;
                 }
             }
             Err(err) => {
                 let text = format!("{err:#}");
-                if text.contains("token") || text.contains("already running") {
+                let busy = text.contains("already running");
+                if text.contains("token") || (busy && slot_retries >= SLOT_RETRIES) {
                     let _ = tx.send(Err(err));
                     return;
+                }
+                if busy {
+                    slot_retries += 1;
                 }
                 tracing::warn!("headless mail wait: {text}");
                 backend = None;

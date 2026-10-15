@@ -1378,3 +1378,86 @@ async fn enrollment_validates_before_saving_and_binds_credentials_to_server() {
     assert!(!overridden.status.success());
     assert!(String::from_utf8_lossy(&overridden.stderr).contains("human token required"));
 }
+
+#[tokio::test]
+async fn rotation_is_owner_only_and_unbinds_sessions() {
+    let server = Server::start_mode("protected-rotation", true);
+    let mut client = server.client().await;
+    let ada = server.admin("add", "Ada");
+    let bob = server.admin("add", "Bob");
+    let a = protected_register(&mut client, &ada, "Zed").await;
+    let lookup = || proto::SessionAgentRequest {
+        harness: "test".into(),
+        session_id: "s1".into(),
+    };
+    client
+        .bind_session(credential(
+            &ada,
+            proto::BindSessionRequest {
+                harness: "test".into(),
+                session_id: "s1".into(),
+                token: a.token.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    let rotate = |token: &str| {
+        credential(
+            token,
+            proto::RetireRequest {
+                agent: "zed".into(),
+            },
+        )
+    };
+    let err = client.rotate_agent_token(rotate(&bob)).await.unwrap_err();
+    assert!(err.message().contains("not your agent"), "{err:?}");
+
+    let r = client
+        .rotate_agent_token(rotate(&ada))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.name, "Zed");
+    assert_ne!(r.token, a.token);
+    assert!(
+        client
+            .whoami(as_agent(&a.token, proto::Empty {}))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        client
+            .whoami(as_agent(&r.token, proto::Empty {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .name,
+        "Zed"
+    );
+    // A session bound before the rotation must not recover the new token.
+    let bound = client
+        .session_agent(credential(&ada, lookup()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(bound.agent.is_none() && bound.token.is_empty(), "{bound:?}");
+}
+
+#[tokio::test]
+async fn trust_mode_servers_refuse_rotation() {
+    let server = Server::start("trust-rotation");
+    let mut client = server.client().await;
+    client
+        .ensure_human(proto::EnsureHumanRequest {
+            name: "will".into(),
+        })
+        .await
+        .unwrap();
+    let a = register(&mut client).await;
+    let err = client
+        .rotate_agent_token(as_human("will", proto::RetireRequest { agent: a.name }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("--require-human-token"), "{err:?}");
+}

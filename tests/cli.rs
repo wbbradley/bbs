@@ -2525,8 +2525,33 @@ fn headless_run_takes_over_an_owned_agent(mode: Mode) {
     let bbs = Bbs::with_mode("takeover", mode);
     // A harness that exits at once: `run` fails after settling the token.
     headless_config(&bbs, &["true"]);
-    let (_, old) = bbs.register_with(&["register", "--name", "Zed"]);
-    bbs.err(&["headless", "run", "Zed"]);
+    let register_out = bbs.ok(&["register", "--name", "Zed"]);
+    let old = register_out
+        .split("--token ")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_string();
+    // An interactive session bound to the agent before the takeover.
+    let bind = serde_json::json!({
+        "session_id": "s1",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "bbs register --name Zed" },
+        "tool_response": { "stdout": register_out, "stderr": "", "interrupted": false, "isImage": false },
+    });
+    let compact = serde_json::json!({ "session_id": "s1", "hook_event_name": "SessionStart", "source": "compact" });
+    assert!(hook(&bbs, bind).is_none());
+    assert!(hook(&bbs, compact.clone()).is_some());
+
+    let err = bbs.err(&["headless", "run", "Zed"]);
+    if matches!(mode, Mode::Remote) {
+        // The test server runs in trust mode, where owners cannot be verified.
+        assert!(err.contains("--require-human-token"), "{err}");
+        return;
+    }
     let new = headless_state(&bbs, "Zed")["token"]
         .as_str()
         .unwrap()
@@ -2534,6 +2559,8 @@ fn headless_run_takes_over_an_owned_agent(mode: Mode) {
     assert_ne!(new, old);
     assert!(bbs.err(&["--token", &old, "whoami"]).contains("token"));
     assert_eq!(bbs.ok(&["--token", &new, "whoami"]), "Zed\n");
+    // The old session no longer recovers the agent's (new) token.
+    assert!(hook(&bbs, compact).is_none());
 
     bbs.ok(&["human", "add", "alice"]);
     bbs.register_with(&["--as", "alice", "register", "--name", "Ada"]);

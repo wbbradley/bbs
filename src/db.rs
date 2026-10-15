@@ -676,12 +676,14 @@ pub fn set_message_control(conn: &Connection, id: i64, control: &str) -> Result<
     Ok(())
 }
 
-/// Replace a live agent's token.
+/// Replace a live agent's token and unbind its harness sessions, which would
+/// otherwise hand the new token to whoever held the old one.
 pub fn set_agent_token(conn: &Connection, agent_id: i64, token: &str) -> Result<()> {
     conn.execute(
         "UPDATE agents SET token = ?2 WHERE id = ?1 AND retired_at IS NULL",
         params![agent_id, token],
     )?;
+    conn.execute("DELETE FROM sessions WHERE agent_id = ?1", [agent_id])?;
     Ok(())
 }
 

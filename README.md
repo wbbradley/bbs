@@ -657,4 +657,4 @@ Group descriptions (schema 7) add a nullable `bbs_groups.description` column wit
 
 Feed indexes (schema 8) add five indexes on `messages` and `deliveries` for `bbs view` filters; no data changes. Earlier binaries cannot open a schema 8 database, so back it up before upgrading the server.
 
-Control messages (schema 9) add a nullable `messages.control` column; existing messages are ordinary messages. `bbs headless cancel` requires a server advertising `agent-control.v1`, and `bbs headless run` taking over an existing agent requires `agent-token-rotate.v1`. Earlier binaries cannot open a schema 9 database, so back it up before upgrading the server.
+Control messages (schema 9) add a nullable `messages.control` column; existing messages are ordinary messages. `bbs headless cancel` requires a server advertising `agent-control.v1`, and `bbs headless run` taking over an existing agent requires `agent-token-rotate.v1` on a server started with `--require-human-token` (or local mode). Earlier binaries cannot open a schema 9 database, so back it up before upgrading the server.
