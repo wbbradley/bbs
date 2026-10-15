@@ -799,6 +799,7 @@ mod tests {
             to_owner: None,
             read_at: read_at.map(Into::into),
             body: body.into(),
+            control: None,
         }
     }
 

@@ -25,6 +25,9 @@ service Bbs {
   rpc Bye(Empty) returns (ByeResponse);
   // Retire another agent. Humans only.
   rpc Retire(RetireRequest) returns (ByeResponse);
+  // Replace an agent's token and return it. Only the agent's owning human;
+  // requires agent-token-rotate.v1.
+  rpc RotateAgentToken(RetireRequest) returns (RegisterResponse);
 
   // Humans only. A description requires group-description.v1.
   rpc GroupRegister(GroupRegisterRequest) returns (GroupResponse);
@@ -120,7 +123,19 @@ message Group {
   optional string description = 3;  // absent when unset or from older servers
 }
 
-message SendRequest { string to = 1; string body = 2; }
+// A control message asks a headless agent's driver to act; `body` describes
+// it for clients that only show text. Requires agent-control.v1.
+enum Control {
+  CONTROL_UNSPECIFIED = 0;
+  CONTROL_CANCEL = 1;  // cancel the agent's running turn
+}
+
+message SendRequest {
+  string to = 1;
+  string body = 2;
+  // Humans only, direct to an agent they own. Requires agent-control.v1.
+  optional Control control = 3;
+}
 message SendResponse {
   string to = 1;                   // canonical recipient: "Juliana" or "@acme"
   optional uint32 recipients = 2;  // broadcasts only: recipients visible to the caller
@@ -146,6 +161,7 @@ message Message {
   optional string from_owner = 9;    // sending agent's human; absent for humans or unknown owners
   optional string reader_owner = 10; // inbox reader's human; absent for human readers and the feed
   optional string to_owner = 11;     // feed only: direct recipient agent's human; absent otherwise
+  optional Control control = 12;     // inbox only: set on control messages
 }
 
 message WaitRequest { optional uint32 limit = 1; }

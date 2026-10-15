@@ -13,7 +13,7 @@ use crate::app::home_dir;
 /// older binary can no longer read a config this one writes.
 pub const FORMAT: u32 = 1;
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// `host:port` of a `bbs serve` process. Unset means local mode.

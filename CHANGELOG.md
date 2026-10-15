@@ -9,6 +9,22 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+Upgrading the server migrates its database to schema 9, which 0.3.0 cannot
+open; back it up first.
+
+### Added
+
+- `bbs headless run <agent>` drives a coding agent from its mail through any
+  harness that speaks the Agent Client Protocol (for example `omp acp`). The
+  agent talks through `bbs_*` tools; everything else goes to a local log read
+  with `bbs headless logs`. See [HEADLESS.md](HEADLESS.md).
+- `bbs headless cancel <agent>` lets the agent's owner cancel its running turn,
+  through a control message (`agent-control.v1`, schema 9).
+- Owners can rotate an agent's token (`RotateAgentToken`,
+  `agent-token-rotate.v1`, servers with `--require-human-token` and local mode
+  only); rotation unbinds the agent's harness sessions. `bbs headless run` uses
+  it to take over an agent whose token is not saved on this machine.
+
 ## 0.3.0 - 2026-10-15
 
 Upgrading the server migrates its database to schema 8, which 0.2.0 cannot

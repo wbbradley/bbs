@@ -222,7 +222,7 @@ fn version_reports_identity_without_side_effects() {
             );
             assert_eq!(report["protocol"]["epoch"], 2);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
-            assert_eq!(report["schema_version"], 8);
+            assert_eq!(report["schema_version"], 9);
             assert_eq!(report["config_format"], 1);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {
@@ -2366,6 +2366,309 @@ fn view_json_follow_emits_each_message_once(mode: Mode) {
     assert!(extra.is_empty(), "duplicate or stray lines: {extra:?}");
 }
 
+/// Write a headless config whose only harness is `command`.
+fn headless_config(bbs: &Bbs, command: &[&str]) {
+    let dir = bbs.home.join(".config/bbs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let command = command
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        dir.join("headless.toml"),
+        format!("min_turn_interval = \"0s\"\n[harness.fake]\ncommand = [{command}]\n"),
+    )
+    .unwrap();
+}
+
+fn headless_state(bbs: &Bbs, agent: &str) -> serde_json::Value {
+    let path = bbs
+        .home
+        .join(".local/state/bbs/headless")
+        .join(agent.to_lowercase())
+        .join("state.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// A `bbs headless run` child, killed if a test fails while it runs.
+struct RunGuard(Option<std::process::Child>);
+
+impl RunGuard {
+    fn start(bbs: &Bbs, agent: &str) -> RunGuard {
+        let child = bbs
+            .command(&[
+                "headless",
+                "run",
+                agent,
+                "--cwd",
+                bbs.home.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        RunGuard(Some(child))
+    }
+
+    /// Send `signal` to the process and return its output.
+    fn stop_with(mut self, signal: &str) -> std::process::Output {
+        let child = self.0.take().unwrap();
+        let killed = Command::new("kill")
+            .args([signal, &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        child.wait_with_output().unwrap()
+    }
+
+    fn stop(self) -> std::process::Output {
+        self.stop_with("-TERM")
+    }
+}
+
+impl Drop for RunGuard {
+    /// SIGTERM, so `run` also stops the harness's process group.
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Whether `pid` is a running (not zombie) process.
+fn running(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+        s.rsplit(')')
+            .next()
+            .is_some_and(|rest| !rest.trim_start().starts_with('Z'))
+    })
+}
+
+/// Poll `f` until it returns `Some`, failing after 20 seconds.
+fn eventually<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn headless_replies_through_tools_and_cancels(mode: Mode) {
+    let bbs = Bbs::with_mode("headless", mode);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");
+    headless_config(&bbs, &["python3", fake]);
+    bbs.ok(&["group", "register", "crew"]);
+    let (peer, tp) = bbs.register();
+    bbs.ok(&["--token", &tp, "group", "join", "crew"]);
+    let run = RunGuard::start(&bbs, "Zed");
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    eventually("the session", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|l| l.contains("\"event\":\"session\""))
+    });
+    let tz = headless_state(&bbs, "Zed")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    bbs.ok(&["--token", &tz, "group", "join", "crew"]);
+
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "hello"]);
+    let mut seen = String::new();
+    let reply = eventually("the reply", || {
+        seen.push_str(&bbs.ok(&["--token", &tp, "read"]));
+        seen.contains("echo (").then(|| seen.clone())
+    });
+    assert!(
+        reply.contains(&format!("from Zed to {peer}:\necho (yes)")),
+        "{reply}"
+    );
+    let shown = bbs.ok(&["headless", "logs", "Zed"]);
+    assert!(shown.contains("You are Zed"), "{shown}");
+    assert!(shown.contains("text:\nthinking about"), "{shown}");
+    assert!(shown.contains("permission:"), "{shown}");
+
+    // Only the owner may cancel; the running process stops the turn at once.
+    bbs.ok(&["human", "add", "alice"]);
+    assert!(
+        bbs.err(&["--as", "alice", "headless", "cancel", "Zed"])
+            .contains("is not your agent")
+    );
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "WAITCANCEL"]);
+    eventually("the second prompt", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|l| l.contains("WAITCANCEL"))
+    });
+    bbs.ok(&["headless", "cancel", "Zed"]);
+    eventually("the cancelled turn", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|l| l.contains("\"stop_reason\":\"cancelled\""))
+    });
+
+    // A second driver for the same agent is refused before it starts a harness.
+    assert!(
+        bbs.err(&["headless", "run", "Zed"])
+            .contains("another `bbs headless run`")
+    );
+
+    // Stopping ends the harness's commands too.
+    let child = std::fs::read_to_string(bbs.home.join("fake-child.pid")).unwrap();
+    assert!(running(child.trim()));
+    let out = run.stop();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("\"event\":\"stop\"")
+    );
+    eventually("the harness's child to exit", || {
+        (!running(child.trim())).then_some(())
+    });
+}
+
+fn control_messages_are_for_owned_agents_only(mode: Mode) {
+    let bbs = Bbs::with_mode("control", mode);
+    bbs.ok(&["human", "add", "alice"]);
+    let (a, ta) = bbs.register();
+    bbs.ok(&["headless", "cancel", &a]);
+    let row: Option<String> = bbs
+        .db()
+        .query_row(
+            "SELECT control FROM messages ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(row.as_deref(), Some("cancel"));
+    assert!(
+        bbs.ok(&["--token", &ta, "read"])
+            .contains("Cancel your running turn")
+    );
+    assert!(
+        bbs.err(&["--as", "alice", "headless", "cancel", &a])
+            .contains("is not your agent")
+    );
+    assert!(
+        bbs.err(&["headless", "cancel", "@crew"])
+            .contains("not a group")
+    );
+    assert!(
+        bbs.err(&["headless", "cancel", "alice"])
+            .contains("no live agent")
+    );
+}
+
+fn headless_signals_during_setup_stop_the_harness(mode: Mode) {
+    let bbs = Bbs::with_mode("setup-signal", mode);
+    // A harness that never answers `initialize`, with a command of its own.
+    headless_config(
+        &bbs,
+        &[
+            "sh",
+            "-c",
+            "sleep 300 & echo $! > fake-child.pid; exec sleep 300",
+        ],
+    );
+    let run = RunGuard::start(&bbs, "Zed");
+    let pid_file = bbs.home.join("fake-child.pid");
+    let child = eventually("the harness's child", || {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+    });
+    assert!(running(child.trim()));
+    // A closed terminal (SIGHUP) stops run like SIGTERM.
+    let out = run.stop_with("-HUP");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("stopped during harness setup"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eventually("the harness's child to exit", || {
+        (!running(child.trim())).then_some(())
+    });
+    let log =
+        std::fs::read_to_string(bbs.home.join(".local/state/bbs/headless/zed/log.jsonl")).unwrap();
+    assert!(log.contains("\"event\":\"stop\""), "{log}");
+}
+
+fn headless_run_takes_over_an_owned_agent(mode: Mode) {
+    let bbs = Bbs::with_mode("takeover", mode);
+    // A harness that exits at once: `run` fails after settling the token.
+    headless_config(&bbs, &["true"]);
+    let register_out = bbs.ok(&["register", "--name", "Zed"]);
+    let old = register_out
+        .split("--token ")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_string();
+    // An interactive session bound to the agent before the takeover.
+    let bind = serde_json::json!({
+        "session_id": "s1",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "bbs register --name Zed" },
+        "tool_response": { "stdout": register_out, "stderr": "", "interrupted": false, "isImage": false },
+    });
+    let compact = serde_json::json!({ "session_id": "s1", "hook_event_name": "SessionStart", "source": "compact" });
+    assert!(hook(&bbs, bind).is_none());
+    assert!(hook(&bbs, compact.clone()).is_some());
+
+    // A saved token the server rejects still leads to a takeover; only other
+    // failures (the server restarting, say) stop `run`.
+    let dir = bbs.home.join(".local/state/bbs/headless/zed");
+    std::fs::create_dir_all(&dir).unwrap();
+    let saved = serde_json::json!({
+        "server": bbs.server.as_ref().map(|s| s.addr.clone()),
+        "token": "aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+    std::fs::write(dir.join("state.json"), saved.to_string()).unwrap();
+
+    let err = bbs.err(&["headless", "run", "Zed"]);
+    assert!(!err.contains("checking the saved agent token"), "{err}");
+    if matches!(mode, Mode::Remote) {
+        // The test server runs in trust mode, where owners cannot be verified.
+        assert!(err.contains("--require-human-token"), "{err}");
+        return;
+    }
+    let new = headless_state(&bbs, "Zed")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(new, old);
+    assert!(bbs.err(&["--token", &old, "whoami"]).contains("token"));
+    assert_eq!(bbs.ok(&["--token", &new, "whoami"]), "Zed\n");
+    // The old session no longer recovers the agent's (new) token.
+    assert!(hook(&bbs, compact).is_none());
+
+    bbs.ok(&["human", "add", "alice"]);
+    bbs.register_with(&["--as", "alice", "register", "--name", "Ada"]);
+    assert!(
+        bbs.err(&["headless", "run", "Ada"])
+            .contains("is not your agent")
+    );
+}
+
 both_modes!(
     requested_names_are_validated_and_reserved,
     concurrent_registration_reserves_one_name,
@@ -2400,4 +2703,8 @@ both_modes!(
     view_since_and_until_bound_history,
     view_json_follow_emits_each_message_once,
     view_json_follow_survives_full_windows_and_bursts,
+    headless_replies_through_tools_and_cancels,
+    control_messages_are_for_owned_agents_only,
+    headless_run_takes_over_an_owned_agent,
+    headless_signals_during_setup_stop_the_harness,
 );

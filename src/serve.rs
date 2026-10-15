@@ -509,6 +509,27 @@ impl Bbs for Server {
             .await
     }
 
+    async fn rotate_agent_token(
+        &self,
+        req: Request<proto::RetireRequest>,
+    ) -> Result<Response<proto::RegisterResponse>, Status> {
+        // Without required human tokens anyone can claim to be the owner, and a
+        // new token would let them act as the agent.
+        if !self.0.require_human_token {
+            self.0.protocol.validate(req.metadata())?;
+            return Err(Status::failed_precondition(
+                "rotating agent tokens requires a server started with --require-human-token",
+            ));
+        }
+        self.unary(
+            "rotate_agent_token",
+            req,
+            Effect::Write,
+            service::rotate_agent_token,
+        )
+        .await
+    }
+
     async fn group_register(
         &self,
         req: Request<proto::GroupRegisterRequest>,

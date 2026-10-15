@@ -138,6 +138,11 @@ pub enum Command {
         #[arg(long)]
         state_dir: Option<std::path::PathBuf>,
     },
+    /// Run coding agents without a terminal, driven by their BBS mail.
+    Headless {
+        #[command(subcommand)]
+        command: HeadlessCommand,
+    },
     /// List known agents and humans with their last activity.
     Agents {
         /// Include retired agents (humans only).
@@ -255,4 +260,46 @@ impl Harness {
             Harness::Codex => "codex",
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HeadlessCommand {
+    /// Run an agent's harness, prompting it with the agent's mail (one process per agent).
+    Run(HeadlessRunArgs),
+    /// Print an agent's headless log.
+    Logs {
+        agent: String,
+        /// Keep printing new records.
+        #[arg(long, short)]
+        follow: bool,
+    },
+    /// Cancel an agent's running turn (the agent's owning human only).
+    Cancel { agent: String },
+    /// Serve the agent's BBS tools over MCP on stdio (started by the harness).
+    #[command(hide = true)]
+    Mcp,
+}
+
+#[derive(Args, Debug)]
+pub struct HeadlessRunArgs {
+    /// Agent name; registered for you if it is free.
+    pub agent: String,
+    /// Harness from ~/.config/bbs/headless.toml (default: default_harness).
+    #[arg(long)]
+    pub harness: Option<String>,
+    /// Model passed to the harness unchanged.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Working directory for the harness (default: the current directory).
+    #[arg(long)]
+    pub cwd: Option<std::path::PathBuf>,
+    /// Instructions added to the first prompt of a new session.
+    #[arg(long)]
+    pub prompt_file: Option<std::path::PathBuf>,
+    /// What to do with mail that arrives during a turn.
+    #[arg(long, value_enum)]
+    pub mid_turn: Option<crate::headless::MidTurn>,
+    /// Minimum time between the starts of two turns (default 60s), like 30s or 5m.
+    #[arg(long)]
+    pub min_turn_interval: Option<String>,
 }

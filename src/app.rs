@@ -60,6 +60,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await;
         }
         Command::Hook { harness } => return crate::hook::run(*harness, &dir).await,
+        Command::Headless { .. } => {
+            let Command::Headless { command } = cli.command else {
+                unreachable!()
+            };
+            return crate::headless::run(command, &dir, cli.as_human.as_deref()).await;
+        }
         Command::Serve {
             listen,
             state_dir,
@@ -118,6 +124,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
     Ok(match command {
         Command::Init { .. }
         | Command::Hook { .. }
+        | Command::Headless { .. }
         | Command::Serve { .. }
         | Command::Admin { .. }
         | Command::Backup { .. }
@@ -204,6 +211,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
             let req = proto::SendRequest {
                 to,
                 body: read_body(body)?,
+                control: None,
             };
             let r = backend.send(req).await?;
             match r.recipients {
@@ -371,7 +379,7 @@ fn kind_name(kind: proto::Kind) -> &'static str {
     }
 }
 
-fn format_groups(groups: &[proto::Group], json: bool) -> Result<String> {
+pub(crate) fn format_groups(groups: &[proto::Group], json: bool) -> Result<String> {
     if json {
         return json_lines(groups.iter().map(|g| GroupJson {
             name: &g.name,
@@ -426,7 +434,7 @@ pub(crate) fn parse_time(flag: &str, s: &str, now: DateTime<Utc>) -> Result<Stri
     Ok(fmt_time(now - chrono::Duration::from_std(d)?))
 }
 
-fn format_messages(msgs: &[proto::Message], json: bool) -> Result<String> {
+pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<String> {
     if json {
         return json_lines(msgs.iter().map(|m| MessageJson {
             id: m.id,
@@ -491,7 +499,7 @@ fn agents_json(r: &proto::ListAgentsResponse) -> Result<String> {
     json_lines(humans.chain(agents))
 }
 
-fn format_agents(r: &proto::ListAgentsResponse) -> String {
+pub(crate) fn format_agents(r: &proto::ListAgentsResponse) -> String {
     let mut table: Vec<[String; 7]> = vec![[
         "NAME".into(),
         "KIND".into(),

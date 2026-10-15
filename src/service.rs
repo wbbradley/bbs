@@ -177,6 +177,10 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
         to_owner: m.to_owner,
         read_at: m.read_at,
         body: m.body,
+        control: match m.control.as_deref() {
+            Some("cancel") => Some(proto::Control::Cancel.into()),
+            _ => None,
+        },
     }
 }
 
@@ -392,6 +396,30 @@ pub fn register(
             "registered agent"
         );
         Ok(proto::RegisterResponse { name, token })
+    })
+}
+
+/// Replace the token of an agent the calling human owns.
+pub fn rotate_agent_token(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::RetireRequest,
+) -> Result<proto::RegisterResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let Some(target) = db::live_agent_by_name(ctx.conn, &req.agent)? else {
+            bail!("no live agent named {:?}", req.agent);
+        };
+        if db::agent_owner_id(ctx.conn, target.id)? != Some(me.id) {
+            bail!("{} is not your agent", target.name);
+        }
+        let token = new_token(ctx.conn)?;
+        db::set_agent_token(ctx.conn, target.id, &token)?;
+        tracing::info!(agent = target.name, by = me.name, "rotated agent token");
+        Ok(proto::RegisterResponse {
+            name: target.name,
+            token,
+        })
     })
 }
 
@@ -670,6 +698,45 @@ fn broadcast(ctx: &Ctx, me: &db::Principal, gid: i64, body: &str) -> Result<(usi
     Ok((count, visible))
 }
 
+/// A control message: from a human, direct to a live agent that human owns.
+fn send_control(
+    ctx: &Ctx,
+    me: &db::Principal,
+    to: &str,
+    body: &str,
+    control: i32,
+) -> Result<proto::SendResponse> {
+    let control = match proto::Control::try_from(control) {
+        Ok(proto::Control::Cancel) => "cancel",
+        _ => bail!("unknown control {control}"),
+    };
+    if me.kind != db::Kind::Human {
+        bail!("only humans can send control messages");
+    }
+    if to.starts_with('@') {
+        bail!("control messages go to one agent, not a group");
+    }
+    let Some(target) = db::live_agent_by_name(ctx.conn, to)? else {
+        bail!("no live agent named {to:?}");
+    };
+    if db::agent_owner_id(ctx.conn, target.id)? != Some(me.id) {
+        bail!("{} is not your agent", target.name);
+    }
+    let msg = db::insert_message(ctx.conn, me, None, body, &ctx.now_s)?;
+    db::set_message_control(ctx.conn, msg, control)?;
+    db::insert_delivery(ctx.conn, msg, db::Kind::Agent, target.id)?;
+    tracing::info!(
+        from = me.name,
+        to = target.name,
+        control,
+        "sent control message"
+    );
+    Ok(proto::SendResponse {
+        to: target.name,
+        recipients: None,
+    })
+}
+
 pub fn send(
     conn: &mut Connection,
     caller: &Caller,
@@ -679,6 +746,9 @@ pub fn send(
         let me = ctx.actor()?;
         let (to, body) = (req.to.as_str(), req.body.as_str());
         validate_body(body)?;
+        if let Some(control) = req.control {
+            return send_control(ctx, &me, to, body, control);
+        }
 
         if let Some(group) = to.strip_prefix('@') {
             let gid = require_group(ctx.conn, group)?;

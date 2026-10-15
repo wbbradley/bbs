@@ -23,6 +23,8 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FEED_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const GROUP_DESCRIPTION: &str = "group-description.v1";
+const AGENT_CONTROL: &str = "agent-control.v1";
+const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
 const FEED_DECODE_LIMIT: usize = 80 * 1024 * 1024;
@@ -311,7 +313,21 @@ impl Backend {
     pub async fn send(&mut self, req: proto::SendRequest) -> Result<proto::SendResponse> {
         match self {
             Backend::Local(l) => service::send(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) if req.control.is_some() => {
+                rpc!(r, send, req, &[AGENT_CONTROL]).map_err(|e| missing_rpc(e, AGENT_CONTROL))
+            }
             Backend::Remote(r) => rpc!(r, send, req),
+        }
+    }
+
+    pub async fn rotate_agent_token(
+        &mut self,
+        req: proto::RetireRequest,
+    ) -> Result<proto::RegisterResponse> {
+        match self {
+            Backend::Local(l) => service::rotate_agent_token(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => rpc!(r, rotate_agent_token, req, &[AGENT_TOKEN_ROTATE])
+                .map_err(|e| missing_rpc(e, AGENT_TOKEN_ROTATE)),
         }
     }
 
