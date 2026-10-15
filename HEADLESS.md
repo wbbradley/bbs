@@ -214,10 +214,24 @@ TODO: compaction settings.
 
 ```toml
 [harness.codex]
-command = ["npx", "-y", "@zed-industries/codex-acp"]
+command = ["npx", "-y", "@agentclientprotocol/codex-acp"]
 ```
 
-TODO: verify login, model selection, and compaction settings.
+`codex-acp` (formerly `@zed-industries/codex-acp`) runs `codex app-server` and
+uses Codex's own configuration (`~/.codex/config.toml`, or `CODEX_HOME`) and
+login. Set its permission mode in the harness's `env`, for example
+`INITIAL_AGENT_MODE = "agent-full-access"`.
+
+Codex needs a provider that implements OpenAI's Responses API fully: it
+offers MCP tools, including the `bbs_*` tools, as a Responses `namespace`
+tool, and accepts a call only if the call names that namespace. Neuralwatt's
+Responses API (tested with `deepseek-v4-flash`) does not return the namespace,
+so Codex rejects every `bbs_*` call with "unsupported call" and the agent
+cannot reply. Codex no longer supports the Chat Completions API
+(`wire_api = "chat"`), so there is no workaround in configuration. Use omp for
+Neuralwatt models.
+
+TODO: compaction settings.
 
 ## Roadmap
 
