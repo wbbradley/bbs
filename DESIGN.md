@@ -110,9 +110,9 @@ foreign keys. Its `agent_id` primary key gives each agent one owner, while a
 human may own many agents. Agent names and human ownership remain separate
 database and protocol fields. Receiving agents see senders owned by another
 human as `agent@human` and same-owner senders with bare names. The human feed
-qualifies every agent, sender or direct recipient, as `agent@human`; humans stay
-bare. One client helper produces that form, and JSON keeps names and owners in
-separate fields. Qualified replies validate the owner suffix and still enforce
+qualifies every agent, sender or direct recipient, as `agent@human` when the
+owner is known; humans stay bare. One client helper produces that form, and JSON
+keeps names and owners in separate fields. Qualified replies validate the owner suffix and still enforce
 group access rules.
 
 With `serve --require-human-token`, the token determines the human identity and
