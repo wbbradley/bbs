@@ -272,6 +272,8 @@ struct ViewState {
     /// Rows that messages may be missing before: a full snapshot arrived whose
     /// oldest message was newer than every row held, so a burst outran it.
     gaps: HashSet<i64>,
+    /// The first snapshot has arrived; later ones can reveal gaps.
+    started: bool,
     /// Line layout that keys scroll against.
     frame: Geometry,
 }
@@ -311,6 +313,7 @@ impl ViewState {
             matched: Vec::new(),
             window,
             gaps: HashSet::new(),
+            started: false,
             frame: Geometry::default(),
         };
         view.ingest(rows);
@@ -320,19 +323,28 @@ impl ViewState {
     /// Merge a feed snapshot: refresh rows it still holds (e.g. `read_at`),
     /// append newer ones, and drop the oldest beyond MAX_ROWS.
     fn ingest(&mut self, snapshot: Vec<Message>) {
-        if let (Some(last), Some(first)) = (self.rows.last(), snapshot.first())
+        // A full window entirely newer than what is held may have skipped
+        // messages; exactly --limit new ones look the same, so this can be a
+        // false positive. A one-message window is always full, so it is not
+        // checked.
+        let newest = self.rows.last().map_or(0, |r| r.id);
+        if let Some(first) = snapshot.first()
+            && self.started
+            && self.window > 1
             && snapshot.len() >= self.window
-            && first.id > last.id
+            && first.id > newest
         {
             self.gaps.insert(first.id);
         }
+        self.started = true;
         for m in snapshot {
             match self.rows.binary_search_by_key(&m.id, |r| r.id) {
-                Ok(i) => {
+                Ok(i) if self.rows[i] != m => {
                     self.matched[i] = self.matches(&m);
                     self.rows[i] = m;
                     self.heights[i] = None;
                 }
+                Ok(_) => {}
                 Err(i) if i == self.rows.len() => {
                     self.matched.push(self.matches(&m));
                     self.rows.push(m);
@@ -350,7 +362,7 @@ impl ViewState {
         self.heights.drain(..excess);
         self.matched.drain(..excess);
         if let Some(oldest) = self.rows.first() {
-            self.gaps.retain(|&id| id > oldest.id);
+            self.gaps.retain(|&id| id >= oldest.id);
         }
         self.layout(self.frame.width, self.frame.height);
     }
@@ -617,7 +629,7 @@ fn message_lines<'a>(row: &'a Message, gap: bool, query: Option<&str>) -> Vec<Li
     }
     let marker = gap.then(|| {
         Line::from(
-            "  ⋯ messages may be missing here: more than --limit arrived at once; use --since to see them"
+            "  ⋯ messages may be missing here: more than --limit arrived at once; use --since/--until or a larger --limit"
                 .yellow(),
         )
     });
@@ -653,14 +665,31 @@ fn find_matches(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
             .zip(&query)
             .all(|(&(_, c), &q)| fold(c) == q);
         if hit {
-            let end = chars.get(i + query.len()).map_or(text.len(), |&(b, _)| b);
+            // Keep combining marks with the character they decorate.
+            let mut next = i + query.len();
+            while chars.get(next).is_some_and(|&(_, c)| is_combining(c)) {
+                next += 1;
+            }
+            let end = chars.get(next).map_or(text.len(), |&(b, _)| b);
             found.push(chars[i].0..end);
-            i += query.len();
+            i = next;
         } else {
             i += 1;
         }
     }
     found
+}
+
+/// Common combining diacritical mark blocks.
+fn is_combining(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
 }
 
 /// Split a span so every `query` match is in reverse video.
@@ -1071,6 +1100,53 @@ mod tests {
         assert!(view.heights.iter().all(Option::is_none));
         draw(&mut view, 10);
         assert!(view.heights.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn gap_detection_covers_an_empty_start_and_skips_one_message_windows() {
+        let mut view = ViewState::new(Vec::new(), 3);
+        view.ingest(numbered(10..13));
+        assert_eq!(view.gaps, HashSet::from([11]));
+        let mut view = ViewState::new(numbered(0..1), 1);
+        for i in 1..5 {
+            view.ingest(numbered(i..i + 1));
+        }
+        assert!(view.gaps.is_empty());
+    }
+
+    #[test]
+    fn a_marker_on_the_oldest_kept_row_stays_drawn() {
+        let mut view = ViewState::new(numbered(0..3), 3);
+        view.ingest(numbered(10..13));
+        // Three past the cap: rows 1-3 are dropped.
+        view.ingest(numbered(13..MAX_ROWS as i64 + 10));
+        // Row 11 (the first after the gap) is now the oldest kept row.
+        assert_eq!(view.rows[0].id, 11);
+        assert!(view.gaps.contains(&11));
+        draw(&mut view, 10);
+        view.handle_key(key(KeyCode::Char('g')));
+        let out = draw(&mut view, 10);
+        assert!(out.contains("messages may be missing"), "{out}");
+        assert!(
+            out.contains("message number 10") && out.contains("message number 11"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn unchanged_rows_keep_their_cached_layout() {
+        let mut view = ViewState::new(numbered(0..3), 1000);
+        draw(&mut view, 10);
+        view.ingest(numbered(0..3));
+        assert!(view.heights.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn highlight_keeps_combining_marks_with_their_letter() {
+        let spans = highlight(Span::raw("e\u{301}cole"), "e");
+        assert_eq!(spans[0].content, "e\u{301}");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "e\u{301}cole");
     }
 
     #[test]
