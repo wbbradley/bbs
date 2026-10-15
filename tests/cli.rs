@@ -2411,22 +2411,29 @@ impl RunGuard {
         RunGuard(Some(child))
     }
 
-    /// SIGTERM the process and return its output.
-    fn stop(mut self) -> std::process::Output {
+    /// Send `signal` to the process and return its output.
+    fn stop_with(mut self, signal: &str) -> std::process::Output {
         let child = self.0.take().unwrap();
         let killed = Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
+            .args([signal, &child.id().to_string()])
             .status()
             .unwrap();
         assert!(killed.success());
         child.wait_with_output().unwrap()
     }
+
+    fn stop(self) -> std::process::Output {
+        self.stop_with("-TERM")
+    }
 }
 
 impl Drop for RunGuard {
+    /// SIGTERM, so `run` also stops the harness's process group.
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
             let _ = child.wait();
         }
     }
@@ -2567,6 +2574,41 @@ fn control_messages_are_for_owned_agents_only(mode: Mode) {
     );
 }
 
+fn headless_signals_during_setup_stop_the_harness(mode: Mode) {
+    let bbs = Bbs::with_mode("setup-signal", mode);
+    // A harness that never answers `initialize`, with a command of its own.
+    headless_config(
+        &bbs,
+        &[
+            "sh",
+            "-c",
+            "sleep 300 & echo $! > fake-child.pid; exec sleep 300",
+        ],
+    );
+    let run = RunGuard::start(&bbs, "Zed");
+    let pid_file = bbs.home.join("fake-child.pid");
+    let child = eventually("the harness's child", || {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+    });
+    assert!(running(child.trim()));
+    // A closed terminal (SIGHUP) stops run like SIGTERM.
+    let out = run.stop_with("-HUP");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("stopped during harness setup"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eventually("the harness's child to exit", || {
+        (!running(child.trim())).then_some(())
+    });
+    let log =
+        std::fs::read_to_string(bbs.home.join(".local/state/bbs/headless/zed/log.jsonl")).unwrap();
+    assert!(log.contains("\"event\":\"stop\""), "{log}");
+}
+
 fn headless_run_takes_over_an_owned_agent(mode: Mode) {
     let bbs = Bbs::with_mode("takeover", mode);
     // A harness that exits at once: `run` fails after settling the token.
@@ -2664,4 +2706,5 @@ both_modes!(
     headless_replies_through_tools_and_cancels,
     control_messages_are_for_owned_agents_only,
     headless_run_takes_over_an_owned_agent,
+    headless_signals_during_setup_stop_the_harness,
 );

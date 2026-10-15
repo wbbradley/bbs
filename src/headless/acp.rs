@@ -38,10 +38,24 @@ pub struct Process {
 }
 
 impl Process {
-    /// SIGTERM the group, wait for the harness, then SIGKILL whatever remains.
+    /// Wait for the harness itself to exit.
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+
+    /// SIGTERM the group, give it `STOP_GRACE` to exit, then SIGKILL whatever
+    /// remains.
     pub async fn stop(&mut self) {
         signal_group(self.pgid, libc::SIGTERM);
-        let _ = timeout(STOP_GRACE, self.child.wait()).await;
+        let deadline = tokio::time::Instant::now() + STOP_GRACE;
+        while tokio::time::Instant::now() < deadline {
+            // Reap the harness, so it does not keep the group alive as a zombie.
+            let _ = self.child.try_wait();
+            if !group_alive(self.pgid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         signal_group(self.pgid, libc::SIGKILL);
         let _ = self.child.wait().await;
     }
@@ -59,6 +73,12 @@ fn signal_group(pgid: libc::pid_t, signal: libc::c_int) {
     unsafe {
         libc::kill(-pgid, signal);
     }
+}
+
+/// Whether any process remains in the group.
+fn group_alive(pgid: libc::pid_t) -> bool {
+    // SAFETY: as above; signal 0 only checks that the group exists.
+    unsafe { libc::kill(-pgid, 0) == 0 }
 }
 
 /// What the harness reported during a session.
@@ -135,13 +155,14 @@ impl Acp {
         mcp: &McpServer,
         resume: Option<&str>,
     ) -> Result<(Acp, Process, mpsc::UnboundedReceiver<Event>, Vec<String>)> {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let stderr = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .open(stderr)
             .with_context(|| format!("opening {}", stderr.display()))?;
+        stderr.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         // Its own process group: a terminal's Ctrl-C reaches bbs only, and stop
         // can signal the agent's commands along with the harness.
         let mut child = Command::new(&config.command[0])

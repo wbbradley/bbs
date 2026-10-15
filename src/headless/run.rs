@@ -90,14 +90,27 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         .session_id
         .clone()
         .filter(|_| state.harness.as_deref() == Some(harness.as_str()));
-    let (acp, mut process, mut events, warnings) = Acp::start(
-        &harness_config,
-        &cwd,
-        &agent_dir.stderr_path(),
-        &mcp,
-        resume.as_deref(),
-    )
-    .await?;
+    // Listen before starting the harness: a signal during setup drops the
+    // start, which kills the harness's process group.
+    let mut signals = Signals::new()?;
+    let stderr = agent_dir.stderr_path();
+    let started = tokio::select! {
+        started = Acp::start(
+            &harness_config,
+            &cwd,
+            &stderr,
+            &mcp,
+            resume.as_deref(),
+        ) => started,
+        _ = signals.recv() => Err(anyhow::anyhow!("stopped during harness setup")),
+    };
+    let (acp, mut process, mut events, warnings) = match started {
+        Ok(started) => started,
+        Err(err) => {
+            log.event("stop", json!({ "error": format!("{err:#}") }));
+            return Err(err);
+        }
+    };
     state.harness = Some(harness.clone());
     state.session_id = Some(acp.session_id().to_string());
     agent_dir.save(&state)?;
@@ -134,8 +147,6 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     let mut queue: Vec<proto::Message> = Vec::new();
     let mut turn: Option<JoinHandle<Result<String>>> = None;
     let mut last_start: Option<Instant> = None;
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
     let result = loop {
         let ready_at = last_start
             .map(|t| t + interval)
@@ -200,11 +211,18 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 Some(event) => record(&mut log, event),
             },
             _ = tokio::time::sleep_until(ready_at), if throttled => {}
-            _ = sigint.recv() => break Ok(()),
-            _ = sigterm.recv() => break Ok(()),
+            status = process.wait() => break Err(match status {
+                Ok(status) => anyhow::anyhow!("the harness exited ({status})"),
+                Err(err) => anyhow::anyhow!("waiting for the harness: {err}"),
+            }),
+            _ = signals.recv() => break Ok(()),
         }
     };
     mail_task.abort();
+    // Mail the wait already took but the loop had not yet received.
+    while let Ok(Ok(batch)) = mail_rx.try_recv() {
+        queue.extend(batch.into_iter().filter(|m| m.control.is_none()));
+    }
     if turn.is_some() {
         let _ = acp.cancel().await;
     }
@@ -307,6 +325,28 @@ async fn agent_token(
             Ok((r.name, r.token))
         }
         Err(err) => Err(err),
+    }
+}
+
+/// The signals that stop `run`: SIGINT, SIGTERM, and SIGHUP (a closed terminal).
+struct Signals([tokio::signal::unix::Signal; 3]);
+
+impl Signals {
+    fn new() -> Result<Signals> {
+        Ok(Signals([
+            signal(SignalKind::interrupt())?,
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::hangup())?,
+        ]))
+    }
+
+    async fn recv(&mut self) {
+        let [int, term, hup] = &mut self.0;
+        tokio::select! {
+            _ = int.recv() => {}
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        }
     }
 }
 

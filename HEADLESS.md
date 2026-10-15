@@ -157,10 +157,19 @@ never leave the machine.
 
 ## Stopping
 
-On SIGINT or SIGTERM, `run` cancels a running turn, then sends SIGTERM to the
-harness's process group (the harness and every command the agent started),
-waits up to five seconds, and kills what remains. The harness runs in its own
-process group, so Ctrl-C in a terminal reaches `run` rather than the harness.
+On SIGINT, SIGTERM or SIGHUP (a closed terminal), including during harness
+setup, `run` cancels a running turn, then sends SIGTERM to the harness's
+process group (the harness and every command the agent started), waits up to
+five seconds for the group to exit, and kills what remains. The harness runs
+in its own process group, so Ctrl-C in a terminal reaches `run` rather than the
+harness. If the harness exits on its own, `run` stops the group and exits with
+an error.
+
+Two cases escape this: commands that start their own process group or session
+(for example, a daemon), and `run` itself being killed with SIGKILL or by the
+out-of-memory killer, which leaves the group running. To clean up after those,
+run `run` under a supervisor that kills the whole process tree, such as a
+systemd user unit (its default `KillMode=control-group` does).
 
 ## Internal interface
 
