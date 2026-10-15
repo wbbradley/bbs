@@ -80,6 +80,8 @@ pub struct MessageView {
     pub to_group: Option<String>,
     /// Feed only: recipient of a direct message.
     pub to_name: Option<String>,
+    /// Feed only: the direct recipient agent's human.
+    pub to_owner: Option<String>,
     /// Feed only: when a direct message was read; always `None` for broadcasts.
     pub read_at: Option<String>,
     pub body: String,
@@ -700,6 +702,7 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         reader_owner: r.get(7)?,
         to_group: r.get(4)?,
         to_name: None,
+        to_owner: None,
         read_at: None,
         body: r.get(5)?,
     })
@@ -1119,7 +1122,7 @@ pub fn feed_messages(
     }
     let sql = format!(
         "SELECT m.id, m.created_at, m.from_kind, COALESCE(fa.name, fh.name), g.name,
-                COALESCE(ta.name, th.name), d.archived_at, m.body, owner.name
+                COALESCE(ta.name, th.name), d.archived_at, m.body, owner.name, to_owner.name
          FROM messages m
          LEFT JOIN agents fa ON m.from_kind = 'agent' AND fa.id = m.from_id
          LEFT JOIN humans fh ON m.from_kind = 'human' AND fh.id = m.from_id
@@ -1129,6 +1132,8 @@ pub fn feed_messages(
          LEFT JOIN deliveries d ON m.to_group_id IS NULL AND d.message_id = m.id
          LEFT JOIN agents ta ON d.recipient_kind = 'agent' AND ta.id = d.recipient_id
          LEFT JOIN humans th ON d.recipient_kind = 'human' AND th.id = d.recipient_id
+         LEFT JOIN agent_owners recipient ON recipient.agent_id = ta.id
+         LEFT JOIN humans to_owner ON to_owner.id = recipient.human_id
          WHERE m.id IN ({})
          ORDER BY m.id",
         vec!["?"; ids.len()].join(", ")
@@ -1150,6 +1155,7 @@ pub fn feed_messages(
                 reader_owner: None,
                 to_group: r.get(4)?,
                 to_name: r.get(5)?,
+                to_owner: r.get(9)?,
                 read_at: r.get(6)?,
                 body: r.get(7)?,
             })

@@ -145,6 +145,7 @@ message Message {
   string body = 8;
   optional string from_owner = 9;    // sending agent's human; absent for humans or unknown owners
   optional string reader_owner = 10; // inbox reader's human; absent for human readers and the feed
+  optional string to_owner = 11;     // feed only: direct recipient agent's human; absent otherwise
 }
 
 message WaitRequest { optional uint32 limit = 1; }

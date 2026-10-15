@@ -2024,7 +2024,7 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
         acme,
         &serde_json::json!({
             "id": acme["id"], "created_at": acme["created_at"], "from": a,
-            "from_kind": "agent", "from_owner": "will", "to": null,
+            "from_kind": "agent", "from_owner": "will", "to": null, "to_owner": null,
             "group": "acme", "body": "acme from A", "read_at": null,
         })
     );
@@ -2039,6 +2039,23 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
             &serde_json::Value::Null,
             &serde_json::json!("will"),
             &serde_json::Value::Null
+        )
+    );
+    assert_eq!(dm["to_owner"], serde_json::Value::Null);
+    // Names and owners stay separate fields in JSON.
+    let agent_dm = &all[bodies(&all).iter().position(|b| *b == "dm C to A").unwrap()];
+    assert_eq!(
+        (
+            &agent_dm["from"],
+            &agent_dm["from_owner"],
+            &agent_dm["to"],
+            &agent_dm["to_owner"]
+        ),
+        (
+            &serde_json::json!(c),
+            &serde_json::json!("ada"),
+            &serde_json::json!(a),
+            &serde_json::json!("will")
         )
     );
 
@@ -2121,6 +2138,16 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
         text.contains(&format!("from {d}@ada to @gamma:\ngamma after B")),
         "{text}"
     );
+    // The feed qualifies every agent, including direct recipients.
+    assert!(
+        text.contains(&format!("from ada (human) to {d}@ada (unread):\nada to D")),
+        "{text}"
+    );
+    let text = bbs.ok(&["view", "--no-follow", "--from", c.as_str()]);
+    assert!(
+        text.contains(&format!("from {c}@ada to {a}@will (unread):\ndm C to A")),
+        "{text}"
+    );
     bbs.ok(&["read"]);
     let text = bbs.ok(&["view", "--no-follow", "--from", "ada", "--limit", "1"]);
     assert!(text.contains("to will (read 20"), "{text}");
@@ -2142,6 +2169,18 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
         bbs.err(&["view", "--json", "--limit", "0"])
             .contains("1..=1000")
     );
+
+    // Inbox reads keep their own rule and carry no recipient owner.
+    let inbox: serde_json::Value = serde_json::from_str(
+        bbs.ok(&["--token", &ta, "read", "--json"])
+            .lines()
+            .find(|l| l.contains("dm C to A"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(inbox.get("to_owner").is_none(), "{inbox}");
+    let text = bbs.ok(&["--token", &ta, "read", "--archived"]);
+    assert!(text.contains(&format!("from {c}@ada to {a}:")), "{text}");
 }
 
 fn view_since_and_until_bound_history(mode: Mode) {
