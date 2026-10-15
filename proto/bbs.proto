@@ -44,6 +44,7 @@ service Bbs {
   rpc WaitForMail(WaitRequest) returns (stream Message);
   rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
   // Humans only. Emits the recent window at start and after every change.
+  // Filters other than backlog require the feed-filter.v1 capability.
   rpc WatchFeed(FeedRequest) returns (stream FeedSnapshot);
 
   // Harness session binding (hooks). The agent token is in the request.
@@ -162,7 +163,23 @@ message Agent {
   optional string owner = 8;  // owning human's name; absent when unknown
 }
 
-message FeedRequest { uint32 backlog = 1; }
+// The window is the most recent `backlog` (1 to 1000) messages that match every
+// filter set. A server without feed-filter.v1 ignores fields 2-8, so clients
+// setting any of them must require that capability.
+message FeedRequest {
+  uint32 backlog = 1;
+  optional string group = 2;       // broadcasts to this group name, '@' optional; archived groups included
+  optional string from = 3;        // sent by this agent or human name (case-insensitive; retired agents included)
+  optional string from_human = 4;  // sent by this human or by any agent the human owns
+  optional string since = 5;       // RFC3339 UTC; created_at >= since
+  optional string until = 6;       // RFC3339 UTC; created_at < until
+  bool mine = 7;                   // the calling human's scope; see `bbs view --mine`
+  // Cursor mode: each snapshot is the next batch of at most `backlog` matching
+  // messages with a greater id, oldest first. The server advances past each
+  // batch, fetches again at once after a full one, and otherwise sends a batch
+  // only when a change brings new matching messages (the first is always sent).
+  optional int64 after_id = 8;
+}
 message FeedSnapshot { repeated Message messages = 1; }
 
 message BindSessionRequest { string harness = 1; string session_id = 2; string token = 3; }

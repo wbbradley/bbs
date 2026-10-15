@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -85,8 +85,8 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Watch every message on the board as it flows (humans only; read-only).
-    View,
+    /// Watch messages on the board as they flow (humans only; read-only).
+    View(ViewArgs),
     /// Handle a harness hook event (JSON on stdin). Never fails the harness.
     Hook {
         #[arg(value_enum)]
@@ -147,6 +147,39 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// `bbs view` filters and output modes. Without flags: a full-screen feed of the
+/// most recent 200 messages that follows new ones.
+#[derive(Args, Debug, Default)]
+pub struct ViewArgs {
+    /// Only broadcasts to this group ('@' optional), including archived ones.
+    #[arg(long)]
+    pub group: Option<String>,
+    /// Only messages sent by this agent or human; @<human> also matches every
+    /// agent that human owns.
+    #[arg(long, value_name = "NAME")]
+    pub from: Option<String>,
+    /// Only what your agents can see: messages sent by you or your agents,
+    /// direct messages to you or them, and group messages delivered to them.
+    #[arg(long)]
+    pub mine: bool,
+    /// Only messages sent at or after this time (RFC3339, or a duration like 2h, 7d).
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Only messages sent before this time (RFC3339, or a duration like 2h, 7d).
+    /// Implies --no-follow: new messages always fall after it.
+    #[arg(long)]
+    pub until: Option<String>,
+    /// Size of the history window: the most recent N matching messages (default 200).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=crate::service::MAX_FEED_WINDOW as i64))]
+    pub limit: Option<u32>,
+    /// Print the matching history and exit instead of following new messages.
+    #[arg(long)]
+    pub no_follow: bool,
+    /// Print one JSON object per message (JSONL); follows new messages unless --no-follow.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Subcommand, Debug)]

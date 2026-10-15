@@ -24,7 +24,7 @@ pub(crate) fn state_dir() -> Result<PathBuf> {
 }
 
 /// Stored timestamps are fixed-width; show them to second precision.
-fn display_time(stored: &str) -> String {
+pub(crate) fn display_time(stored: &str) -> String {
     format!("{}Z", &stored[..19.min(stored.len())])
 }
 
@@ -94,7 +94,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     };
     let mut backend = Backend::open(&config, &dir, caller).await?;
     match cli.command {
-        Command::View => crate::view::run(&mut backend).await,
+        Command::View(args) => crate::view::run(&mut backend, args).await,
         Command::Read {
             limit,
             wait: true,
@@ -122,7 +122,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
         | Command::Admin { .. }
         | Command::Backup { .. }
         | Command::Version { .. }
-        | Command::View => {
+        | Command::View(_) => {
             unreachable!()
         }
         Command::Human {
@@ -221,7 +221,9 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
             let req = proto::ReadRequest {
                 limit,
                 archived,
-                since: since.map(|s| parse_since(&s, Utc::now())).transpose()?,
+                since: since
+                    .map(|s| parse_time("--since", &s, Utc::now()))
+                    .transpose()?,
                 from_kind: None,
             };
             format_messages(&backend.read(req).await?.messages, json)?
@@ -413,14 +415,14 @@ fn read_body(body: Option<String>) -> Result<String> {
     }
 }
 
-/// Resolve `--since` (RFC3339 or a duration like 2h) to RFC3339.
-fn parse_since(s: &str, now: DateTime<Utc>) -> Result<String> {
+/// Resolve a time flag (RFC3339, or a duration like 2h meaning that long ago)
+/// to RFC3339.
+pub(crate) fn parse_time(flag: &str, s: &str, now: DateTime<Utc>) -> Result<String> {
     if let Ok(t) = DateTime::parse_from_rfc3339(s) {
         return Ok(fmt_time(t.with_timezone(&Utc)));
     }
-    let d = humantime::parse_duration(s).with_context(|| {
-        format!("invalid --since {s:?}: expected RFC3339 or a duration like 2h")
-    })?;
+    let d = humantime::parse_duration(s)
+        .with_context(|| format!("invalid {flag} {s:?}: expected RFC3339 or a duration like 2h"))?;
     Ok(fmt_time(now - chrono::Duration::from_std(d)?))
 }
 

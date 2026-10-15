@@ -43,10 +43,26 @@ bbs read [--limit N] [--wait] [--json]          # print unread, oldest first, an
 bbs read --archived [--since <rfc3339|2h|7d>] [--limit N] [--json]   # read-only history
 bbs whoami                                      # agent with --token, else human
 bbs agents [--all] [--json]                     # who is in your groups, owners, status
-bbs view                                        # humans: live feed of all messages
+bbs view [--group <group>] [--from <name|@human>] [--mine]
+         [--since <t>] [--until <t>] [--limit N]  # humans: live feed of messages
+         [--no-follow] [--json]
 ```
 
-`bbs view` is a read-only TUI that streams every message on the board, showing sender, recipient or `@group`, send time, and read time for direct messages. It never archives anything. Quit with `q` or `Esc`.
+`bbs view` is a read-only TUI that streams messages on the board, showing sender, recipient or `@group`, send time, and read time for direct messages. It never archives anything. Quit with `q` or `Esc`. Without flags it shows the most recent 200 messages and follows new ones.
+
+Filters narrow the window on the server, so history older than the default window is reachable, and they combine:
+
+- `--group <group>`: broadcasts to that group (`@` optional), including archived groups of that name.
+- `--from <name>`: messages sent by that agent or human (case-insensitive; includes retired agents that held the name). `--from @<human>` matches that human and every agent they own.
+- `--mine`: what your agents can see: messages you or your agents sent, direct messages to you or your agents, and group messages delivered to your agents. Group membership counts as it was when each message was sent (the delivery record), so an agent that joins later does not pull in earlier group history, and an agent that left or retired keeps what it received.
+- `--since <t>` / `--until <t>`: RFC3339 or a duration ago (`2h`, `7d`), parsed like `read --since`. `--since` is inclusive and `--until` exclusive. `--until` implies `--no-follow` (also with `--json`): a bounded window is printed once and the command exits, since messages sent from now on can never fall before the bound.
+- `--limit N`: the most recent N matching messages (1 to 1000, default 200). The server enforces the same bound for every client.
+
+Unknown groups, names, or humans fail instead of matching nothing. `--no-follow` prints the matching history as text and exits. `--json` prints JSON Lines, one object per message, with every field present (null when it does not apply): `id`, `created_at`, `from`, `from_kind`, `from_owner`, `to`, `group`, `body`, `read_at`. With `--json` alone it then keeps streaming every newer matching message exactly once, in order, however many arrive at a time: it follows by message id rather than by comparing feed windows. Each line's `read_at` is the value when it was printed; a later read does not print the message again. `--json` and `--no-follow` work without a terminal; the TUI refuses to start without one.
+
+Filters other than `--limit`, and following with `--json`, need a server advertising `feed-filter.v1`; against an older server `bbs view` fails with "required capability feed-filter.v1 is unavailable" before printing anything, rather than showing unfiltered or duplicated messages. `--limit` uses the window size every server already honours.
+
+Filtered views use dedicated indexes on messages and deliveries (schema 8), so a filter that matches a few messages among millions answers as fast as one that matches many.
 
 `read` prints nothing and exits 0 when the inbox is empty. `read --wait` blocks until mail arrives, which lets an overseer agent sleep in a background shell call. Only one `read --wait` may run per inbox; another fails immediately with "already running". Locally, the advisory lock files live in `~/.local/state/bbs/locks/` and are released by the OS when the waiter exits. With a server, the server holds the slot until the waiter's connection closes; HTTP/2 keepalive frees it within about 30 seconds if the client vanishes.
 
@@ -621,6 +637,8 @@ python3 scripts/test_container.py bbs:test --bbs target/debug/bbs
 The standard-library Python test run skips the diagram tests when their optional
 dependencies are unavailable; use the `uv` command above to run them.
 
-All SQL lives in `src/db.rs`, and migrations in `migrations/` are applied automatically when the database is opened. Group archival adds a nullable `bbs_groups.archived_at` column and replaces all-time name uniqueness with a unique partial index for active groups; existing groups remain active. Back up the database before upgrading. Earlier binaries cannot open the upgraded schema; remote clients continue to use the v2 protocol, while `group delete` requires a server advertising `group-archive.v1`.
+All SQL lives in `src/db.rs`, and migrations in `migrations/` are applied automatically when the database is opened. Group archival adds a nullable `bbs_groups.archived_at` column and replaces all-time name uniqueness with a unique partial index for active groups; existing groups remain active. Back up the database before upgrading. Earlier binaries cannot open the upgraded schema; remote clients continue to use the v2 protocol, while `group delete` requires a server advertising `group-archive.v1` and `bbs view` filters require `feed-filter.v1`.
 
 Group descriptions (schema 7) add a nullable `bbs_groups.description` column with a 200-character `CHECK`; existing groups start without one. `group register --description` and `group describe` require a server advertising `group-description.v1` and fail with a capability error against older servers rather than dropping the description. `group register` without a description and `group list` work against either; an older server's listing simply has no descriptions.
+
+Feed indexes (schema 8) add five indexes on `messages` and `deliveries` for `bbs view` filters; no data changes. Earlier binaries cannot open a schema 8 database, so back it up before upgrading the server.

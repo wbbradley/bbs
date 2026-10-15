@@ -21,6 +21,15 @@ request that bumps the package version; correct the date if publishing slips.
   server advertising `group-description.v1`; older servers refuse rather than
   drop the description. Schema 7: earlier binaries cannot open an upgraded
   database, so back it up before upgrading the server (#32).
+- `bbs view` filters, evaluated on the server: `--group`, `--from <name|@human>`,
+  `--mine` (what your agents can see), `--since`, `--until`, and `--limit`.
+  `--no-follow` prints the history as text and exits; `--json` prints JSON Lines
+  and then follows by message id, printing each new message exactly once even in
+  bursts larger than the window. Filters and `--json` following need a server
+  advertising the new `feed-filter.v1` capability and fail against older
+  servers. Schema 8 adds indexes for these filters; earlier binaries cannot open
+  a schema 8 database, so back it up before upgrading the server. `--until`
+  implies `--no-follow` (#31).
 
 ### Changed
 

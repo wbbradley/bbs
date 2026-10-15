@@ -189,9 +189,15 @@ async fn incompatible_requests_do_not_touch_state_or_claim_stream_slots() {
             .contains("unknown.v1")
     );
     assert!(
-        raw.watch_feed(as_human("will", proto::FeedRequest { backlog: 10 }))
-            .await
-            .is_err()
+        raw.watch_feed(as_human(
+            "will",
+            proto::FeedRequest {
+                backlog: 10,
+                ..Default::default()
+            }
+        ))
+        .await
+        .is_err()
     );
     assert!(
         raw.wait_for_mail(as_agent(&agent.token, proto::WaitRequest { limit: None }))
@@ -544,13 +550,25 @@ async fn watch_feed_snapshots_on_change_for_humans_only() {
     let a = register(&mut client).await;
 
     let err = client
-        .watch_feed(as_agent(&a.token, proto::FeedRequest { backlog: 10 }))
+        .watch_feed(as_agent(
+            &a.token,
+            proto::FeedRequest {
+                backlog: 10,
+                ..Default::default()
+            },
+        ))
         .await
         .unwrap_err();
     assert!(err.message().contains("humans only"), "{err}");
 
     let mut feed = client
-        .watch_feed(as_human("will", proto::FeedRequest { backlog: 10 }))
+        .watch_feed(as_human(
+            "will",
+            proto::FeedRequest {
+                backlog: 10,
+                ..Default::default()
+            },
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -575,6 +593,238 @@ async fn watch_feed_snapshots_on_change_for_humans_only() {
     assert_eq!(next.messages.len(), 1);
     assert_eq!(next.messages[0].to_name.as_deref(), Some(a.name.as_str()));
     assert_eq!(next.messages[0].read_at, None);
+}
+
+#[tokio::test]
+async fn feed_filters_are_advertised_and_applied_server_side() {
+    let server = Server::start("feed-filter");
+    let mut client = server.client().await;
+    let info = client
+        .server_info(proto::Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(info.capabilities.iter().any(|c| c == "feed-filter.v1"));
+    client
+        .ensure_human(proto::EnsureHumanRequest {
+            name: "will".into(),
+        })
+        .await
+        .unwrap();
+    let a = register(&mut client).await;
+    for body in ["one", "two", "three"] {
+        client
+            .send(as_human(
+                "will",
+                proto::SendRequest {
+                    to: a.name.clone(),
+                    body: body.into(),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    let mut req = contract(proto::FeedRequest {
+        backlog: 2,
+        from_human: Some("will".into()),
+        mine: true,
+        ..Default::default()
+    });
+    req.metadata_mut()
+        .insert("bbs-human", "will".parse().unwrap());
+    req.metadata_mut().insert(
+        "bbs-required-capabilities",
+        "owner-attribution.v1,feed-filter.v1".parse().unwrap(),
+    );
+    let mut raw = server.raw_client().await;
+    let first = raw
+        .watch_feed(req)
+        .await
+        .unwrap()
+        .into_inner()
+        .message()
+        .await
+        .unwrap()
+        .unwrap();
+    let bodies: Vec<_> = first.messages.iter().map(|m| m.body.as_str()).collect();
+    assert_eq!(bodies, ["two", "three"]);
+
+    // The window is bounded on the server, whatever a client asks for.
+    for backlog in [0, 1001, u32::MAX] {
+        let err = client
+            .watch_feed(as_human(
+                "will",
+                proto::FeedRequest {
+                    backlog,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message().contains(&format!(
+                "feed window must be 1 to 1000 messages, not {backlog}"
+            )),
+            "{err}"
+        );
+    }
+
+    // Cursor mode: oldest first after the cursor, in batches, then live.
+    let mut tail = client
+        .watch_feed(as_human(
+            "will",
+            proto::FeedRequest {
+                backlog: 2,
+                after_id: Some(first.messages[0].id - 2),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bodies = Vec::new();
+    while bodies.len() < 3 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), tail.message())
+            .await
+            .expect("cursor batch")
+            .unwrap()
+            .unwrap();
+        assert!(!batch.messages.is_empty() && batch.messages.len() <= 2);
+        bodies.extend(batch.messages.into_iter().map(|m| m.body));
+    }
+    assert_eq!(bodies, ["one", "two", "three"]);
+    client
+        .send(as_human(
+            "will",
+            proto::SendRequest {
+                to: a.name.clone(),
+                body: "four".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    let batch = tokio::time::timeout(Duration::from_secs(5), tail.message())
+        .await
+        .expect("live batch")
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.messages.len(), 1);
+    assert_eq!(batch.messages[0].body, "four");
+}
+
+/// A server from before `feed-filter.v1`: it enforces required capabilities
+/// against its own list, as every bbs.v2 server must, and records what it saw.
+#[derive(Clone, Default)]
+struct LegacyServer(std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>);
+
+impl tonic::server::NamedService for LegacyServer {
+    const NAME: &'static str = "bbs.v2.Bbs";
+}
+
+impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for LegacyServer {
+    type Response = tonic::codegen::http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+        const LEGACY: &[&str] = &[
+            "named-agents.v1",
+            "owner-attribution.v1",
+            "human-token-sessions.v1",
+            "group-archive.v1",
+            "group-description.v1",
+        ];
+        let required = req
+            .headers()
+            .get("bbs-required-capabilities")
+            .map(|v| v.to_str().unwrap().to_string());
+        self.0.lock().unwrap().push(required.clone());
+        let missing = required
+            .iter()
+            .flat_map(|r| r.split(','))
+            .find(|c| !LEGACY.contains(c))
+            .map(str::to_string);
+        Box::pin(async move {
+            Ok(match missing {
+                Some(c) => tonic::Status::failed_precondition(format!(
+                    "incompatible BBS server: required capability {c} is unavailable; upgrade the server or use a compatible client"
+                )),
+                None => tonic::Status::unavailable("legacy server accepted the request"),
+            }
+            .into_http())
+        })
+    }
+}
+
+#[tokio::test]
+async fn filtered_view_refuses_a_server_without_feed_filter() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let legacy = LegacyServer::default();
+    let seen = legacy.0.clone();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(legacy)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let home = std::env::temp_dir().join(format!("bbs-serve-{}-legacy", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let view = |args: &'static [&'static str]| {
+        let (home, addr) = (home.clone(), addr.clone());
+        tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_bbs"))
+                .arg("view")
+                .args(args)
+                .env("HOME", &home)
+                .env("USER", "will")
+                .env("BBS_SERVER", &addr)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        })
+    };
+    for args in [
+        // Following JSON reads by cursor, which an older server would ignore.
+        &["--json"][..],
+        &["--json", "--group", "acme"],
+        &["--no-follow", "--from", "@will"],
+        &["--json", "--mine"],
+        &["--json", "--since", "2h"],
+        &["--no-follow", "--until", "2026-01-01T00:00:00Z"],
+    ] {
+        let out = view(args).await.unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        assert!(out.stdout.is_empty(), "no unfiltered fallback for {args:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("required capability feed-filter.v1 is unavailable"),
+            "{args:?}: {stderr}"
+        );
+    }
+    // --limit maps onto the backlog every server honours, so it needs nothing new.
+    let out = view(&["--json", "--no-follow", "--limit", "5"])
+        .await
+        .unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("legacy server accepted"), "{stderr}");
+    server.abort();
+    let _ = std::fs::remove_dir_all(&home);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 7, "one request per run, no retry or fallback");
+    assert!(
+        seen[..6]
+            .iter()
+            .all(|r| r.as_deref() == Some("owner-attribution.v1,feed-filter.v1"))
+    );
+    assert_eq!(seen[6].as_deref(), Some("owner-attribution.v1"));
 }
 
 #[tokio::test]
@@ -651,7 +901,13 @@ async fn termination_closes_mail_and_feed_streams() {
             .unwrap()
             .into_inner();
         let mut feed = client
-            .watch_feed(as_human("will", proto::FeedRequest { backlog: 10 }))
+            .watch_feed(as_human(
+                "will",
+                proto::FeedRequest {
+                    backlog: 10,
+                    ..Default::default()
+                },
+            ))
             .await
             .unwrap()
             .into_inner();
@@ -908,7 +1164,13 @@ async fn live_rotation_and_revocation_end_idle_streams() {
     let old = server.admin("add", "Ada");
     let agent = protected_register(&mut client, &old, "Alpha").await;
     let mut old_feed = client
-        .watch_feed(credential(&old, proto::FeedRequest { backlog: 10 }))
+        .watch_feed(credential(
+            &old,
+            proto::FeedRequest {
+                backlog: 10,
+                ..Default::default()
+            },
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -945,7 +1207,13 @@ async fn live_rotation_and_revocation_end_idle_streams() {
         .unwrap()
         .into_inner();
     let mut feed = client
-        .watch_feed(credential(&new, proto::FeedRequest { backlog: 10 }))
+        .watch_feed(credential(
+            &new,
+            proto::FeedRequest {
+                backlog: 10,
+                ..Default::default()
+            },
+        ))
         .await
         .unwrap()
         .into_inner();

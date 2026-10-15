@@ -685,7 +685,8 @@ impl Bbs for Server {
             let mut changes = state.notify.subscribe();
             // The first snapshot also checks the caller is a human, before the stream opens.
             let c = caller.clone();
-            let first = match state.call(move |conn| service::feed(conn, &c, req)).await {
+            let r = req.clone();
+            let first = match state.call(move |conn| service::feed(conn, &c, r)).await {
                 Ok(first) => first,
                 Err(status) => {
                     state.record_auth_failure(peer, &status);
@@ -697,22 +698,37 @@ impl Bbs for Server {
             let (terminal, terminal_rx) = oneshot::channel();
             tokio::spawn(async move {
                 let send_snapshots = async {
+                    let mut req = req;
                     let mut snapshot = Ok(first);
+                    let mut sent = false;
                     loop {
                         if let Err(status) = &snapshot {
                             state.warn_failed("watch_feed", &caller, status).await;
                         }
                         let failed = snapshot.is_err();
-                        if tx.send(snapshot).await.is_err() || failed {
+                        // Cursor mode: move past this batch; a full one means
+                        // more may be waiting, so fetch again without waiting.
+                        let (drain, empty) = match &snapshot {
+                            Ok(s) => (
+                                service::advance_feed_cursor(&mut req, s),
+                                s.messages.is_empty(),
+                            ),
+                            Err(_) => (false, false),
+                        };
+                        let skip = sent && empty && req.after_id.is_some();
+                        if !skip && (tx.send(snapshot).await.is_err() || failed) {
                             return;
                         }
-                        tokio::select! {
-                            _ = changes.changed() => {}
-                            _ = tx.closed() => return,
+                        sent = true;
+                        if !drain {
+                            tokio::select! {
+                                _ = changes.changed() => {}
+                                _ = tx.closed() => return,
+                            }
                         }
                         changes.borrow_and_update();
-                        let c = caller.clone();
-                        snapshot = state.call(move |conn| service::feed(conn, &c, req)).await;
+                        let (c, r) = (caller.clone(), req.clone());
+                        snapshot = state.call(move |conn| service::feed(conn, &c, r)).await;
                     }
                 };
                 tokio::select! {
@@ -820,7 +836,10 @@ mod tests {
                 .watch_feed(Request::from_parts(
                     metadata,
                     extensions,
-                    proto::FeedRequest { backlog: 10 }
+                    proto::FeedRequest {
+                        backlog: 10,
+                        ..Default::default()
+                    }
                 ))
                 .await
                 .is_err()
