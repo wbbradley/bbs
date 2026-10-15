@@ -9,6 +9,12 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-15
+
+Upgrading the server migrates its database to schema 8, which 0.2.0 cannot
+open; back it up first. Clients and servers interoperate across 0.2.0 and 0.3.0
+(protocol epoch 2); new features need both sides at 0.3.0.
+
 ### Added
 
 - `bbs agents` shows an OWNER column naming each agent's human (`-` for human
