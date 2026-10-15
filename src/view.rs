@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
@@ -206,18 +206,21 @@ fn format_feed(rows: &[Message]) -> String {
 async fn feed_loop(
     terminal: &mut DefaultTerminal,
     feed: &mut FeedWatch<'_>,
-    mut rows: Vec<Message>,
+    rows: Vec<Message>,
 ) -> Result<()> {
+    let mut view = ViewState::new(rows);
     let mut dirty = true;
     loop {
         if dirty {
-            terminal.draw(|frame| render(frame, &rows))?;
+            terminal.draw(|frame| view.render(frame))?;
             dirty = false;
         }
-        // Wait for the next snapshot, checking keys at least every KEY_POLL_INTERVAL.
+        // Keep reading the stream whatever the view shows: pausing only freezes
+        // the viewport, so the server never waits on this client. Check keys at
+        // least every KEY_POLL_INTERVAL.
         tokio::select! {
             snapshot = feed.next() => {
-                rows = snapshot?;
+                view.ingest(snapshot?);
                 dirty = true;
             }
             _ = tokio::time::sleep(KEY_POLL_INTERVAL) => {}
@@ -225,11 +228,10 @@ async fn feed_loop(
         while event::poll(Duration::ZERO)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c');
-                    if ctrl_c || matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                    if view.handle_key(key) {
                         return Ok(());
                     }
+                    dirty = true;
                 }
                 Event::Resize(..) => dirty = true,
                 _ => {}
@@ -238,40 +240,337 @@ async fn feed_loop(
     }
 }
 
-fn render(frame: &mut Frame, rows: &[Message]) {
-    let [title_area, feed_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(frame.area());
+/// Loaded history kept while the view is open; the oldest rows are dropped
+/// beyond this, never the stream.
+const MAX_ROWS: usize = 10_000;
 
-    let title = Line::from(vec![
-        " bbs view ".bold().reversed(),
-        format!("  {} messages  ·  q/Esc to quit", rows.len()).dark_gray(),
-    ]);
-    frame.render_widget(title, title_area);
+/// The TUI: every row loaded since start, and where the viewport sits in them.
+struct ViewState {
+    /// Oldest first, by message id. Snapshots append newer messages and
+    /// refresh rows they still contain, so history only grows while open.
+    rows: Vec<Message>,
+    /// Wrapped line count of each row at a width, cached between frames.
+    heights: Vec<Option<(u16, usize)>>,
+    /// `None` follows the tail; otherwise the viewport's top line, anchored to
+    /// a message so appends and dropped rows never move it.
+    paused: Option<Anchor>,
+    /// Messages appended while paused.
+    new_count: usize,
+    /// The search being typed after `/`.
+    prompt: Option<String>,
+    /// The committed search, lowercase.
+    query: Option<String>,
+    /// Line layout that keys scroll against.
+    frame: Geometry,
+}
 
-    if rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No messages yet. Waiting…".dark_gray()),
-            feed_area,
-        );
-        return;
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Anchor {
+    id: i64,
+    line: usize,
+}
+
+/// Line layout of `rows` for the current terminal size; kept in step with
+/// `rows`, so indexes into it are row indexes.
+#[derive(Default)]
+struct Geometry {
+    width: u16,
+    height: usize,
+    /// First line of each row.
+    starts: Vec<usize>,
+    total: usize,
+}
+
+impl Geometry {
+    fn bottom(&self) -> usize {
+        self.total.saturating_sub(self.height)
+    }
+}
+
+impl ViewState {
+    fn new(rows: Vec<Message>) -> ViewState {
+        let mut view = ViewState {
+            rows: Vec::new(),
+            heights: Vec::new(),
+            paused: None,
+            new_count: 0,
+            prompt: None,
+            query: None,
+            frame: Geometry::default(),
+        };
+        view.ingest(rows);
+        view
     }
 
-    let mut text = Text::default();
-    for row in rows {
-        text.lines.push(Line::default());
-        text.lines.push(header(row));
-        for mut line in tui_markdown::from_str(&row.body).lines {
-            line.spans.insert(0, Span::raw("  "));
-            text.lines.push(line);
+    /// Merge a feed snapshot: refresh rows it still holds (e.g. `read_at`),
+    /// append newer ones, and drop the oldest beyond MAX_ROWS.
+    fn ingest(&mut self, snapshot: Vec<Message>) {
+        for m in snapshot {
+            match self.rows.binary_search_by_key(&m.id, |r| r.id) {
+                Ok(i) => {
+                    self.rows[i] = m;
+                    self.heights[i] = None;
+                }
+                Err(i) if i == self.rows.len() => {
+                    self.rows.push(m);
+                    self.heights.push(None);
+                    if self.paused.is_some() {
+                        self.new_count += 1;
+                    }
+                }
+                // Older than everything kept: it was dropped, or never loaded.
+                Err(_) => {}
+            }
+        }
+        let excess = self.rows.len().saturating_sub(MAX_ROWS);
+        self.rows.drain(..excess);
+        self.heights.drain(..excess);
+        self.layout(self.frame.width, self.frame.height);
+    }
+
+    /// Recompute line starts for a feed area, measuring only uncached rows.
+    fn layout(&mut self, width: u16, height: usize) {
+        let mut starts = Vec::with_capacity(self.rows.len());
+        let mut total = 0;
+        for (row, cached) in self.rows.iter().zip(&mut self.heights) {
+            starts.push(total);
+            total += match *cached {
+                Some((w, h)) if w == width => h,
+                _ => {
+                    let h = Paragraph::new(Text::from(message_lines(row, None)))
+                        .wrap(Wrap { trim: false })
+                        .line_count(width);
+                    *cached = Some((width, h));
+                    h
+                }
+            };
+        }
+        self.frame = Geometry {
+            width,
+            height,
+            starts,
+            total,
+        };
+    }
+
+    /// The viewport's top line.
+    fn top(&self) -> usize {
+        let Some(anchor) = self.paused else {
+            return self.frame.bottom();
+        };
+        let i = self.rows.partition_point(|r| r.id < anchor.id);
+        let line = match self.rows.get(i) {
+            Some(r) if r.id == anchor.id => anchor.line,
+            _ => 0,
+        };
+        let start = self.frame.starts.get(i).copied().unwrap_or(0);
+        (start + line).min(self.frame.bottom())
+    }
+
+    /// Pause with `line` at the top of the viewport.
+    fn scroll_to(&mut self, line: usize) {
+        let line = line.min(self.frame.bottom());
+        let i = self
+            .frame
+            .starts
+            .partition_point(|&s| s <= line)
+            .saturating_sub(1);
+        let Some(row) = self.rows.get(i) else {
+            return;
+        };
+        if self.paused.is_none() {
+            self.new_count = 0;
+        }
+        self.paused = Some(Anchor {
+            id: row.id,
+            line: line - self.frame.starts[i],
+        });
+    }
+
+    fn follow(&mut self) {
+        self.paused = None;
+        self.new_count = 0;
+    }
+
+    fn matches(&self, row: &Message) -> bool {
+        let Some(query) = &self.query else {
+            return false;
+        };
+        [
+            Some(row.qualified_sender()),
+            row.qualified_recipient(),
+            row.to_group.as_ref().map(|g| format!("@{g}")),
+            Some(row.body.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|text| text.to_lowercase().contains(query.as_str()))
+    }
+
+    /// Jump to the next (or previous) matching message, wrapping around.
+    fn jump(&mut self, forward: bool) {
+        let top = self.top();
+        let starts = &self.frame.starts;
+        let hits: Vec<usize> = (0..self.rows.len())
+            .filter(|&i| self.matches(&self.rows[i]))
+            .collect();
+        let target = if forward {
+            hits.iter().find(|&&i| starts[i] > top).or(hits.first())
+        } else {
+            hits.iter()
+                .rev()
+                .find(|&&i| starts[i] < top)
+                .or(hits.last())
+        };
+        if let Some(&i) = target {
+            self.scroll_to(starts[i]);
         }
     }
 
-    // Follow the tail: scroll so the newest message sits at the bottom.
-    let feed = Paragraph::new(text).wrap(Wrap { trim: false });
-    let total = feed.line_count(feed_area.width);
-    let scroll = total.saturating_sub(feed_area.height as usize);
-    let feed = feed.scroll((scroll.min(u16::MAX as usize) as u16, 0));
-    frame.render_widget(feed, feed_area);
+    /// Apply one key press; `true` quits.
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return true;
+        }
+        if let Some(prompt) = &mut self.prompt {
+            match key.code {
+                KeyCode::Enter => {
+                    let query = std::mem::take(prompt).to_lowercase();
+                    self.prompt = None;
+                    self.query = (!query.is_empty()).then_some(query);
+                    // From the tail, the newest match is the nearest one.
+                    let forward = self.paused.is_some();
+                    self.jump(forward);
+                }
+                KeyCode::Esc => self.prompt = None,
+                KeyCode::Backspace => {
+                    prompt.pop();
+                }
+                KeyCode::Char(c) => prompt.push(c),
+                _ => {}
+            }
+            return false;
+        }
+        let top = self.top();
+        let page = self.frame.height.max(1);
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_to(top.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_to(top + 1),
+            KeyCode::PageUp | KeyCode::Char('b') => self.scroll_to(top.saturating_sub(page)),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_to(top + page),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_to(0),
+            KeyCode::End | KeyCode::Char('G' | 'F') => self.follow(),
+            KeyCode::Char('/') => self.prompt = Some(String::new()),
+            KeyCode::Char('n') => self.jump(true),
+            KeyCode::Char('N') => self.jump(false),
+            _ => {}
+        }
+        false
+    }
+
+    fn render(&mut self, frame: &mut Frame) {
+        let [title_area, feed_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(frame.area());
+        self.layout(feed_area.width, feed_area.height as usize);
+        let top = self.top();
+
+        frame.render_widget(self.title(), title_area);
+        if self.rows.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No messages yet. Waiting…".dark_gray()),
+                feed_area,
+            );
+            return;
+        }
+
+        // Lay out only the rows from the one holding the top line, so scroll
+        // offsets stay small however much history is loaded.
+        let first = self
+            .frame
+            .starts
+            .partition_point(|&s| s <= top)
+            .saturating_sub(1);
+        let mut text = Text::default();
+        for (i, row) in self.rows.iter().enumerate().skip(first) {
+            text.lines.extend(message_lines(row, self.query.as_deref()));
+            let end = self.frame.starts.get(i + 1).unwrap_or(&self.frame.total);
+            if *end >= top + self.frame.height {
+                break;
+            }
+        }
+        let offset = top - self.frame.starts[first];
+        let feed = Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((offset.min(u16::MAX as usize) as u16, 0));
+        frame.render_widget(feed, feed_area);
+    }
+
+    fn title(&self) -> Line<'static> {
+        let mut spans = vec![" bbs view ".bold().reversed()];
+        if let Some(prompt) = &self.prompt {
+            spans.push(format!("  /{prompt}").into());
+            spans.push("█".dark_gray());
+            spans.push("  Enter search · Esc cancel".dark_gray());
+            return Line::from(spans);
+        }
+        let state = match self.paused {
+            None => "following".to_string(),
+            Some(_) if self.new_count > 0 => format!("paused · {} new · G follows", self.new_count),
+            Some(_) => "paused · G follows".to_string(),
+        };
+        spans.push(format!("  {} messages · {state}", self.rows.len()).dark_gray());
+        if let Some(query) = &self.query {
+            let hits = self.rows.iter().filter(|r| self.matches(r)).count();
+            spans.push(format!(" · /{query}: {hits} matches · n/N").dark_gray());
+        }
+        spans.push("  ↑↓ PgUp/PgDn g/G scroll · / search · q quit".dark_gray());
+        Line::from(spans)
+    }
+}
+
+/// A message as displayed: a blank separator, the header, and the indented
+/// markdown body, with `query` matches highlighted.
+fn message_lines<'a>(row: &'a Message, query: Option<&str>) -> Vec<Line<'a>> {
+    let mut lines = vec![Line::default(), header(row)];
+    for mut line in tui_markdown::from_str(&row.body).lines {
+        line.spans.insert(0, Span::raw("  "));
+        lines.push(line);
+    }
+    match query {
+        Some(query) => lines.into_iter().map(|l| highlight(l, query)).collect(),
+        None => lines,
+    }
+}
+
+/// Reverse-video every case-insensitive occurrence of `query` within a span.
+fn highlight<'a>(line: Line<'a>, query: &str) -> Line<'a> {
+    let mut spans = Vec::with_capacity(line.spans.len());
+    for span in line.spans {
+        let lower = span.content.to_lowercase();
+        // Lowercasing can change byte offsets outside ASCII; leave such spans as is.
+        if lower.len() != span.content.len() || !lower.contains(query) {
+            spans.push(span);
+            continue;
+        }
+        let content = span.content.to_string();
+        let mut at = 0;
+        for (i, _) in lower.match_indices(query) {
+            if i > at {
+                spans.push(Span::styled(content[at..i].to_string(), span.style));
+            }
+            let end = i + query.len();
+            spans.push(Span::styled(
+                content[i..end].to_string(),
+                span.style.add_modifier(Modifier::REVERSED),
+            ));
+            at = end;
+        }
+        if at < content.len() {
+            spans.push(Span::styled(content[at..].to_string(), span.style));
+        }
+    }
+    Line { spans, ..line }
 }
 
 fn header(row: &Message) -> Line<'static> {
@@ -294,10 +593,7 @@ fn header(row: &Message) -> Line<'static> {
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )),
         (None, Some(to)) => {
-            spans.push(Span::styled(
-                to,
-                Style::new().add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled(to, Style::new().add_modifier(Modifier::BOLD)));
             spans.push(Span::raw("  "));
             spans.push(match row.read_at.as_deref().and_then(local) {
                 Some(read) => {
@@ -359,9 +655,23 @@ mod tests {
         }
     }
 
+    /// A view of `rows`, numbering them 1.. in order.
+    fn view(rows: &[Message]) -> ViewState {
+        let rows = rows
+            .iter()
+            .zip(1..)
+            .map(|(r, id)| Message { id, ..r.clone() })
+            .collect();
+        ViewState::new(rows)
+    }
+
     fn screen(rows: &[Message], height: u16) -> String {
+        draw(&mut view(rows), height)
+    }
+
+    fn draw(view: &mut ViewState, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(70, height)).unwrap();
-        terminal.draw(|f| render(f, rows)).unwrap();
+        terminal.draw(|f| view.render(f)).unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
             .map(|y| {
@@ -412,6 +722,135 @@ mod tests {
         let out = screen(&[dm, from_human], 20);
         assert!(out.contains("Juliana@will → Mateo@ada  unread"), "{out}");
         assert!(out.contains("ada → @acme"), "{out}");
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn numbered(range: std::ops::Range<i64>) -> Vec<Message> {
+        range
+            .map(|i| Message {
+                id: i + 1,
+                ..row(Some("acme"), None, None, &format!("message number {i}"))
+            })
+            .collect()
+    }
+
+    /// The feed lines below the title.
+    fn feed(screen: &str) -> Vec<&str> {
+        screen.lines().skip(1).collect()
+    }
+
+    #[test]
+    fn paused_view_keeps_ingesting_without_moving() {
+        let mut view = ViewState::new(numbered(0..30));
+        assert!(draw(&mut view, 10).contains("message number 29"));
+        view.handle_key(key(KeyCode::Char('k')));
+        let paused = draw(&mut view, 10);
+        assert!(paused.contains("paused"), "{paused}");
+        // The stream is still consumed while paused; only the viewport is frozen.
+        for i in 30..40 {
+            view.ingest(numbered(i..i + 1));
+        }
+        assert_eq!(view.rows.len(), 40);
+        let later = draw(&mut view, 10);
+        assert_eq!(feed(&later), feed(&paused));
+        assert!(later.contains("10 new"), "{later}");
+        view.handle_key(key(KeyCode::Char('G')));
+        let following = draw(&mut view, 10);
+        assert!(following.contains("message number 39"), "{following}");
+        assert!(following.contains("following") && !following.contains("new"));
+    }
+
+    #[test]
+    fn scroll_keys_move_by_line_page_and_end() {
+        let mut view = ViewState::new(numbered(0..30));
+        draw(&mut view, 10);
+        let bottom = view.top();
+        view.handle_key(key(KeyCode::PageUp));
+        assert_eq!(view.top(), bottom - 9);
+        view.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(view.top(), bottom - 8);
+        view.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(view.top(), 0);
+        assert!(draw(&mut view, 10).contains("message number 0"));
+        view.handle_key(key(KeyCode::Up));
+        assert_eq!(view.top(), 0);
+        view.handle_key(key(KeyCode::PageDown));
+        assert_eq!(view.top(), 9);
+        view.handle_key(key(KeyCode::End));
+        assert_eq!(view.paused, None);
+        assert_eq!(view.top(), bottom);
+    }
+
+    #[test]
+    fn search_jumps_between_matches_and_highlights() {
+        let mut view = ViewState::new(numbered(0..30));
+        draw(&mut view, 10);
+        for code in [KeyCode::Char('/')]
+            .into_iter()
+            .chain("NUMBER 1".chars().map(KeyCode::Char))
+        {
+            view.handle_key(key(code));
+        }
+        assert!(draw(&mut view, 10).contains("/NUMBER 1"));
+        view.handle_key(key(KeyCode::Enter));
+        // From the tail, the newest match comes first; n and N wrap around.
+        let out = draw(&mut view, 10);
+        assert!(feed(&out)[2].ends_with("message number 19"), "{out}");
+        assert!(out.contains("11 matches"), "{out}");
+        view.handle_key(key(KeyCode::Char('n')));
+        assert!(feed(&draw(&mut view, 10))[2].ends_with("message number 1"));
+        view.handle_key(key(KeyCode::Char('n')));
+        assert!(feed(&draw(&mut view, 10))[2].ends_with("message number 10"));
+        view.handle_key(key(KeyCode::Char('N')));
+        view.handle_key(key(KeyCode::Char('N')));
+        assert!(feed(&draw(&mut view, 10))[2].ends_with("message number 19"));
+
+        let line = highlight(Line::from("a Needle, a needle"), "needle");
+        let marked: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(marked, ["Needle", "needle"]);
+    }
+
+    #[test]
+    fn prompt_escape_cancels_instead_of_quitting() {
+        let mut view = ViewState::new(numbered(0..3));
+        assert!(!view.handle_key(key(KeyCode::Char('/'))));
+        assert!(!view.handle_key(key(KeyCode::Char('q'))));
+        assert!(!view.handle_key(key(KeyCode::Esc)));
+        assert_eq!(
+            (view.prompt.as_deref(), view.query.as_deref()),
+            (None, None)
+        );
+        view.handle_key(key(KeyCode::Char('/')));
+        assert!(view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(ViewState::new(Vec::new()).handle_key(key(KeyCode::Esc)));
+    }
+
+    #[test]
+    fn snapshots_refresh_rows_and_the_oldest_are_dropped_past_the_cap() {
+        let mut view = ViewState::new(numbered(0..3));
+        let mut read = numbered(1..2);
+        read[0].read_at = Some("2026-10-09T14:03:00.000000Z".into());
+        // A later window that no longer holds the first row keeps it loaded.
+        view.ingest(read);
+        assert_eq!(view.rows.len(), 3);
+        assert!(view.rows[1].read_at.is_some());
+
+        draw(&mut view, 10);
+        view.handle_key(key(KeyCode::Char('g')));
+        view.ingest(numbered(3..MAX_ROWS as i64 + 5));
+        assert_eq!(view.rows.len(), MAX_ROWS);
+        assert_eq!(view.rows[0].id, 6);
+        // The anchored row was dropped, so the view holds at the oldest kept row.
+        assert_eq!(view.top(), 0);
+        assert!(draw(&mut view, 10).contains("message number 5"));
     }
 
     #[test]
