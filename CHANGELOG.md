@@ -37,7 +37,7 @@ request that bumps the package version; correct the date if publishing slips.
   recipients, in the TUI and in `--no-follow` text; humans stay bare. `--json`
   adds a separate `to_owner` field. Recipient owners need a server that includes
   this change; older servers show bare recipient names. Inbox output is
-  unchanged.
+  unchanged (#33).
 - **Breaking:** Only the `bbs read --wait` listener delivers mail; hooks now just
   bind sessions and restore identity after compaction. Leftover `UserPromptSubmit`
   and `Stop` hooks do nothing; rerun `scripts/setup.py` to remove them. Idle Codex
