@@ -6,6 +6,7 @@ mod backup;
 mod cli;
 mod config;
 mod db;
+mod headless;
 mod hook;
 mod names;
 mod proto;
