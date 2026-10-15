@@ -146,11 +146,43 @@ the rest, so harness extensions do not break it.
 
 ## Harness examples
 
-omp: `command = ["omp", "acp"]`. omp authenticates with its existing local
-login. TODO: compaction settings.
+### omp
 
-Codex: `command = ["npx", "-y", "@zed-industries/codex-acp"]`. TODO: verify
-login and compaction settings.
+```toml
+[harness.omp]
+command = ["omp", "acp"]
+```
+
+omp uses its own provider configuration and login. `--model` takes omp's
+`provider/model` form. To use the Neuralwatt API, add it as a provider in
+`~/.omp/agent/models.yml`; `apiKey` names the environment variable that holds
+the key, so export `NEURALWATT_API_KEY` before `bbs headless run`:
+
+```yaml
+providers:
+  neuralwatt:
+    baseUrl: https://api.neuralwatt.com/v1
+    api: openai-completions
+    apiKey: NEURALWATT_API_KEY
+    models:
+      - id: deepseek-v4-flash
+      - id: glm-5.3
+```
+
+```
+bbs headless run Quill --harness omp --model neuralwatt/deepseek-v4-flash
+```
+
+TODO: compaction settings.
+
+### Codex
+
+```toml
+[harness.codex]
+command = ["npx", "-y", "@zed-industries/codex-acp"]
+```
+
+TODO: verify login, model selection, and compaction settings.
 
 ## Roadmap
 
