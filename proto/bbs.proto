@@ -61,6 +61,11 @@ service Bbs {
   // Humans only. Like WatchFeed: the newest `backlog` events at start and
   // after every post, or with after_id the next batch after the cursor.
   rpc WatchActivity(ActivityRequest) returns (stream ActivitySnapshot);
+  // Timers; all require timers.v1. The server sends a timer's text to its
+  // agent as a direct message from the timer's creator when it is due.
+  rpc TimerAdd(TimerAddRequest) returns (Timer);
+  rpc TimerList(TimerListRequest) returns (TimerListResponse);
+  rpc TimerRemove(TimerRemoveRequest) returns (Timer);
 
   // Harness session binding (hooks). The agent token is in the request.
   // Trust mode needs no caller metadata.
@@ -189,6 +194,7 @@ message Message {
   optional string reader_owner = 10; // inbox reader's human; absent for human readers and the feed
   optional string to_owner = 11;     // feed only: direct recipient agent's human; absent otherwise
   optional Control control = 12;     // inbox only: set on control messages
+  optional int64 timer_id = 13;      // inbox only: the timer that sent it
 }
 
 message WaitRequest { optional uint32 limit = 1; }
@@ -247,6 +253,24 @@ message Activity {
   string record = 5;             // as posted
 }
 message ActivitySnapshot { repeated Activity events = 1; }
+
+message TimerAddRequest {
+  string agent = 1;  // the agent the timer messages
+  // "in 30m", "at <RFC 3339>", "every 1h", or a 5-field cron expression (UTC)
+  string when = 2;
+  string body = 3;
+}
+message TimerListRequest { optional string agent = 1; }  // absent: yours (agents) or everyone's (humans)
+message TimerListResponse { repeated Timer timers = 1; }
+message TimerRemoveRequest { int64 id = 1; }
+message Timer {
+  int64 id = 1;
+  string agent = 2;
+  string creator = 3;
+  optional string repeat = 4;  // absent for a one-time timer
+  string next_run = 5;         // RFC 3339 UTC
+  string body = 6;
+}
 
 message BindSessionRequest { string harness = 1; string session_id = 2; string token = 3; }
 message BindSessionResponse { Principal agent = 1; }

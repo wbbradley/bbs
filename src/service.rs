@@ -4,6 +4,7 @@
 //! about sockets, files or output formatting.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -14,6 +15,7 @@ use crate::auth::{self, AuthenticationError};
 use crate::db;
 use crate::names::NAMES;
 use crate::proto;
+use crate::timer::Schedule;
 
 const RETIRE_AFTER_DAYS: i64 = 7;
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -181,6 +183,7 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
             Some("cancel") => Some(proto::Control::Cancel.into()),
             _ => None,
         },
+        timer_id: m.timer_id,
     }
 }
 
@@ -1295,6 +1298,220 @@ impl Watched for proto::ActivityRequest {
     }
 }
 
+// ---- timers ----------------------------------------------------------------
+
+/// Server limits on timers, applied to each target agent.
+#[derive(Clone, Copy, Debug)]
+pub struct TimerLimits {
+    pub max_per_agent: u32,
+    /// The shortest time a recurring timer may wait between runs.
+    pub min_interval: Duration,
+}
+
+impl Default for TimerLimits {
+    fn default() -> TimerLimits {
+        TimerLimits {
+            max_per_agent: 20,
+            min_interval: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+/// Whether an agent needs a shared group with another agent to set, list or
+/// remove its timers, as `bbs send` does to message it. Waiting on the
+/// human's decision; humans, and agents managing their own, never do.
+const TIMERS_NEED_SHARED_GROUP: bool = true;
+
+fn may_manage_timers(ctx: &Ctx, me: &db::Principal, target: &db::Principal) -> Result<()> {
+    if TIMERS_NEED_SHARED_GROUP
+        && me.kind == db::Kind::Agent
+        && me.id != target.id
+        && !db::share_group(ctx.conn, me.id, target.id)?
+    {
+        bail!("{} is not in any of your groups", target.name);
+    }
+    Ok(())
+}
+
+/// The live agent a timer is for.
+fn timer_agent(ctx: &Ctx, name: &str) -> Result<db::Principal> {
+    match db::live_agent_by_name(ctx.conn, name)? {
+        Some(agent) => Ok(agent),
+        None if db::retired_agent_exists(ctx.conn, name)? => bail!("{name} is retired"),
+        None => bail!("no such agent: {name}"),
+    }
+}
+
+fn timer_proto(t: db::TimerRow) -> proto::Timer {
+    proto::Timer {
+        id: t.id,
+        agent: t.target,
+        creator: t.creator,
+        repeat: t.repeat,
+        next_run: t.next_run,
+        body: t.body,
+    }
+}
+
+/// Set a timer that sends `body` to an agent when `when` comes.
+pub fn timer_add(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::TimerAddRequest,
+    limits: TimerLimits,
+) -> Result<proto::Timer> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        validate_body(&req.body)?;
+        let target = timer_agent(ctx, &req.agent)?;
+        may_manage_timers(ctx, &me, &target)?;
+        let schedule = Schedule::parse(&req.when, ctx.now)?;
+        if let Some(gap) = schedule.shortest_gap(ctx.now)
+            && gap < limits.min_interval
+        {
+            bail!(
+                "{:?} runs as often as every {}; this server's shortest interval is {}",
+                req.when.trim(),
+                humantime::format_duration(gap),
+                humantime::format_duration(limits.min_interval)
+            );
+        }
+        if db::timer_count(ctx.conn, target.id)? >= i64::from(limits.max_per_agent) {
+            bail!(
+                "{} already has {} timers, this server's limit",
+                target.name,
+                limits.max_per_agent
+            );
+        }
+        let next_run = fmt_time(schedule.first(ctx.now)?);
+        let repeat = schedule.repeat();
+        let id = db::insert_timer(
+            ctx.conn,
+            target.id,
+            &me,
+            &req.body,
+            repeat.as_deref(),
+            &next_run,
+            &ctx.now_s,
+        )?;
+        tracing::info!(id, from = me.name, to = target.name, next_run, "set timer");
+        Ok(proto::Timer {
+            id,
+            agent: target.name,
+            creator: me.name,
+            repeat,
+            next_run,
+            body: req.body,
+        })
+    })
+}
+
+/// An agent's timers, soonest first. Without an agent: an agent's own, or for
+/// a human everyone's.
+pub fn timer_list(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::TimerListRequest,
+) -> Result<proto::TimerListResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        let target = match req.agent.as_deref() {
+            Some(name) => {
+                let target = timer_agent(ctx, name)?;
+                may_manage_timers(ctx, &me, &target)?;
+                Some(target.id)
+            }
+            None if me.kind == db::Kind::Agent => Some(me.id),
+            None => None,
+        };
+        let timers = db::timers(ctx.conn, target)?
+            .into_iter()
+            .map(timer_proto)
+            .collect();
+        Ok(proto::TimerListResponse { timers })
+    })
+}
+
+pub fn timer_remove(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::TimerRemoveRequest,
+) -> Result<proto::Timer> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        let missing = || anyhow::anyhow!("no timer {}", req.id);
+        let target_id = db::timer_target(ctx.conn, req.id)?.ok_or_else(missing)?;
+        let timer = db::timers(ctx.conn, Some(target_id))?
+            .into_iter()
+            .find(|t| t.id == req.id)
+            .ok_or_else(missing)?;
+        let target = db::Principal {
+            kind: db::Kind::Agent,
+            id: target_id,
+            name: timer.target.clone(),
+        };
+        may_manage_timers(ctx, &me, &target)?;
+        db::delete_timer(ctx.conn, req.id)?;
+        tracing::info!(id = req.id, by = me.name, "removed timer");
+        Ok(timer_proto(timer))
+    })
+}
+
+/// Timers fired in one transaction; more due wait for the next pass.
+const FIRE_BATCH: u32 = 100;
+
+/// Fire the timers due at `now`. Each sends its text to its agent as a direct
+/// message from its creator and, in the same transaction, is rescheduled from
+/// `now` (so missed runs are not caught up) or, if it ran once, deleted.
+/// Returns how many fired and when the soonest timer left is due.
+pub fn fire_timers(
+    conn: &mut Connection,
+    now: DateTime<Utc>,
+) -> Result<(usize, Option<DateTime<Utc>>)> {
+    let parse = |t: String| {
+        DateTime::parse_from_rfc3339(&t)
+            .map(|t| t.with_timezone(&Utc))
+            .context("stored timer time")
+    };
+    // Most passes find nothing due: answer those without the write lock.
+    let soonest = db::next_timer(conn)?.map(parse).transpose()?;
+    if soonest.is_none_or(|t| t > now) {
+        return Ok((0, soonest));
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let now_s = fmt_time(now);
+    let due = db::due_timers(&tx, &now_s, FIRE_BATCH)?;
+    let mut fired = 0;
+    for timer in &due {
+        // A stored schedule that no longer parses must not block the others.
+        let schedule = match timer
+            .repeat
+            .as_deref()
+            .map(Schedule::from_repeat)
+            .transpose()
+        {
+            Ok(schedule) => schedule,
+            Err(err) => {
+                tracing::warn!(id = timer.id, "deleting timer with a bad schedule: {err:#}");
+                db::delete_timer(&tx, timer.id)?;
+                continue;
+            }
+        };
+        let msg = db::insert_message(&tx, &timer.creator, None, &timer.body, &now_s)?;
+        db::insert_delivery(&tx, msg, db::Kind::Agent, timer.target_id)?;
+        db::set_message_timer(&tx, msg, timer.id)?;
+        match schedule.and_then(|s| s.next_after(now)) {
+            Some(next) => db::set_timer_next_run(&tx, timer.id, &fmt_time(next))?,
+            None => db::delete_timer(&tx, timer.id)?,
+        }
+        fired += 1;
+        tracing::info!(id = timer.id, from = timer.creator.name, "timer fired");
+    }
+    let next = db::next_timer(&tx)?.map(parse).transpose()?;
+    tx.commit()?;
+    Ok((fired, next))
+}
+
 // ---- harness sessions ------------------------------------------------------
 
 pub fn admin_issue_token(conn: &mut Connection, name: &str, create: bool) -> Result<String> {
@@ -1395,4 +1612,247 @@ pub fn session_agent(
             token,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A board with the human will, agents Mateo and Zed in @crew, and Lu in
+    /// no group; the callers for each.
+    fn board() -> (Connection, Caller, [Caller; 3]) {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::migrate(&mut conn).unwrap();
+        let will = Caller {
+            human: Some("will".into()),
+            ..Default::default()
+        };
+        ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: "will".into(),
+            },
+        )
+        .unwrap();
+        group_register(
+            &mut conn,
+            &will,
+            proto::GroupRegisterRequest {
+                group: "crew".into(),
+                description: None,
+            },
+        )
+        .unwrap();
+        let agents = ["Mateo", "Zed", "Lu"].map(|name| {
+            let token = register(
+                &mut conn,
+                &will,
+                proto::RegisterRequest {
+                    name: Some(name.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .token;
+            Caller {
+                token: Some(token),
+                ..Default::default()
+            }
+        });
+        for agent in &agents[..2] {
+            let req = proto::GroupRequest {
+                group: "crew".into(),
+            };
+            group_join(&mut conn, agent, req).unwrap();
+        }
+        (conn, will, agents)
+    }
+
+    fn add(
+        conn: &mut Connection,
+        caller: &Caller,
+        agent: &str,
+        when: &str,
+    ) -> Result<proto::Timer> {
+        let req = proto::TimerAddRequest {
+            agent: agent.into(),
+            when: when.into(),
+            body: format!("{when} for {agent}"),
+        };
+        timer_add(conn, caller, req, TimerLimits::default())
+    }
+
+    fn inbox(conn: &mut Connection, caller: &Caller) -> Vec<proto::Message> {
+        read(conn, caller, proto::ReadRequest::default())
+            .unwrap()
+            .messages
+    }
+
+    fn time(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn a_one_time_timer_sends_once_from_its_creator() {
+        let (mut conn, _, [mateo, zed, _]) = board();
+        let t = add(&mut conn, &mateo, "zed", "in 30m").unwrap();
+        assert_eq!((t.agent.as_str(), t.creator.as_str()), ("Zed", "Mateo"));
+        assert_eq!(t.repeat, None);
+        let due = time(&t.next_run);
+        // Not yet due: nothing fires, and the next run is reported.
+        let early = due - chrono::Duration::seconds(1);
+        assert_eq!(fire_timers(&mut conn, early).unwrap(), (0, Some(due)));
+        assert_eq!(fire_timers(&mut conn, due).unwrap(), (1, None));
+        let mail: Vec<_> = inbox(&mut conn, &zed)
+            .into_iter()
+            .filter(|m| m.timer_id.is_some())
+            .collect();
+        assert_eq!(mail.len(), 1);
+        assert_eq!(
+            (
+                mail[0].from_name.as_str(),
+                mail[0].body.as_str(),
+                mail[0].timer_id
+            ),
+            ("Mateo", "in 30m for zed", Some(t.id))
+        );
+        // Run once, it is gone.
+        assert_eq!(fire_timers(&mut conn, due).unwrap(), (0, None));
+        let listed = timer_list(&mut conn, &zed, proto::TimerListRequest::default()).unwrap();
+        assert!(listed.timers.is_empty());
+    }
+
+    #[test]
+    fn a_recurring_timer_missed_for_a_day_fires_once_then_resumes_from_now() {
+        let (mut conn, _, [mateo, _, _]) = board();
+        // An agent may always set its own.
+        let t = add(&mut conn, &mateo, "Mateo", "every 1h").unwrap();
+        assert_eq!(t.repeat.as_deref(), Some("every 1h"));
+        let late = time(&t.next_run) + chrono::Duration::days(1);
+        let (fired, next) = fire_timers(&mut conn, late).unwrap();
+        assert_eq!((fired, next), (1, Some(late + chrono::Duration::hours(1))));
+        let fired: Vec<_> = inbox(&mut conn, &mateo)
+            .into_iter()
+            .filter_map(|m| m.timer_id)
+            .collect();
+        assert_eq!(fired, [t.id]);
+        let listed = timer_list(&mut conn, &mateo, proto::TimerListRequest::default()).unwrap();
+        assert_eq!(
+            listed.timers[0].next_run,
+            fmt_time(late + chrono::Duration::hours(1))
+        );
+    }
+
+    #[test]
+    fn a_timer_whose_schedule_no_longer_parses_is_deleted_without_blocking_others() {
+        let (mut conn, _, [mateo, zed, _]) = board();
+        let bad = add(&mut conn, &mateo, "Zed", "every 1h").unwrap();
+        let good = add(&mut conn, &mateo, "Zed", "in 1h").unwrap();
+        conn.execute(
+            "UPDATE timers SET repeat = 'every fortnight-ish' WHERE id = ?1",
+            [bad.id],
+        )
+        .unwrap();
+        let due = time(&good.next_run).max(time(&bad.next_run));
+        assert_eq!(fire_timers(&mut conn, due).unwrap(), (1, None));
+        let fired: Vec<_> = inbox(&mut conn, &zed)
+            .into_iter()
+            .filter_map(|m| m.timer_id)
+            .collect();
+        assert_eq!(fired, [good.id]);
+        assert!(db::timers(&conn, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn limits_apply_to_the_target() {
+        let (mut conn, will, [mateo, _, _]) = board();
+        let short = add(&mut conn, &will, "Zed", "every 1m").unwrap_err();
+        assert!(
+            format!("{short:#}").contains("shortest interval is 5m"),
+            "{short:#}"
+        );
+        // Mostly hourly, but two runs a minute apart.
+        let uneven = add(&mut conn, &will, "Zed", "0,1 * * * *").unwrap_err();
+        assert!(
+            format!("{uneven:#}").contains("as often as every 1m"),
+            "{uneven:#}"
+        );
+        // One-time timers have no interval to limit.
+        add(&mut conn, &will, "Zed", "in 1m").unwrap();
+        let limits = TimerLimits {
+            max_per_agent: 2,
+            ..TimerLimits::default()
+        };
+        let req = |when: &str| proto::TimerAddRequest {
+            agent: "Zed".into(),
+            when: when.into(),
+            body: "x".into(),
+        };
+        timer_add(&mut conn, &mateo, req("in 2h"), limits).unwrap();
+        let full = timer_add(&mut conn, &mateo, req("in 3h"), limits).unwrap_err();
+        assert!(
+            format!("{full:#}").contains("Zed already has 2 timers"),
+            "{full:#}"
+        );
+    }
+
+    #[test]
+    fn agents_manage_timers_only_for_agents_they_share_a_group_with() {
+        let (mut conn, will, [mateo, _, lu]) = board();
+        let no = add(&mut conn, &lu, "Zed", "in 1h").unwrap_err();
+        assert!(
+            format!("{no:#}").contains("Zed is not in any of your groups"),
+            "{no:#}"
+        );
+        let t = add(&mut conn, &mateo, "Zed", "in 1h").unwrap();
+        let rm = |conn: &mut Connection, caller: &Caller| {
+            timer_remove(conn, caller, proto::TimerRemoveRequest { id: t.id })
+        };
+        let list = |conn: &mut Connection, caller: &Caller| {
+            let req = proto::TimerListRequest {
+                agent: Some("Zed".into()),
+            };
+            timer_list(conn, caller, req)
+        };
+        assert!(rm(&mut conn, &lu).is_err());
+        assert!(list(&mut conn, &lu).is_err());
+        // Humans may, as with messages.
+        assert_eq!(list(&mut conn, &will).unwrap().timers.len(), 1);
+        let everyone = timer_list(&mut conn, &will, proto::TimerListRequest::default()).unwrap();
+        assert_eq!(everyone.timers.len(), 1);
+        assert_eq!(rm(&mut conn, &will).unwrap().id, t.id);
+        let gone = rm(&mut conn, &mateo).unwrap_err();
+        assert!(
+            format!("{gone:#}").contains(&format!("no timer {}", t.id)),
+            "{gone:#}"
+        );
+    }
+
+    #[test]
+    fn an_agent_in_no_group_manages_its_own_timers() {
+        let (mut conn, _, [_, _, lu]) = board();
+        let t = add(&mut conn, &lu, "Lu", "in 1h").unwrap();
+        let req = proto::TimerListRequest {
+            agent: Some("Lu".into()),
+        };
+        assert_eq!(timer_list(&mut conn, &lu, req).unwrap().timers.len(), 1);
+        timer_remove(&mut conn, &lu, proto::TimerRemoveRequest { id: t.id }).unwrap();
+    }
+
+    #[test]
+    fn retiring_an_agent_deletes_its_timers() {
+        let (mut conn, will, [mateo, zed, _]) = board();
+        add(&mut conn, &mateo, "Zed", "every 1h").unwrap();
+        add(&mut conn, &zed, "Mateo", "every 1h").unwrap();
+        bye(&mut conn, &zed).unwrap();
+        let left = timer_list(&mut conn, &will, proto::TimerListRequest::default()).unwrap();
+        let agents: Vec<_> = left.timers.iter().map(|t| t.agent.as_str()).collect();
+        // Zed's timers went; the one Zed set for Mateo stays.
+        assert_eq!(agents, ["Mateo"]);
+        let retired = add(&mut conn, &mateo, "Zed", "in 1h").unwrap_err();
+        assert!(
+            format!("{retired:#}").contains("Zed is retired"),
+            "{retired:#}"
+        );
+    }
 }

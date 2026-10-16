@@ -23,6 +23,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0009_message_control.sql"),
     include_str!("../migrations/0010_group_writers.sql"),
     include_str!("../migrations/0011_activity.sql"),
+    include_str!("../migrations/0012_timers.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +93,8 @@ pub struct MessageView {
     pub body: String,
     /// Inbox only: the control kind of a control message.
     pub control: Option<String>,
+    /// Inbox only: the timer that sent it.
+    pub timer_id: Option<i64>,
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -406,6 +409,7 @@ pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
     conn.execute("DELETE FROM group_members WHERE agent_id = ?1", params![id])?;
     conn.execute("DELETE FROM group_writers WHERE agent_id = ?1", params![id])?;
     conn.execute("DELETE FROM activity WHERE agent_id = ?1", params![id])?;
+    conn.execute("DELETE FROM timers WHERE target_id = ?1", params![id])?;
     Ok(())
 }
 
@@ -758,7 +762,7 @@ pub fn insert_delivery(conn: &Connection, message_id: i64, kind: Kind, id: i64) 
 const INBOX_SELECT: &str = "
     SELECT m.id, m.created_at, m.from_kind,
            CASE m.from_kind WHEN 'agent' THEN a.name ELSE h.name END,
-           g.name, m.body, owner.name, reader_owner.name, m.control
+           g.name, m.body, owner.name, reader_owner.name, m.control, m.timer_id
     FROM deliveries d
     JOIN messages m ON m.id = d.message_id
     LEFT JOIN agents a ON m.from_kind = 'agent' AND a.id = m.from_id
@@ -789,6 +793,7 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         read_at: None,
         body: r.get(5)?,
         control: r.get(8)?,
+        timer_id: r.get(9)?,
     })
 }
 
@@ -1261,6 +1266,7 @@ pub fn feed_messages(
                 read_at: r.get(6)?,
                 body: r.get(7)?,
                 control: None,
+                timer_id: None,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -1343,6 +1349,148 @@ pub fn activity_page(
         rows.reverse();
     }
     Ok(rows)
+}
+
+// ---- timers (timers.v1) ----------------------------------------------------
+
+pub struct TimerRow {
+    pub id: i64,
+    pub target: String,
+    pub creator: String,
+    pub body: String,
+    pub repeat: Option<String>,
+    pub next_run: String,
+}
+
+/// A timer due to fire, with what firing it needs.
+pub struct DueTimer {
+    pub id: i64,
+    pub target_id: i64,
+    pub creator: Principal,
+    pub body: String,
+    pub repeat: Option<String>,
+}
+
+pub fn insert_timer(
+    conn: &Connection,
+    target_id: i64,
+    creator: &Principal,
+    body: &str,
+    repeat: Option<&str>,
+    next_run: &str,
+    now: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO timers (target_id, creator_kind, creator_id, body, repeat, next_run, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![target_id, creator.kind.as_str(), creator.id, body, repeat, next_run, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn timer_count(conn: &Connection, target_id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM timers WHERE target_id = ?1",
+        [target_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Timers, soonest first: one agent's, or with `None` everyone's.
+pub fn timers(conn: &Connection, target_id: Option<i64>) -> Result<Vec<TimerRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, a.name, CASE t.creator_kind WHEN 'agent' THEN ca.name ELSE ch.name END,
+                t.body, t.repeat, t.next_run
+         FROM timers t
+         JOIN agents a ON a.id = t.target_id
+         LEFT JOIN agents ca ON t.creator_kind = 'agent' AND ca.id = t.creator_id
+         LEFT JOIN humans ch ON t.creator_kind = 'human' AND ch.id = t.creator_id
+         WHERE ?1 IS NULL OR t.target_id = ?1
+         ORDER BY t.next_run, t.id",
+    )?;
+    let rows = stmt
+        .query_map([target_id], |r| {
+            Ok(TimerRow {
+                id: r.get(0)?,
+                target: r.get(1)?,
+                creator: r.get(2)?,
+                body: r.get(3)?,
+                repeat: r.get(4)?,
+                next_run: r.get(5)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// A timer's target, for checking who may remove it.
+pub fn timer_target(conn: &Connection, id: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row("SELECT target_id FROM timers WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+pub fn delete_timer(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM timers WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+/// Timers due at `now`, oldest due first, at most `limit`.
+pub fn due_timers(conn: &Connection, now: &str, limit: u32) -> Result<Vec<DueTimer>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.target_id, t.creator_kind, t.creator_id,
+                CASE t.creator_kind WHEN 'agent' THEN ca.name ELSE ch.name END,
+                t.body, t.repeat
+         FROM timers t
+         LEFT JOIN agents ca ON t.creator_kind = 'agent' AND ca.id = t.creator_id
+         LEFT JOIN humans ch ON t.creator_kind = 'human' AND ch.id = t.creator_id
+         WHERE t.next_run <= ?1
+         ORDER BY t.next_run, t.id LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![now, limit], |r| {
+            let kind: String = r.get(2)?;
+            Ok(DueTimer {
+                id: r.get(0)?,
+                target_id: r.get(1)?,
+                creator: Principal {
+                    kind: if kind == "human" {
+                        Kind::Human
+                    } else {
+                        Kind::Agent
+                    },
+                    id: r.get(3)?,
+                    name: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                },
+                body: r.get(5)?,
+                repeat: r.get(6)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// The soonest `next_run`, if any timer is set.
+pub fn next_timer(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT min(next_run) FROM timers", [], |r| r.get(0))?)
+}
+
+pub fn set_timer_next_run(conn: &Connection, id: i64, next_run: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE timers SET next_run = ?2 WHERE id = ?1",
+        params![id, next_run],
+    )?;
+    Ok(())
+}
+
+pub fn set_message_timer(conn: &Connection, message_id: i64, timer_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET timer_id = ?2 WHERE id = ?1",
+        params![message_id, timer_id],
+    )?;
+    Ok(())
 }
 
 pub fn data_version(conn: &Connection) -> Result<i64> {

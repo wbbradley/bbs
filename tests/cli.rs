@@ -227,7 +227,7 @@ fn version_reports_identity_without_side_effects() {
             );
             assert_eq!(report["protocol"]["epoch"], 2);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
-            assert_eq!(report["schema_version"], 11);
+            assert_eq!(report["schema_version"], 12);
             assert_eq!(report["config_format"], 3);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {
@@ -2221,6 +2221,91 @@ fn bodies(rows: &[serde_json::Value]) -> Vec<&str> {
     rows.iter().map(|r| r["body"].as_str().unwrap()).collect()
 }
 
+fn timers_are_set_listed_fired_and_removed(mode: Mode) {
+    let bbs = Bbs::with_mode("timers", mode);
+    bbs.ok(&["group", "register", "crew"]);
+    let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    let (_c, tc) = bbs.register();
+    for token in [&ta, &tb] {
+        bbs.ok(&["--token", token, "group", "join", "crew"]);
+    }
+
+    let set = bbs.ok(&[
+        "--token",
+        &ta,
+        "timer",
+        "add",
+        &b,
+        "every 1h",
+        "check the build",
+    ]);
+    assert!(
+        set.starts_with(&format!("Timer 1 for {b}: every 1h, next at ")),
+        "{set}"
+    );
+    bbs.ok(&["--token", &ta, "timer", "add", &a, "0 9 * * 1-5", "standup"]);
+    // Agents see their own timers by default; humans see everyone's.
+    let mine = bbs.ok(&["--token", &tb, "timer", "list"]);
+    assert!(
+        mine.contains(&format!("1  {b}  every 1h, next at ")),
+        "{mine}"
+    );
+    assert!(
+        mine.contains(&format!("from {a}: check the build")),
+        "{mine}"
+    );
+    assert_eq!(bbs.ok(&["timer", "list"]).lines().count(), 2);
+    for (args, why) in [
+        (
+            vec!["--token", &tc, "timer", "add", &b, "in 1h", "x"],
+            "is not in any of your groups",
+        ),
+        (
+            vec!["--token", &ta, "timer", "add", &b, "soonish", "x"],
+            "invalid schedule",
+        ),
+        (
+            vec!["--token", &ta, "timer", "add", &b, "every 1m", "x"],
+            "shortest interval is 5m",
+        ),
+        (
+            vec!["--token", &tc, "timer", "rm", "1"],
+            "is not in any of your groups",
+        ),
+    ] {
+        let err = bbs.err(&args);
+        assert!(err.contains(why), "{args:?}: {err}");
+    }
+
+    // Make it due now, then wake the scheduler with any write; read --wait
+    // returns once it has fired.
+    bbs.db()
+        .execute(
+            "UPDATE timers SET next_run = '2026-01-01T00:00:00.000000Z' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    bbs.ok(&["--token", &tb, "status", "waiting for a timer"]);
+    let mail = bbs.ok(&["--token", &tb, "read", "--wait"]);
+    assert!(
+        mail.contains(&format!("from {a} to {b} (timer 1):\ncheck the build")),
+        "{mail}"
+    );
+    // Rescheduled from now, an hour out.
+    let next: String = bbs
+        .db()
+        .query_row("SELECT next_run FROM timers WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert!(next.as_str() > "2026-01-01T01:00:00", "{next}");
+
+    assert_eq!(
+        bbs.ok(&["--token", &tb, "timer", "rm", "1"]),
+        format!("Removed timer 1 for {b}.\n")
+    );
+    assert!(bbs.ok(&["--token", &tb, "timer", "list"]).is_empty());
+}
+
 fn view_with_shows_what_a_name_sent_and_was_sent_directly(mode: Mode) {
     let bbs = Bbs::with_mode("view-with", mode);
     bbs.ok(&["group", "register", "crew"]);
@@ -3260,6 +3345,7 @@ both_modes!(
     view_is_for_humans_only,
     view_filters_by_group_sender_owner_and_scope,
     view_with_shows_what_a_name_sent_and_was_sent_directly,
+    timers_are_set_listed_fired_and_removed,
     view_since_and_until_bound_history,
     view_json_follow_emits_each_message_once,
     view_json_follow_survives_full_windows_and_bursts,

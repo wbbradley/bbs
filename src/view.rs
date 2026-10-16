@@ -367,6 +367,7 @@ mod tests {
             read_at: read_at.map(Into::into),
             body: body.into(),
             control: None,
+            timer_id: None,
         }
     }
 

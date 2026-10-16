@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::db;
 use crate::proto::{self, bbs_client::BbsClient};
 use crate::protocol;
-use crate::service::{self, Caller, Watched};
+use crate::service::{self, Caller, TimerLimits, Watched};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
@@ -27,6 +27,7 @@ const GROUP_WRITERS: &str = "group-writers.v1";
 const GROUP_ADD: &str = "group-add.v1";
 const AGENT_CONTROL: &str = "agent-control.v1";
 pub const AGENT_ACTIVITY: &str = "agent-activity.v1";
+const TIMERS: &str = "timers.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -53,11 +54,24 @@ impl Local {
     pub fn open(dir: &Path, caller: Caller) -> Result<Local> {
         let mut conn = db::open(&dir.join("bbs.db"))?;
         db::migrate(&mut conn)?;
+        fire_local_timers(&mut conn);
         Ok(Local {
             conn,
             dir: dir.to_path_buf(),
             caller,
         })
+    }
+}
+
+/// Fire due timers on a local board, which has no server to do it: on every
+/// open, and while `read --wait` polls. A failure leaves them for next time.
+fn fire_local_timers(conn: &mut rusqlite::Connection) -> usize {
+    match service::fire_timers(conn, chrono::Utc::now()) {
+        Ok((fired, _)) => fired,
+        Err(err) => {
+            tracing::warn!("firing timers: {err:#}");
+            0
+        }
     }
 }
 
@@ -371,6 +385,38 @@ impl Backend {
         }
     }
 
+    pub async fn timer_add(&mut self, req: proto::TimerAddRequest) -> Result<proto::Timer> {
+        match self {
+            Backend::Local(l) => {
+                service::timer_add(&mut l.conn, &l.caller, req, TimerLimits::default())
+            }
+            Backend::Remote(r) => {
+                rpc!(r, timer_add, req, &[TIMERS]).map_err(|e| missing_rpc(e, TIMERS))
+            }
+        }
+    }
+
+    pub async fn timer_list(
+        &mut self,
+        req: proto::TimerListRequest,
+    ) -> Result<proto::TimerListResponse> {
+        match self {
+            Backend::Local(l) => service::timer_list(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, timer_list, req, &[TIMERS]).map_err(|e| missing_rpc(e, TIMERS))
+            }
+        }
+    }
+
+    pub async fn timer_remove(&mut self, req: proto::TimerRemoveRequest) -> Result<proto::Timer> {
+        match self {
+            Backend::Local(l) => service::timer_remove(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, timer_remove, req, &[TIMERS]).map_err(|e| missing_rpc(e, TIMERS))
+            }
+        }
+    }
+
     pub async fn rotate_agent_token(
         &mut self,
         req: proto::RetireRequest,
@@ -614,6 +660,10 @@ impl Local {
         let mut seen_version = None;
         let mut last_touch = Instant::now();
         loop {
+            // Our own writes leave data_version alone, so look again after one.
+            if fire_local_timers(&mut self.conn) > 0 {
+                seen_version = None;
+            }
             let version = db::data_version(&self.conn)?;
             if seen_version != Some(version) {
                 seen_version = Some(version);
