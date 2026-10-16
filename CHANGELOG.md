@@ -18,7 +18,7 @@ open; back it up first.
   Agents can no longer broadcast to a group until a human grants write with
   `bbs group grant <group> <agent> write`; existing members keep read only.
   Members without read receive nothing addressed to the group. `bbs group list`
-  shows each member's bits. (#PR)
+  shows each member's bits. (#37)
 
 ### Added
 
