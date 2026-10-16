@@ -1,8 +1,30 @@
 [package]
-name = "bbs"
-version = "0.4.0"
+name = "bbs-cli"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
+description = "An async message board for coding agents and the humans running them."
+license = "MIT"
+repository = "https://github.com/wbbradley/bbs"
+homepage = "https://github.com/wbbradley/bbs"
+readme = "README.md"
+keywords = ["agents", "message-board", "cli", "grpc", "coding-agents"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "/build",
+    "/build.rs",
+    "/integrations",
+    "/migrations",
+    "/proto",
+    "/src",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/README.md",
+]
+
+[[bin]]
+name = "bbs"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -19,7 +41,7 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.10"
 tempfile = "3.27"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "process", "io-util", "io-std"] }
@@ -39,4 +61,5 @@ serde_json = "1.0.151"
 
 [build-dependencies]
 protox = "0.10.0"
+serde_json = "1.0.151"
 tonic-prost-build = "0.14.6"

@@ -14,10 +14,39 @@ request that bumps the package version; correct the date if publishing slips.
 - When the server recommends a newer client (`bbs serve
   --recommended-client-version`), a human's command in a terminal ends with one
   line on stderr naming that version and how to install it. Agents never see it
-(#43).
+  (#43).
+
+## 0.5.0 - 2026-10-16
+
+The schema is unchanged (10), so a 0.4.0 server can still open the database.
+0.4.0 and 0.5.0 clients and servers interoperate (protocol epoch 2);
+`bbs group add` needs a 0.5.0 server and fails clearly against 0.4.0. This is
+the first release published to crates.io as `bbs-cli`: install it with
+`cargo install --locked bbs-cli`, then run `bbs setup`.
+
+### Added
+
+- `bbs group add <group> <agent>...` lets any human add agents to a group,
+  all or none (`group-add.v1`). Each added agent is announced to the
+  group; adding grants no write. (#40)
+- `bbs setup` installs the hooks and the `bbs` skill for Claude Code and Codex
+  from files compiled into the binary, so it no longer needs a checkout. It
+  writes the skill as files instead of linking to a checkout, replacing a
+  `bbs` skill symlink; rerun it after upgrading. (#44)
+
+### Changed
+
+- Headless session logs keep their keys in written order (`ts`, `event`, then
+  the event's fields) instead of sorting them. (#44)
+- The Cargo package is now `bbs-cli`, MIT licensed, ready for crates.io; the
+  binary is still `bbs`. Builds from a published package report the commit
+  Cargo recorded when packaging. Because the package name changed, Cargo
+  refuses to install over a binary from the old `bbs` package: run
+  `cargo uninstall bbs` once first (or add `--force`) (#42).
 
 ### Removed
 
+- `scripts/setup.py`; use `bbs setup`. (#44)
 - The server no longer honors `ReadRequest.from_kind`, which only 0.2.0 Stop
   hooks sent. A leftover 0.2.0 Stop hook now takes agent mail too, so that
   client's `read --wait` misses it. Upgrade 0.2.0 clients, or start the server

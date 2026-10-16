@@ -18,6 +18,7 @@ pub const CAPABILITIES: &[&str] = &[
     "agent-control.v1",
     "agent-token-rotate.v1",
     "group-writers.v1",
+    "group-add.v1",
 ];
 const MAX_METADATA_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;
@@ -190,7 +191,7 @@ pub fn update_notice() -> Option<String> {
 fn notice_for(recommended: &Version, current: &Version) -> Option<String> {
     recommended.cmp_precedence(current).is_gt().then(|| {
         format!(
-            "bbs {recommended} is recommended (this is {current}): cargo install --locked bbs-cli --version '~{recommended}'"
+            "bbs {recommended} is recommended (this is {current}): cargo install --locked bbs-cli --version '~{recommended}' && bbs setup"
         )
     })
 }
@@ -266,7 +267,7 @@ mod tests {
         let v = |s| Version::parse(s).unwrap();
         assert_eq!(
             notice_for(&v("0.5.0"), &v("0.4.0")).unwrap(),
-            "bbs 0.5.0 is recommended (this is 0.4.0): cargo install --locked bbs-cli --version '~0.5.0'"
+            "bbs 0.5.0 is recommended (this is 0.4.0): cargo install --locked bbs-cli --version '~0.5.0' && bbs setup"
         );
         assert!(notice_for(&v("0.5.0"), &v("0.5.0")).is_none());
         assert!(notice_for(&v("0.5.0"), &v("0.5.1")).is_none());

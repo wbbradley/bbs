@@ -588,6 +588,14 @@ impl Bbs for Server {
             .await
     }
 
+    async fn group_add(
+        &self,
+        req: Request<proto::GroupAddRequest>,
+    ) -> Result<Response<proto::GroupAddResponse>, Status> {
+        self.unary("group_add", req, Effect::Write, service::group_add)
+            .await
+    }
+
     async fn set_group_writer(
         &self,
         req: Request<proto::SetGroupWriterRequest>,

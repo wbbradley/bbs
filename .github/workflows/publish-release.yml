@@ -49,6 +49,8 @@ jobs:
           cargo install --locked --git https://github.com/wbbradley/bbs --rev $GITHUB_SHA --bin bbs
           \`\`\`
 
+          Over a client installed before the package was renamed \`bbs-cli\`, run \`cargo uninstall bbs\` once first.
+
           \`bbs-release.json\` lists its protocol, schema, config format and minimum Rust version.
           NOTES
           gh release create "$tag" bbs-release.json --repo "$GITHUB_REPOSITORY" \

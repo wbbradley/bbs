@@ -29,14 +29,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=BBS_BUILD_DIRTY");
     let revision_override = std::env::var("BBS_BUILD_REVISION").ok();
     let dirty_override = std::env::var("BBS_BUILD_DIRTY").ok();
+    // A published package has no `.git`; Cargo records its commit in
+    // `.cargo_vcs_info.json` instead.
+    let checkout = git_revision();
+    let packaged = checkout.is_none().then(packaged_revision).flatten();
     let (revision, dirty) = identity::resolve(
         revision_override.as_deref(),
         dirty_override.as_deref(),
-        git_revision,
-        || {
-            let mut args = vec!["status", "--porcelain", "--untracked-files=no", "--"];
-            args.extend(INPUTS);
-            git(&args).map(|s| !s.is_empty())
+        || checkout.clone().or(packaged.as_ref().map(|(r, _)| r.clone())),
+        || match &packaged {
+            Some((_, dirty)) => Some(*dirty),
+            None => {
+                let mut args = vec!["status", "--porcelain", "--untracked-files=no", "--"];
+                args.extend(INPUTS);
+                git(&args).map(|s| !s.is_empty())
+            }
         },
     )?;
     println!("cargo:rustc-env=BBS_BUILD_REVISION={revision}");
@@ -72,6 +79,19 @@ fn git_revision() -> Option<String> {
         }
     }
     git(&["rev-parse", "--verify", "HEAD"])
+}
+
+/// The commit and dirty flag `cargo package` recorded, if this is a package.
+fn packaged_revision() -> Option<(String, bool)> {
+    let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
+    // Watch it only when present: Cargo treats a missing path as always changed.
+    let text = std::fs::read_to_string(dir.join(".cargo_vcs_info.json")).ok()?;
+    println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
+    let info: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let git = info.get("git")?;
+    let revision = git.get("sha1")?.as_str()?.to_string();
+    let dirty = git.get("dirty").and_then(|d| d.as_bool()).unwrap_or(false);
+    Some((revision, dirty))
 }
 
 fn git(args: &[&str]) -> Option<String> {

@@ -814,10 +814,7 @@ pub fn take_unread(
     let limit = limit.map_or(i64::MAX, i64::from);
     let msgs: Vec<MessageView> = conn
         .prepare(&sql)?
-        .query_map(
-            params![me.kind.as_str(), me.id, limit],
-            message_view,
-        )?
+        .query_map(params![me.kind.as_str(), me.id, limit], message_view)?
         .collect::<Result<_, _>>()?;
     let mut archive = conn.prepare(
         "UPDATE deliveries SET archived_at = ?1

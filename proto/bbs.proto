@@ -37,6 +37,9 @@ service Bbs {
   rpc GroupJoin(GroupRequest) returns (GroupJoinResponse);
   rpc GroupLeave(GroupRequest) returns (GroupResponse);
   rpc GroupRemove(GroupRemoveRequest) returns (GroupRemoveResponse);
+  // Add agents to a group, all or none. Humans only;
+  // requires group-add.v1.
+  rpc GroupAdd(GroupAddRequest) returns (GroupAddResponse);
   // Grant or revoke an agent's write on a group. Humans
   // only; requires group-writers.v1.
   rpc SetGroupWriter(SetGroupWriterRequest) returns (SetGroupWriterResponse);
@@ -119,6 +122,9 @@ message GroupResponse { string group = 1; }  // canonical name, no '@'
 message GroupJoinResponse { string group = 1; bool joined = 2; }  // joined=false: already a member
 message GroupRemoveRequest { string group = 1; string agent = 2; }
 message GroupRemoveResponse { string group = 1; string agent = 2; }  // canonical names
+message GroupAddRequest { string group = 1; repeated string agents = 2; }
+// Canonical names: newly added, and those that were already members.
+message GroupAddResponse { string group = 1; repeated string added = 2; repeated string already = 3; }
 message GroupListResponse { repeated Group groups = 1; }
 message Group {
   string name = 1;
