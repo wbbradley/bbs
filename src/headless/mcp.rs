@@ -159,7 +159,6 @@ impl Tools {
                         limit: None,
                         archived: true,
                         since: Some(parse_time("since", since, Utc::now())?),
-                        from_kind: None,
                     })
                     .await?;
                 let skip = r.messages.len().saturating_sub(limit);

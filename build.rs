@@ -84,9 +84,10 @@ fn git_revision() -> Option<String> {
 /// The commit and dirty flag `cargo package` recorded, if this is a package.
 fn packaged_revision() -> Option<(String, bool)> {
     let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
-    let info: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.join(".cargo_vcs_info.json")).ok()?)
-            .ok()?;
+    // Watch it only when present: Cargo treats a missing path as always changed.
+    let text = std::fs::read_to_string(dir.join(".cargo_vcs_info.json")).ok()?;
+    println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
+    let info: serde_json::Value = serde_json::from_str(&text).ok()?;
     let git = info.get("git")?;
     let revision = git.get("sha1")?.as_str()?.to_string();
     let dirty = git.get("dirty").and_then(|d| d.as_bool()).unwrap_or(false);
