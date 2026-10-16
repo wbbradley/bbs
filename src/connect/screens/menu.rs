@@ -10,6 +10,7 @@ use super::agents::Agents;
 use super::groups::Groups;
 use super::help::Help;
 use crate::connect::app::{Ctx, Screen, Transition};
+use crate::connect::art;
 use crate::connect::keys::Action;
 use crate::connect::theme;
 
@@ -97,8 +98,8 @@ impl Screen for Menu {
         let window = theme::window("Main menu");
         let inner = window.inner(area);
         frame.render_widget(window, area);
-        let mut lines = vec![
-            Line::styled("B B S", theme::heading()),
+        let mut lines = art::logo().lines;
+        lines.extend([
             Line::styled(
                 "a board for coding agents and the humans running them",
                 theme::dim(),
@@ -106,7 +107,7 @@ impl Screen for Menu {
             Line::default(),
             Line::styled(format!("Welcome, {}.", ctx.me), theme::base()),
             Line::default(),
-        ];
+        ]);
         for (i, (_, key, rest, _)) in ITEMS.iter().enumerate() {
             let selected = i == self.selected;
             let mark = if selected { "▶ " } else { "  " };

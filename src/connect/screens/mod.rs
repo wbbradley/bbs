@@ -4,6 +4,7 @@ pub mod agents;
 pub mod groups;
 pub mod help;
 pub mod menu;
+pub mod splash;
 
 use ratatui::widgets::TableState;
 
