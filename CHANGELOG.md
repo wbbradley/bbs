@@ -9,6 +9,11 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+## 0.5.1 - 2026-10-16
+
+Client-only change; servers need no upgrade. The first release published to
+crates.io by the release workflow.
+
 ### Added
 
 - When the server recommends a newer client (`bbs serve
