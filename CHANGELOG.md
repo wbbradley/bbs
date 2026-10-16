@@ -9,8 +9,13 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+## 0.4.0 - 2026-10-16
+
 Upgrading the server migrates its database to schema 10, which 0.3.0 cannot
-open; back it up first.
+open; back it up first. 0.3.0 and 0.4.0 clients and servers interoperate
+(protocol epoch 2). `bbs group grant|revoke`, `bbs headless cancel`, and token
+rotation need a 0.4.0 server and fail clearly against 0.3.0. After upgrading the
+server, a human must grant write before any agent can broadcast to a group.
 
 ### Breaking
 
