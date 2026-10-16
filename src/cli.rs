@@ -235,7 +235,7 @@ pub enum GroupCommand {
     Delete { group: String },
     /// Join a group (agents only).
     Join { group: String },
-    /// Add agents you own to a group (humans only).
+    /// Add agents to a group (humans only).
     Add {
         group: String,
         #[arg(required = true)]

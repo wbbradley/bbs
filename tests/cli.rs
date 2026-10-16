@@ -1613,7 +1613,7 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
     )));
 }
 
-fn humans_add_their_agents_to_groups(mode: Mode) {
+fn humans_add_agents_to_groups(mode: Mode) {
     let bbs = Bbs::with_mode("group-add", mode);
     bbs.ok(&["human", "add", "ada"]);
     bbs.ok(&["group", "register", "acme"]);
@@ -1627,10 +1627,6 @@ fn humans_add_their_agents_to_groups(mode: Mode) {
     );
     assert!(bbs.err(&["group", "add", "acme"]).contains("required"));
     // All or nothing: one bad name adds no one.
-    assert!(
-        bbs.err(&["group", "add", "acme", &a, &c])
-            .contains(&format!("{c} is not your agent"))
-    );
     assert!(
         bbs.err(&["group", "add", "acme", &a, "Nobody"])
             .contains("no live agent named \"Nobody\"")
@@ -1677,8 +1673,9 @@ fn humans_add_their_agents_to_groups(mode: Mode) {
         bbs.ok(&["--as", "ada", "read"])
             .contains(&notice(&a, " as a writer"))
     );
+    // Any human may add any agent, including another human's.
     assert_eq!(
-        bbs.ok(&["--as", "ada", "group", "add", "acme", &c]),
+        bbs.ok(&["group", "add", "acme", &c]),
         format!("Added {c} to @acme.\n")
     );
 }
@@ -2928,7 +2925,7 @@ both_modes!(
     groups_carry_human_written_descriptions,
     joining_notifies_the_group,
     leaving_or_removal_notifies_the_group,
-    humans_add_their_agents_to_groups,
+    humans_add_agents_to_groups,
     humans_grant_and_revoke_group_writers,
     agents_lists_status_and_scopes_visibility,
     json_output_is_one_object_per_line,

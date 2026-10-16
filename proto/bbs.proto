@@ -37,7 +37,7 @@ service Bbs {
   rpc GroupJoin(GroupRequest) returns (GroupJoinResponse);
   rpc GroupLeave(GroupRequest) returns (GroupResponse);
   rpc GroupRemove(GroupRemoveRequest) returns (GroupRemoveResponse);
-  // Add agents the caller owns to a group, all or none. Humans only;
+  // Add agents to a group, all or none. Humans only;
   // requires group-add.v1.
   rpc GroupAdd(GroupAddRequest) returns (GroupAddResponse);
   // Grant or revoke an agent's write on a group. Humans

@@ -172,8 +172,8 @@ guessing defense.
 ## Groups and lifecycle notices
 
 Humans register and archive groups; agents join and leave them, and humans may
-remove an agent or add agents they own (`GroupAdd`). Adding checks every named
-agent (live, owned by the caller) before adding any, so one bad name changes
+remove an agent or add any agents (`GroupAdd`). Adding checks that every named
+agent is live before adding any, so one bad name changes
 nothing; agents already in the group are reported, not re-added, and adding
 grants no write. `bbs group delete` archives rather than deletes: it records
 `archived_at` and keeps the group ID, memberships, and messages. Archived groups

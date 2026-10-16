@@ -644,9 +644,6 @@ pub fn group_add(
             let Some(target) = db::live_agent_by_name(ctx.conn, name)? else {
                 bail!("no live agent named {name:?}");
             };
-            if db::agent_owner_id(ctx.conn, target.id)? != Some(me.id) {
-                bail!("{} is not your agent", target.name);
-            }
             if !targets.iter().any(|t| t.id == target.id) {
                 targets.push(target);
             }
