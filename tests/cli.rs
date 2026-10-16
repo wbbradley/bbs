@@ -227,7 +227,7 @@ fn version_reports_identity_without_side_effects() {
             );
             assert_eq!(report["protocol"]["epoch"], 2);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
-            assert_eq!(report["schema_version"], 12);
+            assert_eq!(report["schema_version"], 13);
             assert_eq!(report["config_format"], 3);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {
@@ -773,9 +773,10 @@ fn remote_backend_round_trip() {
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
     bbs.grant_write("acme", &a);
     bbs.ok(&["--token", &ta, "read"]);
+    bbs.ok(&["--token", &ta, "send", "--to", "will", "hi"]);
     assert!(
-        bbs.err(&["--token", &ta, "send", "--to", "will", "hi"])
-            .contains("cannot message humans")
+        bbs.ok(&["read"])
+            .contains(&format!("from {a} to will:\nhi"))
     );
     bbs.ok(&["--token", &ta, "send", "--to", "@acme", "standup"]);
     assert!(bbs.ok(&["read"]).contains("standup"));
@@ -861,14 +862,17 @@ fn direct_messages_within_group(mode: Mode) {
     assert!(out.contains("hello there"), "{out}");
 }
 
-fn humans_message_agents_and_humans_but_agents_cannot_dm_humans(mode: Mode) {
+fn humans_and_agents_message_each_other(mode: Mode) {
     let bbs = Bbs::with_mode("human", mode);
     bbs.ok(&["human", "add", "alice"]);
     let (a, ta) = bbs.register();
+    // Any human, with no shared group; agents see humans to address.
+    bbs.ok(&["--token", &ta, "send", "--to", "alice", "need input"]);
     assert!(
-        bbs.err(&["--token", &ta, "send", "--to", "will", "need input"])
-            .contains("through your harness")
+        bbs.ok(&["--as", "alice", "read"])
+            .contains(&format!("from {a} to alice:\nneed input"))
     );
+    assert!(bbs.ok(&["--token", &ta, "agents"]).contains("alice"));
     bbs.ok(&["send", "--to", "alice", "lunch?"]);
     assert!(
         bbs.ok(&["--as", "alice", "read"])
@@ -1702,10 +1706,11 @@ fn agents_lists_status_and_scopes_visibility(mode: Mode) {
         "{seen_by_a}"
     );
     assert!(!seen_by_a.contains(&c), "{seen_by_a}");
+    // Agents may message any human, so they see them all.
     assert!(
         seen_by_a
             .lines()
-            .all(|l| l.split_whitespace().nth(1) != Some("human")),
+            .any(|l| l.split_whitespace().take(2).eq(["will", "human"])),
         "{seen_by_a}"
     );
     let seen_by_human = bbs.ok(&["agents"]);
@@ -3383,7 +3388,7 @@ both_modes!(
     cross_owner_messages_are_qualified_for_each_reader,
     init_is_idempotent,
     direct_messages_within_group,
-    humans_message_agents_and_humans_but_agents_cannot_dm_humans,
+    humans_and_agents_message_each_other,
     broadcast_reaches_members_and_humans,
     bye_retires_token_and_name,
     bye_notifies_and_leaves_groups,

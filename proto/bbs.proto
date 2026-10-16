@@ -48,6 +48,9 @@ service Bbs {
   rpc Send(SendRequest) returns (SendResponse);
   // Unread mail oldest first, archived as returned; or archived history.
   rpc Read(ReadRequest) returns (ReadResponse);
+  // Mark read the caller's unread mail from one sender; requires
+  // human-messages.v1.
+  rpc MarkRead(MarkReadRequest) returns (MarkReadResponse);
   // Block until unread mail exists, take it as Read would, stream it, end.
   // One waiter per inbox; a second fails immediately with "already running".
   rpc WaitForMail(WaitRequest) returns (stream Message);
@@ -271,6 +274,9 @@ message Timer {
   string next_run = 5;         // RFC 3339 UTC
   string body = 6;
 }
+
+message MarkReadRequest { string from = 1; }  // an agent or human name
+message MarkReadResponse { uint32 count = 1; }  // newly marked read
 
 message BindSessionRequest { string harness = 1; string session_id = 2; string token = 3; }
 message BindSessionResponse { Principal agent = 1; }

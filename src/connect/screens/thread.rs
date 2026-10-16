@@ -37,6 +37,8 @@ pub struct Thread {
     group: Option<(proto::Group, GroupAdmin)>,
     /// An agent thread's activity, while shown.
     activity: Option<ActivityPane>,
+    /// An agent thread's agent, whose mail to the human viewing marks read.
+    agent: Option<String>,
 }
 
 impl Thread {
@@ -55,6 +57,7 @@ impl Thread {
             composing: false,
             group: None,
             activity: None,
+            agent: None,
         }
     }
 
@@ -68,7 +71,9 @@ impl Thread {
             with: Some(agent.to_string()),
             ..Default::default()
         };
-        Thread::new(title, req, Some(agent))
+        let mut thread = Thread::new(title, req, Some(agent));
+        thread.agent = Some(agent.to_string());
+        thread
     }
 
     /// Broadcasts to `group`.
@@ -227,6 +232,22 @@ impl Screen for Thread {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn on_view(&mut self, ctx: &Ctx) -> Vec<Request> {
+        let Some(agent) = &self.agent else {
+            return Vec::new();
+        };
+        let unread = self.view.rows.iter().any(|m| {
+            m.read_at.is_none()
+                && m.from_name.eq_ignore_ascii_case(agent)
+                && m.to_name.as_deref() == Some(ctx.me.as_str())
+        });
+        if unread {
+            vec![Request::MarkRead(agent.clone())]
+        } else {
+            Vec::new()
         }
     }
 

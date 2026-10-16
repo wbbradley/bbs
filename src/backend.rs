@@ -28,6 +28,7 @@ const GROUP_ADD: &str = "group-add.v1";
 const AGENT_CONTROL: &str = "agent-control.v1";
 pub const AGENT_ACTIVITY: &str = "agent-activity.v1";
 pub const TIMERS: &str = "timers.v1";
+const HUMAN_MESSAGES: &str = "human-messages.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -382,6 +383,17 @@ impl Backend {
             Backend::Remote(r) => rpc!(r, post_activity, events, &[AGENT_ACTIVITY])
                 .map(|r| r.accepted)
                 .map_err(|e| missing_rpc(e, AGENT_ACTIVITY)),
+        }
+    }
+
+    pub async fn mark_read(
+        &mut self,
+        req: proto::MarkReadRequest,
+    ) -> Result<proto::MarkReadResponse> {
+        match self {
+            Backend::Local(l) => service::mark_read(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => rpc!(r, mark_read, req, &[HUMAN_MESSAGES])
+                .map_err(|e| missing_rpc(e, HUMAN_MESSAGES)),
         }
     }
 

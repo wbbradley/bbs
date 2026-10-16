@@ -22,6 +22,7 @@ pub const CAPABILITIES: &[&str] = &[
     "feed-with.v1",
     "agent-activity.v1",
     "timers.v1",
+    "human-messages.v1",
 ];
 const MAX_METADATA_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;
