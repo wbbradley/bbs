@@ -186,7 +186,7 @@ impl ActivityPane {
         }
         if self.records.is_empty() {
             let text = format!(
-                "{} shares no activity. A headless agent shares it only when its harness sets share_activity = true; see HEADLESS.md.",
+                "{} shares no activity yet. Headless agents share it unless their harness sets share_activity = false; see HEADLESS.md.",
                 self.agent
             );
             frame.render_widget(notice(text, theme::dim()), inner);

@@ -25,6 +25,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0011_activity.sql"),
     include_str!("../migrations/0012_timers.sql"),
     include_str!("../migrations/0013_human_dms.sql"),
+    include_str!("../migrations/0014_activity_seen.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +412,7 @@ pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
     conn.execute("DELETE FROM group_writers WHERE agent_id = ?1", params![id])?;
     conn.execute("DELETE FROM activity WHERE agent_id = ?1", params![id])?;
     conn.execute("DELETE FROM timers WHERE target_id = ?1", params![id])?;
+    conn.execute("DELETE FROM activity_seen WHERE agent_id = ?1", params![id])?;
     Ok(())
 }
 
@@ -812,6 +814,69 @@ pub fn mark_read_from(
            AND message_id IN (SELECT id FROM messages WHERE from_kind = ?4 AND from_id = ?5)",
         params![now, me.kind.as_str(), me.id, from.kind.as_str(), from.id],
     )?)
+}
+
+/// What a human has yet to look at from one agent.
+#[derive(Debug, PartialEq)]
+pub struct AgentSummary {
+    pub agent: String,
+    pub unread_messages: u32,
+    pub oldest_unread_message: Option<String>,
+    pub unseen_stream: u32,
+    pub oldest_unseen_stream: Option<String>,
+}
+
+/// For each live agent with any, the direct messages it sent `human` that are
+/// unread and the shared activity `human` has not seen. Broadcasts don't count:
+/// humans receive every one.
+pub fn agent_summaries(conn: &Connection, human: i64) -> Result<Vec<AgentSummary>> {
+    let mut stmt = conn.prepare_cached(
+        "WITH unread AS (
+             SELECT m.from_id AS agent_id, count(*) AS n, min(m.created_at) AS oldest
+             FROM deliveries d JOIN messages m ON m.id = d.message_id
+             WHERE d.recipient_kind = 'human' AND d.recipient_id = ?1
+               AND d.archived_at IS NULL AND d.direct = 1 AND m.from_kind = 'agent'
+             GROUP BY m.from_id),
+         unseen AS (
+             SELECT a.agent_id, count(*) AS n, min(a.created_at) AS oldest
+             FROM activity a
+             LEFT JOIN activity_seen s ON s.human_id = ?1 AND s.agent_id = a.agent_id
+             WHERE a.id > coalesce(s.seen_id, 0)
+             GROUP BY a.agent_id)
+         SELECT g.name, coalesce(u.n, 0), u.oldest, coalesce(v.n, 0), v.oldest
+         FROM agents g
+         LEFT JOIN unread u ON u.agent_id = g.id
+         LEFT JOIN unseen v ON v.agent_id = g.id
+         WHERE g.retired_at IS NULL AND (u.n IS NOT NULL OR v.n IS NOT NULL)
+         ORDER BY lower(g.name)",
+    )?;
+    let rows = stmt
+        .query_map([human], |r| {
+            Ok(AgentSummary {
+                agent: r.get(0)?,
+                unread_messages: r.get(1)?,
+                oldest_unread_message: r.get(2)?,
+                unseen_stream: r.get(3)?,
+                oldest_unseen_stream: r.get(4)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Record that `human` has seen `agent`'s activity through `through_id`, kept
+/// to the agent's newest activity so later records stay unseen. A cursor
+/// never moves back; returns whether it moved.
+pub fn mark_seen(conn: &Connection, human: i64, agent: i64, through_id: i64) -> Result<bool> {
+    let moved = conn.execute(
+        "INSERT INTO activity_seen (human_id, agent_id, seen_id)
+         SELECT ?1, ?2, min(?3, max(id)) FROM activity WHERE agent_id = ?2
+         HAVING max(id) IS NOT NULL
+         ON CONFLICT (human_id, agent_id) DO UPDATE SET seen_id = excluded.seen_id
+             WHERE excluded.seen_id > activity_seen.seen_id",
+        params![human, agent, through_id],
+    )?;
+    Ok(moved > 0)
 }
 
 pub fn has_unread(conn: &Connection, me: &Principal) -> Result<bool> {

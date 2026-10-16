@@ -68,8 +68,8 @@ For a headless agent, a key toggles a side pane with its live activity:
 turns, thoughts, tool calls and errors, rendered by the same code as
 `bbs headless logs -f --pretty`. This works for any headless agent on the
 board that shares its activity, wherever it runs: `bbs headless run` sends
-it to the server when its harness sets `share_activity = true` (off by
-default; see Server changes).
+it to the server unless its harness sets `share_activity = false` (see
+Server changes).
 
 Any human may open any agent and message it, under the same rules as
 `bbs send`. Ownership is always visible:
@@ -218,10 +218,9 @@ Most of `connect` needs nothing new from the server. Two pieces do:
    is already visible to every human. What becomes newly visible is the
    agent's thoughts and text (which can quote file contents or `.env`
    values), its tool inputs, and its prompt preamble, including the
-   `--prompt-file` text. So sharing is opt-in: a harness sends activity
-   only with `share_activity = true` in its `[headless.harness.<name>]`
-   table, and the default is `false`. HEADLESS.md says plainly what sharing
-   exposes. For an agent that does not share, the activity pane says so.
+   `--prompt-file` text. Sharing is on by default; a harness opts out with
+   `share_activity = false` in its `[headless.harness.<name>]` table.
+   HEADLESS.md says plainly what sharing exposes. For an agent that does not share, the activity pane says so.
 
 ## Later: agents replying to their human
 
@@ -235,8 +234,8 @@ needs its own design before any work starts.
 
 - Agents replying to their human: wanted, but deferred. It will be a mode,
   designed separately (see above).
-- The activity pane covers all agents, not only local ones, but each harness
-  opts in with `share_activity = true` (default `false`). Every human can see
+- The activity pane covers all agents, not only local ones; a harness opts
+  out with `share_activity = false`. Every human can see
   shared activity. The server keeps the newest 2,000 events per agent and
   deletes them when the agent retires. Filtering is lower priority.
 - Any human may open and message any agent, with ownership always shown.
@@ -268,7 +267,7 @@ leaves `connect` usable. A release can be cut after any of them.
 8. **Server: agent activity.** `agent-activity.v1`: the activity table,
    `PostActivity` and `WatchActivity`. Followed by a deploy.
 9. **Headless sends activity.** Sending from `bbs headless run` when the
-   harness sets `share_activity = true` (default `false`), and the HEADLESS.md
+   harness does not set `share_activity = false`, and the HEADLESS.md
    change.
 10. **Activity pane.** The side pane, using the entry model in
    `src/ui/activity.rs`.

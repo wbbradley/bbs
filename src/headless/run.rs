@@ -83,7 +83,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
 
     let mut log = Log::open(&agent_dir.log_path())?;
     let (share_warn, mut share_warnings) = mpsc::unbounded_channel();
-    let sharing = harness_config.share_activity.then(|| {
+    let sharing = harness_config.shares_activity().then(|| {
         let (queue, task) =
             share::start(config.clone(), dir.to_path_buf(), token.clone(), share_warn);
         log.share(queue);

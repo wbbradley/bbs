@@ -227,7 +227,7 @@ fn version_reports_identity_without_side_effects() {
             );
             assert_eq!(report["protocol"]["epoch"], 2);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
-            assert_eq!(report["schema_version"], 13);
+            assert_eq!(report["schema_version"], 14);
             assert_eq!(report["config_format"], 3);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {
@@ -2949,6 +2949,10 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
     let bbs = Bbs::with_mode("headless", mode);
     let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");
     headless_config(&bbs, &["python3", fake]);
+    let config = bbs.home.join(".config/bbs/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("share_activity = false\n");
+    std::fs::write(&config, text).unwrap();
     bbs.ok(&["group", "register", "crew"]);
     let (peer, tp) = bbs.register();
     bbs.ok(&["--token", &tp, "group", "join", "crew"]);
@@ -2977,7 +2981,7 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
     );
     let shown = bbs.ok(&["headless", "logs", "Zed"]);
     assert!(shown.contains("You are Zed"), "{shown}");
-    // Sharing is off unless the harness asks for it.
+    // This harness opts out of sharing.
     assert!(shared_activity(&bbs, "Zed").is_empty());
     assert!(shown.contains("text:\nthinking about"), "{shown}");
     assert!(shown.contains("permission:"), "{shown}");
@@ -3042,14 +3046,10 @@ fn shared_activity(bbs: &Bbs, agent: &str) -> Vec<String> {
         .unwrap()
 }
 
-fn headless_shares_activity_only_when_asked(mode: Mode) {
+fn headless_shares_activity_by_default(mode: Mode) {
     let bbs = Bbs::with_mode("share-activity", mode);
     let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");
     headless_config(&bbs, &["python3", fake]);
-    let config = bbs.home.join(".config/bbs/config.toml");
-    let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str("share_activity = true\n");
-    std::fs::write(&config, text).unwrap();
     bbs.ok(&["group", "register", "crew"]);
     let (_peer, tp) = bbs.register();
     bbs.ok(&["--token", &tp, "group", "join", "crew"]);
@@ -3421,7 +3421,7 @@ both_modes!(
     view_json_follow_emits_each_message_once,
     view_json_follow_survives_full_windows_and_bursts,
     headless_replies_through_tools_and_cancels,
-    headless_shares_activity_only_when_asked,
+    headless_shares_activity_by_default,
     headless_codex_replies_steers_and_interrupts,
     headless_stops_after_repeated_turn_errors,
     connect_is_for_humans_at_a_terminal,

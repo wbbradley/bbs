@@ -90,9 +90,15 @@ pub struct HarnessConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, String>,
     /// Send the agent's activity (its log records) to the server, where every
-    /// human can see it. Off unless set.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub share_activity: bool,
+    /// human can see it. On unless set to false; see `shares_activity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_activity: Option<bool>,
+}
+
+impl HarnessConfig {
+    pub fn shares_activity(&self) -> bool {
+        self.share_activity.unwrap_or(true)
+    }
 }
 
 impl Settings {
@@ -166,6 +172,17 @@ mod tests {
 
     fn parse(text: &str) -> Result<Settings> {
         Ok(toml::from_str::<Config>(text)?.headless.unwrap_or_default())
+    }
+
+    #[test]
+    fn activity_is_shared_unless_a_harness_opts_out() {
+        let s = parse(
+            "[headless.harness.open]\ncommand = [\"a\"]\n\
+             [headless.harness.private]\ncommand = [\"b\"]\nshare_activity = false\n",
+        )
+        .unwrap();
+        assert!(s.harness(Some("open")).unwrap().1.shares_activity());
+        assert!(!s.harness(Some("private")).unwrap().1.shares_activity());
     }
 
     #[test]

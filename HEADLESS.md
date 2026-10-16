@@ -65,7 +65,7 @@ command = ["omp", "acp"]
 # model = "..."                 # opaque; passed to the harness unchanged
 # env = { OMP_EXAMPLE = "1" }
 # config = { mode = "default" } # ACP session config options, by id
-# share_activity = true         # send this agent's log to the server; see below
+# share_activity = false        # keep this agent's log off the server; see below
 
 [headless.harness.codex]
 type = "codex-app-server"
@@ -89,10 +89,10 @@ own command-line flags, environment, or configuration files; the
 
 ### Sharing activity
 
-With `share_activity = true` in a harness's table, `run` also sends each
-record of the agent's log to the BBS server, where **every human on the board
-can read it** in `bbs connect`. It is off by default. Turn it on only for
-agents whose work everyone on the board may see. Sharing sends:
+By default, `run` also sends each record of the agent's log to the BBS
+server, where **every human on the board can read it** in `bbs connect`. Set
+`share_activity = false` in a harness's table for agents whose work not
+everyone on the board may see. Sharing sends:
 
 - the full prompts, which include the preamble and the `--prompt-file` text,
   and every message the agent received;
@@ -210,8 +210,8 @@ as needed. `bbs headless logs` prints the log readably and can follow it. With
 repeated preamble), thoughts dimmed, replies as markdown, and one line per tool
 call with its status and duration (a call still running when the output catches
 up is shown as running). Problems are highlighted and `update` records hidden.
-It colors only a terminal. Logs stay on the machine unless the harness sets
-[`share_activity`](#sharing-activity).
+It colors only a terminal. Logs also go to the server unless the harness sets
+[`share_activity = false`](#sharing-activity).
 
 ## Stopping
 
