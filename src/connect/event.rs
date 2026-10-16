@@ -31,6 +31,11 @@ pub enum Request {
         id: u64,
         req: proto::FeedRequest,
     },
+    /// Stream agent activity, replacing any stream with the same id.
+    WatchActivity {
+        id: u64,
+        req: proto::ActivityRequest,
+    },
     /// Stop a stream.
     Unwatch(u64),
     /// Send a message for the screen `id`.
@@ -64,6 +69,11 @@ pub enum Data {
     Feed {
         id: u64,
         result: Result<Vec<proto::Message>, String>,
+    },
+    /// A batch of the activity stream `id`. A stream ends after an error.
+    Activity {
+        id: u64,
+        result: Result<Vec<proto::Activity>, String>,
     },
     /// The outcome of a send for the screen `id`.
     Sent {
@@ -156,6 +166,13 @@ pub async fn serve(
                 }
                 continue;
             }
+            Request::WatchActivity { id, req } => {
+                let task = tokio::spawn(watch_activity(opener.clone(), id, req, tx.clone()));
+                if let Some(old) = streams.insert(id, task) {
+                    old.abort();
+                }
+                continue;
+            }
             Request::Unwatch(id) => {
                 if let Some(task) = streams.remove(&id) {
                     task.abort();
@@ -239,5 +256,29 @@ async fn watch(opener: Opener, id: u64, req: proto::FeedRequest, tx: UnboundedSe
     if let Err(e) = result {
         let result = Err(format!("{e:#}"));
         let _ = tx.send(Event::Data(Data::Feed { id, result }));
+    }
+}
+
+/// Stream activity `id` until it fails or the app goes away.
+async fn watch_activity(
+    opener: Opener,
+    id: u64,
+    req: proto::ActivityRequest,
+    tx: UnboundedSender<Event>,
+) {
+    let result: anyhow::Result<()> = async {
+        let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller).await?;
+        let mut activity = backend.watch_activity(req).await?;
+        loop {
+            let result = Ok(activity.next().await?);
+            if tx.send(Event::Data(Data::Activity { id, result })).is_err() {
+                return Ok(());
+            }
+        }
+    }
+    .await;
+    if let Err(e) = result {
+        let result = Err(format!("{e:#}"));
+        let _ = tx.send(Event::Data(Data::Activity { id, result }));
     }
 }

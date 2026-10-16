@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::db;
 use crate::proto::{self, bbs_client::BbsClient};
 use crate::protocol;
-use crate::service::{self, Caller};
+use crate::service::{self, Caller, Watched};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
@@ -431,14 +431,7 @@ impl Backend {
         require_filter: bool,
     ) -> Result<FeedWatch<'_>> {
         Ok(match self {
-            Backend::Local(local) => FeedWatch::Local {
-                local,
-                req,
-                seen: None,
-                next_poll: tokio::time::Instant::now(),
-                drain: false,
-                sent: false,
-            },
+            Backend::Local(local) => Watch::local(local, req),
             Backend::Remote(r) => {
                 let capabilities: &[&str] = if req.with.is_some() {
                     &["owner-attribution.v1", "feed-filter.v1", "feed-with.v1"]
@@ -447,8 +440,23 @@ impl Backend {
                 } else {
                     &["owner-attribution.v1"]
                 };
-                FeedWatch::Remote(rpc!(r, watch_feed, req, capabilities)?)
+                Watch::Remote(rpc!(r, watch_feed, req, capabilities)?)
             }
+        })
+    }
+
+    /// Watch agent activity (humans only), as `watch_feed` watches messages.
+    /// A server needs `agent-activity.v1`.
+    pub async fn watch_activity(
+        &mut self,
+        req: proto::ActivityRequest,
+    ) -> Result<ActivityWatch<'_>> {
+        Ok(match self {
+            Backend::Local(local) => Watch::local(local, req),
+            Backend::Remote(r) => Watch::Remote(
+                rpc!(r, watch_activity, req, &[AGENT_ACTIVITY])
+                    .map_err(|e| missing_rpc(e, AGENT_ACTIVITY))?,
+            ),
         })
     }
 
@@ -485,14 +493,18 @@ fn feed_filtered(req: &proto::FeedRequest) -> bool {
         || req.after_id.is_some()
 }
 
-pub enum FeedWatch<'a> {
+pub type FeedWatch<'a> = Watch<'a, proto::FeedRequest>;
+pub type ActivityWatch<'a> = Watch<'a, proto::ActivityRequest>;
+
+/// A watched query's snapshots: the feed's, or agent activity's.
+pub enum Watch<'a, R: Watched> {
     /// Polls `data_version`, which changes only when another connection
     /// commits, and re-fetches after a change. In cursor mode it behaves like
     /// the server: it fetches again at once after a full batch and skips empty
     /// batches after the first.
     Local {
         local: &'a mut Local,
-        req: proto::FeedRequest,
+        req: R,
         seen: Option<i64>,
         /// Kept across calls, so a cancelled `next` does not poll early.
         next_poll: tokio::time::Instant,
@@ -502,14 +514,28 @@ pub enum FeedWatch<'a> {
         sent: bool,
     },
     /// The server pushes a snapshot after every change (or cursor batch).
-    Remote(tonic::Streaming<proto::FeedSnapshot>),
+    Remote(tonic::Streaming<R::Snapshot>),
 }
 
-impl FeedWatch<'_> {
+impl<'a, R: Watched> Watch<'a, R> {
+    fn local(local: &'a mut Local, req: R) -> Watch<'a, R> {
+        Watch::Local {
+            local,
+            req,
+            seen: None,
+            next_poll: tokio::time::Instant::now(),
+            drain: false,
+            sent: false,
+        }
+    }
+
     /// The next snapshot. Cancel-safe: dropping the future loses nothing.
-    pub async fn next(&mut self) -> Result<Vec<proto::Message>> {
+    async fn snapshot(&mut self) -> Result<R::Snapshot>
+    where
+        R::Snapshot: prost::Message + Default,
+    {
         match self {
-            FeedWatch::Local {
+            Watch::Local {
                 local,
                 req,
                 seen,
@@ -526,19 +552,31 @@ impl FeedWatch<'_> {
                     }
                     *seen = Some(version);
                 }
-                let snapshot = service::feed(&mut local.conn, &local.caller, req.clone())?;
-                *drain = service::advance_feed_cursor(req, &snapshot);
-                if req.after_id.is_some() && snapshot.messages.is_empty() && *sent {
+                let snapshot = R::fetch(&mut local.conn, &local.caller, req.clone())?;
+                *drain = req.advance(&snapshot);
+                if req.has_cursor() && R::is_empty(&snapshot) && *sent {
                     continue;
                 }
                 *sent = true;
-                return Ok(snapshot.messages);
+                return Ok(snapshot);
             },
-            FeedWatch::Remote(stream) => match stream.message().await.map_err(status_error)? {
-                Some(snapshot) => Ok(snapshot.messages),
-                None => bail!("the server closed the feed"),
+            Watch::Remote(stream) => match stream.message().await.map_err(status_error)? {
+                Some(snapshot) => Ok(snapshot),
+                None => bail!("the server closed the stream"),
             },
         }
+    }
+}
+
+impl FeedWatch<'_> {
+    pub async fn next(&mut self) -> Result<Vec<proto::Message>> {
+        Ok(self.snapshot().await?.messages)
+    }
+}
+
+impl ActivityWatch<'_> {
+    pub async fn next(&mut self) -> Result<Vec<proto::Activity>> {
+        Ok(self.snapshot().await?.events)
     }
 }
 

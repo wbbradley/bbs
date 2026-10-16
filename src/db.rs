@@ -1303,16 +1303,21 @@ pub fn post_activity(
 }
 
 /// The newest `limit` events, oldest first; with `after`, the oldest `limit`
-/// events after that id.
+/// events after that id. With `agents`, only theirs.
 pub fn activity_page(
     conn: &Connection,
     limit: u32,
     after: Option<i64>,
+    agents: Option<&[i64]>,
 ) -> Result<Vec<ActivityRow>> {
-    let (filter, order) = match after {
-        Some(_) => ("a.id > ?2", "ASC"),
-        None => ("?2 IS NULL", "DESC"),
+    let (mut filter, order) = match after {
+        Some(_) => ("a.id > ?2".to_string(), "ASC"),
+        None => ("?2 IS NULL".to_string(), "DESC"),
     };
+    if let Some(agents) = agents {
+        let ids: Vec<String> = agents.iter().map(i64::to_string).collect();
+        filter.push_str(&format!(" AND a.agent_id IN ({})", ids.join(", ")));
+    }
     let sql = format!(
         "SELECT a.id, a.created_at, ag.name, h.name, a.record
          FROM activity a
@@ -1375,7 +1380,7 @@ mod tests {
         };
         // Mateo's oldest five went; Zed's are untouched.
         assert_eq!((count(1), count(2)), (ACTIVITY_PER_AGENT, 3));
-        let oldest = activity_page(&conn, 1, Some(0)).unwrap();
+        let oldest = activity_page(&conn, 1, Some(0), None).unwrap();
         assert_eq!(oldest[0].record, "zed0");
         let mateo_oldest: String = conn
             .query_row(
@@ -1385,7 +1390,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mateo_oldest, "a5");
-        let newest = activity_page(&conn, 2, None).unwrap();
+        let newest = activity_page(&conn, 2, None, None).unwrap();
+        let zed = activity_page(&conn, 10, None, Some(&[2])).unwrap();
+        let records: Vec<_> = zed.iter().map(|r| r.record.as_str()).collect();
+        assert_eq!(records, ["zed0", "zed1", "zed2"]);
         let records: Vec<_> = newest.iter().map(|r| r.record.as_str()).collect();
         assert_eq!(records, ["b3", "b4"]);
         retire_agent(&conn, 1, "t").unwrap();

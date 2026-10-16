@@ -58,6 +58,8 @@ pub trait Screen {
         Vec::new()
     }
     fn on_data(&mut self, _data: &Data) {}
+    /// Before a reload re-sends `requests`: drop what they will send again.
+    fn reload(&mut self) {}
     /// What to stop when the screen closes.
     fn on_close(&self) -> Vec<Request> {
         Vec::new()
@@ -144,7 +146,8 @@ impl App {
                 return false;
             }
             Action::Reload => {
-                let screen = self.stack.pop().expect("the menu is never popped");
+                let mut screen = self.stack.pop().expect("the menu is never popped");
+                screen.reload();
                 self.fetch(screen.as_ref());
                 self.stack.push(screen);
                 return false;
@@ -836,5 +839,104 @@ mod tests {
         assert!(!screen(&mut app, 80, 24).contains("a menu item's hot key"));
         key(&mut app, 'G');
         assert!(screen(&mut app, 80, 24).contains("a menu item's hot key"));
+    }
+
+    fn activity(id: i64, record: &str) -> proto::Activity {
+        proto::Activity {
+            id,
+            created_at: "2026-10-16T18:00:00.000000Z".into(),
+            agent: "Mateo".into(),
+            owner: Some("ada".into()),
+            record: record.into(),
+        }
+    }
+
+    #[test]
+    fn the_activity_pane_shows_what_the_agent_shares() {
+        let (mut app, mut rx) = app();
+        let thread = mateo(&mut app, &mut rx);
+        key(&mut app, 'A');
+        let Request::WatchActivity { id, req } = rx.try_recv().unwrap() else {
+            panic!("expected an activity watch");
+        };
+        assert_ne!(id, thread);
+        assert_eq!(
+            req,
+            proto::ActivityRequest {
+                backlog: 200,
+                after_id: Some(0),
+                agent: Some("Mateo".into()),
+            }
+        );
+        let out = screen(&mut app, 100, 24);
+        assert!(
+            out.contains("Activity · A hides") && out.contains("Loading…"),
+            "{out}"
+        );
+        app.on_event(Event::Data(Data::Activity {
+            id,
+            result: Ok(vec![
+                activity(1, r#"{"ts":"2026-10-16T18:00:00.000000Z","event":"text","text":"working on the **build**"}"#),
+                activity(2, r#"{"ts":"2026-10-16T18:00:01.000000Z","event":"tool","id":"t1","title":"cargo test","status":"in_progress"}"#),
+            ]),
+        }));
+        let out = screen(&mut app, 100, 24);
+        assert!(out.contains("working on the build"), "{out}");
+        assert!(out.contains("running"), "{out}");
+        // The thread keeps its place beside the pane.
+        assert!(out.contains("i: write to Mateo"), "{out}");
+
+        // A reload starts both streams over, and the pane empties first.
+        key(&mut app, 'r');
+        assert!(matches!(rx.try_recv().unwrap(), Request::Watch { .. }));
+        assert!(
+            matches!(rx.try_recv().unwrap(), Request::WatchActivity { id: again, .. } if again == id)
+        );
+        assert!(screen(&mut app, 100, 24).contains("Loading…"));
+
+        // A hides it and stops its stream; closing the thread stops the rest.
+        key(&mut app, 'A');
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
+        assert!(!screen(&mut app, 100, 24).contains("Activity · A hides"));
+        key(&mut app, 'A');
+        let Request::WatchActivity { id, .. } = rx.try_recv().unwrap() else {
+            panic!("expected an activity watch");
+        };
+        key(&mut app, 'q');
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(thread));
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
+    }
+
+    #[test]
+    fn the_pane_says_when_nothing_is_shared_or_the_server_is_old() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        key(&mut app, 'A');
+        let Request::WatchActivity { id, .. } = rx.try_recv().unwrap() else {
+            panic!("expected an activity watch");
+        };
+        app.on_event(Event::Data(Data::Activity {
+            id,
+            result: Ok(Vec::new()),
+        }));
+        let out = screen(&mut app, 100, 24);
+        assert!(out.contains("Mateo shares no activity"), "{out}");
+        assert!(out.contains("share_activity = true"), "{out}");
+        app.on_event(Event::Data(Data::Activity {
+            id,
+            result: Err("required capability agent-activity.v1 is unavailable".into()),
+        }));
+        let out = screen(&mut app, 100, 24);
+        assert!(out.contains("needs a newer server"), "{out}");
+    }
+
+    #[test]
+    fn only_agent_threads_have_activity() {
+        let (mut app, mut rx) = app();
+        key(&mut app, 'f');
+        watched(&mut rx);
+        key(&mut app, 'A');
+        assert!(rx.try_recv().is_err());
+        assert!(!screen(&mut app, 80, 24).contains("Activity"));
     }
 }

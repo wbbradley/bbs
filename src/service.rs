@@ -1208,7 +1208,22 @@ pub fn activity(
                 req.backlog
             );
         }
-        let events = db::activity_page(ctx.conn, req.backlog, req.after_id)?
+        let agents = req
+            .agent
+            .as_deref()
+            .map(|name| {
+                let ids: Vec<i64> = db::principals_named(ctx.conn, name)?
+                    .into_iter()
+                    .filter(|(kind, _)| *kind == db::Kind::Agent)
+                    .map(|(_, id)| id)
+                    .collect();
+                if ids.is_empty() {
+                    bail!("no agent named {name:?}");
+                }
+                Ok(ids)
+            })
+            .transpose()?;
+        let events = db::activity_page(ctx.conn, req.backlog, req.after_id, agents.as_deref())?
             .into_iter()
             .map(|r| proto::Activity {
                 id: r.id,
@@ -1234,6 +1249,50 @@ pub fn advance_activity_cursor(
         *after = last.id;
     }
     sent.events.len() >= req.backlog as usize
+}
+
+/// A query a watch stream re-runs: a window of the newest rows, or a cursor
+/// that moves past each batch it sends.
+pub trait Watched: Clone + Send + Sync + 'static {
+    type Snapshot: Send + 'static;
+    fn fetch(conn: &mut Connection, caller: &Caller, req: Self) -> Result<Self::Snapshot>;
+    /// Move a cursor past `sent`; `true` when the batch was full, so more may
+    /// be waiting.
+    fn advance(&mut self, sent: &Self::Snapshot) -> bool;
+    fn has_cursor(&self) -> bool;
+    fn is_empty(snapshot: &Self::Snapshot) -> bool;
+}
+
+impl Watched for proto::FeedRequest {
+    type Snapshot = proto::FeedSnapshot;
+    fn fetch(conn: &mut Connection, caller: &Caller, req: Self) -> Result<Self::Snapshot> {
+        feed(conn, caller, req)
+    }
+    fn advance(&mut self, sent: &Self::Snapshot) -> bool {
+        advance_feed_cursor(self, sent)
+    }
+    fn has_cursor(&self) -> bool {
+        self.after_id.is_some()
+    }
+    fn is_empty(snapshot: &Self::Snapshot) -> bool {
+        snapshot.messages.is_empty()
+    }
+}
+
+impl Watched for proto::ActivityRequest {
+    type Snapshot = proto::ActivitySnapshot;
+    fn fetch(conn: &mut Connection, caller: &Caller, req: Self) -> Result<Self::Snapshot> {
+        activity(conn, caller, req)
+    }
+    fn advance(&mut self, sent: &Self::Snapshot) -> bool {
+        advance_activity_cursor(self, sent)
+    }
+    fn has_cursor(&self) -> bool {
+        self.after_id.is_some()
+    }
+    fn is_empty(snapshot: &Self::Snapshot) -> bool {
+        snapshot.events.is_empty()
+    }
 }
 
 // ---- harness sessions ------------------------------------------------------
