@@ -48,6 +48,8 @@ pub enum HarnessType {
     /// An Agent Client Protocol agent.
     #[default]
     Acp,
+    /// Codex's app-server, which can steer a running turn.
+    CodexAppServer,
 }
 
 impl HarnessType {
@@ -66,7 +68,9 @@ pub struct HarnessConfig {
         skip_serializing_if = "HarnessType::is_default"
     )]
     pub kind: HarnessType,
-    /// Program and arguments, for example `["omp", "acp"]`.
+    /// Program and arguments, for example `["omp", "acp"]`. Codex defaults to
+    /// `["codex", "app-server"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     /// Extra environment for the subprocess.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -74,6 +78,9 @@ pub struct HarnessConfig {
     /// Opaque model value for the session's `model` config option.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Codex only: the model provider, from Codex's own configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Other ACP session config options, by id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, String>,
@@ -105,16 +112,34 @@ impl Settings {
                 config::path()?.display()
             ),
         };
-        let Some(config) = self.harnesses.get(&name) else {
+        let Some(mut config) = self.harnesses.get(&name).cloned() else {
             bail!(
                 "no harness named {name:?}; add [headless.harness.{name}] to {}",
                 config::path()?.display()
             );
         };
+        match config.kind {
+            HarnessType::Acp => {
+                if config.provider.is_some() {
+                    bail!("harness {name:?}: `provider` is for codex-app-server harnesses");
+                }
+            }
+            HarnessType::CodexAppServer => {
+                if !config.config.is_empty() {
+                    bail!(
+                        "harness {name:?}: codex-app-server takes no `config`; \
+                         set Codex options in Codex's own configuration"
+                    );
+                }
+                if config.command.is_empty() {
+                    config.command = vec!["codex".into(), "app-server".into()];
+                }
+            }
+        }
         if config.command.is_empty() {
             bail!("harness {name:?} has an empty command");
         }
-        Ok((name, config.clone()))
+        Ok((name, config))
     }
 
     pub fn min_turn_interval(&self) -> Result<Duration> {
@@ -177,6 +202,29 @@ env = { RUST_LOG = "warn" }
         let s = parse("[headless.harness.omp]\ncommand = [\"omp\", \"acp\"]\n").unwrap();
         assert_eq!(s.harness(None).unwrap().0, "omp");
         assert_eq!(s.min_turn_interval().unwrap(), DEFAULT_MIN_TURN_INTERVAL);
+    }
+
+    #[test]
+    fn codex_harness_defaults_its_command() {
+        let s = parse(
+            "[headless.harness.codex]\ntype = \"codex-app-server\"\nmodel = \"m\"\nprovider = \"p\"\n",
+        )
+        .unwrap();
+        let (_, codex) = s.harness(None).unwrap();
+        assert_eq!(codex.kind, HarnessType::CodexAppServer);
+        assert_eq!(codex.command, ["codex", "app-server"]);
+        assert_eq!(codex.provider.as_deref(), Some("p"));
+        let acp_provider = parse("[headless.harness.omp]\ncommand = [\"omp\"]\nprovider = \"p\"\n");
+        assert!(acp_provider.unwrap().harness(None).is_err());
+        let codex_config =
+            parse("[headless.harness.c]\ntype = \"codex-app-server\"\nconfig = { a = \"b\" }\n");
+        assert!(codex_config.unwrap().harness(None).is_err());
+        assert!(
+            parse("[headless.harness.omp]\n")
+                .unwrap()
+                .harness(None)
+                .is_err()
+        );
     }
 
     #[test]

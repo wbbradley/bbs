@@ -83,6 +83,11 @@ impl Pretty {
                 self.line(&mut out, &header, Style::new().fg(Color::Cyan).bold());
                 self.block(&mut out, mail_part(text), Style::new());
             }
+            "steer" => {
+                let line = format!("{time} mail steered into the turn:");
+                self.line(&mut out, &line, Style::new().fg(Color::Cyan));
+                self.block(&mut out, mail_part(text), Style::new());
+            }
             "thought" => {
                 for line in text.trim_end().lines() {
                     let line = format!("│ {line}");

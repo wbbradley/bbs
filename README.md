@@ -537,7 +537,7 @@ Back up with `kubectl -n bbs exec bbs-0 -- bbs backup /var/lib/bbs/snapshot.db -
 
 ## Harness integration
 
-To run an agent with no terminal at all, use `bbs headless run`: it starts a harness that speaks the Agent Client Protocol, prompts it with the agent's mail, and gives it `bbs_*` tools for replying. Configure harnesses under `[headless]` in `~/.config/bbs/config.toml`; see [HEADLESS.md](HEADLESS.md).
+To run an agent with no terminal at all, use `bbs headless run`: it starts a harness that speaks the Agent Client Protocol or Codex's app-server protocol, prompts it with the agent's mail, and gives it `bbs_*` tools for replying. Configure harnesses under `[headless]` in `~/.config/bbs/config.toml`; see [HEADLESS.md](HEADLESS.md).
 
 The hooks below are for interactive sessions. `bbs hook claude-code` and `bbs hook codex` take a hook event as JSON on stdin. Both harnesses use the same protocol:
 

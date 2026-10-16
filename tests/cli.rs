@@ -2807,6 +2807,75 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
     });
 }
 
+fn headless_codex_replies_steers_and_interrupts(mode: Mode) {
+    let bbs = Bbs::with_mode("codex-app-server", mode);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_codex.py");
+    let dir = bbs.home.join(".config/bbs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[headless]\nmin_turn_interval = \"0s\"\n[headless.harness.codex]\n\
+             type = \"codex-app-server\"\ncommand = [\"python3\", {fake:?}]\n\
+             provider = \"fakeprovider\"\n"
+        ),
+    )
+    .unwrap();
+    bbs.ok(&["group", "register", "crew"]);
+    let (peer, tp) = bbs.register();
+    bbs.ok(&["--token", &tp, "group", "join", "crew"]);
+    let run = RunGuard::start(&bbs, "Zed");
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    let log_has = |what: &str, needle: &str| {
+        eventually(what, || {
+            std::fs::read_to_string(&log)
+                .ok()
+                .filter(|l| l.contains(needle))
+        })
+    };
+    log_has("the session", "\"event\":\"session\"");
+    let tz = headless_state(&bbs, "Zed")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    bbs.ok(&["--token", &tz, "group", "join", "crew"]);
+    let mut seen = String::new();
+    let mut reply = |needle: &str| {
+        eventually("the reply", || {
+            seen.push_str(&bbs.ok(&["--token", &tp, "read"]));
+            seen.contains(needle).then(|| seen.clone())
+        })
+    };
+
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "hello"]);
+    let got = reply("echo");
+    assert!(got.contains(&format!("from Zed to {peer}:\necho")), "{got}");
+
+    // Mail that arrives during a turn joins it.
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "WAITSTEER"]);
+    // Steering needs the turn's id, which bbs has once the turn's first item is logged.
+    log_has("the steerable turn", "\"title\":\"waiting-steer\"");
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "and this"]);
+    let got = reply("steered: and this");
+    assert!(got.contains("steered: and this"), "{got}");
+    log_has("the steer", "\"event\":\"steer\"");
+
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "WAITCANCEL"]);
+    log_has("the cancellable turn", "\"title\":\"waiting-cancel\"");
+    bbs.ok(&["headless", "cancel", "Zed"]);
+    log_has("the interrupted turn", "\"stop_reason\":\"interrupted\"");
+
+    let out = run.stop();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = bbs.ok(&["headless", "logs", "Zed"]);
+    assert!(shown.contains("text:\nthinking"), "{shown}");
+    assert!(!shown.contains("turn_error"), "{shown}");
+}
+
 fn control_messages_are_for_owned_agents_only(mode: Mode) {
     let bbs = Bbs::with_mode("control", mode);
     bbs.ok(&["human", "add", "alice"]);
@@ -2971,6 +3040,7 @@ both_modes!(
     view_json_follow_emits_each_message_once,
     view_json_follow_survives_full_windows_and_bursts,
     headless_replies_through_tools_and_cancels,
+    headless_codex_replies_steers_and_interrupts,
     control_messages_are_for_owned_agents_only,
     headless_run_takes_over_an_owned_agent,
     headless_signals_during_setup_stop_the_harness,
