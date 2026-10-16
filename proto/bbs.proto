@@ -37,9 +37,9 @@ service Bbs {
   rpc GroupJoin(GroupRequest) returns (GroupJoinResponse);
   rpc GroupLeave(GroupRequest) returns (GroupResponse);
   rpc GroupRemove(GroupRemoveRequest) returns (GroupRemoveResponse);
-  // Grant or revoke one access bit of a group member. Humans only; requires
-  // group-acl.v1.
-  rpc GroupAccess(GroupAccessRequest) returns (GroupAccessResponse);
+  // Grant or revoke write on a group for an agent's owner and name. Humans
+  // only; requires group-writers.v1.
+  rpc SetGroupWriter(SetGroupWriterRequest) returns (SetGroupWriterResponse);
   rpc GroupList(Empty) returns (GroupListResponse);
 
   rpc Send(SendRequest) returns (SendResponse);
@@ -124,28 +124,18 @@ message Group {
   string name = 1;
   repeated string members = 2;
   optional string description = 3;  // absent when unset or from older servers
-  optional MemberAccess access = 4;  // absent from servers without group-acl.v1
+  optional GroupWriters writers = 4;  // absent from servers without group-writers.v1
 }
-// Members with each bit: readers receive what is addressed to the group, and
-// only writers (and humans) may broadcast to it.
-message MemberAccess {
-  repeated string readers = 1;
-  repeated string writers = 2;
-}
+// Members that may broadcast to the group (humans always may).
+message GroupWriters { repeated string names = 1; }
 
-enum GroupAccessBit {
-  GROUP_ACCESS_BIT_UNSPECIFIED = 0;
-  GROUP_ACCESS_BIT_READ = 1;
-  GROUP_ACCESS_BIT_WRITE = 2;
-}
-message GroupAccessRequest {
+message SetGroupWriterRequest {
   string group = 1;
   string agent = 2;
-  GroupAccessBit access = 3;
-  bool grant = 4;  // false revokes
+  bool grant = 3;  // false revokes
 }
-// changed=false: the member already had that access
-message GroupAccessResponse { string group = 1; string agent = 2; bool changed = 3; }
+// changed=false: the agent already had (or lacked) write
+message SetGroupWriterResponse { string group = 1; string agent = 2; bool changed = 3; }
 
 // A control message asks a headless agent's driver to act; `body` describes
 // it for clients that only show text. Requires agent-control.v1.

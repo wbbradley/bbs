@@ -657,42 +657,40 @@ pub fn group_remove(
     })
 }
 
-pub fn group_access(
+pub fn set_group_writer(
     conn: &mut Connection,
     caller: &Caller,
-    req: proto::GroupAccessRequest,
-) -> Result<proto::GroupAccessResponse> {
+    req: proto::SetGroupWriterRequest,
+) -> Result<proto::SetGroupWriterResponse> {
     with_ctx(conn, caller, |ctx| {
         let me = ctx.human()?;
-        let access = match req.access() {
-            proto::GroupAccessBit::Read => db::Access::Read,
-            proto::GroupAccessBit::Write => db::Access::Write,
-            proto::GroupAccessBit::Unspecified => bail!("access must be read or write"),
-        };
         let group = group_name(&req.group);
         let gid = require_group(ctx.conn, group)?;
         let Some(target) = db::live_agent_by_name(ctx.conn, &req.agent)? else {
             bail!("no live agent named {:?}", req.agent);
         };
-        if !db::is_member(ctx.conn, gid, target.id)? {
+        // Revoking needs no membership, so a grant can be removed after the
+        // agent leaves.
+        if req.grant && !db::is_member(ctx.conn, gid, target.id)? {
             bail!("{} is not in @{group}", target.name);
         }
-        let changed = db::set_member_access(ctx.conn, gid, target.id, access, req.grant)?;
+        if req.grant && db::agent_owner_id(ctx.conn, target.id)?.is_none() {
+            bail!(
+                "{} has no owning human, so it cannot be granted write",
+                target.name
+            );
+        }
+        let changed = db::set_writer(ctx.conn, gid, target.id, req.grant, &ctx.now_s)?;
         if changed {
-            // Announced after the change, so a member losing read does not
-            // receive it and one gaining read does.
             let notice = if req.grant {
                 format!(
-                    "Human {:?} granted {} on @{group} to agent {:?}.",
-                    me.name,
-                    access.as_str(),
-                    target.name
+                    "Human {:?} granted write on @{group} to agent {:?}.",
+                    me.name, target.name
                 )
             } else {
                 format!(
-                    "Human {:?} revoked {} on @{group} from agent {:?}.{}",
+                    "Human {:?} revoked write on @{group} from agent {:?}.{}",
                     me.name,
-                    access.as_str(),
                     target.name,
                     no_writers_left(ctx, gid, group)?
                 )
@@ -701,13 +699,12 @@ pub fn group_access(
             tracing::info!(
                 agent = target.name,
                 group,
-                access = access.as_str(),
                 grant = req.grant,
                 by = me.name,
-                "changed group access"
+                "changed group writer"
             );
         }
-        Ok(proto::GroupAccessResponse {
+        Ok(proto::SetGroupWriterResponse {
             group: group.to_string(),
             agent: target.name,
             changed,
@@ -715,22 +712,23 @@ pub fn group_access(
     })
 }
 
-/// A sentence for notices once the group's last writer is gone, else empty.
+/// A sentence for notices once the group has no writer among its members,
+/// else empty.
 fn no_writers_left(ctx: &Ctx, gid: i64, group: &str) -> Result<String> {
     Ok(if db::group_writers(ctx.conn, gid)?.is_empty() {
-        format!(" @{group} now has no writers.")
+        format!(" @{group} now has no agent writers.")
     } else {
         String::new()
     })
 }
 
 /// The no-writers sentence when `agent`, about to leave, is the group's only
-/// writer; else empty.
+/// writer among its members; else empty.
 fn departing_writer(ctx: &Ctx, gid: i64, group: &str, agent: &db::Principal) -> Result<String> {
-    let only = db::group_writers(ctx.conn, gid)?.len() == 1
-        && db::member_access(ctx.conn, gid, agent.id, db::Access::Write)? == Some(true);
+    let only =
+        db::group_writers(ctx.conn, gid)?.len() == 1 && db::is_writer(ctx.conn, gid, agent.id)?;
     Ok(if only {
-        format!(" @{group} now has no writers.")
+        format!(" @{group} now has no agent writers.")
     } else {
         String::new()
     })
@@ -746,10 +744,7 @@ pub fn group_list(conn: &mut Connection, caller: &Caller) -> Result<proto::Group
                 name: g.name,
                 members: g.members,
                 description: g.description,
-                access: Some(proto::MemberAccess {
-                    readers: g.readers,
-                    writers: g.writers,
-                }),
+                writers: Some(proto::GroupWriters { names: g.writers }),
             })
             .collect();
         Ok(proto::GroupListResponse { groups })
@@ -758,15 +753,14 @@ pub fn group_list(conn: &mut Connection, caller: &Caller) -> Result<proto::Group
 
 // ---- messages --------------------------------------------------------------
 
-/// Deliver `body` from `me` to every member of the group that can read it and
-/// every human, except `me`. Notices use this too, so members without read
-/// receive nothing addressed to the group. Returns (recipients, recipients visible to `me`): humans
+/// Deliver `body` from `me` to every member of the group and every human,
+/// except `me`. Returns (recipients, recipients visible to `me`): humans
 /// silently receive every broadcast, so agents only see the agent count.
 fn broadcast(ctx: &Ctx, me: &db::Principal, gid: i64, body: &str) -> Result<(usize, usize)> {
     let msg = db::insert_message(ctx.conn, me, Some(gid), body, &ctx.now_s)?;
     let mut count = 0;
     let mut visible = 0;
-    let agents = db::group_reader_ids(ctx.conn, gid)?
+    let agents = db::group_member_ids(ctx.conn, gid)?
         .into_iter()
         .map(|id| (db::Kind::Agent, id));
     let humans = db::human_ids(ctx.conn)?
@@ -840,21 +834,20 @@ pub fn send(
         if let Some(group) = to.strip_prefix('@') {
             let gid = require_group(ctx.conn, group)?;
             if me.kind == db::Kind::Agent {
-                match db::member_access(ctx.conn, gid, me.id, db::Access::Write)? {
-                    None => bail!("you are not a member of @{group}"),
-                    Some(false) => {
-                        let writers = db::group_writers(ctx.conn, gid)?;
-                        let denied =
-                            format!("you lack write access to @{group}; only a human can grant it");
-                        match writers.first() {
-                            None => bail!("{denied}. @{group} has no agent writers."),
-                            Some(writer) => bail!(
-                                "{denied}. Writers: {}. To reach the group, DM one: bbs send --to {writer} \"...\"",
-                                writers.join(", ")
-                            ),
-                        }
+                if !db::is_member(ctx.conn, gid, me.id)? {
+                    bail!("you are not a member of @{group}");
+                }
+                if !db::is_writer(ctx.conn, gid, me.id)? {
+                    let writers = db::group_writers(ctx.conn, gid)?;
+                    let denied =
+                        format!("you lack write access to @{group}; only a human can grant it");
+                    if writers.is_empty() {
+                        bail!("{denied}. @{group} has no agent writers.");
                     }
-                    Some(true) => {}
+                    bail!(
+                        "{denied}. Writers: {} (message one of them to reach the group).",
+                        writers.join(", ")
+                    );
                 }
             }
             let (count, visible) = broadcast(ctx, &me, gid, body)?;

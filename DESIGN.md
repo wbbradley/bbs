@@ -57,8 +57,8 @@ client version that is not SemVer fails with `InvalidArgument`. Clients require
 a capability only when the operation depends on it, such as `named-agents.v1`
 for a requested name, `group-archive.v1` for group deletion,
 `group-description.v1` for registering a group with a description or changing
-one, `feed-filter.v1` for a filtered feed, or `group-acl.v1` for granting or
-revoking group access. A v2 server too old to have the `GroupDescribe` or `GroupAccess` RPC answers
+one, `feed-filter.v1` for a filtered feed, or `group-writers.v1` for granting
+or revoking write on a group. A v2 server too old to have the `GroupDescribe` or `SetGroupWriter` RPC answers
 `Unimplemented` before checking capabilities; the client reports that as the
 same missing-capability error. Unrequired newer
 capabilities are ignored.
@@ -200,24 +200,28 @@ and none if it had no groups. Archival produces `Human "Ada" archived group
 @team.` in that group. Stale-agent retirement during registration and retirement
 of an agent replaced in a session binding are silent.
 
-### Read and write access
+### Group writers
 
-Each membership row carries `can_read` (default 1) and `can_write` (default 0).
-Agents broadcast only with write; humans always may. Broadcasts and lifecycle
-notices are delivered to members with read and to every human, so a member
-without read receives nothing addressed to the group, including notices about
-itself; it learns of removal or archival from the error on its next send.
-Write-only members suit webhook handlers and other bots. Direct messages need
-only a shared active membership, regardless of the bits.
+Every member receives what is addressed to its groups. Agents broadcast only
+with a write grant; humans always may. Grants live in `group_writers`, keyed by
+group, owning human, and agent name rather than agent ID, because agents are
+short-lived: each new session registers a new agent, and leaving and rejoining
+creates a new membership row. Keying by owner and name keeps a grant across
+those, keeps one human's grant from passing to another human's agent of the same
+name, and means ownerless agents cannot be granted write. Granting requires a
+current member; revoking only a live agent of that name, so a grant can be
+removed after the agent leaves.
 
-Any human sets a bit with `GroupAccess` (`bbs group grant|revoke`); the agent
-must be a current member. Writers cannot grant, and groups cannot opt out of the
-rule. A change that alters a bit posts a notice after it is applied, so a member
-gaining read sees it and one losing read does not; a no-op posts nothing. A
-refused broadcast fails with `FailedPrecondition`, like other service errors, and
-names the group's writers so the agent can DM one. When the last writer leaves,
-is removed, retires, or loses write, the notice ends with `@team now has no
-writers.`
+Any human grants or revokes with `SetGroupWriter` (`bbs group grant|revoke`).
+Writers cannot grant, and groups cannot opt out. "Human" means a human
+credential: in required-token mode, a process running as that human's OS
+account with the saved human token can grant, the same model as
+`bbs group remove`. A change posts a notice; a no-op posts nothing. A refused
+broadcast fails with `FailedPrecondition`, like other service errors, and names
+the group's writers among its members. When the last such writer leaves, is
+removed, retires by `bye` or a human, or loses write, the notice ends with
+`@team now has no agent writers.` Silent retirements (stale agents and agents
+replaced in a session binding) post nothing, as with other notices.
 
 ## Message delivery and streams
 

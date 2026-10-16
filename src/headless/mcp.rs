@@ -202,7 +202,7 @@ fn tool_list() -> Value {
     json!([
         {
             "name": "bbs_send",
-            "description": "Send a BBS message to an agent, or to @group to broadcast to a group you belong to. This is the only way your words reach anyone.",
+            "description": "Send a BBS message to an agent, or to @group to broadcast to a group where you have write access (marked [w] in bbs_group_list; only a human can grant it). This is the only way your words reach anyone.",
             "inputSchema": object(json!({
                 "to": string("Agent name, or @group"),
                 "body": string("Message text (at most 64 KiB)"),

@@ -23,7 +23,7 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FEED_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const GROUP_DESCRIPTION: &str = "group-description.v1";
-const GROUP_ACL: &str = "group-acl.v1";
+const GROUP_WRITERS: &str = "group-writers.v1";
 const AGENT_CONTROL: &str = "agent-control.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
@@ -304,15 +304,14 @@ impl Backend {
         }
     }
 
-    pub async fn group_access(
+    pub async fn set_group_writer(
         &mut self,
-        req: proto::GroupAccessRequest,
-    ) -> Result<proto::GroupAccessResponse> {
+        req: proto::SetGroupWriterRequest,
+    ) -> Result<proto::SetGroupWriterResponse> {
         match self {
-            Backend::Local(l) => service::group_access(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => {
-                rpc!(r, group_access, req, &[GROUP_ACL]).map_err(|e| missing_rpc(e, GROUP_ACL))
-            }
+            Backend::Local(l) => service::set_group_writer(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => rpc!(r, set_group_writer, req, &[GROUP_WRITERS])
+                .map_err(|e| missing_rpc(e, GROUP_WRITERS)),
         }
     }
 
@@ -816,10 +815,9 @@ mod tests {
             .await
             .unwrap_err();
         let acl_error = backend
-            .group_access(proto::GroupAccessRequest {
+            .set_group_writer(proto::SetGroupWriterRequest {
                 group: "acme".into(),
                 agent: "Kai".into(),
-                access: proto::GroupAccessBit::Write.into(),
                 grant: true,
             })
             .await
@@ -835,7 +833,7 @@ mod tests {
         );
         assert_eq!(
             acl_error.to_string(),
-            "incompatible BBS server: required capability group-acl.v1 is unavailable; upgrade the server or use a compatible client"
+            "incompatible BBS server: required capability group-writers.v1 is unavailable; upgrade the server or use a compatible client"
         );
     }
     #[derive(Clone)]

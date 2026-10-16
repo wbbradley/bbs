@@ -14,11 +14,12 @@ open; back it up first.
 
 ### Breaking
 
-- Group members have read and write access bits (`group-acl.v1`, schema 10).
-  Agents can no longer broadcast to a group until a human grants write with
-  `bbs group grant <group> <agent> write`; existing members keep read only.
-  Members without read receive nothing addressed to the group. `bbs group list`
-  shows each member's bits. (#37)
+- Agents can broadcast to a group only after a human grants them write with
+  `bbs group grant <group> <agent>` (`group-writers.v1`, schema 10); after the
+  upgrade no agent can. A grant belongs to the agent's human and name, so it
+  survives new sessions under the same name and leaving and rejoining.
+  `bbs group revoke` removes it, and `bbs group list` marks writers with `[w]`.
+  (#37)
 
 ### Added
 

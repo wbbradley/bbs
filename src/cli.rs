@@ -239,21 +239,11 @@ pub enum GroupCommand {
     Leave { group: String },
     /// Remove an agent from a group (humans only).
     Remove { group: String, agent: String },
-    /// Let a member read the group or broadcast to it (humans only).
-    Grant {
-        group: String,
-        agent: String,
-        #[arg(value_enum)]
-        access: AccessArg,
-    },
-    /// Take a member's read or write access away (humans only).
-    Revoke {
-        group: String,
-        agent: String,
-        #[arg(value_enum)]
-        access: AccessArg,
-    },
-    /// List groups, their members and access, and descriptions.
+    /// Let an agent broadcast to the group, for its owner and name (humans only).
+    Grant { group: String, agent: String },
+    /// Take an agent's write access to the group away (humans only).
+    Revoke { group: String, agent: String },
+    /// List groups, their members and writers, and descriptions.
     List {
         /// Print one JSON object per group (JSONL) instead of text.
         #[arg(long)]
@@ -316,12 +306,4 @@ pub struct HeadlessRunArgs {
     /// Minimum time between the starts of two turns (default 60s), like 30s or 5m.
     #[arg(long)]
     pub min_turn_interval: Option<String>,
-}
-
-/// A group member's access bit: `read` receives what is addressed to the
-/// group; `write` may broadcast to it.
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-pub enum AccessArg {
-    Read,
-    Write,
 }
