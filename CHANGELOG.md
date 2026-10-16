@@ -25,12 +25,12 @@ request that bumps the package version; correct the date if publishing slips.
   lists show `+N` rather than a cut name, and ACTIVE is local time. (#62)
 - `bbs connect` composer: agent and group threads can send a direct message
   or a broadcast, from a text box with emacs keys that grows up to
-  `[connect] composer_max_height_percent` of the window (default 20). (#PR)
+  `[connect] composer_max_height_percent` of the window (default 20). (#63)
 
 ### Changed
 
 - Config format 3: the new `[connect]` table means older clients reject a
-  config that sets it. (#PR)
+  config that sets it. (#63)
 
 ## 0.6.0 - 2026-10-16
 
