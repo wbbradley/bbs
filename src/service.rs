@@ -1481,23 +1481,35 @@ pub fn fire_timers(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now_s = fmt_time(now);
     let due = db::due_timers(&tx, &now_s, FIRE_BATCH)?;
+    let mut fired = 0;
     for timer in &due {
+        // A stored schedule that no longer parses must not block the others.
+        let schedule = match timer
+            .repeat
+            .as_deref()
+            .map(Schedule::from_repeat)
+            .transpose()
+        {
+            Ok(schedule) => schedule,
+            Err(err) => {
+                tracing::warn!(id = timer.id, "deleting timer with a bad schedule: {err:#}");
+                db::delete_timer(&tx, timer.id)?;
+                continue;
+            }
+        };
         let msg = db::insert_message(&tx, &timer.creator, None, &timer.body, &now_s)?;
         db::insert_delivery(&tx, msg, db::Kind::Agent, timer.target_id)?;
         db::set_message_timer(&tx, msg, timer.id)?;
-        let next = match timer.repeat.as_deref() {
-            Some(repeat) => Schedule::from_repeat(repeat)?.next_after(now),
-            None => None,
-        };
-        match next {
+        match schedule.and_then(|s| s.next_after(now)) {
             Some(next) => db::set_timer_next_run(&tx, timer.id, &fmt_time(next))?,
             None => db::delete_timer(&tx, timer.id)?,
         }
+        fired += 1;
         tracing::info!(id = timer.id, from = timer.creator.name, "timer fired");
     }
     let next = db::next_timer(&tx)?.map(parse).transpose()?;
     tx.commit()?;
-    Ok((due.len(), next))
+    Ok((fired, next))
 }
 
 // ---- harness sessions ------------------------------------------------------
@@ -1729,6 +1741,26 @@ mod tests {
             listed.timers[0].next_run,
             fmt_time(late + chrono::Duration::hours(1))
         );
+    }
+
+    #[test]
+    fn a_timer_whose_schedule_no_longer_parses_is_deleted_without_blocking_others() {
+        let (mut conn, _, [mateo, zed, _]) = board();
+        let bad = add(&mut conn, &mateo, "Zed", "every 1h").unwrap();
+        let good = add(&mut conn, &mateo, "Zed", "in 1h").unwrap();
+        conn.execute(
+            "UPDATE timers SET repeat = 'every fortnight-ish' WHERE id = ?1",
+            [bad.id],
+        )
+        .unwrap();
+        let due = time(&good.next_run).max(time(&bad.next_run));
+        assert_eq!(fire_timers(&mut conn, due).unwrap(), (1, None));
+        let fired: Vec<_> = inbox(&mut conn, &zed)
+            .into_iter()
+            .filter_map(|m| m.timer_id)
+            .collect();
+        assert_eq!(fired, [good.id]);
+        assert!(db::timers(&conn, None).unwrap().is_empty());
     }
 
     #[test]
