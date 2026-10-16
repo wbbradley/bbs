@@ -637,6 +637,9 @@ pub fn group_add(
     with_ctx(conn, caller, |ctx| {
         let me = ctx.human()?;
         let group = group_name(&req.group);
+        if req.agents.is_empty() {
+            bail!("name at least one agent to add");
+        }
         let gid = require_group(ctx.conn, group)?;
         // Check every agent before adding any, so a bad name changes nothing.
         let mut targets: Vec<db::Principal> = Vec::new();

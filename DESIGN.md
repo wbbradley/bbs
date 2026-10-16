@@ -198,7 +198,9 @@ them. Notices name the actor and any affected agent explicitly, for example
 `Human "Ada" retired agent "Jeffrey". Agent "Jeffrey" is no longer a member of
 group @team.` Joining, leaving, and removal each produce one notice in that
 group; joining a group the agent already belongs to produces none. Adding posts
-`Human "Ada" added agent "Jeffrey" to group @team.` for each agent it adds. Retirement by
+`Human "Ada" added agent "Jeffrey" to group @team.` for each agent it adds; an
+agent that still holds a write grant has write again, and the notice ends
+`to group @team as a writer.` Retirement by
 `bye` or a human produces one notice in each active group the agent belonged to,
 and none if it had no groups. Archival produces `Human "Ada" archived group
 @team.` in that group. Stale-agent retirement during registration and retirement

@@ -1631,6 +1631,12 @@ fn humans_add_agents_to_groups(mode: Mode) {
         bbs.err(&["group", "add", "acme", &a, "Nobody"])
             .contains("no live agent named \"Nobody\"")
     );
+    let (d, _td) = bbs.register();
+    bbs.ok(&["retire", &d]);
+    assert!(
+        bbs.err(&["group", "add", "acme", &a, &d])
+            .contains(&format!("no live agent named {d:?}"))
+    );
     assert!(
         bbs.err(&["group", "add", "nope", &a])
             .contains("no such group")
