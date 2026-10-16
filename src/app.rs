@@ -102,7 +102,18 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut backend = Backend::open(&config, &dir, caller).await?;
     match cli.command {
         Command::View(args) => crate::view::run(&mut backend, args).await,
-        Command::Connect => crate::connect::run(backend, config.server.clone()).await,
+        Command::Connect => {
+            let opener = crate::connect::Opener {
+                config: config.clone(),
+                dir: dir.clone(),
+                caller: Caller {
+                    token: cli.token.clone(),
+                    human: config.human(cli.as_human.as_deref()),
+                    ..Default::default()
+                },
+            };
+            crate::connect::run(backend, opener).await
+        }
         Command::Read {
             limit,
             wait: true,

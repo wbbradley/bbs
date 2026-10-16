@@ -19,6 +19,10 @@ request that bumps the package version; correct the date if publishing slips.
   writers, and a help screen generated from its keymap. (#59)
 - `bbs connect` opens with an ANSI-art splash screen, and the main menu shows
   the logo. The art is ordinary `.ans` files in `assets/connect/`. (#60)
+- `bbs connect` threads: `Enter` on an agent opens its conversation, on a
+  group its broadcasts, and the new Feed screen shows everything. Threads
+  follow live and search with `/`. Long table cells end with `…`, group
+  lists show `+N` rather than a cut name, and ACTIVE is local time. (#62)
 
 ## 0.6.0 - 2026-10-16
 

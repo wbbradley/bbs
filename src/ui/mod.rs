@@ -2,6 +2,7 @@
 
 pub mod activity;
 pub mod message;
+pub mod thread;
 
 use ratatui::backend::IntoCrossterm as _;
 use ratatui::crossterm::style::ContentStyle;

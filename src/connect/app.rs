@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use ratatui::Frame;
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc::UnboundedSender;
@@ -32,9 +33,10 @@ pub enum Transition {
 pub trait Screen {
     /// Shown in the title bar.
     fn title(&self) -> String;
-    /// Whether any key (but Ctrl-C) goes to `handle`, as `Action::Open`.
-    fn takes_any_key(&self) -> bool {
-        false
+    /// A key press before the keymap sees it: `Some` when the screen took it,
+    /// as the splash and a search prompt do.
+    fn raw_key(&mut self, _key: KeyEvent) -> Option<Transition> {
+        None
     }
     /// Keys this screen claims before the shared keymap.
     fn hotkeys(&self) -> &[char] {
@@ -45,6 +47,10 @@ pub trait Screen {
         Vec::new()
     }
     fn on_data(&mut self, _data: &Data) {}
+    /// What to stop when the screen closes.
+    fn on_close(&self) -> Vec<Request> {
+        Vec::new()
+    }
     fn handle(&mut self, action: Action, ctx: &Ctx) -> Transition;
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx);
 }
@@ -75,9 +81,19 @@ impl App {
     }
 
     fn fetch(&self, screen: &dyn Screen) {
-        for request in screen.requests() {
+        self.send(screen.requests());
+    }
+
+    fn send(&self, requests: Vec<Request>) {
+        for request in requests {
             // The server task outlives the app; a send cannot fail first.
             let _ = self.requests.send(request);
+        }
+    }
+
+    fn pop(&mut self) {
+        if let Some(screen) = self.stack.pop() {
+            self.send(screen.on_close());
         }
     }
 
@@ -89,11 +105,9 @@ impl App {
     pub fn on_event(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) => {
-                if self.top().takes_any_key() {
-                    let action = self.keymap.resolve(key, &[]);
+                if let Some(transition) = self.top().raw_key(key) {
                     self.keymap = Keymap::default();
-                    let quit = action == Some(Action::Quit);
-                    return quit || self.on_action(Action::Open);
+                    return self.apply(transition);
                 }
                 let hotkeys = self.top().hotkeys().to_vec();
                 match self.keymap.resolve(key, &hotkeys) {
@@ -132,12 +146,15 @@ impl App {
             .last_mut()
             .expect("the menu is never popped")
             .handle(action, ctx);
+        self.apply(transition)
+    }
+
+    /// Apply a screen's transition; `true` quits.
+    fn apply(&mut self, transition: Transition) -> bool {
         match transition {
             Transition::Stay => {}
             Transition::Push(screen) => self.push(screen),
-            Transition::Pop if self.stack.len() > 1 => {
-                self.stack.pop();
-            }
+            Transition::Pop if self.stack.len() > 1 => self.pop(),
             Transition::Pop | Transition::Quit => return true,
         }
         false
@@ -335,5 +352,157 @@ mod tests {
         assert!(out.contains("Ctrl-d"), "{out}");
         key(&mut app, 'q');
         assert!(screen(&mut app, 80, 24).contains("Main menu"));
+    }
+
+    fn enter(app: &mut App) {
+        app.on_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+    }
+
+    fn message(id: i64, from: &str, to: &str, body: &str) -> proto::Message {
+        proto::Message {
+            id,
+            created_at: "2026-10-16T18:00:00.000000Z".into(),
+            from_kind: proto::Kind::Agent.into(),
+            from_name: from.into(),
+            to_name: Some(to.into()),
+            body: body.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The feed stream a screen just asked for.
+    fn watched(rx: &mut UnboundedReceiver<Request>) -> (u64, proto::FeedRequest) {
+        match rx.try_recv().unwrap() {
+            Request::Watch { id, req } => (id, req),
+            other => panic!("expected a watch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_agent_opens_its_conversation_and_closing_it_stops_the_stream() {
+        let (mut app, mut rx) = app();
+        key(&mut app, 'a');
+        rx.try_recv().unwrap();
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![agent("Mateo", "ada", &["crew"])],
+        }))));
+        enter(&mut app);
+        let (id, req) = watched(&mut rx);
+        assert_eq!(req.with.as_deref(), Some("Mateo"));
+        assert_eq!(req.backlog, 200);
+        assert!(screen(&mut app, 80, 24).contains("No messages yet"));
+        app.on_event(Event::Data(Data::Feed {
+            id,
+            result: Ok(vec![
+                message(1, "Mateo", "Zed", "first needle"),
+                message(2, "Zed", "Mateo", "second"),
+            ]),
+        }));
+        // Another stream's snapshot is not this thread's.
+        app.on_event(Event::Data(Data::Feed {
+            id: id + 100,
+            result: Ok(vec![message(9, "Zed", "Lu", "elsewhere")]),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("Mateo, owned by ada"), "{out}");
+        assert!(
+            out.contains("first needle") && out.contains("second"),
+            "{out}"
+        );
+        assert!(!out.contains("elsewhere"), "{out}");
+        assert!(out.contains("2 messages · following"), "{out}");
+        // The search prompt takes every key, q included, until Enter.
+        key(&mut app, '/');
+        for c in "q needle".chars() {
+            assert!(!key(&mut app, c));
+        }
+        assert!(screen(&mut app, 80, 24).contains("/q needle"));
+        enter(&mut app);
+        assert!(screen(&mut app, 80, 24).contains("/q needle: 0 matches"));
+        key(&mut app, '/');
+        for c in "needle".chars() {
+            key(&mut app, c);
+        }
+        enter(&mut app);
+        assert!(screen(&mut app, 80, 24).contains("/needle: 1 matches"));
+        // q closes the thread and stops its stream.
+        assert!(!key(&mut app, 'q'));
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
+        assert!(screen(&mut app, 80, 24).contains("Your agents"));
+    }
+
+    #[test]
+    fn a_server_without_feed_with_asks_for_an_upgrade() {
+        let (mut app, mut rx) = app();
+        key(&mut app, 'a');
+        rx.try_recv().unwrap();
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![agent("Mateo", "ada", &["crew"])],
+        }))));
+        enter(&mut app);
+        let (id, _) = watched(&mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id,
+            result: Err("required capability feed-with.v1 is unavailable".into()),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("needs a newer server (feed-with.v1)"), "{out}");
+        // Reload starts the stream again.
+        key(&mut app, 'r');
+        assert_eq!(watched(&mut rx).0, id);
+    }
+
+    #[test]
+    fn groups_and_the_feed_open_threads() {
+        let (mut app, mut rx) = app();
+        key(&mut app, 'g');
+        rx.try_recv().unwrap();
+        app.on_event(Event::Data(Data::Groups(Ok(proto::GroupListResponse {
+            groups: vec![proto::Group {
+                name: "crew".into(),
+                ..Default::default()
+            }],
+        }))));
+        enter(&mut app);
+        let (_, req) = watched(&mut rx);
+        assert_eq!(req.group.as_deref(), Some("crew"));
+        assert!(screen(&mut app, 80, 24).contains("@crew"));
+        key(&mut app, 'q');
+        rx.try_recv().unwrap();
+        key(&mut app, 'q');
+        key(&mut app, 'f');
+        let (_, req) = watched(&mut rx);
+        assert_eq!(
+            req,
+            proto::FeedRequest {
+                backlog: 200,
+                ..Default::default()
+            }
+        );
+        assert!(screen(&mut app, 80, 24).contains("BBS · Feed"));
+    }
+
+    #[test]
+    fn agent_cells_fit_their_columns() {
+        let (mut app, mut rx) = app();
+        key(&mut app, 'a');
+        rx.try_recv().unwrap();
+        let mut busy = agent("Mateo", "ada", &["crew", "release", "infra"]);
+        busy.status = Some("reviewing the very long pull request about feed filters".into());
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![busy],
+        }))));
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("crew, release +1"), "{out}");
+        assert!(out.contains("reviewing the ver…"), "{out}");
+        // ACTIVE is local time, without the stored form's Z.
+        let local = crate::ui::message::local_time("2026-10-16T18:00:00.000000Z");
+        assert!(out.contains(&local), "{out}");
     }
 }

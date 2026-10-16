@@ -6,13 +6,14 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table, TableState};
 
-use super::navigate;
-use crate::app::display_time;
+use super::thread::Thread;
+use super::{fit, fit_list, navigate};
 use crate::connect::app::{Ctx, Screen, Transition};
 use crate::connect::event::{Data, Request};
 use crate::connect::keys::Action;
 use crate::connect::theme;
 use crate::proto;
+use crate::ui::message::local_time;
 
 #[derive(Default)]
 pub struct Agents {
@@ -54,6 +55,9 @@ impl Screen for Agents {
                     .map(|r| r.agents.clone())
                     .map_err(Clone::clone),
             );
+            if self.state.selected().is_none() {
+                self.state.select(Some(0));
+            }
         }
     }
 
@@ -67,6 +71,15 @@ impl Screen for Agents {
                 self.all = !self.all;
                 self.state.select(Some(0));
                 Transition::Stay
+            }
+            Action::Open => {
+                let shown = self.shown(&ctx.me);
+                match self.state.selected().and_then(|i| shown.get(i)) {
+                    Some(a) => {
+                        Transition::Push(Box::new(Thread::agent(&a.name, a.owner.as_deref())))
+                    }
+                    None => Transition::Stay,
+                }
             }
             Action::Back => Transition::Pop,
             _ => Transition::Stay,
@@ -110,11 +123,12 @@ impl Screen for Agents {
                 ),
                 Span::styled(format!("@{owner}"), Style::new().fg(color)),
             ]);
+            let status_width = inner.width.saturating_sub(22 + 16 + 19 + 3) as usize;
             Row::new(vec![
                 name,
-                Line::raw(a.groups.join(", ")),
-                Line::raw(display_time(&a.active_at)),
-                Line::raw(a.status.clone().unwrap_or_default()),
+                Line::raw(fit_list(&a.groups, 16)),
+                Line::raw(local_time(&a.active_at)),
+                Line::raw(fit(a.status.as_deref().unwrap_or_default(), status_width)),
             ])
         });
         let table = Table::new(
@@ -122,7 +136,7 @@ impl Screen for Agents {
             [
                 Constraint::Length(22),
                 Constraint::Length(16),
-                Constraint::Length(20),
+                Constraint::Length(19),
                 Constraint::Min(10),
             ],
         )

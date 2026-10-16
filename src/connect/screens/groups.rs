@@ -6,7 +6,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Row, Table, TableState};
 
-use super::navigate;
+use super::thread::Thread;
+use super::{fit, fit_list, navigate};
 use crate::connect::app::{Ctx, Screen, Transition};
 use crate::connect::event::{Data, Request};
 use crate::connect::keys::Action;
@@ -23,7 +24,7 @@ pub struct Groups {
 }
 
 /// Members in order, writers marked `[w]` as in `bbs group list`.
-fn members(group: &proto::Group) -> String {
+fn members(group: &proto::Group) -> Vec<String> {
     let writers = group.writers.as_ref().map(|w| &w.names);
     group
         .members
@@ -32,8 +33,7 @@ fn members(group: &proto::Group) -> String {
             true => format!("{m} [w]"),
             false => m.clone(),
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect()
 }
 
 impl Screen for Groups {
@@ -53,6 +53,9 @@ impl Screen for Groups {
                     .map(|r| r.groups.clone())
                     .map_err(Clone::clone),
             );
+            if self.state.selected().is_none() {
+                self.state.select(Some(0));
+            }
         }
     }
 
@@ -65,6 +68,12 @@ impl Screen for Groups {
             return Transition::Stay;
         }
         match action {
+            Action::Open => match (&self.groups, self.state.selected()) {
+                (Some(Ok(groups)), Some(i)) if i < groups.len() => {
+                    Transition::Push(Box::new(Thread::group(&groups[i].name)))
+                }
+                _ => Transition::Stay,
+            },
             Action::Back => Transition::Pop,
             _ => Transition::Stay,
         }
@@ -93,6 +102,7 @@ impl Screen for Groups {
             }
             Some(Ok(groups)) => groups,
         };
+        let members_width = inner.width.saturating_sub(16 + 30 + 2) as usize;
         let rows = groups.iter().map(|g| {
             Row::new(vec![
                 Line::styled(
@@ -101,8 +111,8 @@ impl Screen for Groups {
                         .fg(Color::LightYellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Line::raw(g.description.clone().unwrap_or_default()),
-                Line::raw(members(g)),
+                Line::raw(fit(g.description.as_deref().unwrap_or_default(), 30)),
+                Line::raw(fit_list(&members(g), members_width)),
             ])
         });
         let table = Table::new(
