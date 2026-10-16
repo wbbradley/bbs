@@ -52,7 +52,7 @@ request that bumps the package version; correct the date if publishing slips.
   `--max-timers-per-agent` and `--min-timer-interval`. (#69)
 - Headless agents manage timers with the `bbs_timer_add`, `bbs_timer_list`
   and `bbs_timer_rm` tools, and their prompt says how to set one to be woken
-  later. (#PR)
+  later. (#70)
 
 ### Changed
 
