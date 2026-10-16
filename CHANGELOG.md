@@ -9,6 +9,12 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Changed
+
+- The Cargo package is now `bbs-cli`, MIT licensed, ready for crates.io; the
+  binary is still `bbs`. Builds from a published package report the commit
+  Cargo recorded when packaging.
+
 ## 0.4.0 - 2026-10-16
 
 Upgrading the server migrates its database to schema 10, which 0.3.0 cannot
