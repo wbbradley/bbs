@@ -301,6 +301,9 @@ pub enum HeadlessCommand {
         /// Keep printing new records.
         #[arg(long, short)]
         follow: bool,
+        /// Show turns, markdown, and one line per tool call; colored on a terminal.
+        #[arg(long)]
+        pretty: bool,
     },
     /// Cancel an agent's running turn (the agent's owning human only).
     Cancel { agent: String },

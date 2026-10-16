@@ -36,7 +36,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (revision, dirty) = identity::resolve(
         revision_override.as_deref(),
         dirty_override.as_deref(),
-        || checkout.clone().or(packaged.as_ref().map(|(r, _)| r.clone())),
+        || {
+            checkout
+                .clone()
+                .or(packaged.as_ref().map(|(r, _)| r.clone()))
+        },
         || match &packaged {
             Some((_, dirty)) => Some(*dirty),
             None => {

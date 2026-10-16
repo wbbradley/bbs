@@ -1,7 +1,7 @@
 //! The local event log (`log.jsonl`) and `bbs headless logs`.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 
+use super::pretty::Pretty;
 use crate::service::fmt_time;
 
 /// Appends one JSON object per event. Consecutive text or thought chunks are
@@ -82,15 +83,19 @@ impl Drop for Log {
 }
 
 /// Print the log readably; with `follow`, keep printing appended records.
-pub async fn print(path: &Path, follow: bool) -> Result<()> {
+pub async fn print(path: &Path, follow: bool, pretty: bool) -> Result<()> {
     let file = File::open(path).with_context(|| format!("no log at {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
+    let mut pretty = pretty.then(|| Pretty::new(std::io::stdout().is_terminal()));
     loop {
         line.clear();
         let pos = reader.stream_position()?;
         let n = reader.read_line(&mut line)?;
         if n == 0 || !line.ends_with('\n') {
+            if let Some(pretty) = &mut pretty {
+                print!("{}", pretty.running());
+            }
             if !follow {
                 return Ok(());
             }
@@ -99,7 +104,10 @@ pub async fn print(path: &Path, follow: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(300)).await;
             continue;
         }
-        print!("{}", render(&line));
+        match &mut pretty {
+            Some(pretty) => print!("{}", pretty.render(&line)),
+            None => print!("{}", render(&line)),
+        }
     }
 }
 
