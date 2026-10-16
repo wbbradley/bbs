@@ -2822,6 +2822,8 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
     );
     let shown = bbs.ok(&["headless", "logs", "Zed"]);
     assert!(shown.contains("You are Zed"), "{shown}");
+    // Sharing is off unless the harness asks for it.
+    assert!(shared_activity(&bbs, "Zed").is_empty());
     assert!(shown.contains("text:\nthinking about"), "{shown}");
     assert!(shown.contains("permission:"), "{shown}");
 
@@ -2869,6 +2871,83 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
     eventually("the harness's child to exit", || {
         (!running(child.trim())).then_some(())
     });
+}
+
+/// The `event` of each activity row the board holds for `agent`, oldest first.
+fn shared_activity(bbs: &Bbs, agent: &str) -> Vec<String> {
+    bbs.db()
+        .prepare(
+            "SELECT a.event FROM activity a JOIN agents ag ON ag.id = a.agent_id
+             WHERE ag.name = ?1 ORDER BY a.id",
+        )
+        .unwrap()
+        .query_map([agent], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn headless_shares_activity_only_when_asked(mode: Mode) {
+    let bbs = Bbs::with_mode("share-activity", mode);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");
+    headless_config(&bbs, &["python3", fake]);
+    let config = bbs.home.join(".config/bbs/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("share_activity = true\n");
+    std::fs::write(&config, text).unwrap();
+    bbs.ok(&["group", "register", "crew"]);
+    let (_peer, tp) = bbs.register();
+    bbs.ok(&["--token", &tp, "group", "join", "crew"]);
+    let run = RunGuard::start(&bbs, "Zed");
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    eventually("the session", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|l| l.contains("\"event\":\"session\""))
+    });
+    let tz = headless_state(&bbs, "Zed")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    bbs.ok(&["--token", &tz, "group", "join", "crew"]);
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "hello"]);
+    eventually("the shared turn", || {
+        let events = shared_activity(&bbs, "Zed");
+        events.contains(&"turn_end".to_string()).then_some(())
+    });
+    let out = run.stop();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Stopping waits briefly for the last records, so the stop is shared too.
+    let events = eventually("the shared stop", || {
+        let events = shared_activity(&bbs, "Zed");
+        events.contains(&"stop".to_string()).then_some(events)
+    });
+    for event in [
+        "start", "session", "mail", "prompt", "text", "turn_end", "stop",
+    ] {
+        assert!(events.contains(&event.to_string()), "{event}: {events:?}");
+    }
+    // Shared records are the local log's, in its order.
+    let logged: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .filter(|e| e != "update")
+        .collect();
+    assert_eq!(events, logged);
+
+    // Retiring the agent deletes what it shared.
+    bbs.ok(&["retire", "Zed"]);
+    assert!(shared_activity(&bbs, "Zed").is_empty());
 }
 
 fn headless_codex_replies_steers_and_interrupts(mode: Mode) {
@@ -3185,6 +3264,7 @@ both_modes!(
     view_json_follow_emits_each_message_once,
     view_json_follow_survives_full_windows_and_bursts,
     headless_replies_through_tools_and_cancels,
+    headless_shares_activity_only_when_asked,
     headless_codex_replies_steers_and_interrupts,
     headless_stops_after_repeated_turn_errors,
     connect_is_for_humans_at_a_terminal,

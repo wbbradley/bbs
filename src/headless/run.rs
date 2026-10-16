@@ -15,6 +15,7 @@ use super::harness::{BbsTools, Event, Harness};
 use super::log::Log;
 use super::mcp::{TOKEN_ENV, Tools};
 use super::settings::{DEFAULT_MAX_TURN_ERRORS, MidTurn, Settings};
+use super::share;
 use super::state::{AgentDir, State};
 use crate::app::format_messages;
 use crate::backend::Backend;
@@ -24,6 +25,8 @@ use crate::proto;
 use crate::service::Caller;
 
 /// Wait before retrying after the mail wait fails.
+/// How long a stopping `run` waits for shared activity to be sent.
+const SHARE_FLUSH: Duration = Duration::from_secs(2);
 const MAIL_RETRY: Duration = Duration::from_secs(10);
 /// "already running" retries: after a token takeover the old token's waiter can
 /// hold the inbox briefly. Persisting means another process drives this agent.
@@ -79,6 +82,13 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     agent_dir.save(&state)?;
 
     let mut log = Log::open(&agent_dir.log_path())?;
+    let (share_warn, mut share_warnings) = mpsc::unbounded_channel();
+    let sharing = harness_config.share_activity.then(|| {
+        let (queue, task) =
+            share::start(config.clone(), dir.to_path_buf(), token.clone(), share_warn);
+        log.share(queue);
+        task
+    });
     log.event(
         "start",
         json!({ "agent": agent, "harness": harness, "cwd": cwd, "pid": std::process::id() }),
@@ -250,6 +260,10 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 Ok(status) => anyhow::anyhow!("the harness exited ({status})"),
                 Err(err) => anyhow::anyhow!("waiting for the harness: {err}"),
             }),
+            Some(warning) = share_warnings.recv() => {
+                eprintln!("bbs: warning: {warning}");
+                log.event("warning", json!({ "message": warning }));
+            }
             _ = signals.recv() => break Ok(()),
         }
     };
@@ -273,7 +287,12 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         Ok(()) => log.event("stop", json!({})),
         Err(err) => log.event("stop", json!({ "error": format!("{err:#}") })),
     }
+    log.unshare();
     process.stop().await;
+    if let Some(task) = sharing {
+        // Let the last records, "stop" among them, reach the server.
+        let _ = tokio::time::timeout(SHARE_FLUSH, task).await;
+    }
     result
 }
 

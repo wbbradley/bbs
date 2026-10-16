@@ -26,6 +26,7 @@ const GROUP_DESCRIPTION: &str = "group-description.v1";
 const GROUP_WRITERS: &str = "group-writers.v1";
 const GROUP_ADD: &str = "group-add.v1";
 const AGENT_CONTROL: &str = "agent-control.v1";
+pub const AGENT_ACTIVITY: &str = "agent-activity.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -345,6 +346,28 @@ impl Backend {
                 rpc!(r, send, req, &[AGENT_CONTROL]).map_err(|e| missing_rpc(e, AGENT_CONTROL))
             }
             Backend::Remote(r) => rpc!(r, send, req),
+        }
+    }
+
+    /// Post the calling agent's activity as it comes, until `events` ends;
+    /// how many the server stored. A server needs `agent-activity.v1`.
+    pub async fn post_activity<S>(&mut self, events: S) -> Result<u32>
+    where
+        S: tokio_stream::Stream<Item = proto::ActivityEvent> + Send + 'static,
+    {
+        use tokio_stream::StreamExt;
+        match self {
+            Backend::Local(l) => {
+                tokio::pin!(events);
+                let mut stored = 0;
+                while let Some(event) = events.next().await {
+                    stored += service::post_activity(&mut l.conn, &l.caller, vec![event])?;
+                }
+                Ok(stored)
+            }
+            Backend::Remote(r) => rpc!(r, post_activity, events, &[AGENT_ACTIVITY])
+                .map(|r| r.accepted)
+                .map_err(|e| missing_rpc(e, AGENT_ACTIVITY)),
         }
     }
 

@@ -9,6 +9,7 @@ mod mcp;
 mod rpc;
 mod run;
 mod settings;
+mod share;
 mod state;
 
 use std::path::Path;

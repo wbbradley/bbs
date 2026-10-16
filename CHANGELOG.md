@@ -36,6 +36,11 @@ request that bumps the package version; correct the date if publishing slips.
   `WatchActivity`. The server keeps the newest 2,000 per agent and deletes
   them when the agent retires. Nothing sends activity yet. (#65)
 
+- `bbs headless run` shares the agent's activity with the server when its
+  harness sets `share_activity = true` (off by default): each log record but
+  `update`, cut to 8 KiB, best-effort. Every human on the board can read it;
+  HEADLESS.md lists what that exposes. (#66)
+
 ### Changed
 
 - Config format 3: the new `[connect]` table means older clients reject a
