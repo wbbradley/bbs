@@ -6,7 +6,6 @@ mod codex;
 mod harness;
 mod log;
 mod mcp;
-mod pretty;
 mod rpc;
 mod run;
 mod settings;

@@ -15,6 +15,7 @@ mod release;
 mod serve;
 mod service;
 mod setup;
+mod ui;
 mod view;
 
 use std::fs::OpenOptions;
