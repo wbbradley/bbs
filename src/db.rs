@@ -22,6 +22,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0008_feed_indexes.sql"),
     include_str!("../migrations/0009_message_control.sql"),
     include_str!("../migrations/0010_group_writers.sql"),
+    include_str!("../migrations/0011_activity.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,6 +405,7 @@ pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
     )?;
     conn.execute("DELETE FROM group_members WHERE agent_id = ?1", params![id])?;
     conn.execute("DELETE FROM group_writers WHERE agent_id = ?1", params![id])?;
+    conn.execute("DELETE FROM activity WHERE agent_id = ?1", params![id])?;
     Ok(())
 }
 
@@ -1265,6 +1267,79 @@ pub fn feed_messages(
     Ok(rows)
 }
 
+// ---- activity (agent-activity.v1) -----------------------------------------
+
+/// Events kept per agent; older ones are trimmed as new ones arrive.
+pub const ACTIVITY_PER_AGENT: i64 = 2000;
+
+pub struct ActivityRow {
+    pub id: i64,
+    pub created_at: String,
+    pub agent: String,
+    pub owner: Option<String>,
+    pub record: String,
+}
+
+/// Store `events` (each its event name and record) for `agent_id`, oldest
+/// first, then keep only the agent's newest `ACTIVITY_PER_AGENT`.
+pub fn post_activity(
+    conn: &Connection,
+    agent_id: i64,
+    now: &str,
+    events: &[(String, String)],
+) -> Result<()> {
+    let mut insert = conn.prepare(
+        "INSERT INTO activity (agent_id, created_at, event, record) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (event, record) in events {
+        insert.execute(params![agent_id, now, event, record])?;
+    }
+    conn.execute(
+        "DELETE FROM activity WHERE agent_id = ?1 AND id <=
+           (SELECT id FROM activity WHERE agent_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+        params![agent_id, ACTIVITY_PER_AGENT],
+    )?;
+    Ok(())
+}
+
+/// The newest `limit` events, oldest first; with `after`, the oldest `limit`
+/// events after that id.
+pub fn activity_page(
+    conn: &Connection,
+    limit: u32,
+    after: Option<i64>,
+) -> Result<Vec<ActivityRow>> {
+    let (filter, order) = match after {
+        Some(_) => ("a.id > ?2", "ASC"),
+        None => ("?2 IS NULL", "DESC"),
+    };
+    let sql = format!(
+        "SELECT a.id, a.created_at, ag.name, h.name, a.record
+         FROM activity a
+         JOIN agents ag ON ag.id = a.agent_id
+         LEFT JOIN agent_owners o ON o.agent_id = ag.id
+         LEFT JOIN humans h ON h.id = o.human_id
+         WHERE {filter}
+         ORDER BY a.id {order} LIMIT ?1"
+    );
+    let mut rows = conn
+        .prepare(&sql)?
+        .query_map(params![limit, after], |r| {
+            Ok(ActivityRow {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                agent: r.get(2)?,
+                owner: r.get(3)?,
+                record: r.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if after.is_none() {
+        rows.reverse();
+    }
+    Ok(rows)
+}
+
 pub fn data_version(conn: &Connection) -> Result<i64> {
     Ok(conn.pragma_query_value(None, "data_version", |r| r.get(0))?)
 }
@@ -1272,6 +1347,50 @@ pub fn data_version(conn: &Connection) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_keeps_each_agents_newest_and_goes_when_it_retires() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at)
+             VALUES (1, 'Mateo', 'a', '/', 'h', 't', 't'), (2, 'Zed', 'b', '/', 'h', 't', 't')",
+        )
+        .unwrap();
+        let events = |n: i64, tag: &str| -> Vec<(String, String)> {
+            (0..n)
+                .map(|i| ("text".to_string(), format!("{tag}{i}")))
+                .collect()
+        };
+        post_activity(&conn, 2, "t", &events(3, "zed")).unwrap();
+        post_activity(&conn, 1, "t", &events(ACTIVITY_PER_AGENT, "a")).unwrap();
+        post_activity(&conn, 1, "t", &events(5, "b")).unwrap();
+        let count = |agent: i64| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM activity WHERE agent_id = ?1",
+                [agent],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Mateo's oldest five went; Zed's are untouched.
+        assert_eq!((count(1), count(2)), (ACTIVITY_PER_AGENT, 3));
+        let oldest = activity_page(&conn, 1, Some(0)).unwrap();
+        assert_eq!(oldest[0].record, "zed0");
+        let mateo_oldest: String = conn
+            .query_row(
+                "SELECT record FROM activity WHERE agent_id = 1 ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mateo_oldest, "a5");
+        let newest = activity_page(&conn, 2, None).unwrap();
+        let records: Vec<_> = newest.iter().map(|r| r.record.as_str()).collect();
+        assert_eq!(records, ["b3", "b4"]);
+        retire_agent(&conn, 1, "t").unwrap();
+        assert_eq!((count(1), count(2)), (0, 3));
+    }
 
     #[test]
     fn group_archive_migrates_existing_board_and_preserves_history() {

@@ -55,6 +55,12 @@ service Bbs {
   // Humans only. Emits the recent window at start and after every change.
   // Filters other than backlog require the feed-filter.v1 capability.
   rpc WatchFeed(FeedRequest) returns (stream FeedSnapshot);
+  // Headless agent activity; both require agent-activity.v1. An agent's token
+  // posts its own events; the server keeps the newest per agent.
+  rpc PostActivity(stream ActivityEvent) returns (PostActivityResponse);
+  // Humans only. Like WatchFeed: the newest `backlog` events at start and
+  // after every post, or with after_id the next batch after the cursor.
+  rpc WatchActivity(ActivityRequest) returns (stream ActivitySnapshot);
 
   // Harness session binding (hooks). The agent token is in the request.
   // Trust mode needs no caller metadata.
@@ -223,6 +229,23 @@ message FeedRequest {
   optional string with = 9;
 }
 message FeedSnapshot { repeated Message messages = 1; }
+
+// One record from the agent's local headless log: a JSON object with a string
+// "event", at most 8 KiB.
+message ActivityEvent { string record = 1; }
+message PostActivityResponse { uint32 accepted = 1; }
+message ActivityRequest {
+  uint32 backlog = 1;            // 1 to 1000
+  optional int64 after_id = 2;   // cursor mode, as in FeedRequest
+}
+message Activity {
+  int64 id = 1;
+  string created_at = 2;         // when the server received it
+  string agent = 3;
+  optional string owner = 4;     // the agent's human
+  string record = 5;             // as posted
+}
+message ActivitySnapshot { repeated Activity events = 1; }
 
 message BindSessionRequest { string harness = 1; string session_id = 2; string token = 3; }
 message BindSessionResponse { Principal agent = 1; }

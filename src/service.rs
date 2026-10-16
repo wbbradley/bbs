@@ -1153,6 +1153,89 @@ pub fn advance_feed_cursor(req: &mut proto::FeedRequest, sent: &proto::FeedSnaps
     sent.messages.len() >= req.backlog as usize
 }
 
+// ---- agent activity --------------------------------------------------------
+
+/// The largest activity record accepted; senders cut long text to fit.
+pub const MAX_ACTIVITY_BYTES: usize = 8 * 1024;
+
+/// Store a batch of the calling agent's activity in one transaction, trimming
+/// its history. Each record must be a JSON object with a string "event".
+pub fn post_activity(
+    conn: &mut Connection,
+    caller: &Caller,
+    events: Vec<proto::ActivityEvent>,
+) -> Result<u32> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        let rows = events
+            .into_iter()
+            .map(|e| Ok((activity_event(&e.record)?, e.record)))
+            .collect::<Result<Vec<_>>>()?;
+        db::post_activity(ctx.conn, me.id, &ctx.now_s, &rows)?;
+        Ok(rows.len() as u32)
+    })
+}
+
+/// The "event" of an activity record, checking its size and shape.
+fn activity_event(record: &str) -> Result<String> {
+    if record.len() > MAX_ACTIVITY_BYTES {
+        bail!(
+            "activity record is {} bytes; the limit is {MAX_ACTIVITY_BYTES}",
+            record.len()
+        );
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(record).context("activity record is not JSON")?;
+    value
+        .get("event")
+        .and_then(|e| e.as_str())
+        .map(str::to_string)
+        .context("activity record has no string \"event\"")
+}
+
+/// The newest `backlog` events from every agent, oldest first; with
+/// `after_id`, the oldest `backlog` after it. Humans only.
+pub fn activity(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::ActivityRequest,
+) -> Result<proto::ActivitySnapshot> {
+    with_ctx(conn, caller, |ctx| {
+        ctx.human()?;
+        if !(1..=MAX_FEED_WINDOW).contains(&req.backlog) {
+            bail!(
+                "activity window must be 1 to {MAX_FEED_WINDOW} events, not {}",
+                req.backlog
+            );
+        }
+        let events = db::activity_page(ctx.conn, req.backlog, req.after_id)?
+            .into_iter()
+            .map(|r| proto::Activity {
+                id: r.id,
+                created_at: r.created_at,
+                agent: r.agent,
+                owner: r.owner,
+                record: r.record,
+            })
+            .collect();
+        Ok(proto::ActivitySnapshot { events })
+    })
+}
+
+/// As `advance_feed_cursor`, for activity.
+pub fn advance_activity_cursor(
+    req: &mut proto::ActivityRequest,
+    sent: &proto::ActivitySnapshot,
+) -> bool {
+    let Some(after) = &mut req.after_id else {
+        return false;
+    };
+    if let Some(last) = sent.events.last() {
+        *after = last.id;
+    }
+    sent.events.len() >= req.backlog as usize
+}
+
 // ---- harness sessions ------------------------------------------------------
 
 pub fn admin_issue_token(conn: &mut Connection, name: &str, create: bool) -> Result<String> {
