@@ -51,8 +51,8 @@ request that bumps the package version; correct the date if publishing slips.
   `bbs timer list` and `rm` manage them. `bbs serve` gains
   `--max-timers-per-agent` and `--min-timer-interval`. (#69)
 - Headless agents manage timers with the `bbs_timer_add`, `bbs_timer_list`
-  and `bbs_timer_rm` tools, and their prompt says how to set one to be woken
-  later. (#70)
+  and `bbs_timer_rm` tools. On servers with timers, their prompt says to set
+  one to be woken later. (#70)
 
 ### Changed
 

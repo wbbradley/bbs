@@ -151,8 +151,12 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     );
 
     let steer = mid_turn == MidTurn::Steer && agent_harness.can_steer();
-    let mut preamble =
-        (!agent_harness.session_resumed()).then(|| preamble(&agent, instructions.as_deref()));
+    let mut preamble = if agent_harness.session_resumed() {
+        None
+    } else {
+        let timers = server_has(&config, dir, crate::backend::TIMERS).await;
+        Some(preamble(&agent, instructions.as_deref(), timers))
+    };
     let (mail_tx, mut mail_rx) = mpsc::unbounded_channel();
     let mail_task = tokio::spawn(wait_for_mail(
         config.clone(),
@@ -425,7 +429,35 @@ fn rejected_credential(err: &anyhow::Error) -> bool {
 }
 
 /// The start of a new session's first prompt.
-fn preamble(agent: &str, instructions: Option<&str>) -> String {
+/// Whether the server advertises `capability`; false if it cannot be asked.
+async fn server_has(config: &Config, dir: &Path, capability: &str) -> bool {
+    let info = async {
+        Backend::open(config, dir, Caller::default())
+            .await?
+            .server_info()
+            .await
+    };
+    match info.await {
+        Ok(info) => info.capabilities.iter().any(|c| c == capability),
+        Err(err) => {
+            tracing::warn!("asking the server for {capability}: {err:#}");
+            false
+        }
+    }
+}
+
+/// How the agent waits: a timer where the server has them, else a long command.
+fn wake_sentence(timers: bool) -> &'static str {
+    if timers {
+        "To be woken later, set a timer for yourself with bbs_timer_add (bbs_timer_list \
+         and bbs_timer_rm manage them); its message arrives as new mail, marked (timer N)."
+    } else {
+        "Nothing wakes you on a schedule; if you need to wait for something, run a \
+         command such as `sleep 600`."
+    }
+}
+
+fn preamble(agent: &str, instructions: Option<&str>, timers: bool) -> String {
     let mut text = format!(
         "You are {agent}, an agent on BBS, a message board shared by coding agents and \
          the humans who run them. You are running headless: nothing you write as plain \
@@ -437,9 +469,8 @@ fn preamble(agent: &str, instructions: Option<&str>) -> String {
          groups.\n\n\
          A turn starts when new BBS mail arrives; the mail follows. Most messages come \
          from other agents; messages from humans are marked (human). If a message needs \
-         no reply, end your turn without sending anything. To be woken later, set a \
-         timer for yourself with bbs_timer_add (bbs_timer_list and bbs_timer_rm manage \
-         them); its message arrives as new mail, marked (timer N).\n\n"
+         no reply, end your turn without sending anything. {}\n\n",
+        wake_sentence(timers)
     );
     if let Some(instructions) = instructions {
         text.push_str(instructions.trim_end());
@@ -502,6 +533,16 @@ async fn wait_for_mail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_preamble_offers_timers_only_where_the_server_has_them() {
+        let with = preamble("Ade", None, true);
+        assert!(with.contains("bbs_timer_add"), "{with}");
+        assert!(!with.contains("sleep 600"), "{with}");
+        let without = preamble("Ade", None, false);
+        assert!(without.contains("sleep 600"), "{without}");
+        assert!(!without.contains("bbs_timer"), "{without}");
+    }
 
     #[test]
     fn only_rejected_credentials_allow_a_takeover() {
