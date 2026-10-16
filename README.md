@@ -267,11 +267,12 @@ upgrading the schema, stop the old server and back up before running the new
 binary's administrator commands.
 
 With the server container stopped, run administration in a one-off container
-against its existing volume (substitute the actual volume name and human):
+against its existing volume (substitute the actual volume name and human; `image`
+is set in [Verified container image](#verified-container-image)):
 
 ```sh
 docker run --rm -v bbs-state:/var/lib/bbs --entrypoint bbs \
-  ghcr.io/wbbradley/bbs@sha256:00272b068b0352a137110bf404298afc190f4690d5df109eeee39d720ed628bc \
+  "$image" \
   admin human rotate Ada --state-dir /var/lib/bbs
 ```
 
@@ -332,18 +333,18 @@ loginctl enable-linger "$USER"   # keep it running while you are logged out
 The [`Dockerfile`](Dockerfile) builds the binary in a Rust image and runs `bbs serve` as a non-root user (uid 999) in a slim Debian image, logging to stderr. The database lives on a volume at `/var/lib/bbs`; the container listens on `0.0.0.0:7777` and is published to the host only on the address you choose.
 
 ```sh
-docker pull ghcr.io/wbbradley/bbs@sha256:00272b068b0352a137110bf404298afc190f4690d5df109eeee39d720ed628bc
+docker pull "$image"
 docker run -d --name bbs --restart unless-stopped \
   -v bbs-state:/var/lib/bbs \
   -p 100.64.0.1:7777:7777 \
-  ghcr.io/wbbradley/bbs@sha256:00272b068b0352a137110bf404298afc190f4690d5df109eeee39d720ed628bc \
+  "$image" \
   --listen 0.0.0.0:7777 --require-human-token
 docker logs bbs                          # "bbs serve listening on 0.0.0.0:7777", then the server's log
 ```
 
-For a local source build instead, run `docker build -t bbs .` and substitute
-`bbs` for the digest in `docker run`. See [Verified container image](#verified-container-image)
-for the matching client revision.
+Set `image` as in [Verified container image](#verified-container-image), which also
+names the matching client revision. For a local source build instead, run
+`docker build -t bbs .` and set `image=bbs`.
 
 Keep these in mind:
 
@@ -355,18 +356,17 @@ Keep these in mind:
 
 ### Verified container image
 
-This Linux amd64 image is built from source revision
-[`cc115fa6fcd16fb400cfce9bdda49fcfafbb1af9`](https://github.com/wbbradley/bbs/commit/cc115fa6fcd16fb400cfce9bdda49fcfafbb1af9):
+These shell variables name the latest verified Linux amd64 image and the source
+revision it is built from; the examples in this README use them:
 
-```text
-ghcr.io/wbbradley/bbs@sha256:00272b068b0352a137110bf404298afc190f4690d5df109eeee39d720ed628bc
+```sh
+image=ghcr.io/wbbradley/bbs@sha256:00272b068b0352a137110bf404298afc190f4690d5df109eeee39d720ed628bc
+revision=cc115fa6fcd16fb400cfce9bdda49fcfafbb1af9
 ```
 
 The [publication run](https://github.com/wbbradley/bbs/actions/runs/38840974267)
 passed the test suite, restricted-container checks, and an anonymous pull by
-digest. It includes human-token authentication, named agents and ownership,
-v2 protocol checks, health probes, graceful shutdown, backups, group archival,
-headless agent control, and group write grants (release v0.4.0).
+digest. Publishing a new image updates only these two lines and the run link.
 Use the digest as the Kubernetes `image` value. The following command replaces
 `bbs` in the selected Cargo installation root (normally `~/.cargo/bin`), affecting
 future commands and hooks for that account. It is incompatible with a v1 server.
@@ -375,11 +375,10 @@ for a trial, use [a separate installation root and configuration](#isolated-tria
 Install the matching native client with:
 
 ```sh
-cargo install --locked --git https://github.com/wbbradley/bbs \
-  --rev cc115fa6fcd16fb400cfce9bdda49fcfafbb1af9 --bin bbs
+cargo install --locked --git https://github.com/wbbradley/bbs --rev "$revision" --bin bbs
 ```
 
-This pinned client and image report package version `0.4.0`. The Cargo package
+This client and image report the same package version. The Cargo package
 is `bbs-cli` (the binary is `bbs`); the crates.io crate named `bbs` is unrelated.
 A client installed by the older package name blocks the new one: run
 `cargo uninstall bbs` once, or add `--force`.
@@ -400,8 +399,8 @@ Published [GitHub releases](https://github.com/wbbradley/bbs/releases) are the
 trusted CLI release catalog. Each release is tagged `v<package version>` and
 carries a `bbs-release.json` manifest:
 
-```json
-{"format":1,"version":"0.5.0","tag":"v0.5.0","revision":"<full source revision>","rust_version":"1.89","protocol":{"epoch":2,"capabilities":["named-agents.v1","..."]},"schema_version":10,"config_format":1}
+```text
+{"format":1,"version":"<version>","tag":"v<version>","revision":"<full source revision>","rust_version":"<rust-version>","protocol":{"epoch":<epoch>,"capabilities":["named-agents.v1","..."]},"schema_version":<schema>,"config_format":1}
 ```
 
 `bbs version --manifest` prints this for a clean build and fails for a dirty or
@@ -461,11 +460,12 @@ and token state.
 
 Use a separate OS account or isolated client container with its own
 `~/.config/bbs/config.toml`, and a separate Cargo installation root. For example,
-in that isolated account, install without replacing its default `bbs`:
+in that isolated account, install without replacing its default `bbs` (`revision`
+is set in [Verified container image](#verified-container-image)):
 
 ```sh
 cargo install --locked --git https://github.com/wbbradley/bbs \
-  --rev cc115fa6fcd16fb400cfce9bdda49fcfafbb1af9 --bin bbs \
+  --rev "$revision" --bin bbs \
   --root "$HOME/.local/share/bbs-trial-client"
 ```
 
