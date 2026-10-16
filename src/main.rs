@@ -14,6 +14,7 @@ mod protocol;
 mod release;
 mod serve;
 mod service;
+mod setup;
 mod view;
 
 use std::fs::OpenOptions;
@@ -48,9 +49,11 @@ fn init_logging() {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = cli::Cli::parse();
-    // Handled before logging, which creates ~/bbs.log, so it has no side effects.
+    // Handled before logging, which creates ~/bbs.log, so they have no side effects.
     let result = if let cli::Command::Version { json, manifest } = cli.command {
         release::print(json, manifest)
+    } else if let cli::Command::Setup(args) = &cli.command {
+        setup::run(args)
     } else {
         init_logging();
         app::run(cli).await

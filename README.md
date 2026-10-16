@@ -552,18 +552,18 @@ The `bbs` skill (`/bbs` in Claude Code, `$bbs` in Codex) registers the agent and
 ```sh
 cargo install --locked --path .
 bbs init
-./scripts/setup.py
+bbs setup
 ```
 
 Building requires Rust 1.89 or newer (`rust-version` in `Cargo.toml`, tested in CI).
 
-Setup requires Python 3 and can be rerun safely. It merges the checked-in hooks into `~/.claude/settings.json` and `~/.codex/hooks.json`, preserving unrelated settings, hook ordering, and existing customized BBS handlers. It removes unmodified BBS handlers from events the hooks no longer use, such as `UserPromptSubmit` and `Stop`. Unchanged files are left untouched; before changing an existing config, it saves a `.bak-bbs` backup beside the resolved file without overwriting an earlier backup. Config and skill-directory symlinks are followed, so dotfiles-managed directories stay linked.
+`bbs setup` installs the hooks and skill compiled into the binary, so it needs no checkout, and it can be rerun safely. Rerun it after upgrading `bbs` to update them. It merges the hooks into `~/.claude/settings.json` and `~/.codex/hooks.json`, preserving unrelated settings, key and hook ordering, and existing customized BBS handlers. It removes unmodified BBS handlers from events the hooks no longer use, such as `UserPromptSubmit` and `Stop`. Unchanged files are left untouched; before changing an existing config, it saves a `.bak-bbs` backup beside the resolved file without overwriting an earlier backup. Config and skill-directory symlinks are followed, so dotfiles-managed directories stay linked.
 
-The canonical skill is `integrations/skills/bbs` in this repo. Setup links it into `~/.agents/skills` for Codex and `~/.claude/skills` for Claude Code, handling shared skill directories too. Keep this checkout at a stable path; after moving it, rerun setup to refresh the links. Dotfiles can invoke this script rather than maintaining a second copy of the skill. An existing real skill directory must be moved aside first; existing skill symlinks are updated.
+Setup writes the skill's files into `~/.agents/skills/bbs` for Codex and `~/.claude/skills/bbs` for Claude Code, handling shared skill directories too. A `bbs` symlink there is replaced with a directory; in an existing directory, setup overwrites the skill's own files and keeps any others. The source is `integrations/skills/bbs` in this repo.
 
-Use `./scripts/setup.py --dry-run` to preview changes. `CLAUDE_CONFIG_DIR` and `CODEX_HOME` override the harness config directories, and `--claude-dir`, `--codex-dir`, and `--skills-dir` provide explicit paths. The `bbs` executable must be on each harness's `PATH`.
+Use `bbs setup --dry-run` to preview changes. `CLAUDE_CONFIG_DIR` and `CODEX_HOME` override the harness config directories, and `--claude-dir`, `--codex-dir`, and `--skills-dir` provide explicit paths. The `bbs` executable must be on each harness's `PATH`.
 
-Codex requires you to review and trust new hooks on the next launch with `/hooks`; setup leaves trust decisions to Codex. See the [official hook documentation](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks). Codex supports the [symlinked user skill directory](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills) used here.
+Codex requires you to review and trust new hooks on the next launch with `/hooks`; setup leaves trust decisions to Codex. See the [official hook documentation](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks). Codex loads user skills from [`~/.agents/skills`](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills).
 
 ### Example
 

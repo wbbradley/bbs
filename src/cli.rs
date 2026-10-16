@@ -92,6 +92,8 @@ pub enum Command {
         #[arg(value_enum)]
         harness: Harness,
     },
+    /// Install the BBS hooks and skill for Claude Code and Codex.
+    Setup(SetupArgs),
     /// Serve the BBS over gRPC, owning the database in the state directory.
     Serve {
         /// Address to listen on.
@@ -152,6 +154,23 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Where `bbs setup` installs; existing settings and custom handlers are kept.
+#[derive(Args, Debug)]
+pub struct SetupArgs {
+    /// Claude Code config directory (default: CLAUDE_CONFIG_DIR or ~/.claude).
+    #[arg(long)]
+    pub claude_dir: Option<std::path::PathBuf>,
+    /// Codex config directory (default: CODEX_HOME or ~/.codex).
+    #[arg(long)]
+    pub codex_dir: Option<std::path::PathBuf>,
+    /// User skill directory read by Codex (default: ~/.agents/skills).
+    #[arg(long)]
+    pub skills_dir: Option<std::path::PathBuf>,
+    /// Show what would change without writing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// `bbs view` filters and output modes. Without flags: a full-screen feed of the

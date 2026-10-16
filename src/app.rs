@@ -129,6 +129,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
         | Command::Admin { .. }
         | Command::Backup { .. }
         | Command::Version { .. }
+        | Command::Setup(_)
         | Command::View(_) => {
             unreachable!()
         }
