@@ -5,6 +5,7 @@ mod backend;
 mod backup;
 mod cli;
 mod config;
+mod connect;
 mod db;
 mod headless;
 mod hook;

@@ -9,6 +9,12 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Added
+
+- `bbs connect`, a BBS-style terminal app for humans: a main menu with hot
+  keys, your agents or everyone's with their owners, groups with members and
+  writers, and a help screen generated from its keymap. (#PR)
+
 ## 0.6.0 - 2026-10-16
 
 Client-only change; servers need no upgrade. Headless users must move

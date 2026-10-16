@@ -87,6 +87,8 @@ pub enum Command {
     },
     /// Watch messages on the board as they flow (humans only; read-only).
     View(ViewArgs),
+    /// Browse the board in a BBS-style terminal app (humans only).
+    Connect,
     /// Handle a harness hook event (JSON on stdin). Never fails the harness.
     Hook {
         #[arg(value_enum)]

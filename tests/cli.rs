@@ -2954,6 +2954,15 @@ fn headless_stops_after_repeated_turn_errors(mode: Mode) {
     assert!(headless_state(&bbs, "Zed")["session_id"].is_null());
 }
 
+fn connect_is_for_humans_at_a_terminal(mode: Mode) {
+    let bbs = Bbs::with_mode("connect", mode);
+    let (_, token) = bbs.register();
+    let err = bbs.err(&["--token", &token, "connect"]);
+    assert!(err.contains("bbs connect is for humans"), "{err}");
+    let err = bbs.err(&["connect"]);
+    assert!(err.contains("bbs connect needs a terminal"), "{err}");
+}
+
 fn control_messages_are_for_owned_agents_only(mode: Mode) {
     let bbs = Bbs::with_mode("control", mode);
     bbs.ok(&["human", "add", "alice"]);
@@ -3120,6 +3129,7 @@ both_modes!(
     headless_replies_through_tools_and_cancels,
     headless_codex_replies_steers_and_interrupts,
     headless_stops_after_repeated_turn_errors,
+    connect_is_for_humans_at_a_terminal,
     control_messages_are_for_owned_agents_only,
     headless_run_takes_over_an_owned_agent,
     headless_signals_during_setup_stop_the_harness,
