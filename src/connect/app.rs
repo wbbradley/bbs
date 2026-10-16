@@ -21,6 +21,8 @@ pub struct Ctx {
     pub me: String,
     pub server: String,
     pub started: Instant,
+    /// `[connect] composer_max_height_percent`.
+    pub composer_max_height_percent: u8,
 }
 
 pub enum Transition {
@@ -28,6 +30,8 @@ pub enum Transition {
     Push(Box<dyn Screen>),
     Pop,
     Quit,
+    /// Ask the server for something on the screen's behalf.
+    Request(Request),
 }
 
 pub trait Screen {
@@ -155,6 +159,7 @@ impl App {
             Transition::Stay => {}
             Transition::Push(screen) => self.push(screen),
             Transition::Pop if self.stack.len() > 1 => self.pop(),
+            Transition::Request(request) => self.send(vec![request]),
             Transition::Pop | Transition::Quit => return true,
         }
         false
@@ -190,6 +195,7 @@ mod tests {
             me: "ada".into(),
             server: "bbs:7777".into(),
             started: Instant::now(),
+            composer_max_height_percent: 20,
         };
         let mut app = App::new(ctx, tx);
         // Past the splash.
@@ -236,6 +242,7 @@ mod tests {
             me: "ada".into(),
             server: "bbs:7777".into(),
             started: Instant::now(),
+            composer_max_height_percent: 20,
         };
         let mut app = App::new(ctx, tx);
         let out = screen(&mut app, 80, 24);
@@ -256,6 +263,7 @@ mod tests {
             me: "ada".into(),
             server: "local".into(),
             started: Instant::now(),
+            composer_max_height_percent: 20,
         };
         let mut app = App::new(ctx, tx);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -504,5 +512,129 @@ mod tests {
         // ACTIVE is local time, without the stored form's Z.
         let local = crate::ui::message::local_time("2026-10-16T18:00:00.000000Z");
         assert!(out.contains(&local), "{out}");
+    }
+
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        app.on_event(Event::Key(KeyEvent::new(code, modifiers)))
+    }
+
+    /// The agent thread for Mateo, with its feed stream's id.
+    fn mateo(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> u64 {
+        key(app, 'a');
+        rx.try_recv().unwrap();
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![agent("Mateo", "ada", &["crew"])],
+        }))));
+        enter(app);
+        watched(rx).0
+    }
+
+    #[test]
+    fn the_composer_sends_to_the_agent_and_empties_on_success() {
+        let (mut app, mut rx) = app();
+        let id = mateo(&mut app, &mut rx);
+        assert!(screen(&mut app, 80, 24).contains("i: write to Mateo"));
+        key(&mut app, 'i');
+        // Keys are text now: q does not go back.
+        for c in "quick".chars() {
+            assert!(!key(&mut app, c));
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+        for c in "note".chars() {
+            key(&mut app, c);
+        }
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("To Mateo · Enter sends"), "{out}");
+        assert!(out.contains("quick") && out.contains("note"), "{out}");
+        enter(&mut app);
+        let Request::Send { id: sent, req } = rx.try_recv().unwrap() else {
+            panic!("expected a send");
+        };
+        assert_eq!(
+            (sent, req.to.as_str(), req.body.as_str()),
+            (id, "Mateo", "quick\nnote")
+        );
+        assert!(screen(&mut app, 80, 24).contains("Sending…"));
+        app.on_event(Event::Data(Data::Sent { id, result: Ok(()) }));
+        let out = screen(&mut app, 80, 24);
+        assert!(!out.contains("quick"), "{out}");
+        // Esc leaves the composer, and q then goes back.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(screen(&mut app, 80, 24).contains("i: write to Mateo"));
+        key(&mut app, 'q');
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
+    }
+
+    #[test]
+    fn a_failed_send_keeps_the_text_and_says_why() {
+        let (mut app, mut rx) = app();
+        let id = mateo(&mut app, &mut rx);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        key(&mut app, 'x');
+        enter(&mut app);
+        rx.try_recv().unwrap();
+        app.on_event(Event::Data(Data::Sent {
+            id,
+            result: Err("no agent named Mateo".into()),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("Not sent: no agent named Mateo"), "{out}");
+        assert!(out.contains("│x"), "{out}");
+        // Ctrl-C still quits from the composer.
+        assert!(press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn groups_compose_broadcasts_and_the_feed_has_no_composer() {
+        let (mut app, mut rx) = app();
+        key(&mut app, 'g');
+        rx.try_recv().unwrap();
+        app.on_event(Event::Data(Data::Groups(Ok(proto::GroupListResponse {
+            groups: vec![proto::Group {
+                name: "crew".into(),
+                ..Default::default()
+            }],
+        }))));
+        enter(&mut app);
+        watched(&mut rx);
+        key(&mut app, 'i');
+        key(&mut app, 'x');
+        enter(&mut app);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("expected a send");
+        };
+        assert_eq!(req.to, "@crew");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        key(&mut app, 'q');
+        rx.try_recv().unwrap();
+        key(&mut app, 'q');
+        key(&mut app, 'f');
+        watched(&mut rx);
+        assert!(!screen(&mut app, 80, 24).contains("write to"));
+        // With no composer, i does nothing and q still goes back.
+        key(&mut app, 'i');
+        assert!(!key(&mut app, 'q'));
+        assert!(screen(&mut app, 80, 24).contains("Main menu"));
+    }
+
+    #[test]
+    fn the_composer_grows_to_its_share_of_the_window() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        let rows = |app: &mut App| {
+            screen(app, 80, 30)
+                .lines()
+                .filter(|l| l.starts_with("║│"))
+                .count()
+        };
+        assert_eq!(rows(&mut app), 2);
+        key(&mut app, 'i');
+        for _ in 0..10 {
+            key(&mut app, 'x');
+            press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+        }
+        // 20% of 30 rows.
+        assert_eq!(rows(&mut app), 6);
     }
 }

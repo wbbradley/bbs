@@ -33,6 +33,11 @@ pub enum Request {
     },
     /// Stop a stream.
     Unwatch(u64),
+    /// Send a message for the screen `id`.
+    Send {
+        id: u64,
+        req: proto::SendRequest,
+    },
 }
 
 /// A server reply; errors are messages to show.
@@ -43,6 +48,11 @@ pub enum Data {
     Feed {
         id: u64,
         result: Result<Vec<proto::Message>, String>,
+    },
+    /// The outcome of a send for the screen `id`.
+    Sent {
+        id: u64,
+        result: Result<(), String>,
     },
 }
 
@@ -103,6 +113,10 @@ pub async fn serve(
                     .map_err(error),
             ),
             Request::Groups => Data::Groups(backend.group_list().await.map_err(error)),
+            Request::Send { id, req } => Data::Sent {
+                id,
+                result: backend.send(req).await.map(drop).map_err(error),
+            },
             Request::Watch { id, req } => {
                 let task = tokio::spawn(watch(opener.clone(), id, req, tx.clone()));
                 if let Some(old) = streams.insert(id, task) {

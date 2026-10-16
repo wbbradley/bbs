@@ -19,6 +19,7 @@ pub enum Action {
     Reload,
     ToggleAll,
     Search,
+    Compose,
     NextMatch,
     PrevMatch,
     /// A screen's own hot key, such as a menu item's.
@@ -92,6 +93,11 @@ pub const BINDINGS: &[Binding] = &[
         keys: &[Key::Char('/')],
         action: Action::Search,
         help: "threads: search",
+    },
+    Binding {
+        keys: &[Key::Char('i'), Key::Code(KeyCode::Tab)],
+        action: Action::Compose,
+        help: "threads: write (Enter sends, Esc done)",
     },
     Binding {
         keys: &[Key::Char('n')],

@@ -1,19 +1,21 @@
 //! A live thread of messages: an agent's conversation, a group's broadcasts,
-//! or the whole feed as `bbs view` shows it.
+//! or the whole feed as `bbs view` shows it. Agent and group threads have a
+//! composer below for writing to them.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::connect::app::{Ctx, Screen, Transition};
+use crate::connect::composer::Composer;
 use crate::connect::event::{Data, Request};
 use crate::connect::keys::Action;
 use crate::connect::theme;
-use crate::proto::FeedRequest;
+use crate::proto::{FeedRequest, SendRequest};
 use crate::ui::thread::ThreadView;
 
 /// Messages each feed snapshot holds, as for `bbs view`.
@@ -31,10 +33,13 @@ pub struct Thread {
     error: Option<String>,
     /// The search being typed after `/`.
     prompt: Option<String>,
+    composer: Option<Composer>,
+    /// Keys go to the composer.
+    composing: bool,
 }
 
 impl Thread {
-    fn new(title: String, req: FeedRequest) -> Thread {
+    fn new(title: String, req: FeedRequest, to: Option<&str>) -> Thread {
         Thread {
             title,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -45,6 +50,8 @@ impl Thread {
             view: ThreadView::new(Vec::new(), BACKLOG as usize),
             error: None,
             prompt: None,
+            composer: to.map(Composer::new),
+            composing: false,
         }
     }
 
@@ -58,7 +65,7 @@ impl Thread {
             with: Some(agent.to_string()),
             ..Default::default()
         };
-        Thread::new(title, req)
+        Thread::new(title, req, Some(agent))
     }
 
     /// Broadcasts to `group`.
@@ -67,12 +74,13 @@ impl Thread {
             group: Some(group.to_string()),
             ..Default::default()
         };
-        Thread::new(format!("@{group}"), req)
+        let to = format!("@{group}");
+        Thread::new(to.clone(), req, Some(&to))
     }
 
     /// Everything on the board.
     pub fn feed() -> Thread {
-        Thread::new("Feed".into(), FeedRequest::default())
+        Thread::new("Feed".into(), FeedRequest::default(), None)
     }
 
     fn status(&self) -> Line<'static> {
@@ -95,6 +103,32 @@ impl Thread {
             text.push_str(&format!(" · /{query}: {hits} matches · n/N"));
         }
         Line::styled(text, theme::dim())
+    }
+}
+
+impl Thread {
+    /// A key while composing: `Esc` leaves the composer, and `Enter` sends.
+    fn compose(&mut self, key: KeyEvent) -> Option<Transition> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            // Quit through the keymap, as everywhere.
+            return None;
+        }
+        if key.code == KeyCode::Esc {
+            self.composing = false;
+            return Some(Transition::Stay);
+        }
+        let composer = self.composer.as_mut()?;
+        Some(match composer.key(key) {
+            Some(body) => Transition::Request(Request::Send {
+                id: self.id,
+                req: SendRequest {
+                    to: composer.to().to_string(),
+                    body,
+                    control: None,
+                },
+            }),
+            None => Transition::Stay,
+        })
     }
 }
 
@@ -132,11 +166,23 @@ impl Screen for Thread {
                 }
                 Err(e) => self.error = Some(describe(e)),
             },
+            Data::Sent { id, result } if *id == self.id => {
+                if let Some(composer) = &mut self.composer {
+                    composer.sent(result.clone());
+                }
+                // Show the message just sent.
+                if result.is_ok() {
+                    self.view.follow();
+                }
+            }
             _ => {}
         }
     }
 
     fn raw_key(&mut self, key: KeyEvent) -> Option<Transition> {
+        if self.composing {
+            return self.compose(key);
+        }
         let prompt = self.prompt.as_mut()?;
         match key.code {
             KeyCode::Enter => {
@@ -166,6 +212,7 @@ impl Screen for Thread {
             Action::Top => self.view.scroll_to(0),
             Action::Bottom => self.view.follow(),
             Action::Search => self.prompt = Some(String::new()),
+            Action::Compose => self.composing = self.composer.is_some(),
             Action::NextMatch => self.view.jump(true),
             Action::PrevMatch => self.view.jump(false),
             Action::Back => return Transition::Pop,
@@ -174,12 +221,24 @@ impl Screen for Thread {
         Transition::Stay
     }
 
-    fn render(&mut self, frame: &mut Frame, area: Rect, _ctx: &Ctx) {
+    fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
         let window = theme::window(&self.title);
         let inner = window.inner(area);
         frame.render_widget(window, area);
-        let [status, body] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+        let max_lines = frame.area().height * u16::from(ctx.composer_max_height_percent) / 100;
+        let composer_height = self
+            .composer
+            .as_ref()
+            .map_or(0, |c| c.height(inner.width, max_lines));
+        let [status, body, composer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(composer_height),
+        ])
+        .areas(inner);
+        if let Some(c) = &mut self.composer {
+            c.render(frame, composer, self.composing);
+        }
         if let Some(error) = &self.error {
             let text = vec![
                 Line::styled(error.clone(), theme::error()),

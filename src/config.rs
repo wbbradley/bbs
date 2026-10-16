@@ -12,7 +12,7 @@ use crate::headless::Settings;
 
 /// Version of the fields `Config` accepts. Increase it when a change means an
 /// older binary can no longer read a config this one writes.
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +29,34 @@ pub struct Config {
     /// `[headless]`: harnesses and run defaults for `bbs headless run`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headless: Option<Settings>,
+    /// `[connect]`: settings for `bbs connect`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect: Option<ConnectSettings>,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectSettings {
+    /// The most the composer grows to, as a percentage of the window height.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "percent"
+    )]
+    pub composer_max_height_percent: Option<u8>,
+}
+
+/// The composer's height limit when the config sets none.
+pub const COMPOSER_MAX_HEIGHT_PERCENT: u8 = 20;
+
+fn percent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u8>, D::Error> {
+    let value = u8::deserialize(d)?;
+    if !(1..=100).contains(&value) {
+        return Err(serde::de::Error::custom(format!(
+            "expected a percentage from 1 to 100, got {value}"
+        )));
+    }
+    Ok(Some(value))
 }
 
 pub fn path() -> Result<PathBuf> {
@@ -91,6 +119,13 @@ impl Config {
         Ok(())
     }
 
+    pub fn composer_max_height_percent(&self) -> u8 {
+        self.connect
+            .as_ref()
+            .and_then(|c| c.composer_max_height_percent)
+            .unwrap_or(COMPOSER_MAX_HEIGHT_PERCENT)
+    }
+
     /// The human name: `--as`, then the config, then `$USER`.
     pub fn human(&self, as_human: Option<&str>) -> Option<String> {
         as_human
@@ -117,5 +152,18 @@ mod tests {
         assert!(err.starts_with("line 2: unknown field `bogus`"), "{err}");
         let err = parse("human_token = 'secret\n").err().unwrap();
         assert!(!err.contains("secret"), "{err}");
+    }
+
+    #[test]
+    fn connect_settings_default_and_check_the_composer_height() {
+        assert_eq!(parse("").unwrap().composer_max_height_percent(), 20);
+        let config = parse("[connect]\ncomposer_max_height_percent = 35\n").unwrap();
+        assert_eq!(config.composer_max_height_percent(), 35);
+        for bad in ["0", "101", "\"tall\""] {
+            let text = format!("[connect]\ncomposer_max_height_percent = {bad}\n");
+            let err = parse(&text).err().unwrap();
+            assert!(err.starts_with("line 2: "), "{bad}: {err}");
+        }
+        assert!(parse("[connect]\nwidth = 3\n").is_err());
     }
 }
