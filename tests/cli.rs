@@ -124,6 +124,11 @@ impl Bbs {
         self.run_with_stdin(args, "")
     }
 
+    /// Let `agent` broadcast to `group`, as a human.
+    fn grant_write(&self, group: &str, agent: &str) {
+        self.ok(&["group", "grant", group, agent]);
+    }
+
     fn ok(&self, args: &[&str]) -> String {
         let out = self.run(args);
         assert!(
@@ -222,7 +227,7 @@ fn version_reports_identity_without_side_effects() {
             );
             assert_eq!(report["protocol"]["epoch"], 2);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
-            assert_eq!(report["schema_version"], 9);
+            assert_eq!(report["schema_version"], 10);
             assert_eq!(report["config_format"], 1);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {
@@ -392,6 +397,7 @@ fn cross_owner_messages_are_qualified_for_each_reader(mode: Mode) {
     for token in [&ts, &same_token, &other_token] {
         bbs.ok(&["--token", token, "group", "join", "acme"]);
     }
+    bbs.grant_write("acme", &sender);
     for token in [&ts, &same_token, &other_token] {
         bbs.ok(&["--token", token, "read"]);
     }
@@ -765,6 +771,8 @@ fn remote_backend_round_trip() {
     let (a, ta) = bbs.register();
     let b = register_out.split('"').nth(1).unwrap();
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    bbs.grant_write("acme", &a);
+    bbs.ok(&["--token", &ta, "read"]);
     assert!(
         bbs.err(&["--token", &ta, "send", "--to", "will", "hi"])
             .contains("cannot message humans")
@@ -889,6 +897,19 @@ fn broadcast_reaches_members_and_humans(mode: Mode) {
         bbs.err(&["--token", &tc, "send", "--to", "@acme", "x"])
             .contains("not a member")
     );
+    // Members broadcast only once a human grants them write.
+    assert!(
+        bbs.err(&["--token", &ta, "send", "--to", "@acme", "x"])
+            .contains(
+                "you lack write access to @acme; only a human can grant it. @acme has no agent writers."
+            )
+    );
+    bbs.grant_write("acme", &a);
+    assert!(
+        bbs.err(&["--token", &tb, "send", "--to", "@acme", "x"]).contains(&format!(
+            "you lack write access to @acme; only a human can grant it. Writers: {a} (message one of them to reach the group)."
+        ))
+    );
     let out = bbs.ok(&["--token", &ta, "send", "--to", "@acme", "standup"]);
     assert!(out.contains("1 recipients"), "{out}"); // humans are not counted for agents
 
@@ -896,7 +917,7 @@ fn broadcast_reaches_members_and_humans(mode: Mode) {
         bbs.ok(&["--token", &tb, "read"])
             .contains(&format!("from {a} to @acme:\nstandup"))
     );
-    // A has only B's join notice, not its own broadcast.
+    // A has only B's join notice and the grant, not its own broadcast.
     assert!(!bbs.ok(&["--token", &ta, "read"]).contains("standup"));
     assert_eq!(bbs.ok(&["--token", &tc, "read"]), "");
     assert!(bbs.ok(&["--as", "alice", "read"]).contains("standup"));
@@ -1108,6 +1129,9 @@ fn deleting_groups_archives_history_and_removes_access(mode: Mode) {
     let (b, tb) = bbs.register();
     for token in [&ta, &tb] {
         bbs.ok(&["--token", token, "group", "join", "acme"]);
+    }
+    bbs.grant_write("acme", &a);
+    for token in [&ta, &tb] {
         bbs.ok(&["--token", token, "read"]);
     }
     bbs.ok(&["--token", &ta, "group", "join", "other"]);
@@ -1363,7 +1387,7 @@ fn groups_carry_human_written_descriptions(mode: Mode) {
     assert!(bbs.ok(&["group", "list"]).contains("  -1 means off\n"));
     assert!(
         bbs.ok(&["group", "list", "--json"])
-            .contains(r#""name":"plain","members":[],"description":"-1 means off"}"#)
+            .contains(r#""name":"plain","members":[],"description":"-1 means off","#)
     );
     bbs.ok(&["group", "describe", "plain", &max]);
     assert!(
@@ -1449,6 +1473,144 @@ fn leaving_or_removal_notifies_the_group(mode: Mode) {
     assert!(!bbs.ok(&["read"]).contains("removed"));
     assert_eq!(bbs.ok(&["--token", &tc, "read"]), "");
     assert_eq!(bbs.ok(&["group", "list"]), format!("@acme: {b}\n"));
+}
+
+fn humans_grant_and_revoke_group_writers(mode: Mode) {
+    let bbs = Bbs::with_mode("writers", mode);
+    bbs.ok(&["human", "add", "ada"]);
+    bbs.ok(&["group", "register", "acme"]);
+    let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    let (c, _tc) = bbs.register();
+    for t in [&ta, &tb] {
+        bbs.ok(&["--token", t, "group", "join", "acme"]);
+    }
+    for t in [&ta, &tb] {
+        bbs.ok(&["--token", t, "read"]);
+    }
+    bbs.ok(&["--as", "ada", "read"]);
+
+    // Only humans grant, and only to current members.
+    assert!(
+        bbs.err(&["--token", &ta, "group", "grant", "acme", &a])
+            .contains("for humans only")
+    );
+    assert!(
+        bbs.err(&["group", "grant", "acme", &c])
+            .contains(&format!("{c} is not in @acme"))
+    );
+    assert!(
+        bbs.err(&["group", "grant", "acme", "Nobody"])
+            .contains("no live agent")
+    );
+
+    assert_eq!(
+        bbs.ok(&["group", "grant", "@acme", &a]),
+        format!("Granted write on @acme to {a}.\n")
+    );
+    assert_eq!(
+        bbs.ok(&["group", "grant", "acme", &a]),
+        format!("{a} already has write on @acme.\n")
+    );
+    assert_eq!(
+        bbs.ok(&["group", "revoke", "acme", &b]),
+        format!("{b} already lacks write on @acme.\n")
+    );
+    let granted = format!(
+        "from will (human) to @acme:\nHuman \"will\" granted write on @acme to agent {a:?}.\n"
+    );
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&granted));
+    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&granted));
+    assert!(bbs.ok(&["--as", "ada", "read"]).contains(&granted));
+    let list = bbs.ok(&["group", "list"]);
+    assert!(
+        list.contains(&format!("{a} [w]")) && !list.contains(&format!("{b} [w]")),
+        "{list}"
+    );
+    let groups = json_lines(&bbs.ok(&["group", "list", "--json"]));
+    assert_eq!(groups[0]["writers"], serde_json::json!([a]));
+    // A refused agent learns who can broadcast.
+    assert!(
+        bbs.err(&["--token", &tb, "send", "--to", "@acme", "x"])
+            .contains(&format!("Writers: {a} (message one of them"))
+    );
+    // Without write an agent still reads the group and can DM members.
+    bbs.ok(&["--token", &ta, "send", "--to", "@acme", "standup"]);
+    assert!(bbs.ok(&["--token", &tb, "read"]).contains("standup"));
+    bbs.ok(&["--token", &tb, "send", "--to", &a, "dm"]);
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains("dm"));
+
+    // A grant outlives leaving and rejoining, and the rejoin says so.
+    bbs.ok(&["--token", &ta, "group", "leave", "acme"]);
+    assert!(bbs.ok(&["--as", "ada", "read"]).contains(&format!(
+        "Agent {a:?} left group @acme. @acme now has no agent writers.\n"
+    )));
+    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    assert!(
+        bbs.ok(&["--as", "ada", "read"])
+            .contains(&format!("Agent {a:?} joined group @acme as a writer.\n"))
+    );
+    bbs.ok(&["--token", &ta, "send", "--to", "@acme", "back"]);
+
+    // Revoking needs no membership, and changes nothing else when the group
+    // already had no writers among its members.
+    bbs.ok(&["--token", &ta, "group", "leave", "acme"]);
+    bbs.ok(&["--token", &tb, "read"]);
+    assert_eq!(
+        bbs.ok(&["group", "revoke", "acme", &a]),
+        format!("Revoked write on @acme from {a}.\n")
+    );
+    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&format!(
+        "Human \"will\" revoked write on @acme from agent {a:?}.\n"
+    )));
+    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    assert!(
+        bbs.err(&["--token", &ta, "send", "--to", "@acme", "x"])
+            .contains("@acme has no agent writers.")
+    );
+
+    // Retiring drops the grant: a new agent with that name lacks it.
+    bbs.grant_write("acme", &a);
+    bbs.ok(&["--token", &tb, "read"]);
+    bbs.ok(&["--token", &ta, "bye"]);
+    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&format!(
+        "Agent {a:?} is no longer a member of group @acme. @acme now has no agent writers.\n"
+    )));
+    let writers: i64 = bbs
+        .db()
+        .query_row("SELECT COUNT(*) FROM group_writers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(writers, 0);
+    let (_, ta) = bbs.register_with(&["register", "--name", &a]);
+    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    assert!(
+        bbs.err(&["--token", &ta, "send", "--to", "@acme", "x"])
+            .contains("lack write access")
+    );
+
+    // Losing the last writer by revoke, removal, or retirement is announced.
+    bbs.ok(&["--token", &ta, "read"]);
+    bbs.grant_write("acme", &b);
+    bbs.ok(&["group", "revoke", "acme", &b]);
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&format!(
+        "revoked write on @acme from agent {b:?}. @acme now has no agent writers.\n"
+    )));
+    bbs.grant_write("acme", &b);
+    bbs.ok(&["group", "remove", "acme", &b]);
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&format!(
+        "removed agent {b:?} from group @acme. @acme now has no agent writers.\n"
+    )));
+    // Removal revokes write, so rejoining does not restore it.
+    bbs.ok(&["--token", &tb, "group", "join", "acme"]);
+    assert!(
+        bbs.err(&["--token", &tb, "send", "--to", "@acme", "x"])
+            .contains("lack write access")
+    );
+    bbs.grant_write("acme", &b);
+    bbs.ok(&["retire", &b]);
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&format!(
+        "Agent {b:?} is no longer a member of group @acme. @acme now has no agent writers.\n"
+    )));
 }
 
 fn agents_lists_status_and_scopes_visibility(mode: Mode) {
@@ -1695,9 +1857,9 @@ fn json_output_is_one_object_per_line(mode: Mode) {
     bbs.ok(&["group", "register", "empty"]);
     let (a, ta) = bbs.register_with(&["register", "--name", "Jeffrey", "--note", "on it"]);
     let (b, tb) = bbs.register_with(&["--as", "Ada", "register"]);
-    for token in [&ta, &tb] {
-        bbs.ok(&["--token", token, "group", "join", "acme"]);
-    }
+    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    bbs.grant_write("acme", &a);
+    bbs.ok(&["--token", &tb, "group", "join", "acme"]);
     for token in [&ta, &tb] {
         bbs.ok(&["--token", token, "read"]);
     }
@@ -1806,8 +1968,8 @@ fn json_output_is_one_object_per_line(mode: Mode) {
     assert_eq!(
         groups,
         vec![
-            serde_json::json!({"name": "acme", "members": [b], "description": null}),
-            serde_json::json!({"name": "empty", "members": [], "description": null}),
+            serde_json::json!({"name": "acme", "members": [b], "description": null, "writers": []}),
+            serde_json::json!({"name": "empty", "members": [], "description": null, "writers": []}),
         ]
     );
 }
@@ -2002,6 +2164,9 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
     }
     bbs.ok(&["--token", &td, "group", "join", "beta"]);
     bbs.ok(&["--token", &td, "group", "join", "gamma"]);
+    bbs.grant_write("acme", &a);
+    bbs.grant_write("beta", &d);
+    bbs.grant_write("gamma", &d);
 
     bbs.ok(&["--token", &ta, "send", "--to", "@acme", "acme from A"]);
     bbs.ok(&["--token", &td, "send", "--to", "@beta", "beta from D"]);
@@ -2330,6 +2495,11 @@ fn view_json_follow_emits_each_message_once(mode: Mode) {
     let (a, ta) = bbs.register();
     let (_b, _tb) = bbs.register();
     bbs.ok(&["send", "--to", &a, "history"]);
+    // Set up a group as another human, so its notices do not match.
+    bbs.ok(&["human", "add", "ada"]);
+    bbs.ok(&["--as", "ada", "group", "register", "acme"]);
+    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    bbs.ok(&["--as", "ada", "group", "grant", "acme", &a]);
     let mut child = bbs.spawn(&["view", "--json", "--from", "will"]);
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2354,8 +2524,6 @@ fn view_json_follow_emits_each_message_once(mode: Mode) {
     // Reading changes read_at and re-sends the window; nothing is repeated.
     bbs.ok(&["--token", &ta, "read"]);
     // A non-matching sender produces a snapshot but no line.
-    bbs.ok(&["group", "register", "acme"]);
-    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
     bbs.ok(&["--token", &ta, "send", "--to", "@acme", "x"]);
     bbs.ok(&["send", "--to", &a, "live two"]);
     assert_eq!(next()["body"], "live two");
@@ -2690,6 +2858,7 @@ both_modes!(
     groups_carry_human_written_descriptions,
     joining_notifies_the_group,
     leaving_or_removal_notifies_the_group,
+    humans_grant_and_revoke_group_writers,
     agents_lists_status_and_scopes_visibility,
     json_output_is_one_object_per_line,
     active_at_writes_are_debounced,

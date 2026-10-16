@@ -98,15 +98,16 @@ class BubbleSetsTests(unittest.TestCase):
 
     def test_bbs_input_ignores_humans_and_retired_includes_ungrouped(self):
         with patch.object(bs, "command", side_effect=[
-            "@team: Alice, Bob\n  Ships the: thing, with Carol\n@empty: (no agents)\n",
+            ('{"name":"team","members":["Alice","Bob"],"description":"Ships the: thing, with Carol",'
+             '"writers":["Alice"]}\n{"name":"empty","members":[],"description":null,"writers":[]}\n'),
             ("NAME KIND GROUPS ACTIVE_AT WHERE STATUS\nWill human * now\nAlice agent team now\n"
             "Bob agent team now\nSolo agent - now\nOld retired - now\n"),
         ]) as run:
             data = bs.read_bbs("custom-bbs")
         self.assertEqual(data["agents"], ["Alice", "Bob", "Solo"])
         self.assertEqual(data["groups"], {"empty": [], "team": ["Alice", "Bob"]})
-        self.assertEqual(run.call_args_list[0].args[0], ["custom-bbs", "group", "list"])
-        for output in ("unexpected output", "  description before any group\n"):
+        self.assertEqual(run.call_args_list[0].args[0], ["custom-bbs", "group", "list", "--json"])
+        for output in ("unexpected output", '{"members": []}\n'):
             with (patch.object(bs, "command", return_value=output),
                   self.assertRaisesRegex(ValueError, "unrecognized")):
                 bs.read_bbs()

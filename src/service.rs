@@ -467,12 +467,13 @@ pub fn retire_agent(
 /// change in each group. Announce first: retirement drops the memberships.
 fn retire(ctx: &Ctx, by: &db::Principal, target: &db::Principal, notice: &str) -> Result<()> {
     for (gid, group) in db::member_groups(ctx.conn, target.id)? {
+        let orphaned = departing_writer(ctx, gid, &group, target)?;
         broadcast(
             ctx,
             by,
             gid,
             &format!(
-                "{notice} Agent {:?} is no longer a member of group @{group}.",
+                "{notice} Agent {:?} is no longer a member of group @{group}.{orphaned}",
                 target.name
             ),
         )?;
@@ -582,7 +583,15 @@ pub fn group_join(
                 ctx,
                 &me,
                 gid,
-                &format!("Agent {:?} joined group @{group}.", me.name),
+                &format!(
+                    "Agent {:?} joined group @{group}{}.",
+                    me.name,
+                    if db::is_writer(ctx.conn, gid, me.id)? {
+                        " as a writer"
+                    } else {
+                        ""
+                    }
+                ),
             )?;
             tracing::info!(agent = me.name, group, "joined group");
         }
@@ -605,11 +614,12 @@ pub fn group_leave(
         if !db::is_member(ctx.conn, gid, me.id)? {
             bail!("you are not in @{group}");
         }
+        let orphaned = departing_writer(ctx, gid, group, &me)?;
         broadcast(
             ctx,
             &me,
             gid,
-            &format!("Agent {:?} left group @{group}.", me.name),
+            &format!("Agent {:?} left group @{group}.{orphaned}", me.name),
         )?;
         db::leave_group(ctx.conn, gid, me.id)?;
         tracing::info!(agent = me.name, group, "left group");
@@ -635,12 +645,15 @@ pub fn group_remove(
             bail!("{} is not in @{group}", target.name);
         }
         // Notify before removing so the removed agent learns why the group went quiet.
+        let orphaned = departing_writer(ctx, gid, group, &target)?;
         let notice = format!(
-            "Human {:?} removed agent {:?} from group @{group}.",
+            "Human {:?} removed agent {:?} from group @{group}.{orphaned}",
             me.name, target.name
         );
         broadcast(ctx, &me, gid, &notice)?;
         db::leave_group(ctx.conn, gid, target.id)?;
+        // Agents join groups themselves, so removal also takes write away.
+        db::set_writer(ctx.conn, gid, target.id, false, &ctx.now_s)?;
         tracing::info!(
             agent = target.name,
             group,
@@ -654,6 +667,77 @@ pub fn group_remove(
     })
 }
 
+pub fn set_group_writer(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::SetGroupWriterRequest,
+) -> Result<proto::SetGroupWriterResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let group = group_name(&req.group);
+        let gid = require_group(ctx.conn, group)?;
+        let Some(target) = db::live_agent_by_name(ctx.conn, &req.agent)? else {
+            bail!("no live agent named {:?}", req.agent);
+        };
+        // Granting needs a member; revoking does not, so a grant can be
+        // removed after the agent leaves.
+        if req.grant && !db::is_member(ctx.conn, gid, target.id)? {
+            bail!("{} is not in @{group}", target.name);
+        }
+        let had_writers = !db::group_writers(ctx.conn, gid)?.is_empty();
+        let changed = db::set_writer(ctx.conn, gid, target.id, req.grant, &ctx.now_s)?;
+        let agent = target.name;
+        if changed {
+            let notice = if req.grant {
+                format!(
+                    "Human {:?} granted write on @{group} to agent {agent:?}.",
+                    me.name
+                )
+            } else {
+                let orphaned = had_writers && db::group_writers(ctx.conn, gid)?.is_empty();
+                format!(
+                    "Human {:?} revoked write on @{group} from agent {agent:?}.{}",
+                    me.name,
+                    if orphaned {
+                        no_writers(group)
+                    } else {
+                        String::new()
+                    }
+                )
+            };
+            broadcast(ctx, &me, gid, &notice)?;
+            tracing::info!(
+                agent,
+                group,
+                grant = req.grant,
+                by = me.name,
+                "changed group writer"
+            );
+        }
+        Ok(proto::SetGroupWriterResponse {
+            group: group.to_string(),
+            agent,
+            changed,
+        })
+    })
+}
+
+fn no_writers(group: &str) -> String {
+    format!(" @{group} now has no agent writers.")
+}
+
+/// The no-writers sentence when `agent`, about to leave, is the group's only
+/// writer among its members; else empty.
+fn departing_writer(ctx: &Ctx, gid: i64, group: &str, agent: &db::Principal) -> Result<String> {
+    let only =
+        db::group_writers(ctx.conn, gid)?.len() == 1 && db::is_writer(ctx.conn, gid, agent.id)?;
+    Ok(if only {
+        no_writers(group)
+    } else {
+        String::new()
+    })
+}
+
 pub fn group_list(conn: &mut Connection, caller: &Caller) -> Result<proto::GroupListResponse> {
     with_ctx(conn, caller, |ctx| {
         let me = ctx.actor()?;
@@ -664,6 +748,7 @@ pub fn group_list(conn: &mut Connection, caller: &Caller) -> Result<proto::Group
                 name: g.name,
                 members: g.members,
                 description: g.description,
+                writers: Some(proto::GroupWriters { names: g.writers }),
             })
             .collect();
         Ok(proto::GroupListResponse { groups })
@@ -752,8 +837,22 @@ pub fn send(
 
         if let Some(group) = to.strip_prefix('@') {
             let gid = require_group(ctx.conn, group)?;
-            if me.kind == db::Kind::Agent && !db::is_member(ctx.conn, gid, me.id)? {
-                bail!("you are not a member of @{group}");
+            if me.kind == db::Kind::Agent {
+                if !db::is_member(ctx.conn, gid, me.id)? {
+                    bail!("you are not a member of @{group}");
+                }
+                if !db::is_writer(ctx.conn, gid, me.id)? {
+                    let writers = db::group_writers(ctx.conn, gid)?;
+                    let denied =
+                        format!("you lack write access to @{group}; only a human can grant it");
+                    if writers.is_empty() {
+                        bail!("{denied}. @{group} has no agent writers.");
+                    }
+                    bail!(
+                        "{denied}. Writers: {} (message one of them to reach the group).",
+                        writers.join(", ")
+                    );
+                }
             }
             let (count, visible) = broadcast(ctx, &me, gid, body)?;
             tracing::info!(

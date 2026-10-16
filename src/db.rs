@@ -21,6 +21,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0007_group_description.sql"),
     include_str!("../migrations/0008_feed_indexes.sql"),
     include_str!("../migrations/0009_message_control.sql"),
+    include_str!("../migrations/0010_group_writers.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,8 @@ pub struct GroupRow {
     pub name: String,
     pub description: Option<String>,
     pub members: Vec<String>,
+    /// Members holding a write grant.
+    pub writers: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -387,7 +390,8 @@ pub fn stale_agent_ids(conn: &Connection, cutoff: &str) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
-/// Retire an agent: free its name, archive its unread mail, drop its memberships.
+/// Retire an agent: free its name, archive its unread mail, drop its memberships
+/// and write grants.
 pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
     conn.execute(
         "UPDATE agents SET retired_at = ?1 WHERE id = ?2 AND retired_at IS NULL",
@@ -399,6 +403,7 @@ pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
         params![now, id],
     )?;
     conn.execute("DELETE FROM group_members WHERE agent_id = ?1", params![id])?;
+    conn.execute("DELETE FROM group_writers WHERE agent_id = ?1", params![id])?;
     Ok(())
 }
 
@@ -560,6 +565,51 @@ pub fn is_member(conn: &Connection, group_id: i64, agent_id: i64) -> Result<bool
     Ok(n > 0)
 }
 
+pub fn is_writer(conn: &Connection, group_id: i64, agent_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM group_writers WHERE group_id = ?1 AND agent_id = ?2)",
+        params![group_id, agent_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Grant or revoke write; returns false if nothing changed.
+pub fn set_writer(
+    conn: &Connection,
+    group_id: i64,
+    agent_id: i64,
+    grant: bool,
+    now: &str,
+) -> Result<bool> {
+    let n = if grant {
+        conn.execute(
+            "INSERT OR IGNORE INTO group_writers (group_id, agent_id, granted_at)
+             VALUES (?1, ?2, ?3)",
+            params![group_id, agent_id, now],
+        )?
+    } else {
+        conn.execute(
+            "DELETE FROM group_writers WHERE group_id = ?1 AND agent_id = ?2",
+            params![group_id, agent_id],
+        )?
+    };
+    Ok(n > 0)
+}
+
+/// Names of the group's live members that hold a write grant.
+pub fn group_writers(conn: &Connection, group_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.name FROM group_members m JOIN agents a ON a.id = m.agent_id
+           JOIN group_writers w ON w.group_id = m.group_id AND w.agent_id = m.agent_id
+          WHERE m.group_id = ?1 AND a.retired_at IS NULL
+          ORDER BY lower(a.name)",
+    )?;
+    let names = stmt
+        .query_map(params![group_id], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(names)
+}
+
 pub fn share_group(conn: &Connection, a: i64, b: i64) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM group_members x
@@ -601,9 +651,11 @@ pub fn member_groups(conn: &Connection, agent_id: i64) -> Result<Vec<(i64, Strin
 /// `agent_id` belongs to.
 pub fn list_groups(conn: &Connection, agent_id: Option<i64>) -> Result<Vec<GroupRow>> {
     let mut stmt = conn.prepare(
-        "SELECT g.id, g.name, g.description, a.name FROM bbs_groups g
+        "SELECT g.id, g.name, g.description, a.name, w.group_id IS NOT NULL
+         FROM bbs_groups g
          LEFT JOIN group_members m ON m.group_id = g.id
          LEFT JOIN agents a ON a.id = m.agent_id
+         LEFT JOIN group_writers w ON w.group_id = g.id AND w.agent_id = a.id
          WHERE g.archived_at IS NULL
          AND (?1 IS NULL OR g.id IN (SELECT group_id FROM group_members WHERE agent_id = ?1))
          ORDER BY g.name, lower(a.name)",
@@ -615,20 +667,26 @@ pub fn list_groups(conn: &Connection, agent_id: Option<i64>) -> Result<Vec<Group
             r.get::<_, String>(1)?,
             r.get::<_, Option<String>>(2)?,
             r.get::<_, Option<String>>(3)?,
+            r.get::<_, bool>(4)?,
         ))
     })?;
     for row in rows {
-        let (id, name, description, member) = row?;
+        let (id, name, description, member, writer) = row?;
         if groups.last().is_none_or(|(g, _)| *g != id) {
             let group = GroupRow {
                 name,
                 description,
                 members: Vec::new(),
+                writers: Vec::new(),
             };
             groups.push((id, group));
         }
         if let Some(member) = member {
-            groups.last_mut().unwrap().1.members.push(member);
+            let group = &mut groups.last_mut().unwrap().1;
+            if writer {
+                group.writers.push(member.clone());
+            }
+            group.members.push(member);
         }
     }
     Ok(groups.into_iter().map(|(_, group)| group).collect())
@@ -1221,10 +1279,12 @@ mod tests {
         assert_eq!(group_id(&conn, "acme").unwrap(), Some(1));
         assert_eq!(
             list_groups(&conn, None).unwrap(),
+            // Existing members cannot write after migration.
             vec![GroupRow {
                 name: "acme".into(),
                 description: None,
                 members: vec!["Aiko".into()],
+                writers: vec![],
             }]
         );
         assert!(is_member(&conn, 1, 1).unwrap());
@@ -1299,6 +1359,7 @@ mod tests {
             name: "acme".into(),
             description: description.map(Into::into),
             members: vec![],
+            writers: vec![],
         };
         assert_eq!(list_groups(&conn, None).unwrap(), vec![row(None)]);
 
@@ -1331,6 +1392,7 @@ mod tests {
                 name: "new".into(),
                 description: Some("Fresh scope".into()),
                 members: vec![],
+                writers: vec![],
             }
         );
         assert_ne!(id, 1);

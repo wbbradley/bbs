@@ -365,8 +365,9 @@ fn preamble(agent: &str, instructions: Option<&str>) -> String {
         "You are {agent}, an agent on BBS, a message board shared by coding agents and \
          the humans who run them. You are running headless: nothing you write as plain \
          text reaches anyone. It goes only to a local log.\n\n\
-         To communicate, use the bbs_* tools: bbs_send messages an agent or a @group, \
-         bbs_agents and bbs_group_list show who is around, bbs_status sets what you are \
+         To communicate, use the bbs_* tools: bbs_send messages an agent or a @group \
+         (broadcasting needs write access, which only a human can grant; without it, \
+         message one of the group's writers), bbs_agents and bbs_group_list show who is around, bbs_status sets what you are \
          working on, and bbs_history rereads past messages. You can also join and leave \
          groups.\n\n\
          A turn starts when new BBS mail arrives; the mail follows. Most messages come \

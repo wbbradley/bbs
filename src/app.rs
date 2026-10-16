@@ -182,6 +182,12 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 let r = backend.group_remove(req).await?;
                 format!("Removed {} from @{}.\n", r.agent, r.group)
             }
+            GroupCommand::Grant { group, agent } => {
+                set_group_writer(backend, group, agent, true).await?
+            }
+            GroupCommand::Revoke { group, agent } => {
+                set_group_writer(backend, group, agent, false).await?
+            }
             GroupCommand::List { json } => {
                 format_groups(&backend.group_list().await?.groups, json)?
             }
@@ -340,6 +346,8 @@ struct GroupJson<'a> {
     name: &'a str,
     members: &'a [String],
     description: Option<&'a str>,
+    /// Null from servers without group-writers.v1.
+    writers: Option<&'a [String]>,
 }
 
 #[derive(Serialize)]
@@ -385,6 +393,7 @@ pub(crate) fn format_groups(groups: &[proto::Group], json: bool) -> Result<Strin
             name: &g.name,
             members: &g.members,
             description: g.description.as_deref(),
+            writers: g.writers.as_ref().map(|w| &w.names[..]),
         }));
     }
     let mut out = String::new();
@@ -392,7 +401,14 @@ pub(crate) fn format_groups(groups: &[proto::Group], json: bool) -> Result<Strin
         let members = if g.members.is_empty() {
             "(no agents)".to_string()
         } else {
-            g.members.join(", ")
+            g.members
+                .iter()
+                .map(|m| match &g.writers {
+                    Some(w) if w.names.contains(m) => format!("{m} [w]"),
+                    _ => m.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         writeln!(out, "@{}: {members}", g.name)?;
         // Indented under its group so member parsing stays one `@group: ...` row.
@@ -401,6 +417,26 @@ pub(crate) fn format_groups(groups: &[proto::Group], json: bool) -> Result<Strin
         }
     }
     Ok(out)
+}
+
+async fn set_group_writer(
+    backend: &mut Backend,
+    group: String,
+    agent: String,
+    grant: bool,
+) -> Result<String> {
+    let req = proto::SetGroupWriterRequest {
+        group,
+        agent,
+        grant,
+    };
+    let r = backend.set_group_writer(req).await?;
+    Ok(match (grant, r.changed) {
+        (true, true) => format!("Granted write on @{} to {}.\n", r.group, r.agent),
+        (false, true) => format!("Revoked write on @{} from {}.\n", r.group, r.agent),
+        (true, false) => format!("{} already has write on @{}.\n", r.agent, r.group),
+        (false, false) => format!("{} already lacks write on @{}.\n", r.agent, r.group),
+    })
 }
 
 pub(crate) fn identity_line(name: &str, token: &str) -> String {

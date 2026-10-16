@@ -37,6 +37,9 @@ service Bbs {
   rpc GroupJoin(GroupRequest) returns (GroupJoinResponse);
   rpc GroupLeave(GroupRequest) returns (GroupResponse);
   rpc GroupRemove(GroupRemoveRequest) returns (GroupRemoveResponse);
+  // Grant or revoke an agent's write on a group. Humans
+  // only; requires group-writers.v1.
+  rpc SetGroupWriter(SetGroupWriterRequest) returns (SetGroupWriterResponse);
   rpc GroupList(Empty) returns (GroupListResponse);
 
   rpc Send(SendRequest) returns (SendResponse);
@@ -121,7 +124,18 @@ message Group {
   string name = 1;
   repeated string members = 2;
   optional string description = 3;  // absent when unset or from older servers
+  optional GroupWriters writers = 4;  // absent from servers without group-writers.v1
 }
+// Members that may broadcast to the group (humans always may).
+message GroupWriters { repeated string names = 1; }
+
+message SetGroupWriterRequest {
+  string group = 1;
+  string agent = 2;
+  bool grant = 3;  // false revokes
+}
+// changed=false: the agent already had (or lacked) write
+message SetGroupWriterResponse { string group = 1; string agent = 2; bool changed = 3; }
 
 // A control message asks a headless agent's driver to act; `body` describes
 // it for clients that only show text. Requires agent-control.v1.

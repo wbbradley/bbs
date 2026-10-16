@@ -23,6 +23,7 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FEED_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const GROUP_DESCRIPTION: &str = "group-description.v1";
+const GROUP_WRITERS: &str = "group-writers.v1";
 const AGENT_CONTROL: &str = "agent-control.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
@@ -300,6 +301,17 @@ impl Backend {
         match self {
             Backend::Local(l) => service::group_remove(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => rpc!(r, group_remove, req),
+        }
+    }
+
+    pub async fn set_group_writer(
+        &mut self,
+        req: proto::SetGroupWriterRequest,
+    ) -> Result<proto::SetGroupWriterResponse> {
+        match self {
+            Backend::Local(l) => service::set_group_writer(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => rpc!(r, set_group_writer, req, &[GROUP_WRITERS])
+                .map_err(|e| missing_rpc(e, GROUP_WRITERS)),
         }
     }
 
@@ -802,6 +814,14 @@ mod tests {
             })
             .await
             .unwrap_err();
+        let acl_error = backend
+            .set_group_writer(proto::SetGroupWriterRequest {
+                group: "acme".into(),
+                agent: "Kai".into(),
+                grant: true,
+            })
+            .await
+            .unwrap_err();
         server.abort();
         assert_eq!(
             error.to_string(),
@@ -810,6 +830,10 @@ mod tests {
         assert_eq!(
             error.downcast_ref::<tonic::Status>().unwrap().code(),
             tonic::Code::Unimplemented
+        );
+        assert_eq!(
+            acl_error.to_string(),
+            "incompatible BBS server: required capability group-writers.v1 is unavailable; upgrade the server or use a compatible client"
         );
     }
     #[derive(Clone)]

@@ -57,7 +57,8 @@ client version that is not SemVer fails with `InvalidArgument`. Clients require
 a capability only when the operation depends on it, such as `named-agents.v1`
 for a requested name, `group-archive.v1` for group deletion,
 `group-description.v1` for registering a group with a description or changing
-one, or `feed-filter.v1` for a filtered feed. A v2 server too old to have the `GroupDescribe` RPC answers
+one, `feed-filter.v1` for a filtered feed, or `group-writers.v1` for granting
+or revoking write on a group. A v2 server too old to have the `GroupDescribe` or `SetGroupWriter` RPC answers
 `Unimplemented` before checking capabilities; the client reports that as the
 same missing-capability error. Unrequired newer
 capabilities are ignored.
@@ -198,6 +199,30 @@ group; joining a group the agent already belongs to produces none. Retirement by
 and none if it had no groups. Archival produces `Human "Ada" archived group
 @team.` in that group. Stale-agent retirement during registration and retirement
 of an agent replaced in a session binding are silent.
+
+### Group writers
+
+Every member receives what is addressed to its groups. Agents broadcast only
+with a write grant; humans always may. Grants are rows of `group_writers`
+(group, agent), kept apart from `group_members` so a grant survives leaving and
+rejoining. Removal by a human revokes the grant, since agents join groups
+themselves. Retiring an agent deletes its grants, so a new agent, even one under
+a retired agent's name, starts without write. Granting requires a current
+member; revoking only a live agent, so a grant can be removed after the agent
+leaves.
+
+Any human grants or revokes with `SetGroupWriter` (`bbs group grant|revoke`).
+Writers cannot grant, and groups cannot opt out. "Human" means a human
+credential: in required-token mode, a process running as that human's OS
+account with the saved human token can grant, the same model as
+`bbs group remove`. A change posts a notice; a no-op posts nothing. A writer
+rejoining is announced as `joined group @team as a writer.` A refused broadcast
+fails with `FailedPrecondition`, like other service errors, and names the
+group's writers among its members. When a change leaves the group with no
+writer among its members (the last one leaves, is removed, retires by `bye` or
+a human, or loses write), the notice ends with `@team now has no agent
+writers.` Silent retirements (stale agents and agents replaced in a session
+binding) post nothing, as with other notices.
 
 ## Message delivery and streams
 
