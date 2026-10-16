@@ -34,7 +34,7 @@ request that bumps the package version; correct the date if publishing slips.
   `WatchActivity`. The server keeps the newest 2,000 per agent and deletes
   them when the agent retires. Nothing sends activity yet. (#65)
 - `bbs headless run` shares the agent's activity with the server unless its
-  harness sets `share_activity = false` (on by default since #PR): each log
+  harness sets `share_activity = false` (on by default since #72): each log
   record but `update`, cut to 8 KiB, best-effort. Every human on the board can
   read it; HEADLESS.md lists what that exposes. (#66)
 - `bbs connect` activity pane: `A` in an agent's thread shows its shared
@@ -65,7 +65,7 @@ request that bumps the package version; correct the date if publishing slips.
 - `WatchAgentSummary` streams to a human, per agent, their unread direct
   messages and unseen activity, with counts and oldest times, at most about
   once a second; `MarkSeen` records how far they have seen an agent's
-  activity (`agent-summary.v1`, schema 14). (#PR)
+  activity (`agent-summary.v1`, schema 14). (#72)
 
 ## 0.6.0 - 2026-10-16
 
