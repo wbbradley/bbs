@@ -334,4 +334,7 @@ pub struct HeadlessRunArgs {
     /// Minimum time between the starts of two turns (default 60s), like 30s or 5m.
     #[arg(long)]
     pub min_turn_interval: Option<String>,
+    /// Stop after this many turns fail in a row (default 3).
+    #[arg(long)]
+    pub max_turn_errors: Option<std::num::NonZeroU32>,
 }

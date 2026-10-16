@@ -2676,6 +2676,11 @@ impl RunGuard {
         RunGuard(Some(child))
     }
 
+    /// Wait for the process to exit on its own and return its output.
+    fn wait(mut self) -> std::process::Output {
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+
     /// Send `signal` to the process and return its output.
     fn stop_with(mut self, signal: &str) -> std::process::Output {
         let child = self.0.take().unwrap();
@@ -2876,6 +2881,67 @@ fn headless_codex_replies_steers_and_interrupts(mode: Mode) {
     assert!(!shown.contains("turn_error"), "{shown}");
 }
 
+fn headless_stops_after_repeated_turn_errors(mode: Mode) {
+    let bbs = Bbs::with_mode("turn-errors", mode);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");
+    let dir = bbs.home.join(".config/bbs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[headless]\nmin_turn_interval = \"0s\"\nmax_turn_errors = 2\n\
+             [headless.harness.fake]\ncommand = [\"python3\", {fake:?}]\n"
+        ),
+    )
+    .unwrap();
+    bbs.ok(&["group", "register", "crew"]);
+    let (_, tp) = bbs.register();
+    bbs.ok(&["--token", &tp, "group", "join", "crew"]);
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    let logged = |event: &str, count: usize| {
+        eventually(event, || {
+            let log = std::fs::read_to_string(&log).ok()?;
+            let needle = format!("\"event\":\"{event}\"");
+            (log.matches(&needle).count() >= count).then_some(())
+        })
+    };
+    let mut errors = 0;
+    let mut fail_twice = |run: RunGuard| {
+        // One at a time, so each is its own turn.
+        for _ in 0..2 {
+            bbs.ok(&["--token", &tp, "send", "--to", "Zed", "FAILTURN"]);
+            errors += 1;
+            logged("turn_error", errors);
+        }
+        let out = run.wait();
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("2 turns failed in a row"), "{stderr}");
+    };
+
+    // A new session that fails is kept: the session is not the suspect.
+    let run = RunGuard::start(&bbs, "Zed");
+    logged("session", 1);
+    let tz = headless_state(&bbs, "Zed")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    bbs.ok(&["--token", &tz, "group", "join", "crew"]);
+    fail_twice(run);
+    assert_eq!(headless_state(&bbs, "Zed")["session_id"], "fake-session");
+
+    // A resumed session that never completes a turn is dropped.
+    let run = RunGuard::start(&bbs, "Zed");
+    logged("session", 2);
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("\"resumed\":true")
+    );
+    fail_twice(run);
+    assert!(headless_state(&bbs, "Zed")["session_id"].is_null());
+}
+
 fn control_messages_are_for_owned_agents_only(mode: Mode) {
     let bbs = Bbs::with_mode("control", mode);
     bbs.ok(&["human", "add", "alice"]);
@@ -3041,6 +3107,7 @@ both_modes!(
     view_json_follow_survives_full_windows_and_bursts,
     headless_replies_through_tools_and_cancels,
     headless_codex_replies_steers_and_interrupts,
+    headless_stops_after_repeated_turn_errors,
     control_messages_are_for_owned_agents_only,
     headless_run_takes_over_an_owned_agent,
     headless_signals_during_setup_stop_the_harness,
