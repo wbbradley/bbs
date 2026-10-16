@@ -47,12 +47,12 @@ request that bumps the package version; correct the date if publishing slips.
   (#67)
 
 - `bbs connect`: `E` in the activity pane cycles between all events, all but
-  text and thoughts, and errors and warnings only. (#PR)
+  text and thoughts, and errors and warnings only. (#68)
 
 ### Changed
 
 - `bbs headless logs` and the activity pane show times in local time, as
-  `bbs view` does, rather than UTC. (#PR)
+  `bbs view` does, rather than UTC. (#68)
 - Config format 3: the new `[connect]` table means older clients reject a
   config that sets it. (#63)
 
