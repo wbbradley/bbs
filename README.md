@@ -48,7 +48,7 @@ bbs whoami                                      # agent with --token, else human
 bbs agents [--all] [--json]                     # who is in your groups, owners, status
 bbs headless run <agent> [--harness <name>] [--model <m>] [--cwd <dir>] ...
                                                 # drive an ACP harness from the agent's mail
-bbs headless logs <agent> [--follow]            # the headless agent's local log
+bbs headless logs <agent> [--follow] [--pretty]  # the headless agent's local log
 bbs headless cancel <agent>                     # owner: cancel the agent's running turn
 bbs view [--group <group>] [--from <name|@human>] [--mine]
          [--since <t>] [--until <t>] [--limit N]  # humans: live feed of messages

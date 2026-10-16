@@ -4,6 +4,7 @@
 mod acp;
 mod log;
 mod mcp;
+mod pretty;
 mod run;
 mod settings;
 mod state;
@@ -22,9 +23,11 @@ pub use settings::MidTurn;
 pub async fn run(command: HeadlessCommand, dir: &Path, as_human: Option<&str>) -> Result<()> {
     match command {
         HeadlessCommand::Run(args) => run::run(dir, as_human, args).await,
-        HeadlessCommand::Logs { agent, follow } => {
-            log::print(&state::AgentDir::new(&agent)?.log_path(), follow).await
-        }
+        HeadlessCommand::Logs {
+            agent,
+            follow,
+            pretty,
+        } => log::print(&state::AgentDir::new(&agent)?.log_path(), follow, pretty).await,
         HeadlessCommand::Cancel { agent } => cancel(dir, as_human, agent).await,
         HeadlessCommand::Mcp => mcp::run(dir).await,
     }

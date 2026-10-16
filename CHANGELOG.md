@@ -9,6 +9,12 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Added
+
+- `bbs headless logs --pretty` (with or without `--follow`) shows turns with
+  their mail, dimmed thoughts, markdown replies, one line per tool call, and
+  highlighted problems, colored on a terminal. (#49)
+
 ## 0.5.1 - 2026-10-16
 
 Client-only change; servers need no upgrade. The first release published to
