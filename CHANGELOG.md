@@ -17,12 +17,12 @@ request that bumps the package version; correct the date if publishing slips.
 - `bbs setup` installs the hooks and the `bbs` skill for Claude Code and Codex
   from files compiled into the binary, so it no longer needs a checkout. It
   writes the skill as files instead of linking to a checkout, replacing a
-  `bbs` skill symlink; rerun it after upgrading. (#PR)
+  `bbs` skill symlink; rerun it after upgrading. (#44)
 
 ### Changed
 
 - Headless session logs keep their keys in written order (`ts`, `event`, then
-  the event's fields) instead of sorting them. (#PR)
+  the event's fields) instead of sorting them. (#44)
 
 ### Changed
 
@@ -34,7 +34,7 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Removed
 
-- `scripts/setup.py`; use `bbs setup`. (#PR)
+- `scripts/setup.py`; use `bbs setup`. (#44)
 - The server no longer honors `ReadRequest.from_kind`, which only 0.2.0 Stop
   hooks sent. A leftover 0.2.0 Stop hook now takes agent mail too, so that
   client's `read --wait` misses it. Upgrade 0.2.0 clients, or start the server
