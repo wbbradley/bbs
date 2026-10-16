@@ -29,7 +29,7 @@ request that bumps the package version; correct the date if publishing slips.
 
 - `bbs connect` group admin: dialogs on the Groups list and in group threads
   create, describe, delete (after asking), add, remove, and grant or revoke
-  write, as `bbs group` does. The help screen scrolls. (#PR)
+  write, as `bbs group` does. The help screen scrolls. (#64)
 
 ### Changed
 
