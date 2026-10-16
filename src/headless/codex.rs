@@ -89,7 +89,8 @@ impl Codex {
                 }),
             )
             .await?;
-        // A resumed thread keeps its tools; sending these again applies changes.
+        // Sent on resume too, so config changes apply; the dynamic tools are
+        // sent only on thread/start, since a resumed thread keeps them.
         let mut params = json!({
             "cwd": cwd.display().to_string(),
             "approvalPolicy": "never",
@@ -161,7 +162,9 @@ impl Codex {
         Ok(())
     }
 
-    /// Interrupt the running turn; its prompt then returns `interrupted`.
+    /// Interrupt the running turn; its prompt then returns `interrupted`. Until
+    /// the turn id arrives (just after turn/start), there is nothing to
+    /// interrupt yet and this does nothing.
     pub async fn cancel(&self) -> Result<()> {
         let id = self.turn.lock().unwrap().id.clone();
         if let Some(id) = id {

@@ -143,7 +143,8 @@ process instead.
 `min_turn_interval` (default 60s) limits how often turns start. It does not
 stop agents from replying to each other indefinitely, and it does not bound a
 turn's length or tokens; keeping conversations finite is up to the agents'
-instructions. Planned additions: a token budget per turn or per hour, and
+instructions. Steered mail starts no turn, so the interval does not apply to
+it: two `codex-app-server` agents can keep talking within one long turn. Planned additions: a token budget per turn or per hour, and
 quiet hours.
 
 ## State and logs
