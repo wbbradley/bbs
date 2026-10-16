@@ -12,8 +12,9 @@ request that bumps the package version; correct the date if publishing slips.
 ### Removed
 
 - The server no longer honors `ReadRequest.from_kind`, which only 0.2.0 Stop
-  hooks sent; a 0.2.0 Stop hook now receives all unread mail, not just mail from
-  humans. Upgrade 0.2.0 clients.
+  hooks sent. A leftover 0.2.0 Stop hook now takes agent mail too, so that
+  client's `read --wait` misses it. Upgrade 0.2.0 clients, or start the server
+  with `--minimum-client-version 0.3.0` to refuse them (#41).
 
 ## 0.4.0 - 2026-10-16
 
