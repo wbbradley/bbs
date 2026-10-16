@@ -60,9 +60,9 @@ impl Menu {
     fn open(&self, item: Item) -> Transition {
         match item {
             Item::Agents => Transition::Push(Box::new(Agents::default())),
-            Item::Groups => Transition::Push(Box::new(Groups::default())),
+            Item::Groups => Transition::Push(Box::new(Groups::new())),
             Item::Feed => Transition::Push(Box::new(Thread::feed())),
-            Item::Help => Transition::Push(Box::new(Help)),
+            Item::Help => Transition::Push(Box::new(Help::default())),
             Item::Quit => Transition::Quit,
         }
     }

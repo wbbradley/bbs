@@ -38,6 +38,22 @@ pub enum Request {
         id: u64,
         req: proto::SendRequest,
     },
+    /// Change a group for the screen `id`; the group list follows a success.
+    Admin {
+        id: u64,
+        op: Admin,
+    },
+}
+
+/// One group change, as the CLI's `bbs group` commands make it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Admin {
+    Create(proto::GroupRegisterRequest),
+    Describe(proto::GroupDescribeRequest),
+    Delete(proto::GroupRequest),
+    Add(proto::GroupAddRequest),
+    Remove(proto::GroupRemoveRequest),
+    Writer(proto::SetGroupWriterRequest),
 }
 
 /// A server reply; errors are messages to show.
@@ -53,6 +69,11 @@ pub enum Data {
     Sent {
         id: u64,
         result: Result<(), String>,
+    },
+    /// What a group change did, for the screen `id`.
+    Admin {
+        id: u64,
+        result: Result<String, String>,
     },
 }
 
@@ -117,6 +138,17 @@ pub async fn serve(
                 id,
                 result: backend.send(req).await.map(drop).map_err(error),
             },
+            Request::Admin { id, op } => {
+                let result = admin(&mut backend, op).await.map_err(error);
+                let changed = result.is_ok();
+                if tx.send(Event::Data(Data::Admin { id, result })).is_err() {
+                    break;
+                }
+                if !changed {
+                    continue;
+                }
+                Data::Groups(backend.group_list().await.map_err(error))
+            }
             Request::Watch { id, req } => {
                 let task = tokio::spawn(watch(opener.clone(), id, req, tx.clone()));
                 if let Some(old) = streams.insert(id, task) {
@@ -138,6 +170,57 @@ pub async fn serve(
     for task in streams.into_values() {
         task.abort();
     }
+}
+
+/// Make a group change and describe what it did.
+async fn admin(backend: &mut Backend, op: Admin) -> anyhow::Result<String> {
+    Ok(match op {
+        Admin::Create(req) => {
+            let group = backend.group_register(req).await?.group;
+            format!("Created @{group}.")
+        }
+        Admin::Describe(req) => {
+            let cleared = req.description.is_none();
+            let group = backend.group_describe(req).await?.group;
+            match cleared {
+                true => format!("Cleared the description of @{group}."),
+                false => format!("Described @{group}."),
+            }
+        }
+        Admin::Delete(req) => {
+            let group = backend.group_delete(req).await?.group;
+            format!("Deleted @{group}.")
+        }
+        Admin::Add(req) => {
+            let r = backend.group_add(req).await?;
+            let mut parts = Vec::new();
+            if !r.added.is_empty() {
+                parts.push(format!("Added {} to @{}.", r.added.join(", "), r.group));
+            }
+            if !r.already.is_empty() {
+                parts.push(format!(
+                    "Already in @{}: {}.",
+                    r.group,
+                    r.already.join(", ")
+                ));
+            }
+            parts.join(" ")
+        }
+        Admin::Remove(req) => {
+            let r = backend.group_remove(req).await?;
+            format!("Removed {} from @{}.", r.agent, r.group)
+        }
+        Admin::Writer(req) => {
+            let grant = req.grant;
+            let r = backend.set_group_writer(req).await?;
+            match (grant, r.changed) {
+                (true, true) => format!("{} can now write to @{}.", r.agent, r.group),
+                (true, false) => format!("{} could already write to @{}.", r.agent, r.group),
+                (false, true) => format!("{} can no longer write to @{}.", r.agent, r.group),
+                (false, false) => format!("{} could not write to @{}.", r.agent, r.group),
+            }
+        }
+    })
 }
 
 /// Stream feed `id` until it fails or the app goes away.

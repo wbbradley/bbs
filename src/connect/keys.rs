@@ -22,9 +22,23 @@ pub enum Action {
     Compose,
     NextMatch,
     PrevMatch,
+    /// Change the selected group.
+    Group(GroupOp),
     /// A screen's own hot key, such as a menu item's.
     Hotkey(char),
     Quit,
+}
+
+/// A group change, each one dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupOp {
+    Create,
+    Describe,
+    Delete,
+    Add,
+    Remove,
+    Grant,
+    Revoke,
 }
 
 /// One key, as the help screen shows it.
@@ -123,6 +137,41 @@ pub const BINDINGS: &[Binding] = &[
         keys: &[Key::Char('r')],
         action: Action::Reload,
         help: "reload",
+    },
+    Binding {
+        keys: &[Key::Char('c')],
+        action: Action::Group(GroupOp::Create),
+        help: "groups: create a group",
+    },
+    Binding {
+        keys: &[Key::Char('e')],
+        action: Action::Group(GroupOp::Describe),
+        help: "groups: describe",
+    },
+    Binding {
+        keys: &[Key::Char('D')],
+        action: Action::Group(GroupOp::Delete),
+        help: "groups: delete (asks first)",
+    },
+    Binding {
+        keys: &[Key::Char('+')],
+        action: Action::Group(GroupOp::Add),
+        help: "groups: add agents",
+    },
+    Binding {
+        keys: &[Key::Char('-')],
+        action: Action::Group(GroupOp::Remove),
+        help: "groups: remove an agent",
+    },
+    Binding {
+        keys: &[Key::Char('w')],
+        action: Action::Group(GroupOp::Grant),
+        help: "groups: grant write",
+    },
+    Binding {
+        keys: &[Key::Char('W')],
+        action: Action::Group(GroupOp::Revoke),
+        help: "groups: revoke write",
     },
     Binding {
         keys: &[Key::Char('a')],
