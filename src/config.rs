@@ -35,6 +35,21 @@ pub fn path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".config/bbs/config.toml"))
 }
 
+/// Parse a config, reporting errors without the source snippet `toml` would
+/// quote, since that can contain a credential. The message names a value only
+/// when it has the wrong type, and the credential fields take any string.
+fn parse(text: &str) -> Result<Config, String> {
+    toml::from_str(text).map_err(|err| {
+        let line = err
+            .span()
+            .map(|span| text[..span.start].matches('\n').count() + 1);
+        match line {
+            Some(line) => format!("line {line}: {}", err.message()),
+            None => err.message().to_string(),
+        }
+    })
+}
+
 impl Config {
     /// The config file as written, without environment overrides.
     pub fn read() -> Result<Config> {
@@ -44,8 +59,7 @@ impl Config {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
             Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
         };
-        // TOML diagnostics can quote input lines containing credentials.
-        toml::from_str(&text).map_err(|_| anyhow::anyhow!("invalid config in {}", path.display()))
+        parse(&text).map_err(|err| anyhow::anyhow!("invalid config in {}: {err}", path.display()))
     }
 
     /// The effective config: the file, with `BBS_SERVER` overriding `server`.
@@ -83,5 +97,25 @@ impl Config {
             .map(str::to_string)
             .or_else(|| self.human.clone())
             .or_else(|| std::env::var("USER").ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_errors_name_the_line_but_not_the_credential() {
+        let err = parse("human_token = \"secret\"\n[headless]\nmid_turn = \"sometimes\"\n")
+            .err()
+            .unwrap();
+        assert_eq!(
+            err,
+            "line 3: unknown variant `sometimes`, expected `steer` or `queue`"
+        );
+        let err = parse("human = \"ada\"\nbogus = 1\n").err().unwrap();
+        assert!(err.starts_with("line 2: unknown field `bogus`"), "{err}");
+        let err = parse("human_token = 'secret\n").err().unwrap();
+        assert!(!err.contains("secret"), "{err}");
     }
 }
