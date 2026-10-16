@@ -231,6 +231,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-markdown",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

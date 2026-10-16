@@ -18,6 +18,9 @@ pub enum Action {
     Help,
     Reload,
     ToggleAll,
+    Search,
+    NextMatch,
+    PrevMatch,
     /// A screen's own hot key, such as a menu item's.
     Hotkey(char),
     Quit,
@@ -84,6 +87,21 @@ pub const BINDINGS: &[Binding] = &[
         keys: &[Key::Code(KeyCode::Enter)],
         action: Action::Open,
         help: "open",
+    },
+    Binding {
+        keys: &[Key::Char('/')],
+        action: Action::Search,
+        help: "threads: search",
+    },
+    Binding {
+        keys: &[Key::Char('n')],
+        action: Action::NextMatch,
+        help: "threads: next match",
+    },
+    Binding {
+        keys: &[Key::Char('N')],
+        action: Action::PrevMatch,
+        help: "threads: previous match",
     },
     Binding {
         keys: &[Key::Char('q'), Key::Code(KeyCode::Esc)],

@@ -55,6 +55,7 @@ tonic-prost = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tui-markdown = "0.3.10"
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 http-body = "1.0"

@@ -16,7 +16,9 @@ use tokio::sync::mpsc::unbounded_channel;
 use crate::backend::Backend;
 use crate::proto::Kind;
 
-pub async fn run(mut backend: Backend, server: Option<String>) -> Result<()> {
+pub use event::Opener;
+
+pub async fn run(mut backend: Backend, opener: Opener) -> Result<()> {
     let me = backend.whoami().await?;
     if me.kind() != Kind::Human {
         bail!("bbs connect is for humans; agents use the other bbs commands");
@@ -26,12 +28,16 @@ pub async fn run(mut backend: Backend, server: Option<String>) -> Result<()> {
     }
     let ctx = app::Ctx {
         me: me.name,
-        server: server.unwrap_or_else(|| "local".into()),
+        server: opener
+            .config
+            .server
+            .clone()
+            .unwrap_or_else(|| "local".into()),
         started: Instant::now(),
     };
     let (events, mut rx) = unbounded_channel();
     let (requests, requests_rx) = unbounded_channel();
-    tokio::spawn(event::serve(backend, requests_rx, events.clone()));
+    tokio::spawn(event::serve(backend, opener, requests_rx, events.clone()));
     let mut app = app::App::new(ctx, requests);
     let mut terminal = ratatui::init();
     event::spawn_input(events.clone());

@@ -9,6 +9,7 @@ use ratatui::widgets::Paragraph;
 use super::agents::Agents;
 use super::groups::Groups;
 use super::help::Help;
+use super::thread::Thread;
 use crate::connect::app::{Ctx, Screen, Transition};
 use crate::connect::art;
 use crate::connect::keys::Action;
@@ -19,12 +20,13 @@ use crate::connect::theme;
 enum Item {
     Agents,
     Groups,
+    Feed,
     Help,
     Quit,
 }
 
 /// Each item: its hot key, its label with the hot key first, and the rest.
-const ITEMS: [(char, &str, &str, Item); 4] = [
+const ITEMS: [(char, &str, &str, Item); 5] = [
     (
         'a',
         "A",
@@ -37,9 +39,17 @@ const ITEMS: [(char, &str, &str, Item); 4] = [
         "roups     members, writers and descriptions",
         Item::Groups,
     ),
+    (
+        'f',
+        "F",
+        "eed       every message, as bbs view shows it",
+        Item::Feed,
+    ),
     ('?', "?", "          help: the keys", Item::Help),
     ('q', "Q", "uit       hang up", Item::Quit),
 ];
+
+const HOTKEYS: [char; 3] = [ITEMS[0].0, ITEMS[1].0, ITEMS[2].0];
 
 #[derive(Default)]
 pub struct Menu {
@@ -51,6 +61,7 @@ impl Menu {
         match item {
             Item::Agents => Transition::Push(Box::new(Agents::default())),
             Item::Groups => Transition::Push(Box::new(Groups::default())),
+            Item::Feed => Transition::Push(Box::new(Thread::feed())),
             Item::Help => Transition::Push(Box::new(Help)),
             Item::Quit => Transition::Quit,
         }
@@ -62,8 +73,9 @@ impl Screen for Menu {
         "Main menu".into()
     }
 
+    /// The letter items; `?` and `q` already do the same in the keymap.
     fn hotkeys(&self) -> &[char] {
-        &['a', 'g']
+        &HOTKEYS
     }
 
     fn handle(&mut self, action: Action, _ctx: &Ctx) -> Transition {
@@ -131,5 +143,17 @@ impl Screen for Menu {
         let [_, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
         let [_, body] = Layout::horizontal([Constraint::Length(4), Constraint::Min(0)]).areas(body);
         frame.render_widget(Paragraph::new(lines), body);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_letter_item_is_a_hot_key() {
+        for (key, ..) in ITEMS {
+            assert!(HOTKEYS.contains(&key) || matches!(key, '?' | 'q'), "{key}");
+        }
     }
 }

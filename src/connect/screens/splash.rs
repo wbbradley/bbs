@@ -1,6 +1,7 @@
 //! The splash shown on connecting; any key goes on to the menu.
 
 use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Paragraph};
@@ -17,8 +18,11 @@ impl Screen for Splash {
         "Connecting".into()
     }
 
-    fn takes_any_key(&self) -> bool {
-        true
+    /// Any key but Ctrl-C, which still quits through the keymap.
+    fn raw_key(&mut self, key: KeyEvent) -> Option<Transition> {
+        let ctrl_c =
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        (!ctrl_c).then_some(Transition::Pop)
     }
 
     fn handle(&mut self, _action: Action, _ctx: &Ctx) -> Transition {

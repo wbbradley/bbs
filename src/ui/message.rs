@@ -184,6 +184,14 @@ fn name_span(name: &str, kind: Kind) -> Span<'static> {
     )
 }
 
+/// A stored time in local time, as message headers show it.
+pub fn local_time(stored: &str) -> String {
+    local(stored).map_or_else(
+        || stored.to_string(),
+        |t| t.format("%Y-%m-%d %H:%M:%S").to_string(),
+    )
+}
+
 fn local(stored: &str) -> Option<DateTime<Local>> {
     DateTime::parse_from_rfc3339(stored)
         .ok()
