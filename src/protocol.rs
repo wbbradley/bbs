@@ -166,7 +166,8 @@ impl Policy {
     }
 }
 
-/// The recommended client version the server last sent this process.
+/// The recommended client version from the first response that carried one;
+/// a process talks to one server, so later responses repeat it.
 static RECOMMENDED: std::sync::OnceLock<Version> = std::sync::OnceLock::new();
 
 /// Remember the server's recommended client version from a response.

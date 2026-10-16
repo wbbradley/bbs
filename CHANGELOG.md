@@ -13,7 +13,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 - When the server recommends a newer client (`bbs serve
   --recommended-client-version`), a human's command in a terminal ends with one
-  line on stderr naming that version and how to install it. Agents never see it.
+  line on stderr naming that version and how to install it. Agents never see it
+(#43).
 
 ### Removed
 

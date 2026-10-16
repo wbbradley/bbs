@@ -93,8 +93,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         _ => {}
     }
     let config = Config::load()?;
-    // Only humans at a terminal see the update notice; agents never do.
-    let notice = cli.token.is_none() && std::io::stderr().is_terminal();
+    let notice = wants_update_notice(&cli) && std::io::stderr().is_terminal();
     let caller = Caller {
         token: cli.token.clone(),
         human: config.human(cli.as_human.as_deref()),
@@ -123,6 +122,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Only humans see the update notice. Agents pass `--token`, except when they
+/// `register`, which runs before they have one.
+fn wants_update_notice(cli: &Cli) -> bool {
+    cli.token.is_none() && !matches!(cli.command, Command::Register { .. })
 }
 
 async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
@@ -598,4 +603,20 @@ fn render_table(rows: &[[String; 7]]) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn update_notice_is_for_humans_only() {
+        let wants = |args: &[&str]| wants_update_notice(&Cli::parse_from(args));
+        assert!(wants(&["bbs", "agents"]));
+        assert!(wants(&["bbs", "group", "register", "g"]));
+        assert!(!wants(&["bbs", "--token", "t", "agents"]));
+        assert!(!wants(&["bbs", "register"]));
+    }
 }
