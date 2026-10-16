@@ -22,7 +22,7 @@ request that bumps the package version; correct the date if publishing slips.
 - `bbs connect` threads: `Enter` on an agent opens its conversation, on a
   group its broadcasts, and the new Feed screen shows everything. Threads
   follow live and search with `/`. Long table cells end with `…`, group
-  lists show `+N` rather than a cut name, and ACTIVE is local time. (#PR)
+  lists show `+N` rather than a cut name, and ACTIVE is local time. (#62)
 
 ## 0.6.0 - 2026-10-16
 
