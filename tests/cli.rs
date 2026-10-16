@@ -2221,6 +2221,71 @@ fn bodies(rows: &[serde_json::Value]) -> Vec<&str> {
     rows.iter().map(|r| r["body"].as_str().unwrap()).collect()
 }
 
+fn headless_agents_manage_timers_with_tools(mode: Mode) {
+    let bbs = Bbs::with_mode("timer-tools", mode);
+    let (a, ta) = bbs.register();
+    let call = |id: u32, name: &str, args: serde_json::Value| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": args },
+        })
+        .to_string()
+    };
+    let input = [
+        call(
+            1,
+            "bbs_timer_add",
+            serde_json::json!({ "agent": a, "when": "every 1h", "text": "stretch" }),
+        ),
+        call(2, "bbs_timer_list", serde_json::json!({})),
+        call(
+            3,
+            "bbs_timer_add",
+            serde_json::json!({ "agent": a, "when": "every 1m", "text": "x" }),
+        ),
+        call(4, "bbs_timer_rm", serde_json::json!({ "id": 1 })),
+        call(5, "bbs_timer_list", serde_json::json!({})),
+    ]
+    .join("\n");
+    let out = bbs.run_with_env(
+        &["headless", "mcp"],
+        &format!("{input}\n"),
+        &[("BBS_HEADLESS_TOKEN", &ta)],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let replies: Vec<(String, bool)> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let reply: serde_json::Value = serde_json::from_str(line).unwrap();
+            let result = &reply["result"];
+            let text = result["content"][0]["text"].as_str().unwrap().to_string();
+            (text, result["isError"] == true)
+        })
+        .collect();
+    assert_eq!(replies.len(), 5, "{replies:?}");
+    assert!(
+        replies[0]
+            .0
+            .starts_with(&format!("Timer 1 for {a}: every 1h, next at ")),
+        "{replies:?}"
+    );
+    assert!(
+        replies[1].0.contains(&format!("from {a}: stretch")),
+        "{replies:?}"
+    );
+    assert!(
+        replies[2].1 && replies[2].0.contains("shortest interval is 5m"),
+        "{replies:?}"
+    );
+    assert_eq!(replies[3], (format!("Removed timer 1 for {a}."), false));
+    assert_eq!(replies[4], ("No timers.".to_string(), false));
+}
+
 fn timers_are_set_listed_fired_and_removed(mode: Mode) {
     let bbs = Bbs::with_mode("timers", mode);
     bbs.ok(&["group", "register", "crew"]);
@@ -3346,6 +3411,7 @@ both_modes!(
     view_filters_by_group_sender_owner_and_scope,
     view_with_shows_what_a_name_sent_and_was_sent_directly,
     timers_are_set_listed_fired_and_removed,
+    headless_agents_manage_timers_with_tools,
     view_since_and_until_bound_history,
     view_json_follow_emits_each_message_once,
     view_json_follow_survives_full_windows_and_bursts,

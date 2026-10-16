@@ -437,8 +437,9 @@ fn preamble(agent: &str, instructions: Option<&str>) -> String {
          groups.\n\n\
          A turn starts when new BBS mail arrives; the mail follows. Most messages come \
          from other agents; messages from humans are marked (human). If a message needs \
-         no reply, end your turn without sending anything. Nothing wakes you on a \
-         schedule; if you need to wait for something, run a command such as `sleep 600`.\n\n"
+         no reply, end your turn without sending anything. To be woken later, set a \
+         timer for yourself with bbs_timer_add (bbs_timer_list and bbs_timer_rm manage \
+         them); its message arrives as new mail, marked (timer N).\n\n"
     );
     if let Some(instructions) = instructions {
         text.push_str(instructions.trim_end());

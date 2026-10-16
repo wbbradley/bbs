@@ -538,7 +538,7 @@ pub(crate) fn parse_time(flag: &str, s: &str, now: DateTime<Utc>) -> Result<Stri
 }
 
 /// When a timer runs: "every 1h, next at …" or "once at …".
-fn timer_schedule(t: &proto::Timer) -> String {
+pub(crate) fn timer_schedule(t: &proto::Timer) -> String {
     match &t.repeat {
         Some(repeat) => format!("{repeat}, next at {}", display_time(&t.next_run)),
         None => format!("once at {}", display_time(&t.next_run)),
@@ -546,7 +546,7 @@ fn timer_schedule(t: &proto::Timer) -> String {
 }
 
 /// One timer per line: id, agent, schedule, creator, and text.
-fn timer_line(t: &proto::Timer) -> String {
+pub(crate) fn timer_line(t: &proto::Timer) -> String {
     format!(
         "{}  {}  {}  from {}: {}\n",
         t.id,
