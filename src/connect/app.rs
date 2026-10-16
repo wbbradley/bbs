@@ -11,6 +11,7 @@ use super::event::{Data, Event, Request};
 use super::keys::{Action, Keymap};
 use super::screens::help::Help;
 use super::screens::menu::Menu;
+use super::screens::splash::Splash;
 use super::theme;
 
 /// What every screen may need to know.
@@ -31,6 +32,10 @@ pub enum Transition {
 pub trait Screen {
     /// Shown in the title bar.
     fn title(&self) -> String;
+    /// Whether any key (but Ctrl-C) goes to `handle`, as `Action::Open`.
+    fn takes_any_key(&self) -> bool {
+        false
+    }
     /// Keys this screen claims before the shared keymap.
     fn hotkeys(&self) -> &[char] {
         &[]
@@ -60,6 +65,7 @@ impl App {
             requests,
         };
         app.push(Box::new(Menu::default()));
+        app.push(Box::new(Splash));
         app
     }
 
@@ -83,6 +89,12 @@ impl App {
     pub fn on_event(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) => {
+                if self.top().takes_any_key() {
+                    let action = self.keymap.resolve(key, &[]);
+                    self.keymap = Keymap::default();
+                    let quit = action == Some(Action::Quit);
+                    return quit || self.on_action(Action::Open);
+                }
                 let hotkeys = self.top().hotkeys().to_vec();
                 match self.keymap.resolve(key, &hotkeys) {
                     Some(action) => self.on_action(action),
@@ -162,7 +174,10 @@ mod tests {
             server: "bbs:7777".into(),
             started: Instant::now(),
         };
-        (App::new(ctx, tx), rx)
+        let mut app = App::new(ctx, tx);
+        // Past the splash.
+        key(&mut app, ' ');
+        (app, rx)
     }
 
     fn key(app: &mut App, c: char) -> bool {
@@ -195,6 +210,39 @@ mod tests {
             status: Some(format!("{name} is busy")),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_splash_comes_first_and_any_key_passes_it() {
+        let (tx, _rx) = unbounded_channel();
+        let ctx = Ctx {
+            me: "ada".into(),
+            server: "bbs:7777".into(),
+            started: Instant::now(),
+        };
+        let mut app = App::new(ctx, tx);
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("██████"), "{out}");
+        assert!(out.contains("CONNECT 14400/ARQ · bbs:7777"), "{out}");
+        assert!(out.contains("press any key"), "{out}");
+        // `g` would start `gg` elsewhere; here it only passes the splash.
+        assert!(!key(&mut app, 'g'));
+        assert!(screen(&mut app, 80, 24).contains("[A]gents"));
+        assert!(!key(&mut app, 'g'));
+        assert!(screen(&mut app, 80, 24).contains("BBS · Groups"));
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_splash() {
+        let (tx, _rx) = unbounded_channel();
+        let ctx = Ctx {
+            me: "ada".into(),
+            server: "local".into(),
+            started: Instant::now(),
+        };
+        let mut app = App::new(ctx, tx);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.on_event(Event::Key(ctrl_c)));
     }
 
     #[test]

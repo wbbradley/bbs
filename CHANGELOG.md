@@ -14,6 +14,8 @@ request that bumps the package version; correct the date if publishing slips.
 - `bbs connect`, a BBS-style terminal app for humans: a main menu with hot
   keys, your agents or everyone's with their owners, groups with members and
   writers, and a help screen generated from its keymap. (#59)
+- `bbs connect` opens with an ANSI-art splash screen, and the main menu shows
+  the logo. The art is ordinary `.ans` files in `assets/connect/`. (#60)
 
 ## 0.6.0 - 2026-10-16
 
