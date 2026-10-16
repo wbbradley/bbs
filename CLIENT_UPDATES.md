@@ -65,7 +65,7 @@ Use separate identifiers for separate decisions:
 | Package version | SemVer from Cargo.toml; published tags `vMAJOR.MINOR.PATCH` |
 | Build revision | Full Git commit; `unknown` when provenance is unavailable; dirty development builds are marked |
 | Protocol epoch | Integer `2` with the new `bbs.v2` wire service; the existing `bbs.v1` service is legacy and requires coordinated bootstrap |
-| Capabilities | Stable strings for optional behavior, currently `named-agents.v1`, `owner-attribution.v1`, `human-token-sessions.v1`, `group-archive.v1`, `group-description.v1`, and `feed-filter.v1` |
+| Capabilities | Stable strings for optional behavior, currently `named-agents.v1`, `owner-attribution.v1`, `human-token-sessions.v1`, `group-archive.v1`, `group-description.v1`, `feed-filter.v1`, `agent-control.v1`, `agent-token-rotate.v1`, and `group-writers.v1` |
 | Minimum client version | Optional operator policy; rejection applies only when configured |
 | Recommended client version | Optional advisory hint, independent of the server package version |
 | Schema/config support | Record the schema migration destination and client config format; initially exclude changes from automatic updates |
