@@ -24,6 +24,7 @@ const FEED_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const GROUP_DESCRIPTION: &str = "group-description.v1";
 const GROUP_WRITERS: &str = "group-writers.v1";
+const GROUP_ADD: &str = "group-add.v1";
 const AGENT_CONTROL: &str = "agent-control.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
@@ -301,6 +302,18 @@ impl Backend {
         match self {
             Backend::Local(l) => service::group_remove(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => rpc!(r, group_remove, req),
+        }
+    }
+
+    pub async fn group_add(
+        &mut self,
+        req: proto::GroupAddRequest,
+    ) -> Result<proto::GroupAddResponse> {
+        match self {
+            Backend::Local(l) => service::group_add(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, group_add, req, &[GROUP_ADD]).map_err(|e| missing_rpc(e, GROUP_ADD))
+            }
         }
     }
 
@@ -814,6 +827,13 @@ mod tests {
             })
             .await
             .unwrap_err();
+        let add_error = backend
+            .group_add(proto::GroupAddRequest {
+                group: "acme".into(),
+                agents: vec!["Kai".into()],
+            })
+            .await
+            .unwrap_err();
         let acl_error = backend
             .set_group_writer(proto::SetGroupWriterRequest {
                 group: "acme".into(),
@@ -830,6 +850,10 @@ mod tests {
         assert_eq!(
             error.downcast_ref::<tonic::Status>().unwrap().code(),
             tonic::Code::Unimplemented
+        );
+        assert_eq!(
+            add_error.to_string(),
+            "incompatible BBS server: required capability group-add.v1 is unavailable; upgrade the server or use a compatible client"
         );
         assert_eq!(
             acl_error.to_string(),

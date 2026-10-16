@@ -629,6 +629,55 @@ pub fn group_leave(
     })
 }
 
+pub fn group_add(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::GroupAddRequest,
+) -> Result<proto::GroupAddResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let group = group_name(&req.group);
+        if req.agents.is_empty() {
+            bail!("name at least one agent to add");
+        }
+        let gid = require_group(ctx.conn, group)?;
+        // Check every agent before adding any, so a bad name changes nothing.
+        let mut targets: Vec<db::Principal> = Vec::new();
+        for name in &req.agents {
+            let Some(target) = db::live_agent_by_name(ctx.conn, name)? else {
+                bail!("no live agent named {name:?}");
+            };
+            if !targets.iter().any(|t| t.id == target.id) {
+                targets.push(target);
+            }
+        }
+        let (mut added, mut already) = (Vec::new(), Vec::new());
+        for target in targets {
+            if !db::join_group(ctx.conn, gid, target.id, &ctx.now_s)? {
+                already.push(target.name);
+                continue;
+            }
+            let writer = if db::is_writer(ctx.conn, gid, target.id)? {
+                " as a writer"
+            } else {
+                ""
+            };
+            let notice = format!(
+                "Human {:?} added agent {:?} to group @{group}{writer}.",
+                me.name, target.name
+            );
+            broadcast(ctx, &me, gid, &notice)?;
+            tracing::info!(agent = target.name, group, by = me.name, "added to group");
+            added.push(target.name);
+        }
+        Ok(proto::GroupAddResponse {
+            group: group.to_string(),
+            added,
+            already,
+        })
+    })
+}
+
 pub fn group_remove(
     conn: &mut Connection,
     caller: &Caller,
