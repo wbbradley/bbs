@@ -167,6 +167,35 @@ impl Policy {
     }
 }
 
+/// The recommended client version from the first response that carried one;
+/// a process talks to one server, so later responses repeat it.
+static RECOMMENDED: std::sync::OnceLock<Version> = std::sync::OnceLock::new();
+
+/// Remember the server's recommended client version from a response.
+pub fn note_recommended(metadata: &MetadataMap) {
+    if let Some(version) = metadata
+        .get("bbs-recommended-client-version")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| parse_version(v).ok())
+    {
+        let _ = RECOMMENDED.set(version);
+    }
+}
+
+/// One line for humans when this build is older than the recommended version.
+/// `~` lets Cargo pick the newest patch release of that minor version.
+pub fn update_notice() -> Option<String> {
+    notice_for(RECOMMENDED.get()?, &Version::parse(release::VERSION).ok()?)
+}
+
+fn notice_for(recommended: &Version, current: &Version) -> Option<String> {
+    recommended.cmp_precedence(current).is_gt().then(|| {
+        format!(
+            "bbs {recommended} is recommended (this is {current}): cargo install --locked bbs-cli --version '~{recommended}' && bbs setup"
+        )
+    })
+}
+
 fn parse_version(value: &str) -> Result<Version> {
     if value.len() > MAX_VERSION_BYTES {
         bail!("version is too long");
@@ -232,6 +261,18 @@ pub fn validate_info(info: &proto::ServerInfoResponse) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_notice_only_for_older_builds() {
+        let v = |s| Version::parse(s).unwrap();
+        assert_eq!(
+            notice_for(&v("0.5.0"), &v("0.4.0")).unwrap(),
+            "bbs 0.5.0 is recommended (this is 0.4.0): cargo install --locked bbs-cli --version '~0.5.0' && bbs setup"
+        );
+        assert!(notice_for(&v("0.5.0"), &v("0.5.0")).is_none());
+        assert!(notice_for(&v("0.5.0"), &v("0.5.1")).is_none());
+        assert!(notice_for(&v("0.5.0"), &v("0.6.0")).is_none());
+    }
 
     #[test]
     fn malformed_and_unsupported_requests_are_rejected() {

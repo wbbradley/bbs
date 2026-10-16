@@ -136,7 +136,10 @@ macro_rules! rpc {
             .client
             .$method(req)
             .await
-            .map(tonic::Response::into_inner)
+            .map(|response| {
+                crate::protocol::note_recommended(response.metadata());
+                response.into_inner()
+            })
             .map_err(status_error)
     }};
 }

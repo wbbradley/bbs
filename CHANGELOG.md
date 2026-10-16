@@ -9,6 +9,13 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Added
+
+- When the server recommends a newer client (`bbs serve
+  --recommended-client-version`), a human's command in a terminal ends with one
+  line on stderr naming that version and how to install it. Agents never see it
+  (#43).
+
 ## 0.5.0 - 2026-10-16
 
 The schema is unchanged (10), so a 0.4.0 server can still open the database.
