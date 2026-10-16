@@ -2775,10 +2775,12 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
             .contains("is not your agent")
     );
     bbs.ok(&["--token", &tp, "send", "--to", "Zed", "WAITCANCEL"]);
+    // The prompt is logged before the harness gets it; wait until the harness
+    // reports it, or the cancel could reach the harness first.
     eventually("the second prompt", || {
         std::fs::read_to_string(&log)
             .ok()
-            .filter(|l| l.contains("WAITCANCEL"))
+            .filter(|l| l.contains("\"title\":\"waiting-cancel\""))
     });
     bbs.ok(&["headless", "cancel", "Zed"]);
     eventually("the cancelled turn", || {
@@ -2838,6 +2840,14 @@ fn headless_codex_replies_steers_and_interrupts(mode: Mode) {
                 .filter(|l| l.contains(needle))
         })
     };
+    // A reply is sent before its turn ends. Mail sent before then would be
+    // steered into the ending turn, so wait for each turn's end.
+    let turns_ended = |count: usize| {
+        eventually("the turn's end", || {
+            let log = std::fs::read_to_string(&log).ok()?;
+            (log.matches("\"event\":\"turn_end\"").count() >= count).then_some(())
+        })
+    };
     log_has("the session", "\"event\":\"session\"");
     let tz = headless_state(&bbs, "Zed")["token"]
         .as_str()
@@ -2855,6 +2865,7 @@ fn headless_codex_replies_steers_and_interrupts(mode: Mode) {
     bbs.ok(&["--token", &tp, "send", "--to", "Zed", "hello"]);
     let got = reply("echo");
     assert!(got.contains(&format!("from Zed to {peer}:\necho")), "{got}");
+    turns_ended(1);
 
     // Mail that arrives during a turn joins it.
     bbs.ok(&["--token", &tp, "send", "--to", "Zed", "WAITSTEER"]);
@@ -2864,6 +2875,7 @@ fn headless_codex_replies_steers_and_interrupts(mode: Mode) {
     let got = reply("steered: and this");
     assert!(got.contains("steered: and this"), "{got}");
     log_has("the steer", "\"event\":\"steer\"");
+    turns_ended(2);
 
     bbs.ok(&["--token", &tp, "send", "--to", "Zed", "WAITCANCEL"]);
     log_has("the cancellable turn", "\"title\":\"waiting-cancel\"");
