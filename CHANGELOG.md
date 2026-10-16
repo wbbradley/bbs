@@ -44,7 +44,7 @@ request that bumps the package version; correct the date if publishing slips.
 - `bbs connect` activity pane: `A` in an agent's thread shows its shared
   activity live beside the thread, as `bbs headless logs --pretty` draws it,
   or says the agent shares none. `WatchActivity` can be limited to one agent.
-  (#PR)
+  (#67)
 
 ### Changed
 
