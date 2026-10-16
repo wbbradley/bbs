@@ -9,8 +9,9 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 
-use super::pretty::Pretty;
 use crate::service::fmt_time;
+use crate::ui::activity::Activity;
+use crate::ui::to_ansi;
 
 /// Appends one JSON object per event. Consecutive text or thought chunks are
 /// joined into one record, flushed when another event arrives.
@@ -87,14 +88,15 @@ pub async fn print(path: &Path, follow: bool, pretty: bool) -> Result<()> {
     let file = File::open(path).with_context(|| format!("no log at {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
-    let mut pretty = pretty.then(|| Pretty::new(std::io::stdout().is_terminal()));
+    let color = std::io::stdout().is_terminal();
+    let mut pretty = pretty.then(|| Activity::new(color));
     loop {
         line.clear();
         let pos = reader.stream_position()?;
         let n = reader.read_line(&mut line)?;
         if n == 0 || !line.ends_with('\n') {
             if let Some(pretty) = &mut pretty {
-                print!("{}", pretty.running());
+                print!("{}", to_ansi(&pretty.running(), color));
             }
             if !follow {
                 return Ok(());
@@ -105,7 +107,7 @@ pub async fn print(path: &Path, follow: bool, pretty: bool) -> Result<()> {
             continue;
         }
         match &mut pretty {
-            Some(pretty) => print!("{}", pretty.render(&line)),
+            Some(pretty) => print!("{}", to_ansi(&pretty.render(&line), color)),
             None => print!("{}", render(&line)),
         }
     }

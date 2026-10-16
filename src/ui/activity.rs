@@ -1,12 +1,11 @@
-//! `bbs headless logs --pretty`: the event log as a readable stream, with
-//! markdown and colors when printing to a terminal.
+//! A headless agent's event log as styled lines: what `bbs headless logs
+//! --pretty` prints.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use ratatui::backend::IntoCrossterm as _;
-use ratatui::crossterm::style::ContentStyle;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use serde_json::{Map, Value};
 
 /// A tool call waiting for its result.
@@ -17,32 +16,33 @@ struct Call {
 }
 
 /// Renders records one at a time, pairing each tool call's records by id.
-pub struct Pretty {
-    color: bool,
+pub struct Activity {
+    /// Render `text` records' markdown, rather than showing their source.
+    markdown: bool,
     calls: HashMap<String, Call>,
     /// Ids in start order, so running calls are reported in order.
     order: Vec<String>,
 }
 
-impl Pretty {
-    pub fn new(color: bool) -> Pretty {
-        Pretty {
-            color,
+impl Activity {
+    pub fn new(markdown: bool) -> Activity {
+        Activity {
+            markdown,
             calls: HashMap::new(),
             order: Vec::new(),
         }
     }
 
-    /// One log line as text; empty for hidden records.
-    pub fn render(&mut self, line: &str) -> String {
+    /// One log line as styled lines; none for hidden records.
+    pub fn render(&mut self, line: &str) -> Vec<Line<'static>> {
         let Ok(Value::Object(r)) = serde_json::from_str::<Value>(line) else {
-            return line.to_string();
+            return styled(line.trim_end_matches('\n'), Style::new());
         };
         let ts = str_field(&r, "ts");
         let time = ts.get(11..19).unwrap_or(ts);
         let text = str_field(&r, "text");
         let message = str_field(&r, "message");
-        let mut out = String::new();
+        let mut out = Vec::new();
         match str_field(&r, "event") {
             "update" => {}
             "start" => {
@@ -78,7 +78,7 @@ impl Pretty {
                 self.line(&mut out, &line, Style::new().fg(Color::Yellow));
             }
             "prompt" => {
-                out.push('\n');
+                out.push(Line::default());
                 let header = format!("━━ {time} turn ━━");
                 self.line(&mut out, &header, Style::new().fg(Color::Cyan).bold());
                 self.block(&mut out, mail_part(text), Style::new());
@@ -143,22 +143,20 @@ impl Pretty {
 
     /// Tool calls still running, each reported once; called while waiting for
     /// more of a followed log, so a long call shows before it finishes.
-    pub fn running(&mut self) -> String {
-        let mut out = String::new();
+    pub fn running(&mut self) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
         for id in &self.order {
             let call = self.calls.get_mut(id).expect("ordered calls exist");
             if !call.shown {
                 call.shown = true;
-                let line = format!("  … {} running", call.name);
-                out.push_str(&paint(self.color, &line, dim()));
-                out.push('\n');
+                out.extend(styled(&format!("  … {} running", call.name), dim()));
             }
         }
         out
     }
 
     /// One line per finished call: its name, status, and duration.
-    fn tool(&mut self, out: &mut String, r: &Map<String, Value>) {
+    fn tool(&mut self, out: &mut Vec<Line<'static>>, r: &Map<String, Value>) {
         let id = str_field(r, "id").to_string();
         let status = str_field(r, "status");
         if status == "pending" || status == "in_progress" {
@@ -195,43 +193,41 @@ impl Pretty {
         self.line(out, &line, style);
     }
 
-    fn line(&self, out: &mut String, text: &str, style: Style) {
-        out.push_str(&paint(self.color, text, style));
-        out.push('\n');
+    fn line(&self, out: &mut Vec<Line<'static>>, text: &str, style: Style) {
+        out.extend(styled(text, style));
     }
 
     /// Text in one style, trailing blank lines trimmed.
-    fn block(&self, out: &mut String, text: &str, style: Style) {
+    fn block(&self, out: &mut Vec<Line<'static>>, text: &str, style: Style) {
         for line in text.trim_end().lines() {
             self.line(out, line, style);
         }
     }
 
-    /// Markdown as styled lines; the source text when not coloring.
-    fn markdown(&self, out: &mut String, text: &str) {
-        if !self.color {
+    /// Markdown as styled lines, or the source text.
+    fn markdown(&self, out: &mut Vec<Line<'static>>, text: &str) {
+        if !self.markdown {
             return self.block(out, text, Style::new());
         }
         for line in tui_markdown::from_str(text.trim_end()).lines {
-            for span in &line.spans {
-                let style = line.style.patch(span.style);
-                out.push_str(&paint(true, &span.content, style));
-            }
-            out.push('\n');
+            let spans = line
+                .spans
+                .iter()
+                .map(|span| Span::styled(span.content.to_string(), line.style.patch(span.style)));
+            out.push(Line::from(spans.collect::<Vec<_>>()));
         }
     }
+}
+
+/// `text` in one style, one `Line` per line of it: a `Line` drops newlines.
+fn styled(text: &str, style: Style) -> Vec<Line<'static>> {
+    text.split('\n')
+        .map(|line| Line::styled(line.to_string(), style))
+        .collect()
 }
 
 fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
-}
-
-fn paint(color: bool, text: &str, style: Style) -> String {
-    if !color || text.is_empty() || style == Style::new() {
-        return text.to_string();
-    }
-    let style: ContentStyle = style.into_crossterm();
-    style.apply(text).to_string()
 }
 
 fn str_field<'a>(r: &'a Map<String, Value>, key: &str) -> &'a str {
@@ -266,10 +262,14 @@ fn mail_part(prompt: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::to_ansi;
 
     fn render(lines: &[&str]) -> String {
-        let mut pretty = Pretty::new(false);
-        lines.iter().map(|l| pretty.render(l)).collect()
+        let mut activity = Activity::new(false);
+        lines
+            .iter()
+            .map(|l| to_ansi(&activity.render(l), false))
+            .collect()
     }
 
     #[test]
@@ -295,23 +295,26 @@ mod tests {
 
     #[test]
     fn tool_calls_are_one_line_when_they_finish() {
-        let mut pretty = Pretty::new(false);
+        let mut pretty = Activity::new(false);
         let mut out = String::new();
         for line in [
             r#"{"ts":"2026-10-16T05:43:07.5Z","event":"tool","title":"xd://mcp__bbs_send","kind":"execute","status":"pending","id":"a"}"#,
             r#"{"ts":"2026-10-16T05:43:07.6Z","event":"tool","title":"Read src/main.rs","status":"pending","id":"b"}"#,
             r#"{"ts":"2026-10-16T05:43:07.75Z","event":"tool","status":"failed","id":"a"}"#,
         ] {
-            out.push_str(&pretty.render(line));
+            out.push_str(&to_ansi(&pretty.render(line), false));
         }
         assert_eq!(out, "  ✗ bbs_send failed (0.2s)\n");
         // A call still running is reported once while following.
-        assert_eq!(pretty.running(), "  … Read src/main.rs running\n");
-        assert_eq!(pretty.running(), "");
+        assert_eq!(
+            to_ansi(&pretty.running(), false),
+            "  … Read src/main.rs running\n"
+        );
+        assert!(pretty.running().is_empty());
         let done =
             r#"{"ts":"2026-10-16T05:43:09.6Z","event":"tool","status":"completed","id":"b"}"#;
         assert_eq!(
-            pretty.render(done),
+            to_ansi(&pretty.render(done), false),
             "  ✓ Read src/main.rs completed (2.0s)\n"
         );
     }
@@ -336,13 +339,28 @@ mod tests {
     }
 
     #[test]
+    fn multi_line_titles_keep_their_lines() {
+        let out = render(&[
+            r#"{"ts":"2026-10-16T05:00:00Z","event":"tool","title":"$ cat <<EOF\nhi\nEOF","status":"pending","id":"a"}"#,
+            r#"{"ts":"2026-10-16T05:00:01Z","event":"tool","status":"completed","id":"a"}"#,
+        ]);
+        assert_eq!(out, "  ✓ $ cat <<EOF\nhi\nEOF completed (1.0s)\n");
+    }
+
+    #[test]
     fn colors_and_markdown_only_when_asked() {
-        let mut pretty = Pretty::new(true);
-        let text =
-            pretty.render(r#"{"ts":"2026-10-16T05:00:00Z","event":"text","text":"**bold** text"}"#);
+        let mut pretty = Activity::new(true);
+        let text = to_ansi(
+            &pretty
+                .render(r#"{"ts":"2026-10-16T05:00:00Z","event":"text","text":"**bold** text"}"#),
+            true,
+        );
         assert!(text.contains("\x1b["), "{text:?}");
         assert!(!text.contains("**"), "{text:?}");
-        let error = pretty.render(r#"{"ts":"2026-10-16T05:00:00Z","event":"error","message":"x"}"#);
+        let error = to_ansi(
+            &pretty.render(r#"{"ts":"2026-10-16T05:00:00Z","event":"error","message":"x"}"#),
+            true,
+        );
         assert!(error.starts_with("\x1b["), "{error:?}");
     }
 }
