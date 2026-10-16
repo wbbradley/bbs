@@ -237,6 +237,7 @@ message PostActivityResponse { uint32 accepted = 1; }
 message ActivityRequest {
   uint32 backlog = 1;            // 1 to 1000
   optional int64 after_id = 2;   // cursor mode, as in FeedRequest
+  optional string agent = 3;     // only this agent's (case-insensitive; retired included)
 }
 message Activity {
   int64 id = 1;

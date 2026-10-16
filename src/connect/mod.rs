@@ -1,5 +1,6 @@
 //! `bbs connect`: a BBS-style terminal app for humans. See CONNECT.md.
 
+mod activity;
 mod admin;
 mod app;
 mod art;

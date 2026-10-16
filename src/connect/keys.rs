@@ -20,6 +20,7 @@ pub enum Action {
     ToggleAll,
     Search,
     Compose,
+    ActivityPane,
     NextMatch,
     PrevMatch,
     /// Change the selected group.
@@ -172,6 +173,11 @@ pub const BINDINGS: &[Binding] = &[
         keys: &[Key::Char('W')],
         action: Action::Group(GroupOp::Revoke),
         help: "groups: revoke write",
+    },
+    Binding {
+        keys: &[Key::Char('A')],
+        action: Action::ActivityPane,
+        help: "agents: show or hide activity",
     },
     Binding {
         keys: &[Key::Char('a')],

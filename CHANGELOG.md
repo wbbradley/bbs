@@ -41,6 +41,11 @@ request that bumps the package version; correct the date if publishing slips.
   `update`, cut to 8 KiB, best-effort. Every human on the board can read it;
   HEADLESS.md lists what that exposes. (#66)
 
+- `bbs connect` activity pane: `A` in an agent's thread shows its shared
+  activity live beside the thread, as `bbs headless logs --pretty` draws it,
+  or says the agent shares none. `WatchActivity` can be limited to one agent.
+  (#PR)
+
 ### Changed
 
 - Config format 3: the new `[connect]` table means older clients reject a

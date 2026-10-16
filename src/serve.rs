@@ -21,7 +21,7 @@ use crate::db;
 use crate::proto::bbs_server::{Bbs, BbsServer};
 use crate::proto::{self, Kind};
 use crate::protocol::Policy;
-use crate::service::{self, Caller};
+use crate::service::{self, Caller, Watched};
 
 /// Keepalive pings let a vanished client free its waiter slot within ~30s.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
@@ -401,50 +401,6 @@ impl Server {
         }
         .await;
         self.0.protocol.finish(result)
-    }
-}
-
-/// A query a watch stream re-runs: a window of the newest rows, or a cursor
-/// that moves past each batch it sends.
-trait Watched: Clone + Send + Sync + 'static {
-    type Snapshot: Send + 'static;
-    fn fetch(conn: &mut Connection, caller: &Caller, req: Self) -> Result<Self::Snapshot>;
-    /// Move a cursor past `sent`; `true` when the batch was full, so more may
-    /// be waiting.
-    fn advance(&mut self, sent: &Self::Snapshot) -> bool;
-    fn has_cursor(&self) -> bool;
-    fn is_empty(snapshot: &Self::Snapshot) -> bool;
-}
-
-impl Watched for proto::FeedRequest {
-    type Snapshot = proto::FeedSnapshot;
-    fn fetch(conn: &mut Connection, caller: &Caller, req: Self) -> Result<Self::Snapshot> {
-        service::feed(conn, caller, req)
-    }
-    fn advance(&mut self, sent: &Self::Snapshot) -> bool {
-        service::advance_feed_cursor(self, sent)
-    }
-    fn has_cursor(&self) -> bool {
-        self.after_id.is_some()
-    }
-    fn is_empty(snapshot: &Self::Snapshot) -> bool {
-        snapshot.messages.is_empty()
-    }
-}
-
-impl Watched for proto::ActivityRequest {
-    type Snapshot = proto::ActivitySnapshot;
-    fn fetch(conn: &mut Connection, caller: &Caller, req: Self) -> Result<Self::Snapshot> {
-        service::activity(conn, caller, req)
-    }
-    fn advance(&mut self, sent: &Self::Snapshot) -> bool {
-        service::advance_activity_cursor(self, sent)
-    }
-    fn has_cursor(&self) -> bool {
-        self.after_id.is_some()
-    }
-    fn is_empty(snapshot: &Self::Snapshot) -> bool {
-        snapshot.events.is_empty()
     }
 }
 
@@ -1155,6 +1111,7 @@ mod tests {
         let watch = proto::ActivityRequest {
             backlog: 2,
             after_id: Some(0),
+            agent: None,
         };
         let mut stream = client
             .watch_activity(with_metadata(watch, "bbs-human", "will"))
@@ -1198,6 +1155,8 @@ mod tests {
                 proto::ActivityRequest {
                     backlog: 2,
                     after_id: None,
+                    // One agent's, named case-insensitively.
+                    agent: Some("mateo".into()),
                 },
                 "bbs-human",
                 "will",
@@ -1251,6 +1210,7 @@ mod tests {
                 proto::ActivityRequest {
                     backlog: 10,
                     after_id: None,
+                    agent: None,
                 },
                 "bbs-token",
                 &token,
@@ -1258,5 +1218,18 @@ mod tests {
             .await
             .unwrap_err();
         assert!(status.message().contains("humans only"), "{status:?}");
+        let status = client
+            .watch_activity(with_metadata(
+                proto::ActivityRequest {
+                    backlog: 10,
+                    after_id: None,
+                    agent: Some("Nobody".into()),
+                },
+                "bbs-human",
+                "will",
+            ))
+            .await
+            .unwrap_err();
+        assert!(status.message().contains("no agent named"), "{status:?}");
     }
 }

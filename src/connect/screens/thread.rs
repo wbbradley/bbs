@@ -8,6 +8,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::connect::activity::ActivityPane;
 use crate::connect::admin::GroupAdmin;
 use crate::connect::app::{Ctx, Screen, Transition, next_id};
 use crate::connect::composer::Composer;
@@ -34,6 +35,8 @@ pub struct Thread {
     composing: bool,
     /// A group thread's group, as last listed, and its admin dialogs.
     group: Option<(proto::Group, GroupAdmin)>,
+    /// An agent thread's activity, while shown.
+    activity: Option<ActivityPane>,
 }
 
 impl Thread {
@@ -51,6 +54,7 @@ impl Thread {
             composer: to.map(Composer::new),
             composing: false,
             group: None,
+            activity: None,
         }
     }
 
@@ -170,14 +174,26 @@ impl Screen for Thread {
         if self.group.is_some() {
             requests.push(Request::Groups);
         }
+        requests.extend(self.activity.as_ref().map(ActivityPane::watch));
         requests
     }
 
+    fn reload(&mut self) {
+        if let Some(pane) = &mut self.activity {
+            pane.reset();
+        }
+    }
+
     fn on_close(&self) -> Vec<Request> {
-        vec![Request::Unwatch(self.id)]
+        let mut requests = vec![Request::Unwatch(self.id)];
+        requests.extend(self.activity.as_ref().map(ActivityPane::unwatch));
+        requests
     }
 
     fn on_data(&mut self, data: &Data) {
+        if let Some(pane) = &mut self.activity {
+            pane.on_data(data);
+        }
         match data {
             Data::Feed { id, result } if *id == self.id => match result {
                 Ok(messages) => {
@@ -253,6 +269,17 @@ impl Screen for Thread {
             Action::Bottom => self.view.follow(),
             Action::Search => self.prompt = Some(String::new()),
             Action::Compose => self.composing = self.composer.is_some(),
+            // Only an agent's thread has activity.
+            Action::ActivityPane => match (self.activity.take(), &self.req.with) {
+                (Some(pane), _) => return Transition::Request(pane.unwatch()),
+                (None, Some(agent)) => {
+                    let pane = ActivityPane::new(agent);
+                    let watch = pane.watch();
+                    self.activity = Some(pane);
+                    return Transition::Request(watch);
+                }
+                (None, None) => {}
+            },
             // Creating a group belongs to the Groups list.
             Action::Group(op) if op != GroupOp::Create => {
                 if let Some((group, admin)) = &mut self.group {
@@ -278,8 +305,15 @@ impl Screen for Thread {
 impl Thread {
     fn draw(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
         let window = theme::window(&self.title);
-        let inner = window.inner(area);
+        let mut inner = window.inner(area);
         frame.render_widget(window, area);
+        if let Some(pane) = &self.activity {
+            let [thread, side] =
+                Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .areas(inner);
+            pane.render(frame, side);
+            inner = thread;
+        }
         let max_lines = frame.area().height * u16::from(ctx.composer_max_height_percent) / 100;
         let composer_height = self
             .composer
