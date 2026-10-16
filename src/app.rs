@@ -93,6 +93,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         _ => {}
     }
     let config = Config::load()?;
+    // Only humans at a terminal see the update notice; agents never do.
+    let notice = cli.token.is_none() && std::io::stderr().is_terminal();
     let caller = Caller {
         token: cli.token.clone(),
         human: config.human(cli.as_human.as_deref()),
@@ -115,6 +117,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         command => {
             print!("{}", dispatch(&mut backend, command).await?);
+            if notice && let Some(line) = crate::protocol::update_notice() {
+                eprintln!("{line}");
+            }
             Ok(())
         }
     }

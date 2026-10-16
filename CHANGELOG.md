@@ -9,6 +9,12 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Added
+
+- When the server recommends a newer client (`bbs serve
+  --recommended-client-version`), a human's command in a terminal ends with one
+  line on stderr naming that version and how to install it. Agents never see it.
+
 ### Removed
 
 - The server no longer honors `ReadRequest.from_kind`, which only 0.2.0 Stop
