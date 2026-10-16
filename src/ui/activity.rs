@@ -19,6 +19,8 @@ struct Call {
 pub struct Activity {
     /// Render `text` records' markdown, rather than showing their source.
     markdown: bool,
+    /// Show times in local time rather than the log's UTC.
+    local: bool,
     calls: HashMap<String, Call>,
     /// Ids in start order, so running calls are reported in order.
     order: Vec<String>,
@@ -28,9 +30,16 @@ impl Activity {
     pub fn new(markdown: bool) -> Activity {
         Activity {
             markdown,
+            local: false,
             calls: HashMap::new(),
             order: Vec::new(),
         }
+    }
+
+    /// Show times in local time, as `bbs connect` does elsewhere.
+    pub fn local_time(mut self) -> Activity {
+        self.local = true;
+        self
     }
 
     /// One log line as styled lines; none for hidden records.
@@ -38,8 +47,7 @@ impl Activity {
         let Ok(Value::Object(r)) = serde_json::from_str::<Value>(line) else {
             return styled(line.trim_end_matches('\n'), Style::new());
         };
-        let ts = str_field(&r, "ts");
-        let time = ts.get(11..19).unwrap_or(ts);
+        let time = super::clock(str_field(&r, "ts"), self.local);
         let text = str_field(&r, "text");
         let message = str_field(&r, "message");
         let mut out = Vec::new();
@@ -291,6 +299,19 @@ mod tests {
              **Done.**\n\
              05:43:10 turn end (end_turn)\n"
         );
+    }
+
+    #[test]
+    fn times_are_the_logs_utc_unless_local() {
+        let line = r#"{"ts":"2026-10-16T05:43:10Z","event":"turn_end","stop_reason":"end_turn"}"#;
+        let utc = to_ansi(&Activity::new(false).render(line), false);
+        assert_eq!(utc, "05:43:10 turn end (end_turn)\n");
+        let local = to_ansi(&Activity::new(false).local_time().render(line), false);
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-10-16T05:43:10Z")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S");
+        assert_eq!(local, format!("{expected} turn end (end_turn)\n"));
     }
 
     #[test]
