@@ -9,14 +9,14 @@ use ratatui::crossterm::style::ContentStyle;
 use ratatui::style::Style;
 use ratatui::text::Line;
 
-/// A stored RFC 3339 time as local `HH:MM:SS`; unparsable text as it is.
-pub fn clock(ts: &str) -> String {
+/// A stored RFC 3339 UTC time as `HH:MM:SS`, in local time when `local`.
+pub fn clock(ts: &str, local: bool) -> String {
     match chrono::DateTime::parse_from_rfc3339(ts) {
-        Ok(t) => t
+        Ok(t) if local => t
             .with_timezone(&chrono::Local)
             .format("%H:%M:%S")
             .to_string(),
-        Err(_) => ts.get(11..19).unwrap_or(ts).to_string(),
+        _ => ts.get(11..19).unwrap_or(ts).to_string(),
     }
 }
 

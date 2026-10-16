@@ -19,6 +19,8 @@ struct Call {
 pub struct Activity {
     /// Render `text` records' markdown, rather than showing their source.
     markdown: bool,
+    /// Show times in local time rather than the log's UTC.
+    local: bool,
     calls: HashMap<String, Call>,
     /// Ids in start order, so running calls are reported in order.
     order: Vec<String>,
@@ -28,9 +30,16 @@ impl Activity {
     pub fn new(markdown: bool) -> Activity {
         Activity {
             markdown,
+            local: false,
             calls: HashMap::new(),
             order: Vec::new(),
         }
+    }
+
+    /// Show times in local time, as `bbs connect` does elsewhere.
+    pub fn local_time(mut self) -> Activity {
+        self.local = true;
+        self
     }
 
     /// One log line as styled lines; none for hidden records.
@@ -38,7 +47,7 @@ impl Activity {
         let Ok(Value::Object(r)) = serde_json::from_str::<Value>(line) else {
             return styled(line.trim_end_matches('\n'), Style::new());
         };
-        let time = super::clock(str_field(&r, "ts"));
+        let time = super::clock(str_field(&r, "ts"), self.local);
         let text = str_field(&r, "text");
         let message = str_field(&r, "message");
         let mut out = Vec::new();
@@ -261,7 +270,7 @@ fn mail_part(prompt: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::{clock, to_ansi};
+    use crate::ui::to_ansi;
 
     fn render(lines: &[&str]) -> String {
         let mut activity = Activity::new(false);
@@ -281,21 +290,28 @@ mod tests {
             r#"{"ts":"2026-10-16T05:43:10Z","event":"text","text":"**Done.**"}"#,
             r#"{"ts":"2026-10-16T05:43:10Z","event":"turn_end","stop_reason":"end_turn"}"#,
         ]);
-        let (mail, end) = (
-            clock("2026-10-16T05:43:05.8Z"),
-            clock("2026-10-16T05:43:10Z"),
-        );
         assert_eq!(
             out,
-            format!(
-                "{mail} mail from wbbradley\n\
-                 \n━━ {mail} turn ━━\n\
-                 [2026-10-16T05:43:05Z] from wbbradley (human) to @g:\nhello\n\
-                 │ Let me look.\n\
-                 **Done.**\n\
-                 {end} turn end (end_turn)\n"
-            )
+            "05:43:05 mail from wbbradley\n\
+             \n━━ 05:43:05 turn ━━\n\
+             [2026-10-16T05:43:05Z] from wbbradley (human) to @g:\nhello\n\
+             │ Let me look.\n\
+             **Done.**\n\
+             05:43:10 turn end (end_turn)\n"
         );
+    }
+
+    #[test]
+    fn times_are_the_logs_utc_unless_local() {
+        let line = r#"{"ts":"2026-10-16T05:43:10Z","event":"turn_end","stop_reason":"end_turn"}"#;
+        let utc = to_ansi(&Activity::new(false).render(line), false);
+        assert_eq!(utc, "05:43:10 turn end (end_turn)\n");
+        let local = to_ansi(&Activity::new(false).local_time().render(line), false);
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-10-16T05:43:10Z")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S");
+        assert_eq!(local, format!("{expected} turn end (end_turn)\n"));
     }
 
     #[test]
@@ -333,20 +349,13 @@ mod tests {
             r#"{"ts":"2026-10-16T05:00:03Z","event":"permission","tool":"bash"}"#,
             "not json\n",
         ]);
-        let t = |s: u32| clock(&format!("2026-10-16T05:00:0{s}Z"));
         assert_eq!(
             out,
-            format!(
-                "{} warning: slow\n\
-                 {} turn_error: boom\n\
-                 {} stopped: the harness exited\n\
-                 {} permission {{\"tool\":\"bash\"}}\n\
-                 not json\n",
-                t(0),
-                t(1),
-                t(2),
-                t(3)
-            )
+            "05:00:00 warning: slow\n\
+             05:00:01 turn_error: boom\n\
+             05:00:02 stopped: the harness exited\n\
+             05:00:03 permission {\"tool\":\"bash\"}\n\
+             not json\n"
         );
     }
 

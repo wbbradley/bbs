@@ -83,7 +83,7 @@ impl ActivityPane {
             agent: agent.to_string(),
             kinds: Kinds::All,
             records: std::collections::VecDeque::new(),
-            renderer: Activity::new(true),
+            renderer: Activity::new(true).local_time(),
             lines: Vec::new(),
             loaded: false,
             error: None,
@@ -118,7 +118,7 @@ impl ActivityPane {
     /// Show the next set of kinds, redrawing every record kept.
     pub fn cycle(&mut self) {
         self.kinds = self.kinds.next();
-        self.renderer = Activity::new(true);
+        self.renderer = Activity::new(true).local_time();
         self.lines.clear();
         let records = std::mem::take(&mut self.records);
         self.show(records.iter());
