@@ -5,97 +5,22 @@
 //! are approved. Session updates become [`Event`]s; anything unrecognized is
 //! reported by kind rather than rejected, so harness extensions do not break it.
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::time::{Duration, timeout};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 
+use super::harness::{Event, MAX_INPUT_CHARS, SETUP_TIMEOUT, truncate};
+use super::rpc::{Incoming, Process, Rpc};
 use super::settings::HarnessConfig;
 
 const PROTOCOL_VERSION: u64 = 1;
 /// JSON-RPC error code ACP uses when the agent needs `authenticate` first.
 const AUTH_REQUIRED: i64 = -32000;
-/// Longest tool input kept in an event.
-const MAX_INPUT_CHARS: usize = 2000;
-/// Longest wait for the harness to initialize and open a session.
-const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long the harness's process group gets to exit after SIGTERM.
-const STOP_GRACE: Duration = Duration::from_secs(5);
-
-/// The harness process and its process group, which also holds every command
-/// the agent started. Dropping it kills the group.
-pub struct Process {
-    child: Child,
-    pgid: libc::pid_t,
-}
-
-impl Process {
-    /// Wait for the harness itself to exit.
-    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
-    }
-
-    /// SIGTERM the group, give it `STOP_GRACE` to exit, then SIGKILL whatever
-    /// remains.
-    pub async fn stop(&mut self) {
-        signal_group(self.pgid, libc::SIGTERM);
-        let deadline = tokio::time::Instant::now() + STOP_GRACE;
-        while tokio::time::Instant::now() < deadline {
-            // Reap the harness, so it does not keep the group alive as a zombie.
-            let _ = self.child.try_wait();
-            if !group_alive(self.pgid) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        signal_group(self.pgid, libc::SIGKILL);
-        let _ = self.child.wait().await;
-    }
-}
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        signal_group(self.pgid, libc::SIGKILL);
-    }
-}
-
-fn signal_group(pgid: libc::pid_t, signal: libc::c_int) {
-    // SAFETY: kill(2) with a negative pid signals that process group; it has no
-    // memory-safety preconditions.
-    unsafe {
-        libc::kill(-pgid, signal);
-    }
-}
-
-/// Whether any process remains in the group.
-fn group_alive(pgid: libc::pid_t) -> bool {
-    // SAFETY: as above; signal 0 only checks that the group exists.
-    unsafe { libc::kill(-pgid, 0) == 0 }
-}
-
-/// What the harness reported during a session.
-#[derive(Debug)]
-pub enum Event {
-    Text(String),
-    Thought(String),
-    /// A tool call started or changed: id, and the fields worth logging.
-    Tool(String, Value),
-    /// A permission request and the option chosen for it.
-    Permission(Value),
-    /// A session update this client does not interpret, by kind.
-    Other(String),
-    /// The harness's stdout closed.
-    Exited,
-}
-
 /// The MCP server the harness should start for the agent's BBS tools.
 pub struct McpServer {
     pub name: String,
@@ -115,26 +40,12 @@ impl McpServer {
     }
 }
 
-#[derive(Debug)]
-struct RpcError {
-    code: i64,
-    message: String,
-}
-
-type Pending = std::sync::Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>;
-
-struct Inner {
-    stdin: Mutex<ChildStdin>,
-    pending: Pending,
-    next_id: AtomicU64,
-    /// While a loaded session replays its history, updates are not events.
-    replaying: AtomicBool,
-}
-
 /// One running ACP agent and the session it serves.
 #[derive(Clone)]
 pub struct Acp {
-    inner: Arc<Inner>,
+    rpc: Rpc,
+    /// While a loaded session replays its history, updates are not events.
+    replaying: Arc<AtomicBool>,
     session_id: String,
     pub session_resumed: bool,
 }
@@ -155,41 +66,16 @@ impl Acp {
         mcp: &McpServer,
         resume: Option<&str>,
     ) -> Result<(Acp, Process, mpsc::UnboundedReceiver<Event>, Vec<String>)> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let stderr = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(stderr)
-            .with_context(|| format!("opening {}", stderr.display()))?;
-        stderr.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        // Its own process group: a terminal's Ctrl-C reaches bbs only, and stop
-        // can signal the agent's commands along with the harness.
-        let mut child = Command::new(&config.command[0])
-            .args(&config.command[1..])
-            .envs(&config.env)
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(stderr)
-            .process_group(0)
-            .spawn()
-            .with_context(|| format!("starting harness {:?}", config.command))?;
-        let pgid = child.id().context("the harness exited at once")? as libc::pid_t;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let inner = Arc::new(Inner {
-            stdin: Mutex::new(stdin),
-            pending: Default::default(),
-            next_id: AtomicU64::new(1),
-            replaying: AtomicBool::new(false),
-        });
         let (events, rx) = mpsc::unbounded_channel();
-        tokio::spawn(read_loop(inner.clone(), BufReader::new(stdout), events));
-
-        let mut process = Process { child, pgid };
+        let replaying = Arc::new(AtomicBool::new(false));
+        let handler = {
+            let replaying = replaying.clone();
+            move |rpc: &Rpc, msg: Incoming| handle(rpc, msg, &replaying, &events)
+        };
+        let (rpc, mut process) = Rpc::spawn(&config.command, &config.env, cwd, stderr, handler)?;
         let mut acp = Acp {
-            inner,
+            rpc,
+            replaying,
             session_id: String::new(),
             session_resumed: false,
         };
@@ -229,9 +115,9 @@ impl Acp {
                 None
             };
             if let Some(method) = method {
-                acp.inner.replaying.store(true, Ordering::SeqCst);
-                let result = acp.request(method, params).await;
-                acp.inner.replaying.store(false, Ordering::SeqCst);
+                acp.replaying.store(true, Ordering::SeqCst);
+                let result = acp.rpc.request(method, params).await;
+                acp.replaying.store(false, Ordering::SeqCst);
                 match result {
                     Ok(result) => {
                         acp.session_id = id.to_string();
@@ -246,7 +132,7 @@ impl Acp {
             Some(result) => result,
             None => {
                 let params = json!({ "cwd": cwd, "mcpServers": servers });
-                let result = match acp.call("session/new", params).await {
+                let result = match acp.rpc.call("session/new", params).await {
                     // Logging in may be interactive; it belongs outside headless.
                     Err(err) if err.code == AUTH_REQUIRED => bail!(
                         "the harness needs a login; run it interactively once to log in ({})",
@@ -268,13 +154,9 @@ impl Acp {
         &self.session_id
     }
 
-    /// ACP has no way to add input to a running turn.
-    pub fn can_steer(&self) -> bool {
-        false
-    }
-
     async fn initialize(&self) -> Result<AgentCaps> {
         let result = self
+            .rpc
             .request(
                 "initialize",
                 json!({
@@ -316,12 +198,13 @@ impl Acp {
                 self.set_option(id, model).await?;
             } else if opened["models"].is_object() {
                 // The pre-config-option model selector some agents still use.
-                self.request(
-                    "session/set_model",
-                    json!({ "sessionId": self.session_id, "modelId": model }),
-                )
-                .await
-                .with_context(|| format!("setting model {model:?}"))?;
+                self.rpc
+                    .request(
+                        "session/set_model",
+                        json!({ "sessionId": self.session_id, "modelId": model }),
+                    )
+                    .await
+                    .with_context(|| format!("setting model {model:?}"))?;
             } else if self.session_resumed {
                 warnings.push(format!(
                     "the resumed session lists no model option; model {model:?} not applied"
@@ -337,18 +220,20 @@ impl Acp {
     }
 
     async fn set_option(&self, id: &str, value: &str) -> Result<()> {
-        self.request(
-            "session/set_config_option",
-            json!({ "sessionId": self.session_id, "configId": id, "value": value }),
-        )
-        .await
-        .with_context(|| format!("setting session option {id} to {value:?}"))?;
+        self.rpc
+            .request(
+                "session/set_config_option",
+                json!({ "sessionId": self.session_id, "configId": id, "value": value }),
+            )
+            .await
+            .with_context(|| format!("setting session option {id} to {value:?}"))?;
         Ok(())
     }
 
     /// Run one turn; returns the stop reason.
     pub async fn prompt(&self, text: &str) -> Result<String> {
         let result = self
+            .rpc
             .request(
                 "session/prompt",
                 json!({
@@ -365,120 +250,31 @@ impl Acp {
 
     /// Ask the agent to stop the running turn; the prompt then returns `cancelled`.
     pub async fn cancel(&self) -> Result<()> {
-        self.notify("session/cancel", json!({ "sessionId": self.session_id }))
+        self.rpc
+            .notify("session/cancel", json!({ "sessionId": self.session_id }))
             .await
-    }
-
-    async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        self.call(method, params)
-            .await
-            .map_err(|e| anyhow!("{method}: {} (code {})", e.message, e.code))
-    }
-
-    async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
-        let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().unwrap().insert(id, tx);
-        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        if let Err(err) = send(&self.inner, &msg).await {
-            self.inner.pending.lock().unwrap().remove(&id);
-            return Err(RpcError {
-                code: 0,
-                message: format!("{err:#}"),
-            });
-        }
-        rx.await.unwrap_or_else(|_| {
-            Err(RpcError {
-                code: 0,
-                message: "the harness exited".into(),
-            })
-        })
-    }
-
-    async fn notify(&self, method: &str, params: Value) -> Result<()> {
-        send(
-            &self.inner,
-            &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
-        )
-        .await
     }
 }
 
-async fn send(inner: &Inner, msg: &Value) -> Result<()> {
-    let mut line = msg.to_string();
-    line.push('\n');
-    let mut stdin = inner.stdin.lock().await;
-    stdin.write_all(line.as_bytes()).await?;
-    stdin.flush().await?;
-    Ok(())
-}
-
-async fn read_loop(
-    inner: Arc<Inner>,
-    mut stdout: BufReader<tokio::process::ChildStdout>,
-    events: mpsc::UnboundedSender<Event>,
-) {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match stdout.read_line(&mut line).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+fn handle(rpc: &Rpc, msg: Incoming, replaying: &AtomicBool, events: &mpsc::UnboundedSender<Event>) {
+    match msg {
+        Incoming::Request { id, method, params } => {
+            rpc.respond_later(id, answer(&method, &params, events));
         }
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            tracing::warn!("harness wrote a non-JSON line");
-            continue;
-        };
-        let method = msg["method"].as_str();
-        match (method, msg.get("id")) {
-            (None, Some(id)) => {
-                let Some(id) = id.as_u64() else { continue };
-                let Some(tx) = inner.pending.lock().unwrap().remove(&id) else {
-                    continue;
-                };
-                let result = match msg.get("error") {
-                    Some(err) => Err(RpcError {
-                        code: err["code"].as_i64().unwrap_or(0),
-                        message: err["message"].as_str().unwrap_or("error").to_string(),
-                    }),
-                    None => Ok(msg["result"].clone()),
-                };
-                let _ = tx.send(result);
+        Incoming::Notification { method, params } if method == "session/update" => {
+            if !replaying.load(Ordering::SeqCst)
+                && let Some(event) = update_event(&params["update"])
+            {
+                let _ = events.send(event);
             }
-            (Some(method), Some(id)) => {
-                let reply = answer(method, &msg["params"], &events);
-                let response = match reply {
-                    Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                    Err(message) => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32601, "message": message },
-                    }),
-                };
-                if send(&inner, &response).await.is_err() {
-                    break;
-                }
-            }
-            (Some("session/update"), None) => {
-                if !inner.replaying.load(Ordering::SeqCst)
-                    && let Some(event) = update_event(&msg["params"]["update"])
-                {
-                    let _ = events.send(event);
-                }
-            }
-            (Some(other), None) => {
-                let _ = events.send(Event::Other(other.to_string()));
-            }
-            (None, None) => {}
+        }
+        Incoming::Notification { method, .. } => {
+            let _ = events.send(Event::Other(method));
+        }
+        Incoming::Exited => {
+            let _ = events.send(Event::Exited);
         }
     }
-    for (_, tx) in inner.pending.lock().unwrap().drain() {
-        let _ = tx.send(Err(RpcError {
-            code: 0,
-            message: "the harness exited".into(),
-        }));
-    }
-    let _ = events.send(Event::Exited);
 }
 
 /// Answer a request from the agent. Permission requests are approved; this
@@ -534,12 +330,10 @@ fn update_event(update: &Value) -> Option<Event> {
                 }
             }
             if let Some(input) = update.get("rawInput").filter(|v| !v.is_null()) {
-                let mut s = input.to_string();
-                if s.chars().count() > MAX_INPUT_CHARS {
-                    s = s.chars().take(MAX_INPUT_CHARS).collect();
-                    s.push('…');
-                }
-                fields.insert("input".into(), s.into());
+                fields.insert(
+                    "input".into(),
+                    truncate(input.to_string(), MAX_INPUT_CHARS).into(),
+                );
             }
             Event::Tool(id, Value::Object(fields))
         }

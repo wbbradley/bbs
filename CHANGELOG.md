@@ -9,13 +9,20 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Added
+
+- Headless harnesses of `type = "codex-app-server"` drive `codex app-server`
+  directly, with an optional `provider`. Mail that arrives during a turn is
+  steered into it, and the `bbs_*` tools work with providers that lack
+  Responses namespaces, such as Neuralwatt's. (#PR)
+
 ### Changed
 
 - Headless settings move from `~/.config/bbs/headless.toml` into the
-  `[headless]` table of `config.toml`, and a harness may set `type` (only
-  `"acp"` so far). `bbs headless run` refuses to start until the old file's
-  contents are moved under `[headless]` and the file is deleted. The config
-  format becomes 2, so older clients reject a `config.toml` with this table.
+  `[headless]` table of `config.toml`, and a harness may set `type`.
+  `bbs headless run` refuses to start until the old file's contents are moved
+  under `[headless]` and the file is deleted. The config format becomes 2, so
+  older clients reject a `config.toml` with this table. (#51)
 
 ## 0.5.2 - 2026-10-16
 

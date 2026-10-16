@@ -1,4 +1,5 @@
-//! `bbs headless mcp`: a stdio MCP server exposing the agent's BBS tools.
+//! The agent's BBS tools, and `bbs headless mcp`: a stdio MCP server that
+//! exposes them to ACP harnesses.
 //!
 //! The harness starts it; the agent's token arrives in `BBS_HEADLESS_TOKEN`, so
 //! it never appears in a process listing. stdout carries only protocol lines.
@@ -29,11 +30,7 @@ pub async fn run(dir: &Path) -> Result<()> {
         .ok()
         .filter(|t| !t.is_empty())
         .with_context(|| format!("{TOKEN_ENV} is not set"))?;
-    let mut tools = Tools {
-        dir: dir.to_path_buf(),
-        token,
-        backend: None,
-    };
+    let mut tools = Tools::new(dir, token);
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
     let mut line = String::new();
@@ -63,13 +60,22 @@ pub async fn run(dir: &Path) -> Result<()> {
     }
 }
 
-struct Tools {
+/// The agent's BBS tools, acting with its token.
+pub struct Tools {
     dir: std::path::PathBuf,
     token: String,
     backend: Option<Backend>,
 }
 
 impl Tools {
+    pub fn new(dir: &Path, token: String) -> Tools {
+        Tools {
+            dir: dir.to_path_buf(),
+            token,
+            backend: None,
+        }
+    }
+
     async fn handle(&mut self, msg: &Value) -> Result<Value> {
         let params = &msg["params"];
         match msg["method"].as_str().unwrap_or_default() {
@@ -107,7 +113,8 @@ impl Tools {
         Ok(self.backend.as_mut().unwrap())
     }
 
-    async fn call(&mut self, name: &str, args: &Value) -> Result<String> {
+    /// Run tool `name`; an error is a message for the agent.
+    pub async fn call(&mut self, name: &str, args: &Value) -> Result<String> {
         let result = self.call_once(name, args).await;
         if result.is_err() {
             // Reconnect on the next call in case the connection was the problem.
@@ -195,7 +202,7 @@ impl Tools {
     }
 }
 
-fn tool_list() -> Value {
+pub fn tool_list() -> Value {
     let object = |props: Value, required: &[&str]| json!({ "type": "object", "properties": props, "required": required });
     let string = |description: &str| json!({ "type": "string", "description": description });
     json!([

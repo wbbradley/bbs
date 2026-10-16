@@ -10,9 +10,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::acp::{Acp, Event, McpServer};
+use super::acp::McpServer;
+use super::harness::{BbsTools, Event, Harness};
 use super::log::Log;
-use super::mcp::TOKEN_ENV;
+use super::mcp::{TOKEN_ENV, Tools};
 use super::settings::{MidTurn, Settings};
 use super::state::{AgentDir, State};
 use crate::app::format_messages;
@@ -95,16 +96,16 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     let mut signals = Signals::new()?;
     let stderr = agent_dir.stderr_path();
     let started = tokio::select! {
-        started = Acp::start(
+        started = Harness::start(
             &harness_config,
             &cwd,
             &stderr,
-            &mcp,
+            BbsTools { mcp, tools: Tools::new(dir, token.clone()) },
             resume.as_deref(),
         ) => started,
         _ = signals.recv() => Err(anyhow::anyhow!("stopped during harness setup")),
     };
-    let (acp, mut process, mut events, warnings) = match started {
+    let (agent_harness, mut process, mut events, warnings) = match started {
         Ok(started) => started,
         Err(err) => {
             log.event("stop", json!({ "error": format!("{err:#}") }));
@@ -112,17 +113,17 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         }
     };
     state.harness = Some(harness.clone());
-    state.session_id = Some(acp.session_id().to_string());
+    state.session_id = Some(agent_harness.session_id().to_string());
     agent_dir.save(&state)?;
     log.event(
         "session",
-        json!({ "id": acp.session_id(), "resumed": acp.session_resumed }),
+        json!({ "id": agent_harness.session_id(), "resumed": agent_harness.session_resumed() }),
     );
     for warning in warnings {
         eprintln!("bbs: warning: {warning}");
         log.event("warning", json!({ "message": warning }));
     }
-    if explicit_steer && !acp.can_steer() {
+    if explicit_steer && !agent_harness.can_steer() {
         let warning = format!(
             "harness {harness:?} cannot steer a running turn; mail that arrives during a turn is queued"
         );
@@ -134,8 +135,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         agent_dir.log_path().display()
     );
 
-    let steer = mid_turn == MidTurn::Steer && acp.can_steer();
-    let mut preamble = (!acp.session_resumed).then(|| preamble(&agent, instructions.as_deref()));
+    let steer = mid_turn == MidTurn::Steer && agent_harness.can_steer();
+    let mut preamble =
+        (!agent_harness.session_resumed()).then(|| preamble(&agent, instructions.as_deref()));
     let (mail_tx, mut mail_rx) = mpsc::unbounded_channel();
     let mail_task = tokio::spawn(wait_for_mail(
         config.clone(),
@@ -153,16 +155,13 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             .unwrap_or_else(Instant::now);
         if turn.is_none() && !queue.is_empty() && Instant::now() >= ready_at {
             let mut prompt = preamble.take().unwrap_or_default();
-            prompt.push_str(&format!(
-                "New BBS mail ({} message{}):\n\n{}",
-                queue.len(),
-                if queue.len() == 1 { "" } else { "s" },
-                format_messages(&queue, false)?
-            ));
+            prompt.push_str(&mail_prompt(&queue)?);
             queue.clear();
             log.event("prompt", json!({ "text": prompt }));
-            let acp = acp.clone();
-            turn = Some(tokio::spawn(async move { acp.prompt(&prompt).await }));
+            let agent_harness = agent_harness.clone();
+            turn = Some(tokio::spawn(
+                async move { agent_harness.prompt(&prompt).await },
+            ));
             last_start = Some(Instant::now());
             continue;
         }
@@ -176,7 +175,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     batch.retain(|m| m.control.is_none());
                     if cancels > 0 {
                         let running = turn.is_some();
-                        if running && let Err(err) = acp.cancel().await {
+                        if running && let Err(err) = agent_harness.cancel().await {
                             log.event("error", json!({ "message": format!("cancel: {err:#}") }));
                         }
                         log.event("cancel", json!({ "turn_running": running }));
@@ -184,15 +183,24 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     if batch.is_empty() {
                         continue;
                     }
-                    let waiting = turn.is_some() || Instant::now() < ready_at;
-                    log.event("mail", json!({
-                        "count": batch.len(),
-                        "from": batch.iter().map(|m| m.sender_display_name()).collect::<Vec<_>>(),
-                        "queued": waiting,
-                    }));
+                    let from: Vec<_> = batch.iter().map(|m| m.sender_display_name()).collect();
                     if steer && turn.is_some() {
-                        todo!("steer mail into the running turn (no harness can yet)");
+                        // Steering fails when the turn is ending; the mail is
+                        // then queued for the next turn.
+                        let text = mail_prompt(&batch)?;
+                        match agent_harness.steer(&text).await {
+                            Ok(()) => {
+                                log.event("mail", json!({ "count": batch.len(), "from": from, "queued": false }));
+                                log.event("steer", json!({ "text": text }));
+                                continue;
+                            }
+                            Err(err) => log.event("warning", json!({
+                                "message": format!("steering failed, so the mail is queued: {err:#}"),
+                            })),
+                        }
                     }
+                    let waiting = turn.is_some() || Instant::now() < ready_at;
+                    log.event("mail", json!({ "count": batch.len(), "from": from, "queued": waiting }));
                     queue.extend(batch);
                 }
                 Some(Err(err)) => break Err(err),
@@ -224,7 +232,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         queue.extend(batch.into_iter().filter(|m| m.control.is_none()));
     }
     if turn.is_some() {
-        let _ = acp.cancel().await;
+        let _ = agent_harness.cancel().await;
     }
     log.flush();
     if !queue.is_empty() {
@@ -251,9 +259,20 @@ fn record(log: &mut Log, event: Event) {
             log.event("tool", fields);
         }
         Event::Permission(fields) => log.event("permission", fields),
+        Event::Warning(message) => log.event("warning", json!({ "message": message })),
         Event::Other(kind) => log.event("update", json!({ "kind": kind })),
         Event::Exited => {}
     }
+}
+
+/// A prompt listing `mail`, oldest first.
+fn mail_prompt(mail: &[proto::Message]) -> Result<String> {
+    Ok(format!(
+        "New BBS mail ({} message{}):\n\n{}",
+        mail.len(),
+        if mail.len() == 1 { "" } else { "s" },
+        format_messages(mail, false)?
+    ))
 }
 
 /// The agent's identity and token: the saved token if it is still valid on this
