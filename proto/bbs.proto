@@ -202,8 +202,9 @@ message Agent {
 }
 
 // The window is the most recent `backlog` (1 to 1000) messages that match every
-// filter set. A server without feed-filter.v1 ignores fields 2-8, so clients
-// setting any of them must require that capability.
+// filter set. A server without feed-filter.v1 ignores fields 2-8, and one
+// without feed-with.v1 ignores field 9, so clients setting them must require
+// those capabilities.
 message FeedRequest {
   uint32 backlog = 1;
   optional string group = 2;       // broadcasts to this group name, '@' optional; archived groups included
@@ -217,6 +218,9 @@ message FeedRequest {
   // batch, fetches again at once after a full one, and otherwise sends a batch
   // only when a change brings new matching messages (the first is always sent).
   optional int64 after_id = 8;
+  // Sent by this agent or human name, or sent directly to it (case-insensitive;
+  // retired agents included).
+  optional string with = 9;
 }
 message FeedSnapshot { repeated Message messages = 1; }
 

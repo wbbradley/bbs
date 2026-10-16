@@ -2221,6 +2221,63 @@ fn bodies(rows: &[serde_json::Value]) -> Vec<&str> {
     rows.iter().map(|r| r["body"].as_str().unwrap()).collect()
 }
 
+fn view_with_shows_what_a_name_sent_and_was_sent_directly(mode: Mode) {
+    let bbs = Bbs::with_mode("view-with", mode);
+    bbs.ok(&["group", "register", "crew"]);
+    let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    let (_c, tc) = bbs.register();
+    for token in [&ta, &tb, &tc] {
+        bbs.ok(&["--token", token, "group", "join", "crew"]);
+    }
+    bbs.grant_write("crew", &a);
+    bbs.grant_write("crew", &b);
+    bbs.ok(&["--token", &ta, "send", "--to", &b, "A to B"]);
+    bbs.ok(&["--token", &tb, "send", "--to", &a, "B to A"]);
+    bbs.ok(&["--token", &tc, "send", "--to", &b, "C to B"]);
+    bbs.ok(&["--token", &ta, "send", "--to", "@crew", "A to crew"]);
+    bbs.ok(&["--token", &tb, "send", "--to", "@crew", "B to crew"]);
+    bbs.ok(&["send", "--to", &a, "will to A"]);
+    bbs.ok(&["human", "add", "ada"]);
+    bbs.ok(&["--as", "ada", "send", "--to", "will", "ada to will"]);
+
+    // What A sent, anywhere (its join notice too), and direct messages to A;
+    // not broadcasts A received.
+    let with_a = view_json(&bbs, &["--with", &a.to_lowercase()]);
+    let joined = format!("Agent \"{a}\" joined group @crew.");
+    assert_eq!(
+        bodies(&with_a),
+        [
+            joined.as_str(),
+            "A to B",
+            "B to A",
+            "A to crew",
+            "will to A"
+        ]
+    );
+    // Other filters still apply.
+    let with_a_crew = view_json(&bbs, &["--with", &a, "--group", "crew"]);
+    assert_eq!(bodies(&with_a_crew), [joined.as_str(), "A to crew"]);
+    let limited = view_json(&bbs, &["--with", &a, "--limit", "2"]);
+    assert_eq!(bodies(&limited), ["A to crew", "will to A"]);
+    // A human's name: what they sent (the write grants too) and direct
+    // messages to them.
+    let with_will = view_json(&bbs, &["--with", "will"]);
+    assert_eq!(
+        bodies(&with_will),
+        [
+            format!("Human \"will\" granted write on @crew to agent \"{a}\"."),
+            format!("Human \"will\" granted write on @crew to agent \"{b}\"."),
+            "will to A".to_string(),
+            "ada to will".to_string(),
+        ]
+    );
+    assert!(
+        bbs.err(&["view", "--json", "--no-follow", "--with", "nobody"])
+            .contains("no agent or human named \"nobody\"")
+    );
+}
+
 fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
     let bbs = Bbs::with_mode("view-filters", mode);
     bbs.ok(&["human", "add", "ada"]);
@@ -3123,6 +3180,7 @@ both_modes!(
     read_wait_fails_if_retired_while_waiting,
     view_is_for_humans_only,
     view_filters_by_group_sender_owner_and_scope,
+    view_with_shows_what_a_name_sent_and_was_sent_directly,
     view_since_and_until_bound_history,
     view_json_follow_emits_each_message_once,
     view_json_follow_survives_full_windows_and_bursts,

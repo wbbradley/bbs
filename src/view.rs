@@ -76,6 +76,7 @@ fn request(args: &ViewArgs, now: DateTime<Utc>) -> Result<FeedRequest> {
         until: time("--until", &args.until)?,
         mine: args.mine,
         after_id: None,
+        with: args.with.clone(),
     })
 }
 
