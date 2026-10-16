@@ -390,7 +390,8 @@ pub fn stale_agent_ids(conn: &Connection, cutoff: &str) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
-/// Retire an agent: free its name, archive its unread mail, drop its memberships.
+/// Retire an agent: free its name, archive its unread mail, drop its memberships
+/// and write grants.
 pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
     conn.execute(
         "UPDATE agents SET retired_at = ?1 WHERE id = ?2 AND retired_at IS NULL",
@@ -402,6 +403,7 @@ pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
         params![now, id],
     )?;
     conn.execute("DELETE FROM group_members WHERE agent_id = ?1", params![id])?;
+    conn.execute("DELETE FROM group_writers WHERE agent_id = ?1", params![id])?;
     Ok(())
 }
 
@@ -563,21 +565,15 @@ pub fn is_member(conn: &Connection, group_id: i64, agent_id: i64) -> Result<bool
     Ok(n > 0)
 }
 
-/// Whether the agent's owner holds a write grant on the group for its name.
-/// Ownerless agents can never write.
 pub fn is_writer(conn: &Connection, group_id: i64, agent_id: i64) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agents a
-           JOIN agent_owners o ON o.agent_id = a.id
-           JOIN group_writers w ON w.human_id = o.human_id AND lower(w.name) = lower(a.name)
-          WHERE a.id = ?2 AND w.group_id = ?1)",
+        "SELECT EXISTS(SELECT 1 FROM group_writers WHERE group_id = ?1 AND agent_id = ?2)",
         params![group_id, agent_id],
         |r| r.get(0),
     )?)
 }
 
-/// Grant write on the group to the agent's owner and name, or revoke it.
-/// Returns false if nothing changed.
+/// Grant or revoke write; returns false if nothing changed.
 pub fn set_writer(
     conn: &Connection,
     group_id: i64,
@@ -585,33 +581,26 @@ pub fn set_writer(
     grant: bool,
     now: &str,
 ) -> Result<bool> {
-    let changed = if grant {
+    let n = if grant {
         conn.execute(
-            "INSERT OR IGNORE INTO group_writers (group_id, human_id, name, granted_at)
-             SELECT ?1, o.human_id, a.name, ?3 FROM agents a
-               JOIN agent_owners o ON o.agent_id = a.id WHERE a.id = ?2",
+            "INSERT OR IGNORE INTO group_writers (group_id, agent_id, granted_at)
+             VALUES (?1, ?2, ?3)",
             params![group_id, agent_id, now],
         )?
     } else {
         conn.execute(
-            "DELETE FROM group_writers WHERE group_id = ?1 AND rowid IN (
-               SELECT w.rowid FROM group_writers w
-                 JOIN agent_owners o ON o.human_id = w.human_id
-                 JOIN agents a ON a.id = o.agent_id AND lower(a.name) = lower(w.name)
-                WHERE a.id = ?2)",
+            "DELETE FROM group_writers WHERE group_id = ?1 AND agent_id = ?2",
             params![group_id, agent_id],
         )?
     };
-    Ok(changed > 0)
+    Ok(n > 0)
 }
 
 /// Names of the group's live members that hold a write grant.
 pub fn group_writers(conn: &Connection, group_id: i64) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT a.name FROM group_members m JOIN agents a ON a.id = m.agent_id
-           JOIN agent_owners o ON o.agent_id = a.id
-           JOIN group_writers w ON w.group_id = m.group_id AND w.human_id = o.human_id
-                AND lower(w.name) = lower(a.name)
+           JOIN group_writers w ON w.group_id = m.group_id AND w.agent_id = m.agent_id
           WHERE m.group_id = ?1 AND a.retired_at IS NULL
           ORDER BY lower(a.name)",
     )?;
@@ -666,9 +655,7 @@ pub fn list_groups(conn: &Connection, agent_id: Option<i64>) -> Result<Vec<Group
          FROM bbs_groups g
          LEFT JOIN group_members m ON m.group_id = g.id
          LEFT JOIN agents a ON a.id = m.agent_id
-         LEFT JOIN agent_owners o ON o.agent_id = a.id
-         LEFT JOIN group_writers w ON w.group_id = g.id AND w.human_id = o.human_id
-              AND lower(w.name) = lower(a.name)
+         LEFT JOIN group_writers w ON w.group_id = g.id AND w.agent_id = a.id
          WHERE g.archived_at IS NULL
          AND (?1 IS NULL OR g.id IN (SELECT group_id FROM group_members WHERE agent_id = ?1))
          ORDER BY g.name, lower(a.name)",

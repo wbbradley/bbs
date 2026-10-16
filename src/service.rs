@@ -583,7 +583,15 @@ pub fn group_join(
                 ctx,
                 &me,
                 gid,
-                &format!("Agent {:?} joined group @{group}.", me.name),
+                &format!(
+                    "Agent {:?} joined group @{group}{}.",
+                    me.name,
+                    if db::is_writer(ctx.conn, gid, me.id)? {
+                        " as a writer"
+                    } else {
+                        ""
+                    }
+                ),
             )?;
             tracing::info!(agent = me.name, group, "joined group");
         }
@@ -669,35 +677,35 @@ pub fn set_group_writer(
         let Some(target) = db::live_agent_by_name(ctx.conn, &req.agent)? else {
             bail!("no live agent named {:?}", req.agent);
         };
-        // Revoking needs no membership, so a grant can be removed after the
-        // agent leaves.
+        // Granting needs a member; revoking does not, so a grant can be
+        // removed after the agent leaves.
         if req.grant && !db::is_member(ctx.conn, gid, target.id)? {
             bail!("{} is not in @{group}", target.name);
         }
-        if req.grant && db::agent_owner_id(ctx.conn, target.id)?.is_none() {
-            bail!(
-                "{} has no owning human, so it cannot be granted write",
-                target.name
-            );
-        }
+        let had_writers = !db::group_writers(ctx.conn, gid)?.is_empty();
         let changed = db::set_writer(ctx.conn, gid, target.id, req.grant, &ctx.now_s)?;
+        let agent = target.name;
         if changed {
             let notice = if req.grant {
                 format!(
-                    "Human {:?} granted write on @{group} to agent {:?}.",
-                    me.name, target.name
+                    "Human {:?} granted write on @{group} to agent {agent:?}.",
+                    me.name
                 )
             } else {
+                let orphaned = had_writers && db::group_writers(ctx.conn, gid)?.is_empty();
                 format!(
-                    "Human {:?} revoked write on @{group} from agent {:?}.{}",
+                    "Human {:?} revoked write on @{group} from agent {agent:?}.{}",
                     me.name,
-                    target.name,
-                    no_writers_left(ctx, gid, group)?
+                    if orphaned {
+                        no_writers(group)
+                    } else {
+                        String::new()
+                    }
                 )
             };
             broadcast(ctx, &me, gid, &notice)?;
             tracing::info!(
-                agent = target.name,
+                agent,
                 group,
                 grant = req.grant,
                 by = me.name,
@@ -706,20 +714,14 @@ pub fn set_group_writer(
         }
         Ok(proto::SetGroupWriterResponse {
             group: group.to_string(),
-            agent: target.name,
+            agent,
             changed,
         })
     })
 }
 
-/// A sentence for notices once the group has no writer among its members,
-/// else empty.
-fn no_writers_left(ctx: &Ctx, gid: i64, group: &str) -> Result<String> {
-    Ok(if db::group_writers(ctx.conn, gid)?.is_empty() {
-        format!(" @{group} now has no agent writers.")
-    } else {
-        String::new()
-    })
+fn no_writers(group: &str) -> String {
+    format!(" @{group} now has no agent writers.")
 }
 
 /// The no-writers sentence when `agent`, about to leave, is the group's only
@@ -728,7 +730,7 @@ fn departing_writer(ctx: &Ctx, gid: i64, group: &str, agent: &db::Principal) -> 
     let only =
         db::group_writers(ctx.conn, gid)?.len() == 1 && db::is_writer(ctx.conn, gid, agent.id)?;
     Ok(if only {
-        format!(" @{group} now has no agent writers.")
+        no_writers(group)
     } else {
         String::new()
     })

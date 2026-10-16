@@ -1540,49 +1540,67 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
     bbs.ok(&["--token", &tb, "send", "--to", &a, "dm"]);
     assert!(bbs.ok(&["--token", &ta, "read"]).contains("dm"));
 
-    // A grant outlives leaving and rejoining.
+    // A grant outlives leaving and rejoining, and the rejoin says so.
     bbs.ok(&["--token", &ta, "group", "leave", "acme"]);
     assert!(bbs.ok(&["--as", "ada", "read"]).contains(&format!(
         "Agent {a:?} left group @acme. @acme now has no agent writers.\n"
     )));
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    assert!(
+        bbs.ok(&["--as", "ada", "read"])
+            .contains(&format!("Agent {a:?} joined group @acme as a writer.\n"))
+    );
     bbs.ok(&["--token", &ta, "send", "--to", "@acme", "back"]);
 
-    // It belongs to the owner and name, so a new agent of the same human
-    // under that name keeps it, and another human's agent of that name does not.
-    bbs.ok(&["--token", &ta, "bye"]);
-    let (_, ta) = bbs.register_with(&["register", "--name", &a]);
-    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
-    bbs.ok(&["--token", &ta, "send", "--to", "@acme", "new session"]);
-    bbs.ok(&["--token", &ta, "bye"]);
-    let (_, ta) = bbs.register_with(&["--as", "ada", "register", "--name", &a]);
-    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
-    assert!(
-        bbs.err(&["--token", &ta, "send", "--to", "@acme", "x"])
-            .contains("lack write access")
-    );
-    bbs.ok(&["--token", &ta, "bye"]);
-
-    // Revoking needs no membership.
-    let (_, ta) = bbs.register_with(&["register", "--name", &a]);
+    // Revoking needs no membership, and changes nothing else when the group
+    // already had no writers among its members.
+    bbs.ok(&["--token", &ta, "group", "leave", "acme"]);
+    bbs.ok(&["--token", &tb, "read"]);
     assert_eq!(
         bbs.ok(&["group", "revoke", "acme", &a]),
         format!("Revoked write on @acme from {a}.\n")
     );
+    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&format!(
+        "Human \"will\" revoked write on @acme from agent {a:?}.\n"
+    )));
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
     assert!(
         bbs.err(&["--token", &ta, "send", "--to", "@acme", "x"])
             .contains("@acme has no agent writers.")
     );
 
-    // Losing the last writer by revoke or retirement is announced.
+    // Retiring drops the grant: a new agent with that name lacks it.
+    bbs.grant_write("acme", &a);
     bbs.ok(&["--token", &tb, "read"]);
+    bbs.ok(&["--token", &ta, "bye"]);
+    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&format!(
+        "Agent {a:?} is no longer a member of group @acme. @acme now has no agent writers.\n"
+    )));
+    let writers: i64 = bbs
+        .db()
+        .query_row("SELECT COUNT(*) FROM group_writers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(writers, 0);
+    let (_, ta) = bbs.register_with(&["register", "--name", &a]);
+    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    assert!(
+        bbs.err(&["--token", &ta, "send", "--to", "@acme", "x"])
+            .contains("lack write access")
+    );
+
+    // Losing the last writer by revoke, removal, or retirement is announced.
+    bbs.ok(&["--token", &ta, "read"]);
     bbs.grant_write("acme", &b);
     bbs.ok(&["group", "revoke", "acme", &b]);
-    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&format!(
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&format!(
         "revoked write on @acme from agent {b:?}. @acme now has no agent writers.\n"
     )));
     bbs.grant_write("acme", &b);
+    bbs.ok(&["group", "remove", "acme", &b]);
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&format!(
+        "removed agent {b:?} from group @acme. @acme now has no agent writers.\n"
+    )));
+    bbs.ok(&["--token", &tb, "group", "join", "acme"]);
     bbs.ok(&["retire", &b]);
     assert!(bbs.ok(&["--token", &ta, "read"]).contains(&format!(
         "Agent {b:?} is no longer a member of group @acme. @acme now has no agent writers.\n"

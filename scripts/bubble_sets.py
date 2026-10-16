@@ -97,13 +97,12 @@ def command(args):
 def read_bbs(bbs="bbs"):
     """Use the public CLI, respecting its server and caller configuration."""
     groups = {}
-    for line in command([bbs, "group", "list"]).splitlines():
-        if line.startswith("  ") and groups:
-            continue  # the preceding group's description
-        if not line.startswith("@") or ": " not in line:
-            raise ValueError(f"unrecognized bbs group list row: {line!r}")
-        name, members = line[1:].split(": ", 1)
-        groups[name] = [] if members == "(no agents)" else members.split(", ")
+    for line in command([bbs, "group", "list", "--json"]).splitlines():
+        try:
+            row = json.loads(line)
+            groups[row["name"]] = list(row["members"])
+        except (ValueError, TypeError, KeyError) as error:
+            raise ValueError(f"unrecognized bbs group list row: {line!r}") from error
     rows = command([bbs, "agents"]).splitlines()
     if not rows or rows[0].split()[:2] != ["NAME", "KIND"]:
         raise ValueError("unrecognized bbs agents header")

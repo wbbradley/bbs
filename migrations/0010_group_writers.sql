@@ -1,10 +1,10 @@
--- Agents allowed to broadcast to a group, keyed by owning human and agent name
--- so a grant outlives any one agent identity (new sessions, leaving and
--- rejoining). Groups start with no writers; humans always may broadcast.
+-- Agents allowed to broadcast to a group; humans always may. Kept apart from
+-- group_members so a grant survives leaving and rejoining. Retiring an agent
+-- deletes its grants. Groups start with no writers.
 CREATE TABLE group_writers (
     group_id    INTEGER NOT NULL REFERENCES bbs_groups (id),
-    human_id    INTEGER NOT NULL REFERENCES humans (id),
-    name        TEXT NOT NULL,
-    granted_at  TEXT NOT NULL
+    agent_id    INTEGER NOT NULL REFERENCES agents (id),
+    granted_at  TEXT NOT NULL,
+    PRIMARY KEY (group_id, agent_id)
 );
-CREATE UNIQUE INDEX group_writers_key ON group_writers (group_id, human_id, lower(name));
+CREATE INDEX group_writers_agent ON group_writers (agent_id);
