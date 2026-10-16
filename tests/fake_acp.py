@@ -2,8 +2,8 @@
 
 On each prompt it starts (once) the MCP server the client passed in
 session/new, asks for one permission, and replies to the last sender with
-bbs_send. A prompt containing WAITCANCEL waits for session/cancel instead and
-ends the turn as cancelled. At startup it starts a long `sleep`, standing in for
+bbs_send. A prompt containing WAITCANCEL starts a "waiting-cancel" tool call,
+waits for session/cancel instead, and ends the turn as cancelled. At startup it starts a long `sleep`, standing in for
 an agent's command, and writes its pid to fake-child.pid in its directory.
 """
 
@@ -76,6 +76,9 @@ def main():
             update(session, {"sessionUpdate": "agent_message_chunk",
                              "content": {"type": "text", "text": "thinking about " + sender}})
             if "WAITCANCEL" in text:
+                # Tells the test the prompt has arrived, so a cancel cannot overtake it.
+                update(session, {"sessionUpdate": "tool_call", "toolCallId": "w",
+                                 "title": "waiting-cancel", "status": "in_progress"})
                 cancel = read()
                 assert cancel["method"] == "session/cancel", cancel
                 out({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "cancelled"}})
