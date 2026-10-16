@@ -13,7 +13,7 @@ request that bumps the package version; correct the date if publishing slips.
 
 - `bbs connect`, a BBS-style terminal app for humans: a main menu with hot
   keys, your agents or everyone's with their owners, groups with members and
-  writers, and a help screen generated from its keymap. (#PR)
+  writers, and a help screen generated from its keymap. (#59)
 
 ## 0.6.0 - 2026-10-16
 
