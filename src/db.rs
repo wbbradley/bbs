@@ -826,30 +826,37 @@ pub struct AgentSummary {
     pub oldest_unseen_stream: Option<String>,
 }
 
+/// Unread mail through the human's inbox index; unseen activity per live
+/// agent through `activity_agent`, from the human's cursor, so neither walks
+/// the whole activity table.
+const AGENT_SUMMARIES: &str = "
+    WITH unread AS (
+        SELECT m.from_id AS agent_id, count(*) AS n, min(m.created_at) AS oldest
+        FROM deliveries d JOIN messages m ON m.id = d.message_id
+        WHERE d.recipient_kind = 'human' AND d.recipient_id = ?1
+          AND d.archived_at IS NULL AND d.direct = 1 AND m.from_kind = 'agent'
+        GROUP BY m.from_id),
+    summaries AS MATERIALIZED (
+        SELECT g.name, coalesce(u.n, 0) AS unread, u.oldest AS unread_oldest,
+               (SELECT count(*) FROM activity act
+                WHERE act.agent_id = g.id AND act.id > coalesce(s.seen_id, 0)) AS unseen,
+               -- Ids grow with arrival, so the first unseen is the oldest.
+               (SELECT act.created_at FROM activity act
+                WHERE act.agent_id = g.id AND act.id > coalesce(s.seen_id, 0)
+                ORDER BY act.id LIMIT 1) AS unseen_oldest
+        FROM agents g
+        LEFT JOIN activity_seen s ON s.human_id = ?1 AND s.agent_id = g.id
+        LEFT JOIN unread u ON u.agent_id = g.id
+        WHERE g.retired_at IS NULL)
+    SELECT name, unread, unread_oldest, unseen, unseen_oldest FROM summaries
+    WHERE unread > 0 OR unseen > 0
+    ORDER BY lower(name)";
+
 /// For each live agent with any, the direct messages it sent `human` that are
 /// unread and the shared activity `human` has not seen. Broadcasts don't count:
 /// humans receive every one.
 pub fn agent_summaries(conn: &Connection, human: i64) -> Result<Vec<AgentSummary>> {
-    let mut stmt = conn.prepare_cached(
-        "WITH unread AS (
-             SELECT m.from_id AS agent_id, count(*) AS n, min(m.created_at) AS oldest
-             FROM deliveries d JOIN messages m ON m.id = d.message_id
-             WHERE d.recipient_kind = 'human' AND d.recipient_id = ?1
-               AND d.archived_at IS NULL AND d.direct = 1 AND m.from_kind = 'agent'
-             GROUP BY m.from_id),
-         unseen AS (
-             SELECT a.agent_id, count(*) AS n, min(a.created_at) AS oldest
-             FROM activity a
-             LEFT JOIN activity_seen s ON s.human_id = ?1 AND s.agent_id = a.agent_id
-             WHERE a.id > coalesce(s.seen_id, 0)
-             GROUP BY a.agent_id)
-         SELECT g.name, coalesce(u.n, 0), u.oldest, coalesce(v.n, 0), v.oldest
-         FROM agents g
-         LEFT JOIN unread u ON u.agent_id = g.id
-         LEFT JOIN unseen v ON v.agent_id = g.id
-         WHERE g.retired_at IS NULL AND (u.n IS NOT NULL OR v.n IS NOT NULL)
-         ORDER BY lower(g.name)",
-    )?;
+    let mut stmt = conn.prepare_cached(AGENT_SUMMARIES)?;
     let rows = stmt
         .query_map([human], |r| {
             Ok(AgentSummary {
@@ -1871,6 +1878,33 @@ mod tests {
             );
             assert!(plan.iter().any(|l| l.contains(index)), "{index}: {plan:?}");
         }
+    }
+
+    #[test]
+    fn agent_summaries_walk_activity_by_agent_from_the_cursor() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {AGENT_SUMMARIES}"))
+            .unwrap()
+            .query_map([1], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // Each of the two lookups, once per agent, ranges over the agent's
+        // records after the cursor; nothing scans the activity table.
+        let activity: Vec<_> = plan.iter().filter(|l| l.contains(" act ")).collect();
+        assert_eq!(activity.len(), 2, "{plan:#?}");
+        for line in activity {
+            assert!(
+                line.starts_with("SEARCH act USING")
+                    && line.contains("activity_agent (agent_id=? AND id>?)"),
+                "{plan:#?}"
+            );
+        }
+        // The cursor is one primary-key lookup per agent.
+        let cursor = "SEARCH s USING PRIMARY KEY (human_id=? AND agent_id=?)";
+        assert!(plan.iter().any(|l| l.starts_with(cursor)), "{plan:#?}");
     }
 
     #[test]
