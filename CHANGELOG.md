@@ -23,9 +23,6 @@ request that bumps the package version; correct the date if publishing slips.
 
 - Headless session logs keep their keys in written order (`ts`, `event`, then
   the event's fields) instead of sorting them. (#44)
-
-### Changed
-
 - The Cargo package is now `bbs-cli`, MIT licensed, ready for crates.io; the
   binary is still `bbs`. Builds from a published package report the commit
   Cargo recorded when packaging. Because the package name changed, Cargo
