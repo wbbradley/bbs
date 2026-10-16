@@ -27,6 +27,10 @@ request that bumps the package version; correct the date if publishing slips.
   or a broadcast, from a text box with emacs keys that grows up to
   `[connect] composer_max_height_percent` of the window (default 20). (#63)
 
+- `bbs connect` group admin: dialogs on the Groups list and in group threads
+  create, describe, delete (after asking), add, remove, and grant or revoke
+  write, as `bbs group` does. The help screen scrolls. (#64)
+
 ### Changed
 
 - Config format 3: the new `[connect]` table means older clients reject a

@@ -1,8 +1,6 @@
 //! A live thread of messages: an agent's conversation, a group's broadcasts,
 //! or the whole feed as `bbs view` shows it. Agent and group threads have a
-//! composer below for writing to them.
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//! composer below for writing to them, and group threads the admin dialogs.
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -10,19 +8,17 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::connect::app::{Ctx, Screen, Transition};
+use crate::connect::admin::GroupAdmin;
+use crate::connect::app::{Ctx, Screen, Transition, next_id};
 use crate::connect::composer::Composer;
 use crate::connect::event::{Data, Request};
-use crate::connect::keys::Action;
+use crate::connect::keys::{Action, GroupOp};
 use crate::connect::theme;
-use crate::proto::{FeedRequest, SendRequest};
+use crate::proto::{self, FeedRequest, SendRequest};
 use crate::ui::thread::ThreadView;
 
 /// Messages each feed snapshot holds, as for `bbs view`.
 const BACKLOG: u32 = 200;
-
-/// Ids that tell each screen's feed stream apart.
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct Thread {
     title: String,
@@ -36,13 +32,15 @@ pub struct Thread {
     composer: Option<Composer>,
     /// Keys go to the composer.
     composing: bool,
+    /// A group thread's group, as last listed, and its admin dialogs.
+    group: Option<(proto::Group, GroupAdmin)>,
 }
 
 impl Thread {
     fn new(title: String, req: FeedRequest, to: Option<&str>) -> Thread {
         Thread {
             title,
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_id(),
             req: FeedRequest {
                 backlog: BACKLOG,
                 ..req
@@ -52,6 +50,7 @@ impl Thread {
             prompt: None,
             composer: to.map(Composer::new),
             composing: false,
+            group: None,
         }
     }
 
@@ -75,7 +74,13 @@ impl Thread {
             ..Default::default()
         };
         let to = format!("@{group}");
-        Thread::new(to.clone(), req, Some(&to))
+        let mut thread = Thread::new(to.clone(), req, Some(&to));
+        let listed = proto::Group {
+            name: group.to_string(),
+            ..Default::default()
+        };
+        thread.group = Some((listed, GroupAdmin::default()));
+        thread
     }
 
     /// Everything on the board.
@@ -84,6 +89,16 @@ impl Thread {
     }
 
     fn status(&self) -> Line<'static> {
+        let notice = self.group.as_ref().and_then(|(_, admin)| admin.notice());
+        let mut line = self.thread_status();
+        if let Some(notice) = notice {
+            line.spans.push(Span::styled(" · ", theme::dim()));
+            line.spans.extend(notice.spans);
+        }
+        line
+    }
+
+    fn thread_status(&self) -> Line<'static> {
         if let Some(prompt) = &self.prompt {
             return Line::from(vec![
                 Span::styled(format!("/{prompt}"), theme::base()),
@@ -147,10 +162,15 @@ impl Screen for Thread {
     }
 
     fn requests(&self) -> Vec<Request> {
-        vec![Request::Watch {
+        let mut requests = vec![Request::Watch {
             id: self.id,
             req: self.req.clone(),
-        }]
+        }];
+        // The group's description, for the describe dialog.
+        if self.group.is_some() {
+            requests.push(Request::Groups);
+        }
+        requests
     }
 
     fn on_close(&self) -> Vec<Request> {
@@ -166,6 +186,21 @@ impl Screen for Thread {
                 }
                 Err(e) => self.error = Some(describe(e)),
             },
+            Data::Groups(Ok(list)) => {
+                if let Some((group, _)) = &mut self.group
+                    && let Some(listed) = list
+                        .groups
+                        .iter()
+                        .find(|g| g.name.eq_ignore_ascii_case(&group.name))
+                {
+                    *group = listed.clone();
+                }
+            }
+            Data::Admin { .. } => {
+                if let Some((_, admin)) = &mut self.group {
+                    admin.on_data(self.id, data);
+                }
+            }
             Data::Sent { id, result } if *id == self.id => {
                 if let Some(composer) = &mut self.composer {
                     composer.sent(result.clone());
@@ -182,6 +217,11 @@ impl Screen for Thread {
     fn raw_key(&mut self, key: KeyEvent) -> Option<Transition> {
         if self.composing {
             return self.compose(key);
+        }
+        if let Some((_, admin)) = &mut self.group
+            && let Some(transition) = admin.key(self.id, key)
+        {
+            return Some(transition);
         }
         let prompt = self.prompt.as_mut()?;
         match key.code {
@@ -213,6 +253,12 @@ impl Screen for Thread {
             Action::Bottom => self.view.follow(),
             Action::Search => self.prompt = Some(String::new()),
             Action::Compose => self.composing = self.composer.is_some(),
+            // Creating a group belongs to the Groups list.
+            Action::Group(op) if op != GroupOp::Create => {
+                if let Some((group, admin)) = &mut self.group {
+                    admin.open(op, Some(group));
+                }
+            }
             Action::NextMatch => self.view.jump(true),
             Action::PrevMatch => self.view.jump(false),
             Action::Back => return Transition::Pop,
@@ -222,6 +268,15 @@ impl Screen for Thread {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
+        self.draw(frame, area, ctx);
+        if let Some((_, admin)) = &self.group {
+            admin.render(frame, area);
+        }
+    }
+}
+
+impl Thread {
+    fn draw(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
         let window = theme::window(&self.title);
         let inner = window.inner(area);
         frame.render_widget(window, area);

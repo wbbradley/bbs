@@ -15,6 +15,13 @@ use super::screens::menu::Menu;
 use super::screens::splash::Splash;
 use super::theme;
 
+/// A fresh id, telling apart the screens that ask the server for things.
+pub fn next_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// What every screen may need to know.
 pub struct Ctx {
     /// The connected human.
@@ -133,7 +140,7 @@ impl App {
         match action {
             Action::Quit => return true,
             Action::Help => {
-                self.push(Box::new(Help));
+                self.push(Box::new(Help::default()));
                 return false;
             }
             Action::Reload => {
@@ -183,6 +190,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connect::event::Admin;
     use crate::proto;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -479,6 +487,8 @@ mod tests {
         enter(&mut app);
         let (_, req) = watched(&mut rx);
         assert_eq!(req.group.as_deref(), Some("crew"));
+        // And the group list, for the describe dialog.
+        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
         assert!(screen(&mut app, 80, 24).contains("@crew"));
         key(&mut app, 'q');
         rx.try_recv().unwrap();
@@ -598,6 +608,7 @@ mod tests {
         }))));
         enter(&mut app);
         watched(&mut rx);
+        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
         key(&mut app, 'i');
         key(&mut app, 'x');
         enter(&mut app);
@@ -636,5 +647,194 @@ mod tests {
         }
         // 20% of 30 rows.
         assert_eq!(rows(&mut app), 6);
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            assert!(!key(app, c));
+        }
+    }
+
+    /// The Groups list holding @crew, described, with Mateo and Zed.
+    fn crew_list(app: &mut App, rx: &mut UnboundedReceiver<Request>) {
+        key(app, 'g');
+        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+        app.on_event(Event::Data(Data::Groups(Ok(proto::GroupListResponse {
+            groups: vec![proto::Group {
+                name: "crew".into(),
+                members: vec!["Mateo".into(), "Zed".into()],
+                description: Some("the build crew".into()),
+                writers: None,
+            }],
+        }))));
+    }
+
+    fn admin(rx: &mut UnboundedReceiver<Request>) -> (u64, Admin) {
+        match rx.try_recv().unwrap() {
+            Request::Admin { id, op } => (id, op),
+            other => panic!("expected an admin request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn creating_a_group_takes_a_name_and_a_description() {
+        let (mut app, mut rx) = app();
+        crew_list(&mut app, &mut rx);
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("c create · e describe"), "{out}");
+        key(&mut app, 'c');
+        // q is text in a dialog, not back.
+        typed(&mut app, "ops q");
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        typed(&mut app, "on call");
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("Create a group"), "{out}");
+        assert!(out.contains("name: ops"), "{out}");
+        enter(&mut app);
+        let (id, op) = admin(&mut rx);
+        assert_eq!(
+            op,
+            Admin::Create(proto::GroupRegisterRequest {
+                group: "ops".into(),
+                description: Some("on call".into()),
+            })
+        );
+        assert!(screen(&mut app, 80, 24).contains("Working…"));
+        app.on_event(Event::Data(Data::Admin {
+            id,
+            result: Ok("Created @ops.".into()),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("Created @ops."), "{out}");
+        assert!(!out.contains("Create a group"), "{out}");
+    }
+
+    #[test]
+    fn each_dialog_makes_its_change_to_the_selected_group() {
+        let (mut app, mut rx) = app();
+        crew_list(&mut app, &mut rx);
+        // Describe starts from the current description; emptying it clears.
+        key(&mut app, 'e');
+        assert!(screen(&mut app, 80, 24).contains("description: the build crew"));
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        enter(&mut app);
+        let (_, op) = admin(&mut rx);
+        assert_eq!(
+            op,
+            Admin::Describe(proto::GroupDescribeRequest {
+                group: "crew".into(),
+                description: None,
+            })
+        );
+        key(&mut app, '+');
+        typed(&mut app, "Lu, Kai  Ines");
+        enter(&mut app);
+        let Admin::Add(add) = admin(&mut rx).1 else {
+            panic!("expected add");
+        };
+        assert_eq!(add.agents, ["Lu", "Kai", "Ines"]);
+        for (k, grant) in [('w', true), ('W', false)] {
+            key(&mut app, k);
+            typed(&mut app, "Zed");
+            enter(&mut app);
+            assert_eq!(
+                admin(&mut rx).1,
+                Admin::Writer(proto::SetGroupWriterRequest {
+                    group: "crew".into(),
+                    agent: "Zed".into(),
+                    grant,
+                })
+            );
+        }
+        key(&mut app, '-');
+        typed(&mut app, "Mateo");
+        enter(&mut app);
+        assert_eq!(
+            admin(&mut rx).1,
+            Admin::Remove(proto::GroupRemoveRequest {
+                group: "crew".into(),
+                agent: "Mateo".into(),
+            })
+        );
+        // Esc cancels without a request.
+        key(&mut app, '-');
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(rx.try_recv().is_err());
+        assert!(screen(&mut app, 80, 24).contains("Groups (1)"));
+    }
+
+    #[test]
+    fn deleting_asks_first_and_failures_show() {
+        let (mut app, mut rx) = app();
+        crew_list(&mut app, &mut rx);
+        key(&mut app, 'D');
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("Delete @crew?"), "{out}");
+        key(&mut app, 'n');
+        assert!(rx.try_recv().is_err());
+        key(&mut app, 'D');
+        key(&mut app, 'y');
+        let (id, op) = admin(&mut rx);
+        assert_eq!(
+            op,
+            Admin::Delete(proto::GroupRequest {
+                group: "crew".into()
+            })
+        );
+        app.on_event(Event::Data(Data::Admin {
+            id,
+            result: Err("only humans can delete groups".into()),
+        }));
+        assert!(screen(&mut app, 80, 24).contains("only humans can delete groups"));
+    }
+
+    #[test]
+    fn a_group_thread_has_the_dialogs_for_its_own_group() {
+        let (mut app, mut rx) = app();
+        crew_list(&mut app, &mut rx);
+        enter(&mut app);
+        let (id, _) = watched(&mut rx);
+        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+        app.on_event(Event::Data(Data::Groups(Ok(proto::GroupListResponse {
+            groups: vec![proto::Group {
+                name: "crew".into(),
+                description: Some("renamed crew".into()),
+                ..Default::default()
+            }],
+        }))));
+        // Creating is for the Groups list.
+        key(&mut app, 'c');
+        assert!(!screen(&mut app, 80, 24).contains("Create a group"));
+        key(&mut app, 'e');
+        assert!(screen(&mut app, 80, 24).contains("description: renamed crew"));
+        typed(&mut app, "!");
+        enter(&mut app);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Request::Admin {
+                id,
+                op: Admin::Describe(proto::GroupDescribeRequest {
+                    group: "crew".into(),
+                    description: Some("renamed crew!".into()),
+                }),
+            }
+        );
+        app.on_event(Event::Data(Data::Admin {
+            id,
+            result: Ok("Described @crew.".into()),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("following · Described @crew."), "{out}");
+    }
+
+    #[test]
+    fn help_scrolls_to_its_last_key() {
+        let (mut app, _rx) = app();
+        key(&mut app, '?');
+        assert!(!screen(&mut app, 80, 24).contains("a menu item's hot key"));
+        key(&mut app, 'G');
+        assert!(screen(&mut app, 80, 24).contains("a menu item's hot key"));
     }
 }
