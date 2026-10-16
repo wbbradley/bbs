@@ -159,7 +159,8 @@ message ReadRequest {
   optional uint32 limit = 1;
   bool archived = 2;
   optional string since = 3;    // RFC3339 UTC; with archived only
-  optional Kind from_kind = 4;  // only mail from this kind (Stop hooks of 0.2.0 clients)
+  reserved 4;
+  reserved "from_kind";
 }
 message ReadResponse { repeated Message messages = 1; }
 

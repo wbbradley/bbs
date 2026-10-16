@@ -9,6 +9,12 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Removed
+
+- The server no longer honors `ReadRequest.from_kind`, which only 0.2.0 Stop
+  hooks sent; a 0.2.0 Stop hook now receives all unread mail, not just mail from
+  humans. Upgrade 0.2.0 clients.
+
 ## 0.4.0 - 2026-10-16
 
 Upgrading the server migrates its database to schema 10, which 0.3.0 cannot

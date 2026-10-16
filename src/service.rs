@@ -924,12 +924,7 @@ pub fn read(
                 .transpose()?;
             db::archived_since(ctx.conn, &me, since.as_deref(), req.limit)?
         } else {
-            let from_kind = match req.from_kind.map(proto::Kind::try_from) {
-                Some(Ok(proto::Kind::Agent)) => Some(db::Kind::Agent),
-                Some(Ok(proto::Kind::Human)) => Some(db::Kind::Human),
-                _ => None,
-            };
-            let msgs = db::take_unread(ctx.conn, &me, from_kind, req.limit, &ctx.now_s)?;
+            let msgs = db::take_unread(ctx.conn, &me, req.limit, &ctx.now_s)?;
             if !msgs.is_empty() {
                 tracing::info!(reader = me.name, count = msgs.len(), "archived messages");
             }

@@ -238,7 +238,6 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 since: since
                     .map(|s| parse_time("--since", &s, Utc::now()))
                     .transpose()?,
-                from_kind: None,
             };
             format_messages(&backend.read(req).await?.messages, json)?
         }
