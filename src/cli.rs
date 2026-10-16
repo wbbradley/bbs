@@ -44,6 +44,11 @@ pub enum Command {
         #[command(subcommand)]
         command: GroupCommand,
     },
+    /// Timers: text the server sends an agent later, once or on a schedule.
+    Timer {
+        #[command(subcommand)]
+        command: TimerCommand,
+    },
     /// Register a new agent and print its name and token.
     Register {
         /// Requested agent name; fail if already reserved (case-insensitive).
@@ -113,6 +118,12 @@ pub enum Command {
         /// Advertise an available client release without requiring it (SemVer).
         #[arg(long)]
         recommended_client_version: Option<semver::Version>,
+        /// The most timers one agent may have.
+        #[arg(long, default_value_t = 20)]
+        max_timers_per_agent: u32,
+        /// The shortest time a recurring timer may wait between runs.
+        #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
+        min_timer_interval: std::time::Duration,
     },
     /// Administer the local server state; ignores client server configuration.
     Admin {
@@ -234,6 +245,24 @@ pub enum AdminHumanCommand {
     Rotate { name: String },
     /// Disable human access and owned agents on authenticated servers.
     Revoke { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TimerCommand {
+    /// Send <text> to <agent> when <when> comes, as a message from you.
+    Add {
+        agent: String,
+        /// "in 30m", "at <RFC 3339 time>", "every 1h", or a 5-field cron
+        /// expression in UTC such as "0 9 * * 1-5". Quote it.
+        when: String,
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+    /// List an agent's timers, soonest first: by default your own (agents)
+    /// or everyone's (humans).
+    List { agent: Option<String> },
+    /// Remove a timer by its id.
+    Rm { id: i64 },
 }
 
 #[derive(Subcommand, Debug)]

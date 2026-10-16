@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -21,7 +22,7 @@ use crate::db;
 use crate::proto::bbs_server::{Bbs, BbsServer};
 use crate::proto::{self, Kind};
 use crate::protocol::Policy;
-use crate::service::{self, Caller, Watched};
+use crate::service::{self, Caller, TimerLimits, Watched};
 
 /// Keepalive pings let a vanished client free its waiter slot within ~30s.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
@@ -40,11 +41,20 @@ pub async fn run(
     dir: &Path,
     require_human_token: bool,
     protocol: Policy,
+    timer_limits: TimerLimits,
 ) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut conn = db::open(&dir.join("bbs.db"))?;
     db::migrate(&mut conn)?;
-    serve(conn, listen, dir, require_human_token, protocol).await
+    serve(
+        conn,
+        listen,
+        dir,
+        require_human_token,
+        protocol,
+        timer_limits,
+    )
+    .await
 }
 
 async fn serve(
@@ -53,6 +63,7 @@ async fn serve(
     dir: &Path,
     require_human_token: bool,
     protocol: Policy,
+    timer_limits: TimerLimits,
 ) -> Result<()> {
     let signal = shutdown_signal()?;
     let listener = tokio::net::TcpListener::bind(listen)
@@ -68,7 +79,10 @@ async fn serve(
         require_human_token,
         protocol,
         auth_failures: Mutex::new(HashMap::new()),
+        timer_limits,
+        clock: Arc::new(Utc::now),
     });
+    tokio::spawn(run_timers(state.clone()));
     let (health, health_service) = tonic_health::server::health_reporter();
     health.set_serving::<BbsServer<Server>>().await;
     let server = tonic::transport::Server::builder()
@@ -129,6 +143,53 @@ struct State {
     require_human_token: bool,
     protocol: Policy,
     auth_failures: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    timer_limits: TimerLimits,
+    /// The time timers fire by; tests set it.
+    clock: Clock,
+}
+
+type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+
+/// The longest the scheduler sleeps, so a changed wall clock is noticed.
+const TIMER_RECHECK: Duration = Duration::from_secs(60);
+
+/// Fire due timers, then sleep until the next is due (or the recheck), waking
+/// early after any committed change, which may have added one. A timer due
+/// while the server was down fires on the first pass.
+async fn run_timers(state: Arc<State>) {
+    let mut changes = state.notify.subscribe();
+    loop {
+        changes.borrow_and_update();
+        let now = (state.clock)();
+        let wait = match state
+            .call(move |conn| service::fire_timers(conn, now))
+            .await
+        {
+            Ok((fired, next)) => {
+                if fired > 0 {
+                    state.changed();
+                }
+                match next {
+                    // Already due (more than one pass's worth): go again now.
+                    Some(next) => (next - now)
+                        .to_std()
+                        .unwrap_or(Duration::ZERO)
+                        .min(TIMER_RECHECK),
+                    None => TIMER_RECHECK,
+                }
+            }
+            Err(status) if status.code() == tonic::Code::Unavailable => return,
+            Err(status) => {
+                tracing::warn!("firing timers: {}", status.message());
+                TIMER_RECHECK
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = changes.changed() => {}
+            _ = state.stopping() => return,
+        }
+    }
 }
 
 impl State {
@@ -863,6 +924,33 @@ impl Bbs for Server {
         self.0.protocol.finish(result)
     }
 
+    async fn timer_add(
+        &self,
+        req: Request<proto::TimerAddRequest>,
+    ) -> Result<Response<proto::Timer>, Status> {
+        let limits = self.0.timer_limits;
+        self.unary("timer_add", req, Effect::Write, move |conn, caller, req| {
+            service::timer_add(conn, caller, req, limits)
+        })
+        .await
+    }
+
+    async fn timer_list(
+        &self,
+        req: Request<proto::TimerListRequest>,
+    ) -> Result<Response<proto::TimerListResponse>, Status> {
+        self.unary("timer_list", req, Effect::Query, service::timer_list)
+            .await
+    }
+
+    async fn timer_remove(
+        &self,
+        req: Request<proto::TimerRemoveRequest>,
+    ) -> Result<Response<proto::Timer>, Status> {
+        self.unary("timer_remove", req, Effect::Write, service::timer_remove)
+            .await
+    }
+
     type WatchActivityStream = BoxStream<proto::ActivitySnapshot>;
 
     async fn watch_activity(
@@ -922,6 +1010,8 @@ mod tests {
             require_human_token: false,
             protocol: Policy::default(),
             auth_failures: Mutex::new(HashMap::from([(peer.ip(), (Instant::now(), 20))])),
+            timer_limits: TimerLimits::default(),
+            clock: Arc::new(Utc::now),
         });
         let server = Server(state.clone());
         let request = || {
@@ -1012,6 +1102,8 @@ mod tests {
             require_human_token: false,
             protocol: Policy::default(),
             auth_failures: Mutex::new(HashMap::new()),
+            timer_limits: TimerLimits::default(),
+            clock: Arc::new(Utc::now),
         });
         let (started, active) = tokio::sync::oneshot::channel();
         let (finish, release) = std::sync::mpsc::channel();
@@ -1078,6 +1170,8 @@ mod tests {
             require_human_token: false,
             protocol: Policy::default(),
             auth_failures: Mutex::new(HashMap::new()),
+            timer_limits: TimerLimits::default(),
+            clock: Arc::new(Utc::now),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1231,5 +1325,115 @@ mod tests {
             .await
             .unwrap_err();
         assert!(status.message().contains("no agent named"), "{status:?}");
+    }
+
+    /// A board where will's timer for Mateo was due an hour before `start`
+    /// (as if the server was down), with another due 10 minutes after it.
+    fn timer_board(start: DateTime<Utc>) -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::migrate(&mut conn).unwrap();
+        let will = Caller {
+            human: Some("will".into()),
+            ..Default::default()
+        };
+        service::ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: "will".into(),
+            },
+        )
+        .unwrap();
+        service::register(
+            &mut conn,
+            &will,
+            proto::RegisterRequest {
+                name: Some("Mateo".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (when, body) in [("in 1d", "missed"), ("in 1d", "later")] {
+            let req = proto::TimerAddRequest {
+                agent: "Mateo".into(),
+                when: when.into(),
+                body: body.into(),
+            };
+            service::timer_add(&mut conn, &will, req, TimerLimits::default()).unwrap();
+        }
+        let at = |minutes: i64| service::fmt_time(start + chrono::Duration::minutes(minutes));
+        conn.execute(
+            "UPDATE timers SET next_run = ?1 WHERE body = 'missed'",
+            [at(-60)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE timers SET next_run = ?1 WHERE body = 'later'",
+            [at(10)],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The bodies of the messages timers have sent, oldest first.
+    async fn fired(state: &Arc<State>) -> Vec<String> {
+        state
+            .call(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT body FROM messages WHERE timer_id IS NOT NULL ORDER BY id")?;
+                let bodies = stmt
+                    .query_map([], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?;
+                Ok(bodies)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_scheduler_fires_by_its_clock_and_catches_up_once_on_start() {
+        let start = Utc::now();
+        let conn = timer_board(start);
+        let now = Arc::new(Mutex::new(start));
+        let clock = now.clone();
+        let state = Arc::new(State {
+            conn: Mutex::new(conn),
+            notify: watch::Sender::new(0),
+            activity: watch::Sender::new(0),
+            waiters: Mutex::new(HashSet::new()),
+            shutdown: watch::Sender::new(false),
+            require_human_token: false,
+            protocol: Policy::default(),
+            auth_failures: Mutex::new(HashMap::new()),
+            timer_limits: TimerLimits::default(),
+            clock: Arc::new(move || *clock.lock().unwrap()),
+        });
+        let mut changes = state.notify.subscribe();
+        // Wait for the scheduler to commit what `done` checks for. It bumps
+        // `notify` after firing, so a check that misses it still wakes.
+        async fn until(changes: &mut watch::Receiver<u64>, mut done: impl AsyncFnMut() -> bool) {
+            let wait = async {
+                while !done().await {
+                    changes.changed().await.unwrap();
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(10), wait)
+                .await
+                .expect("the scheduler to fire");
+        }
+        tokio::spawn(run_timers(state.clone()));
+        // The timer missed while "down" fires once at once; the other waits.
+        until(&mut changes, async || fired(&state).await == ["missed"]).await;
+
+        // Its time comes when the clock says so, after any change wakes the
+        // scheduler (as a new timer would) rather than a real ten minutes.
+        *now.lock().unwrap() = start + chrono::Duration::minutes(10);
+        state.changed();
+        until(&mut changes, async || {
+            fired(&state).await == ["missed", "later"]
+        })
+        .await;
+        let left = state.call(|conn| db::next_timer(conn)).await.unwrap();
+        assert_eq!(left, None);
+        state.shutdown.send_replace(true);
     }
 }

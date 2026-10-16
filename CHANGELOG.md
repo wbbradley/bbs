@@ -45,6 +45,12 @@ request that bumps the package version; correct the date if publishing slips.
   text and thoughts, and errors and warnings only. The pane shows local
   times, as the rest of `connect` does. (#68)
 
+- Timers (`timers.v1`, schema 12): `bbs timer add <agent> "<when>" <text>`
+  has the server send an agent a message later, once (`in 30m`, `at <time>`)
+  or on a schedule (`every 1h`, or 5-field cron in UTC), at least once.
+  `bbs timer list` and `rm` manage them. `bbs serve` gains
+  `--max-timers-per-agent` and `--min-timer-interval`. (#PR)
+
 ### Changed
 
 - Config format 3: the new `[connect]` table means older clients reject a

@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::backend::{Backend, Local, Remote};
-use crate::cli::{Cli, Command, GroupCommand, HumanCommand};
+use crate::cli::{Cli, Command, GroupCommand, HumanCommand, TimerCommand};
 use crate::config::Config;
 use crate::proto;
 use crate::service::{Caller, MAX_BODY_BYTES, fmt_time};
@@ -72,6 +72,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             require_human_token,
             minimum_client_version,
             recommended_client_version,
+            max_timers_per_agent,
+            min_timer_interval,
         } => {
             return crate::serve::run(
                 *listen,
@@ -81,6 +83,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                     minimum_client_version.clone(),
                     recommended_client_version.clone(),
                 )?,
+                crate::service::TimerLimits {
+                    max_per_agent: *max_timers_per_agent,
+                    min_interval: *min_timer_interval,
+                },
             )
             .await;
         }
@@ -164,6 +170,29 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 .await?;
             format!("Added human {name}.\n")
         }
+        Command::Timer { command } => match command {
+            TimerCommand::Add { agent, when, text } => {
+                let req = proto::TimerAddRequest {
+                    agent,
+                    when,
+                    body: text,
+                };
+                let t = backend.timer_add(req).await?;
+                format!("Timer {} for {}: {}.\n", t.id, t.agent, timer_schedule(&t))
+            }
+            TimerCommand::List { agent } => {
+                let r = backend
+                    .timer_list(proto::TimerListRequest { agent })
+                    .await?;
+                r.timers.iter().map(timer_line).collect()
+            }
+            TimerCommand::Rm { id } => {
+                let t = backend
+                    .timer_remove(proto::TimerRemoveRequest { id })
+                    .await?;
+                format!("Removed timer {} for {}.\n", t.id, t.agent)
+            }
+        },
         Command::Group { command } => match command {
             GroupCommand::Register { group, description } => {
                 let r = backend
@@ -399,6 +428,8 @@ struct MessageJson<'a> {
     /// Broadcast group; null for direct messages.
     group: Option<&'a str>,
     body: &'a str,
+    /// The timer that sent it; null for other messages.
+    timer: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -506,6 +537,26 @@ pub(crate) fn parse_time(flag: &str, s: &str, now: DateTime<Utc>) -> Result<Stri
     Ok(fmt_time(now - chrono::Duration::from_std(d)?))
 }
 
+/// When a timer runs: "every 1h, next at …" or "once at …".
+fn timer_schedule(t: &proto::Timer) -> String {
+    match &t.repeat {
+        Some(repeat) => format!("{repeat}, next at {}", display_time(&t.next_run)),
+        None => format!("once at {}", display_time(&t.next_run)),
+    }
+}
+
+/// One timer per line: id, agent, schedule, creator, and text.
+fn timer_line(t: &proto::Timer) -> String {
+    format!(
+        "{}  {}  {}  from {}: {}\n",
+        t.id,
+        t.agent,
+        timer_schedule(t),
+        t.creator,
+        t.body.replace('\n', " ")
+    )
+}
+
 pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<String> {
     if json {
         return json_lines(msgs.iter().map(|m| MessageJson {
@@ -517,6 +568,7 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
             to: m.to_name.as_deref(),
             group: m.to_group.as_deref(),
             body: &m.body,
+            timer: m.timer_id,
         }));
     }
     let mut out = String::new();
@@ -533,9 +585,13 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
             (Some(g), _) => format!("@{g}"),
             (None, to) => to.clone().unwrap_or_default(),
         };
+        let timer = m
+            .timer_id
+            .map(|id| format!(" (timer {id})"))
+            .unwrap_or_default();
         writeln!(
             out,
-            "[{}] from {}{human} to {to}:",
+            "[{}] from {}{human} to {to}{timer}:",
             display_time(&m.created_at),
             m.sender_display_name()
         )?;

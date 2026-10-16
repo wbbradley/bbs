@@ -16,6 +16,7 @@ mod release;
 mod serve;
 mod service;
 mod setup;
+mod timer;
 mod ui;
 mod view;
 
