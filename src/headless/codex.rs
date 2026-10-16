@@ -10,13 +10,49 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use super::harness::{Event, MAX_INPUT_CHARS, SETUP_TIMEOUT, truncate};
 use super::mcp::{Tools, tool_list};
 use super::rpc::{Incoming, Process, Rpc};
 use super::settings::HarnessConfig;
+
+/// Longest wait for a starting turn's id before steering or interrupting it.
+const TURN_ID_WAIT: Duration = Duration::from_secs(10);
+
+/// The running turn, and a signal for each change to it.
+#[derive(Default)]
+struct TurnState {
+    turn: Mutex<Turn>,
+    changed: Notify,
+}
+
+impl TurnState {
+    fn set(&self, f: impl FnOnce(&mut Turn)) {
+        f(&mut self.turn.lock().unwrap());
+        self.changed.notify_waiters();
+    }
+
+    /// The running turn's id. A turn that is starting may not have one yet;
+    /// wait up to `wait` for it.
+    async fn running_id(&self, wait: Duration) -> Option<String> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let turn = self.turn.lock().unwrap();
+                if turn.id.is_some() || turn.done.is_none() {
+                    return turn.id.clone();
+                }
+            }
+            timeout_at(deadline, changed).await.ok()?;
+        }
+    }
+}
 
 /// The running turn, if any.
 #[derive(Default)]
@@ -33,7 +69,7 @@ pub struct Codex {
     rpc: Rpc,
     thread_id: String,
     pub resumed: bool,
-    turn: Arc<Mutex<Turn>>,
+    turn: Arc<TurnState>,
 }
 
 impl Codex {
@@ -47,7 +83,7 @@ impl Codex {
         resume: Option<&str>,
     ) -> Result<(Codex, Process, mpsc::UnboundedReceiver<Event>)> {
         let (events, rx) = mpsc::unbounded_channel();
-        let turn = Arc::new(Mutex::new(Turn::default()));
+        let turn = Arc::new(TurnState::default());
         let handler = {
             let turn = turn.clone();
             let tools = Arc::new(tokio::sync::Mutex::new(tools));
@@ -130,29 +166,31 @@ impl Codex {
     /// Run one turn; returns its status (`completed` or `interrupted`).
     pub async fn prompt(&self, text: &str) -> Result<String> {
         let (tx, rx) = oneshot::channel();
-        self.turn.lock().unwrap().done = Some(tx);
+        self.turn.set(|turn| turn.done = Some(tx));
         let params = json!({ "threadId": self.thread_id, "input": input(text) });
         let result = match self.rpc.request("turn/start", params).await {
             Ok(result) => result,
             Err(err) => {
-                *self.turn.lock().unwrap() = Turn::default();
+                self.turn.set(|turn| *turn = Turn::default());
                 return Err(err);
             }
         };
-        {
-            let mut turn = self.turn.lock().unwrap();
+        self.turn.set(|turn| {
             if turn.done.is_some() && turn.id.is_none() {
                 turn.id = result["turn"]["id"].as_str().map(str::to_string);
             }
-        }
+        });
         rx.await.map_err(|_| anyhow!("the harness exited"))?
     }
 
     /// Add `text` to the running turn. Fails when no turn is running or the
     /// turn cannot take input (it is ending, say).
     pub async fn steer(&self, text: &str) -> Result<()> {
-        let id = self.turn.lock().unwrap().id.clone();
-        let id = id.context("no turn is running")?;
+        let id = self
+            .turn
+            .running_id(TURN_ID_WAIT)
+            .await
+            .context("no turn is running")?;
         self.rpc
             .request(
                 "turn/steer",
@@ -162,12 +200,9 @@ impl Codex {
         Ok(())
     }
 
-    /// Interrupt the running turn; its prompt then returns `interrupted`. Until
-    /// the turn id arrives (just after turn/start), there is nothing to
-    /// interrupt yet and this does nothing.
+    /// Interrupt the running turn; its prompt then returns `interrupted`.
     pub async fn cancel(&self) -> Result<()> {
-        let id = self.turn.lock().unwrap().id.clone();
-        if let Some(id) = id {
+        if let Some(id) = self.turn.running_id(TURN_ID_WAIT).await {
             self.rpc
                 .request(
                     "turn/interrupt",
@@ -195,7 +230,7 @@ fn dynamic_tools() -> Value {
 fn handle(
     rpc: &Rpc,
     msg: Incoming,
-    turn: &Mutex<Turn>,
+    turn: &TurnState,
     tools: &Arc<tokio::sync::Mutex<Tools>>,
     events: &mpsc::UnboundedSender<Event>,
 ) {
@@ -228,7 +263,7 @@ fn handle(
         }
         Incoming::Exited => {
             // Dropping the sender fails the running prompt.
-            *turn.lock().unwrap() = Turn::default();
+            turn.set(|turn| *turn = Turn::default());
             let _ = events.send(Event::Exited);
         }
     }
@@ -254,21 +289,23 @@ fn answer(
 }
 
 /// The event a notification reports, tracking the running turn as it goes.
-fn notification_event(method: &str, params: &Value, turn: &Mutex<Turn>) -> Option<Event> {
+fn notification_event(method: &str, params: &Value, turn: &TurnState) -> Option<Event> {
     let delta = || params["delta"].as_str().map(str::to_string);
     Some(match method {
         "item/agentMessage/delta" => Event::Text(delta()?),
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => Event::Thought(delta()?),
         "item/started" | "item/completed" => item_event(method, &params["item"])?,
         "turn/started" => {
-            let mut turn = turn.lock().unwrap();
-            if turn.done.is_some() {
-                turn.id = params["turn"]["id"].as_str().map(str::to_string);
-            }
+            turn.set(|turn| {
+                if turn.done.is_some() {
+                    turn.id = params["turn"]["id"].as_str().map(str::to_string);
+                }
+            });
             return None;
         }
         "turn/completed" => {
-            let done = std::mem::take(&mut *turn.lock().unwrap()).done;
+            let mut done = None;
+            turn.set(|turn| done = std::mem::take(turn).done);
             if let Some(done) = done {
                 let _ = done.send(turn_outcome(&params["turn"]));
             }
@@ -343,7 +380,7 @@ mod tests {
 
     #[test]
     fn maps_notifications() {
-        let turn = Mutex::new(Turn::default());
+        let turn = TurnState::default();
         let e = notification_event(
             "item/agentMessage/delta",
             &json!({ "delta": "hi", "itemId": "i" }),
@@ -400,25 +437,25 @@ mod tests {
 
     #[test]
     fn tracks_the_running_turn() {
-        let turn = Mutex::new(Turn::default());
+        let turn = TurnState::default();
         // Not waiting for a turn: a stray turn/started is not tracked.
         notification_event("turn/started", &json!({ "turn": { "id": "t0" } }), &turn);
-        assert!(turn.lock().unwrap().id.is_none());
+        assert!(turn.turn.lock().unwrap().id.is_none());
 
         let (tx, mut rx) = oneshot::channel();
-        turn.lock().unwrap().done = Some(tx);
+        turn.turn.lock().unwrap().done = Some(tx);
         notification_event("turn/started", &json!({ "turn": { "id": "t1" } }), &turn);
-        assert_eq!(turn.lock().unwrap().id.as_deref(), Some("t1"));
+        assert_eq!(turn.turn.lock().unwrap().id.as_deref(), Some("t1"));
         notification_event(
             "turn/completed",
             &json!({ "turn": { "id": "t1", "status": "interrupted", "items": [] } }),
             &turn,
         );
         assert_eq!(rx.try_recv().unwrap().unwrap(), "interrupted");
-        assert!(turn.lock().unwrap().id.is_none());
+        assert!(turn.turn.lock().unwrap().id.is_none());
 
         let (tx, mut rx) = oneshot::channel();
-        turn.lock().unwrap().done = Some(tx);
+        turn.turn.lock().unwrap().done = Some(tx);
         notification_event(
             "turn/completed",
             &json!({ "turn": { "id": "t2", "status": "failed",
@@ -427,6 +464,34 @@ mod tests {
         );
         let err = rx.try_recv().unwrap().unwrap_err();
         assert_eq!(err.to_string(), "the turn failed: quota");
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_starting_turns_id() {
+        let turn = Arc::new(TurnState::default());
+        let wait = Duration::from_secs(5);
+        assert_eq!(turn.running_id(wait).await, None, "no turn running");
+
+        let (tx, _rx) = oneshot::channel();
+        turn.set(|t| t.done = Some(tx));
+        assert_eq!(turn.running_id(Duration::from_millis(50)).await, None);
+        let started = turn.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            notification_event("turn/started", &json!({ "turn": { "id": "t1" } }), &started);
+        });
+        assert_eq!(turn.running_id(wait).await.as_deref(), Some("t1"));
+
+        // A turn that ends before its id arrives has nothing left to steer.
+        turn.set(|t| *t = Turn::default());
+        let (tx, _rx) = oneshot::channel();
+        turn.set(|t| t.done = Some(tx));
+        let ended = turn.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ended.set(|t| *t = Turn::default());
+        });
+        assert_eq!(turn.running_id(wait).await, None);
     }
 
     #[test]
