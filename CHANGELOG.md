@@ -9,6 +9,11 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+## 0.6.0 - 2026-10-16
+
+Client-only change; servers need no upgrade. Headless users must move
+`headless.toml` into `config.toml` (see Changed).
+
 ### Added
 
 - `bbs headless run` stops with an error after `max_turn_errors` turns
