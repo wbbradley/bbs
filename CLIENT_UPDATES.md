@@ -8,7 +8,7 @@ see it. There is no setting to turn it off.
 
 ## Current implementation
 
-`Cargo.toml` declares version `0.5.0` and `rust-version`, which CI tests.
+`Cargo.toml` declares the package version and `rust-version`, which CI tests.
 `build.rs` embeds the full git revision, a dirty flag, and the target, or takes
 `BBS_BUILD_REVISION`/`BBS_BUILD_DIRTY` from builders without `.git`; otherwise the
 revision is `unknown`. Side-effect-free `bbs version --json` reports the package
