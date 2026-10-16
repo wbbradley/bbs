@@ -1087,6 +1087,17 @@ pub fn feed(
                 Ok(ids)
             })
             .transpose()?;
+        let with = req
+            .with
+            .as_deref()
+            .map(|name| {
+                let ids = db::principals_named(ctx.conn, name)?;
+                if ids.is_empty() {
+                    bail!("no agent or human named {name:?}");
+                }
+                Ok(ids)
+            })
+            .transpose()?;
         let from_human = req
             .from_human
             .as_deref()
@@ -1115,6 +1126,7 @@ pub fn feed(
             group_ids,
             senders,
             from_human,
+            with,
             since: since.as_deref(),
             until: until.as_deref(),
             scope: req.mine.then_some(me.id),

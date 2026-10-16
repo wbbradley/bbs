@@ -399,8 +399,8 @@ impl Backend {
     /// Watch the most recent `req.backlog` matching messages (humans only): the
     /// first snapshot comes at once, then one after every change. With
     /// `after_id`, each snapshot is instead the next batch after the cursor.
-    /// Filters and the cursor require `feed-filter.v1`, since an older server
-    /// would ignore them; `require_filter` also requires it for a request that
+    /// Filters and the cursor require `feed-filter.v1`, and `with` also
+    /// `feed-with.v1`, since an older server would ignore them; `require_filter` also requires it for a request that
     /// sets neither, so a caller about to follow by cursor fails up front.
     pub async fn watch_feed(
         &mut self,
@@ -417,7 +417,9 @@ impl Backend {
                 sent: false,
             },
             Backend::Remote(r) => {
-                let capabilities: &[&str] = if require_filter || feed_filtered(&req) {
+                let capabilities: &[&str] = if req.with.is_some() {
+                    &["owner-attribution.v1", "feed-filter.v1", "feed-with.v1"]
+                } else if require_filter || feed_filtered(&req) {
                     &["owner-attribution.v1", "feed-filter.v1"]
                 } else {
                     &["owner-attribution.v1"]
@@ -717,6 +719,12 @@ mod tests {
             ..Default::default()
         };
         assert!(backend.watch_feed(filtered, false).await.is_err());
+        let with = proto::FeedRequest {
+            backlog: 10,
+            with: Some("Zed".into()),
+            ..Default::default()
+        };
+        assert!(backend.watch_feed(with, false).await.is_err());
         assert!(
             backend
                 .bind_session(proto::BindSessionRequest::default())
@@ -765,6 +773,10 @@ mod tests {
             ("WaitForMail", Some("owner-attribution.v1")),
             ("WatchFeed", Some("owner-attribution.v1")),
             ("WatchFeed", Some("owner-attribution.v1,feed-filter.v1")),
+            (
+                "WatchFeed",
+                Some("owner-attribution.v1,feed-filter.v1,feed-with.v1"),
+            ),
             ("BindSession", Some("human-token-sessions.v1")),
             ("SessionAgent", Some("human-token-sessions.v1")),
             ("GroupDelete", Some("group-archive.v1")),

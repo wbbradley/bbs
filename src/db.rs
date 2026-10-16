@@ -897,6 +897,8 @@ pub struct FeedFilter<'a> {
     pub senders: Option<Vec<(Kind, i64)>>,
     /// Sent by this human id or by an agent it owns.
     pub from_human: Option<i64>,
+    /// Sent by any of these principals, or sent directly to one of them.
+    pub with: Option<Vec<(Kind, i64)>>,
     /// `created_at >= since`.
     pub since: Option<&'a str>,
     /// `created_at < until`.
@@ -962,6 +964,8 @@ enum Term {
     /// A direct message to this human. Agents cannot message humans, so only
     /// human-sent direct messages qualify.
     DirectTo(i64),
+    /// A direct message to this agent.
+    DirectToAgent(i64),
     /// A broadcast to this group.
     ToGroup(i64),
 }
@@ -974,6 +978,7 @@ enum Expanded {
     FromHuman,
     Scope,
     Groups,
+    With,
 }
 
 const OWNED_AGENTS: &str = "SELECT agent_id FROM agent_owners WHERE human_id = ?";
@@ -1114,6 +1119,15 @@ fn term_sql(term: Term, limit: u32, filter: &FeedFilter, expanded: Expanded) -> 
             ),
             vec![Value::Integer(agent)],
         ),
+        Term::DirectToAgent(agent) => (
+            format!(
+                "SELECT m.id FROM deliveries d JOIN messages m ON m.id = d.message_id
+                 WHERE d.recipient_kind = 'agent' AND d.recipient_id = ?
+                   AND m.to_group_id IS NULL{predicates}
+                 ORDER BY d.message_id {dir} LIMIT ?"
+            ),
+            vec![Value::Integer(agent)],
+        ),
         Term::ToGroup(group) => (
             format!(
                 "SELECT m.id FROM messages m WHERE m.to_group_id = ?{predicates}
@@ -1141,7 +1155,17 @@ fn term_sql(term: Term, limit: u32, filter: &FeedFilter, expanded: Expanded) -> 
 /// filter is answered as the union of each term's own first `limit`, which
 /// holds the overall first `limit`.
 fn page_ids(conn: &Connection, limit: u32, filter: &FeedFilter) -> Result<Vec<i64>> {
-    let (expanded, terms) = if let Some(senders) = &filter.senders {
+    let (expanded, terms) = if let Some(with) = &filter.with {
+        let mut terms = Vec::new();
+        for &(kind, id) in with {
+            terms.push(Term::Sent(kind, id));
+            terms.push(match kind {
+                Kind::Human => Term::DirectTo(id),
+                Kind::Agent => Term::DirectToAgent(id),
+            });
+        }
+        (Expanded::With, terms)
+    } else if let Some(senders) = &filter.senders {
         let terms = senders.iter().map(|&(k, id)| Term::Sent(k, id)).collect();
         (Expanded::Senders, terms)
     } else if let Some(human) = filter.from_human {
@@ -1472,6 +1496,10 @@ mod tests {
             (
                 term_sql(Term::DirectTo(1), 200, &mine, Expanded::Scope),
                 "messages_human_dm",
+            ),
+            (
+                term_sql(Term::DirectToAgent(2), 200, &mine, Expanded::With),
+                "deliveries_recipient",
             ),
             (
                 term_sql(Term::ToGroup(1), 200, &mine, Expanded::Groups),

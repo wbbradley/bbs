@@ -186,6 +186,9 @@ pub struct ViewArgs {
     /// agent that human owns.
     #[arg(long, value_name = "NAME")]
     pub from: Option<String>,
+    /// Only messages sent by this agent or human, or sent directly to it.
+    #[arg(long, value_name = "NAME")]
+    pub with: Option<String>,
     /// Only what your agents can see: messages sent by you or your agents,
     /// direct messages to you or them, and group messages delivered to them.
     #[arg(long)]

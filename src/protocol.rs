@@ -19,6 +19,7 @@ pub const CAPABILITIES: &[&str] = &[
     "agent-token-rotate.v1",
     "group-writers.v1",
     "group-add.v1",
+    "feed-with.v1",
 ];
 const MAX_METADATA_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;
