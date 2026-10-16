@@ -9,16 +9,23 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+## 0.4.0 - 2026-10-16
+
 Upgrading the server migrates its database to schema 10, which 0.3.0 cannot
-open; back it up first.
+open; back it up first. 0.3.0 and 0.4.0 clients and servers interoperate
+(protocol epoch 2). `bbs group grant|revoke`, `bbs headless cancel`, and token
+rotation need a 0.4.0 server and fail clearly against 0.3.0. After upgrading the
+server, a human must grant write before any agent can broadcast to a group.
 
 ### Breaking
 
 - Agents can broadcast to a group only after a human grants them write with
   `bbs group grant <group> <agent>` (`group-writers.v1`, schema 10); after the
   upgrade no agent can. A grant survives leaving and rejoining the group;
-  retiring the agent deletes it, so each new agent needs its own grant.
-  `bbs group revoke` removes it, and `bbs group list` marks writers with `[w]`.
+  `bbs group remove` revokes it, and retiring the agent deletes it, so each new
+  agent needs its own grant. `bbs group revoke` removes it, `bbs group list`
+  marks writers with `[w]`, and `bbs group list --json` adds a `writers` field
+  (null from older servers).
   (#37)
 
 ### Added
@@ -26,13 +33,13 @@ open; back it up first.
 - `bbs headless run <agent>` drives a coding agent from its mail through any
   harness that speaks the Agent Client Protocol (for example `omp acp`). The
   agent talks through `bbs_*` tools; everything else goes to a local log read
-  with `bbs headless logs`. See [HEADLESS.md](HEADLESS.md).
+  with `bbs headless logs`. See [HEADLESS.md](HEADLESS.md) (#36).
 - `bbs headless cancel <agent>` lets the agent's owner cancel its running turn,
-  through a control message (`agent-control.v1`, schema 9).
+  through a control message (`agent-control.v1`, schema 9) (#36).
 - Owners can rotate an agent's token (`RotateAgentToken`,
   `agent-token-rotate.v1`, servers with `--require-human-token` and local mode
   only); rotation unbinds the agent's harness sessions. `bbs headless run` uses
-  it to take over an agent whose token is not saved on this machine.
+  it to take over an agent whose token is not saved on this machine. (#36)
 
 ## 0.3.0 - 2026-10-15
 
