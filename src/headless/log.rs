@@ -18,6 +18,9 @@ use crate::ui::to_ansi;
 pub struct Log {
     file: File,
     pending: Option<(&'static str, String)>,
+    /// With `share_activity`, where records also go, and how many the full
+    /// queue dropped.
+    share: Option<(tokio::sync::mpsc::Sender<String>, u64)>,
 }
 
 impl Log {
@@ -35,7 +38,18 @@ impl Log {
         Ok(Log {
             file,
             pending: None,
+            share: None,
         })
+    }
+
+    /// Also send each record but `update` to `share`, cut to fit.
+    pub fn share(&mut self, share: tokio::sync::mpsc::Sender<String>) {
+        self.share = Some((share, 0));
+    }
+
+    /// Stop sharing, so the sender can finish.
+    pub fn unshare(&mut self) {
+        self.share = None;
     }
 
     /// Record `event` with `fields` (an object).
@@ -68,7 +82,19 @@ impl Log {
         if let Value::Object(fields) = fields {
             record.extend(fields);
         }
-        let mut line = Value::Object(record).to_string();
+        let record = Value::Object(record);
+        if let Some((share, dropped)) = &mut self.share
+            && event != "update"
+            && share
+                .try_send(crate::headless::share::capped(&record))
+                .is_err()
+        {
+            *dropped += 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!("activity sharing is behind; {dropped} records dropped");
+            }
+        }
+        let mut line = record.to_string();
         line.push('\n');
         // Logging is best-effort; a full disk must not stop the agent.
         if let Err(err) = self.file.write_all(line.as_bytes()) {
@@ -145,6 +171,31 @@ fn render(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shares_records_but_updates_and_drops_what_the_queue_cannot_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let mut log = Log::open(&path).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        log.share(tx);
+        log.event("update", json!({ "kind": "usage" }));
+        log.chunk("text", "hel");
+        log.chunk("text", "lo");
+        log.event("turn_end", json!({ "stop_reason": "end_turn" }));
+        // The queue holds two; the third is dropped, but still logged.
+        log.event("stop", json!({}));
+        assert_eq!(log.share.as_ref().unwrap().1, 1);
+        log.unshare();
+        let mut shared = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            let record: Value = serde_json::from_str(&record).unwrap();
+            shared.push(record["event"].as_str().unwrap().to_string());
+        }
+        assert_eq!(shared, ["text", "turn_end"]);
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert!(logged.contains("\"event\":\"update\"") && logged.contains("\"event\":\"stop\""));
+    }
 
     #[test]
     fn joins_chunks_and_renders() {

@@ -89,6 +89,10 @@ pub struct HarnessConfig {
     /// Other ACP session config options, by id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, String>,
+    /// Send the agent's activity (its log records) to the server, where every
+    /// human can see it. Off unless set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub share_activity: bool,
 }
 
 impl Settings {
