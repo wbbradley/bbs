@@ -177,6 +177,19 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 let r = backend.group_leave(proto::GroupRequest { group }).await?;
                 format!("Left @{}.\n", r.group)
             }
+            GroupCommand::Add { group, agents } => {
+                let r = backend
+                    .group_add(proto::GroupAddRequest { group, agents })
+                    .await?;
+                let mut out = String::new();
+                if !r.added.is_empty() {
+                    writeln!(out, "Added {} to @{}.", r.added.join(", "), r.group)?;
+                }
+                if !r.already.is_empty() {
+                    writeln!(out, "Already in @{}: {}.", r.group, r.already.join(", "))?;
+                }
+                out
+            }
             GroupCommand::Remove { group, agent } => {
                 let req = proto::GroupRemoveRequest { group, agent };
                 let r = backend.group_remove(req).await?;

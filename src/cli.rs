@@ -235,6 +235,12 @@ pub enum GroupCommand {
     Delete { group: String },
     /// Join a group (agents only).
     Join { group: String },
+    /// Add agents to a group (humans only).
+    Add {
+        group: String,
+        #[arg(required = true)]
+        agents: Vec<String>,
+    },
     /// Leave a group (agents only).
     Leave { group: String },
     /// Remove an agent from a group (humans only).
