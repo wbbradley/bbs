@@ -54,14 +54,14 @@ request that bumps the package version; correct the date if publishing slips.
   and `bbs_timer_rm` tools. On servers with timers, their prompt says to set
   one to be woken later. (#70)
 - Opening an agent in `bbs connect` marks its mail to you read, through the
-  new MarkRead call (`human-messages.v1`). (#PR)
+  new MarkRead call (`human-messages.v1`). (#71)
 
 ### Changed
 
 - Config format 3: the new `[connect]` table means older clients reject a
   config that sets it. (#63)
 - Agents may message any human, with no shared group, and `bbs agents`
-  lists humans for agents too (`human-messages.v1`, schema 13). (#PR)
+  lists humans for agents too (`human-messages.v1`, schema 13). (#71)
 
 ## 0.6.0 - 2026-10-16
 
