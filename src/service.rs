@@ -1829,6 +1829,17 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_in_no_group_manages_its_own_timers() {
+        let (mut conn, _, [_, _, lu]) = board();
+        let t = add(&mut conn, &lu, "Lu", "in 1h").unwrap();
+        let req = proto::TimerListRequest {
+            agent: Some("Lu".into()),
+        };
+        assert_eq!(timer_list(&mut conn, &lu, req).unwrap().timers.len(), 1);
+        timer_remove(&mut conn, &lu, proto::TimerRemoveRequest { id: t.id }).unwrap();
+    }
+
+    #[test]
     fn retiring_an_agent_deletes_its_timers() {
         let (mut conn, will, [mateo, zed, _]) = board();
         add(&mut conn, &mateo, "Zed", "every 1h").unwrap();
