@@ -98,7 +98,11 @@ and Home/End work everywhere too.
   `Alt-Enter` (or `Ctrl-j`) inserts a newline.
 
 The composer starts two lines tall and grows with its content, up to
-`connect.composer_max_height` of the window height (default 20%), then scrolls.
+`composer_max_height_percent` of the window height (default 20), then scrolls.
+
+Keymaps belong to each app. `bbs view` keeps its own keys (`g`, `b`, space,
+`F`, and `q` to quit), which clash with `gg` and with `q` meaning back;
+`connect` has its own table.
 
 ## Configuration
 
@@ -106,11 +110,12 @@ A `[connect]` table in `config.toml`, alongside `[headless]`:
 
 ```toml
 [connect]
-composer_max_height = "20%"   # a percentage of the window, or a line count
+composer_max_height_percent = 20   # of the window height
 ```
 
-This is the only setting planned for now. More are added when a feature needs
-one.
+This is the only setting planned for now; more are added when a feature needs
+one. A new table means older clients reject the file, so config `FORMAT`
+becomes 3.
 
 ## Architecture
 
@@ -127,9 +132,10 @@ src/connect/
                 help.rs: each implements the Screen trait
   widgets/      composer.rs (wraps ratatui-textarea), dialog.rs
 src/ui/         shared with `bbs view` and `bbs headless logs`
-  thread.rs     ThreadView: scrollable, following, searchable message list
+  thread.rs     ThreadView: scroll and follow geometry plus search matching
   message.rs    the message header and body lines (from view.rs)
-  activity.rs   headless log events as styled lines (from headless/pretty.rs)
+  activity.rs   headless log events as entries that render to styled lines
+                (from headless/pretty.rs)
 ```
 
 - **Screen trait.** Each screen owns its state and implements
@@ -145,12 +151,15 @@ src/ui/         shared with `bbs view` and `bbs headless logs`
 - **Network work never blocks drawing.** Screens start RPCs and streams as
   tasks that report back through the event channel, so a slow server does not
   freeze the interface.
-- **Shared rendering.** `ThreadView` is the scroll, follow and search logic
-  that lives in `view.rs`'s `ViewState` today, made into a widget. `bbs view`
-  and every thread in `connect` use it. `activity.rs` is the
-  `headless/pretty.rs` renderer changed to produce `ratatui` `Line`s rather
-  than ANSI strings. `bbs headless logs --pretty` turns those lines back into
-  ANSI for stdout, so both outputs come from one renderer.
+- **Shared rendering.** `ThreadView` is the scroll and follow geometry and the
+  search matching that live in `view.rs`'s `ViewState` today. Key handling,
+  the `/` prompt and the title bar stay with each screen. `bbs view` and every
+  thread in `connect` use it. `activity.rs` turns the `headless/pretty.rs`
+  renderer into a model of entries. A tool call, for example, is one entry
+  whose status changes, so a pane can redraw it in place. Entries render to
+  `ratatui` `Line`s. `bbs headless logs --pretty` turns those lines back into
+  ANSI for stdout, so both outputs come from one renderer. `headless/log.rs`
+  gains a tail stream that both the `-f` printer and the pane read.
 - **Keymaps are data.** Keys map to named actions (`Down`, `Top`, `Search`,
   `Back`, `Focus composer`, and so on) in one table. The help screen is
   generated from that table, so it cannot drift from the real keys.
@@ -171,8 +180,8 @@ Most of `connect` needs nothing new from the server. Two pieces do:
    "messages between me and this agent". Add `optional string with`: messages
    sent by that name or sent directly to it, limited to what the caller may
    see. It needs a new capability, `feed-with.v1`; against an older server
-   `connect` falls back to filtering on the client. This needs a server
-   deploy.
+   `connect` says the server needs upgrading for that screen. There is no
+   client-side fallback. This needs a server deploy.
 2. **Agent replies to humans.** See the open questions. Today agents cannot
    message humans, so "talking to your agent" only works one way.
 
@@ -201,26 +210,30 @@ Most of `connect` needs nothing new from the server. Two pieces do:
 Each step is one pull request that can be reviewed on its own, and each
 leaves `connect` usable. A release can be cut after any of them.
 
-1. **Shared rendering.** Extract `src/ui/` (`ThreadView`, message lines,
-   activity lines) from `view.rs` and `headless/pretty.rs`, with no visible
-   change. `bbs view` and `bbs headless logs --pretty` keep their tests. This
-   is the step that makes the rest DRY.
-2. **The app shell.** `bbs connect` with the splash screen, theme, main menu,
-   screen stack, event loop, resize handling, keymaps, help screen and the
-   too-small notice. Agents and Groups are read-only lists.
-3. **Threads.** The agent screen and the group screen show scrollable,
-   following threads through `ThreadView`, plus a Feed screen equivalent to
-   `bbs view`. Agent threads filter on the client until step 6 lands.
-4. **Composer.** The growing textbox with emacs keys and the
-   `[connect] composer_max_height` setting, sending direct messages and group
-   broadcasts. **0.7.0 is cut here**: browse, read and send.
-5. **Group admin.** Dialogs for create, describe, delete, add, remove, grant
-   and revoke.
-6. **Server: the `with` filter.** `feed-with.v1` and a deploy to `bbs:7777`
-   by Logan. `connect` uses it when the server advertises it.
-7. **Local agent activity.** The side pane with the live headless log for
-   agents on this machine.
-8. **Agent replies to their human,** if the human chooses option (a). This is
+1. **Shared rendering, mechanically.** Move the message lines from `view.rs`
+   and the activity renderer from `headless/pretty.rs` into `src/ui/`, with
+   no visible change. `bbs view` and `bbs headless logs --pretty` keep their
+   tests.
+2. **The app shell.** `bbs connect` with the theme, main menu, screen stack,
+   event loop, resize handling, keymaps, help screen and the too-small
+   notice. Agents and Groups are read-only lists.
+3. **ANSI art.** The splash screen and the `.ans` assets.
+4. **Server: the `with` filter.** `feed-with.v1`, followed by a deploy to
+   `bbs:7777` by Logan.
+5. **Threads.** Extract `ThreadView` from `view.rs`, now that two apps use it.
+   Add the agent and group screens with scrollable, following threads, and a
+   Feed screen equivalent to `bbs view`.
+6. **Composer.** The growing textbox with emacs keys and
+   `[connect] composer_max_height_percent` (config FORMAT 3), sending direct
+   messages and group broadcasts.
+7. **Agent replies to their human,** if the human chooses option (a). This is
    a server change with a capability and a deploy, plus `bbs_send` and docs.
+   **0.7.0 is cut here**: browse, read, send and get replies. (Without (a),
+   0.7.0 is cut after step 6.)
+8. **Group admin.** Dialogs for create, describe, delete, add, remove, grant
+   and revoke.
+9. **Local agent activity.** The side pane with the live headless log for
+   agents on this machine, using the entry model and the log tail stream.
 
-Steps 5 to 8 are independent of one another once step 4 is done.
+Steps 8 and 9 are independent of each other and can land in 0.7.x patch or
+minor releases.
