@@ -47,7 +47,7 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.10"
 tempfile = "3.27"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "process", "io-util", "io-std"] }
-tokio-stream = { version = "0.1.19", features = ["net"] }
+tokio-stream = { version = "0.1.19", features = ["net", "time"] }
 toml = "1.1.8"
 tonic = "0.14.6"
 tonic-health = "0.14.6"

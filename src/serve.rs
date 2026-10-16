@@ -13,9 +13,9 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
-use tokio_stream::Stream;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tonic::{Request, Response, Status};
+use tokio_stream::{Stream, StreamExt};
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::db;
 use crate::proto::bbs_server::{Bbs, BbsServer};
@@ -30,6 +30,10 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Leave time for process teardown within a ten-second container grace period.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
+/// Activity events stored together: at most this many, waiting at most this
+/// long for more after the first.
+const ACTIVITY_BATCH: usize = 64;
+const ACTIVITY_BATCH_WAIT: Duration = Duration::from_millis(50);
 
 pub async fn run(
     listen: SocketAddr,
@@ -58,6 +62,7 @@ async fn serve(
     let state = Arc::new(State {
         conn: Mutex::new(conn),
         notify: watch::Sender::new(0),
+        activity: watch::Sender::new(0),
         waiters: Mutex::new(HashSet::new()),
         shutdown: watch::Sender::new(false),
         require_human_token,
@@ -116,6 +121,8 @@ struct State {
     conn: Mutex<Connection>,
     /// Bumped after every committed change; waiters and feeds re-check on it.
     notify: watch::Sender<u64>,
+    /// Bumped after each batch of agent activity, which nothing else watches.
+    activity: watch::Sender<u64>,
     /// Inboxes with a `WaitForMail` stream open, as (kind, id).
     waiters: Mutex<HashSet<(i32, i64)>>,
     shutdown: watch::Sender<bool>,
@@ -391,6 +398,134 @@ impl Server {
                 self.0.changed();
             }
             Ok(Response::new(out))
+        }
+        .await;
+        self.0.protocol.finish(result)
+    }
+}
+
+/// A query a watch stream re-runs: a window of the newest rows, or a cursor
+/// that moves past each batch it sends.
+trait Watched: Clone + Send + Sync + 'static {
+    type Snapshot: Send + 'static;
+    fn fetch(conn: &mut Connection, caller: &Caller, req: Self) -> Result<Self::Snapshot>;
+    /// Move a cursor past `sent`; `true` when the batch was full, so more may
+    /// be waiting.
+    fn advance(&mut self, sent: &Self::Snapshot) -> bool;
+    fn has_cursor(&self) -> bool;
+    fn is_empty(snapshot: &Self::Snapshot) -> bool;
+}
+
+impl Watched for proto::FeedRequest {
+    type Snapshot = proto::FeedSnapshot;
+    fn fetch(conn: &mut Connection, caller: &Caller, req: Self) -> Result<Self::Snapshot> {
+        service::feed(conn, caller, req)
+    }
+    fn advance(&mut self, sent: &Self::Snapshot) -> bool {
+        service::advance_feed_cursor(self, sent)
+    }
+    fn has_cursor(&self) -> bool {
+        self.after_id.is_some()
+    }
+    fn is_empty(snapshot: &Self::Snapshot) -> bool {
+        snapshot.messages.is_empty()
+    }
+}
+
+impl Watched for proto::ActivityRequest {
+    type Snapshot = proto::ActivitySnapshot;
+    fn fetch(conn: &mut Connection, caller: &Caller, req: Self) -> Result<Self::Snapshot> {
+        service::activity(conn, caller, req)
+    }
+    fn advance(&mut self, sent: &Self::Snapshot) -> bool {
+        service::advance_activity_cursor(self, sent)
+    }
+    fn has_cursor(&self) -> bool {
+        self.after_id.is_some()
+    }
+    fn is_empty(snapshot: &Self::Snapshot) -> bool {
+        snapshot.events.is_empty()
+    }
+}
+
+impl Server {
+    /// Stream snapshots of `req`: the first at once (which also checks the
+    /// caller, before the stream opens), then another after each change seen
+    /// on `changes`. In cursor mode an empty batch is not sent after the first.
+    async fn watch<R: Watched>(
+        &self,
+        rpc: &'static str,
+        req: Request<R>,
+        mut changes: watch::Receiver<u64>,
+    ) -> Result<Response<BoxStream<R::Snapshot>>, Status> {
+        self.0.protocol.validate(req.metadata())?;
+        let result = async {
+            let peer = req.remote_addr().map(|addr| addr.ip());
+            let caller = Arc::new(caller(&req, self.0.require_human_token));
+            self.0.enforce_auth_rate(peer, &caller).await?;
+            let req = req.into_inner();
+            let state = self.0.clone();
+            let c = caller.clone();
+            let r = req.clone();
+            let first = match state.call(move |conn| R::fetch(conn, &c, r)).await {
+                Ok(first) => first,
+                Err(status) => {
+                    state.record_auth_failure(peer, &status);
+                    state.warn_failed(rpc, &caller, &status).await;
+                    return Err(status);
+                }
+            };
+            let (tx, rx) = mpsc::channel(4);
+            let (terminal, terminal_rx) = oneshot::channel();
+            tokio::spawn(async move {
+                let send_snapshots = async {
+                    let mut req = req;
+                    let mut snapshot = Ok(first);
+                    let mut sent = false;
+                    loop {
+                        if let Err(status) = &snapshot {
+                            state.warn_failed(rpc, &caller, status).await;
+                        }
+                        let failed = snapshot.is_err();
+                        // Cursor mode: move past this batch; a full one means
+                        // more may be waiting, so fetch again without waiting.
+                        let (drain, empty) = match &snapshot {
+                            Ok(s) => (req.advance(s), R::is_empty(s)),
+                            Err(_) => (false, false),
+                        };
+                        let skip = sent && empty && req.has_cursor();
+                        if !skip && (tx.send(snapshot).await.is_err() || failed) {
+                            return;
+                        }
+                        sent = true;
+                        if !drain {
+                            tokio::select! {
+                                _ = changes.changed() => {}
+                                _ = tx.closed() => return,
+                            }
+                        }
+                        changes.borrow_and_update();
+                        let (c, r) = (caller.clone(), req.clone());
+                        snapshot = state.call(move |conn| R::fetch(conn, &c, r)).await;
+                    }
+                };
+                tokio::select! {
+                    _ = state.stopping() => {
+                        let _ = terminal.send(Status::unavailable("server is shutting down"));
+                    },
+                    status = state.watch_credentials(caller.clone()) => {
+                        state.record_auth_failure(peer, &status);
+                        let _ = terminal.send(status);
+                    },
+                    _ = send_snapshots => {},
+                }
+            });
+            Ok(Response::new(Box::pin(CancellableStream {
+                messages: ReceiverStream::new(rx),
+                terminal: Some(terminal_rx),
+                done: false,
+                protocol: self.0.protocol.clone(),
+            }) as BoxStream<R::Snapshot>))
         }
         .await;
         self.0.protocol.finish(result)
@@ -717,84 +852,69 @@ impl Bbs for Server {
         &self,
         req: Request<proto::FeedRequest>,
     ) -> Result<Response<Self::WatchFeedStream>, Status> {
+        let changes = self.0.notify.subscribe();
+        self.watch("watch_feed", req, changes).await
+    }
+
+    async fn post_activity(
+        &self,
+        req: Request<Streaming<proto::ActivityEvent>>,
+    ) -> Result<Response<proto::PostActivityResponse>, Status> {
         self.0.protocol.validate(req.metadata())?;
         let result = async {
             let peer = req.remote_addr().map(|addr| addr.ip());
             let caller = Arc::new(caller(&req, self.0.require_human_token));
             self.0.enforce_auth_rate(peer, &caller).await?;
-            let req = req.into_inner();
             let state = self.0.clone();
-            let mut changes = state.notify.subscribe();
-            // The first snapshot also checks the caller is a human, before the stream opens.
-            let c = caller.clone();
-            let r = req.clone();
-            let first = match state.call(move |conn| service::feed(conn, &c, r)).await {
-                Ok(first) => first,
-                Err(status) => {
+            // Each batch is what arrived together, stored in one transaction.
+            let batches = req
+                .into_inner()
+                .chunks_timeout(ACTIVITY_BATCH, ACTIVITY_BATCH_WAIT);
+            tokio::pin!(batches);
+            let mut accepted = 0;
+            let posting = async {
+                while let Some(batch) = batches.next().await {
+                    let batch = batch.into_iter().collect::<Result<Vec<_>, Status>>()?;
+                    let c = caller.clone();
+                    let posted = state
+                        .call(move |conn| service::post_activity(conn, &c, batch))
+                        .await;
+                    match posted {
+                        Ok(n) => accepted += n,
+                        Err(status) => {
+                            state.record_auth_failure(peer, &status);
+                            state.warn_failed("post_activity", &caller, &status).await;
+                            return Err(status);
+                        }
+                    }
+                    state.activity.send_modify(|v| *v += 1);
+                }
+                Ok(())
+            };
+            tokio::select! {
+                posted = posting => posted?,
+                _ = state.stopping() => {
+                    return Err(Status::unavailable("server is shutting down"));
+                }
+                status = state.watch_credentials(caller.clone()) => {
                     state.record_auth_failure(peer, &status);
-                    state.warn_failed("watch_feed", &caller, &status).await;
                     return Err(status);
                 }
-            };
-            let (tx, rx) = mpsc::channel(4);
-            let (terminal, terminal_rx) = oneshot::channel();
-            tokio::spawn(async move {
-                let send_snapshots = async {
-                    let mut req = req;
-                    let mut snapshot = Ok(first);
-                    let mut sent = false;
-                    loop {
-                        if let Err(status) = &snapshot {
-                            state.warn_failed("watch_feed", &caller, status).await;
-                        }
-                        let failed = snapshot.is_err();
-                        // Cursor mode: move past this batch; a full one means
-                        // more may be waiting, so fetch again without waiting.
-                        let (drain, empty) = match &snapshot {
-                            Ok(s) => (
-                                service::advance_feed_cursor(&mut req, s),
-                                s.messages.is_empty(),
-                            ),
-                            Err(_) => (false, false),
-                        };
-                        let skip = sent && empty && req.after_id.is_some();
-                        if !skip && (tx.send(snapshot).await.is_err() || failed) {
-                            return;
-                        }
-                        sent = true;
-                        if !drain {
-                            tokio::select! {
-                                _ = changes.changed() => {}
-                                _ = tx.closed() => return,
-                            }
-                        }
-                        changes.borrow_and_update();
-                        let (c, r) = (caller.clone(), req.clone());
-                        snapshot = state.call(move |conn| service::feed(conn, &c, r)).await;
-                    }
-                };
-                tokio::select! {
-                    _ = state.stopping() => {
-                        let _ = terminal.send(Status::unavailable("server is shutting down"));
-                    },
-                    status = state.watch_credentials(caller.clone()) => {
-                        state.record_auth_failure(peer, &status);
-                        let _ = terminal.send(status);
-                    },
-                    _ = send_snapshots => {},
-                }
-            });
-            Ok(Response::<Self::WatchFeedStream>::new(Box::pin(
-                CancellableStream {
-                    messages: ReceiverStream::new(rx),
-                    terminal: Some(terminal_rx),
-                    done: false,
-                    protocol: self.0.protocol.clone(),
-                },
-            )))
+            }
+            Ok(Response::new(proto::PostActivityResponse { accepted }))
         }
         .await;
         self.0.protocol.finish(result)
+    }
+
+    type WatchActivityStream = BoxStream<proto::ActivitySnapshot>;
+
+    async fn watch_activity(
+        &self,
+        req: Request<proto::ActivityRequest>,
+    ) -> Result<Response<Self::WatchActivityStream>, Status> {
+        let changes = self.0.activity.subscribe();
+        self.watch("watch_activity", req, changes).await
     }
 
     async fn bind_session(
@@ -840,6 +960,7 @@ mod tests {
         let state = Arc::new(State {
             conn: Mutex::new(conn),
             notify: watch::Sender::new(0),
+            activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
@@ -929,6 +1050,7 @@ mod tests {
         let state = Arc::new(State {
             conn: Mutex::new(conn),
             notify: watch::Sender::new(0),
+            activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
@@ -963,5 +1085,178 @@ mod tests {
             .query_row("SELECT value FROM writes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(value, "committed");
+    }
+
+    /// A server on a free local port over a fresh board with the human will
+    /// and their agent Mateo: its address and Mateo's token.
+    async fn activity_board() -> (String, String) {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::migrate(&mut conn).unwrap();
+        let will = Caller {
+            human: Some("will".into()),
+            ..Default::default()
+        };
+        service::ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: "will".into(),
+            },
+        )
+        .unwrap();
+        let token = service::register(
+            &mut conn,
+            &will,
+            proto::RegisterRequest {
+                name: Some("Mateo".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .token;
+        let state = Arc::new(State {
+            conn: Mutex::new(conn),
+            notify: watch::Sender::new(0),
+            activity: watch::Sender::new(0),
+            waiters: Mutex::new(HashSet::new()),
+            shutdown: watch::Sender::new(false),
+            require_human_token: false,
+            protocol: Policy::default(),
+            auth_failures: Mutex::new(HashMap::new()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(BbsServer::new(Server(state)))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        (format!("http://{addr}"), token)
+    }
+
+    fn with_metadata<T>(message: T, key: &'static str, value: &str) -> Request<T> {
+        let mut req = Request::new(message);
+        req.metadata_mut().insert(key, value.parse().unwrap());
+        req.metadata_mut()
+            .insert("bbs-protocol-epoch", "2".parse().unwrap());
+        req
+    }
+
+    fn event(record: &str) -> proto::ActivityEvent {
+        proto::ActivityEvent {
+            record: record.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agents_post_activity_and_humans_watch_it() {
+        let (addr, token) = activity_board().await;
+        let mut client = proto::bbs_client::BbsClient::connect(addr).await.unwrap();
+        // Humans watch; a cursor stream sends the first (empty) batch at once.
+        let watch = proto::ActivityRequest {
+            backlog: 2,
+            after_id: Some(0),
+        };
+        let mut stream = client
+            .watch_activity(with_metadata(watch, "bbs-human", "will"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.message().await.unwrap().unwrap().events.is_empty());
+
+        let records = [
+            r#"{"ts":"t","event":"turn_start"}"#,
+            r#"{"ts":"t","event":"text","text":"hi"}"#,
+            r#"{"ts":"t","event":"turn_end"}"#,
+        ];
+        let posted = client
+            .post_activity(with_metadata(
+                tokio_stream::iter(records.map(event)),
+                "bbs-token",
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(posted.accepted, 3);
+        // A full batch of two, then the third straight after.
+        let mut seen = Vec::new();
+        while seen.len() < 3 {
+            let batch = stream.message().await.unwrap().unwrap();
+            for e in batch.events {
+                assert_eq!(
+                    (e.agent.as_str(), e.owner.as_deref()),
+                    ("Mateo", Some("will"))
+                );
+                seen.push(e.record);
+            }
+        }
+        assert_eq!(seen, records);
+
+        // Without a cursor, the newest window, oldest first.
+        let window = client
+            .watch_activity(with_metadata(
+                proto::ActivityRequest {
+                    backlog: 2,
+                    after_id: None,
+                },
+                "bbs-human",
+                "will",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .message()
+            .await
+            .unwrap()
+            .unwrap();
+        let records: Vec<_> = window.events.iter().map(|e| e.record.as_str()).collect();
+        assert_eq!(records, &seen[1..]);
+    }
+
+    #[tokio::test]
+    async fn bad_records_and_wrong_callers_are_refused() {
+        let (addr, token) = activity_board().await;
+        let mut client = proto::bbs_client::BbsClient::connect(addr).await.unwrap();
+        let big = format!(
+            r#"{{"event":"text","text":"{}"}}"#,
+            "x".repeat(service::MAX_ACTIVITY_BYTES)
+        );
+        for (record, why) in [
+            ("not json", "not JSON"),
+            (r#"{"text":"no event"}"#, "no string \"event\""),
+            (big.as_str(), "the limit is 8192"),
+        ] {
+            let status = client
+                .post_activity(with_metadata(
+                    tokio_stream::iter([event(record)]),
+                    "bbs-token",
+                    &token,
+                ))
+                .await
+                .unwrap_err();
+            assert!(status.message().contains(why), "{why}: {status:?}");
+        }
+        // Only agents post, and only humans watch.
+        let status = client
+            .post_activity(with_metadata(
+                tokio_stream::iter([event(r#"{"event":"text"}"#)]),
+                "bbs-human",
+                "will",
+            ))
+            .await
+            .unwrap_err();
+        assert!(status.message().contains("requires --token"), "{status:?}");
+        let status = client
+            .watch_activity(with_metadata(
+                proto::ActivityRequest {
+                    backlog: 10,
+                    after_id: None,
+                },
+                "bbs-token",
+                &token,
+            ))
+            .await
+            .unwrap_err();
+        assert!(status.message().contains("humans only"), "{status:?}");
     }
 }

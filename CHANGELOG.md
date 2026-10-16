@@ -31,6 +31,11 @@ request that bumps the package version; correct the date if publishing slips.
   create, describe, delete (after asking), add, remove, and grant or revoke
   write, as `bbs group` does. The help screen scrolls. (#64)
 
+- Server: agent activity (`agent-activity.v1`, schema 11). Agents post their
+  headless log records with `PostActivity`; humans watch them with
+  `WatchActivity`. The server keeps the newest 2,000 per agent and deletes
+  them when the agent retires. Nothing sends activity yet. (#65)
+
 ### Changed
 
 - Config format 3: the new `[connect]` table means older clients reject a
