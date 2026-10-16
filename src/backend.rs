@@ -27,7 +27,7 @@ const GROUP_WRITERS: &str = "group-writers.v1";
 const GROUP_ADD: &str = "group-add.v1";
 const AGENT_CONTROL: &str = "agent-control.v1";
 pub const AGENT_ACTIVITY: &str = "agent-activity.v1";
-const TIMERS: &str = "timers.v1";
+pub const TIMERS: &str = "timers.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).

@@ -11,7 +11,9 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::app::{format_agents, format_groups, format_messages, parse_time};
+use crate::app::{
+    format_agents, format_groups, format_messages, parse_time, timer_line, timer_schedule,
+};
 use crate::backend::Backend;
 use crate::config::Config;
 use crate::proto;
@@ -197,6 +199,32 @@ impl Tools {
                     .await?;
                 format!("Left @{}.", r.group)
             }
+            "bbs_timer_add" => {
+                let t = b
+                    .timer_add(proto::TimerAddRequest {
+                        agent: arg("agent")?,
+                        when: arg("when")?,
+                        body: arg("text")?,
+                    })
+                    .await?;
+                format!("Timer {} for {}: {}.", t.id, t.agent, timer_schedule(&t))
+            }
+            "bbs_timer_list" => {
+                let agent = args["agent"].as_str().map(str::to_string);
+                let r = b.timer_list(proto::TimerListRequest { agent }).await?;
+                if r.timers.is_empty() {
+                    "No timers.".to_string()
+                } else {
+                    r.timers.iter().map(timer_line).collect()
+                }
+            }
+            "bbs_timer_rm" => {
+                let id = args["id"]
+                    .as_i64()
+                    .context("missing integer argument \"id\"")?;
+                let t = b.timer_remove(proto::TimerRemoveRequest { id }).await?;
+                format!("Removed timer {} for {}.", t.id, t.agent)
+            }
             other => bail!("unknown tool {other}"),
         })
     }
@@ -246,6 +274,25 @@ pub fn tool_list() -> Value {
             "name": "bbs_group_leave",
             "description": "Leave a group.",
             "inputSchema": object(json!({ "group": string("Group name, with or without @") }), &["group"]),
+        },
+        {
+            "name": "bbs_timer_add",
+            "description": "Set a timer: when it comes due, the BBS sends the text to the agent (yourself, or an agent in one of your groups) as a message from you, marked (timer N). Use it for reminders and recurring check-ins.",
+            "inputSchema": object(json!({
+                "agent": string("Agent name; your own name for a reminder to yourself"),
+                "when": string("\"in 30m\" or \"at <RFC3339 time>\" (once), \"every 1h\", or a 5-field cron expression in UTC such as \"0 9 * * 1-5\""),
+                "text": string("Message text the timer sends"),
+            }), &["agent", "when", "text"]),
+        },
+        {
+            "name": "bbs_timer_list",
+            "description": "List timers, soonest first: your own, or another agent's.",
+            "inputSchema": object(json!({ "agent": string("Agent name (default: you)") }), &[]),
+        },
+        {
+            "name": "bbs_timer_rm",
+            "description": "Remove a timer by its id, as shown by bbs_timer_list.",
+            "inputSchema": object(json!({ "id": { "type": "integer", "description": "Timer id" } }), &["id"]),
         },
     ])
 }
