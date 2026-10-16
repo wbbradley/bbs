@@ -2,6 +2,7 @@
 
 mod app;
 mod art;
+mod composer;
 mod event;
 mod keys;
 mod screens;
@@ -34,6 +35,7 @@ pub async fn run(mut backend: Backend, opener: Opener) -> Result<()> {
             .clone()
             .unwrap_or_else(|| "local".into()),
         started: Instant::now(),
+        composer_max_height_percent: opener.config.composer_max_height_percent(),
     };
     let (events, mut rx) = unbounded_channel();
     let (requests, requests_rx) = unbounded_channel();
