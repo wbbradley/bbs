@@ -59,17 +59,24 @@ shared title bar and status bar.
 
 ### Agent screen
 
-Split vertically. The top pane is the conversation thread, scrollable, newest
-at the bottom, and following new messages until you scroll up (as `bbs view`
-does now). The bottom pane is the composer. Sending goes to the agent by
-direct message.
+Split vertically. The top pane is the agent's timeline, scrollable, newest
+at the bottom, and following until you scroll up (as `bbs view` does). The
+bottom pane is the composer. Sending goes to the agent by direct message.
 
-For a headless agent, a key toggles a side pane with its live activity:
-turns, thoughts, tool calls and errors, rendered by the same code as
-`bbs headless logs -f --pretty`. This works for any headless agent on the
-board that shares its activity, wherever it runs: `bbs headless run` sends
-it to the server unless its harness sets `share_activity = false` (see
-Server changes).
+The timeline merges, in time order, the agent's messages with its live
+activity: turns, thoughts, tool calls and errors, rendered by the same code as
+`bbs headless logs -f --pretty`, with calls still running shown below. `A`
+cycles between everything, messages only and activity only; `E` cycles which
+kinds of activity show. This works for any headless agent on the board that
+shares its activity, wherever it runs: `bbs headless run` sends it to the
+server unless its harness sets `share_activity = false` (see Server changes).
+
+Viewing the timeline marks read the agent's direct messages to you
+(`MarkRead`) and marks seen its activity through the newest record shown
+(`MarkSeen`), each only while the timeline shows that kind. The Agents list
+watches `WatchAgentSummary` and puts first the agents with messages to you
+unread, then those with activity unseen, each oldest first, then the rest;
+its NEW column counts both.
 
 Any human may open any agent and message it, under the same rules as
 `bbs send`. Ownership is always visible:
@@ -269,8 +276,8 @@ leaves `connect` usable. A release can be cut after any of them.
 9. **Headless sends activity.** Sending from `bbs headless run` when the
    harness does not set `share_activity = false`, and the HEADLESS.md
    change.
-10. **Activity pane.** The side pane, using the entry model in
-   `src/ui/activity.rs`.
+10. **Activity timeline.** Activity merged into the agent's thread, using the
+   entry model in `src/ui/activity.rs`, with unread and unseen ordering.
 11. **Activity filters**, like `bbs view`'s. Lower priority.
 
 Later, after its own design: agents replying to their human, as a mode.

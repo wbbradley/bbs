@@ -50,6 +50,13 @@ pub enum Request {
     },
     /// Mark read the human's mail from this sender. The feed shows the result.
     MarkRead(String),
+    /// Mark seen an agent's activity through an id. Summaries show the result.
+    MarkSeen {
+        agent: String,
+        through_id: i64,
+    },
+    /// Stream per-agent summaries, replacing any stream with the same id.
+    WatchSummary(u64),
 }
 
 /// One group change, as the CLI's `bbs group` commands make it.
@@ -76,6 +83,11 @@ pub enum Data {
     Activity {
         id: u64,
         result: Result<Vec<proto::Activity>, String>,
+    },
+    /// Summaries from the stream `id`. A stream ends after an error.
+    Summary {
+        id: u64,
+        result: Result<Vec<proto::AgentSummary>, String>,
     },
     /// The outcome of a send for the screen `id`.
     Sent {
@@ -165,6 +177,20 @@ pub async fn serve(
                 // A failure leaves the mail unread, to be marked on a later view.
                 if let Err(err) = backend.mark_read(proto::MarkReadRequest { from }).await {
                     tracing::warn!("marking mail read: {err:#}");
+                }
+                continue;
+            }
+            Request::MarkSeen { agent, through_id } => {
+                let req = proto::MarkSeenRequest { agent, through_id };
+                if let Err(err) = backend.mark_seen(req).await {
+                    tracing::warn!("marking activity seen: {err:#}");
+                }
+                continue;
+            }
+            Request::WatchSummary(id) => {
+                let task = tokio::spawn(watch_summary(opener.clone(), id, tx.clone()));
+                if let Some(old) = streams.insert(id, task) {
+                    old.abort();
                 }
                 continue;
             }
@@ -265,6 +291,25 @@ async fn watch(opener: Opener, id: u64, req: proto::FeedRequest, tx: UnboundedSe
     if let Err(e) = result {
         let result = Err(format!("{e:#}"));
         let _ = tx.send(Event::Data(Data::Feed { id, result }));
+    }
+}
+
+/// Stream summaries `id` until it fails or the app goes away.
+async fn watch_summary(opener: Opener, id: u64, tx: UnboundedSender<Event>) {
+    let result: anyhow::Result<()> = async {
+        let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller).await?;
+        let mut summaries = backend.watch_agent_summary().await?;
+        loop {
+            let result = Ok(summaries.next().await?);
+            if tx.send(Event::Data(Data::Summary { id, result })).is_err() {
+                return Ok(());
+            }
+        }
+    }
+    .await;
+    if let Err(e) = result {
+        let result = Err(format!("{e:#}"));
+        let _ = tx.send(Event::Data(Data::Summary { id, result }));
     }
 }
 

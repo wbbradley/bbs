@@ -29,6 +29,7 @@ const AGENT_CONTROL: &str = "agent-control.v1";
 pub const AGENT_ACTIVITY: &str = "agent-activity.v1";
 pub const TIMERS: &str = "timers.v1";
 const HUMAN_MESSAGES: &str = "human-messages.v1";
+pub const AGENT_SUMMARY: &str = "agent-summary.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -518,6 +519,29 @@ impl Backend {
         })
     }
 
+    pub async fn watch_agent_summary(&mut self) -> Result<SummaryWatch<'_>> {
+        let req = proto::AgentSummaryRequest {};
+        Ok(match self {
+            Backend::Local(local) => Watch::local(local, req),
+            Backend::Remote(r) => Watch::Remote(
+                rpc!(r, watch_agent_summary, req, &[AGENT_SUMMARY])
+                    .map_err(|e| missing_rpc(e, AGENT_SUMMARY))?,
+            ),
+        })
+    }
+
+    pub async fn mark_seen(
+        &mut self,
+        req: proto::MarkSeenRequest,
+    ) -> Result<proto::MarkSeenResponse> {
+        match self {
+            Backend::Local(l) => service::mark_seen(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, mark_seen, req, &[AGENT_SUMMARY]).map_err(|e| missing_rpc(e, AGENT_SUMMARY))
+            }
+        }
+    }
+
     /// Block until the caller has unread mail, then take it as `read` would.
     /// One waiter per inbox; a second fails immediately.
     pub async fn wait_for_mail(&mut self, limit: Option<u32>) -> Result<Vec<proto::Message>> {
@@ -553,6 +577,7 @@ fn feed_filtered(req: &proto::FeedRequest) -> bool {
 
 pub type FeedWatch<'a> = Watch<'a, proto::FeedRequest>;
 pub type ActivityWatch<'a> = Watch<'a, proto::ActivityRequest>;
+pub type SummaryWatch<'a> = Watch<'a, proto::AgentSummaryRequest>;
 
 /// A watched query's snapshots: the feed's, or agent activity's.
 pub enum Watch<'a, R: Watched> {
@@ -635,6 +660,12 @@ impl FeedWatch<'_> {
 impl ActivityWatch<'_> {
     pub async fn next(&mut self) -> Result<Vec<proto::Activity>> {
         Ok(self.snapshot().await?.events)
+    }
+}
+
+impl SummaryWatch<'_> {
+    pub async fn next(&mut self) -> Result<Vec<proto::AgentSummary>> {
+        Ok(self.snapshot().await?.agents)
     }
 }
 

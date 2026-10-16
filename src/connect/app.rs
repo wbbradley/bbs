@@ -59,7 +59,8 @@ pub trait Screen {
     }
     fn on_data(&mut self, _data: &Data) {}
     /// What to ask for because the human is looking at this screen: called
-    /// on the top screen after new data, and when it is uncovered.
+    /// on the top screen after new data and after each key, which may have
+    /// uncovered it or changed what it shows.
     fn on_view(&mut self, _ctx: &Ctx) -> Vec<Request> {
         Vec::new()
     }
@@ -113,7 +114,6 @@ impl App {
         if let Some(screen) = self.stack.pop() {
             self.send(screen.on_close());
         }
-        self.viewed();
     }
 
     fn viewed(&mut self) {
@@ -130,15 +130,20 @@ impl App {
     pub fn on_event(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) => {
-                if let Some(transition) = self.top().raw_key(key) {
+                let quit = if let Some(transition) = self.top().raw_key(key) {
                     self.keymap = Keymap::default();
-                    return self.apply(transition);
+                    self.apply(transition)
+                } else {
+                    let hotkeys = self.top().hotkeys().to_vec();
+                    match self.keymap.resolve(key, &hotkeys) {
+                        Some(action) => self.on_action(action),
+                        None => false,
+                    }
+                };
+                if !quit {
+                    self.viewed();
                 }
-                let hotkeys = self.top().hotkeys().to_vec();
-                match self.keymap.resolve(key, &hotkeys) {
-                    Some(action) => self.on_action(action),
-                    None => false,
-                }
+                quit
             }
             Event::Data(data) => {
                 for screen in &mut self.stack {
@@ -320,6 +325,7 @@ mod tests {
         let (mut app, mut rx) = app();
         assert!(!key(&mut app, 'a'));
         assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        assert!(matches!(rx.try_recv().unwrap(), Request::WatchSummary(_)));
         assert!(screen(&mut app, 80, 24).contains("Loading"));
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
@@ -340,6 +346,7 @@ mod tests {
         // Reload asks again; q goes back, and q on the menu quits.
         key(&mut app, 'r');
         assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        assert!(matches!(rx.try_recv().unwrap(), Request::WatchSummary(_)));
         assert!(!key(&mut app, 'q'));
         assert!(screen(&mut app, 80, 24).contains("Main menu"));
         assert!(key(&mut app, 'q'));
@@ -386,6 +393,13 @@ mod tests {
         assert!(screen(&mut app, 80, 24).contains("Main menu"));
     }
 
+    /// Open the Agents screen, taking its list and summary requests.
+    fn open_agents(app: &mut App, rx: &mut UnboundedReceiver<Request>) {
+        key(app, 'a');
+        assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        assert!(matches!(rx.try_recv().unwrap(), Request::WatchSummary(_)));
+    }
+
     fn enter(app: &mut App) {
         app.on_event(Event::Key(KeyEvent::new(
             KeyCode::Enter,
@@ -416,8 +430,7 @@ mod tests {
     #[test]
     fn an_agent_opens_its_conversation_and_closing_it_stops_the_stream() {
         let (mut app, mut rx) = app();
-        key(&mut app, 'a');
-        rx.try_recv().unwrap();
+        open_agents(&mut app, &mut rx);
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
             agents: vec![agent("Mateo", "ada", &["crew"])],
@@ -425,6 +438,9 @@ mod tests {
         enter(&mut app);
         let (id, req) = watched(&mut rx);
         assert_eq!(req.with.as_deref(), Some("Mateo"));
+        let Request::WatchActivity { id: act, .. } = rx.try_recv().unwrap() else {
+            panic!("expected an activity watch");
+        };
         assert_eq!(req.backlog, 200);
         assert!(screen(&mut app, 80, 24).contains("No messages yet"));
         app.on_event(Event::Data(Data::Feed {
@@ -446,7 +462,10 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("elsewhere"), "{out}");
-        assert!(out.contains("2 messages · following"), "{out}");
+        assert!(
+            out.contains("2 entries · A: all · E: all kinds · following"),
+            "{out}"
+        );
         // The search prompt takes every key, q included, until Enter.
         key(&mut app, '/');
         for c in "q needle".chars() {
@@ -461,23 +480,24 @@ mod tests {
         }
         enter(&mut app);
         assert!(screen(&mut app, 80, 24).contains("/needle: 1 matches"));
-        // q closes the thread and stops its stream.
+        // q closes the thread and stops its streams.
         assert!(!key(&mut app, 'q'));
         assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(act));
         assert!(screen(&mut app, 80, 24).contains("Your agents"));
     }
 
     #[test]
     fn viewing_an_agent_thread_marks_its_mail_to_me_read() {
         let (mut app, mut rx) = app();
-        key(&mut app, 'a');
-        rx.try_recv().unwrap();
+        open_agents(&mut app, &mut rx);
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
             agents: vec![agent("Mateo", "ada", &["crew"])],
         }))));
         enter(&mut app);
         let (id, _) = watched(&mut rx);
+        rx.try_recv().unwrap(); // its activity
         let feed = |read: bool| Data::Feed {
             id,
             result: Ok(vec![
@@ -503,14 +523,14 @@ mod tests {
     #[test]
     fn a_server_without_feed_with_asks_for_an_upgrade() {
         let (mut app, mut rx) = app();
-        key(&mut app, 'a');
-        rx.try_recv().unwrap();
+        open_agents(&mut app, &mut rx);
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
             agents: vec![agent("Mateo", "ada", &["crew"])],
         }))));
         enter(&mut app);
         let (id, _) = watched(&mut rx);
+        rx.try_recv().unwrap(); // its activity
         app.on_event(Event::Data(Data::Feed {
             id,
             result: Err("required capability feed-with.v1 is unavailable".into()),
@@ -555,10 +575,61 @@ mod tests {
     }
 
     #[test]
-    fn agent_cells_fit_their_columns() {
+    fn agents_with_unread_mail_then_unseen_activity_come_first() {
         let (mut app, mut rx) = app();
         key(&mut app, 'a');
-        rx.try_recv().unwrap();
+        assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        let Request::WatchSummary(id) = rx.try_recv().unwrap() else {
+            panic!("expected a summary watch");
+        };
+        let names = ["Ana", "Bo", "Cy", "Di", "Ed"];
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: names.iter().map(|n| agent(n, "ada", &["crew"])).collect(),
+        }))));
+        let summary =
+            |agent: &str, mail: u32, mail_at: &str, seen: u32, seen_at: &str| proto::AgentSummary {
+                agent: agent.into(),
+                unread_messages: mail,
+                oldest_unread_message: (mail > 0).then(|| format!("2026-10-16T18:00:{mail_at}Z")),
+                unseen_stream: seen,
+                oldest_unseen_stream: (seen > 0).then(|| format!("2026-10-16T18:00:{seen_at}Z")),
+            };
+        // Selecting Bo, who then moves; the selection moves with it.
+        key(&mut app, 'j');
+        app.on_event(Event::Data(Data::Summary {
+            id,
+            result: Ok(vec![
+                summary("di", 0, "", 150, "01"),
+                summary("Cy", 2, "05", 0, ""),
+                summary("Ed", 1, "03", 4, "00"),
+                summary("Bo", 0, "", 3, "02"),
+            ]),
+        }));
+        let out = screen(&mut app, 100, 24);
+        let rows = order(&out, &["Ana@", "Bo@", "Cy@", "Di@", "Ed@"]);
+        assert_eq!(rows, ["Ed@", "Cy@", "Di@", "Bo@", "Ana@"], "{out}");
+        assert!(out.contains("✉1 •4") && out.contains("•99"), "{out}");
+        enter(&mut app);
+        assert_eq!(watched(&mut rx).1.with.as_deref(), Some("Bo"));
+        key(&mut app, 'q');
+        // Without summaries (an older server), the server's order.
+        app.on_event(Event::Data(Data::Summary {
+            id,
+            result: Err("required capability agent-summary.v1 is unavailable".into()),
+        }));
+        let out = screen(&mut app, 100, 24);
+        assert_eq!(
+            order(&out, &["Ana@", "Bo@", "Cy@", "Di@", "Ed@"]),
+            ["Ana@", "Bo@", "Cy@", "Di@", "Ed@"]
+        );
+        assert!(!out.contains('✉'), "{out}");
+    }
+
+    #[test]
+    fn agent_cells_fit_their_columns() {
+        let (mut app, mut rx) = app();
+        open_agents(&mut app, &mut rx);
         let mut busy = agent("Mateo", "ada", &["crew", "release", "infra"]);
         busy.status = Some("reviewing the very long pull request about feed filters".into());
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
@@ -567,7 +638,7 @@ mod tests {
         }))));
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("crew, release +1"), "{out}");
-        assert!(out.contains("reviewing the ver…"), "{out}");
+        assert!(out.contains("reviewing…"), "{out}");
         // ACTIVE is local time, without the stored form's Z.
         let local = crate::ui::message::local_time("2026-10-16T18:00:00.000000Z");
         assert!(out.contains(&local), "{out}");
@@ -578,15 +649,26 @@ mod tests {
     }
 
     /// The agent thread for Mateo, with its feed stream's id.
-    fn mateo(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> u64 {
-        key(app, 'a');
-        rx.try_recv().unwrap();
+    /// Open Mateo's thread; returns its feed stream and its activity stream.
+    fn mateo_streams(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> (u64, u64) {
+        open_agents(app, rx);
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
             agents: vec![agent("Mateo", "ada", &["crew"])],
         }))));
         enter(app);
-        watched(rx).0
+        let feed = watched(rx).0;
+        match rx.try_recv().unwrap() {
+            Request::WatchActivity { id, req } => {
+                assert_eq!(req.agent.as_deref(), Some("Mateo"));
+                (feed, id)
+            }
+            other => panic!("expected an activity watch, got {other:?}"),
+        }
+    }
+
+    fn mateo(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> u64 {
+        mateo_streams(app, rx).0
     }
 
     #[test]
@@ -887,93 +969,123 @@ mod tests {
         assert!(screen(&mut app, 80, 24).contains("a menu item's hot key"));
     }
 
-    fn activity(id: i64, record: &str) -> proto::Activity {
+    fn activity(id: i64, at: &str, record: &str) -> proto::Activity {
         proto::Activity {
             id,
-            created_at: "2026-10-16T18:00:00.000000Z".into(),
+            created_at: format!("2026-10-16T18:00:{at}.000000Z"),
             agent: "Mateo".into(),
             owner: Some("ada".into()),
             record: record.into(),
         }
     }
 
-    #[test]
-    fn the_activity_pane_shows_what_the_agent_shares() {
-        let (mut app, mut rx) = app();
-        let thread = mateo(&mut app, &mut rx);
-        key(&mut app, 'A');
-        let Request::WatchActivity { id, req } = rx.try_recv().unwrap() else {
-            panic!("expected an activity watch");
-        };
-        assert_ne!(id, thread);
-        assert_eq!(
-            req,
-            proto::ActivityRequest {
-                backlog: 200,
-                after_id: Some(0),
-                agent: Some("Mateo".into()),
-            }
-        );
-        let out = screen(&mut app, 100, 24);
-        assert!(
-            out.contains("E kinds · A hides") && out.contains("Loading…"),
-            "{out}"
-        );
-        app.on_event(Event::Data(Data::Activity {
-            id,
-            result: Ok(vec![
-                activity(1, r#"{"ts":"2026-10-16T18:00:00.000000Z","event":"text","text":"working on the **build**"}"#),
-                activity(2, r#"{"ts":"2026-10-16T18:00:01.000000Z","event":"tool","id":"t1","title":"cargo test","status":"in_progress"}"#),
-            ]),
-        }));
-        let out = screen(&mut app, 100, 24);
-        assert!(out.contains("working on the build"), "{out}");
-        assert!(out.contains("running"), "{out}");
-        // The thread keeps its place beside the pane.
-        assert!(out.contains("i: write to Mateo"), "{out}");
+    fn at(id: i64, at: &str, from: &str, to: &str, body: &str) -> proto::Message {
+        proto::Message {
+            created_at: format!("2026-10-16T18:00:{at}.000000Z"),
+            ..message(id, from, to, body)
+        }
+    }
 
-        // A reload starts both streams over, and the pane empties first.
-        key(&mut app, 'r');
-        assert!(matches!(rx.try_recv().unwrap(), Request::Watch { .. }));
-        assert!(
-            matches!(rx.try_recv().unwrap(), Request::WatchActivity { id: again, .. } if again == id)
-        );
-        assert!(screen(&mut app, 100, 24).contains("Loading…"));
-
-        // A hides it and stops its stream; closing the thread stops the rest.
-        key(&mut app, 'A');
-        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
-        assert!(!screen(&mut app, 100, 24).contains("E kinds · A hides"));
-        key(&mut app, 'A');
-        let Request::WatchActivity { id, .. } = rx.try_recv().unwrap() else {
-            panic!("expected an activity watch");
-        };
-        key(&mut app, 'q');
-        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(thread));
-        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
+    /// Where each of `needles` first appears in `out`, in order of appearance.
+    fn order(out: &str, needles: &[&str]) -> Vec<String> {
+        let mut found: Vec<(usize, &str)> = needles
+            .iter()
+            .map(|n| (out.find(n).unwrap_or_else(|| panic!("{n}: {out}")), *n))
+            .collect();
+        found.sort();
+        found.into_iter().map(|(_, n)| n.to_string()).collect()
     }
 
     #[test]
-    fn the_pane_says_when_nothing_is_shared_or_the_server_is_old() {
+    fn an_agents_timeline_merges_messages_and_activity_in_time_order() {
         let (mut app, mut rx) = app();
-        mateo(&mut app, &mut rx);
-        key(&mut app, 'A');
-        let Request::WatchActivity { id, .. } = rx.try_recv().unwrap() else {
-            panic!("expected an activity watch");
-        };
+        let (feed, act) = mateo_streams(&mut app, &mut rx);
+        // Activity's history often arrives after newer messages.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![at(1, "02", "Zed", "Mateo", "a request")]),
+        }));
         app.on_event(Event::Data(Data::Activity {
-            id,
+            id: act,
+            result: Ok(vec![
+                activity(1, "01", r#"{"ts":"2026-10-16T18:00:01Z","event":"text","text":"working on the **build**"}"#),
+                activity(2, "03", r#"{"ts":"2026-10-16T18:00:03Z","event":"text","text":"reply sent"}"#),
+                activity(3, "04", r#"{"ts":"2026-10-16T18:00:04Z","event":"tool","id":"t1","title":"cargo test","status":"in_progress"}"#),
+            ]),
+        }));
+        let out = screen(&mut app, 100, 24);
+        assert_eq!(
+            order(&out, &["working on the build", "a request", "reply sent"]),
+            ["working on the build", "a request", "reply sent"]
+        );
+        assert!(out.contains("cargo test running"), "{out}");
+        assert!(out.contains("3 entries · A: all · E: all kinds"), "{out}");
+        assert!(out.contains("i: write to Mateo"), "{out}");
+
+        // A cycles messages only, activity only, then everything again.
+        key(&mut app, 'A');
+        let out = screen(&mut app, 100, 24);
+        assert!(out.contains("1 entries · A: messages ·"), "{out}");
+        assert!(
+            out.contains("a request") && !out.contains("reply sent"),
+            "{out}"
+        );
+        assert!(!out.contains("cargo test running"), "{out}");
+        key(&mut app, 'A');
+        let out = screen(&mut app, 100, 24);
+        assert!(out.contains("A: activity · E: all kinds"), "{out}");
+        assert!(
+            !out.contains("a request") && out.contains("reply sent"),
+            "{out}"
+        );
+        key(&mut app, 'A');
+        assert!(screen(&mut app, 100, 24).contains("3 entries · A: all"));
+
+        // A reload starts both streams over without the activity it had.
+        while rx.try_recv().is_ok() {}
+        key(&mut app, 'r');
+        assert_eq!(watched(&mut rx).0, feed);
+        assert!(matches!(rx.try_recv().unwrap(), Request::WatchActivity { id, .. } if id == act));
+        let out = screen(&mut app, 100, 24);
+        assert!(
+            !out.contains("reply sent") && out.contains("a request"),
+            "{out}"
+        );
+        // Closing the thread stops both.
+        while rx.try_recv().is_ok() {}
+        key(&mut app, 'q');
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(feed));
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(act));
+    }
+
+    #[test]
+    fn activity_alone_says_when_nothing_is_shared_or_the_server_is_old() {
+        let (mut app, mut rx) = app();
+        let (_, act) = mateo_streams(&mut app, &mut rx);
+        key(&mut app, 'A');
+        key(&mut app, 'A');
+        assert!(screen(&mut app, 100, 24).contains("Loading…"));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
             result: Ok(Vec::new()),
         }));
-        let out = screen(&mut app, 100, 24);
+        let out = screen(&mut app, 140, 24);
         assert!(out.contains("Mateo shares no activity"), "{out}");
         assert!(out.contains("share_activity = false"), "{out}");
-        app.on_event(Event::Data(Data::Activity {
-            id,
+        let old = Data::Activity {
+            id: act,
             result: Err("required capability agent-activity.v1 is unavailable".into()),
-        }));
+        };
+        app.on_event(Event::Data(old));
         let out = screen(&mut app, 100, 24);
         assert!(out.contains("needs a newer server"), "{out}");
+        // With messages shown, the error is a note on the status line.
+        key(&mut app, 'A');
+        let out = screen(&mut app, 120, 24);
+        assert!(
+            out.contains("activity: Activity needs a newer server"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -983,67 +1095,99 @@ mod tests {
         watched(&mut rx);
         key(&mut app, 'A');
         assert!(rx.try_recv().is_err());
-        assert!(!screen(&mut app, 80, 24).contains("Activity"));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("0 messages · following") && !out.contains("A: all"),
+            "{out}"
+        );
     }
 
     #[test]
     fn e_cycles_the_kinds_of_activity_shown() {
         let (mut app, mut rx) = app();
-        mateo(&mut app, &mut rx);
-        key(&mut app, 'A');
-        let Request::WatchActivity { id, .. } = rx.try_recv().unwrap() else {
-            panic!("expected an activity watch");
-        };
+        let (_, act) = mateo_streams(&mut app, &mut rx);
         app.on_event(Event::Data(Data::Activity {
-            id,
+            id: act,
             result: Ok(vec![
-                activity(1, r#"{"ts":"2026-10-16T18:00:00Z","event":"thought","text":"pondering"}"#),
-                activity(2, r#"{"ts":"2026-10-16T18:00:01Z","event":"mail","count":1,"from":["Zed"],"queued":false}"#),
-                activity(3, r#"{"ts":"2026-10-16T18:00:02Z","event":"warning","message":"slow disk"}"#),
+                activity(1, "00", r#"{"ts":"2026-10-16T18:00:00Z","event":"thought","text":"pondering"}"#),
+                activity(2, "01", r#"{"ts":"2026-10-16T18:00:01Z","event":"mail","count":1,"from":["Zed"],"queued":false}"#),
+                activity(3, "02", r#"{"ts":"2026-10-16T18:00:02Z","event":"warning","message":"slow disk"}"#),
             ]),
         }));
         let out = screen(&mut app, 100, 24);
-        assert!(out.contains("Activity · all"), "{out}");
+        assert!(out.contains("E: all kinds"), "{out}");
         assert!(
             out.contains("pondering") && out.contains("mail from Zed"),
             "{out}"
         );
         key(&mut app, 'E');
         let out = screen(&mut app, 100, 24);
-        assert!(out.contains("Activity · no text"), "{out}");
+        assert!(out.contains("E: no text"), "{out}");
         assert!(
             !out.contains("pondering") && out.contains("mail from Zed"),
             "{out}"
         );
         key(&mut app, 'E');
         let out = screen(&mut app, 100, 24);
-        assert!(out.contains("Activity · problems"), "{out}");
+        assert!(out.contains("E: problems"), "{out}");
         assert!(
             !out.contains("mail from Zed") && out.contains("slow disk"),
             "{out}"
         );
         // New records follow the filter too, and the filter survives a reload.
         app.on_event(Event::Data(Data::Activity {
-            id,
+            id: act,
             result: Ok(vec![activity(
                 4,
+                "03",
                 r#"{"ts":"2026-10-16T18:00:03Z","event":"thought","text":"later thought"}"#,
             )]),
         }));
         assert!(!screen(&mut app, 100, 24).contains("later thought"));
         key(&mut app, 'r');
-        assert!(screen(&mut app, 100, 24).contains("Activity · problems"));
-        // Nothing of the chosen kinds says so.
-        while rx.try_recv().is_ok() {}
+        assert!(screen(&mut app, 100, 24).contains("E: problems"));
+        // Showing activity alone, nothing of the chosen kinds says so.
+        key(&mut app, 'A');
+        key(&mut app, 'A');
         app.on_event(Event::Data(Data::Activity {
-            id,
+            id: act,
             result: Ok(vec![activity(
                 5,
+                "04",
                 r#"{"ts":"2026-10-16T18:00:04Z","event":"text","text":"hi"}"#,
             )]),
         }));
-        assert!(screen(&mut app, 100, 24).contains("Nothing of these kinds. E shows all."));
+        assert!(screen(&mut app, 100, 24).contains("Nothing of these kinds. E shows all kinds."));
         key(&mut app, 'E');
         assert!(screen(&mut app, 100, 24).contains("hi"));
+    }
+
+    #[test]
+    fn viewing_activity_marks_it_seen_as_far_as_shown() {
+        let (mut app, mut rx) = app();
+        let (_, act) = mateo_streams(&mut app, &mut rx);
+        let batch = |id: i64| Data::Activity {
+            id: act,
+            result: Ok(vec![activity(
+                id,
+                "00",
+                r#"{"ts":"2026-10-16T18:00:00Z","event":"text","text":"hi"}"#,
+            )]),
+        };
+        app.on_event(Event::Data(batch(7)));
+        let seen = |through_id| Request::MarkSeen {
+            agent: "Mateo".into(),
+            through_id,
+        };
+        assert_eq!(rx.try_recv().unwrap(), seen(7));
+        // Once marked, an unrelated update marks nothing.
+        app.on_event(Event::Data(Data::Groups(Err("x".into()))));
+        assert!(rx.try_recv().is_err());
+        // With messages alone shown, new activity is not seen.
+        key(&mut app, 'A');
+        app.on_event(Event::Data(batch(8)));
+        assert!(rx.try_recv().is_err());
+        key(&mut app, 'A');
+        assert_eq!(rx.try_recv().unwrap(), seen(8));
     }
 }

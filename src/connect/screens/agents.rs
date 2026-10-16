@@ -1,4 +1,6 @@
 //! Agents: yours by default, everyone's on request, each with its owner.
+//! Those with mail to the viewer unread come first, then those with activity
+//! unseen, each oldest first.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
@@ -6,19 +8,27 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table, TableState};
 
+use std::collections::HashMap;
+
 use super::thread::Thread;
 use super::{fit, fit_list, navigate};
-use crate::connect::app::{Ctx, Screen, Transition};
+use crate::connect::app::{Ctx, Screen, Transition, next_id};
 use crate::connect::event::{Data, Request};
 use crate::connect::keys::Action;
 use crate::connect::theme;
 use crate::proto;
 use crate::ui::message::local_time;
 
-#[derive(Default)]
 pub struct Agents {
+    /// The summary stream.
+    id: u64,
     /// None until the first reply.
     agents: Option<Result<Vec<proto::Agent>, String>>,
+    /// What the viewer has yet to read or see, by lower-cased agent name. An
+    /// older server has no summaries; the list keeps the server's order.
+    summaries: HashMap<String, proto::AgentSummary>,
+    /// The selected agent, kept selected as the order changes.
+    selected: Option<String>,
     /// Everyone's agents rather than only the viewer's.
     all: bool,
     state: TableState,
@@ -26,16 +36,78 @@ pub struct Agents {
     page: usize,
 }
 
+impl Default for Agents {
+    fn default() -> Agents {
+        Agents {
+            id: next_id(),
+            agents: None,
+            summaries: HashMap::new(),
+            selected: None,
+            all: false,
+            state: TableState::default(),
+            page: 0,
+        }
+    }
+}
+
 impl Agents {
+    fn summary(&self, agent: &str) -> Option<&proto::AgentSummary> {
+        self.summaries.get(&agent.to_lowercase())
+    }
+
+    /// Unread mail first, then unseen activity, each oldest first; the rest
+    /// keep the server's order.
     fn shown<'a>(&'a self, me: &str) -> Vec<&'a proto::Agent> {
         let Some(Ok(agents)) = &self.agents else {
             return Vec::new();
         };
-        agents
+        let mut shown: Vec<_> = agents
             .iter()
             .filter(|a| self.all || a.owner.as_deref() == Some(me))
-            .collect()
+            .collect();
+        shown.sort_by_key(|a| match self.summary(&a.name) {
+            Some(s) if s.unread_messages > 0 => (0, s.oldest_unread_message.clone()),
+            Some(s) if s.unseen_stream > 0 => (1, s.oldest_unseen_stream.clone()),
+            _ => (2, None),
+        });
+        shown
     }
+
+    /// Remember the selected agent's name.
+    fn remember(&mut self, me: &str) {
+        let name = self
+            .state
+            .selected()
+            .and_then(|i| self.shown(me).get(i).map(|a| a.name.clone()));
+        self.selected = name;
+    }
+
+    /// Select the remembered agent wherever it now is.
+    fn reselect(&mut self, me: &str) {
+        let at = self
+            .selected
+            .as_ref()
+            .and_then(|name| self.shown(me).iter().position(|a| &a.name == name));
+        if let Some(i) = at {
+            self.state.select(Some(i));
+        }
+    }
+}
+
+/// What the viewer has yet to look at, as the NEW column shows it: unread
+/// messages (✉) and unseen activity (•), each counted to 99.
+fn pending(s: Option<&proto::AgentSummary>) -> String {
+    let Some(s) = s else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if s.unread_messages > 0 {
+        parts.push(format!("✉{}", s.unread_messages.min(99)));
+    }
+    if s.unseen_stream > 0 {
+        parts.push(format!("•{}", s.unseen_stream.min(99)));
+    }
+    parts.join(" ")
 }
 
 impl Screen for Agents {
@@ -44,10 +116,26 @@ impl Screen for Agents {
     }
 
     fn requests(&self) -> Vec<Request> {
-        vec![Request::Agents]
+        vec![Request::Agents, Request::WatchSummary(self.id)]
+    }
+
+    fn on_close(&self) -> Vec<Request> {
+        vec![Request::Unwatch(self.id)]
     }
 
     fn on_data(&mut self, data: &Data) {
+        if let Data::Summary { id, result } = data
+            && *id == self.id
+        {
+            // Without summaries (an older server, say) the order is the server's.
+            self.summaries = match result {
+                Ok(summaries) => summaries
+                    .iter()
+                    .map(|s| (s.agent.to_lowercase(), s.clone()))
+                    .collect(),
+                Err(_) => HashMap::new(),
+            };
+        }
         if let Data::Agents(result) = data {
             self.agents = Some(
                 result
@@ -64,12 +152,14 @@ impl Screen for Agents {
     fn handle(&mut self, action: Action, ctx: &Ctx) -> Transition {
         let len = self.shown(&ctx.me).len();
         if navigate(&mut self.state, len, self.page, action) {
+            self.remember(&ctx.me);
             return Transition::Stay;
         }
         match action {
             Action::ToggleAll => {
                 self.all = !self.all;
                 self.state.select(Some(0));
+                self.remember(&ctx.me);
                 Transition::Stay
             }
             Action::Open => {
@@ -87,6 +177,7 @@ impl Screen for Agents {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
+        self.reselect(&ctx.me);
         let shown = self.shown(&ctx.me);
         let title = match (self.all, &self.agents) {
             (false, Some(Ok(_))) => format!("Your agents ({}) · a: everyone's", shown.len()),
@@ -123,9 +214,10 @@ impl Screen for Agents {
                 ),
                 Span::styled(format!("@{owner}"), Style::new().fg(color)),
             ]);
-            let status_width = inner.width.saturating_sub(22 + 16 + 19 + 3) as usize;
+            let status_width = inner.width.saturating_sub(22 + 7 + 16 + 19 + 4) as usize;
             Row::new(vec![
                 name,
+                Line::styled(pending(self.summary(&a.name)), theme::heading()),
                 Line::raw(fit_list(&a.groups, 16)),
                 Line::raw(local_time(&a.active_at)),
                 Line::raw(fit(a.status.as_deref().unwrap_or_default(), status_width)),
@@ -135,12 +227,13 @@ impl Screen for Agents {
             rows,
             [
                 Constraint::Length(22),
+                Constraint::Length(7),
                 Constraint::Length(16),
                 Constraint::Length(19),
                 Constraint::Min(10),
             ],
         )
-        .header(Row::new(["AGENT", "GROUPS", "ACTIVE", "STATUS"]).style(theme::heading()))
+        .header(Row::new(["AGENT", "NEW", "GROUPS", "ACTIVE", "STATUS"]).style(theme::heading()))
         .style(theme::base())
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
         if self.state.selected().is_none() {
@@ -148,5 +241,6 @@ impl Screen for Agents {
         }
         self.page = inner.height.saturating_sub(1) as usize;
         frame.render_stateful_widget(table, inner, &mut self.state);
+        self.remember(&ctx.me);
     }
 }
