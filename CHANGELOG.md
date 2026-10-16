@@ -14,7 +14,7 @@ request that bumps the package version; correct the date if publishing slips.
 - Headless harnesses of `type = "codex-app-server"` drive `codex app-server`
   directly, with an optional `provider`. Mail that arrives during a turn is
   steered into it, and the `bbs_*` tools work with providers that lack
-  Responses namespaces, such as Neuralwatt's. (#PR)
+  Responses namespaces, such as Neuralwatt's. (#52)
 
 ### Changed
 
