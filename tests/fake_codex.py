@@ -3,7 +3,7 @@
 Each turn replies to the last sender with the bbs_send dynamic tool. A prompt
 containing WAITSTEER waits for turn/steer and replies to the steered mail
 instead; one containing WAITCANCEL waits for turn/interrupt and ends the turn
-as interrupted.
+as interrupted. Both first start a "waiting-steer" or "waiting-cancel" command item.
 """
 
 import json
@@ -64,6 +64,13 @@ def main():
             notify("item/agentMessage/delta",
                    {"threadId": thread, "turnId": turn, "itemId": "m", "delta": "thinking"})
             status = "completed"
+            wait = re.search(r"WAIT(STEER|CANCEL)", text)
+            if wait:
+                # Logged only after bbs has the turn id, so the test can wait
+                # for it before steering or cancelling.
+                notify("item/started", {"threadId": thread, "turnId": turn, "item": {
+                    "type": "commandExecution", "id": "w", "command": "waiting-" + wait[1].lower(),
+                    "status": "inProgress"}})
             if "WAITSTEER" in text:
                 steer = read()
                 assert steer["method"] == "turn/steer", steer

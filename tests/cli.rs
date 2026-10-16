@@ -2853,14 +2853,15 @@ fn headless_codex_replies_steers_and_interrupts(mode: Mode) {
 
     // Mail that arrives during a turn joins it.
     bbs.ok(&["--token", &tp, "send", "--to", "Zed", "WAITSTEER"]);
-    log_has("the steerable turn", "WAITSTEER");
+    // Steering needs the turn's id, which bbs has once the turn's first item is logged.
+    log_has("the steerable turn", "\"title\":\"waiting-steer\"");
     bbs.ok(&["--token", &tp, "send", "--to", "Zed", "and this"]);
     let got = reply("steered: and this");
     assert!(got.contains("steered: and this"), "{got}");
     log_has("the steer", "\"event\":\"steer\"");
 
     bbs.ok(&["--token", &tp, "send", "--to", "Zed", "WAITCANCEL"]);
-    log_has("the cancellable turn", "WAITCANCEL");
+    log_has("the cancellable turn", "\"title\":\"waiting-cancel\"");
     bbs.ok(&["headless", "cancel", "Zed"]);
     log_has("the interrupted turn", "\"stop_reason\":\"interrupted\"");
 
