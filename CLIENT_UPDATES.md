@@ -28,12 +28,12 @@ The wire service is `bbs.v2` with protocol epoch `2`. Every request except
 when the operation depends on one, `bbs-required-capabilities` (for example
 `named-agents.v1` for a requested name, `group-archive.v1` for group deletion,
 `group-description.v1` for setting a group description, `feed-filter.v1`
-for a filtered `bbs view`, and `group-writers.v1` for granting or revoking write on a
-group). The server enforces these before service logic. Its
+for a filtered `bbs view`, `group-writers.v1` for granting or revoking write on a
+group, and `group-add.v1` for adding agents to a group). The server enforces these before service logic. Its
 capabilities are `named-agents.v1`, `owner-attribution.v1`,
 `human-token-sessions.v1`, `group-archive.v1`, `group-description.v1`,
-`feed-filter.v1`, `agent-control.v1`, `agent-token-rotate.v1`, and
-`group-writers.v1`. `bbs serve --minimum-client-version` rejects absent, malformed,
+`feed-filter.v1`, `agent-control.v1`, `agent-token-rotate.v1`,
+`group-writers.v1`, and `group-add.v1`. `bbs serve --minimum-client-version` rejects absent, malformed,
 or older client versions; `--recommended-client-version` is advisory.
 
 Clients older than `group-writers.v1` still work against a newer server, but
@@ -65,7 +65,7 @@ Use separate identifiers for separate decisions:
 | Package version | SemVer from Cargo.toml; published tags `vMAJOR.MINOR.PATCH` |
 | Build revision | Full Git commit; `unknown` when provenance is unavailable; dirty development builds are marked |
 | Protocol epoch | Integer `2` with the new `bbs.v2` wire service; the existing `bbs.v1` service is legacy and requires coordinated bootstrap |
-| Capabilities | Stable strings for optional behavior, currently `named-agents.v1`, `owner-attribution.v1`, `human-token-sessions.v1`, `group-archive.v1`, `group-description.v1`, `feed-filter.v1`, `agent-control.v1`, `agent-token-rotate.v1`, and `group-writers.v1` |
+| Capabilities | Stable strings for optional behavior, currently `named-agents.v1`, `owner-attribution.v1`, `human-token-sessions.v1`, `group-archive.v1`, `group-description.v1`, `feed-filter.v1`, `agent-control.v1`, `agent-token-rotate.v1`, `group-writers.v1`, and `group-add.v1` |
 | Minimum client version | Optional operator policy; rejection applies only when configured |
 | Recommended client version | Optional advisory hint, independent of the server package version |
 | Schema/config support | Record the schema migration destination and client config format; initially exclude changes from automatic updates |

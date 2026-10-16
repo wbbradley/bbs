@@ -1613,6 +1613,76 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
     )));
 }
 
+fn humans_add_their_agents_to_groups(mode: Mode) {
+    let bbs = Bbs::with_mode("group-add", mode);
+    bbs.ok(&["human", "add", "ada"]);
+    bbs.ok(&["group", "register", "acme"]);
+    let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    let (c, _tc) = bbs.register_with(&["--as", "ada", "register"]);
+
+    assert!(
+        bbs.err(&["--token", &ta, "group", "add", "acme", &a])
+            .contains("for humans only")
+    );
+    assert!(bbs.err(&["group", "add", "acme"]).contains("required"));
+    // All or nothing: one bad name adds no one.
+    assert!(
+        bbs.err(&["group", "add", "acme", &a, &c])
+            .contains(&format!("{c} is not your agent"))
+    );
+    assert!(
+        bbs.err(&["group", "add", "acme", &a, "Nobody"])
+            .contains("no live agent named \"Nobody\"")
+    );
+    assert!(
+        bbs.err(&["group", "add", "nope", &a])
+            .contains("no such group")
+    );
+    assert_eq!(bbs.ok(&["group", "list"]), "@acme: (no agents)\n");
+
+    assert_eq!(
+        bbs.ok(&["group", "add", "@acme", &a, &b.to_lowercase()]),
+        format!("Added {a}, {b} to @acme.\n")
+    );
+    let notice = |agent: &str, suffix: &str| {
+        format!(
+            "from will (human) to @acme:\nHuman \"will\" added agent {agent:?} to group @acme{suffix}.\n"
+        )
+    };
+    let ada = bbs.ok(&["--as", "ada", "read"]);
+    assert!(
+        ada.contains(&notice(&a, "")) && ada.contains(&notice(&b, "")),
+        "{ada}"
+    );
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&notice(&b, "")));
+    assert_eq!(
+        bbs.ok(&["group", "add", "acme", &a, &b, &a]),
+        format!("Already in @acme: {a}, {b}.\n")
+    );
+    // Membership is real: the agents share a group now.
+    bbs.ok(&["--token", &ta, "send", "--to", &b, "hi"]);
+    assert!(bbs.ok(&["--token", &tb, "read"]).contains("hi"));
+
+    // Adding grants nothing, but a kept grant is announced.
+    assert!(
+        bbs.err(&["--token", &ta, "send", "--to", "@acme", "x"])
+            .contains("lack write access")
+    );
+    bbs.grant_write("acme", &a);
+    bbs.ok(&["--token", &ta, "group", "leave", "acme"]);
+    bbs.ok(&["--as", "ada", "read"]);
+    bbs.ok(&["group", "add", "acme", &a]);
+    assert!(
+        bbs.ok(&["--as", "ada", "read"])
+            .contains(&notice(&a, " as a writer"))
+    );
+    assert_eq!(
+        bbs.ok(&["--as", "ada", "group", "add", "acme", &c]),
+        format!("Added {c} to @acme.\n")
+    );
+}
+
 fn agents_lists_status_and_scopes_visibility(mode: Mode) {
     let bbs = Bbs::with_mode("agents", mode);
     bbs.ok(&["group", "register", "acme"]);
@@ -2858,6 +2928,7 @@ both_modes!(
     groups_carry_human_written_descriptions,
     joining_notifies_the_group,
     leaving_or_removal_notifies_the_group,
+    humans_add_their_agents_to_groups,
     humans_grant_and_revoke_group_writers,
     agents_lists_status_and_scopes_visibility,
     json_output_is_one_object_per_line,

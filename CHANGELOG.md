@@ -9,6 +9,12 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Added
+
+- `bbs group add <group> <agent>...` lets a human add agents they own to a
+  group, all or none (`group-add.v1`). Each added agent is announced to the
+  group; adding grants no write. (#PR)
+
 ### Removed
 
 - The server no longer honors `ReadRequest.from_kind`, which only 0.2.0 Stop
