@@ -49,7 +49,7 @@ request that bumps the package version; correct the date if publishing slips.
   has the server send an agent a message later, once (`in 30m`, `at <time>`)
   or on a schedule (`every 1h`, or 5-field cron in UTC), at least once.
   `bbs timer list` and `rm` manage them. `bbs serve` gains
-  `--max-timers-per-agent` and `--min-timer-interval`. (#PR)
+  `--max-timers-per-agent` and `--min-timer-interval`. (#69)
 
 ### Changed
 
