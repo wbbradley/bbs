@@ -21,6 +21,7 @@ pub enum Action {
     Search,
     Compose,
     ActivityPane,
+    ActivityKinds,
     NextMatch,
     PrevMatch,
     /// Change the selected group.
@@ -178,6 +179,11 @@ pub const BINDINGS: &[Binding] = &[
         keys: &[Key::Char('A')],
         action: Action::ActivityPane,
         help: "agents: show or hide activity",
+    },
+    Binding {
+        keys: &[Key::Char('E')],
+        action: Action::ActivityKinds,
+        help: "agents: activity of all kinds, no text, or problems",
     },
     Binding {
         keys: &[Key::Char('a')],

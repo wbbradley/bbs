@@ -9,6 +9,17 @@ use ratatui::crossterm::style::ContentStyle;
 use ratatui::style::Style;
 use ratatui::text::Line;
 
+/// A stored RFC 3339 time as local `HH:MM:SS`; unparsable text as it is.
+pub fn clock(ts: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        Ok(t) => t
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S")
+            .to_string(),
+        Err(_) => ts.get(11..19).unwrap_or(ts).to_string(),
+    }
+}
+
 /// Styled lines as text for a terminal, one per line; plain text when `color`
 /// is false.
 pub fn to_ansi(lines: &[Line], color: bool) -> String {

@@ -38,8 +38,7 @@ impl Activity {
         let Ok(Value::Object(r)) = serde_json::from_str::<Value>(line) else {
             return styled(line.trim_end_matches('\n'), Style::new());
         };
-        let ts = str_field(&r, "ts");
-        let time = ts.get(11..19).unwrap_or(ts);
+        let time = super::clock(str_field(&r, "ts"));
         let text = str_field(&r, "text");
         let message = str_field(&r, "message");
         let mut out = Vec::new();
@@ -262,7 +261,7 @@ fn mail_part(prompt: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::to_ansi;
+    use crate::ui::{clock, to_ansi};
 
     fn render(lines: &[&str]) -> String {
         let mut activity = Activity::new(false);
@@ -282,14 +281,20 @@ mod tests {
             r#"{"ts":"2026-10-16T05:43:10Z","event":"text","text":"**Done.**"}"#,
             r#"{"ts":"2026-10-16T05:43:10Z","event":"turn_end","stop_reason":"end_turn"}"#,
         ]);
+        let (mail, end) = (
+            clock("2026-10-16T05:43:05.8Z"),
+            clock("2026-10-16T05:43:10Z"),
+        );
         assert_eq!(
             out,
-            "05:43:05 mail from wbbradley\n\
-             \n━━ 05:43:05 turn ━━\n\
-             [2026-10-16T05:43:05Z] from wbbradley (human) to @g:\nhello\n\
-             │ Let me look.\n\
-             **Done.**\n\
-             05:43:10 turn end (end_turn)\n"
+            format!(
+                "{mail} mail from wbbradley\n\
+                 \n━━ {mail} turn ━━\n\
+                 [2026-10-16T05:43:05Z] from wbbradley (human) to @g:\nhello\n\
+                 │ Let me look.\n\
+                 **Done.**\n\
+                 {end} turn end (end_turn)\n"
+            )
         );
     }
 
@@ -328,13 +333,20 @@ mod tests {
             r#"{"ts":"2026-10-16T05:00:03Z","event":"permission","tool":"bash"}"#,
             "not json\n",
         ]);
+        let t = |s: u32| clock(&format!("2026-10-16T05:00:0{s}Z"));
         assert_eq!(
             out,
-            "05:00:00 warning: slow\n\
-             05:00:01 turn_error: boom\n\
-             05:00:02 stopped: the harness exited\n\
-             05:00:03 permission {\"tool\":\"bash\"}\n\
-             not json\n"
+            format!(
+                "{} warning: slow\n\
+                 {} turn_error: boom\n\
+                 {} stopped: the harness exited\n\
+                 {} permission {{\"tool\":\"bash\"}}\n\
+                 not json\n",
+                t(0),
+                t(1),
+                t(2),
+                t(3)
+            )
         );
     }
 

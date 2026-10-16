@@ -146,7 +146,7 @@ fn render(line: &str) -> String {
     };
     let ts = r
         .remove("ts")
-        .and_then(|v| v.as_str().map(|s| s.get(11..19).unwrap_or(s).to_string()))
+        .and_then(|v| v.as_str().map(crate::ui::clock))
         .unwrap_or_default();
     let event = r
         .remove("event")

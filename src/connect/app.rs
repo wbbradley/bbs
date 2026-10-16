@@ -870,7 +870,7 @@ mod tests {
         );
         let out = screen(&mut app, 100, 24);
         assert!(
-            out.contains("Activity · A hides") && out.contains("Loading…"),
+            out.contains("E kinds · A hides") && out.contains("Loading…"),
             "{out}"
         );
         app.on_event(Event::Data(Data::Activity {
@@ -897,7 +897,7 @@ mod tests {
         // A hides it and stops its stream; closing the thread stops the rest.
         key(&mut app, 'A');
         assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
-        assert!(!screen(&mut app, 100, 24).contains("Activity · A hides"));
+        assert!(!screen(&mut app, 100, 24).contains("E kinds · A hides"));
         key(&mut app, 'A');
         let Request::WatchActivity { id, .. } = rx.try_recv().unwrap() else {
             panic!("expected an activity watch");
@@ -938,5 +938,66 @@ mod tests {
         key(&mut app, 'A');
         assert!(rx.try_recv().is_err());
         assert!(!screen(&mut app, 80, 24).contains("Activity"));
+    }
+
+    #[test]
+    fn e_cycles_the_kinds_of_activity_shown() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        key(&mut app, 'A');
+        let Request::WatchActivity { id, .. } = rx.try_recv().unwrap() else {
+            panic!("expected an activity watch");
+        };
+        app.on_event(Event::Data(Data::Activity {
+            id,
+            result: Ok(vec![
+                activity(1, r#"{"ts":"2026-10-16T18:00:00Z","event":"thought","text":"pondering"}"#),
+                activity(2, r#"{"ts":"2026-10-16T18:00:01Z","event":"mail","count":1,"from":["Zed"],"queued":false}"#),
+                activity(3, r#"{"ts":"2026-10-16T18:00:02Z","event":"warning","message":"slow disk"}"#),
+            ]),
+        }));
+        let out = screen(&mut app, 100, 24);
+        assert!(out.contains("Activity · all"), "{out}");
+        assert!(
+            out.contains("pondering") && out.contains("mail from Zed"),
+            "{out}"
+        );
+        key(&mut app, 'E');
+        let out = screen(&mut app, 100, 24);
+        assert!(out.contains("Activity · no text"), "{out}");
+        assert!(
+            !out.contains("pondering") && out.contains("mail from Zed"),
+            "{out}"
+        );
+        key(&mut app, 'E');
+        let out = screen(&mut app, 100, 24);
+        assert!(out.contains("Activity · problems"), "{out}");
+        assert!(
+            !out.contains("mail from Zed") && out.contains("slow disk"),
+            "{out}"
+        );
+        // New records follow the filter too, and the filter survives a reload.
+        app.on_event(Event::Data(Data::Activity {
+            id,
+            result: Ok(vec![activity(
+                4,
+                r#"{"ts":"2026-10-16T18:00:03Z","event":"thought","text":"later thought"}"#,
+            )]),
+        }));
+        assert!(!screen(&mut app, 100, 24).contains("later thought"));
+        key(&mut app, 'r');
+        assert!(screen(&mut app, 100, 24).contains("Activity · problems"));
+        // Nothing of the chosen kinds says so.
+        while rx.try_recv().is_ok() {}
+        app.on_event(Event::Data(Data::Activity {
+            id,
+            result: Ok(vec![activity(
+                5,
+                r#"{"ts":"2026-10-16T18:00:04Z","event":"text","text":"hi"}"#,
+            )]),
+        }));
+        assert!(screen(&mut app, 100, 24).contains("Nothing of these kinds. E shows all."));
+        key(&mut app, 'E');
+        assert!(screen(&mut app, 100, 24).contains("hi"));
     }
 }

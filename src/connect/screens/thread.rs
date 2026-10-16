@@ -270,6 +270,11 @@ impl Screen for Thread {
             Action::Search => self.prompt = Some(String::new()),
             Action::Compose => self.composing = self.composer.is_some(),
             // Only an agent's thread has activity.
+            Action::ActivityKinds => {
+                if let Some(pane) = &mut self.activity {
+                    pane.cycle();
+                }
+            }
             Action::ActivityPane => match (self.activity.take(), &self.req.with) {
                 (Some(pane), _) => return Transition::Request(pane.unwatch()),
                 (None, Some(agent)) => {
