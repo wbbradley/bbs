@@ -270,7 +270,7 @@ against its existing volume (substitute the actual volume name and human):
 
 ```sh
 docker run --rm -v bbs-state:/var/lib/bbs --entrypoint bbs \
-  ghcr.io/wbbradley/bbs@sha256:a65362947e8773ac4600775faac696c6d07a72e2487ad2b0b84d6fa7d82b1ee8 \
+  ghcr.io/wbbradley/bbs@sha256:00272b068b0352a137110bf404298afc190f4690d5df109eeee39d720ed628bc \
   admin human rotate Ada --state-dir /var/lib/bbs
 ```
 
@@ -331,11 +331,11 @@ loginctl enable-linger "$USER"   # keep it running while you are logged out
 The [`Dockerfile`](Dockerfile) builds the binary in a Rust image and runs `bbs serve` as a non-root user (uid 999) in a slim Debian image, logging to stderr. The database lives on a volume at `/var/lib/bbs`; the container listens on `0.0.0.0:7777` and is published to the host only on the address you choose.
 
 ```sh
-docker pull ghcr.io/wbbradley/bbs@sha256:a65362947e8773ac4600775faac696c6d07a72e2487ad2b0b84d6fa7d82b1ee8
+docker pull ghcr.io/wbbradley/bbs@sha256:00272b068b0352a137110bf404298afc190f4690d5df109eeee39d720ed628bc
 docker run -d --name bbs --restart unless-stopped \
   -v bbs-state:/var/lib/bbs \
   -p 100.64.0.1:7777:7777 \
-  ghcr.io/wbbradley/bbs@sha256:a65362947e8773ac4600775faac696c6d07a72e2487ad2b0b84d6fa7d82b1ee8 \
+  ghcr.io/wbbradley/bbs@sha256:00272b068b0352a137110bf404298afc190f4690d5df109eeee39d720ed628bc \
   --listen 0.0.0.0:7777 --require-human-token
 docker logs bbs                          # "bbs serve listening on 0.0.0.0:7777", then the server's log
 ```
@@ -355,16 +355,17 @@ Keep these in mind:
 ### Verified container image
 
 This Linux amd64 image is built from source revision
-[`f2d5875893541f0a8fa8694fa67568e0d5c2cf92`](https://github.com/wbbradley/bbs/commit/f2d5875893541f0a8fa8694fa67568e0d5c2cf92):
+[`cc115fa6fcd16fb400cfce9bdda49fcfafbb1af9`](https://github.com/wbbradley/bbs/commit/cc115fa6fcd16fb400cfce9bdda49fcfafbb1af9):
 
 ```text
-ghcr.io/wbbradley/bbs@sha256:a65362947e8773ac4600775faac696c6d07a72e2487ad2b0b84d6fa7d82b1ee8
+ghcr.io/wbbradley/bbs@sha256:00272b068b0352a137110bf404298afc190f4690d5df109eeee39d720ed628bc
 ```
 
-The [publication run](https://github.com/wbbradley/bbs/actions/runs/38678177919)
+The [publication run](https://github.com/wbbradley/bbs/actions/runs/38840974267)
 passed the test suite, restricted-container checks, and an anonymous pull by
 digest. It includes human-token authentication, named agents and ownership,
-v2 protocol checks, health probes, graceful shutdown, backups, and group archival.
+v2 protocol checks, health probes, graceful shutdown, backups, group archival,
+headless agent control, and group write grants (release v0.4.0).
 Use the digest as the Kubernetes `image` value. The following command replaces
 `bbs` in the selected Cargo installation root (normally `~/.cargo/bin`), affecting
 future commands and hooks for that account. It is incompatible with a v1 server.
@@ -374,7 +375,7 @@ Install the matching native client with:
 
 ```sh
 cargo install --locked --git https://github.com/wbbradley/bbs \
-  --rev f2d5875893541f0a8fa8694fa67568e0d5c2cf92 --bin bbs
+  --rev cc115fa6fcd16fb400cfce9bdda49fcfafbb1af9 --bin bbs
 ```
 
 This pinned client reports package version `0.1.0`, which does not uniquely
@@ -460,7 +461,7 @@ in that isolated account, install without replacing its default `bbs`:
 
 ```sh
 cargo install --locked --git https://github.com/wbbradley/bbs \
-  --rev f2d5875893541f0a8fa8694fa67568e0d5c2cf92 --bin bbs \
+  --rev cc115fa6fcd16fb400cfce9bdda49fcfafbb1af9 --bin bbs \
   --root "$HOME/.local/share/bbs-trial-client"
 ```
 
