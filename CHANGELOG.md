@@ -70,7 +70,7 @@ request that bumps the package version; correct the date if publishing slips.
   activity in time order, replacing the side pane; `A` cycles all, messages
   and activity. Viewing it marks the agent's mail to you read and its
   activity seen, and the Agents list puts unread mail first, then unseen
-  activity, each oldest first, with counts under NEW. (#PR)
+  activity, each oldest first, with counts under NEW. (#73)
 
 ## 0.6.0 - 2026-10-16
 
