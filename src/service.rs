@@ -652,6 +652,8 @@ pub fn group_remove(
         );
         broadcast(ctx, &me, gid, &notice)?;
         db::leave_group(ctx.conn, gid, target.id)?;
+        // Agents join groups themselves, so removal also takes write away.
+        db::set_writer(ctx.conn, gid, target.id, false, &ctx.now_s)?;
         tracing::info!(
             agent = target.name,
             group,

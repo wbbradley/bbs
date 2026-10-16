@@ -1600,7 +1600,13 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
     assert!(bbs.ok(&["--token", &ta, "read"]).contains(&format!(
         "removed agent {b:?} from group @acme. @acme now has no agent writers.\n"
     )));
+    // Removal revokes write, so rejoining does not restore it.
     bbs.ok(&["--token", &tb, "group", "join", "acme"]);
+    assert!(
+        bbs.err(&["--token", &tb, "send", "--to", "@acme", "x"])
+            .contains("lack write access")
+    );
+    bbs.grant_write("acme", &b);
     bbs.ok(&["retire", &b]);
     assert!(bbs.ok(&["--token", &ta, "read"]).contains(&format!(
         "Agent {b:?} is no longer a member of group @acme. @acme now has no agent writers.\n"

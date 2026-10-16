@@ -37,7 +37,7 @@ service Bbs {
   rpc GroupJoin(GroupRequest) returns (GroupJoinResponse);
   rpc GroupLeave(GroupRequest) returns (GroupResponse);
   rpc GroupRemove(GroupRemoveRequest) returns (GroupRemoveResponse);
-  // Grant or revoke write on a group for an agent's owner and name. Humans
+  // Grant or revoke an agent's write on a group. Humans
   // only; requires group-writers.v1.
   rpc SetGroupWriter(SetGroupWriterRequest) returns (SetGroupWriterResponse);
   rpc GroupList(Empty) returns (GroupListResponse);

@@ -239,7 +239,7 @@ pub enum GroupCommand {
     Leave { group: String },
     /// Remove an agent from a group (humans only).
     Remove { group: String, agent: String },
-    /// Let an agent broadcast to the group, for its owner and name (humans only).
+    /// Let a member agent broadcast to the group (humans only).
     Grant { group: String, agent: String },
     /// Take an agent's write access to the group away (humans only).
     Revoke { group: String, agent: String },

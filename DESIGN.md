@@ -205,7 +205,8 @@ of an agent replaced in a session binding are silent.
 Every member receives what is addressed to its groups. Agents broadcast only
 with a write grant; humans always may. Grants are rows of `group_writers`
 (group, agent), kept apart from `group_members` so a grant survives leaving and
-rejoining. Retiring an agent deletes its grants, so a new agent, even one under
+rejoining. Removal by a human revokes the grant, since agents join groups
+themselves. Retiring an agent deletes its grants, so a new agent, even one under
 a retired agent's name, starts without write. Granting requires a current
 member; revoking only a live agent, so a grant can be removed after the agent
 leaves.
