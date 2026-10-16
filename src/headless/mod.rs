@@ -18,7 +18,7 @@ use crate::cli::HeadlessCommand;
 use crate::config::Config;
 use crate::proto;
 use crate::service::Caller;
-pub use settings::MidTurn;
+pub use settings::{MidTurn, Settings};
 
 pub async fn run(command: HeadlessCommand, dir: &Path, as_human: Option<&str>) -> Result<()> {
     match command {

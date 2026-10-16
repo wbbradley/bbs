@@ -9,6 +9,14 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Changed
+
+- Headless settings move from `~/.config/bbs/headless.toml` into the
+  `[headless]` table of `config.toml`, and a harness may set `type` (only
+  `"acp"` so far). `bbs headless run` refuses to start until the old file's
+  contents are moved under `[headless]` and the file is deleted. The config
+  format becomes 2, so older clients reject a `config.toml` with this table.
+
 ## 0.5.2 - 2026-10-16
 
 Client-only change; servers need no upgrade.

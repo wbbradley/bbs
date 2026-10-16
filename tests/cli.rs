@@ -228,7 +228,7 @@ fn version_reports_identity_without_side_effects() {
             assert_eq!(report["protocol"]["epoch"], 2);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
             assert_eq!(report["schema_version"], 10);
-            assert_eq!(report["config_format"], 1);
+            assert_eq!(report["config_format"], 2);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {
             assert!(stdout.starts_with(&format!("bbs {} (", env!("CARGO_PKG_VERSION"))));
@@ -2617,10 +2617,34 @@ fn headless_config(bbs: &Bbs, command: &[&str]) {
         .collect::<Vec<_>>()
         .join(", ");
     std::fs::write(
-        dir.join("headless.toml"),
-        format!("min_turn_interval = \"0s\"\n[harness.fake]\ncommand = [{command}]\n"),
+        dir.join("config.toml"),
+        format!(
+            "[headless]\nmin_turn_interval = \"0s\"\n[headless.harness.fake]\ncommand = [{command}]\n"
+        ),
     )
     .unwrap();
+}
+
+#[test]
+fn init_keeps_headless_settings() {
+    let bbs = Bbs::new("init-headless");
+    headless_config(&bbs, &["omp", "acp"]);
+    bbs.ok(&["init", "--human", "ada"]);
+    let config = std::fs::read_to_string(config_path(&bbs)).unwrap();
+    assert!(config.contains("human = \"ada\""), "{config}");
+    assert!(config.contains("min_turn_interval = \"0s\""), "{config}");
+    assert!(config.contains("[headless.harness.fake]"), "{config}");
+    assert!(config.contains("command = [\"omp\", \"acp\"]"), "{config}");
+}
+
+#[test]
+fn headless_refuses_the_old_settings_file() {
+    let bbs = Bbs::new("old-headless");
+    headless_config(&bbs, &["true"]);
+    std::fs::write(bbs.home.join(".config/bbs/headless.toml"), "").unwrap();
+    let err = bbs.err(&["headless", "run", "Zed"]);
+    assert!(err.contains("headless.toml is no longer read"), "{err}");
+    assert!(err.contains("under [headless]"), "{err}");
 }
 
 fn headless_state(bbs: &Bbs, agent: &str) -> serde_json::Value {

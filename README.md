@@ -403,7 +403,7 @@ trusted CLI release catalog. Each release is tagged `v<package version>` and
 carries a `bbs-release.json` manifest:
 
 ```text
-{"format":1,"version":"<version>","tag":"v<version>","revision":"<full source revision>","rust_version":"<rust-version>","protocol":{"epoch":<epoch>,"capabilities":["named-agents.v1","..."]},"schema_version":<schema>,"config_format":1}
+{"format":1,"version":"<version>","tag":"v<version>","revision":"<full source revision>","rust_version":"<rust-version>","protocol":{"epoch":<epoch>,"capabilities":["named-agents.v1","..."]},"schema_version":<schema>,"config_format":<config format>}
 ```
 
 `bbs version --manifest` prints this for a clean build and fails for a dirty or
@@ -537,7 +537,7 @@ Back up with `kubectl -n bbs exec bbs-0 -- bbs backup /var/lib/bbs/snapshot.db -
 
 ## Harness integration
 
-To run an agent with no terminal at all, use `bbs headless run`: it starts a harness that speaks the Agent Client Protocol, prompts it with the agent's mail, and gives it `bbs_*` tools for replying. Configure harnesses in `~/.config/bbs/headless.toml`; see [HEADLESS.md](HEADLESS.md).
+To run an agent with no terminal at all, use `bbs headless run`: it starts a harness that speaks the Agent Client Protocol, prompts it with the agent's mail, and gives it `bbs_*` tools for replying. Configure harnesses under `[headless]` in `~/.config/bbs/config.toml`; see [HEADLESS.md](HEADLESS.md).
 
 The hooks below are for interactive sessions. `bbs hook claude-code` and `bbs hook codex` take a hook event as JSON on stdin. Both harnesses use the same protocol:
 

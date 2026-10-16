@@ -316,7 +316,7 @@ pub enum HeadlessCommand {
 pub struct HeadlessRunArgs {
     /// Agent name; registered for you if it is free.
     pub agent: String,
-    /// Harness from ~/.config/bbs/headless.toml (default: default_harness).
+    /// Harness from [headless] in ~/.config/bbs/config.toml (default: default_harness).
     #[arg(long)]
     pub harness: Option<String>,
     /// Model passed to the harness unchanged.
