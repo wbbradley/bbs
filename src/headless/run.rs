@@ -14,7 +14,7 @@ use super::acp::McpServer;
 use super::harness::{BbsTools, Event, Harness};
 use super::log::Log;
 use super::mcp::{TOKEN_ENV, Tools};
-use super::settings::{MidTurn, Settings};
+use super::settings::{DEFAULT_MAX_TURN_ERRORS, MidTurn, Settings};
 use super::state::{AgentDir, State};
 use crate::app::format_messages;
 use crate::backend::Backend;
@@ -42,6 +42,11 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             .with_context(|| format!("invalid --min-turn-interval {s:?}"))?,
         None => settings.min_turn_interval()?,
     };
+    let max_turn_errors = args
+        .max_turn_errors
+        .or(settings.max_turn_errors)
+        .unwrap_or(DEFAULT_MAX_TURN_ERRORS)
+        .get();
     let cwd = match &args.cwd {
         Some(cwd) => cwd
             .canonicalize()
@@ -149,6 +154,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     let mut queue: Vec<proto::Message> = Vec::new();
     let mut turn: Option<JoinHandle<Result<String>>> = None;
     let mut last_start: Option<Instant> = None;
+    let mut turn_errors = 0;
+    // A resumed session that never completes a turn may be what fails.
+    let mut session_proven = !agent_harness.session_resumed();
     let result = loop {
         let ready_at = last_start
             .map(|t| t + interval)
@@ -208,10 +216,29 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             },
             done = async { turn.as_mut().unwrap().await }, if turn.is_some() => {
                 turn = None;
-                match done {
-                    Ok(Ok(stop)) => log.event("turn_end", json!({ "stop_reason": stop })),
-                    Ok(Err(err)) => log.event("turn_error", json!({ "message": format!("{err:#}") })),
-                    Err(err) => log.event("turn_error", json!({ "message": err.to_string() })),
+                let message = match done {
+                    Ok(Ok(stop)) => {
+                        log.event("turn_end", json!({ "stop_reason": stop }));
+                        turn_errors = 0;
+                        session_proven = true;
+                        continue;
+                    }
+                    Ok(Err(err)) => format!("{err:#}"),
+                    Err(err) => err.to_string(),
+                };
+                log.event("turn_error", json!({ "message": message }));
+                turn_errors += 1;
+                if turn_errors >= max_turn_errors {
+                    if !session_proven {
+                        // Start a new session next time instead of this one.
+                        state.session_id = None;
+                        if let Err(err) = agent_dir.save(&state) {
+                            log.event("warning", json!({ "message": format!("{err:#}") }));
+                        }
+                    }
+                    break Err(anyhow::anyhow!(
+                        "{turn_errors} turns failed in a row; the last: {message}"
+                    ));
                 }
             }
             event = events.recv() => match event {

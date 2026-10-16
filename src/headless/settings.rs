@@ -1,6 +1,7 @@
 //! The `[headless]` table of `config.toml`: named harnesses and run defaults.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -10,6 +11,7 @@ use crate::app::home_dir;
 use crate::config::{self, Config};
 
 pub const DEFAULT_MIN_TURN_INTERVAL: Duration = Duration::from_secs(60);
+pub const DEFAULT_MAX_TURN_ERRORS: NonZeroU32 = NonZeroU32::new(3).unwrap();
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -32,6 +34,9 @@ pub struct Settings {
     /// Minimum time between the starts of two turns, like "60s" or "5m".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_turn_interval: Option<String>,
+    /// Turns that may fail in a row before `run` stops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_turn_errors: Option<NonZeroU32>,
     /// `[headless.harness.<name>]` tables.
     #[serde(
         default,
@@ -169,6 +174,7 @@ human = "will"
 default_harness = "omp"
 mid_turn = "queue"
 min_turn_interval = "2m"
+max_turn_errors = 5
 
 [headless.harness.omp]
 command = ["omp", "acp"]
@@ -185,6 +191,7 @@ env = { RUST_LOG = "warn" }
         assert_eq!(s.default_harness.as_deref(), Some("omp"));
         assert_eq!(s.mid_turn, Some(MidTurn::Queue));
         assert_eq!(s.min_turn_interval().unwrap(), Duration::from_secs(120));
+        assert_eq!(s.max_turn_errors.map(NonZeroU32::get), Some(5));
         let (name, omp) = s.harness(None).unwrap();
         assert_eq!(name, "omp");
         assert_eq!(omp.kind, HarnessType::Acp);
@@ -237,6 +244,7 @@ env = { RUST_LOG = "warn" }
     #[test]
     fn rejects_unknown_keys_and_types() {
         assert!(parse("[headless]\nbogus = 1\n").is_err());
+        assert!(parse("[headless]\nmax_turn_errors = 0\n").is_err());
         assert!(parse("[headless.harness.omp]\ncommand = [\"x\"]\nbogus = 1\n").is_err());
         assert!(parse("[headless.harness.omp]\ntype = \"bogus\"\ncommand = [\"x\"]\n").is_err());
     }
