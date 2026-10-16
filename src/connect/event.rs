@@ -48,6 +48,8 @@ pub enum Request {
         id: u64,
         op: Admin,
     },
+    /// Mark read the human's mail from this sender. The feed shows the result.
+    MarkRead(String),
 }
 
 /// One group change, as the CLI's `bbs group` commands make it.
@@ -158,6 +160,13 @@ pub async fn serve(
                     continue;
                 }
                 Data::Groups(backend.group_list().await.map_err(error))
+            }
+            Request::MarkRead(from) => {
+                // A failure leaves the mail unread, to be marked on a later view.
+                if let Err(err) = backend.mark_read(proto::MarkReadRequest { from }).await {
+                    tracing::warn!("marking mail read: {err:#}");
+                }
+                continue;
             }
             Request::Watch { id, req } => {
                 let task = tokio::spawn(watch(opener.clone(), id, req, tx.clone()));

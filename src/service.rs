@@ -933,12 +933,6 @@ pub fn send(
         if target.kind == me.kind && target.id == me.id {
             bail!("cannot send a message to yourself");
         }
-        if me.kind == db::Kind::Agent && target.kind == db::Kind::Human {
-            bail!(
-                "agents cannot message humans; talk to {} through your harness",
-                target.name
-            );
-        }
         if me.kind == db::Kind::Agent
             && target.kind == db::Kind::Agent
             && !db::share_group(ctx.conn, me.id, target.id)?
@@ -961,6 +955,27 @@ pub fn send(
 }
 
 /// Unread mail oldest first, archived as returned; or archived history.
+/// Mark read the caller's unread mail from `from`, as viewing it in
+/// `bbs connect` does.
+pub fn mark_read(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::MarkReadRequest,
+) -> Result<proto::MarkReadResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        let from = match db::find_human(ctx.conn, &req.from)? {
+            Some(h) => h,
+            None => db::live_agent_by_name(ctx.conn, &req.from)?
+                .with_context(|| format!("no such agent or human: {}", req.from))?,
+        };
+        let count = db::mark_read_from(ctx.conn, &me, &from, &ctx.now_s)?;
+        Ok(proto::MarkReadResponse {
+            count: count as u32,
+        })
+    })
+}
+
 pub fn read(
     conn: &mut Connection,
     caller: &Caller,
@@ -1010,12 +1025,8 @@ pub fn list_agents(
                         .any(|g| mine.contains(g))
             });
         }
-        // Agents cannot message humans, so humans are not listed for them.
-        let humans = match me.kind {
-            db::Kind::Human => db::list_humans(ctx.conn)?,
-            db::Kind::Agent => Vec::new(),
-        };
-        let humans = humans
+        // Anyone may message any human, so every caller sees them all.
+        let humans = db::list_humans(ctx.conn)?
             .into_iter()
             .map(|h| proto::Human {
                 name: h.name,
@@ -1837,6 +1848,69 @@ mod tests {
         };
         assert_eq!(timer_list(&mut conn, &lu, req).unwrap().timers.len(), 1);
         timer_remove(&mut conn, &lu, proto::TimerRemoveRequest { id: t.id }).unwrap();
+    }
+
+    #[test]
+    fn agents_message_any_human_who_sees_it_in_their_feed_and_marks_it_read() {
+        let (mut conn, will, [mateo, zed, lu]) = board();
+        // Lu shares no group with anyone, and needs none to reach a human.
+        for (agent, body) in [(&lu, "from lu"), (&mateo, "from mateo")] {
+            let req = proto::SendRequest {
+                to: "will".into(),
+                body: body.into(),
+                control: None,
+            };
+            send(&mut conn, agent, req).unwrap();
+        }
+        let will_id = db::find_human(&conn, "will").unwrap().unwrap().id;
+        let lu_id = db::live_agent_by_name(&conn, "Lu").unwrap().unwrap().id;
+        let scope = db::FeedFilter {
+            scope: Some(will_id),
+            ..Default::default()
+        };
+        let feed = db::feed_messages(&conn, 10, &scope).unwrap();
+        assert!(
+            feed.iter()
+                .any(|m| m.body == "from lu" && m.to_name.as_deref() == Some("will"))
+        );
+        let with = db::FeedFilter {
+            with: Some(vec![(db::Kind::Agent, lu_id)]),
+            ..Default::default()
+        };
+        let thread = db::feed_messages(&conn, 10, &with).unwrap();
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].read_at, None);
+
+        let mark = |conn: &mut Connection, from: &str| {
+            let req = proto::MarkReadRequest { from: from.into() };
+            mark_read(conn, &will, req).unwrap().count
+        };
+        assert_eq!(mark(&mut conn, "lu"), 1);
+        // Already read: nothing changes, so the server signals nothing.
+        assert_eq!(mark(&mut conn, "lu"), 0);
+        assert!(
+            db::feed_messages(&conn, 10, &with).unwrap()[0]
+                .read_at
+                .is_some()
+        );
+        // Only Lu's mail: Mateo's is still unread.
+        let unread: Vec<_> = read(&mut conn, &will, proto::ReadRequest::default())
+            .unwrap()
+            .messages
+            .into_iter()
+            .filter(|m| m.to_group.is_none())
+            .map(|m| m.body)
+            .collect();
+        assert_eq!(unread, ["from mateo"]);
+        // An unknown sender is an error.
+        let req = proto::MarkReadRequest {
+            from: "nobody".into(),
+        };
+        let err = mark_read(&mut conn, &zed, req).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no such agent or human: nobody"),
+            "{err:#}"
+        );
     }
 
     #[test]

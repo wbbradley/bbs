@@ -432,7 +432,7 @@ async fn serve_round_trip_and_wait_for_mail() {
         .send(as_agent(
             &a.token,
             proto::SendRequest {
-                to: "will".into(),
+                to: "nobody".into(),
                 body: "hi".into(),
                 control: None,
             },
@@ -440,7 +440,7 @@ async fn serve_round_trip_and_wait_for_mail() {
         .await
         .unwrap_err();
     assert!(
-        err.message().contains("agents cannot message humans"),
+        err.message().contains("no such agent or human: nobody"),
         "{err}"
     );
 
@@ -597,6 +597,77 @@ async fn watch_feed_snapshots_on_change_for_humans_only() {
     assert_eq!(next.messages.len(), 1);
     assert_eq!(next.messages[0].to_name.as_deref(), Some(a.name.as_str()));
     assert_eq!(next.messages[0].read_at, None);
+}
+
+#[tokio::test]
+async fn humans_mark_an_agents_mail_read_and_only_a_change_refreshes_feeds() {
+    let server = Server::start("mark-read");
+    let mut client = server.client().await;
+    client
+        .ensure_human(proto::EnsureHumanRequest {
+            name: "will".into(),
+        })
+        .await
+        .unwrap();
+    let a = register(&mut client).await;
+    let mut feed = client
+        .watch_feed(as_human(
+            "will",
+            proto::FeedRequest {
+                backlog: 10,
+                with: Some(a.name.clone()),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut next = async || {
+        tokio::time::timeout(Duration::from_secs(5), feed.message())
+            .await
+            .expect("feed updated")
+            .unwrap()
+            .unwrap()
+            .messages
+    };
+    assert!(next().await.is_empty());
+    let send = |body: &str| {
+        as_agent(
+            &a.token,
+            proto::SendRequest {
+                to: "will".into(),
+                body: body.into(),
+                control: None,
+            },
+        )
+    };
+    client.send(send("first")).await.unwrap();
+    let unread = next().await;
+    assert_eq!(unread[0].to_name.as_deref(), Some("will"));
+    assert_eq!(unread[0].read_at, None);
+
+    let mark = || {
+        as_human(
+            "will",
+            proto::MarkReadRequest {
+                from: a.name.clone(),
+            },
+        )
+    };
+    assert_eq!(
+        client.mark_read(mark()).await.unwrap().into_inner().count,
+        1
+    );
+    assert!(next().await[0].read_at.is_some());
+    // Nothing left to mark: no refresh, so the next snapshot is the next send.
+    assert_eq!(
+        client.mark_read(mark()).await.unwrap().into_inner().count,
+        0
+    );
+    client.send(send("second")).await.unwrap();
+    let after = next().await;
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert_eq!(after[1].body, "second");
 }
 
 #[tokio::test]

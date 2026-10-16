@@ -256,9 +256,10 @@ name, a human with their agents, the caller's scope, a group name reused across
 archived groups) runs one indexed walk per principal, delivery recipient, or
 group, each stopping after `backlog` rows, and merges them; none scans the whole
 message table. The one walk not bounded by its own matches is the scope's
-direct messages to the human: it reads human-sent direct messages
-(`messages_human_dm`) until it finds `backlog` delivered to the caller, which
-stays small because agents cannot message humans. The supporting indexes come
+direct messages to the human: it walks the human's direct deliveries
+(`deliveries_human_dm`, a partial index on deliveries flagged `direct`, from
+migration 0013) rather than every delivery to the human, which includes every
+broadcast. The supporting indexes come
 from migration 0008 (schema 8). `--until` implies `--no-follow`: following a
 window bounded in the past would wait forever for messages that cannot match.
 

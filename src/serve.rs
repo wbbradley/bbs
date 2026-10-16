@@ -924,6 +924,21 @@ impl Bbs for Server {
         self.0.protocol.finish(result)
     }
 
+    async fn mark_read(
+        &self,
+        req: Request<proto::MarkReadRequest>,
+    ) -> Result<Response<proto::MarkReadResponse>, Status> {
+        // Only a change wakes watchers: marking nothing must not refresh the
+        // feeds whose snapshots prompt connect to mark.
+        let response = self
+            .unary("mark_read", req, Effect::Query, service::mark_read)
+            .await?;
+        if response.get_ref().count > 0 {
+            self.0.changed();
+        }
+        Ok(response)
+    }
+
     async fn timer_add(
         &self,
         req: Request<proto::TimerAddRequest>,

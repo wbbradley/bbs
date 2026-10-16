@@ -24,6 +24,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0010_group_writers.sql"),
     include_str!("../migrations/0011_activity.sql"),
     include_str!("../migrations/0012_timers.sql"),
+    include_str!("../migrations/0013_human_dms.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -753,7 +754,8 @@ pub fn set_agent_token(conn: &Connection, agent_id: i64, token: &str) -> Result<
 
 pub fn insert_delivery(conn: &Connection, message_id: i64, kind: Kind, id: i64) -> Result<()> {
     conn.execute(
-        "INSERT INTO deliveries (message_id, recipient_kind, recipient_id) VALUES (?1, ?2, ?3)",
+        "INSERT INTO deliveries (message_id, recipient_kind, recipient_id, direct)
+         SELECT id, ?2, ?3, to_group_id IS NULL FROM messages WHERE id = ?1",
         params![message_id, kind.as_str(), id],
     )?;
     Ok(())
@@ -795,6 +797,21 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         control: r.get(8)?,
         timer_id: r.get(9)?,
     })
+}
+
+/// Mark read `me`'s unread mail from one sender; returns how many.
+pub fn mark_read_from(
+    conn: &Connection,
+    me: &Principal,
+    from: &Principal,
+    now: &str,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE deliveries SET archived_at = ?1
+         WHERE recipient_kind = ?2 AND recipient_id = ?3 AND archived_at IS NULL
+           AND message_id IN (SELECT id FROM messages WHERE from_kind = ?4 AND from_id = ?5)",
+        params![now, me.kind.as_str(), me.id, from.kind.as_str(), from.id],
+    )?)
 }
 
 pub fn has_unread(conn: &Connection, me: &Principal) -> Result<bool> {
@@ -968,8 +985,7 @@ enum Term {
     Sent(Kind, i64),
     /// Delivered to this agent.
     DeliveredTo(i64),
-    /// A direct message to this human. Agents cannot message humans, so only
-    /// human-sent direct messages qualify.
+    /// A direct message to this human.
     DirectTo(i64),
     /// A direct message to this agent.
     DirectToAgent(i64),
@@ -1144,11 +1160,11 @@ fn term_sql(term: Term, limit: u32, filter: &FeedFilter, expanded: Expanded) -> 
         ),
         Term::DirectTo(human) => (
             format!(
-                "SELECT m.id FROM messages m INDEXED BY messages_human_dm
-                 WHERE m.to_group_id IS NULL AND m.from_kind = 'human'
-                   AND EXISTS (SELECT 1 FROM deliveries x WHERE x.message_id = m.id
-                               AND x.recipient_kind = 'human' AND x.recipient_id = ?){predicates}
-                 ORDER BY m.id {dir} LIMIT ?"
+                "SELECT m.id FROM deliveries d INDEXED BY deliveries_human_dm
+                 JOIN messages m ON m.id = d.message_id
+                 WHERE d.recipient_kind = 'human' AND d.direct = 1
+                   AND d.recipient_id = ?{predicates}
+                 ORDER BY d.message_id {dir} LIMIT ?"
             ),
             vec![Value::Integer(human)],
         ),
@@ -1770,7 +1786,7 @@ mod tests {
             ),
             (
                 term_sql(Term::DirectTo(1), 200, &mine, Expanded::Scope),
-                "messages_human_dm",
+                "deliveries_human_dm",
             ),
             (
                 term_sql(Term::DirectToAgent(2), 200, &mine, Expanded::With),
@@ -1798,7 +1814,7 @@ mod tests {
             conn.prepare(
                 "SELECT name FROM sqlite_schema WHERE type = 'index' AND name IN
                  ('messages_group', 'messages_sender', 'messages_created',
-                  'messages_human_dm', 'deliveries_recipient') ORDER BY name",
+                  'deliveries_human_dm', 'deliveries_recipient') ORDER BY name",
             )
             .unwrap()
             .query_map([], |r| r.get(0))
@@ -1843,6 +1859,47 @@ mod tests {
             assert_eq!(feed.len(), 1);
             assert_eq!(feed[0].body, "before schema 8");
         }
+    }
+
+    #[test]
+    fn migration_13_flags_existing_direct_deliveries() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for sql in &MIGRATIONS[..12] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA user_version = 12;
+             INSERT INTO humans (id, name, created_at, active_at)
+                 VALUES (1, 'will', '2026-10-14', '2026-10-14'),
+                        (2, 'ada', '2026-10-14', '2026-10-14');
+             INSERT INTO bbs_groups (id, name, created_at) VALUES (1, 'acme', '2026-10-14');
+             INSERT INTO messages (id, from_kind, from_id, to_group_id, body, created_at)
+                 VALUES (1, 'human', 2, NULL, 'direct', '2026-10-14T00:00:00.000000Z'),
+                        (2, 'human', 2, 1, 'broadcast', '2026-10-14T00:00:01.000000Z');
+             INSERT INTO deliveries (message_id, recipient_kind, recipient_id)
+                 VALUES (1, 'human', 1), (2, 'human', 1);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let direct: Vec<(i64, bool)> = conn
+            .prepare("SELECT message_id, direct FROM deliveries ORDER BY message_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(direct, [(1, true), (2, false)]);
+        let filter = FeedFilter {
+            scope: Some(1),
+            ..Default::default()
+        };
+        let bodies: Vec<_> = feed_messages(&conn, 10, &filter)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
+        assert_eq!(bodies, ["direct"]);
     }
 
     #[test]

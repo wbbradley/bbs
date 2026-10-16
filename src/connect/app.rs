@@ -58,6 +58,11 @@ pub trait Screen {
         Vec::new()
     }
     fn on_data(&mut self, _data: &Data) {}
+    /// What to ask for because the human is looking at this screen: called
+    /// on the top screen after new data, and when it is uncovered.
+    fn on_view(&mut self, _ctx: &Ctx) -> Vec<Request> {
+        Vec::new()
+    }
     /// Before a reload re-sends `requests`: drop what they will send again.
     fn reload(&mut self) {}
     /// What to stop when the screen closes.
@@ -108,6 +113,13 @@ impl App {
         if let Some(screen) = self.stack.pop() {
             self.send(screen.on_close());
         }
+        self.viewed();
+    }
+
+    fn viewed(&mut self) {
+        let screen = self.stack.last_mut().expect("the menu is never popped");
+        let requests = screen.on_view(&self.ctx);
+        self.send(requests);
     }
 
     fn top(&mut self) -> &mut Box<dyn Screen> {
@@ -132,6 +144,7 @@ impl App {
                 for screen in &mut self.stack {
                     screen.on_data(&data);
                 }
+                self.viewed();
                 false
             }
             Event::Resize | Event::Tick => false,
@@ -452,6 +465,39 @@ mod tests {
         assert!(!key(&mut app, 'q'));
         assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
         assert!(screen(&mut app, 80, 24).contains("Your agents"));
+    }
+
+    #[test]
+    fn viewing_an_agent_thread_marks_its_mail_to_me_read() {
+        let (mut app, mut rx) = app();
+        key(&mut app, 'a');
+        rx.try_recv().unwrap();
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![agent("Mateo", "ada", &["crew"])],
+        }))));
+        enter(&mut app);
+        let (id, _) = watched(&mut rx);
+        let feed = |read: bool| Data::Feed {
+            id,
+            result: Ok(vec![
+                message(1, "Mateo", "Zed", "not to me"),
+                proto::Message {
+                    read_at: read.then(|| "2026-10-16T18:01:00.000000Z".into()),
+                    ..message(2, "Mateo", "ada", "to me")
+                },
+            ]),
+        };
+        // Covered by help, the thread is not being viewed.
+        key(&mut app, '?');
+        app.on_event(Event::Data(feed(false)));
+        assert!(rx.try_recv().is_err());
+        // Uncovered, it is.
+        key(&mut app, 'q');
+        assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("Mateo".into()));
+        // Once the feed shows it read, there is nothing to mark.
+        app.on_event(Event::Data(feed(true)));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
