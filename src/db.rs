@@ -800,25 +800,22 @@ pub fn has_unread(conn: &Connection, me: &Principal) -> Result<bool> {
     Ok(n != 0)
 }
 
-/// Fetch unread messages oldest-first and mark them archived. `from_kind`
-/// restricts this to messages sent by humans or by agents.
+/// Fetch unread messages oldest-first and mark them archived.
 pub fn take_unread(
     conn: &Connection,
     me: &Principal,
-    from_kind: Option<Kind>,
     limit: Option<u32>,
     now: &str,
 ) -> Result<Vec<MessageView>> {
     let sql = format!(
-        "{INBOX_SELECT} AND d.archived_at IS NULL AND (?3 IS NULL OR m.from_kind = ?3)
-         ORDER BY m.created_at, m.id LIMIT ?4"
+        "{INBOX_SELECT} AND d.archived_at IS NULL
+         ORDER BY m.created_at, m.id LIMIT ?3"
     );
     let limit = limit.map_or(i64::MAX, i64::from);
-    let from_kind = from_kind.map(Kind::as_str);
     let msgs: Vec<MessageView> = conn
         .prepare(&sql)?
         .query_map(
-            params![me.kind.as_str(), me.id, from_kind, limit],
+            params![me.kind.as_str(), me.id, limit],
             message_view,
         )?
         .collect::<Result<_, _>>()?;
@@ -1309,7 +1306,7 @@ mod tests {
             id: 1,
             name: "Aiko".into(),
         };
-        let unread = take_unread(&conn, &reader, None, None, "2026-10-15").unwrap();
+        let unread = take_unread(&conn, &reader, None, "2026-10-15").unwrap();
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].to_group.as_deref(), Some("acme"));
         assert!(
@@ -1599,7 +1596,7 @@ mod tests {
         assert_eq!(feed[1].to_name.as_deref(), Some("Bram"));
         assert_eq!(feed[1].read_at, None);
 
-        take_unread(&conn, &b, None, None, "2026-10-09T01:00:00.000000Z").unwrap();
+        take_unread(&conn, &b, None, "2026-10-09T01:00:00.000000Z").unwrap();
         let feed = feed_messages(&conn, 10, &FeedFilter::default()).unwrap();
         assert_eq!(feed[0].read_at, None, "broadcast read times stay hidden");
         assert_eq!(
