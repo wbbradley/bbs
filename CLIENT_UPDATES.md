@@ -52,9 +52,9 @@ connection timeout. Client configuration rejects unknown fields. Local
 database opens apply forward migrations and reject a schema newer than the binary
 supports.
 
-Installation currently uses Cargo. `scripts/setup.py` independently installs hook
-configuration and links skills to a source checkout. Replacing the executable
-does not update that checkout or the installed hook definitions.
+Installation currently uses Cargo. `bbs setup` separately installs the hook
+configuration and skill files compiled into the binary. Replacing the executable
+does not update the installed hooks or skill until `bbs setup` runs again.
 
 ## Release identity and compatibility
 
@@ -408,16 +408,14 @@ update. Keep automatically managed client installations separate from the binary
 used to run a server; do not infer that all local state paths can be discovered. Older binaries should ignore the separate updater
 settings file rather than failing to parse the human-token config.
 
-Hook configuration and skill symlinks are a second installation lifecycle. Do not
-`git pull` an arbitrary checkout, discard local edits, rewrite harness config, or
-silently move a skill link during a CLI update. Report the linked checkout and
+Hook configuration and skill files are a second installation lifecycle. Do not
+rewrite harness config or replace a skill during a CLI update. Report the
 required integration compatibility. If an update requires new integration files,
-keep it manual until the human updates that checkout and reviews setup changes.
-For a human-requested integration update, use a clean matching source checkout,
-preview with `scripts/setup.py --dry-run`, then explicitly apply it. Preserve
-customized handlers, paths and symlinks, and follow the harness trust review. The
-existing one-time `.bak-bbs` and multi-file setup writes are not a per-release
-transaction or complete rollback record. Backward-compatible integration changes
+keep it manual: the human previews with `bbs setup --dry-run` from the new
+binary, then explicitly applies it. Preserve customized handlers, paths and
+symlinks, and follow the harness trust review. The existing one-time `.bak-bbs`
+and multi-file setup writes are not a per-release transaction or complete
+rollback record. Backward-compatible integration changes
 can be updated independently. A future
 managed integration bundle may be proposed separately; it is not a prerequisite
 for version discovery and notifications.
