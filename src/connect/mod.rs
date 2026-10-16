@@ -1,6 +1,5 @@
 //! `bbs connect`: a BBS-style terminal app for humans. See CONNECT.md.
 
-mod activity;
 mod admin;
 mod app;
 mod art;
@@ -10,6 +9,7 @@ mod event;
 mod keys;
 mod screens;
 mod theme;
+mod timeline;
 
 use std::io::IsTerminal;
 use std::time::Instant;

@@ -151,6 +151,16 @@ impl Activity {
 
     /// Tool calls still running, each reported once; called while waiting for
     /// more of a followed log, so a long call shows before it finishes.
+    /// Every tool call still running, one line each, in start order, without
+    /// marking them shown: for a view redrawn as calls finish.
+    pub fn in_progress(&self) -> Vec<Line<'static>> {
+        self.order
+            .iter()
+            .filter_map(|id| self.calls.get(id))
+            .flat_map(|call| styled(&format!("  … {} running", call.name), dim()))
+            .collect()
+    }
+
     pub fn running(&mut self) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         for id in &self.order {

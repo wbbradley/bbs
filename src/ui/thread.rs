@@ -3,11 +3,12 @@
 //! prompt and the title stay with each app.
 
 use std::collections::HashSet;
+use std::hash::Hash;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
-use ratatui::text::Text;
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::proto::Message;
@@ -17,19 +18,56 @@ use crate::ui::message::{find_matches, fold, message_lines};
 /// beyond this, never the stream.
 pub(crate) const MAX_ROWS: usize = 10_000;
 
-/// A scrollable, following thread of messages: every row loaded since it
-/// opened, and where the viewport sits in them. Fields are crate-visible so
-/// the apps' tests can check its state.
-pub struct ThreadView {
-    /// Oldest first, by message id. Snapshots append newer messages and
-    /// refresh rows they still contain, so history only grows while open.
-    pub(crate) rows: Vec<Message>,
+/// One row of a thread: a message, or anything else drawn as lines.
+pub trait Row: PartialEq {
+    /// Rows are kept in key order.
+    type Key: Ord + Copy + Hash;
+    /// A row's place may fall between rows already held, and it goes there;
+    /// otherwise only rows newer than all those held are added.
+    const MERGES: bool = false;
+    fn key(&self) -> Self::Key;
+    /// `gap`: messages may be missing before this row.
+    fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>>;
+    /// Whether the row matches a case-folded search.
+    fn matches(&self, query: &str) -> bool;
+}
+
+impl Row for Message {
+    type Key = i64;
+    fn key(&self) -> i64 {
+        self.id
+    }
+    fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>> {
+        message_lines(self, gap, query)
+    }
+    /// The sender, recipient, group, or body as sent (markdown included).
+    fn matches(&self, query: &str) -> bool {
+        [
+            Some(self.qualified_sender()),
+            self.qualified_recipient(),
+            self.to_group.as_ref().map(|g| format!("@{g}")),
+        ]
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .chain([self.body.as_str()])
+        .any(|text| !find_matches(text, query).is_empty())
+    }
+}
+
+/// A scrollable, following thread of rows, messages by default: every row
+/// loaded since it opened, and where the viewport sits in them. Fields are
+/// crate-visible so the apps' tests can check its state.
+pub struct ThreadView<R: Row = Message> {
+    /// Oldest first, by key. Snapshots append newer rows and refresh rows
+    /// they still contain, so history only grows while open.
+    pub(crate) rows: Vec<R>,
     /// Wrapped line count of each row at a width, cached between frames.
     pub(crate) heights: Vec<Option<(u16, usize)>>,
     /// `None` follows the tail; otherwise the viewport's top line, anchored to
     /// a message so appends never move it. If the cap drops the anchored row,
     /// the view holds at the oldest kept row.
-    pub(crate) paused: Option<Anchor>,
+    pub(crate) paused: Option<Anchor<R::Key>>,
     /// Messages appended while paused.
     pub(crate) new_count: usize,
     /// The committed search, case-folded by `fold`.
@@ -41,7 +79,7 @@ pub struct ThreadView {
     pub(crate) window: usize,
     /// Rows that messages may be missing before: a full snapshot arrived whose
     /// oldest message was newer than every row held, so a burst outran it.
-    pub(crate) gaps: HashSet<i64>,
+    pub(crate) gaps: HashSet<R::Key>,
     /// The first snapshot has arrived; later ones can reveal gaps.
     pub(crate) started: bool,
     /// Line layout that keys scroll against.
@@ -49,8 +87,8 @@ pub struct ThreadView {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Anchor {
-    pub(crate) id: i64,
+pub(crate) struct Anchor<K> {
+    pub(crate) id: K,
     pub(crate) line: usize,
 }
 
@@ -71,8 +109,8 @@ impl Geometry {
     }
 }
 
-impl ThreadView {
-    pub fn new(rows: Vec<Message>, window: usize) -> ThreadView {
+impl<R: Row> ThreadView<R> {
+    pub fn new(rows: Vec<R>, window: usize) -> ThreadView<R> {
         let mut view = ThreadView {
             rows: Vec::new(),
             heights: Vec::new(),
@@ -91,23 +129,23 @@ impl ThreadView {
 
     /// Merge a feed snapshot: refresh rows it still holds (e.g. `read_at`),
     /// append newer ones, and drop the oldest beyond MAX_ROWS.
-    pub fn ingest(&mut self, snapshot: Vec<Message>) {
+    pub fn ingest(&mut self, snapshot: Vec<R>) {
         // A full window entirely newer than what is held may have skipped
         // messages; exactly --limit new ones look the same, so this can be a
         // false positive. A one-message window is always full, so it is not
         // checked.
-        let newest = self.rows.last().map_or(0, |r| r.id);
+        let newest = self.rows.last().map(Row::key);
         if let Some(first) = snapshot.first()
             && self.started
             && self.window > 1
             && snapshot.len() >= self.window
-            && first.id > newest
+            && newest.is_none_or(|newest| first.key() > newest)
         {
-            self.gaps.insert(first.id);
+            self.gaps.insert(first.key());
         }
         self.started = true;
         for m in snapshot {
-            match self.rows.binary_search_by_key(&m.id, |r| r.id) {
+            match self.rows.binary_search_by_key(&m.key(), Row::key) {
                 Ok(i) if self.rows[i] != m => {
                     self.matched[i] = self.matches(&m);
                     self.rows[i] = m;
@@ -122,6 +160,11 @@ impl ThreadView {
                         self.new_count += 1;
                     }
                 }
+                Err(i) if R::MERGES => {
+                    self.matched.insert(i, self.matches(&m));
+                    self.rows.insert(i, m);
+                    self.heights.insert(i, None);
+                }
                 // Older than everything kept: it was dropped, or never loaded.
                 Err(_) => {}
             }
@@ -131,7 +174,8 @@ impl ThreadView {
         self.heights.drain(..excess);
         self.matched.drain(..excess);
         if let Some(oldest) = self.rows.first() {
-            self.gaps.retain(|&id| id >= oldest.id);
+            let oldest = oldest.key();
+            self.gaps.retain(|&id| id >= oldest);
         }
         self.layout(self.frame.width, self.frame.height);
     }
@@ -149,8 +193,8 @@ impl ThreadView {
             total += match *cached {
                 Some((w, h)) if w == width => h,
                 _ => {
-                    let gap = self.gaps.contains(&row.id);
-                    let h = Paragraph::new(Text::from(message_lines(row, gap, None)))
+                    let gap = self.gaps.contains(&row.key());
+                    let h = Paragraph::new(Text::from(row.lines(gap, None)))
                         .wrap(Wrap { trim: false })
                         .line_count(width);
                     *cached = Some((width, h));
@@ -171,11 +215,11 @@ impl ThreadView {
         let Some(anchor) = self.paused else {
             return self.frame.bottom();
         };
-        let i = self.rows.partition_point(|r| r.id < anchor.id);
+        let i = self.rows.partition_point(|r| r.key() < anchor.id);
         let start = self.frame.starts.get(i).copied().unwrap_or(0);
         let line = match self.rows.get(i) {
             // A resize can shorten the row the anchor line was measured in.
-            Some(r) if r.id == anchor.id => {
+            Some(r) if r.key() == anchor.id => {
                 let end = self.frame.starts.get(i + 1).unwrap_or(&self.frame.total);
                 anchor.line.min(end.saturating_sub(start + 1))
             }
@@ -199,7 +243,7 @@ impl ThreadView {
             self.new_count = 0;
         }
         self.paused = Some(Anchor {
-            id: row.id,
+            id: row.key(),
             line: line - self.frame.starts[i],
         });
     }
@@ -216,22 +260,10 @@ impl ThreadView {
         self.new_count = 0;
     }
 
-    /// Whether the search matches the row's sender, recipient, group, or body
-    /// as sent (markdown included).
-    fn matches(&self, row: &Message) -> bool {
-        let Some(query) = &self.query else {
-            return false;
-        };
-        [
-            Some(row.qualified_sender()),
-            row.qualified_recipient(),
-            row.to_group.as_ref().map(|g| format!("@{g}")),
-        ]
-        .iter()
-        .flatten()
-        .map(String::as_str)
-        .chain([row.body.as_str()])
-        .any(|text| !find_matches(text, query).is_empty())
+    fn matches(&self, row: &R) -> bool {
+        self.query
+            .as_deref()
+            .is_some_and(|query| row.matches(query))
     }
 
     pub fn set_query(&mut self, query: &str) {
@@ -318,9 +350,8 @@ impl ThreadView {
             .saturating_sub(1);
         let mut text = Text::default();
         for (i, row) in self.rows.iter().enumerate().skip(first) {
-            let gap = self.gaps.contains(&row.id);
-            text.lines
-                .extend(message_lines(row, gap, self.query.as_deref()));
+            let gap = self.gaps.contains(&row.key());
+            text.lines.extend(row.lines(gap, self.query.as_deref()));
             let end = self.frame.starts.get(i + 1).unwrap_or(&self.frame.total);
             if *end >= top + self.frame.height {
                 break;

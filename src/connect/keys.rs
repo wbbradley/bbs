@@ -20,7 +20,8 @@ pub enum Action {
     ToggleAll,
     Search,
     Compose,
-    ActivityPane,
+    /// An agent's timeline: everything, only messages, or only activity.
+    Show,
     ActivityKinds,
     NextMatch,
     PrevMatch,
@@ -177,8 +178,8 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: &[Key::Char('A')],
-        action: Action::ActivityPane,
-        help: "agents: show or hide activity",
+        action: Action::Show,
+        help: "agents: show all, messages, or activity",
     },
     Binding {
         keys: &[Key::Char('E')],

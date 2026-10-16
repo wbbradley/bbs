@@ -66,6 +66,11 @@ request that bumps the package version; correct the date if publishing slips.
   messages and unseen activity, with counts and oldest times, at most about
   once a second; `MarkSeen` records how far they have seen an agent's
   activity (`agent-summary.v1`, schema 14). (#72)
+- `bbs connect`: an agent's thread is one timeline of its messages and its
+  activity in time order, replacing the side pane; `A` cycles all, messages
+  and activity. Viewing it marks the agent's mail to you read and its
+  activity seen, and the Agents list puts unread mail first, then unseen
+  activity, each oldest first, with counts under NEW. (#73)
 
 ## 0.6.0 - 2026-10-16
 
