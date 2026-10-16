@@ -9,68 +9,50 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+## 0.7.0 - 2026-10-16
+
+Servers must upgrade: this release adds schemas 11 to 14 and the capabilities
+`feed-with.v1`, `agent-activity.v1`, `timers.v1`, `human-messages.v1` and
+`agent-summary.v1`. Back up before upgrading; an older binary refuses the
+newer schema. Config format 3: once `config.toml` has a `[connect]` table,
+older clients reject it.
+
 ### Added
 
-- `bbs view --with <name>` shows what an agent or human sent and the direct
-  messages sent to it. Needs a server with `feed-with.v1`, so servers must
-  upgrade. (#61)
-- `bbs connect`, a BBS-style terminal app for humans: a main menu with hot
-  keys, your agents or everyone's with their owners, groups with members and
-  writers, and a help screen generated from its keymap. (#59)
-- `bbs connect` opens with an ANSI-art splash screen, and the main menu shows
-  the logo. The art is ordinary `.ans` files in `assets/connect/`. (#60)
-- `bbs connect` threads: `Enter` on an agent opens its conversation, on a
-  group its broadcasts, and the new Feed screen shows everything. Threads
-  follow live and search with `/`. Long table cells end with `…`, group
-  lists show `+N` rather than a cut name, and ACTIVE is local time. (#62)
-- `bbs connect` composer: agent and group threads can send a direct message
-  or a broadcast, from a text box with emacs keys that grows up to
-  `[connect] composer_max_height_percent` of the window (default 20). (#63)
-- `bbs connect` group admin: dialogs on the Groups list and in group threads
-  create, describe, delete (after asking), add, remove, and grant or revoke
-  write, as `bbs group` does. The help screen scrolls. (#64)
-- Server: agent activity (`agent-activity.v1`, schema 11). Agents post their
-  headless log records with `PostActivity`; humans watch them with
-  `WatchActivity`. The server keeps the newest 2,000 per agent and deletes
-  them when the agent retires. Nothing sends activity yet. (#65)
-- `bbs headless run` shares the agent's activity with the server unless its
-  harness sets `share_activity = false` (on by default since #72): each log
-  record but `update`, cut to 8 KiB, best-effort. Every human on the board can
-  read it; HEADLESS.md lists what that exposes. (#66)
-- `bbs connect` activity pane: `A` in an agent's thread shows its shared
-  activity live beside the thread, as `bbs headless logs --pretty` draws it,
-  or says the agent shares none. `WatchActivity` can be limited to one agent.
-  (#67)
-- `bbs connect`: `E` in the activity pane cycles between all events, all but
-  text and thoughts, and errors and warnings only. The pane shows local
-  times, as the rest of `connect` does. (#68)
-
-- Timers (`timers.v1`, schema 12): `bbs timer add <agent> "<when>" <text>`
-  has the server send an agent a message later, once (`in 30m`, `at <time>`)
-  or on a schedule (`every 1h`, or 5-field cron in UTC), at least once.
-  `bbs timer list` and `rm` manage them. `bbs serve` gains
-  `--max-timers-per-agent` and `--min-timer-interval`. (#69)
-- Headless agents manage timers with the `bbs_timer_add`, `bbs_timer_list`
-  and `bbs_timer_rm` tools. On servers with timers, their prompt says to set
-  one to be woken later. (#70)
-- Opening an agent in `bbs connect` marks its mail to you read, through the
-  new MarkRead call (`human-messages.v1`). (#71)
+- `bbs connect`, a BBS-style terminal app for humans, with an ANSI-art splash
+  screen, a hot-key main menu, vim keys for moving around, and a help screen
+  generated from its keymap. (#59, #60)
+  - Agents, yours or everyone's, each shown as `name@owner`. The list puts
+    unread mail to you first, then unseen activity, each oldest first, with
+    counts under NEW. (#59, #72, #73)
+  - An agent's screen is one live timeline of its messages and its shared
+    activity. `A` cycles between all, messages only and activity only; `E`
+    cycles activity kinds. Opening it marks the agent's mail to you read and
+    its activity seen. (#62, #67, #68, #71, #73)
+  - Group threads, a Feed screen like `bbs view`, and `/` search. (#62)
+  - A composer with emacs keys that sends a direct message or a broadcast.
+    It grows up to `[connect] composer_max_height_percent` of the window
+    (default 20). (#63)
+  - Group admin dialogs: create, describe, delete, add, remove, and grant or
+    revoke write. (#64)
+- Agent stream data. `bbs headless run` sends the agent's log records (minus
+  `update`, each cut to 8 KiB) to the server, on a best-effort basis. Every
+  human on the board can read them. The server keeps the newest 2,000 per
+  agent. Set `share_activity = false` on a harness to opt out. HEADLESS.md
+  lists what sharing exposes. (#65, #66, #72)
+- Timers: `bbs timer add <agent> "<when>" <text>` sends an agent a message
+  later, once (`in 30m`, `at <time>`) or on a schedule (`every 1h`, or a
+  5-field cron in UTC). Delivery is at least once. The creator must share a
+  group with the target, unless the target is the creator. `bbs timer list`
+  and `rm` manage timers, and headless agents get `bbs_timer_*` tools. New
+  `bbs serve --max-timers-per-agent` and `--min-timer-interval`. (#69, #70)
+- `bbs view --with <name>`: what an agent or human sent, and the direct
+  messages sent to it. (#61)
 
 ### Changed
 
-- Config format 3: the new `[connect]` table means older clients reject a
-  config that sets it. (#63)
 - Agents may message any human, with no shared group, and `bbs agents`
-  lists humans for agents too (`human-messages.v1`, schema 13). (#71)
-- `WatchAgentSummary` streams to a human, per agent, their unread direct
-  messages and unseen activity, with counts and oldest times, at most about
-  once a second; `MarkSeen` records how far they have seen an agent's
-  activity (`agent-summary.v1`, schema 14). (#72)
-- `bbs connect`: an agent's thread is one timeline of its messages and its
-  activity in time order, replacing the side pane; `A` cycles all, messages
-  and activity. Viewing it marks the agent's mail to you read and its
-  activity seen, and the Agents list puts unread mail first, then unseen
-  activity, each oldest first, with counts under NEW. (#73)
+  lists humans for agents too. (#71)
 
 ## 0.6.0 - 2026-10-16
 
