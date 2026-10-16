@@ -102,6 +102,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut backend = Backend::open(&config, &dir, caller).await?;
     match cli.command {
         Command::View(args) => crate::view::run(&mut backend, args).await,
+        Command::Connect => crate::connect::run(backend, config.server.clone()).await,
         Command::Read {
             limit,
             wait: true,
@@ -140,7 +141,8 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
         | Command::Backup { .. }
         | Command::Version { .. }
         | Command::Setup(_)
-        | Command::View(_) => {
+        | Command::View(_)
+        | Command::Connect => {
             unreachable!()
         }
         Command::Human {
