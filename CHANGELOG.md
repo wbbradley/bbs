@@ -9,6 +9,14 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+## 0.5.0 - 2026-10-16
+
+The schema is unchanged (10), so a 0.4.0 server can still open the database.
+0.4.0 and 0.5.0 clients and servers interoperate (protocol epoch 2);
+`bbs group add` needs a 0.5.0 server and fails clearly against 0.4.0. This is
+the first release published to crates.io as `bbs-cli`: install it with
+`cargo install --locked bbs-cli`, then run `bbs setup`.
+
 ### Added
 
 - `bbs group add <group> <agent>...` lets any human add agents to a group,
