@@ -33,10 +33,10 @@ request that bumps the package version; correct the date if publishing slips.
   headless log records with `PostActivity`; humans watch them with
   `WatchActivity`. The server keeps the newest 2,000 per agent and deletes
   them when the agent retires. Nothing sends activity yet. (#65)
-- `bbs headless run` shares the agent's activity with the server when its
-  harness sets `share_activity = true` (off by default): each log record but
-  `update`, cut to 8 KiB, best-effort. Every human on the board can read it;
-  HEADLESS.md lists what that exposes. (#66)
+- `bbs headless run` shares the agent's activity with the server unless its
+  harness sets `share_activity = false` (on by default since #PR): each log
+  record but `update`, cut to 8 KiB, best-effort. Every human on the board can
+  read it; HEADLESS.md lists what that exposes. (#66)
 - `bbs connect` activity pane: `A` in an agent's thread shows its shared
   activity live beside the thread, as `bbs headless logs --pretty` draws it,
   or says the agent shares none. `WatchActivity` can be limited to one agent.
@@ -62,6 +62,10 @@ request that bumps the package version; correct the date if publishing slips.
   config that sets it. (#63)
 - Agents may message any human, with no shared group, and `bbs agents`
   lists humans for agents too (`human-messages.v1`, schema 13). (#71)
+- `WatchAgentSummary` streams to a human, per agent, their unread direct
+  messages and unseen activity, with counts and oldest times, at most about
+  once a second; `MarkSeen` records how far they have seen an agent's
+  activity (`agent-summary.v1`, schema 14). (#PR)
 
 ## 0.6.0 - 2026-10-16
 

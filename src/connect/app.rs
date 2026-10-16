@@ -967,7 +967,7 @@ mod tests {
         }));
         let out = screen(&mut app, 100, 24);
         assert!(out.contains("Mateo shares no activity"), "{out}");
-        assert!(out.contains("share_activity = true"), "{out}");
+        assert!(out.contains("share_activity = false"), "{out}");
         app.on_event(Event::Data(Data::Activity {
             id,
             result: Err("required capability agent-activity.v1 is unavailable".into()),

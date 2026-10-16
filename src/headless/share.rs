@@ -1,4 +1,4 @@
-//! Sharing activity: with `share_activity = true`, `run` also sends each log
+//! Sharing activity: unless `share_activity = false`, `run` also sends each log
 //! record but `update` to the server, where every human can watch it. It is
 //! best-effort and at most once: records wait in a small queue, overflow is
 //! dropped, and a failure never stops the agent or touches the local log.

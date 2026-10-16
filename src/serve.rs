@@ -150,6 +150,71 @@ struct State {
 
 type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
+/// What a watch stream waits on between snapshots: one change signal, or
+/// two, and optionally a shortest time between fetches, so a busy board
+/// costs a watcher at most one fetch per interval.
+struct Changes {
+    signal: watch::Receiver<u64>,
+    also: Option<watch::Receiver<u64>>,
+    interval: Option<(Duration, tokio::time::Instant)>,
+}
+
+impl Changes {
+    fn new(signal: watch::Receiver<u64>) -> Changes {
+        Changes {
+            signal,
+            also: None,
+            interval: None,
+        }
+    }
+
+    /// Wake on either signal, at most once per `interval`.
+    fn coalesced(
+        signal: watch::Receiver<u64>,
+        also: watch::Receiver<u64>,
+        interval: Duration,
+    ) -> Changes {
+        Changes {
+            signal,
+            also: Some(also),
+            interval: Some((interval, tokio::time::Instant::now())),
+        }
+    }
+
+    /// Until a change, and then until the interval since the last fetch is up.
+    async fn changed(&mut self) {
+        // A signal's sender lives as long as the server state, so neither ends.
+        match &mut self.also {
+            Some(also) => {
+                tokio::select! {
+                    _ = self.signal.changed() => {}
+                    _ = also.changed() => {}
+                }
+            }
+            None => {
+                let _ = self.signal.changed().await;
+            }
+        }
+        if let Some((interval, last)) = self.interval {
+            tokio::time::sleep_until(last + interval).await;
+        }
+    }
+
+    /// About to fetch: what has changed so far is covered.
+    fn taken(&mut self) {
+        self.signal.borrow_and_update();
+        if let Some(also) = &mut self.also {
+            also.borrow_and_update();
+        }
+        if let Some((_, last)) = &mut self.interval {
+            *last = tokio::time::Instant::now();
+        }
+    }
+}
+
+/// The shortest time between a summary watcher's fetches.
+const SUMMARY_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The longest the scheduler sleeps, so a changed wall clock is noticed.
 const TIMER_RECHECK: Duration = Duration::from_secs(60);
 
@@ -473,7 +538,7 @@ impl Server {
         &self,
         rpc: &'static str,
         req: Request<R>,
-        mut changes: watch::Receiver<u64>,
+        mut changes: Changes,
     ) -> Result<Response<BoxStream<R::Snapshot>>, Status> {
         self.0.protocol.validate(req.metadata())?;
         let result = async {
@@ -499,6 +564,7 @@ impl Server {
                     let mut req = req;
                     let mut snapshot = Ok(first);
                     let mut sent = false;
+                    let mut last: Option<R::Snapshot> = None;
                     loop {
                         if let Err(status) = &snapshot {
                             state.warn_failed(rpc, &caller, status).await;
@@ -510,7 +576,13 @@ impl Server {
                             Ok(s) => (req.advance(s), R::is_empty(s)),
                             Err(_) => (false, false),
                         };
-                        let skip = sent && empty && req.has_cursor();
+                        let repeat = R::ONLY_CHANGES
+                            && last.is_some()
+                            && snapshot.as_ref().ok() == last.as_ref();
+                        let skip = (sent && empty && req.has_cursor()) || repeat;
+                        if R::ONLY_CHANGES && !skip {
+                            last = snapshot.as_ref().ok().cloned();
+                        }
                         if !skip && (tx.send(snapshot).await.is_err() || failed) {
                             return;
                         }
@@ -521,7 +593,7 @@ impl Server {
                                 _ = tx.closed() => return,
                             }
                         }
-                        changes.borrow_and_update();
+                        changes.taken();
                         let (c, r) = (caller.clone(), req.clone());
                         snapshot = state.call(move |conn| R::fetch(conn, &c, r)).await;
                     }
@@ -870,7 +942,7 @@ impl Bbs for Server {
         req: Request<proto::FeedRequest>,
     ) -> Result<Response<Self::WatchFeedStream>, Status> {
         let changes = self.0.notify.subscribe();
-        self.watch("watch_feed", req, changes).await
+        self.watch("watch_feed", req, Changes::new(changes)).await
     }
 
     async fn post_activity(
@@ -924,6 +996,32 @@ impl Bbs for Server {
         self.0.protocol.finish(result)
     }
 
+    async fn watch_agent_summary(
+        &self,
+        req: Request<proto::AgentSummaryRequest>,
+    ) -> Result<Response<Self::WatchAgentSummaryStream>, Status> {
+        let changes = Changes::coalesced(
+            self.0.notify.subscribe(),
+            self.0.activity.subscribe(),
+            SUMMARY_INTERVAL,
+        );
+        self.watch("watch_agent_summary", req, changes).await
+    }
+
+    async fn mark_seen(
+        &self,
+        req: Request<proto::MarkSeenRequest>,
+    ) -> Result<Response<proto::MarkSeenResponse>, Status> {
+        // As with mark_read, only a moved cursor wakes summary watchers.
+        let response = self
+            .unary("mark_seen", req, Effect::Query, service::mark_seen)
+            .await?;
+        if response.get_ref().moved {
+            self.0.changed();
+        }
+        Ok(response)
+    }
+
     async fn mark_read(
         &self,
         req: Request<proto::MarkReadRequest>,
@@ -966,6 +1064,7 @@ impl Bbs for Server {
             .await
     }
 
+    type WatchAgentSummaryStream = BoxStream<proto::AgentSummarySnapshot>;
     type WatchActivityStream = BoxStream<proto::ActivitySnapshot>;
 
     async fn watch_activity(
@@ -973,7 +1072,8 @@ impl Bbs for Server {
         req: Request<proto::ActivityRequest>,
     ) -> Result<Response<Self::WatchActivityStream>, Status> {
         let changes = self.0.activity.subscribe();
-        self.watch("watch_activity", req, changes).await
+        self.watch("watch_activity", req, Changes::new(changes))
+            .await
     }
 
     async fn bind_session(
@@ -1402,6 +1502,31 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_changes_wake_on_either_signal_at_most_once_per_interval() {
+        let (notify, activity) = (watch::Sender::new(0u64), watch::Sender::new(0u64));
+        let mut changes =
+            Changes::coalesced(notify.subscribe(), activity.subscribe(), SUMMARY_INTERVAL);
+        let start = tokio::time::Instant::now();
+        changes.taken();
+        // A burst on both signals is one wake, a full interval after the fetch.
+        for _ in 0..5 {
+            notify.send_modify(|v| *v += 1);
+            activity.send_modify(|v| *v += 1);
+        }
+        changes.changed().await;
+        assert_eq!(start.elapsed(), SUMMARY_INTERVAL);
+        changes.taken();
+        // The burst is covered: nothing wakes until the next change, on
+        // either signal; one long after the last fetch wakes at once.
+        let quiet = tokio::time::timeout(Duration::from_secs(60), changes.changed()).await;
+        assert!(quiet.is_err());
+        activity.send_modify(|v| *v += 1);
+        let before = tokio::time::Instant::now();
+        changes.changed().await;
+        assert_eq!(before.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test]

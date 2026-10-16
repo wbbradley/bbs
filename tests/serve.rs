@@ -671,6 +671,72 @@ async fn humans_mark_an_agents_mail_read_and_only_a_change_refreshes_feeds() {
 }
 
 #[tokio::test]
+async fn agent_summaries_stream_what_a_human_has_yet_to_read_or_see() {
+    let server = Server::start("summary");
+    let mut client = server.client().await;
+    client
+        .ensure_human(proto::EnsureHumanRequest {
+            name: "will".into(),
+        })
+        .await
+        .unwrap();
+    let a = register(&mut client).await;
+    let refused = client
+        .watch_agent_summary(as_agent(&a.token, proto::AgentSummaryRequest {}))
+        .await
+        .unwrap_err();
+    assert!(refused.message().contains("humans only"), "{refused}");
+    let mut summaries = client
+        .watch_agent_summary(as_human("will", proto::AgentSummaryRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut next = async || {
+        tokio::time::timeout(Duration::from_secs(10), summaries.message())
+            .await
+            .expect("a summary")
+            .unwrap()
+            .unwrap()
+            .agents
+    };
+    assert!(next().await.is_empty());
+
+    let dm = proto::SendRequest {
+        to: "will".into(),
+        body: "a question".into(),
+        control: None,
+    };
+    client.send(as_agent(&a.token, dm)).await.unwrap();
+    let s = next().await;
+    assert_eq!((s[0].unread_messages, s[0].unseen_stream), (1, 0), "{s:?}");
+
+    // A change that leaves the summary as it was sends nothing, so the next
+    // summary is the activity's.
+    let status = proto::SetStatusRequest {
+        text: "busy".into(),
+    };
+    client.set_status(as_agent(&a.token, status)).await.unwrap();
+    let events = tokio_stream::iter(vec![proto::ActivityEvent {
+        record: r#"{"ts":"2026-10-16T12:00:00Z","event":"text"}"#.into(),
+    }]);
+    client
+        .post_activity(as_agent(&a.token, events))
+        .await
+        .unwrap();
+    let s = next().await;
+    assert_eq!((s[0].unread_messages, s[0].unseen_stream), (1, 1), "{s:?}");
+
+    let seen = proto::MarkSeenRequest {
+        agent: a.name.clone(),
+        through_id: i64::MAX,
+    };
+    let moved = client.mark_seen(as_human("will", seen)).await.unwrap();
+    assert!(moved.into_inner().moved);
+    let s = next().await;
+    assert_eq!((s[0].unread_messages, s[0].unseen_stream), (1, 0), "{s:?}");
+}
+
+#[tokio::test]
 async fn feed_filters_are_advertised_and_applied_server_side() {
     let server = Server::start("feed-filter");
     let mut client = server.client().await;

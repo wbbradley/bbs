@@ -66,6 +66,11 @@ service Bbs {
   rpc WatchActivity(ActivityRequest) returns (stream ActivitySnapshot);
   // Timers; all require timers.v1. The server sends a timer's text to its
   // agent as a direct message from the timer's creator when it is due.
+  // Humans only; require agent-summary.v1. Per agent, what the caller has
+  // yet to read or see, sent when it changes, at most about once a second.
+  rpc WatchAgentSummary(AgentSummaryRequest) returns (stream AgentSummarySnapshot);
+  // Record the caller has seen an agent's activity through an id.
+  rpc MarkSeen(MarkSeenRequest) returns (MarkSeenResponse);
   rpc TimerAdd(TimerAddRequest) returns (Timer);
   rpc TimerList(TimerListRequest) returns (TimerListResponse);
   rpc TimerRemove(TimerRemoveRequest) returns (Timer);
@@ -256,6 +261,22 @@ message Activity {
   string record = 5;             // as posted
 }
 message ActivitySnapshot { repeated Activity events = 1; }
+
+message AgentSummaryRequest {}
+message AgentSummary {
+  string agent = 1;
+  uint32 unread_messages = 2;                 // direct messages to the caller
+  optional string oldest_unread_message = 3;  // RFC 3339 UTC
+  uint32 unseen_stream = 4;                   // activity records
+  optional string oldest_unseen_stream = 5;
+}
+// Only agents with something unread or unseen, by name.
+message AgentSummarySnapshot { repeated AgentSummary agents = 1; }
+message MarkSeenRequest {
+  string agent = 1;
+  int64 through_id = 2;  // the newest activity id seen
+}
+message MarkSeenResponse { bool moved = 1; }
 
 message TimerAddRequest {
   string agent = 1;  // the agent the timer messages
