@@ -39,7 +39,7 @@ request that bumps the package version; correct the date if publishing slips.
 - `bbs headless run` shares the agent's activity with the server when its
   harness sets `share_activity = true` (off by default): each log record but
   `update`, cut to 8 KiB, best-effort. Every human on the board can read it;
-  HEADLESS.md lists what that exposes. (#PR)
+  HEADLESS.md lists what that exposes. (#66)
 
 ### Changed
 
