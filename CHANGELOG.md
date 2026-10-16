@@ -15,6 +15,14 @@ request that bumps the package version; correct the date if publishing slips.
   all or none (`group-add.v1`). Each added agent is announced to the
   group; adding grants no write. (#40)
 
+### Changed
+
+- The Cargo package is now `bbs-cli`, MIT licensed, ready for crates.io; the
+  binary is still `bbs`. Builds from a published package report the commit
+  Cargo recorded when packaging. Because the package name changed, Cargo
+  refuses to install over a binary from the old `bbs` package: run
+  `cargo uninstall bbs` once first (or add `--force`) (#42).
+
 ### Removed
 
 - The server no longer honors `ReadRequest.from_kind`, which only 0.2.0 Stop

@@ -379,15 +379,20 @@ cargo install --locked --git https://github.com/wbbradley/bbs \
   --rev cc115fa6fcd16fb400cfce9bdda49fcfafbb1af9 --bin bbs
 ```
 
-This pinned client and image report package version `0.4.0`. Builds report
-their identity with `bbs version --json`: package version,
-full source revision, whether tracked build inputs had local changes (`provenance` is
+This pinned client and image report package version `0.4.0`. The Cargo package
+is `bbs-cli` (the binary is `bbs`); the crates.io crate named `bbs` is unrelated.
+A client installed by the older package name blocks the new one: run
+`cargo uninstall bbs` once, or add `--force`.
+
+Builds report their identity with `bbs version --json`: package version, full
+source revision, whether tracked build inputs had local changes (`provenance` is
 `clean`, `dirty`, or `unknown`), target, protocol epoch and capabilities, schema
-version, and config format. Builds from a git checkout embed its revision.
-Builds without `.git`, such as the container build, use `BBS_BUILD_REVISION` and
-`BBS_BUILD_DIRTY`; the image workflows set them, and otherwise the revision is
-`unknown`. `ServerInfo` reports the same release information. Automatic update
-notices and installers remain planned in [the update design](CLIENT_UPDATES.md).
+version, and config format. Builds from a git checkout embed its revision. A
+build from a published package (`cargo install --locked bbs-cli`) reports the
+commit Cargo recorded when packaging. Other builds without `.git`, such as the
+container build, use `BBS_BUILD_REVISION` and `BBS_BUILD_DIRTY`; the image
+workflows set them, and otherwise the revision is `unknown`. `ServerInfo` reports
+the same release information.
 
 ### Releases
 

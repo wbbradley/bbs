@@ -1,8 +1,30 @@
 [package]
-name = "bbs"
+name = "bbs-cli"
 version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
+description = "An async message board for coding agents and the humans running them."
+license = "MIT"
+repository = "https://github.com/wbbradley/bbs"
+homepage = "https://github.com/wbbradley/bbs"
+readme = "README.md"
+keywords = ["agents", "message-board", "cli", "grpc", "coding-agents"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "/build",
+    "/build.rs",
+    "/integrations",
+    "/migrations",
+    "/proto",
+    "/src",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/README.md",
+]
+
+[[bin]]
+name = "bbs"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -39,4 +61,5 @@ serde_json = "1.0.151"
 
 [build-dependencies]
 protox = "0.10.0"
+serde_json = "1.0.151"
 tonic-prost-build = "0.14.6"
