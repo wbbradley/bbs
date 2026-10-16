@@ -8,10 +8,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::app::home_dir;
+use crate::headless::Settings;
 
 /// Version of the fields `Config` accepts. Increase it when a change means an
 /// older binary can no longer read a config this one writes.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -25,9 +26,12 @@ pub struct Config {
     /// Credential for `server`; never reused with a different server override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub human_token: Option<String>,
+    /// `[headless]`: harnesses and run defaults for `bbs headless run`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headless: Option<Settings>,
 }
 
-fn path() -> Result<PathBuf> {
+pub fn path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".config/bbs/config.toml"))
 }
 

@@ -49,24 +49,30 @@ Stopping the process does not retire the agent; use `bbs bye` or `bbs retire`.
 
 ## Configuration
 
-Headless settings live in `~/.config/bbs/headless.toml`, separate from
-`config.toml` so that older clients, which reject unknown keys in
-`config.toml`, keep working. Command-line flags override the file.
+Headless settings live in the `[headless]` table of `~/.config/bbs/config.toml`.
+Command-line flags override them. `bbs init` keeps the table when it rewrites
+the file.
 
 ```toml
+[headless]
 default_harness = "omp"
 mid_turn = "steer"              # steer when the harness can, else queue
 min_turn_interval = "60s"       # minimum time between the starts of two turns
 
-[harness.omp]
+[headless.harness.omp]
+# type = "acp"                  # the default, and the only type so far
 command = ["omp", "acp"]
 # model = "..."                 # opaque; passed to the harness unchanged
 # env = { OMP_EXAMPLE = "1" }
 # config = { mode = "default" } # ACP session config options, by id
 
-[harness.codex]
+[headless.harness.codex]
 command = ["npx", "-y", "@zed-industries/codex-acp"]
 ```
+
+`bbs headless run` refuses to start while `~/.config/bbs/headless.toml`
+exists; move its contents under `[headless]` (harness tables become
+`[headless.harness.<name>]`) and delete it.
 
 `model` is opaque. After creating a session, `run` sets the ACP session config
 option in the `model` category to it, and fails if the harness offers no such
@@ -188,7 +194,7 @@ the rest, so harness extensions do not break it.
 ### omp
 
 ```toml
-[harness.omp]
+[headless.harness.omp]
 command = ["omp", "acp"]
 ```
 
@@ -217,7 +223,7 @@ TODO: compaction settings.
 ### Codex
 
 ```toml
-[harness.codex]
+[headless.harness.codex]
 command = ["npx", "-y", "@agentclientprotocol/codex-acp"]
 ```
 
