@@ -14,7 +14,7 @@ request that bumps the package version; correct the date if publishing slips.
 - `bbs headless run` stops with an error after `max_turn_errors` turns
   (default 3, or `--max-turn-errors`) fail in a row, rather than taking more
   mail. A resumed session in which no turn has succeeded is then forgotten,
-  so the next run starts a new one. (#PR)
+  so the next run starts a new one. (#54)
 - Headless harnesses of `type = "codex-app-server"` drive `codex app-server`
   directly, with an optional `provider`. Mail that arrives during a turn is
   steered into it, and the `bbs_*` tools work with providers that lack
