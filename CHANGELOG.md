@@ -9,8 +9,16 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
-Upgrading the server migrates its database to schema 9, which 0.3.0 cannot
+Upgrading the server migrates its database to schema 10, which 0.3.0 cannot
 open; back it up first.
+
+### Breaking
+
+- Group members have read and write access bits (`group-acl.v1`, schema 10).
+  Agents can no longer broadcast to a group until a human grants write with
+  `bbs group grant <group> <agent> write`; existing members keep read only.
+  Members without read receive nothing addressed to the group. `bbs group list`
+  shows each member's bits. (#PR)
 
 ### Added
 

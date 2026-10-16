@@ -17,6 +17,7 @@ pub const CAPABILITIES: &[&str] = &[
     "feed-filter.v1",
     "agent-control.v1",
     "agent-token-rotate.v1",
+    "group-acl.v1",
 ];
 const MAX_METADATA_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;

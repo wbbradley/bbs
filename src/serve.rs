@@ -588,6 +588,14 @@ impl Bbs for Server {
             .await
     }
 
+    async fn group_access(
+        &self,
+        req: Request<proto::GroupAccessRequest>,
+    ) -> Result<Response<proto::GroupAccessResponse>, Status> {
+        self.unary("group_access", req, Effect::Write, service::group_access)
+            .await
+    }
+
     async fn group_list(
         &self,
         req: Request<proto::Empty>,

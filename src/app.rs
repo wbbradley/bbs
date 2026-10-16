@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::backend::{Backend, Local, Remote};
-use crate::cli::{Cli, Command, GroupCommand, HumanCommand};
+use crate::cli::{AccessArg, Cli, Command, GroupCommand, HumanCommand};
 use crate::config::Config;
 use crate::proto;
 use crate::service::{Caller, MAX_BODY_BYTES, fmt_time};
@@ -182,6 +182,16 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 let r = backend.group_remove(req).await?;
                 format!("Removed {} from @{}.\n", r.agent, r.group)
             }
+            GroupCommand::Grant {
+                group,
+                agent,
+                access,
+            } => group_access(backend, group, agent, access, true).await?,
+            GroupCommand::Revoke {
+                group,
+                agent,
+                access,
+            } => group_access(backend, group, agent, access, false).await?,
             GroupCommand::List { json } => {
                 format_groups(&backend.group_list().await?.groups, json)?
             }
@@ -340,6 +350,9 @@ struct GroupJson<'a> {
     name: &'a str,
     members: &'a [String],
     description: Option<&'a str>,
+    /// Null from servers without group-acl.v1.
+    readers: Option<&'a [String]>,
+    writers: Option<&'a [String]>,
 }
 
 #[derive(Serialize)]
@@ -385,6 +398,8 @@ pub(crate) fn format_groups(groups: &[proto::Group], json: bool) -> Result<Strin
             name: &g.name,
             members: &g.members,
             description: g.description.as_deref(),
+            readers: g.access.as_ref().map(|a| &a.readers[..]),
+            writers: g.access.as_ref().map(|a| &a.writers[..]),
         }));
     }
     let mut out = String::new();
@@ -392,7 +407,19 @@ pub(crate) fn format_groups(groups: &[proto::Group], json: bool) -> Result<Strin
         let members = if g.members.is_empty() {
             "(no agents)".to_string()
         } else {
-            g.members.join(", ")
+            g.members
+                .iter()
+                .map(|m| match &g.access {
+                    Some(a) => {
+                        let read = if a.readers.contains(m) { "r" } else { "" };
+                        let write = if a.writers.contains(m) { "w" } else { "" };
+                        let bits = format!("{read}{write}");
+                        format!("{m} [{}]", if bits.is_empty() { "-" } else { &bits })
+                    }
+                    None => m.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         writeln!(out, "@{}: {members}", g.name)?;
         // Indented under its group so member parsing stays one `@group: ...` row.
@@ -401,6 +428,32 @@ pub(crate) fn format_groups(groups: &[proto::Group], json: bool) -> Result<Strin
         }
     }
     Ok(out)
+}
+
+async fn group_access(
+    backend: &mut Backend,
+    group: String,
+    agent: String,
+    access: AccessArg,
+    grant: bool,
+) -> Result<String> {
+    let (bit, name) = match access {
+        AccessArg::Read => (proto::GroupAccessBit::Read, "read"),
+        AccessArg::Write => (proto::GroupAccessBit::Write, "write"),
+    };
+    let req = proto::GroupAccessRequest {
+        group,
+        agent,
+        access: bit.into(),
+        grant,
+    };
+    let r = backend.group_access(req).await?;
+    Ok(match (grant, r.changed) {
+        (true, true) => format!("Granted {name} on @{} to {}.\n", r.group, r.agent),
+        (false, true) => format!("Revoked {name} on @{} from {}.\n", r.group, r.agent),
+        (true, false) => format!("{} already has {name} on @{}.\n", r.agent, r.group),
+        (false, false) => format!("{} already lacks {name} on @{}.\n", r.agent, r.group),
+    })
 }
 
 pub(crate) fn identity_line(name: &str, token: &str) -> String {

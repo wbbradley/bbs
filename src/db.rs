@@ -21,6 +21,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0007_group_description.sql"),
     include_str!("../migrations/0008_feed_indexes.sql"),
     include_str!("../migrations/0009_message_control.sql"),
+    include_str!("../migrations/0010_group_access.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,31 @@ pub struct GroupRow {
     pub name: String,
     pub description: Option<String>,
     pub members: Vec<String>,
+    pub readers: Vec<String>,
+    pub writers: Vec<String>,
+}
+
+/// One of a group member's access bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Read,
+    Write,
+}
+
+impl Access {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Access::Read => "read",
+            Access::Write => "write",
+        }
+    }
+
+    fn column(self) -> &'static str {
+        match self {
+            Access::Read => "can_read",
+            Access::Write => "can_write",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -560,6 +586,53 @@ pub fn is_member(conn: &Connection, group_id: i64, agent_id: i64) -> Result<bool
     Ok(n > 0)
 }
 
+/// A member's access bit in an active group; `None` for non-members.
+pub fn member_access(
+    conn: &Connection,
+    group_id: i64,
+    agent_id: i64,
+    access: Access,
+) -> Result<Option<bool>> {
+    let sql = format!(
+        "SELECT m.{} FROM group_members m JOIN bbs_groups g ON g.id = m.group_id
+         WHERE m.group_id = ?1 AND m.agent_id = ?2 AND g.archived_at IS NULL",
+        access.column()
+    );
+    Ok(conn
+        .query_row(&sql, params![group_id, agent_id], |r| r.get(0))
+        .optional()?)
+}
+
+/// Set a member's access bit; returns false if it already had that value.
+pub fn set_member_access(
+    conn: &Connection,
+    group_id: i64,
+    agent_id: i64,
+    access: Access,
+    value: bool,
+) -> Result<bool> {
+    let sql = format!(
+        "UPDATE group_members SET {0} = ?3
+         WHERE group_id = ?1 AND agent_id = ?2 AND {0} != ?3",
+        access.column()
+    );
+    Ok(conn.execute(&sql, params![group_id, agent_id, value])? > 0)
+}
+
+/// Names of the group's live writers.
+pub fn group_writers(conn: &Connection, group_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.name FROM group_members m JOIN agents a ON a.id = m.agent_id
+         WHERE m.group_id = ?1 AND m.can_write AND a.retired_at IS NULL
+         ORDER BY lower(a.name)",
+    )?;
+    let names = stmt
+        .query_map(params![group_id], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(names)
+}
+
+/// DM eligibility: any shared membership counts, whatever its access bits.
 pub fn share_group(conn: &Connection, a: i64, b: i64) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM group_members x
@@ -572,11 +645,13 @@ pub fn share_group(conn: &Connection, a: i64, b: i64) -> Result<bool> {
     Ok(n > 0)
 }
 
-pub fn group_member_ids(conn: &Connection, group_id: i64) -> Result<Vec<i64>> {
+/// Live members that receive what is addressed to the group.
+pub fn group_reader_ids(conn: &Connection, group_id: i64) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
         "SELECT m.agent_id FROM group_members m JOIN agents a ON a.id = m.agent_id
          JOIN bbs_groups g ON g.id = m.group_id
-         WHERE m.group_id = ?1 AND a.retired_at IS NULL AND g.archived_at IS NULL
+         WHERE m.group_id = ?1 AND m.can_read AND a.retired_at IS NULL
+           AND g.archived_at IS NULL
          ORDER BY m.agent_id",
     )?;
     let ids = stmt
@@ -601,7 +676,8 @@ pub fn member_groups(conn: &Connection, agent_id: i64) -> Result<Vec<(i64, Strin
 /// `agent_id` belongs to.
 pub fn list_groups(conn: &Connection, agent_id: Option<i64>) -> Result<Vec<GroupRow>> {
     let mut stmt = conn.prepare(
-        "SELECT g.id, g.name, g.description, a.name FROM bbs_groups g
+        "SELECT g.id, g.name, g.description, a.name, m.can_read, m.can_write
+         FROM bbs_groups g
          LEFT JOIN group_members m ON m.group_id = g.id
          LEFT JOIN agents a ON a.id = m.agent_id
          WHERE g.archived_at IS NULL
@@ -615,20 +691,31 @@ pub fn list_groups(conn: &Connection, agent_id: Option<i64>) -> Result<Vec<Group
             r.get::<_, String>(1)?,
             r.get::<_, Option<String>>(2)?,
             r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<bool>>(4)?,
+            r.get::<_, Option<bool>>(5)?,
         ))
     })?;
     for row in rows {
-        let (id, name, description, member) = row?;
+        let (id, name, description, member, read, write) = row?;
         if groups.last().is_none_or(|(g, _)| *g != id) {
             let group = GroupRow {
                 name,
                 description,
                 members: Vec::new(),
+                readers: Vec::new(),
+                writers: Vec::new(),
             };
             groups.push((id, group));
         }
         if let Some(member) = member {
-            groups.last_mut().unwrap().1.members.push(member);
+            let group = &mut groups.last_mut().unwrap().1;
+            if read == Some(true) {
+                group.readers.push(member.clone());
+            }
+            if write == Some(true) {
+                group.writers.push(member.clone());
+            }
+            group.members.push(member);
         }
     }
     Ok(groups.into_iter().map(|(_, group)| group).collect())
@@ -1221,21 +1308,24 @@ mod tests {
         assert_eq!(group_id(&conn, "acme").unwrap(), Some(1));
         assert_eq!(
             list_groups(&conn, None).unwrap(),
+            // Existing members can read but not write after migration.
             vec![GroupRow {
                 name: "acme".into(),
                 description: None,
                 members: vec!["Aiko".into()],
+                readers: vec!["Aiko".into()],
+                writers: vec![],
             }]
         );
         assert!(is_member(&conn, 1, 1).unwrap());
-        assert_eq!(group_member_ids(&conn, 1).unwrap(), vec![1]);
+        assert_eq!(group_reader_ids(&conn, 1).unwrap(), vec![1]);
         assert_eq!(member_groups(&conn, 1).unwrap(), vec![(1, "acme".into())]);
         archive_group(&conn, 1, "2026-10-15").unwrap();
         assert_eq!(group_id(&conn, "acme").unwrap(), None);
 
         assert!(!is_member(&conn, 1, 1).unwrap());
         assert!(!share_group(&conn, 1, 1).unwrap());
-        assert!(group_member_ids(&conn, 1).unwrap().is_empty());
+        assert!(group_reader_ids(&conn, 1).unwrap().is_empty());
         assert!(member_groups(&conn, 1).unwrap().is_empty());
         assert!(agent_groups(&conn).unwrap().is_empty());
         assert!(list_groups(&conn, None).unwrap().is_empty());
@@ -1270,7 +1360,7 @@ mod tests {
         assert!(index_sql.contains("WHERE archived_at IS NULL"));
         let new_id = insert_group(&conn, "acme", None, "2026-10-15").unwrap();
         assert_ne!(new_id, 1);
-        assert!(group_member_ids(&conn, new_id).unwrap().is_empty());
+        assert!(group_reader_ids(&conn, new_id).unwrap().is_empty());
         assert!(insert_group(&conn, "acme", None, "2026-10-15").is_err());
         assert!(
             conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
@@ -1299,6 +1389,8 @@ mod tests {
             name: "acme".into(),
             description: description.map(Into::into),
             members: vec![],
+            readers: vec![],
+            writers: vec![],
         };
         assert_eq!(list_groups(&conn, None).unwrap(), vec![row(None)]);
 
@@ -1331,6 +1423,8 @@ mod tests {
                 name: "new".into(),
                 description: Some("Fresh scope".into()),
                 members: vec![],
+                readers: vec![],
+                writers: vec![],
             }
         );
         assert_ne!(id, 1);
