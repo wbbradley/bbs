@@ -9,6 +9,10 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Added
+
+- `bbs headless run --new-session` starts a new harness session instead of resuming the saved one (#PR).
+
 ## 0.7.0 - 2026-10-16
 
 Servers must upgrade: this release adds schemas 11 to 14 and the capabilities
