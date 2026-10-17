@@ -94,20 +94,14 @@ impl Agents {
     }
 }
 
-/// What the viewer has yet to look at, as the NEW column shows it: unread
-/// messages (✉) and unseen activity (•), each counted to 99.
-fn pending(s: Option<&proto::AgentSummary>) -> String {
-    let Some(s) = s else {
-        return String::new();
-    };
-    let mut parts = Vec::new();
-    if s.unread_messages > 0 {
-        parts.push(format!("✉{}", s.unread_messages.min(99)));
+/// Count conventions shared by the inbox and activity columns: blank at zero,
+/// otherwise the source marker and a count capped at 99.
+fn pending(count: u32, marker: char) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!("{marker}{}", count.min(99))
     }
-    if s.unseen_stream > 0 {
-        parts.push(format!("•{}", s.unseen_stream.min(99)));
-    }
-    parts.join(" ")
 }
 
 impl Screen for Agents {
@@ -203,6 +197,14 @@ impl Screen for Agents {
             frame.render_widget(Paragraph::new(line), inner);
             return;
         }
+        // Keep both counts and a readable status at the minimum terminal width.
+        let groups_width = inner
+            .width
+            .saturating_sub(20 + 5 + 8 + 19 + 10 + 5)
+            .clamp(11, 16);
+        let status_width = inner
+            .width
+            .saturating_sub(20 + 5 + 8 + groups_width + 19 + 5) as usize;
         let rows = shown.iter().map(|a| {
             let owner = a.owner.as_deref().unwrap_or("?");
             let color = if owner == ctx.me {
@@ -217,11 +219,18 @@ impl Screen for Agents {
                 ),
                 Span::styled(format!("@{owner}"), Style::new().fg(color)),
             ]);
-            let status_width = inner.width.saturating_sub(22 + 7 + 16 + 19 + 4) as usize;
+            let summary = self.summary(&a.name);
             Row::new(vec![
                 name,
-                Line::styled(pending(self.summary(&a.name)), theme::heading()),
-                Line::raw(fit_list(&a.groups, 16)),
+                Line::styled(
+                    pending(summary.map_or(0, |s| s.unread_messages), '✉'),
+                    theme::heading(),
+                ),
+                Line::styled(
+                    pending(summary.map_or(0, |s| s.unseen_stream), '•'),
+                    theme::heading(),
+                ),
+                Line::raw(fit_list(&a.groups, groups_width as usize)),
                 Line::raw(local_time(&a.active_at)),
                 Line::raw(fit(a.status.as_deref().unwrap_or_default(), status_width)),
             ])
@@ -229,14 +238,18 @@ impl Screen for Agents {
         let table = Table::new(
             rows,
             [
-                Constraint::Length(22),
-                Constraint::Length(7),
-                Constraint::Length(16),
+                Constraint::Length(20),
+                Constraint::Length(5),
+                Constraint::Length(8),
+                Constraint::Length(groups_width),
                 Constraint::Length(19),
                 Constraint::Min(10),
             ],
         )
-        .header(Row::new(["AGENT", "NEW", "GROUPS", "ACTIVE", "STATUS"]).style(theme::heading()))
+        .header(
+            Row::new(["AGENT", "INBOX", "ACTIVITY", "GROUPS", "ACTIVE", "STATUS"])
+                .style(theme::heading()),
+        )
         .style(theme::base())
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
         if self.state.selected().is_none() {

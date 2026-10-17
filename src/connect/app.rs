@@ -636,7 +636,10 @@ mod tests {
         let out = screen(&mut app, 100, 24);
         let rows = order(&out, &["Ana@", "Bo@", "Cy@", "Di@", "Ed@"]);
         assert_eq!(rows, ["Ed@", "Cy@", "Di@", "Bo@", "Ana@"], "{out}");
-        assert!(out.contains("✉1 •4") && out.contains("•99"), "{out}");
+        assert!(
+            out.contains("✉1") && out.contains("•4") && out.contains("•99"),
+            "{out}"
+        );
         enter(&mut app);
         assert_eq!(watched(&mut rx).1.with.as_deref(), Some("Bo"));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
@@ -654,6 +657,100 @@ mod tests {
     }
 
     #[test]
+    fn agents_show_separate_inbox_and_activity_counts_at_minimum_width() {
+        let (mut app, mut rx) = app();
+        key(&mut app, 'a');
+        assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        let Request::WatchSummary(id) = rx.try_recv().unwrap() else {
+            panic!("expected summary watch");
+        };
+        let cases = [
+            ("Missing", 0, 0),
+            ("Zero", 0, 0),
+            ("One", 1, 2),
+            ("MailOnly", 4, 0),
+            ("ActivityOnly", 0, 5),
+            ("Limit", 99, 99),
+            ("Capped", 123, 1000),
+        ];
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: cases
+                .iter()
+                .map(|(name, _, _)| agent(name, "ada", &["crew"]))
+                .collect(),
+        }))));
+        app.on_event(Event::Data(Data::Summary {
+            id,
+            result: Ok(cases
+                .iter()
+                .skip(1)
+                .map(|(name, mail, activity)| proto::AgentSummary {
+                    agent: (*name).into(),
+                    unread_messages: *mail,
+                    unseen_stream: *activity,
+                    ..Default::default()
+                })
+                .collect()),
+        }));
+        for width in [80, 100] {
+            let out = screen(&mut app, width, 24);
+            let header: Vec<_> = out
+                .lines()
+                .find(|line| line.contains("INBOX"))
+                .unwrap()
+                .chars()
+                .collect();
+            let column = |label: &str| {
+                header
+                    .windows(label.len())
+                    .position(|s| s.iter().collect::<String>() == label)
+                    .unwrap()
+            };
+            let inbox = column("INBOX");
+            let activity = column("ACTIVITY");
+            assert!(
+                inbox + 5 < activity && activity + 8 < column("GROUPS"),
+                "{out}"
+            );
+            assert!(out.contains("ACTIVE") && out.contains("STATUS"), "{out}");
+            for (name, mail, stream) in cases {
+                let row: Vec<_> = out
+                    .lines()
+                    .find(|line| line.contains(&format!("{name}@")))
+                    .unwrap()
+                    .chars()
+                    .collect();
+                let cell = |start, len| {
+                    row[start..start + len]
+                        .iter()
+                        .collect::<String>()
+                        .trim()
+                        .to_string()
+                };
+                assert_eq!(
+                    cell(inbox, 5),
+                    if mail == 0 {
+                        String::new()
+                    } else {
+                        format!("✉{}", mail.min(99))
+                    },
+                    "{out}"
+                );
+                assert_eq!(
+                    cell(activity, 8),
+                    if stream == 0 {
+                        String::new()
+                    } else {
+                        format!("•{}", stream.min(99))
+                    },
+                    "{out}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn agent_cells_fit_their_columns() {
         let (mut app, mut rx) = app();
         open_agents(&mut app, &mut rx);
@@ -664,7 +761,7 @@ mod tests {
             agents: vec![busy],
         }))));
         let out = screen(&mut app, 80, 24);
-        assert!(out.contains("crew, release +1"), "{out}");
+        assert!(out.contains("crew +2"), "{out}");
         assert!(out.contains("reviewing…"), "{out}");
         // ACTIVE is local time, without the stored form's Z.
         let local = crate::ui::message::local_time("2026-10-16T18:00:00.000000Z");
@@ -1545,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_keeps_verbose_filters_and_does_not_mark_hidden_activity_seen() {
+    fn compact_keeps_verbose_filters_while_marking_hidden_activity_seen() {
         let (mut app, mut rx) = app();
         let (feed, act) = mateo_streams(&mut app, &mut rx);
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
@@ -1556,12 +1653,15 @@ mod tests {
             id: feed,
             result: Ok(vec![message(1, "Mateo", "ada", "visible-direct")]),
         }));
-        assert!(
-            rx.try_recv().is_err(),
-            "mail is hidden in verbose activity-only mode"
-        );
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("Mateo".into()));
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![proto::Message {
+                read_at: Some("2026-10-16T18:00:01Z".into()),
+                ..message(1, "Mateo", "ada", "visible-direct")
+            }]),
+        }));
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         app.on_event(Event::Data(Data::Activity {
             id: act,
             result: Ok(vec![
@@ -1569,6 +1669,13 @@ mod tests {
                 activity(8, "02", r#"{"event":"warning","message":"hidden-warning"}"#),
             ]),
         }));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Request::MarkSeen {
+                agent: "Mateo".into(),
+                through_id: 8
+            }
+        );
         key(&mut app, 'A');
         key(&mut app, 'E');
         let out = screen(&mut app, 120, 24);
@@ -1578,9 +1685,7 @@ mod tests {
                 && !out.contains("filtered-text"),
             "{out}"
         );
-        while let Ok(request) = rx.try_recv() {
-            assert!(!matches!(request, Request::MarkSeen { .. }));
-        }
+        assert!(rx.try_recv().is_err());
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let out = screen(&mut app, 120, 24);
         assert!(
@@ -1591,13 +1696,7 @@ mod tests {
             !out.contains("visible-direct") && !out.contains("filtered-text"),
             "{out}"
         );
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            Request::MarkSeen {
-                agent: "Mateo".into(),
-                through_id: 8
-            }
-        );
+        assert!(rx.try_recv().is_err(), "toggling does not re-mark activity");
     }
 
     #[test]
@@ -1871,7 +1970,101 @@ mod tests {
     }
 
     #[test]
-    fn viewing_activity_marks_it_seen_as_far_as_shown() {
+    fn active_conversations_mark_mail_and_activity_in_every_view_and_filter() {
+        for (compact, show_steps, kind_steps) in
+            [(true, 0, 0), (false, 1, 0), (false, 2, 1), (false, 0, 2)]
+        {
+            let (mut app, mut rx) = app();
+            app.ctx.preferences.set_compact(compact);
+            let (feed, act) = mateo_streams(&mut app, &mut rx);
+            press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+            for _ in 0..show_steps {
+                key(&mut app, 'A');
+            }
+            for _ in 0..kind_steps {
+                key(&mut app, 'E');
+            }
+            assert!(rx.try_recv().is_err(), "nothing received, nothing to mark");
+            for id in [1, 2] {
+                app.on_event(Event::Data(Data::Feed {
+                    id: feed,
+                    result: Ok(vec![message(id, "Mateo", "ada", "received mail")]),
+                }));
+                assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("Mateo".into()));
+                app.on_event(Event::Data(Data::Feed {
+                    id: feed,
+                    result: Ok(vec![proto::Message {
+                        read_at: Some("2026-10-16T18:00:01Z".into()),
+                        ..message(id, "Mateo", "ada", "received mail")
+                    }]),
+                }));
+                app.on_event(Event::Data(Data::Activity {
+                    id: act,
+                    result: Ok(vec![activity(
+                        id,
+                        "00",
+                        r#"{"event":"text","text":"filtered activity"}"#,
+                    )]),
+                }));
+                assert_eq!(
+                    rx.try_recv().unwrap(),
+                    Request::MarkSeen {
+                        agent: "Mateo".into(),
+                        through_id: id
+                    }
+                );
+                app.on_event(Event::Tick);
+                assert!(
+                    rx.try_recv().is_err(),
+                    "already received activity is not marked twice"
+                );
+            }
+            // Help covers the conversation; arrivals remain pending until it is uncovered.
+            key(&mut app, '?');
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(vec![message(3, "Mateo", "ada", "covered mail")]),
+            }));
+            app.on_event(Event::Data(Data::Activity {
+                id: act,
+                result: Ok(vec![activity(
+                    3,
+                    "00",
+                    r#"{"event":"text","text":"covered activity"}"#,
+                )]),
+            }));
+            assert!(rx.try_recv().is_err());
+            key(&mut app, 'q');
+            assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("Mateo".into()));
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                Request::MarkSeen {
+                    agent: "Mateo".into(),
+                    through_id: 3
+                }
+            );
+            // Closing stops both watches, and late batches do not mark anything.
+            key(&mut app, 'q');
+            assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(feed));
+            assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(act));
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(vec![message(4, "Mateo", "ada", "closed mail")]),
+            }));
+            app.on_event(Event::Data(Data::Activity {
+                id: act,
+                result: Ok(vec![activity(
+                    4,
+                    "00",
+                    r#"{"event":"text","text":"closed activity"}"#,
+                )]),
+            }));
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn viewing_activity_marks_received_records_seen_even_when_filtered() {
         let (mut app, mut rx) = app();
         let (_, act) = mateo_streams(&mut app, &mut rx);
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
@@ -1892,11 +2085,11 @@ mod tests {
         // Once marked, an unrelated update marks nothing.
         app.on_event(Event::Data(Data::Groups(Err("x".into()))));
         assert!(rx.try_recv().is_err());
-        // With messages alone shown, new activity is not seen.
+        // With messages alone shown, received activity is still seen.
         key(&mut app, 'A');
         app.on_event(Event::Data(batch(8)));
-        assert!(rx.try_recv().is_err());
-        key(&mut app, 'A');
         assert_eq!(rx.try_recv().unwrap(), seen(8));
+        key(&mut app, 'A');
+        assert!(rx.try_recv().is_err());
     }
 }
