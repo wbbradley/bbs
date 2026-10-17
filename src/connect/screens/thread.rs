@@ -3,7 +3,7 @@
 //! Agent and group threads have a composer below for writing to them, and
 //! group threads the admin dialogs.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -49,6 +49,8 @@ pub struct Thread {
     group: Option<(proto::Group, GroupAdmin)>,
     /// An agent thread's agent, whose mail to the human viewing marks read.
     agent: Option<String>,
+    /// Agent and owner identify a draft independently of its feed stream.
+    draft_key: Option<String>,
     /// An agent thread's activity, which viewing marks seen.
     stream: Option<Stream>,
     /// The newest activity marked seen.
@@ -76,6 +78,7 @@ impl Thread {
             composing: false,
             group: None,
             agent: None,
+            draft_key: None,
             stream: None,
             seen: 0,
         }
@@ -93,6 +96,12 @@ impl Thread {
         };
         let mut thread = Thread::new(title, req, Some(agent));
         thread.agent = Some(agent.to_string());
+        thread.draft_key = Some(format!(
+            "{}@{}",
+            agent.to_ascii_lowercase(),
+            owner.unwrap_or_default().to_ascii_lowercase()
+        ));
+        thread.composing = true;
         thread.human = Some(human.to_string());
         thread.stream = Some(Stream::new(agent));
         thread
@@ -265,20 +274,42 @@ impl Thread {
 }
 
 impl Thread {
-    /// A key while composing: `Esc` leaves the composer, and `Enter` sends.
+    /// Agent conversations open in insert mode; only Ctrl-U/PgUp switch to
+    /// navigation. Groups keep Esc as the way out of their composer.
     fn compose(&mut self, key: KeyEvent) -> Option<Transition> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             // Quit through the keymap, as everywhere.
             return None;
         }
         if key.code == KeyCode::Esc {
+            if self.agent.is_some() {
+                return Some(Transition::Pop);
+            }
             self.composing = false;
             return Some(Transition::Stay);
         }
+        if self.agent.is_some()
+            && (key.code == KeyCode::PageUp
+                || key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.composing = false;
+            let page = self.view.page();
+            self.view.scroll_up(if key.code == KeyCode::PageUp {
+                page
+            } else {
+                page / 2
+            });
+            return Some(Transition::Stay);
+        }
+        let send_id = if key.code == KeyCode::Enter {
+            next_id()
+        } else {
+            self.id
+        };
         let composer = self.composer.as_mut()?;
-        Some(match composer.key(key) {
+        Some(match composer.key(key, send_id) {
             Some(body) => Transition::Request(Request::Send {
-                id: self.id,
+                id: send_id,
                 req: SendRequest {
                     to: composer.to().to_string(),
                     body,
@@ -332,6 +363,22 @@ impl Screen for Thread {
         requests
     }
 
+    fn save_draft(&mut self, drafts: &mut HashMap<String, Composer>) {
+        if let Some(key) = &self.draft_key
+            && let Some(composer) = self.composer.take()
+        {
+            drafts.insert(key.clone(), composer);
+        }
+    }
+
+    fn restore_draft(&mut self, drafts: &mut HashMap<String, Composer>) {
+        if let Some(key) = &self.draft_key
+            && let Some(composer) = drafts.remove(key)
+        {
+            self.composer = Some(composer);
+        }
+    }
+
     fn on_data(&mut self, data: &Data) {
         if let Some(stream) = &mut self.stream {
             let entries = stream.on_data(data);
@@ -366,13 +413,14 @@ impl Screen for Thread {
                     admin.on_data(self.id, data);
                 }
             }
-            Data::Sent { id, result } if *id == self.id => {
-                if let Some(composer) = &mut self.composer {
-                    composer.sent(result.clone());
-                }
-                // Show the message just sent.
-                if result.is_ok() {
-                    self.view.follow();
+            Data::Sent { id, result } => {
+                if let Some(composer) = &mut self.composer
+                    && composer.sent(*id, result.clone())
+                {
+                    // A saved draft can finish a send from an earlier screen.
+                    if result.is_ok() {
+                        self.view.follow();
+                    }
                 }
             }
             _ => {}
@@ -419,6 +467,10 @@ impl Screen for Thread {
         }
         if self.composing {
             return self.compose(key);
+        }
+        if self.agent.is_some() && self.prompt.is_none() && key.code == KeyCode::Esc {
+            self.composing = true;
+            return Some(Transition::Stay);
         }
         if let Some((_, admin)) = &mut self.group
             && let Some(transition) = admin.key(self.id, key)
@@ -505,12 +557,19 @@ impl Thread {
         ])
         .areas(inner);
         if let Some(c) = &mut self.composer {
-            c.render(frame, composer, self.composing);
+            c.render(frame, composer, self.composing, self.agent.is_some());
         }
         if let Some(error) = &self.error {
             let text = vec![
                 Line::styled(error.clone(), theme::error()),
-                Line::styled("r reloads", theme::dim()),
+                Line::styled(
+                    if self.agent.is_some() {
+                        "Ctrl-U/PgUp navigates · r reloads"
+                    } else {
+                        "r reloads"
+                    },
+                    theme::dim(),
+                ),
             ];
             frame.render_widget(Paragraph::new(text), body);
             return;

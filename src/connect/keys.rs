@@ -114,7 +114,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: &[Key::Char('i'), Key::Code(KeyCode::Tab)],
         action: Action::Compose,
-        help: "threads: write (Enter sends, Esc done)",
+        help: "threads: write (agents start in insert mode)",
     },
     Binding {
         keys: &[Key::Char('n')],
@@ -129,7 +129,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: &[Key::Char('q'), Key::Code(KeyCode::Esc)],
         action: Action::Back,
-        help: "back (quit from the main menu)",
+        help: "back (agent navigation: Esc writes; menu: quit)",
     },
     Binding {
         keys: &[Key::Char('?')],

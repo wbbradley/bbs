@@ -110,15 +110,22 @@ and Home/End work everywhere too.
 
 - Lists and threads: `j`/`k` down and up, `gg`/`G` top and bottom,
   `Ctrl-d`/`Ctrl-u` half a page, `/` search, `n`/`N` next and previous match,
-  `Enter` open, `q` or `Esc` back, `?` help. Menu hot keys jump straight
-  to a screen.
-- In a screen with a composer, `i` (or `Tab`) focuses the composer and `Esc`
-  returns to the thread.
+  `Enter` open, `q` back, `?` help. `Esc` goes back in lists, group threads
+  and the Feed; agent conversations use the modes below. Menu hot keys jump
+  straight to a screen.
+- Agent conversations open in Insert mode, with the composer active. `Ctrl-u`
+  or `PgUp` switches to navigation and scrolls the timeline. In navigation,
+  `Esc` returns to Insert mode; in Insert mode, `Esc` goes back to Agents.
+  Each agent's draft and cursor position are restored when its conversation
+  is reopened during the same `connect` session. Arrow keys, including `Up`
+  on the first line, stay within the editor while in Insert mode.
+- In a group thread, `i` (or `Tab`) focuses the composer and `Esc` returns
+  to navigation. Its `Ctrl-u` deletes back to the start of the line (at the
+  start, join onto the previous line).
 - In the composer: `Ctrl-a`/`Ctrl-e` start and end of line, `Ctrl-f`/`Ctrl-b`
   forward and back a character, `Alt-f`/`Alt-b` a word, `Ctrl-k` kill to end of
   line, `Ctrl-y` yank, `Ctrl-w`/`Alt-Backspace` delete a word back, `Ctrl-d`
-  delete forward, `Ctrl-u` delete back to the start of the line (at the start,
-  join onto the previous line), `Ctrl-_` (or `Ctrl-/`) undo, `Ctrl-r` redo,
+  delete forward, `Ctrl-_` (or `Ctrl-/`) undo, `Ctrl-r` redo,
   `Ctrl-p`/`Ctrl-n` previous and next line. `Enter` sends;
   `Alt-Enter` (or `Ctrl-j`) inserts a newline.
 

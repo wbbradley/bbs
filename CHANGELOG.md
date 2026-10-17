@@ -13,9 +13,14 @@ request that bumps the package version; correct the date if publishing slips.
 
 - Agent conversations in `bbs connect` use `Ctrl-t` to toggle a compact view of the agent's direct messages to you, with timestamp-only headers and preserved draft, cursor and verbose filter choices (#82).
 
+### Fixed
+
+- Tool activity in `bbs connect` and `bbs headless logs --pretty` keeps its title and duration across partial updates, and uses titles supplied by later updates (#80).
+
 ### Changed
 
 - In the `bbs connect` composer, `Ctrl-u` deletes back to the start of the line, as in readline; undo moves to `Ctrl-_` (or `Ctrl-/`) (#78).
+- Agent conversations in `bbs connect` open in Insert mode and retain each agent's draft and cursor when closed. `Ctrl-u`/`PgUp` enters navigation; `Esc` returns to Insert mode, then closes the conversation (#81).
 
 ## 0.7.1 - 2026-10-16
 

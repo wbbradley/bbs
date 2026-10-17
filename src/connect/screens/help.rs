@@ -12,6 +12,17 @@ use crate::connect::app::{Ctx, Screen, Transition};
 use crate::connect::keys::{Action, BINDINGS};
 use crate::connect::theme;
 
+const AGENT_KEYS: &[(&str, &str)] = &[
+    (
+        "Agent insert",
+        "Enter sends; Esc back, saving the draft/cursor",
+    ),
+    ("Ctrl-U / PgUp", "agent insert: navigate the timeline"),
+    ("Esc", "agent navigation: return to insert mode"),
+    ("↑ / ↓", "agent insert: move within the draft"),
+    ("Ctrl-T", "agents: verbose or only messages to you"),
+];
+
 /// The keys, one per row; it scrolls when they outgrow the window.
 #[derive(Default)]
 pub struct Help {
@@ -26,7 +37,12 @@ impl Screen for Help {
     }
 
     fn handle(&mut self, action: Action, _ctx: &Ctx) -> Transition {
-        if navigate(&mut self.state, BINDINGS.len() + 2, self.page, action) {
+        if navigate(
+            &mut self.state,
+            BINDINGS.len() + AGENT_KEYS.len() + 1,
+            self.page,
+            action,
+        ) {
             return Transition::Stay;
         }
         match action {
@@ -53,10 +69,12 @@ impl Screen for Help {
             Line::styled("[X]", theme::base().fg(theme::HOTKEY)),
             Line::raw("a menu item's hot key"),
         ]));
-        rows.push(Row::new(vec![
-            Line::styled("Ctrl-T", theme::base().fg(theme::HOTKEY)),
-            Line::raw("agents: verbose or only messages to you"),
-        ]));
+        rows.extend(AGENT_KEYS.iter().map(|(key, help)| {
+            Row::new(vec![
+                Line::styled(*key, theme::base().fg(theme::HOTKEY)),
+                Line::raw(*help),
+            ])
+        }));
         let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(10)])
             .style(theme::base())
             .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
