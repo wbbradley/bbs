@@ -38,7 +38,7 @@ pub enum Request {
     },
     /// Stop a stream.
     Unwatch(u64),
-    /// Send a message for the screen `id`.
+    /// Send a message; `id` identifies this send independently of the screen.
     Send {
         id: u64,
         req: proto::SendRequest,
@@ -89,7 +89,7 @@ pub enum Data {
         id: u64,
         result: Result<Vec<proto::AgentSummary>, String>,
     },
-    /// The outcome of a send for the screen `id`.
+    /// The outcome of the send `id`, even if its screen has closed.
     Sent {
         id: u64,
         result: Result<(), String>,
