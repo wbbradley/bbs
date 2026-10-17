@@ -110,7 +110,9 @@ and Home/End work everywhere too.
 - In the composer: `Ctrl-a`/`Ctrl-e` start and end of line, `Ctrl-f`/`Ctrl-b`
   forward and back a character, `Alt-f`/`Alt-b` a word, `Ctrl-k` kill to end of
   line, `Ctrl-y` yank, `Ctrl-w`/`Alt-Backspace` delete a word back, `Ctrl-d`
-  delete forward, `Ctrl-p`/`Ctrl-n` previous and next line. `Enter` sends;
+  delete forward, `Ctrl-u` delete back to the start of the line (at the start,
+  join onto the previous line), `Ctrl-_` (or `Ctrl-/`) undo, `Ctrl-r` redo,
+  `Ctrl-p`/`Ctrl-n` previous and next line. `Enter` sends;
   `Alt-Enter` (or `Ctrl-j`) inserts a newline.
 
 The composer starts two lines tall and grows with its content, up to

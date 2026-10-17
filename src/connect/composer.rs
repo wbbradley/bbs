@@ -44,6 +44,17 @@ impl Composer {
         match key.code {
             KeyCode::Enter if alt => self.text.insert_newline(),
             KeyCode::Char('j') if ctrl => self.text.insert_newline(),
+            // readline's unix-line-discard: delete back to the start of the
+            // line, or join onto the previous line at its start.
+            KeyCode::Char('u') if ctrl => {
+                self.text.delete_line_by_head();
+            }
+            // Emacs undo. Terminals send Ctrl-_ (and Ctrl-/) as 0x1F, which
+            // crossterm reports as Ctrl-7; with keyboard enhancement it is
+            // the key itself.
+            KeyCode::Char('_' | '/' | '7') if ctrl => {
+                self.text.undo();
+            }
             KeyCode::Enter => {
                 let body = self.text.lines().join("\n");
                 if self.sending || body.trim().is_empty() {
@@ -180,6 +191,33 @@ mod tests {
         press(&mut c, KeyCode::Char('b'), KeyModifiers::ALT);
         press(&mut c, KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert_eq!(c.text.lines(), ["hello here "]);
+    }
+
+    #[test]
+    fn ctrl_u_deletes_back_to_the_line_start_and_ctrl_underscore_undoes() {
+        let mut c = Composer::new("Mateo");
+        typed(&mut c, "one");
+        press(&mut c, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        typed(&mut c, "two three");
+        // Mid-line: only the text before the cursor goes.
+        for _ in 0.."three".len() {
+            press(&mut c, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        }
+        press(&mut c, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(c.text.lines(), ["one", "three"]);
+        // At column 0: the line joins onto the previous one.
+        press(&mut c, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(c.text.lines(), ["onethree"]);
+        assert_eq!(c.text.cursor(), (0, 3));
+        for code in [KeyCode::Char('7'), KeyCode::Char('_'), KeyCode::Char('/')] {
+            typed(&mut c, "x");
+            press(&mut c, code, KeyModifiers::CONTROL);
+            assert_eq!(c.text.lines(), ["onethree"], "{code:?}");
+        }
+        press(&mut c, KeyCode::Char('7'), KeyModifiers::CONTROL);
+        assert_eq!(c.text.lines(), ["one", "three"]);
+        press(&mut c, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(c.text.lines(), ["onethree"]);
     }
 
     #[test]
