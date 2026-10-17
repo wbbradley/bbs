@@ -19,7 +19,7 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
-- Compact agent conversations in `bbs connect` show direct messages in both directions. Your outgoing messages have a lighter background with blank padding in compact and verbose views (#83).
+- Agent conversations in `bbs connect` default to a compact view of direct messages in both directions and remember the global `Ctrl-t` choice locally across launches. Your outgoing messages have a lighter background with blank padding in compact and verbose views (#83).
 
 - In the `bbs connect` composer, `Ctrl-u` deletes back to the start of the line, as in readline; undo moves to `Ctrl-_` (or `Ctrl-/`) (#78).
 - Agent conversations in `bbs connect` open in Insert mode and retain each agent's draft and cursor when closed. `Ctrl-u`/`PgUp` enters navigation; `Esc` returns to Insert mode, then closes the conversation (#81).

@@ -34,7 +34,7 @@ pub struct Thread {
     /// Raw feed boundaries that may have skipped messages, before compact filtering.
     message_gaps: BTreeSet<i64>,
     show: Show,
-    /// Agent conversations start verbose; compact mode shows only direct mail
+    /// Compact mode shows only direct mail
     /// between that agent and this human, retaining the verbose filter choices.
     compact: bool,
     human: Option<String>,
@@ -85,7 +85,7 @@ impl Thread {
     }
 
     /// What `agent` sent and what was sent to it directly.
-    pub fn agent(agent: &str, owner: Option<&str>, human: &str) -> Thread {
+    pub fn agent(agent: &str, owner: Option<&str>, human: &str, compact: bool) -> Thread {
         let title = match owner {
             Some(owner) => format!("{agent}, owned by {owner}"),
             None => agent.to_string(),
@@ -103,6 +103,7 @@ impl Thread {
         ));
         thread.composing = true;
         thread.human = Some(human.to_string());
+        thread.compact = compact;
         thread.stream = Some(Stream::new(agent));
         thread
     }
@@ -479,7 +480,7 @@ impl Screen for Thread {
         {
             self.compact = !self.compact;
             self.rebuild();
-            return Some(Transition::Stay);
+            return Some(Transition::Compact(self.compact));
         }
         if self.composing {
             return self.compose(key);
@@ -592,7 +593,11 @@ impl Thread {
         }
         // Lay out first, so the status line reflects this frame.
         self.view.layout(body.width, body.height as usize);
-        frame.render_widget(Paragraph::new(self.status()), status);
+        let status_line = match &ctx.preferences.error {
+            Some(error) if self.agent.is_some() => Line::styled(error.clone(), theme::error()),
+            _ => self.status(),
+        };
+        frame.render_widget(Paragraph::new(status_line), status);
         if let Some(notice) = self.empty_activity() {
             frame.render_widget(Paragraph::new(notice).wrap(Wrap { trim: false }), body);
             return;
