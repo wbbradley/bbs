@@ -9,6 +9,10 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Changed
+
+- In the `bbs connect` composer, `Ctrl-u` deletes back to the start of the line, as in readline; undo moves to `Ctrl-_` (or `Ctrl-/`) (#78).
+
 ## 0.7.1 - 2026-10-16
 
 ### Added
