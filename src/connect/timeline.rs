@@ -24,7 +24,11 @@ const MAX_RECORDS: usize = 5000;
 pub enum Entry {
     Message(Message),
     /// A direct message in compact mode, with a timestamp-only header.
-    CompactMessage(Message),
+    CompactMessage {
+        message: Message,
+        /// A possible gap in the raw feed before this visible message.
+        gap: bool,
+    },
     /// One activity record, drawn when it arrived.
     Stream {
         id: i64,
@@ -45,7 +49,9 @@ impl Row for Entry {
 
     fn key(&self) -> Self::Key {
         match self {
-            Entry::Message(m) | Entry::CompactMessage(m) => (micros(&m.created_at), 0, m.id),
+            Entry::Message(m) | Entry::CompactMessage { message: m, .. } => {
+                (micros(&m.created_at), 0, m.id)
+            }
             Entry::Stream { id, created_at, .. } => (micros(created_at), 1, *id),
         }
     }
@@ -53,14 +59,17 @@ impl Row for Entry {
     fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>> {
         match self {
             Entry::Message(m) => message_lines(m, gap, query),
-            Entry::CompactMessage(m) => compact_message_lines(m, gap, query),
+            Entry::CompactMessage {
+                message,
+                gap: raw_gap,
+            } => compact_message_lines(message, gap || *raw_gap, query),
             Entry::Stream { lines, .. } => lines.clone(),
         }
     }
 
     fn matches(&self, query: &str) -> bool {
         match self {
-            Entry::Message(m) | Entry::CompactMessage(m) => m.matches(query),
+            Entry::Message(m) | Entry::CompactMessage { message: m, .. } => m.matches(query),
             Entry::Stream { lines, .. } => lines.iter().any(|line| {
                 let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 !find_matches(&text, query).is_empty()

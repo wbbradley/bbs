@@ -1254,6 +1254,96 @@ mod tests {
     }
 
     #[test]
+    fn compact_feed_keeps_raw_gap_warnings_through_filtering_and_toggles() {
+        for all_hidden in [true, false] {
+            let (mut app, mut rx) = app();
+            let (feed, _) = mateo_streams(&mut app, &mut rx);
+            press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(vec![message(1, "Mateo", "ada", "before-gap")]),
+            }));
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+            // A burst pushed a visible DM out of the raw 200-message window.
+            let snapshot = (201..=400)
+                .map(|id| {
+                    message(
+                        id,
+                        "Mateo",
+                        if !all_hidden && id == 400 {
+                            "ada"
+                        } else {
+                            "Ben"
+                        },
+                        if id == 400 { "after-gap" } else { "hidden" },
+                    )
+                })
+                .collect();
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(snapshot),
+            }));
+            if all_hidden {
+                assert!(!screen(&mut app, 120, 30).contains("messages may be missing"));
+                // A later visible arrival still carries the raw gap boundary.
+                app.on_event(Event::Data(Data::Feed {
+                    id: feed,
+                    result: Ok(vec![message(401, "Mateo", "ada", "after-gap")]),
+                }));
+            }
+            let out = screen(&mut app, 120, 30);
+            assert_eq!(
+                order(
+                    &out,
+                    &["before-gap", "messages may be missing", "after-gap"]
+                ),
+                ["before-gap", "messages may be missing", "after-gap"],
+                "{out}"
+            );
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+            let out = screen(&mut app, 120, 30);
+            assert_eq!(out.matches("messages may be missing").count(), 1, "{out}");
+        }
+        let (mut app, mut rx) = app();
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok((1..200)
+                .map(|id| {
+                    message(
+                        id,
+                        "Mateo",
+                        if id == 1 { "ada" } else { "Ben" },
+                        "already received",
+                    )
+                })
+                .collect()),
+        }));
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        // This full raw window overlaps previously held hidden messages.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok((2..=201)
+                .map(|id| {
+                    message(
+                        id,
+                        "Mateo",
+                        if id == 201 { "ada" } else { "Ben" },
+                        "new arrival",
+                    )
+                })
+                .collect()),
+        }));
+        let out = screen(&mut app, 120, 30);
+        assert!(
+            out.contains("new arrival") && !out.contains("messages may be missing"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn compact_toggle_is_only_for_agent_conversations() {
         let (mut app, mut rx) = app();
         crew_list(&mut app, &mut rx);

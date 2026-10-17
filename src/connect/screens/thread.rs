@@ -3,6 +3,8 @@
 //! Agent and group threads have a composer below for writing to them, and
 //! group threads the admin dialogs.
 
+use std::collections::{BTreeSet, HashSet};
+
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -29,6 +31,8 @@ pub struct Thread {
     view: ThreadView<Entry>,
     /// Every message received, so another `show` can rebuild the view.
     messages: Vec<Message>,
+    /// Raw feed boundaries that may have skipped messages, before compact filtering.
+    message_gaps: BTreeSet<i64>,
     show: Show,
     /// Agent conversations start verbose; compact mode shows only direct mail
     /// from that agent to this human, retaining the verbose filter choices.
@@ -62,6 +66,7 @@ impl Thread {
             },
             view: ThreadView::new(Vec::new(), BACKLOG as usize),
             messages: Vec::new(),
+            message_gaps: BTreeSet::new(),
             show: Show::All,
             compact: false,
             human: None,
@@ -114,16 +119,26 @@ impl Thread {
     }
 
     fn message_entries(&self, messages: &[Message]) -> Vec<Entry> {
+        if !self.compact {
+            return messages.iter().cloned().map(Entry::Message).collect();
+        }
+        let visible_gaps: HashSet<_> = self
+            .message_gaps
+            .iter()
+            .filter_map(|gap| {
+                self.messages
+                    .iter()
+                    .find(|m| m.id >= *gap && self.direct_to_human(m))
+                    .map(|m| m.id)
+            })
+            .collect();
         messages
             .iter()
-            .filter(|m| !self.compact || self.direct_to_human(m))
+            .filter(|m| self.direct_to_human(m))
             .cloned()
-            .map(|m| {
-                if self.compact {
-                    Entry::CompactMessage(m)
-                } else {
-                    Entry::Message(m)
-                }
+            .map(|m| Entry::CompactMessage {
+                gap: visible_gaps.contains(&m.id),
+                message: m,
             })
             .collect()
     }
@@ -146,6 +161,12 @@ impl Thread {
 
     /// Keep a snapshot's messages, refreshing those held, oldest first.
     fn keep(&mut self, snapshot: &[Message]) {
+        if let Some(first) = snapshot.first()
+            && snapshot.len() >= BACKLOG as usize
+            && self.messages.last().is_none_or(|last| first.id > last.id)
+        {
+            self.message_gaps.insert(first.id);
+        }
         for m in snapshot {
             match self.messages.binary_search_by_key(&m.id, |r| r.id) {
                 Ok(i) => self.messages[i] = m.clone(),
@@ -154,6 +175,9 @@ impl Thread {
         }
         let over = self.messages.len().saturating_sub(MAX_ROWS);
         self.messages.drain(..over);
+        if let Some(oldest) = self.messages.first() {
+            self.message_gaps.retain(|id| *id >= oldest.id);
+        }
     }
 
     /// Broadcasts to `group`.
