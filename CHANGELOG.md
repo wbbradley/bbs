@@ -11,7 +11,7 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Added
 
-- `bbs headless run --new-session` starts a new harness session instead of resuming the saved one (#PR).
+- `bbs headless run --new-session` starts a new harness session instead of resuming the saved one (#76).
 
 ## 0.7.0 - 2026-10-16
 
