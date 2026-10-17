@@ -488,6 +488,42 @@ mod tests {
     }
 
     #[test]
+    fn conversation_body_keeps_line_breaks_and_wrapped_indentation() {
+        let (mut app, mut rx) = app();
+        let id = mateo(&mut app, &mut rx);
+        let text = "word ".repeat(24);
+        app.on_event(Event::Data(Data::Feed {
+            id,
+            result: Ok(vec![message(
+                1,
+                "Mateo",
+                "ada",
+                &format!("first\n  **{}**\nlast", text.trim_end()),
+            )]),
+        }));
+        let out = screen(&mut app, 80, 24);
+        let lines: Vec<_> = out.lines().collect();
+        let first = lines
+            .iter()
+            .position(|l| l.contains("  first"))
+            .expect(&out);
+        let last = lines.iter().position(|l| l.contains("  last")).expect(&out);
+        assert!(last > first + 2, "{out}");
+        let margin = lines[first].find("first").unwrap();
+        for line in &lines[first + 1..last] {
+            assert_eq!(line.find("word"), Some(margin + 2), "{out}");
+        }
+        assert_eq!(
+            lines[first + 1..last]
+                .iter()
+                .flat_map(|l| l.trim_matches('║').split_whitespace())
+                .count(),
+            24,
+            "{out}"
+        );
+    }
+
+    #[test]
     fn viewing_an_agent_thread_marks_its_mail_to_me_read() {
         let (mut app, mut rx) = app();
         open_agents(&mut app, &mut rx);

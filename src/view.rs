@@ -432,6 +432,41 @@ mod tests {
     }
 
     #[test]
+    fn body_line_breaks_and_indentation_survive_wrapping_and_resize() {
+        let rows = [row(
+            Some("acme"),
+            None,
+            None,
+            "first\n  **alpha beta gamma delta epsilon zeta**\nlast",
+        )];
+        let mut view = view(&rows);
+        for width in [25, 40, 25] {
+            let out = draw_sized(&mut view, width, 20);
+            let lines: Vec<_> = out.lines().collect();
+            let first = lines.iter().position(|l| *l == "  first").expect(&out);
+            let last = lines.iter().position(|l| *l == "  last").expect(&out);
+            assert!(last > first + 1, "{out}");
+            if width == 25 {
+                assert!(last > first + 2, "{out}");
+            }
+            for line in &lines[first + 1..last] {
+                assert!(
+                    line.starts_with("    ") && !line.starts_with("     "),
+                    "{out}"
+                );
+            }
+            assert_eq!(
+                lines[first + 1..last]
+                    .iter()
+                    .map(|l| l.trim())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                "alpha beta gamma delta epsilon zeta"
+            );
+        }
+    }
+
+    #[test]
     fn headers_qualify_agents_with_their_humans() {
         let mut dm = row(None, Some("Mateo"), None, "hi");
         dm.from_owner = Some("will".into());

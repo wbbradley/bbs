@@ -37,6 +37,7 @@ gethostname = "1.1.0"
 humantime = "2.4.0"
 libc = "0.2.190"
 prost = "0.14.4"
+pulldown-cmark = "0.13.4"
 rand = "0.9"
 rpassword = "7.4"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
@@ -46,6 +47,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.10"
 tempfile = "3.27"
+textwrap = { version = "0.16.2", default-features = false, features = ["unicode-width"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "process", "io-util", "io-std"] }
 tokio-stream = { version = "0.1.19", features = ["net", "time"] }
 toml = "1.1.8"

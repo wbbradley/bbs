@@ -2,6 +2,7 @@
 //! matches highlighted. Shared by `bbs view` and `bbs connect`.
 
 use chrono::{DateTime, Local};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 
@@ -13,10 +14,25 @@ const HEADER_NAMES: [usize; 2] = [2, 4];
 /// A message as displayed: a blank separator, a marker when messages may be
 /// missing before it, the header, and the indented markdown body, with
 /// `query` matches highlighted in the names and body.
-pub fn message_lines<'a>(row: &'a Message, gap: bool, query: Option<&str>) -> Vec<Line<'a>> {
+pub fn message_lines<'a>(
+    row: &'a Message,
+    gap: bool,
+    query: Option<&str>,
+    width: u16,
+) -> Vec<Line<'a>> {
     let mut header = header(row);
     let mut body = Vec::new();
-    for mut line in tui_markdown::from_str(&row.body).lines {
+    let source = literal_lines(&row.body);
+    for line in tui_markdown::from_str(&source).lines {
+        let mut line = Line {
+            spans: line
+                .spans
+                .into_iter()
+                .map(|s| Span::styled(s.content.into_owned(), s.style))
+                .collect(),
+            style: line.style,
+            alignment: line.alignment,
+        };
         line.spans.insert(0, Span::raw("  "));
         body.push(line);
     }
@@ -47,7 +63,152 @@ pub fn message_lines<'a>(row: &'a Message, gap: bool, query: Option<&str>) -> Ve
         .into_iter()
         .chain(marker)
         .chain([header])
-        .chain(body)
+        .chain(body.into_iter().flat_map(|line| wrap_body(line, width)))
+        .collect()
+}
+
+/// Keep message line breaks while letting Markdown interpret its block syntax.
+/// Use the same parser extensions as tui-markdown so code, tables and metadata
+/// are not mistaken for ordinary paragraphs.
+fn literal_lines(source: &str) -> String {
+    let options = Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_HEADING_ATTRIBUTES
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_SUPERSCRIPT
+        | Options::ENABLE_SUBSCRIPT
+        | Options::ENABLE_MATH
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_DEFINITION_LIST
+        | Options::ENABLE_GFM
+        | Options::ENABLE_TABLES;
+    let mut edits = Vec::new();
+    let mut containers = 0usize;
+    let mut lists = Vec::new();
+    let mut item_indents = Vec::new();
+    let mut events = Parser::new_ext(source, options)
+        .into_offset_iter()
+        .peekable();
+    while let Some((event, range)) = events.next() {
+        match event {
+            Event::Start(Tag::List(index)) => {
+                containers += 1;
+                lists.push(index);
+            }
+            Event::Start(Tag::BlockQuote(_) | Tag::DefinitionList) => containers += 1,
+            Event::End(TagEnd::List(_)) => {
+                containers -= 1;
+                lists.pop();
+            }
+            Event::End(TagEnd::BlockQuote(_) | TagEnd::DefinitionList) => containers -= 1,
+            Event::Start(Tag::Item) => {
+                // Match tui-markdown's list marker width, including nesting and
+                // multi-digit ordered markers, on the new continuation line.
+                let marker_width = lists.len() * 4 - 3;
+                let indent = match lists.last_mut() {
+                    Some(Some(index)) => {
+                        let width = marker_width.max(index.to_string().len()) + 2;
+                        *index += 1;
+                        width
+                    }
+                    _ => marker_width + 1,
+                };
+                item_indents.push(indent);
+            }
+            Event::End(TagEnd::Item) => {
+                item_indents.pop();
+            }
+            Event::Start(Tag::Paragraph) if containers == 0 => {
+                let start = source[..range.start].rfind('\n').map_or(0, |i| i + 1);
+                let prefix = &source[start..range.start];
+                if prefix.bytes().all(|b| matches!(b, b' ' | b'\t')) {
+                    edits.push((range.start, "&#32;".repeat(indent_columns(prefix))));
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if event == Event::SoftBreak {
+                    edits.push((range.start, "  ".to_string()));
+                }
+                if let Some((_, next)) = events.peek()
+                    && next.start >= range.end
+                {
+                    let prefix = &source[range.end..next.start];
+                    let (spaces, quote) = prefix
+                        .rsplit_once('>')
+                        .map_or((prefix, false), |(_, s)| (s, true));
+                    if spaces.bytes().all(|b| matches!(b, b' ' | b'\t')) {
+                        let columns = indent_columns(spaces).saturating_sub(usize::from(quote));
+                        let columns = columns.max(item_indents.last().copied().unwrap_or(0));
+                        // Keep structural indentation in the source; entities
+                        // restore only the visible spaces Markdown trims away.
+                        edits.push((next.start, "&#32;".repeat(columns)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    edits.sort_by_key(|(at, _)| *at);
+    let mut out = String::new();
+    let mut at = 0;
+    for (position, insertion) in edits {
+        out.push_str(&source[at..position]);
+        out.push_str(&insertion);
+        at = position;
+    }
+    out.push_str(&source[at..]);
+    out
+}
+
+/// Markdown tabs advance to four-column tab stops.
+fn indent_columns(spaces: &str) -> usize {
+    spaces.bytes().fold(0, |column, b| {
+        column + if b == b'\t' { 4 - column % 4 } else { 1 }
+    })
+}
+
+/// Wrap body lines with their visible indentation on every continuation, keeping
+/// span styles (including search highlights) across the split.
+fn wrap_body(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    if width == 0 || line.width() <= usize::from(width) {
+        return vec![line];
+    }
+    let text = line.to_string();
+    let indent = text.bytes().take_while(|&b| b == b' ').count();
+    // Leave room for a wide character, even in a very narrow pane.
+    let indent = indent.min(usize::from(width.saturating_sub(2)));
+    let options = textwrap::Options::new(usize::from(width) - indent)
+        .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation);
+    let mut at = indent;
+    textwrap::wrap(&text[indent..], options)
+        .into_iter()
+        .map(|part| {
+            let start = at
+                + text[at..]
+                    .find(part.as_ref())
+                    .expect("wrapping only splits the source");
+            let end = start + part.len();
+            at = end;
+            let mut spans = vec![Span::raw(" ".repeat(indent))];
+            let mut offset = 0;
+            for span in &line.spans {
+                let lo = start.max(offset);
+                let hi = end.min(offset + span.content.len());
+                if lo < hi {
+                    spans.push(Span::styled(
+                        span.content[lo - offset..hi - offset].to_owned(),
+                        span.style,
+                    ));
+                }
+                offset += span.content.len();
+            }
+            Line {
+                spans,
+                style: line.style,
+                alignment: line.alignment,
+            }
+        })
         .collect()
 }
 
@@ -201,6 +362,112 @@ fn local(stored: &str) -> Option<DateTime<Local>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn body(source: &str, width: u16, query: Option<&str>) -> Vec<Line<'static>> {
+        let row = Message {
+            body: source.into(),
+            ..Message::default()
+        };
+        // The header borrows nothing from the row, and body spans own their text.
+        message_lines(&row, false, query, width)
+            .into_iter()
+            .skip(2)
+            .map(|line| Line {
+                spans: line
+                    .spans
+                    .into_iter()
+                    .map(|s| Span::styled(s.content.into_owned(), s.style))
+                    .collect(),
+                style: line.style,
+                alignment: line.alignment,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_line_breaks_and_plain_indentation_survive_markdown() {
+        for newline in ["\n", "\r\n"] {
+            let source = format!("  **one**{newline} two{newline}\tthree{newline}{newline}last");
+            let lines = body(&source, 80, None);
+            let text: Vec<_> = lines.iter().map(ToString::to_string).collect();
+            assert_eq!(text, ["    one", "   two", "      three", "  ", "  last"]);
+            assert!(
+                lines[0]
+                    .spans
+                    .iter()
+                    .any(|s| s.content == "one" && s.style.add_modifier.contains(Modifier::BOLD))
+            );
+        }
+        for source in ["one  \n  two", "one\\\n  two"] {
+            assert_eq!(
+                body(source, 80, None)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                ["  one", "    two"]
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_blocks_keep_their_formatting() {
+        for source in [
+            "# Heading\n\n- **one**\n  - two\n\n> quote",
+            "```rust\nfn main() {\n    println!(\"hi\");\n}\n```",
+            "| one | two |\n| --- | --- |\n| a | b |",
+            "---\nkey: value\n---\n\ntext",
+        ] {
+            let expected: Vec<_> = tui_markdown::from_str(source)
+                .lines
+                .into_iter()
+                .map(|mut line| {
+                    line.spans.insert(0, Span::raw("  "));
+                    line
+                })
+                .collect();
+            assert_eq!(body(source, 100, None), expected, "{source}");
+        }
+        assert_eq!(
+            body("- one\n  continued\n  - nested\n    continued", 80, None)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "  - one",
+                "    continued",
+                "      - nested",
+                "        continued"
+            ]
+        );
+    }
+
+    #[test]
+    fn wrapped_body_keeps_indentation_styles_and_search_highlights() {
+        let lines = body("  **alpha beta gamma delta**", 15, Some("gamma"));
+        assert_eq!(
+            lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["    alpha beta", "    gamma delta"]
+        );
+        for line in &lines {
+            for span in &line.spans {
+                if !span.content.trim().is_empty() {
+                    assert!(span.style.add_modifier.contains(Modifier::BOLD));
+                }
+                if span.content == "gamma" {
+                    assert!(span.style.add_modifier.contains(Modifier::REVERSED));
+                }
+            }
+        }
+        let lines = body("界界界界界界", 8, None);
+        assert_eq!(
+            lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["  界界界", "  界界界"]
+        );
+        for width in [0, 1, 2, 3, 5] {
+            let lines = body("  abc界", width, None);
+            assert!(!lines.is_empty());
+        }
+    }
 
     #[test]
     fn highlight_keeps_combining_marks_with_their_letter() {

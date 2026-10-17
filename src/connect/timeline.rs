@@ -48,9 +48,9 @@ impl Row for Entry {
         }
     }
 
-    fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>> {
+    fn lines(&self, gap: bool, query: Option<&str>, width: u16) -> Vec<Line<'_>> {
         match self {
-            Entry::Message(m) => message_lines(m, gap, query),
+            Entry::Message(m) => message_lines(m, gap, query, width),
             Entry::Stream { lines, .. } => lines.clone(),
         }
     }
