@@ -20,7 +20,7 @@ const AGENT_KEYS: &[(&str, &str)] = &[
     ("Ctrl-U / PgUp", "agent insert: navigate the timeline"),
     ("Esc", "agent navigation: return to insert mode"),
     ("↑ / ↓", "agent insert: move within the draft"),
-    ("Ctrl-T", "agents: verbose or only messages to you"),
+    ("Ctrl-T", "agents: verbose or your direct conversation"),
 ];
 
 /// The keys, one per row; it scrolls when they outgrow the window.

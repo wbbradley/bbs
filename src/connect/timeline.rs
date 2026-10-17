@@ -4,10 +4,12 @@
 use std::collections::VecDeque;
 
 use chrono::DateTime;
+use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 
 use super::app::next_id;
 use super::event::{Data, Request};
+use super::theme;
 use crate::backend::AGENT_ACTIVITY;
 use crate::proto::{self, Message};
 use crate::ui::activity::Activity;
@@ -22,10 +24,11 @@ const MAX_RECORDS: usize = 5000;
 /// One row of a timeline.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
-    Message(Message),
-    /// A direct message in compact mode, with a timestamp-only header.
-    CompactMessage {
+    Message {
         message: Message,
+        /// Use a timestamp-only header in compact conversations.
+        compact: bool,
+        outgoing: bool,
         /// A possible gap in the raw feed before this visible message.
         gap: bool,
     },
@@ -49,27 +52,56 @@ impl Row for Entry {
 
     fn key(&self) -> Self::Key {
         match self {
-            Entry::Message(m) | Entry::CompactMessage { message: m, .. } => {
-                (micros(&m.created_at), 0, m.id)
-            }
+            Entry::Message { message: m, .. } => (micros(&m.created_at), 0, m.id),
             Entry::Stream { id, created_at, .. } => (micros(created_at), 1, *id),
         }
     }
 
     fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>> {
         match self {
-            Entry::Message(m) => message_lines(m, gap, query),
-            Entry::CompactMessage {
+            Entry::Message {
                 message,
+                compact,
+                outgoing,
                 gap: raw_gap,
-            } => compact_message_lines(message, gap || *raw_gap, query),
+            } => {
+                let mut lines = if *compact {
+                    compact_message_lines(message, gap || *raw_gap, query)
+                } else {
+                    message_lines(message, gap, query)
+                };
+                if *outgoing {
+                    // Dark-gray timestamps disappear against the outgoing background.
+                    for line in &mut lines {
+                        line.style.bg = Some(theme::OUTGOING);
+                        if line.style.fg == Some(Color::DarkGray) {
+                            line.style.fg = Some(Color::Gray);
+                        }
+                        for span in &mut line.spans {
+                            span.style.bg = Some(theme::OUTGOING);
+                            if span.style.fg == Some(Color::DarkGray) {
+                                span.style.fg = Some(Color::Gray);
+                            }
+                        }
+                    }
+                    lines.push(Line::default());
+                }
+                lines
+            }
             Entry::Stream { lines, .. } => lines.clone(),
+        }
+    }
+
+    fn style(&self) -> Style {
+        match self {
+            Entry::Message { outgoing: true, .. } => Style::new().bg(theme::OUTGOING),
+            _ => Style::default(),
         }
     }
 
     fn matches(&self, query: &str) -> bool {
         match self {
-            Entry::Message(m) | Entry::CompactMessage { message: m, .. } => m.matches(query),
+            Entry::Message { message: m, .. } => m.matches(query),
             Entry::Stream { lines, .. } => lines.iter().any(|line| {
                 let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 !find_matches(&text, query).is_empty()
@@ -271,6 +303,106 @@ impl Stream {
             Err(e) => {
                 self.error = Some(e.clone());
                 Vec::new()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::thread::ThreadView;
+    use ratatui::{Terminal, backend::TestBackend, style::Modifier, widgets::Block};
+
+    #[test]
+    fn outgoing_background_covers_padding_wrapping_and_scrolled_rows() {
+        for compact in [false, true] {
+            for width in [24, 48] {
+                let make = |id, outgoing, body: &str| Entry::Message {
+                    message: Message {
+                        id,
+                        created_at: "2026-10-16T18:00:00Z".into(),
+                        from_name: if outgoing { "ada" } else { "Mateo" }.into(),
+                        from_kind: if outgoing {
+                            proto::Kind::Human
+                        } else {
+                            proto::Kind::Agent
+                        }
+                        .into(),
+                        to_name: Some(if outgoing { "Mateo" } else { "ada" }.into()),
+                        body: body.into(),
+                        ..Default::default()
+                    },
+                    outgoing,
+                    compact,
+                    gap: false,
+                };
+                let outgoing = make(
+                    2,
+                    true,
+                    "**needle** followed by enough words to wrap across several full rendered rows.\n\n`code` and [link](https://example.com)",
+                );
+                let raw_lines = outgoing.lines(false, None).len();
+                let mut view = ThreadView::new(
+                    vec![make(1, false, "before"), outgoing, make(3, false, "after")],
+                    200,
+                );
+                view.set_query("needle");
+                let mut terminal = Terminal::new(TestBackend::new(width, 60)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(Block::new().style(theme::base()), frame.area());
+                        view.render(frame, frame.area());
+                    })
+                    .unwrap();
+                let start = view.frame.starts[1] as u16;
+                let end = view.frame.starts[2] as u16;
+                assert!(usize::from(end - start) > raw_lines, "body must wrap");
+                let buffer = terminal.backend().buffer();
+                for y in 0..60 {
+                    for x in 0..width {
+                        let cell = &buffer[(x, y)];
+                        assert_eq!(
+                            cell.bg,
+                            if (start..end).contains(&y) {
+                                theme::OUTGOING
+                            } else {
+                                theme::BACKGROUND
+                            },
+                            "at {x},{y}, compact={compact}"
+                        );
+                        if (start..end).contains(&y) && cell.symbol() != " " {
+                            assert_ne!(cell.fg, theme::OUTGOING, "text must remain readable");
+                        }
+                    }
+                }
+                for y in [start, end - 1] {
+                    assert!((0..width).all(|x| buffer[(x, y)].symbol() == " "));
+                }
+                assert_eq!(buffer[(0, start + 1)].fg, Color::Gray);
+                assert!(buffer.content.iter().any(|c| c.symbol() == "n"
+                    && c.modifier.contains(Modifier::BOLD | Modifier::REVERSED)));
+                // The same full-row background survives a viewport clipped into the message.
+                terminal.backend_mut().resize(width, 3);
+                terminal
+                    .resize(ratatui::layout::Rect::new(0, 0, width, 3))
+                    .unwrap();
+                view.layout(width, 3);
+                view.scroll_to(usize::from(start) + 2);
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(Block::new().style(theme::base()), frame.area());
+                        view.render(frame, frame.area());
+                    })
+                    .unwrap();
+                assert!(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .iter()
+                        .all(|c| c.bg == theme::OUTGOING)
+                );
             }
         }
     }

@@ -35,7 +35,7 @@ pub struct Thread {
     message_gaps: BTreeSet<i64>,
     show: Show,
     /// Agent conversations start verbose; compact mode shows only direct mail
-    /// from that agent to this human, retaining the verbose filter choices.
+    /// between that agent and this human, retaining the verbose filter choices.
     compact: bool,
     human: Option<String>,
     /// The stream's last error; it has ended until a reload.
@@ -128,24 +128,25 @@ impl Thread {
     }
 
     fn message_entries(&self, messages: &[Message]) -> Vec<Entry> {
-        if !self.compact {
-            return messages.iter().cloned().map(Entry::Message).collect();
-        }
         let visible_gaps: HashSet<_> = self
             .message_gaps
             .iter()
             .filter_map(|gap| {
                 self.messages
                     .iter()
-                    .find(|m| m.id >= *gap && self.direct_to_human(m))
+                    .find(|m| {
+                        m.id >= *gap && (self.direct_to_human(m) || self.direct_from_human(m))
+                    })
                     .map(|m| m.id)
             })
             .collect();
         messages
             .iter()
-            .filter(|m| self.direct_to_human(m))
+            .filter(|m| !self.compact || self.direct_to_human(m) || self.direct_from_human(m))
             .cloned()
-            .map(|m| Entry::CompactMessage {
+            .map(|m| Entry::Message {
+                compact: self.compact,
+                outgoing: self.direct_from_human(&m),
                 gap: visible_gaps.contains(&m.id),
                 message: m,
             })
@@ -165,6 +166,21 @@ impl Thread {
                     .to_name
                     .as_ref()
                     .is_some_and(|to| to.eq_ignore_ascii_case(human))
+            })
+    }
+
+    fn direct_from_human(&self, message: &Message) -> bool {
+        message.from_kind() == proto::Kind::Human
+            && self
+                .human
+                .as_ref()
+                .is_some_and(|human| message.from_name.eq_ignore_ascii_case(human))
+            && message.to_group.is_none()
+            && self.agent.as_ref().is_some_and(|agent| {
+                message
+                    .to_name
+                    .as_ref()
+                    .is_some_and(|to| to.eq_ignore_ascii_case(agent))
             })
     }
 
@@ -229,7 +245,7 @@ impl Thread {
             ]);
         }
         let mut text = if self.compact {
-            format!("{} messages to you · ", self.view.rows.len())
+            format!("{} messages · ", self.view.rows.len())
         } else {
             match &self.stream {
                 Some(stream) => {
