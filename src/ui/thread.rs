@@ -7,7 +7,7 @@ use std::hash::Hash;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Stylize;
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 
@@ -28,6 +28,10 @@ pub trait Row: PartialEq {
     fn key(&self) -> Self::Key;
     /// `gap`: messages may be missing before this row.
     fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>>;
+    /// Style applied across each rendered row, including wrapped continuations.
+    fn style(&self) -> Style {
+        Style::default()
+    }
     /// Whether the row matches a case-folded search.
     fn matches(&self, query: &str) -> bool;
 }
@@ -348,19 +352,26 @@ impl<R: Row> ThreadView<R> {
             .starts
             .partition_point(|&s| s <= top)
             .saturating_sub(1);
-        let mut text = Text::default();
         for (i, row) in self.rows.iter().enumerate().skip(first) {
             let gap = self.gaps.contains(&row.key());
-            text.lines.extend(row.lines(gap, self.query.as_deref()));
-            let end = self.frame.starts.get(i + 1).unwrap_or(&self.frame.total);
-            if *end >= top + self.frame.height {
+            let start = self.frame.starts[i];
+            let end = *self.frame.starts.get(i + 1).unwrap_or(&self.frame.total);
+            let visible_start = start.max(top);
+            let visible_end = end.min(top + self.frame.height);
+            let row_area = Rect::new(
+                area.x,
+                area.y + (visible_start - top) as u16,
+                area.width,
+                (visible_end - visible_start) as u16,
+            );
+            let paragraph = Paragraph::new(row.lines(gap, self.query.as_deref()))
+                .style(row.style())
+                .wrap(Wrap { trim: false })
+                .scroll(((visible_start - start).min(u16::MAX as usize) as u16, 0));
+            frame.render_widget(paragraph, row_area);
+            if end >= top + self.frame.height {
                 break;
             }
         }
-        let offset = top - self.frame.starts[first];
-        let feed = Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .scroll((offset.min(u16::MAX as usize) as u16, 0));
-        frame.render_widget(feed, area);
     }
 }

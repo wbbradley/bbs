@@ -169,6 +169,7 @@ impl Screen for Agents {
                         &a.name,
                         a.owner.as_deref(),
                         &ctx.me,
+                        ctx.preferences.compact(),
                     ))),
                     None => Transition::Stay,
                 }

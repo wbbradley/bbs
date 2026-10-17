@@ -16,6 +16,8 @@ pub const MIN_HEIGHT: u16 = 24;
 const BAUD: &str = "14400 baud";
 
 pub const BACKGROUND: Color = Color::Black;
+/// Current human's direct messages in agent conversations.
+pub const OUTGOING: Color = Color::DarkGray;
 /// Agents the viewing human owns, and other humans' agents.
 pub const OWN_AGENT: Color = Color::LightCyan;
 pub const OTHER_AGENT: Color = Color::LightMagenta;

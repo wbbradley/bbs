@@ -7,6 +7,7 @@ mod composer;
 mod dialog;
 mod event;
 mod keys;
+mod preferences;
 mod screens;
 mod theme;
 mod timeline;
@@ -39,6 +40,7 @@ pub async fn run(mut backend: Backend, opener: Opener) -> Result<()> {
             .unwrap_or_else(|| "local".into()),
         started: Instant::now(),
         composer_max_height_percent: opener.config.composer_max_height_percent(),
+        preferences: preferences::Preferences::load(crate::app::state_dir()?.join("connect.json"))?,
     };
     let (events, mut rx) = unbounded_channel();
     let (requests, requests_rx) = unbounded_channel();

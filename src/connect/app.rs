@@ -12,6 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::composer::Composer;
 use super::event::{Data, Event, Request};
 use super::keys::{Action, Keymap};
+use super::preferences::Preferences;
 use super::screens::help::Help;
 use super::screens::menu::Menu;
 use super::screens::splash::Splash;
@@ -32,6 +33,7 @@ pub struct Ctx {
     pub started: Instant,
     /// `[connect] composer_max_height_percent`.
     pub composer_max_height_percent: u8,
+    pub preferences: Preferences,
 }
 
 pub enum Transition {
@@ -41,6 +43,8 @@ pub enum Transition {
     Quit,
     /// Ask the server for something on the screen's behalf.
     Request(Request),
+    /// Remember the agent conversation view locally for this and future sessions.
+    Compact(bool),
 }
 
 pub trait Screen {
@@ -199,6 +203,7 @@ impl App {
     fn apply(&mut self, transition: Transition) -> bool {
         match transition {
             Transition::Stay => {}
+            Transition::Compact(compact) => self.ctx.preferences.set_compact(compact),
             Transition::Push(screen) => self.push(screen),
             Transition::Pop if self.stack.len() > 1 => self.pop(),
             Transition::Request(request) => self.send(vec![request]),
@@ -234,12 +239,15 @@ mod tests {
 
     fn app() -> (App, UnboundedReceiver<Request>) {
         let (tx, rx) = unbounded_channel();
-        let ctx = Ctx {
+        let mut ctx = Ctx {
             me: "ada".into(),
             server: "bbs:7777".into(),
             started: Instant::now(),
             composer_max_height_percent: 20,
+            preferences: Preferences::default(),
         };
+        // Most interaction tests exercise an explicitly chosen verbose view.
+        ctx.preferences.set_compact(false);
         let mut app = App::new(ctx, tx);
         // Past the splash.
         key(&mut app, ' ');
@@ -286,6 +294,7 @@ mod tests {
             server: "bbs:7777".into(),
             started: Instant::now(),
             composer_max_height_percent: 20,
+            preferences: Preferences::default(),
         };
         let mut app = App::new(ctx, tx);
         let out = screen(&mut app, 80, 24);
@@ -307,6 +316,7 @@ mod tests {
             server: "local".into(),
             started: Instant::now(),
             composer_max_height_percent: 20,
+            preferences: Preferences::default(),
         };
         let mut app = App::new(ctx, tx);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -1265,7 +1275,9 @@ mod tests {
         };
         let outbound = proto::Message {
             from_kind: proto::Kind::Human.into(),
-            ..message(5, "ada", "Mateo", "outbound-body")
+            created_at: "2026-10-16T18:00:01Z".into(),
+            to_owner: Some("ada".into()),
+            ..message(5, "ADA", "MATEO", "outbound-body")
         };
         let wrong_kind = proto::Message {
             from_kind: proto::Kind::Human.into(),
@@ -1288,7 +1300,19 @@ mod tests {
                 message(6, "Zed", "ada", "other-agent-body"),
                 wrong_kind,
                 owned_recipient,
-                message(9, "MATEO", "ADA", "direct-two"),
+                proto::Message {
+                    created_at: "2026-10-16T18:00:02Z".into(),
+                    ..message(9, "MATEO", "ADA", "direct-two")
+                },
+                proto::Message {
+                    from_kind: proto::Kind::Human.into(),
+                    ..message(10, "Ben", "Mateo", "other-human-outbound")
+                },
+                message(11, "ada", "Mateo", "agent-named-human"),
+                proto::Message {
+                    from_kind: proto::Kind::Human.into(),
+                    ..message(12, "ada", "Zed", "outbound-other-agent")
+                },
             ]),
         }));
         app.on_event(Event::Data(Data::Activity {
@@ -1309,17 +1333,19 @@ mod tests {
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let compact = screen(&mut app, 120, 40);
         assert!(
-            compact.contains("2 messages to you") && compact.contains("Ctrl-T: verbose"),
+            compact.contains("3 messages") && compact.contains("Ctrl-T: verbose"),
             "{compact}"
         );
-        for shown in ["direct-one", "direct-two"] {
+        for shown in ["direct-one", "outbound-body", "direct-two"] {
             assert!(compact.contains(shown), "{compact}");
         }
         for hidden in [
             "to-agent-body",
             "other-human-body",
             "broadcast-body",
-            "outbound-body",
+            "other-human-outbound",
+            "agent-named-human",
+            "outbound-other-agent",
             "other-agent-body",
             "human-sender-body",
             "owned-recipient-body",
@@ -1330,11 +1356,15 @@ mod tests {
         ] {
             assert!(!compact.contains(hidden), "{hidden}: {compact}");
         }
+        assert_eq!(
+            order(&compact, &["direct-one", "outbound-body", "direct-two"]),
+            ["direct-one", "outbound-body", "direct-two"]
+        );
         let headers: Vec<_> = compact
             .lines()
             .filter(|line| line.contains(&timestamp))
             .collect();
-        assert_eq!(headers.len(), 2, "{compact}");
+        assert_eq!(headers.len(), 1, "{compact}");
         assert!(
             headers
                 .iter()
@@ -1343,16 +1373,28 @@ mod tests {
         app.on_event(Event::Data(Data::Feed {
             id: feed,
             result: Ok(vec![
-                message(10, "Mateo", "ada", "live-direct"),
-                message(11, "Mateo", "Ben", "live-hidden"),
+                proto::Message {
+                    created_at: "2026-10-16T18:00:04Z".into(),
+                    ..message(13, "Mateo", "ada", "live-direct")
+                },
+                message(14, "Mateo", "Ben", "live-hidden"),
+                proto::Message {
+                    from_kind: proto::Kind::Human.into(),
+                    created_at: "2026-10-16T18:00:03Z".into(),
+                    ..message(15, "ada", "Mateo", "live-outbound")
+                },
             ]),
         }));
         let compact = screen(&mut app, 120, 40);
         assert!(
-            compact.contains("3 messages to you")
+            compact.contains("5 messages")
                 && compact.contains("live-direct")
                 && !compact.contains("live-hidden"),
             "{compact}"
+        );
+        assert_eq!(
+            order(&compact, &["direct-two", "live-outbound", "live-direct"]),
+            ["direct-two", "live-outbound", "live-direct"]
         );
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let verbose = screen(&mut app, 120, 40);
@@ -1362,6 +1404,144 @@ mod tests {
                 && verbose.contains("→"),
             "{verbose}"
         );
+    }
+
+    #[test]
+    fn outgoing_mail_is_shaded_only_in_agent_conversations_and_stays_unread() {
+        let (mut app, mut rx) = app();
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        let outgoing = proto::Message {
+            from_kind: proto::Kind::Human.into(),
+            ..message(1, "ada", "Mateo", "my-outgoing-message")
+        };
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![outgoing.clone()]),
+        }));
+        assert!(
+            rx.try_recv().is_err(),
+            "outgoing mail must not mark mail read or activity seen"
+        );
+        let assert_background = |app: &mut App, shaded: bool| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let y = (0..30)
+                .find(|y| {
+                    (0..100)
+                        .map(|x| buffer[(x, *y)].symbol())
+                        .collect::<String>()
+                        .contains("my-outgoing-message")
+                })
+                .unwrap();
+            assert_eq!(
+                buffer[(98, y)].bg,
+                if shaded {
+                    theme::OUTGOING
+                } else {
+                    theme::BACKGROUND
+                }
+            );
+            assert!((1..99).all(|x| buffer[(x, y)].bg == buffer[(98, y)].bg));
+            if shaded {
+                for padding in [y - 2, y + 1] {
+                    assert!((1..99).all(|x| buffer[(x, padding)].bg == theme::OUTGOING
+                        && buffer[(x, padding)].symbol() == " "));
+                }
+            }
+        };
+        assert_background(&mut app, true);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_background(&mut app, true);
+        assert!(rx.try_recv().is_err());
+        // Leave Insert mode, then close the conversation and open the board feed.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        while rx.try_recv().is_ok() {}
+        key(&mut app, 'q');
+        while rx.try_recv().is_ok() {}
+        key(&mut app, 'f');
+        let (feed, _) = watched(&mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![outgoing]),
+        }));
+        assert_background(&mut app, false);
+    }
+
+    #[test]
+    fn conversation_preference_defaults_to_compact_and_is_shared_and_reloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connect.json");
+        let (mut first_app, mut rx) = app();
+        first_app.ctx.preferences = Preferences::load(path.clone()).unwrap();
+        open_agents(&mut first_app, &mut rx);
+        first_app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![agent("Mateo", "ada", &[]), agent("Zed", "ada", &[])],
+        }))));
+        reopen(&mut first_app, &mut rx);
+        assert!(screen(&mut first_app, 120, 24).contains("Ctrl-T: verbose"));
+        typed(&mut first_app, "draft");
+        press(&mut first_app, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut first_app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(!Preferences::load(path.clone()).unwrap().compact());
+        close_conversation(&mut first_app, &mut rx);
+        key(&mut first_app, 'j');
+        reopen(&mut first_app, &mut rx);
+        assert!(screen(&mut first_app, 120, 24).contains("Ctrl-T: compact"));
+        press(&mut first_app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut first_app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(screen(&mut first_app, 120, 24).contains("Navigation · Esc/i write to Zed"));
+        assert!(Preferences::load(path.clone()).unwrap().compact());
+        press(&mut first_app, KeyCode::Esc, KeyModifiers::NONE);
+        close_conversation(&mut first_app, &mut rx);
+        key(&mut first_app, 'k');
+        reopen(&mut first_app, &mut rx);
+        assert!(screen(&mut first_app, 120, 24).contains("Ctrl-T: verbose"));
+        typed(&mut first_app, "X");
+        enter(&mut first_app);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("expected send");
+        };
+        assert_eq!(req.body, "drafXt");
+
+        // A new app invocation inherits the saved global preference.
+        for compact in [true, false] {
+            let mut preferences = Preferences::load(path.clone()).unwrap();
+            preferences.set_compact(compact);
+            let (mut next_app, mut next_rx) = app();
+            next_app.ctx.preferences = Preferences::load(path.clone()).unwrap();
+            mateo(&mut next_app, &mut next_rx);
+            let out = screen(&mut next_app, 120, 24);
+            assert!(out.contains(if compact {
+                "Ctrl-T: verbose"
+            } else {
+                "Ctrl-T: compact"
+            }));
+        }
+    }
+
+    #[test]
+    fn preference_save_errors_are_visible_without_losing_the_view_or_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state");
+        let (mut app, mut rx) = app();
+        app.ctx.preferences = Preferences::load(parent.join("connect.json")).unwrap();
+        std::fs::write(&parent, "blocked").unwrap();
+        mateo(&mut app, &mut rx);
+        typed(&mut app, "draft");
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("Cannot save view preference")
+                && out.contains("draft")
+                && out.contains("To Mateo · Enter sends"),
+            "{out}"
+        );
+        assert!(!app.ctx.preferences.compact());
+        std::fs::remove_file(&parent).unwrap();
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(!screen(&mut app, 80, 24).contains("Cannot save view preference"));
     }
 
     #[test]
@@ -1483,7 +1663,10 @@ mod tests {
                 // A later visible arrival still carries the raw gap boundary.
                 app.on_event(Event::Data(Data::Feed {
                     id: feed,
-                    result: Ok(vec![message(401, "Mateo", "ada", "after-gap")]),
+                    result: Ok(vec![proto::Message {
+                        from_kind: proto::Kind::Human.into(),
+                        ..message(401, "ada", "Mateo", "after-gap")
+                    }]),
                 }));
             }
             let out = screen(&mut app, 120, 30);
