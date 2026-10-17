@@ -5,6 +5,8 @@ use chrono::{DateTime, Local};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::proto::{Kind, Message};
 
@@ -177,19 +179,11 @@ fn wrap_body(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
     let indent = text.bytes().take_while(|&b| b == b' ').count();
     // Leave room for a wide character, even in a very narrow pane.
     let indent = indent.min(usize::from(width.saturating_sub(2)));
-    let options = textwrap::Options::new(usize::from(width) - indent)
-        .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit)
-        .word_splitter(textwrap::WordSplitter::NoHyphenation);
-    let mut at = indent;
-    textwrap::wrap(&text[indent..], options)
+    wrapped_ranges(&text[indent..], usize::from(width) - indent)
         .into_iter()
-        .map(|part| {
-            let start = at
-                + text[at..]
-                    .find(part.as_ref())
-                    .expect("wrapping only splits the source");
-            let end = start + part.len();
-            at = end;
+        .map(|range| {
+            let start = indent + range.start;
+            let end = indent + range.end;
             let mut spans = vec![Span::raw(" ".repeat(indent))];
             let mut offset = 0;
             for span in &line.spans {
@@ -210,6 +204,53 @@ fn wrap_body(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
             }
         })
         .collect()
+}
+
+/// Greedy word wrapping with byte ranges that always end at grapheme boundaries.
+fn wrapped_ranges(text: &str, width: usize) -> Vec<std::ops::Range<usize>> {
+    let graphemes: Vec<_> = text.grapheme_indices(true).collect();
+    let whitespace =
+        |g: &str| g == "\u{200b}" || g != "\u{a0}" && g.chars().all(char::is_whitespace);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < graphemes.len() {
+        let mut used = 0;
+        let mut last_space = None;
+        let mut end = graphemes.len();
+        let mut next = end;
+        for i in start..graphemes.len() {
+            let (_, g) = graphemes[i];
+            if used + g.width() > width {
+                (end, next) = if whitespace(g) {
+                    (i, i)
+                } else if let Some((space_start, space_end)) = last_space {
+                    (space_start, space_end)
+                } else {
+                    // A single grapheme can be wider than a narrow pane.
+                    // Keep it whole and always make progress.
+                    let end = i.max(start + 1);
+                    (end, end)
+                };
+                break;
+            }
+            used += g.width();
+            if whitespace(g) {
+                let space_start = if i > start && whitespace(graphemes[i - 1].1) {
+                    last_space.map_or(i, |(start, _)| start)
+                } else {
+                    i
+                };
+                last_space = Some((space_start, i + 1));
+            }
+        }
+        let byte_end = graphemes.get(end).map_or(text.len(), |(at, _)| *at);
+        ranges.push(graphemes[start].0..byte_end);
+        while next < graphemes.len() && whitespace(graphemes[next].1) {
+            next += 1;
+        }
+        start = next;
+    }
+    ranges
 }
 
 /// Case folding for search: a character's lowercase form when that is one
@@ -467,6 +508,41 @@ mod tests {
             let lines = body("  abc界", width, None);
             assert!(!lines.is_empty());
         }
+    }
+
+    #[test]
+    fn wrapping_keeps_emoji_and_combining_graphemes_whole() {
+        for cluster in ["👍🏽", "🇺🇸", "👨‍👩‍👧‍👦", "e\u{301}"] {
+            let text = cluster.repeat(3);
+            for width in [1, 2, 3, 4, 5, 6, 9] {
+                let lines = body(&format!("**{text}**"), width, None);
+                let pieces: Vec<_> = lines
+                    .iter()
+                    .map(|line| line.to_string().trim().to_owned())
+                    .collect();
+                assert_eq!(pieces.concat(), text, "{cluster} at width {width}");
+                for piece in pieces {
+                    assert!(
+                        piece.graphemes(true).all(|g| g == cluster),
+                        "{piece:?} at width {width}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            body("👍🏽👍🏽👍🏽", 4, None)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["  👍🏽", "  👍🏽", "  👍🏽"]
+        );
+        assert_eq!(
+            body("🇺🇸🇺🇸🇺🇸", 5, None)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["  🇺🇸", "  🇺🇸", "  🇺🇸"]
+        );
     }
 
     #[test]
