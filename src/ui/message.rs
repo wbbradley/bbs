@@ -14,7 +14,32 @@ const HEADER_NAMES: [usize; 2] = [2, 4];
 /// missing before it, the header, and the indented markdown body, with
 /// `query` matches highlighted in the names and body.
 pub fn message_lines<'a>(row: &'a Message, gap: bool, query: Option<&str>) -> Vec<Line<'a>> {
-    let mut header = header(row);
+    with_header(row, gap, query, header(row))
+}
+
+/// The same body and search rendering, with only the timestamp as its header.
+pub fn compact_message_lines<'a>(
+    row: &'a Message,
+    gap: bool,
+    query: Option<&str>,
+) -> Vec<Line<'a>> {
+    with_header(
+        row,
+        gap,
+        query,
+        Line::styled(
+            local_time(&row.created_at),
+            Style::new().fg(Color::DarkGray),
+        ),
+    )
+}
+
+fn with_header<'a>(
+    row: &'a Message,
+    gap: bool,
+    query: Option<&str>,
+    mut header: Line<'static>,
+) -> Vec<Line<'a>> {
     let mut body = Vec::new();
     for mut line in tui_markdown::from_str(&row.body).lines {
         line.spans.insert(0, Span::raw("  "));
@@ -201,6 +226,32 @@ fn local(stored: &str) -> Option<DateTime<Local>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_headers_only_show_time_and_keep_body_styles_and_search() {
+        let row = Message {
+            created_at: "2026-10-16T18:00:00Z".into(),
+            from_name: "Mateo".into(),
+            to_name: Some("ada".into()),
+            body: "**answer**".into(),
+            ..Default::default()
+        };
+        let full = message_lines(&row, false, Some("answer"));
+        let compact = compact_message_lines(&row, false, Some("answer"));
+        assert_eq!(compact[1].to_string(), local_time(&row.created_at));
+        assert_eq!(&compact[2..], &full[2..]);
+        let answer = compact[2]
+            .spans
+            .iter()
+            .find(|s| s.content == "answer")
+            .unwrap();
+        assert!(
+            answer
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::REVERSED)
+        );
+    }
 
     #[test]
     fn highlight_keeps_combining_marks_with_their_letter() {

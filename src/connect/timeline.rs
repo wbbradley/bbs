@@ -11,7 +11,7 @@ use super::event::{Data, Request};
 use crate::backend::AGENT_ACTIVITY;
 use crate::proto::{self, Message};
 use crate::ui::activity::Activity;
-use crate::ui::message::{find_matches, message_lines};
+use crate::ui::message::{compact_message_lines, find_matches, message_lines};
 use crate::ui::thread::Row;
 
 /// Events each batch holds; the stream catches up from the start in batches.
@@ -23,6 +23,12 @@ const MAX_RECORDS: usize = 5000;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
     Message(Message),
+    /// A direct message in compact mode, with a timestamp-only header.
+    CompactMessage {
+        message: Message,
+        /// A possible gap in the raw feed before this visible message.
+        gap: bool,
+    },
     /// One activity record, drawn when it arrived.
     Stream {
         id: i64,
@@ -43,7 +49,9 @@ impl Row for Entry {
 
     fn key(&self) -> Self::Key {
         match self {
-            Entry::Message(m) => (micros(&m.created_at), 0, m.id),
+            Entry::Message(m) | Entry::CompactMessage { message: m, .. } => {
+                (micros(&m.created_at), 0, m.id)
+            }
             Entry::Stream { id, created_at, .. } => (micros(created_at), 1, *id),
         }
     }
@@ -51,13 +59,17 @@ impl Row for Entry {
     fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>> {
         match self {
             Entry::Message(m) => message_lines(m, gap, query),
+            Entry::CompactMessage {
+                message,
+                gap: raw_gap,
+            } => compact_message_lines(message, gap || *raw_gap, query),
             Entry::Stream { lines, .. } => lines.clone(),
         }
     }
 
     fn matches(&self, query: &str) -> bool {
         match self {
-            Entry::Message(m) => m.matches(query),
+            Entry::Message(m) | Entry::CompactMessage { message: m, .. } => m.matches(query),
             Entry::Stream { lines, .. } => lines.iter().any(|line| {
                 let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 !find_matches(&text, query).is_empty()

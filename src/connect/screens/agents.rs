@@ -165,9 +165,11 @@ impl Screen for Agents {
             Action::Open => {
                 let shown = self.shown(&ctx.me);
                 match self.state.selected().and_then(|i| shown.get(i)) {
-                    Some(a) => {
-                        Transition::Push(Box::new(Thread::agent(&a.name, a.owner.as_deref())))
-                    }
+                    Some(a) => Transition::Push(Box::new(Thread::agent(
+                        &a.name,
+                        a.owner.as_deref(),
+                        &ctx.me,
+                    ))),
                     None => Transition::Stay,
                 }
             }

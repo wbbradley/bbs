@@ -9,6 +9,10 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Added
+
+- Agent conversations in `bbs connect` use `Ctrl-t` to toggle a compact view of the agent's direct messages to you, with timestamp-only headers and preserved draft, cursor and verbose filter choices (#82).
+
 ### Fixed
 
 - Tool activity in `bbs connect` and `bbs headless logs --pretty` keeps its title and duration across partial updates, and uses titles supplied by later updates (#80).
