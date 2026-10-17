@@ -105,7 +105,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     let resume = state
         .session_id
         .clone()
-        .filter(|_| state.harness.as_deref() == Some(harness.as_str()));
+        .filter(|_| !args.new_session && state.harness.as_deref() == Some(harness.as_str()));
     // Listen before starting the harness: a signal during setup drops the
     // start, which kills the harness's process group.
     let mut signals = Signals::new()?;

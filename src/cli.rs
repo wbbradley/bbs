@@ -362,6 +362,9 @@ pub struct HeadlessRunArgs {
     /// Instructions added to the first prompt of a new session.
     #[arg(long)]
     pub prompt_file: Option<std::path::PathBuf>,
+    /// Start a new harness session instead of resuming the saved one.
+    #[arg(long)]
+    pub new_session: bool,
     /// What to do with mail that arrives during a turn.
     #[arg(long, value_enum)]
     pub mid_turn: Option<crate::headless::MidTurn>,

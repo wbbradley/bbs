@@ -2873,14 +2873,20 @@ struct RunGuard(Option<std::process::Child>);
 
 impl RunGuard {
     fn start(bbs: &Bbs, agent: &str) -> RunGuard {
+        RunGuard::start_with(bbs, agent, &[])
+    }
+
+    fn start_with(bbs: &Bbs, agent: &str, extra: &[&str]) -> RunGuard {
+        let mut args = vec![
+            "headless",
+            "run",
+            agent,
+            "--cwd",
+            bbs.home.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
         let child = bbs
-            .command(&[
-                "headless",
-                "run",
-                agent,
-                "--cwd",
-                bbs.home.to_str().unwrap(),
-            ])
+            .command(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -3245,6 +3251,34 @@ fn headless_stops_after_repeated_turn_errors(mode: Mode) {
     assert!(headless_state(&bbs, "Zed")["session_id"].is_null());
 }
 
+fn headless_new_session_skips_resume(mode: Mode) {
+    let bbs = Bbs::with_mode("new-session", mode);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");
+    headless_config(&bbs, &["python3", fake]);
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    let sessions = |count: usize| {
+        eventually("session", || {
+            let log = std::fs::read_to_string(&log).ok()?;
+            let resumed: Vec<bool> = log
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|record| record["event"] == "session")
+                .map(|record| record["resumed"].as_bool().unwrap())
+                .collect();
+            (resumed.len() >= count).then_some(resumed)
+        })
+    };
+
+    // A plain run resumes; --new-session does not, and the next run resumes again.
+    for (count, extra) in [(1, &[][..]), (2, &[]), (3, &["--new-session"]), (4, &[])] {
+        let run = RunGuard::start_with(&bbs, "Zed", extra);
+        sessions(count);
+        run.stop();
+    }
+    assert_eq!(sessions(4), [false, true, false, true]);
+    assert_eq!(headless_state(&bbs, "Zed")["session_id"], "fake-session");
+}
+
 fn connect_is_for_humans_at_a_terminal(mode: Mode) {
     let bbs = Bbs::with_mode("connect", mode);
     let (_, token) = bbs.register();
@@ -3424,6 +3458,7 @@ both_modes!(
     headless_shares_activity_by_default,
     headless_codex_replies_steers_and_interrupts,
     headless_stops_after_repeated_turn_errors,
+    headless_new_session_skips_resume,
     connect_is_for_humans_at_a_terminal,
     control_messages_are_for_owned_agents_only,
     headless_run_takes_over_an_owned_agent,
