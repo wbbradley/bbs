@@ -9,6 +9,10 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Fixed
+
+- Tool activity in `bbs connect` and `bbs headless logs --pretty` keeps its title and duration across partial updates, and uses titles supplied by later updates (#80).
+
 ### Changed
 
 - In the `bbs connect` composer, `Ctrl-u` deletes back to the start of the line, as in readline; undo moves to `Ctrl-_` (or `Ctrl-/`) (#78).
