@@ -177,6 +177,17 @@ impl Activity {
     fn tool(&mut self, out: &mut Vec<Line<'static>>, r: &Map<String, Value>) {
         let id = str_field(r, "id").to_string();
         let status = str_field(r, "status");
+        let title = str_field(r, "title");
+        if !title.is_empty()
+            && let Some(call) = self.calls.get_mut(&id)
+        {
+            call.name = tool_name(title);
+        }
+        // ACP tool updates are partial: output or title updates need not carry
+        // a status. They do not finish a call or establish a new running call.
+        if status.is_empty() {
+            return;
+        }
         if status == "pending" || status == "in_progress" {
             if !self.calls.contains_key(&id) {
                 self.order.push(id.clone());
@@ -347,6 +358,68 @@ mod tests {
         assert_eq!(
             to_ansi(&pretty.render(done), false),
             "  ✓ Read src/main.rs completed (2.0s)\n"
+        );
+    }
+
+    #[test]
+    fn partial_tool_updates_keep_the_title_and_original_start_time() {
+        let mut pretty = Activity::new(false);
+        for line in [
+            r#"{"ts":"2026-10-16T05:00:00Z","event":"tool","title":"cargo test","status":"in_progress","id":"a"}"#,
+            r#"{"ts":"2026-10-16T05:00:01Z","event":"tool","id":"a"}"#,
+            r#"{"ts":"2026-10-16T05:00:02Z","event":"tool","id":"a"}"#,
+        ] {
+            assert!(pretty.render(line).is_empty());
+        }
+        assert_eq!(
+            to_ansi(&pretty.in_progress(), false),
+            "  … cargo test running\n"
+        );
+        assert_eq!(
+            to_ansi(&pretty.running(), false),
+            "  … cargo test running\n"
+        );
+        assert!(pretty.running().is_empty());
+        let done = r#"{"ts":"2026-10-16T05:00:03Z","event":"tool","status":"completed","id":"a"}"#;
+        assert_eq!(
+            to_ansi(&pretty.render(done), false),
+            "  ✓ cargo test completed (3.0s)\n"
+        );
+        assert!(pretty.in_progress().is_empty());
+        // An output update after completion must not resurrect the call.
+        assert!(pretty.render(r#"{"event":"tool","id":"a"}"#).is_empty());
+        assert!(pretty.in_progress().is_empty());
+    }
+
+    #[test]
+    fn tool_titles_can_arrive_in_later_updates() {
+        let mut pretty = Activity::new(false);
+        assert!(
+            pretty
+                .render(r#"{"event":"tool","status":"pending","id":"a"}"#)
+                .is_empty()
+        );
+        for update in [
+            r#"{"event":"tool","title":"Read first.rs","status":"in_progress","id":"a"}"#,
+            r#"{"event":"tool","title":"Read second.rs","id":"a"}"#,
+        ] {
+            assert!(pretty.render(update).is_empty());
+        }
+        assert_eq!(
+            to_ansi(&pretty.in_progress(), false),
+            "  … Read second.rs running\n"
+        );
+        let done = r#"{"event":"tool","title":"Read final.rs","status":"failed","id":"a"}"#;
+        assert_eq!(
+            to_ansi(&pretty.render(done), false),
+            "  ✗ Read final.rs failed\n"
+        );
+        assert!(pretty.in_progress().is_empty());
+        // A history window may begin with a result whose start was dropped.
+        let orphan = r#"{"event":"tool","title":"Read orphan.rs","status":"completed","id":"b"}"#;
+        assert_eq!(
+            to_ansi(&pretty.render(orphan), false),
+            "  ✓ Read orphan.rs completed\n"
         );
     }
 
