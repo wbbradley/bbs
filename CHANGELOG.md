@@ -16,6 +16,7 @@ request that bumps the package version; correct the date if publishing slips.
 ### Changed
 
 - In the `bbs connect` composer, `Ctrl-u` deletes back to the start of the line, as in readline; undo moves to `Ctrl-_` (or `Ctrl-/`) (#78).
+- Agent conversations in `bbs connect` open in Insert mode and retain each agent's draft and cursor when closed. `Ctrl-u`/`PgUp` enters navigation; `Esc` returns to Insert mode, then closes the conversation (#81).
 
 ## 0.7.1 - 2026-10-16
 

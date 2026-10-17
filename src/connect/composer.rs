@@ -17,8 +17,8 @@ pub struct Composer {
     text: TextArea<'static>,
     /// Who it sends to: an agent's name or `@group`.
     to: String,
-    /// A send is in flight; its text stays until it succeeds.
-    sending: bool,
+    /// A send's id and submitted text; later edits remain if it succeeds.
+    sending: Option<(u64, String)>,
     /// Why the last send failed.
     error: Option<String>,
 }
@@ -28,7 +28,7 @@ impl Composer {
         Composer {
             text: blank(),
             to: to.to_string(),
-            sending: false,
+            sending: None,
             error: None,
         }
     }
@@ -38,7 +38,7 @@ impl Composer {
     }
 
     /// Apply a key; the body to send when `Enter` sends one.
-    pub fn key(&mut self, key: KeyEvent) -> Option<String> {
+    pub fn key(&mut self, key: KeyEvent, send_id: u64) -> Option<String> {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -57,10 +57,10 @@ impl Composer {
             }
             KeyCode::Enter => {
                 let body = self.text.lines().join("\n");
-                if self.sending || body.trim().is_empty() {
+                if self.sending.is_some() || body.trim().is_empty() {
                     return None;
                 }
-                self.sending = true;
+                self.sending = Some((send_id, body.clone()));
                 self.error = None;
                 return Some(body);
             }
@@ -71,16 +71,22 @@ impl Composer {
         None
     }
 
-    /// The outcome of the send in flight: on success the box empties.
-    pub fn sent(&mut self, result: Result<(), String>) {
-        self.sending = false;
+    /// Consume a matching send result; success clears only unchanged text.
+    pub fn sent(&mut self, id: u64, result: Result<(), String>) -> bool {
+        if self.sending.as_ref().map(|(pending, _)| *pending) != Some(id) {
+            return false;
+        }
+        let (_, body) = self.sending.take().expect("the matching send exists");
         match result {
             Ok(()) => {
-                self.text = blank();
+                if self.text.lines().join("\n") == body {
+                    self.text = blank();
+                }
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
         }
+        true
     }
 
     /// Rows the box takes at `width`, borders included: two text lines when
@@ -101,10 +107,15 @@ impl Composer {
         lines.clamp(MIN_LINES, max_lines.max(MIN_LINES)) + 2
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
-        let title = match (&self.error, self.sending, focused) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool, agent: bool) {
+        let title = match (&self.error, self.sending.is_some(), focused) {
             (Some(e), ..) => format!(" Not sent: {e} "),
             (None, true, _) => " Sending… ".to_string(),
+            (None, false, true) if agent => format!(
+                " To {} · Enter sends · Ctrl-U/PgUp scroll · Esc back ",
+                self.to
+            ),
+            (None, false, false) if agent => format!(" Navigation · Esc/i write to {} ", self.to),
             (None, false, true) => {
                 format!(
                     " To {} · Enter sends · Alt-Enter new line · Esc done ",
@@ -147,7 +158,7 @@ mod tests {
     use super::*;
 
     fn press(composer: &mut Composer, code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
-        composer.key(KeyEvent::new(code, modifiers))
+        composer.key(KeyEvent::new(code, modifiers), 1)
     }
 
     fn typed(composer: &mut Composer, text: &str) {
@@ -169,9 +180,9 @@ mod tests {
         assert_eq!(body.as_deref(), Some("one\ntwo\nthree"));
         // One send at a time; a failure keeps the text for another try.
         assert_eq!(press(&mut c, KeyCode::Enter, KeyModifiers::NONE), None);
-        c.sent(Err("no agent named Mateo".into()));
+        c.sent(1, Err("no agent named Mateo".into()));
         assert!(press(&mut c, KeyCode::Enter, KeyModifiers::NONE).is_some());
-        c.sent(Ok(()));
+        c.sent(1, Ok(()));
         assert_eq!(c.text.lines(), [""]);
     }
 

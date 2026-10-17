@@ -1,5 +1,6 @@
 //! The app: a stack of screens under a shared title bar and status bar.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use ratatui::Frame;
@@ -8,6 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::composer::Composer;
 use super::event::{Data, Event, Request};
 use super::keys::{Action, Keymap};
 use super::screens::help::Help;
@@ -15,7 +17,7 @@ use super::screens::menu::Menu;
 use super::screens::splash::Splash;
 use super::theme;
 
-/// A fresh id, telling apart the screens that ask the server for things.
+/// A fresh id for a screen, stream or send request.
 pub fn next_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -70,6 +72,9 @@ pub trait Screen {
     fn on_close(&self) -> Vec<Request> {
         Vec::new()
     }
+    /// Move an agent's composer between its screen and the session's saved drafts.
+    fn save_draft(&mut self, _drafts: &mut HashMap<String, Composer>) {}
+    fn restore_draft(&mut self, _drafts: &mut HashMap<String, Composer>) {}
     fn handle(&mut self, action: Action, ctx: &Ctx) -> Transition;
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx);
 }
@@ -79,6 +84,7 @@ pub struct App {
     ctx: Ctx,
     keymap: Keymap,
     requests: UnboundedSender<Request>,
+    drafts: HashMap<String, Composer>,
 }
 
 impl App {
@@ -88,13 +94,15 @@ impl App {
             ctx,
             keymap: Keymap::default(),
             requests,
+            drafts: HashMap::new(),
         };
         app.push(Box::new(Menu::default()));
         app.push(Box::new(Splash));
         app
     }
 
-    fn push(&mut self, screen: Box<dyn Screen>) {
+    fn push(&mut self, mut screen: Box<dyn Screen>) {
+        screen.restore_draft(&mut self.drafts);
         self.fetch(screen.as_ref());
         self.stack.push(screen);
     }
@@ -111,8 +119,9 @@ impl App {
     }
 
     fn pop(&mut self) {
-        if let Some(screen) = self.stack.pop() {
+        if let Some(mut screen) = self.stack.pop() {
             self.send(screen.on_close());
+            screen.save_draft(&mut self.drafts);
         }
     }
 
@@ -146,6 +155,11 @@ impl App {
                 quit
             }
             Event::Data(data) => {
+                if let Data::Sent { id, result } = &data {
+                    for draft in self.drafts.values_mut() {
+                        draft.sent(*id, result.clone());
+                    }
+                }
                 for screen in &mut self.stack {
                     screen.on_data(&data);
                 }
@@ -442,6 +456,7 @@ mod tests {
             panic!("expected an activity watch");
         };
         assert_eq!(req.backlog, 200);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         assert!(screen(&mut app, 80, 24).contains("No messages yet"));
         app.on_event(Event::Data(Data::Feed {
             id,
@@ -509,6 +524,7 @@ mod tests {
             ]),
         };
         // Covered by help, the thread is not being viewed.
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         key(&mut app, '?');
         app.on_event(Event::Data(feed(false)));
         assert!(rx.try_recv().is_err());
@@ -538,6 +554,7 @@ mod tests {
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("needs a newer server (feed-with.v1)"), "{out}");
         // Reload starts the stream again.
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         key(&mut app, 'r');
         assert_eq!(watched(&mut rx).0, id);
     }
@@ -612,7 +629,7 @@ mod tests {
         assert!(out.contains("✉1 •4") && out.contains("•99"), "{out}");
         enter(&mut app);
         assert_eq!(watched(&mut rx).1.with.as_deref(), Some("Bo"));
-        key(&mut app, 'q');
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         // Without summaries (an older server), the server's order.
         app.on_event(Event::Data(Data::Summary {
             id,
@@ -675,8 +692,7 @@ mod tests {
     fn the_composer_sends_to_the_agent_and_empties_on_success() {
         let (mut app, mut rx) = app();
         let id = mateo(&mut app, &mut rx);
-        assert!(screen(&mut app, 80, 24).contains("i: write to Mateo"));
-        key(&mut app, 'i');
+        assert!(screen(&mut app, 80, 24).contains("To Mateo · Enter sends"));
         // Keys are text now: q does not go back.
         for c in "quick".chars() {
             assert!(!key(&mut app, c));
@@ -693,28 +709,204 @@ mod tests {
             panic!("expected a send");
         };
         assert_eq!(
-            (sent, req.to.as_str(), req.body.as_str()),
-            (id, "Mateo", "quick\nnote")
+            (req.to.as_str(), req.body.as_str()),
+            ("Mateo", "quick\nnote")
         );
         assert!(screen(&mut app, 80, 24).contains("Sending…"));
-        app.on_event(Event::Data(Data::Sent { id, result: Ok(()) }));
+        app.on_event(Event::Data(Data::Sent {
+            id: sent,
+            result: Ok(()),
+        }));
         let out = screen(&mut app, 80, 24);
         assert!(!out.contains("quick"), "{out}");
-        // Esc leaves the composer, and q then goes back.
+        // Esc closes the agent conversation directly.
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(screen(&mut app, 80, 24).contains("i: write to Mateo"));
-        key(&mut app, 'q');
+        assert!(screen(&mut app, 80, 24).contains("Your agents"));
         assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
+    }
+
+    #[test]
+    fn agent_insert_and_navigation_modes_use_explicit_switches() {
+        for switch in [
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        ] {
+            let (mut app, mut rx) = app();
+            let id = mateo(&mut app, &mut rx);
+            app.on_event(Event::Data(Data::Feed {
+                id,
+                result: Ok((1..50)
+                    .map(|id| message(id, "Zed", "Mateo", &format!("message {id}")))
+                    .collect()),
+            }));
+            assert!(screen(&mut app, 100, 24).contains("To Mateo · Enter sends"));
+            typed(&mut app, "first");
+            press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+            typed(&mut app, "second");
+            // Up from either line stays in the editor, including at its top.
+            for _ in 0..3 {
+                press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+                assert!(screen(&mut app, 100, 24).contains("To Mateo · Enter sends"));
+            }
+            app.on_event(Event::Key(switch));
+            let out = screen(&mut app, 100, 24);
+            assert!(
+                out.contains("Navigation · Esc/i write to Mateo") && out.contains("paused"),
+                "{out}"
+            );
+            for key in [
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            ] {
+                app.on_event(Event::Key(key));
+                assert!(screen(&mut app, 100, 24).contains("Navigation · Esc/i write to Mateo"));
+            }
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let out = screen(&mut app, 100, 24);
+            assert!(
+                out.contains("To Mateo · Enter sends")
+                    && out.contains("first")
+                    && out.contains("second"),
+                "{out}"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(screen(&mut app, 100, 24).contains("Your agents"));
+            assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
+        }
+    }
+
+    /// Reopen the selected agent after a conversation has closed.
+    fn reopen(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> u64 {
+        enter(app);
+        let id = watched(rx).0;
+        assert!(matches!(rx.try_recv(), Ok(Request::WatchActivity { .. })));
+        id
+    }
+
+    fn close_conversation(app: &mut App, rx: &mut UnboundedReceiver<Request>) {
+        press(app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(rx.try_recv(), Ok(Request::Unwatch(_))));
+        assert!(matches!(rx.try_recv(), Ok(Request::Unwatch(_))));
+    }
+
+    #[test]
+    fn each_agent_restores_its_own_draft_and_cursor() {
+        let (mut app, mut rx) = app();
+        open_agents(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![agent("Mateo", "ada", &[]), agent("Zed", "ada", &[])],
+        }))));
+        reopen(&mut app, &mut rx);
+        typed(&mut app, "one");
+        press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+        typed(&mut app, "two");
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        }
+        close_conversation(&mut app, &mut rx);
+
+        key(&mut app, 'j');
+        reopen(&mut app, &mut rx);
+        assert!(!screen(&mut app, 80, 24).contains("│one"));
+        typed(&mut app, "other");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        }
+        close_conversation(&mut app, &mut rx);
+
+        key(&mut app, 'k');
+        reopen(&mut app, &mut rx);
+        typed(&mut app, "X");
+        enter(&mut app);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("expected send");
+        };
+        assert_eq!((req.to.as_str(), req.body.as_str()), ("Mateo", "one\ntXwo"));
+        close_conversation(&mut app, &mut rx);
+        key(&mut app, 'j');
+        reopen(&mut app, &mut rx);
+        typed(&mut app, "Y");
+        enter(&mut app);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("expected send");
+        };
+        assert_eq!((req.to.as_str(), req.body.as_str()), ("Zed", "otYher"));
+    }
+
+    #[test]
+    fn sends_finish_safely_while_conversations_are_closed_or_reopened() {
+        for success in [true, false] {
+            for edited in [true, false] {
+                for reopened in [true, false] {
+                    let (mut app, mut rx) = app();
+                    mateo(&mut app, &mut rx);
+                    typed(&mut app, "draft");
+                    enter(&mut app);
+                    let Request::Send { id, .. } = rx.try_recv().unwrap() else {
+                        panic!("expected send");
+                    };
+                    if edited {
+                        typed(&mut app, "X");
+                    }
+                    close_conversation(&mut app, &mut rx);
+                    if reopened {
+                        reopen(&mut app, &mut rx);
+                        assert!(screen(&mut app, 80, 24).contains("Sending…"));
+                        enter(&mut app);
+                        assert!(rx.try_recv().is_err(), "cannot duplicate a pending send");
+                    }
+                    app.on_event(Event::Data(Data::Sent {
+                        id,
+                        result: if success {
+                            Ok(())
+                        } else {
+                            Err("offline".into())
+                        },
+                    }));
+                    if !reopened {
+                        reopen(&mut app, &mut rx);
+                    }
+                    let out = screen(&mut app, 80, 24);
+                    assert!(!out.contains("Sending…"), "{out}");
+                    if !success {
+                        assert!(out.contains("Not sent: offline"), "{out}");
+                    }
+                    enter(&mut app);
+                    if edited || !success {
+                        let Request::Send { id: retry, req } = rx.try_recv().unwrap() else {
+                            panic!("expected retry/new send");
+                        };
+                        assert_ne!(retry, id);
+                        assert_eq!(req.body, if edited { "draftX" } else { "draft" });
+                        // An old reply cannot clear the newer send or unlock another Enter.
+                        app.on_event(Event::Data(Data::Sent { id, result: Ok(()) }));
+                        enter(&mut app);
+                        assert!(rx.try_recv().is_err());
+                    } else {
+                        assert!(rx.try_recv().is_err(), "success clears the submitted draft");
+                        assert!(!out.contains("│draft"), "{out}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
     fn a_failed_send_keeps_the_text_and_says_why() {
         let (mut app, mut rx) = app();
-        let id = mateo(&mut app, &mut rx);
-        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        mateo(&mut app, &mut rx);
         key(&mut app, 'x');
         enter(&mut app);
-        rx.try_recv().unwrap();
+        let Request::Send { id, .. } = rx.try_recv().unwrap() else {
+            panic!("expected a send");
+        };
         app.on_event(Event::Data(Data::Sent {
             id,
             result: Err("no agent named Mateo".into()),
@@ -741,6 +933,9 @@ mod tests {
         watched(&mut rx);
         assert_eq!(rx.try_recv().unwrap(), Request::Groups);
         key(&mut app, 'i');
+        key(&mut app, 'x');
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(!screen(&mut app, 80, 24).contains("│x"));
         key(&mut app, 'x');
         enter(&mut app);
         let Request::Send { req, .. } = rx.try_recv().unwrap() else {
@@ -771,7 +966,6 @@ mod tests {
                 .count()
         };
         assert_eq!(rows(&mut app), 2);
-        key(&mut app, 'i');
         for _ in 0..10 {
             key(&mut app, 'x');
             press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
@@ -1000,6 +1194,7 @@ mod tests {
     fn an_agents_timeline_merges_messages_and_activity_in_time_order() {
         let (mut app, mut rx) = app();
         let (feed, act) = mateo_streams(&mut app, &mut rx);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         // Activity's history often arrives after newer messages.
         app.on_event(Event::Data(Data::Feed {
             id: feed,
@@ -1020,7 +1215,7 @@ mod tests {
         );
         assert!(out.contains("cargo test running"), "{out}");
         assert!(out.contains("3 entries · A: all · E: all kinds"), "{out}");
-        assert!(out.contains("i: write to Mateo"), "{out}");
+        assert!(out.contains("Navigation · Esc/i write to Mateo"), "{out}");
 
         // A cycles messages only, activity only, then everything again.
         key(&mut app, 'A');
@@ -1062,6 +1257,7 @@ mod tests {
     fn activity_alone_says_when_nothing_is_shared_or_the_server_is_old() {
         let (mut app, mut rx) = app();
         let (_, act) = mateo_streams(&mut app, &mut rx);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         key(&mut app, 'A');
         key(&mut app, 'A');
         assert!(screen(&mut app, 100, 24).contains("Loading…"));
@@ -1106,6 +1302,7 @@ mod tests {
     fn e_cycles_the_kinds_of_activity_shown() {
         let (mut app, mut rx) = app();
         let (_, act) = mateo_streams(&mut app, &mut rx);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         app.on_event(Event::Data(Data::Activity {
             id: act,
             result: Ok(vec![
@@ -1166,6 +1363,7 @@ mod tests {
     fn viewing_activity_marks_it_seen_as_far_as_shown() {
         let (mut app, mut rx) = app();
         let (_, act) = mateo_streams(&mut app, &mut rx);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         let batch = |id: i64| Data::Activity {
             id: act,
             result: Ok(vec![activity(
