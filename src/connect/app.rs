@@ -1059,6 +1059,244 @@ mod tests {
     }
 
     #[test]
+    fn compact_conversations_filter_direct_mail_and_live_arrivals() {
+        let (mut app, mut rx) = app();
+        let (feed, act) = mateo_streams(&mut app, &mut rx);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        let broadcast = proto::Message {
+            to_name: None,
+            to_group: Some("crew".into()),
+            ..message(4, "Mateo", "", "broadcast-body")
+        };
+        let outbound = proto::Message {
+            from_kind: proto::Kind::Human.into(),
+            ..message(5, "ada", "Mateo", "outbound-body")
+        };
+        let wrong_kind = proto::Message {
+            from_kind: proto::Kind::Human.into(),
+            ..message(7, "Mateo", "ada", "human-sender-body")
+        };
+        let owned_recipient = proto::Message {
+            to_owner: Some("someone".into()),
+            ..message(8, "Mateo", "ada", "owned-recipient-body")
+        };
+        let direct = message(1, "Mateo", "ada", "**direct-one**");
+        let timestamp = crate::ui::message::local_time(&direct.created_at);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![
+                direct,
+                message(2, "Mateo", "Zed", "to-agent-body"),
+                message(3, "Mateo", "Ben", "other-human-body"),
+                broadcast,
+                outbound,
+                message(6, "Zed", "ada", "other-agent-body"),
+                wrong_kind,
+                owned_recipient,
+                message(9, "MATEO", "ADA", "direct-two"),
+            ]),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![activity(
+                1,
+                "01",
+                r#"{"event":"warning","message":"activity-body"}"#,
+            )]),
+        }));
+        let verbose = screen(&mut app, 120, 40);
+        assert!(
+            verbose.contains("Ctrl-T: compact")
+                && verbose.contains("broadcast-body")
+                && verbose.contains("activity-body"),
+            "{verbose}"
+        );
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let compact = screen(&mut app, 120, 40);
+        assert!(
+            compact.contains("2 messages to you") && compact.contains("Ctrl-T: verbose"),
+            "{compact}"
+        );
+        for shown in ["direct-one", "direct-two"] {
+            assert!(compact.contains(shown), "{compact}");
+        }
+        for hidden in [
+            "to-agent-body",
+            "other-human-body",
+            "broadcast-body",
+            "outbound-body",
+            "other-agent-body",
+            "human-sender-body",
+            "owned-recipient-body",
+            "activity-body",
+            "→",
+            "unread",
+            "**",
+        ] {
+            assert!(!compact.contains(hidden), "{hidden}: {compact}");
+        }
+        let headers: Vec<_> = compact
+            .lines()
+            .filter(|line| line.contains(&timestamp))
+            .collect();
+        assert_eq!(headers.len(), 2, "{compact}");
+        assert!(
+            headers
+                .iter()
+                .all(|line| line.trim_matches('║').trim() == timestamp)
+        );
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![
+                message(10, "Mateo", "ada", "live-direct"),
+                message(11, "Mateo", "Ben", "live-hidden"),
+            ]),
+        }));
+        let compact = screen(&mut app, 120, 40);
+        assert!(
+            compact.contains("3 messages to you")
+                && compact.contains("live-direct")
+                && !compact.contains("live-hidden"),
+            "{compact}"
+        );
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let verbose = screen(&mut app, 120, 40);
+        assert!(
+            verbose.contains("live-hidden")
+                && verbose.contains("activity-body")
+                && verbose.contains("→"),
+            "{verbose}"
+        );
+    }
+
+    #[test]
+    fn compact_keeps_verbose_filters_and_does_not_mark_hidden_activity_seen() {
+        let (mut app, mut rx) = app();
+        let (feed, act) = mateo_streams(&mut app, &mut rx);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        key(&mut app, 'A');
+        key(&mut app, 'A');
+        key(&mut app, 'E');
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(1, "Mateo", "ada", "visible-direct")]),
+        }));
+        assert!(
+            rx.try_recv().is_err(),
+            "mail is hidden in verbose activity-only mode"
+        );
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("Mateo".into()));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![
+                activity(7, "01", r#"{"event":"text","text":"filtered-text"}"#),
+                activity(8, "02", r#"{"event":"warning","message":"hidden-warning"}"#),
+            ]),
+        }));
+        key(&mut app, 'A');
+        key(&mut app, 'E');
+        let out = screen(&mut app, 120, 24);
+        assert!(
+            out.contains("visible-direct")
+                && !out.contains("hidden-warning")
+                && !out.contains("filtered-text"),
+            "{out}"
+        );
+        while let Ok(request) = rx.try_recv() {
+            assert!(!matches!(request, Request::MarkSeen { .. }));
+        }
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let out = screen(&mut app, 120, 24);
+        assert!(
+            out.contains("A: activity · E: no text") && out.contains("hidden-warning"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("visible-direct") && !out.contains("filtered-text"),
+            "{out}"
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Request::MarkSeen {
+                agent: "Mateo".into(),
+                through_id: 8
+            }
+        );
+    }
+
+    #[test]
+    fn compact_toggle_preserves_navigation_focus_and_composer_cursor() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let out = screen(&mut app, 120, 24);
+        assert!(
+            out.contains("write to Mateo") && out.contains("Ctrl-T: verbose"),
+            "{out}"
+        );
+        key(&mut app, 'i');
+        typed(&mut app, "hello");
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(screen(&mut app, 120, 24).contains("To Mateo · Enter sends"));
+        typed(&mut app, "X");
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(screen(&mut app, 120, 24).contains("To Mateo · Enter sends"));
+        typed(&mut app, "Y");
+        enter(&mut app);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("expected send");
+        };
+        assert_eq!(req.body, "helXYlo");
+    }
+
+    #[test]
+    fn compact_toggle_is_only_for_agent_conversations() {
+        let (mut app, mut rx) = app();
+        crew_list(&mut app, &mut rx);
+        enter(&mut app);
+        let (group, _) = watched(&mut rx);
+        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+        let broadcast = proto::Message {
+            to_name: None,
+            to_group: Some("crew".into()),
+            ..message(1, "Mateo", "", "broadcast remains")
+        };
+        app.on_event(Event::Data(Data::Feed {
+            id: group,
+            result: Ok(vec![broadcast.clone()]),
+        }));
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let out = screen(&mut app, 100, 24);
+        assert!(
+            out.contains("broadcast remains")
+                && out.contains("→ @crew")
+                && !out.contains("Ctrl-T:"),
+            "{out}"
+        );
+        key(&mut app, 'q');
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(group));
+        key(&mut app, 'q');
+        key(&mut app, 'f');
+        let (feed, _) = watched(&mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![broadcast]),
+        }));
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let out = screen(&mut app, 100, 24);
+        assert!(
+            out.contains("broadcast remains")
+                && out.contains("→ @crew")
+                && !out.contains("Ctrl-T:"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn activity_alone_says_when_nothing_is_shared_or_the_server_is_old() {
         let (mut app, mut rx) = app();
         let (_, act) = mateo_streams(&mut app, &mut rx);

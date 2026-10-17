@@ -26,7 +26,7 @@ impl Screen for Help {
     }
 
     fn handle(&mut self, action: Action, _ctx: &Ctx) -> Transition {
-        if navigate(&mut self.state, BINDINGS.len() + 1, self.page, action) {
+        if navigate(&mut self.state, BINDINGS.len() + 2, self.page, action) {
             return Transition::Stay;
         }
         match action {
@@ -52,6 +52,10 @@ impl Screen for Help {
         rows.push(Row::new(vec![
             Line::styled("[X]", theme::base().fg(theme::HOTKEY)),
             Line::raw("a menu item's hot key"),
+        ]));
+        rows.push(Row::new(vec![
+            Line::styled("Ctrl-T", theme::base().fg(theme::HOTKEY)),
+            Line::raw("agents: verbose or only messages to you"),
         ]));
         let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(10)])
             .style(theme::base())

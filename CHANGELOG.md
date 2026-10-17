@@ -9,6 +9,10 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Added
+
+- Agent conversations in `bbs connect` use `Ctrl-t` to toggle a compact view of the agent's direct messages to you, with timestamp-only headers and preserved draft, cursor and verbose filter choices (#82).
+
 ### Changed
 
 - In the `bbs connect` composer, `Ctrl-u` deletes back to the start of the line, as in readline; undo moves to `Ctrl-_` (or `Ctrl-/`) (#78).
