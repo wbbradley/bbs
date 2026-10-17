@@ -27,7 +27,7 @@ pub trait Row: PartialEq {
     const MERGES: bool = false;
     fn key(&self) -> Self::Key;
     /// `gap`: messages may be missing before this row.
-    fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>>;
+    fn lines(&self, gap: bool, query: Option<&str>, width: u16) -> Vec<Line<'_>>;
     /// Whether the row matches a case-folded search.
     fn matches(&self, query: &str) -> bool;
 }
@@ -37,8 +37,8 @@ impl Row for Message {
     fn key(&self) -> i64 {
         self.id
     }
-    fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>> {
-        message_lines(self, gap, query)
+    fn lines(&self, gap: bool, query: Option<&str>, width: u16) -> Vec<Line<'_>> {
+        message_lines(self, gap, query, width)
     }
     /// The sender, recipient, group, or body as sent (markdown included).
     fn matches(&self, query: &str) -> bool {
@@ -194,7 +194,7 @@ impl<R: Row> ThreadView<R> {
                 Some((w, h)) if w == width => h,
                 _ => {
                     let gap = self.gaps.contains(&row.key());
-                    let h = Paragraph::new(Text::from(row.lines(gap, None)))
+                    let h = Paragraph::new(Text::from(row.lines(gap, None, width)))
                         .wrap(Wrap { trim: false })
                         .line_count(width);
                     *cached = Some((width, h));
@@ -351,7 +351,8 @@ impl<R: Row> ThreadView<R> {
         let mut text = Text::default();
         for (i, row) in self.rows.iter().enumerate().skip(first) {
             let gap = self.gaps.contains(&row.key());
-            text.lines.extend(row.lines(gap, self.query.as_deref()));
+            text.lines
+                .extend(row.lines(gap, self.query.as_deref(), area.width));
             let end = self.frame.starts.get(i + 1).unwrap_or(&self.frame.total);
             if *end >= top + self.frame.height {
                 break;

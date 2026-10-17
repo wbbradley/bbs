@@ -12,6 +12,7 @@ request that bumps the package version; correct the date if publishing slips.
 ### Changed
 
 - In the `bbs connect` composer, `Ctrl-u` deletes back to the start of the line, as in readline; undo moves to `Ctrl-_` (or `Ctrl-/`) (#78).
+- Message bodies in `bbs connect` and `bbs view` preserve single line breaks and indentation, including wrapped lines, while keeping Markdown formatting (#79).
 
 ## 0.7.1 - 2026-10-16
 
