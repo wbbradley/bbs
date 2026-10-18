@@ -87,7 +87,7 @@ impl Thread {
     /// What `agent` sent and what was sent to it directly.
     pub fn agent(agent: &str, owner: Option<&str>, human: &str, compact: bool) -> Thread {
         let title = match owner {
-            Some(owner) => format!("{agent}, owned by {owner}"),
+            Some(owner) => format!("{agent}, reports to {owner}"),
             None => agent.to_string(),
         };
         let req = FeedRequest {
@@ -291,7 +291,7 @@ impl Thread {
 }
 
 impl Thread {
-    /// Agent conversations open in insert mode; only Ctrl-U/PgUp switch to
+    /// Agent conversations open in insert mode; only PgUp switches to
     /// navigation. Groups keep Esc as the way out of their composer.
     fn compose(&mut self, key: KeyEvent) -> Option<Transition> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -305,17 +305,10 @@ impl Thread {
             self.composing = false;
             return Some(Transition::Stay);
         }
-        if self.agent.is_some()
-            && (key.code == KeyCode::PageUp
-                || key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
+        if self.agent.is_some() && key.code == KeyCode::PageUp {
             self.composing = false;
             let page = self.view.page();
-            self.view.scroll_up(if key.code == KeyCode::PageUp {
-                page
-            } else {
-                page / 2
-            });
+            self.view.scroll_up(page);
             return Some(Transition::Stay);
         }
         let send_id = if key.code == KeyCode::Enter {
@@ -578,7 +571,7 @@ impl Thread {
                 Line::styled(error.clone(), theme::error()),
                 Line::styled(
                     if self.agent.is_some() {
-                        "Ctrl-U/PgUp navigates · r reloads"
+                        "PgUp navigates · r reloads"
                     } else {
                         "r reloads"
                     },
