@@ -549,9 +549,7 @@ impl Screen for Thread {
 
 impl Thread {
     fn draw(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
-        let window = theme::window(&self.title);
-        let inner = window.inner(area);
-        frame.render_widget(window, area);
+        let inner = theme::screen(frame, area, &self.title);
         let max_lines = frame.area().height * u16::from(ctx.composer_max_height_percent) / 100;
         let composer_height = self
             .composer

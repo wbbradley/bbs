@@ -23,6 +23,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
+- `bbs connect` screens no longer draw an outer double-line border; each screen's heading sits above its content, and the bottom status bar's style fills the whole line like a traditional status bar. Dialogs keep their boundaries.
+
 - Compact agent conversations omit message headers and timestamps, with a dark separator above outgoing messages. Composer targets use a semantic orange color and key hints use a distinct italic style.
 
 - The `bbs connect` textbox has one blank row above its hint, using the same themed surface while keeping the text area and scrolling unchanged (#89).

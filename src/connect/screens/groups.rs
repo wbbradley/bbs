@@ -128,9 +128,7 @@ impl Groups {
             Some(Ok(groups)) => format!("Groups ({})", groups.len()),
             _ => "Groups".to_string(),
         };
-        let window = theme::window(&title);
-        let inner = window.inner(area);
-        frame.render_widget(window, area);
+        let inner = theme::screen(frame, area, &title);
         let [inner, notice] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
         let hint = Line::styled(

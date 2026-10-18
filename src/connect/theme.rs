@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 /// The smallest terminal the layout is drawn for.
 pub const MIN_WIDTH: u16 = 80;
@@ -29,14 +29,16 @@ pub fn error() -> Style {
     style(Role::Error)
 }
 
-/// A double-line window with its title in the top border.
-pub fn window(title: &str) -> Block<'static> {
-    Block::new()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(style(Role::Border))
-        .title(Span::styled(format!(" {title} "), heading()))
-        .style(base())
+/// A screen's heading row above its content area; screens have no outer
+/// border (dialogs keep their own).
+pub fn screen(frame: &mut Frame, area: Rect, title: &str) -> Rect {
+    let [title_row, body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!(" {title} "), heading()))),
+        title_row,
+    );
+    body
 }
 
 /// The bar across the top: the board's name and the current screen.
