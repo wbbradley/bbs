@@ -79,6 +79,11 @@ pub trait Screen {
     /// Move an agent's composer between its screen and the session's saved drafts.
     fn save_draft(&mut self, _drafts: &mut HashMap<String, Composer>) {}
     fn restore_draft(&mut self, _drafts: &mut HashMap<String, Composer>) {}
+    /// Test access to an Agents screen in the stack.
+    #[cfg(test)]
+    fn as_agents_mut(&mut self) -> Option<&mut super::screens::agents::Agents> {
+        None
+    }
     fn handle(&mut self, action: Action, ctx: &Ctx) -> Transition;
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx);
 }
@@ -454,6 +459,18 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), Request::WatchSummary(_)));
     }
 
+    /// Fix the render time of every Agents screen on the stack.
+    fn set_agents_now(app: &mut App, now: &str) {
+        let now = chrono::DateTime::parse_from_rfc3339(now)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        for screen in app.stack.iter_mut() {
+            if let Some(agents) = screen.as_agents_mut() {
+                agents.set_now(now);
+            }
+        }
+    }
+
     fn enter(app: &mut App) {
         app.on_event(Event::Key(KeyEvent::new(
             KeyCode::Enter,
@@ -694,6 +711,8 @@ mod tests {
         let Request::WatchSummary(id) = rx.try_recv().unwrap() else {
             panic!("expected summary watch");
         };
+        // Ages are rendered against a fixed time; Old's age needs an 11-wide
+        // ACTIVE column, the rest show "1d18h ago".
         let cases = [
             ("Missing", 0, 0),
             ("Zero", 0, 0),
@@ -703,12 +722,16 @@ mod tests {
             ("Limit", 99, 99),
             ("Capped", 123, 1000),
         ];
+        let mut agents: Vec<_> = cases
+            .iter()
+            .map(|(name, _, _)| agent(name, "ada", &["crew"]))
+            .collect();
+        let mut old = agent("Old", "ada", &["crew"]);
+        old.active_at = "2026-07-06T13:00:00Z".into();
+        agents.push(old);
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
-            agents: cases
-                .iter()
-                .map(|(name, _, _)| agent(name, "ada", &["crew"]))
-                .collect(),
+            agents,
         }))));
         app.on_event(Event::Data(Data::Summary {
             id,
@@ -723,6 +746,7 @@ mod tests {
                 })
                 .collect()),
         }));
+        set_agents_now(&mut app, "2026-10-18T12:00:00Z");
         for width in [80, 100] {
             let out = screen(&mut app, width, 24);
             let header: Vec<_> = out
@@ -741,14 +765,17 @@ mod tests {
             let owner = column("OWNER");
             let inbox = column("INBOX");
             let activity = column("ACTIVITY");
+            let active = column("ACTIVE");
+            // ACTIVE grew to fit the widest age, "103d23h ago".
             assert!(
                 agent + 10 < owner
                     && owner + 9 < inbox
                     && inbox + 5 < activity
-                    && activity + 8 < column("GROUPS"),
+                    && activity + 8 < column("GROUPS")
+                    && column("GROUPS") < active
+                    && active + 11 < column("STATUS"),
                 "{out}"
             );
-            assert!(out.contains("ACTIVE") && out.contains("STATUS"), "{out}");
             for (name, mail, stream) in cases {
                 let row: Vec<_> = out
                     .lines()
@@ -764,6 +791,7 @@ mod tests {
                         .to_string()
                 };
                 assert_eq!(cell(owner, 9), "ada", "{out}");
+                assert_eq!(cell(active, 11), "1d18h ago", "{out}");
                 assert_eq!(
                     cell(inbox, 5),
                     if mail == 0 {
@@ -783,6 +811,15 @@ mod tests {
                     "{out}"
                 );
             }
+            // A 100+ day age is not truncated.
+            let row: Vec<_> = out
+                .lines()
+                .find(|line| line.contains("Old"))
+                .unwrap()
+                .chars()
+                .collect();
+            let cell: String = row[active..active + 11].iter().collect::<String>().trim().to_string();
+            assert_eq!(cell, "103d23h ago", "{out}");
         }
     }
 
@@ -792,16 +829,17 @@ mod tests {
         open_agents(&mut app, &mut rx);
         let mut busy = agent("Mateo", "ada", &["crew", "release", "infra"]);
         busy.status = Some("reviewing the very long pull request about feed filters".into());
+        busy.active_at = "2026-10-18T11:46:00Z".into();
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
             agents: vec![busy],
         }))));
+        set_agents_now(&mut app, "2026-10-18T12:00:00Z");
         let out = screen(&mut app, 80, 24);
-        assert!(out.contains("crew +2"), "{out}");
-        assert!(out.contains("reviewing…"), "{out}");
-        // ACTIVE is local time, without the stored form's Z.
-        let local = crate::ui::message::local_time("2026-10-16T18:00:00.000000Z");
-        assert!(out.contains(&local), "{out}");
+        assert!(out.contains("crew, release +1"), "{out}");
+        assert!(out.contains("reviewing the ve…"), "{out}");
+        // ACTIVE shows an age against the fixed render time.
+        assert!(out.contains("14m ago"), "{out}");
     }
 
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {

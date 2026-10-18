@@ -19,6 +19,7 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
+- The Agents list in `bbs connect` shows last activity as an age with at most two day/hour/minute units (`14m ago`, `3d4h ago`, never `3d4h17m ago`) instead of a full timestamp (#88).
 - The `bbs connect` textbox is borderless, shares the outgoing-message surface, and hides soft-wrap separator spaces while preserving indentation and draft bytes. One layout keeps wrapping, cursor/selection, scrolling and height aligned. Agent Insert mode restores `Ctrl-u` deletion/undo; only `PgUp` enters timeline navigation. Agent conversation titles say “reports to” (#87).
 
 - Terminal views use shared semantic color schemes with Gruvbox dark medium by default. Select `terminal` or `no-color` with `--theme` or `BBS_THEME`; outgoing messages and input share a lighter surface, and Markdown, activity, dialogs, and the logo follow the selected scheme (#86).

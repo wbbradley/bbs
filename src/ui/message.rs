@@ -215,6 +215,28 @@ fn local(stored: &str) -> Option<DateTime<Local>> {
         .map(|t| t.with_timezone(&Local))
 }
 
+/// How long ago `stored` was, as at most two nonzero day/hour/minute units
+/// plus "ago": "14m ago", "1h53m ago", "3d4h ago" (never "3d4h17m ago").
+/// Under a minute, or in the future from clock skew, shows "0m ago". A
+/// missing or unparseable time stays blank.
+pub fn age(stored: &str, now: DateTime<Local>) -> String {
+    let Some(t) = local(stored) else {
+        return String::new();
+    };
+    let minutes = (now.signed_duration_since(t).num_seconds().max(0) / 60) as u64;
+    let units = [(minutes / 1440, "d"), (minutes % 1440 / 60, "h"), (minutes % 60, "m")];
+    let shown: Vec<String> = units
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .take(2)
+        .map(|(n, u)| format!("{n}{u}"))
+        .collect();
+    match shown.is_empty() {
+        true => "0m ago".to_string(),
+        false => format!("{} ago", shown.join("")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +265,34 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::BOLD | Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn age_shows_at_most_two_nonzero_units() {
+        let now = DateTime::parse_from_rfc3339("2026-10-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Local);
+        let cases = [
+            ("", ""),
+            ("not a time", ""),
+            // Future clock skew clamps to zero.
+            ("2026-10-18T12:00:01Z", "0m ago"),
+            ("2026-10-18T12:00:00Z", "0m ago"),
+            ("2026-10-18T11:59:01Z", "0m ago"),
+            ("2026-10-18T11:59:00Z", "1m ago"),
+            ("2026-10-18T11:46:00Z", "14m ago"),
+            ("2026-10-18T11:00:00Z", "1h ago"),
+            ("2026-10-18T10:07:00Z", "1h53m ago"),
+            ("2026-10-17T12:00:00Z", "1d ago"),
+            ("2026-10-17T11:00:00Z", "1d1h ago"),
+            // The third unit is dropped, and zero units are skipped.
+            ("2026-10-15T07:43:00Z", "3d4h ago"),
+            ("2026-10-15T11:43:00Z", "3d17m ago"),
+            ("2026-10-11T12:01:00Z", "6d23h ago"),
+        ];
+        for (stored, want) in cases {
+            assert_eq!(age(stored, now), want, "{stored}");
+        }
     }
 
     #[test]
