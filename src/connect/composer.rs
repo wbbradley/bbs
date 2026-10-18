@@ -193,6 +193,9 @@ impl Composer {
             self.text.move_cursor(CursorMove::End);
         }
         for _ in target.1..self.text.cursor().1 {
+            if self.text.cursor().1 <= target.1 {
+                break;
+            }
             let before = self.text.cursor();
             self.text.move_cursor(CursorMove::Back);
             let after = self.text.cursor();
@@ -506,6 +509,23 @@ mod tests {
             );
             assert_eq!(c.text.lines()[0].chars().count(), 65_536);
         }
+    }
+
+    #[test]
+    fn large_jump_stops_before_combining_and_zwj_suffixes() {
+        let mut c = Composer::new("Mateo");
+        let prefix = "x".repeat(65_536);
+        let suffix = "e\u{301}👩‍💻z\u{301}🇺🇸";
+        c.text = TextArea::new(vec![format!("{prefix}{suffix}")]);
+        c.text.move_cursor(CursorMove::End);
+        c.text.start_selection();
+        let end = c.text.cursor().1;
+        c.jump(DataCursor(0, 65_536));
+        assert_eq!(c.text.cursor(), (0, 65_536));
+        assert_eq!(c.text.selection_range(), Some(((0, 65_536), (0, end))));
+        c.text.copy();
+        assert_eq!(c.text.yank_text(), suffix);
+        assert_eq!(c.text.lines()[0], format!("{prefix}{suffix}"));
     }
 
     #[test]
