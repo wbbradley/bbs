@@ -212,9 +212,16 @@ impl Screen for Agents {
             frame.render_widget(Paragraph::new(line), inner);
             return;
         }
-        // One render time for every row in the frame.
+        // One render time for every row in the frame. An unknown time shows a
+        // dash rather than a misleading age.
         let now = self.now.unwrap_or_else(Local::now);
-        let ages: Vec<String> = shown.iter().map(|a| age(&a.active_at, now)).collect();
+        let ages: Vec<String> = shown
+            .iter()
+            .map(|a| match age(&a.active_at, now) {
+                s if s.is_empty() => "-".to_string(),
+                s => s,
+            })
+            .collect();
         // Keep both counts and a readable status at the minimum terminal width.
         // AGENT fits the whole random name pool; OWNER fits most human names.
         // ACTIVE fits the widest rendered age ("103d23h ago" is 11), at the
