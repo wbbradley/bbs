@@ -30,9 +30,10 @@ several separate `bbs group` commands.
 - Gruvbox dark medium by default; `--theme` or `BBS_THEME` can select
   `terminal` or `no-color`. All rendered components consume semantic styles
   from `src/ui/theme.rs`, including the lighter shared outgoing/input surface.
-- Double-line box drawing (`╔═╗║╚╝`) for windows, and block shading
-  (`░▒▓█`) for title bars and menus. A status bar along the bottom with the
-  server, the human, the time online, and a fake baud rate.
+- Screens have no outer border; each screen's heading sits above its content
+  and dialogs keep their own boundaries. Block shading (`░▒▓█`) for title bars
+  and menus. A status bar fills the whole bottom line with the server, the
+  human, the time online, and a fake baud rate.
 - A splash screen with a large logo, shown on connect and skipped with any key.
   Its geometry is embedded from `assets/connect/logo.txt` and colored by the
   scheme's Logo role. Menu items have hot keys shown in brackets, `[A]gents`.
@@ -41,8 +42,8 @@ several separate `bbs group` commands.
 
 ## Screens
 
-The top level is a main menu. Every other screen is a full window under a
-shared title bar and status bar.
+The top level is a main menu. Every other screen sits under a shared title bar
+and above the full-width status bar.
 
 | Screen | What it shows | Data |
 | --- | --- | --- |

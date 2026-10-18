@@ -47,9 +47,7 @@ impl Screen for Config {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
-        let window = theme::window("Config");
-        let inner = window.inner(area);
-        frame.render_widget(window, area);
+        let inner = theme::screen(frame, area, "Config");
         let current = scheme::current();
         let mut lines = vec![
             Line::default(),

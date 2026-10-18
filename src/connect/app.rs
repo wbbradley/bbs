@@ -278,7 +278,10 @@ impl App {
                 status,
             );
         } else {
-            frame.render_widget(Paragraph::new(bar), status);
+            frame.render_widget(
+                Paragraph::new(bar).style(theme::style(theme::Role::StatusBar)),
+                status,
+            );
         }
     }
 }
@@ -479,6 +482,11 @@ mod tests {
             .collect()
     }
 
+    /// Whether a rendered line is exactly `text`, ignoring trailing padding.
+    fn has_line(out: &str, text: &str) -> bool {
+        out.lines().any(|l| l.trim_end() == text)
+    }
+
     fn agent(name: &str, owner: &str, groups: &[&str]) -> proto::Agent {
         proto::Agent {
             name: name.into(),
@@ -547,6 +555,31 @@ mod tests {
         assert!(out.contains("terminal too small"), "{out}");
         assert!(out.contains("79×24; needs 80×24"), "{out}");
         assert!(!out.contains("[A]gents"), "{out}");
+    }
+
+    #[test]
+    fn screens_have_no_outer_border_and_a_full_width_status_bar() {
+        let (mut app, mut rx) = app();
+        open_agents(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![agent("Mateo", "ada", &["crew"])],
+        }))));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        // The screen heading is there, but the double border is gone.
+        assert!(text.contains("Your agents (1)"), "{text}");
+        for cell in buffer.content.iter() {
+            assert!(!"╔╗╚╝═║".contains(cell.symbol()), "{text}");
+        }
+        // The status bar's style fills the whole bottom row.
+        let bar = theme::style(theme::Role::StatusBar);
+        for x in 0..80 {
+            let cell = &buffer[(x, 23)];
+            assert!(cell.fg == bar.fg.unwrap() && cell.bg == bar.bg.unwrap(), "{text}");
+        }
     }
 
     #[test]
@@ -1034,7 +1067,7 @@ mod tests {
         set_agents_now(&mut app, "2026-10-18T12:00:00Z");
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("crew, release +1"), "{out}");
-        assert!(out.contains("reviewing the ve…"), "{out}");
+        assert!(out.contains("reviewing the very…"), "{out}");
         // ACTIVE shows an age against the fixed render time.
         assert!(out.contains("14m ago"), "{out}");
     }
@@ -1478,7 +1511,7 @@ mod tests {
 
         key(&mut app, 'j');
         reopen(&mut app, &mut rx);
-        assert!(!screen(&mut app, 80, 24).contains("║one"));
+        assert!(!has_line(&screen(&mut app, 80, 24), "one"));
         typed(&mut app, "other");
         for _ in 0..3 {
             press(&mut app, KeyCode::Left, KeyModifiers::NONE);
@@ -1555,7 +1588,7 @@ mod tests {
                         assert!(rx.try_recv().is_err());
                     } else {
                         assert!(rx.try_recv().is_err(), "success clears the submitted draft");
-                        assert!(!out.contains("║draft"), "{out}");
+                        assert!(!has_line(&out, "draft"), "{out}");
                     }
                 }
             }
@@ -1577,7 +1610,7 @@ mod tests {
         }));
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("Not sent: no agent named Mateo"), "{out}");
-        assert!(out.contains("║x"), "{out}");
+        assert!(has_line(&out, "x"), "{out}");
         // Ctrl-C still quits from the composer.
         assert!(press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL));
     }
@@ -1599,7 +1632,7 @@ mod tests {
         key(&mut app, 'i');
         key(&mut app, 'x');
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
-        assert!(!screen(&mut app, 80, 24).contains("║x"));
+        assert!(!has_line(&screen(&mut app, 80, 24), "x"));
         key(&mut app, 'x');
         enter(&mut app);
         let Request::Send { req, .. } = rx.try_recv().unwrap() else {
@@ -1628,7 +1661,7 @@ mod tests {
                 .lines()
                 .skip_while(|l| !l.contains("To Mateo · Enter sends"))
                 .skip(1)
-                .take_while(|l| !l.starts_with('╚'))
+                .take_while(|l| !l.starts_with(" bbs:7777"))
                 .count()
         };
         assert_eq!(rows(&mut app), 2);

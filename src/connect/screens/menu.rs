@@ -111,9 +111,7 @@ impl Screen for Menu {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
-        let window = theme::window("Main menu");
-        let inner = window.inner(area);
-        frame.render_widget(window, area);
+        let inner = theme::screen(frame, area, "Main menu");
         let mut lines = art::logo().lines;
         lines.extend([
             Line::styled(

@@ -196,9 +196,7 @@ impl Screen for Agents {
             (true, Some(Ok(_))) => format!("All agents ({}) · a: yours", shown.len()),
             _ => "Agents".to_string(),
         };
-        let window = theme::window(&title);
-        let inner = window.inner(area);
-        frame.render_widget(window, area);
+        let inner = theme::screen(frame, area, &title);
         let empty = match &self.agents {
             None => Some(Line::styled("Loading…", theme::dim())),
             Some(Err(e)) => Some(Line::styled(e.clone(), theme::error())),

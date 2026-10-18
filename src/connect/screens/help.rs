@@ -52,9 +52,7 @@ impl Screen for Help {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, _ctx: &Ctx) {
-        let window = theme::window("Keys · j/k scroll");
-        let inner = window.inner(area);
-        frame.render_widget(window, area);
+        let inner = theme::screen(frame, area, "Keys · j/k scroll");
         let mut rows: Vec<Row> = BINDINGS
             .iter()
             .map(|b| {
