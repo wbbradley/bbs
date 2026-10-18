@@ -539,6 +539,7 @@ mod tests {
                 .contains("unconfirmed"),
             "metadata does not refresh pending age"
         );
+        r.pending = None;
         r.answered = Some(proto::EffortOutcome {
             request_id: 101,
             result: 3,
