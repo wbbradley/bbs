@@ -360,13 +360,18 @@ mod tests {
         }))));
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("Your agents (1)"), "{out}");
-        assert!(out.contains("Mateo@ada"), "{out}");
-        assert!(!out.contains("Zed@bob"), "{out}");
+        // Name and owner show in separate AGENT and OWNER columns.
+        assert!(out.contains("OWNER"), "{out}");
+        assert!(out.contains("Mateo"), "{out}");
+        assert!(out.contains("ada"), "{out}");
+        assert!(!out.contains("Mateo@ada"), "{out}");
+        assert!(!out.contains("Zed"), "{out}");
         // `a` here shows everyone's; the menu's hot key does not apply.
         key(&mut app, 'a');
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("All agents (2)"), "{out}");
-        assert!(out.contains("Zed@bob"), "{out}");
+        assert!(out.contains("Zed"), "{out}");
+        assert!(out.contains("bob"), "{out}");
         // Reload asks again; q goes back, and q on the menu quits.
         key(&mut app, 'r');
         assert_eq!(rx.try_recv().unwrap(), Request::Agents);
@@ -634,8 +639,8 @@ mod tests {
             ]),
         }));
         let out = screen(&mut app, 100, 24);
-        let rows = order(&out, &["Ana@", "Bo@", "Cy@", "Di@", "Ed@"]);
-        assert_eq!(rows, ["Ed@", "Cy@", "Di@", "Bo@", "Ana@"], "{out}");
+        let rows = order(&out, &["Ana", "Bo", "Cy", "Di", "Ed"]);
+        assert_eq!(rows, ["Ed", "Cy", "Di", "Bo", "Ana"], "{out}");
         assert!(
             out.contains("✉1") && out.contains("•4") && out.contains("•99"),
             "{out}"
@@ -650,8 +655,8 @@ mod tests {
         }));
         let out = screen(&mut app, 100, 24);
         assert_eq!(
-            order(&out, &["Ana@", "Bo@", "Cy@", "Di@", "Ed@"]),
-            ["Ana@", "Bo@", "Cy@", "Di@", "Ed@"]
+            order(&out, &["Ana", "Bo", "Cy", "Di", "Ed"]),
+            ["Ana", "Bo", "Cy", "Di", "Ed"]
         );
         assert!(!out.contains('✉'), "{out}");
     }
@@ -669,7 +674,7 @@ mod tests {
             ("Zero", 0, 0),
             ("One", 1, 2),
             ("MailOnly", 4, 0),
-            ("ActivityOnly", 0, 5),
+            ("ActOnly", 0, 5),
             ("Limit", 99, 99),
             ("Capped", 123, 1000),
         ];
@@ -707,17 +712,22 @@ mod tests {
                     .position(|s| s.iter().collect::<String>() == label)
                     .unwrap()
             };
+            let agent = column("AGENT");
+            let owner = column("OWNER");
             let inbox = column("INBOX");
             let activity = column("ACTIVITY");
             assert!(
-                inbox + 5 < activity && activity + 8 < column("GROUPS"),
+                agent + 10 < owner
+                    && owner + 9 < inbox
+                    && inbox + 5 < activity
+                    && activity + 8 < column("GROUPS"),
                 "{out}"
             );
             assert!(out.contains("ACTIVE") && out.contains("STATUS"), "{out}");
             for (name, mail, stream) in cases {
                 let row: Vec<_> = out
                     .lines()
-                    .find(|line| line.contains(&format!("{name}@")))
+                    .find(|line| line.contains(name))
                     .unwrap()
                     .chars()
                     .collect();
@@ -728,6 +738,7 @@ mod tests {
                         .trim()
                         .to_string()
                 };
+                assert_eq!(cell(owner, 9), "ada", "{out}");
                 assert_eq!(
                     cell(inbox, 5),
                     if mail == 0 {

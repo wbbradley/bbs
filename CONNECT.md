@@ -50,7 +50,7 @@ shared title bar and status bar.
 | Screen | What it shows | Data |
 | --- | --- | --- |
 | Main menu | Splash art, hot-key menu, unread counts | `Whoami`, `ListAgents` |
-| Agents | Your agents (or everyone's): name, groups, status, last active, headless or not | `ListAgents` |
+| Agents | Your agents (or everyone's): name, owner, groups, status, last active, headless or not | `ListAgents` |
 | Agent | One agent: its conversation with you, a composer, and (headless agents) its live activity | `WatchFeed`, `Send`, `WatchActivity` |
 | Groups | Groups with members, writers and descriptions | `GroupList` |
 | Group | One group's broadcasts, a composer, and admin actions | `WatchFeed`, `Send`, group RPCs |
@@ -95,7 +95,7 @@ activity, each capped at 99 and blank at zero.
 
 Any human may open any agent and message it, under the same rules as
 `bbs send`. Ownership is always visible:
-- every agent shows its owner (`Mateo@ada`), as in `bbs agents`;
+- every agent shows its owner in a separate OWNER column, as in `bbs agents`;
 - your own agents are drawn in one colour and other humans' agents in
   another;
 - the agent screen's title says whose agent it is, for example
