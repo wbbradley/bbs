@@ -60,6 +60,8 @@ pub struct AgentRow {
     pub active_at: String,
     pub retired_at: Option<String>,
     pub owner: Option<String>,
+    /// The newest message or activity event the agent sent; None when never.
+    pub last_sent_at: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -474,8 +476,14 @@ pub fn set_status(conn: &Connection, id: i64, status: &str, now: &str) -> Result
 }
 
 pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<AgentRow>> {
+    // last_sent_at is the newest server-stamped message or activity the agent
+    // sent; both subqueries are index-backed (messages_sender, activity_agent).
     let mut stmt = conn.prepare(
-        "SELECT a.id, a.name, a.status, a.pwd, a.hostname, a.active_at, a.retired_at, h.name
+        "SELECT a.id, a.name, a.status, a.pwd, a.hostname, a.active_at, a.retired_at, h.name,
+                (SELECT MAX(created_at) FROM (
+                   SELECT created_at FROM messages WHERE from_kind = 'agent' AND from_id = a.id
+                   UNION ALL
+                   SELECT created_at FROM activity WHERE agent_id = a.id))
          FROM agents a
          LEFT JOIN agent_owners o ON o.agent_id = a.id
          LEFT JOIN humans h ON h.id = o.human_id
@@ -493,6 +501,7 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                 active_at: r.get(5)?,
                 retired_at: r.get(6)?,
                 owner: r.get(7)?,
+                last_sent_at: r.get(8)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -1588,6 +1597,45 @@ pub fn data_version(conn: &Connection) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_agents_reports_last_sent_message_and_activity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at)
+             VALUES (1, 'Mateo', 'a', '/', 'h', 't', 't'), (2, 'Zed', 'b', '/', 'h', 't', 't')",
+        )
+        .unwrap();
+        let last_sent = |name: &str| {
+            list_agents(&conn, false)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.name == name)
+                .and_then(|r| r.last_sent_at)
+        };
+        // Never sent: absent.
+        assert_eq!(last_sent("Mateo"), None);
+        // Mateo sends a message; an older activity event does not lower the max.
+        conn.execute(
+            "INSERT INTO messages (from_kind, from_id, body, created_at)
+             VALUES ('agent', 1, 'hi', '2026-10-17T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        post_activity(&conn, 1, "2026-10-17T09:00:00Z", &[("text".into(), "e".into())]).unwrap();
+        assert_eq!(last_sent("Mateo").as_deref(), Some("2026-10-17T10:00:00Z"));
+        // Zed only posts activity.
+        post_activity(&conn, 2, "2026-10-17T11:00:00Z", &[("text".into(), "e".into())]).unwrap();
+        assert_eq!(last_sent("Zed").as_deref(), Some("2026-10-17T11:00:00Z"));
+        // Trimming keeps the newest events, so the max survives it.
+        let events = |n: i64| -> Vec<(String, String)> {
+            (0..n).map(|i| ("text".into(), format!("e{i}"))).collect()
+        };
+        post_activity(&conn, 2, "2026-10-17T12:00:00Z", &events(ACTIVITY_PER_AGENT)).unwrap();
+        post_activity(&conn, 2, "2026-10-17T13:00:00Z", &events(5)).unwrap();
+        assert_eq!(last_sent("Zed").as_deref(), Some("2026-10-17T13:00:00Z"));
+    }
 
     #[test]
     fn activity_keeps_each_agents_newest_and_goes_when_it_retires() {

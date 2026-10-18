@@ -219,6 +219,9 @@ message Agent {
   bool retired = 6;
   repeated string groups = 7;
   optional string owner = 8;  // owning human's name; absent when unknown
+  // The newest server time the agent sent a message or posted an activity
+  // event; absent when it never did (or the server is too old to say).
+  optional string last_sent_at = 9;
 }
 
 // The window is the most recent `backlog` (1 to 1000) messages that match every

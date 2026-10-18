@@ -1044,6 +1044,7 @@ pub fn list_agents(
                 active_at: a.active_at,
                 retired: a.retired_at.is_some(),
                 owner: a.owner,
+                last_sent_at: a.last_sent_at,
             })
             .collect();
         Ok(proto::ListAgentsResponse { humans, agents })
@@ -1757,6 +1758,71 @@ mod tests {
 
     fn time(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn last_sent_at_tracks_sends_and_activity_not_reads_or_presence() {
+        let (mut conn, will, agents) = board();
+        let sent = |conn: &mut Connection| {
+            list_agents(conn, &will, proto::ListAgentsRequest { all: false })
+                .unwrap()
+                .agents
+                .into_iter()
+                .map(|a| (a.name, a.last_sent_at))
+                .collect::<Vec<_>>()
+        };
+        let at = |rows: &[(String, Option<String>)], name: &str| {
+            rows.iter().find(|(n, _)| n == name).unwrap().1.clone()
+        };
+        // Lu never sent and joined no group: absent. Mateo and Zed have their
+        // join announcements, which are messages they sent.
+        let rows = sent(&mut conn);
+        assert!(at(&rows, "Lu").is_none());
+        let mateo_join = at(&rows, "Mateo").unwrap();
+        let zed_join = at(&rows, "Zed").unwrap();
+        send(
+            &mut conn,
+            &agents[0],
+            proto::SendRequest {
+                to: "Zed".into(),
+                body: "hi".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let rows = sent(&mut conn);
+        let mateo_at = at(&rows, "Mateo").unwrap();
+        assert!(mateo_at >= mateo_join);
+        assert_eq!(at(&rows, "Zed").as_deref(), Some(zed_join.as_str()));
+        // Mateo's stamp matches the stored message's server time.
+        let stored: String = conn
+            .query_row(
+                "SELECT created_at FROM messages WHERE from_kind = 'agent' ORDER BY id DESC",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mateo_at, stored);
+        // Reads and presence touches do not move it.
+        whoami(&mut conn, &agents[0]).unwrap();
+        inbox(&mut conn, &agents[0]);
+        inbox(&mut conn, &agents[1]);
+        let rows = sent(&mut conn);
+        assert_eq!(at(&rows, "Mateo").as_deref(), Some(mateo_at.as_str()));
+        assert_eq!(at(&rows, "Zed").as_deref(), Some(zed_join.as_str()));
+        // Posting activity does.
+        post_activity(
+            &mut conn,
+            &agents[1],
+            vec![proto::ActivityEvent {
+                record: r#"{"event":"text","text":"working"}"#.into(),
+            }],
+        )
+        .unwrap();
+        let rows = sent(&mut conn);
+        let zed_at = at(&rows, "Zed").unwrap();
+        assert!(zed_at >= zed_join);
+        assert_eq!(at(&rows, "Mateo").as_deref(), Some(mateo_at.as_str()));
     }
 
     #[test]

@@ -212,14 +212,15 @@ impl Screen for Agents {
             frame.render_widget(Paragraph::new(line), inner);
             return;
         }
-        // One render time for every row in the frame. An unknown time shows a
-        // dash rather than a misleading age.
+        // One render time for every row in the frame. ACTIVE is the age of the
+        // agent's last sent message or activity event; an agent without any
+        // (or a server too old to say) shows a dash rather than a false age.
         let now = self.now.unwrap_or_else(Local::now);
         let ages: Vec<String> = shown
             .iter()
-            .map(|a| match age(&a.active_at, now) {
-                s if s.is_empty() => "-".to_string(),
-                s => s,
+            .map(|a| match a.last_sent_at.as_deref().map(|s| age(s, now)) {
+                Some(s) if !s.is_empty() => s,
+                _ => "-".to_string(),
             })
             .collect();
         // Keep both counts and a readable status at the minimum terminal width.

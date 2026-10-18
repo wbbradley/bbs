@@ -311,6 +311,7 @@ mod tests {
             owner: Some(owner.into()),
             groups: groups.iter().map(|g| g.to_string()).collect(),
             active_at: "2026-10-16T18:00:00.000000Z".into(),
+            last_sent_at: Some("2026-10-16T18:00:00.000000Z".into()),
             status: Some(format!("{name} is busy")),
             ..Default::default()
         }
@@ -727,11 +728,11 @@ mod tests {
             .map(|(name, _, _)| agent(name, "ada", &["crew"]))
             .collect();
         let mut old = agent("Old", "ada", &["crew"]);
-        old.active_at = "2026-07-06T13:00:00Z".into();
+        old.last_sent_at = Some("2026-07-06T13:00:00Z".into());
         agents.push(old);
-        // An unknown active time renders a dash, not an age.
+        // No known sent event (or an old server without the field): a dash.
         let mut blank = agent("Blank", "ada", &["crew"]);
-        blank.active_at = String::new();
+        blank.last_sent_at = None;
         agents.push(blank);
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
@@ -842,7 +843,7 @@ mod tests {
         open_agents(&mut app, &mut rx);
         let mut busy = agent("Mateo", "ada", &["crew", "release", "infra"]);
         busy.status = Some("reviewing the very long pull request about feed filters".into());
-        busy.active_at = "2026-10-18T11:46:00Z".into();
+        busy.last_sent_at = Some("2026-10-18T11:46:00Z".into());
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
             agents: vec![busy],

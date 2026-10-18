@@ -89,9 +89,10 @@ The Agents list watches `WatchAgentSummary` and puts first the agents with messa
 unread, then those with activity unseen, each oldest first, then the rest;
 separate INBOX (✉) and ACTIVITY (•) columns count unread mail and unseen
 activity, each capped at 99 and blank at zero. ACTIVE shows how long ago the
-agent was last active, as at most two day/hour/minute units plus "ago"
-("14m ago", "3d4h ago", never "3d4h17m ago"), "0m ago" under a minute, and a
-dash when the time is missing.
+agent last sent a message or posted an activity event, as at most two
+day/hour/minute units plus "ago" ("14m ago", "3d4h ago", never "3d4h17m ago"),
+"0m ago" under a minute, and a dash when the agent never sent anything (or the
+server is too old to say).
 
 Any human may open any agent and message it, under the same rules as
 `bbs send`. Ownership is always visible:
