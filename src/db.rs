@@ -1659,6 +1659,72 @@ mod tests {
     }
 
     #[test]
+    fn last_sent_lookups_do_not_grow_with_history() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO humans (id, name, created_at, active_at) VALUES (1, 'will', 't', 't');
+             INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at)
+             VALUES (1, 'Mateo', 'a', '/', 'h', 't', 't')",
+        )
+        .unwrap();
+        let fill = |conn: &Connection, n: usize| {
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO messages (from_kind, from_id, body, created_at)
+                     VALUES ('agent', 1, 'x', 't')",
+                )
+                .unwrap();
+            for _ in 0..n {
+                stmt.execute([]).unwrap();
+            }
+        };
+        // SQLite VM ops one call takes, via the progress handler.
+        let ops = |conn: &Connection, f: &dyn Fn(&Connection)| -> usize {
+            let ops = Arc::new(AtomicUsize::new(0));
+            let counting = ops.clone();
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    counting.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            )
+            .unwrap();
+            f(conn);
+            conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+            ops.load(Ordering::Relaxed)
+        };
+        fill(&conn, 1_000);
+        let list_small = ops(&conn, &|c| {
+            list_agents(c, false).unwrap();
+        });
+        let summary_small = ops(&conn, &|c| {
+            agent_summaries(c, 1).unwrap();
+        });
+        fill(&conn, 99_000);
+        let list_large = ops(&conn, &|c| {
+            list_agents(c, false).unwrap();
+        });
+        let summary_large = ops(&conn, &|c| {
+            agent_summaries(c, 1).unwrap();
+        });
+        // Each source's newest row comes from one bounded index walk, so a
+        // 100x history grows the work by little, not by 100x.
+        assert!(
+            list_large < list_small * 2 + 1000,
+            "list_agents: small={list_small} large={list_large}"
+        );
+        assert!(
+            summary_large < summary_small * 2 + 1000,
+            "agent_summaries: small={summary_small} large={summary_large}"
+        );
+    }
+
+    #[test]
     fn activity_keeps_each_agents_newest_and_goes_when_it_retires() {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();

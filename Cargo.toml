@@ -61,7 +61,7 @@ croner = "4.0.1"
 
 [dev-dependencies]
 http-body = "1.0"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53", features = ["test-util"] }
 
