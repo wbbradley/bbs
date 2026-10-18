@@ -371,7 +371,6 @@ impl Backend {
 
     /// Report the calling agent's own effort state. A server needs
     /// `agent-effort.v1`.
-    #[allow(dead_code)] // the headless driver lands next
     pub async fn report_effort(
         &mut self,
         req: proto::ReportEffortRequest,
