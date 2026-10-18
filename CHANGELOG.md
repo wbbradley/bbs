@@ -8,6 +8,11 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.8.1 - 2026-10-18
+
+Client-only layout fix; protocol v2, schema 14, config format 3 and Rust 1.89
+remain unchanged.
+
 ### Fixed
 
 - Textboxes start with three light rows (top padding, one text row and bottom
