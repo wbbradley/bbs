@@ -2224,7 +2224,7 @@ mod tests {
         // Controls straddle the ordinary message in time: one older (pins
         // archived history's oldest-first limit), one newer (pins the feed's
         // newest-first limit). A post-LIMIT filter would fail either window.
-        let cancel = insert_message(&conn, &will, None, "cancel", "2026-10-09T00:00:00.000000Z")
+        let cancel = insert_message(&conn, &will, None, "cancel", "2026-10-08T23:59:58.000000Z")
             .unwrap();
         set_message_control(&conn, cancel, "cancel").unwrap();
         insert_delivery(&conn, cancel, Kind::Agent, bram.id).unwrap();
@@ -2274,15 +2274,14 @@ mod tests {
         assert_eq!(
             delivered,
             [
-                ("hi Bram".to_string(), None),
                 ("cancel".to_string(), Some("cancel".to_string())),
+                ("hi Bram".to_string(), None),
                 ("set-effort".to_string(), Some("set-effort".to_string())),
             ]
         );
         assert!(effort_control_body(&conn, bram.id, ordinary).unwrap().is_none());
-        let set_effort = ordinary + 2;
         assert_eq!(
-            effort_control_body(&conn, bram.id, set_effort).unwrap().as_deref(),
+            effort_control_body(&conn, bram.id, effort).unwrap().as_deref(),
             Some("set-effort")
         );
         // Archived history excludes controls too, oldest-first and limited.
