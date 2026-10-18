@@ -30,10 +30,11 @@ several separate `bbs group` commands.
 - Gruvbox dark medium by default; `--theme` or `BBS_THEME` can select
   `terminal` or `no-color`. All rendered components consume semantic styles
   from `src/ui/theme.rs`, including the lighter shared outgoing/input surface.
-- Screens have no outer border; each screen's heading sits above its content
+- Screens have no outer border; list/menu headings sit above their content
   and dialogs keep their own boundaries. Block shading (`░▒▓█`) for title bars
   and menus. A status bar fills the whole bottom line with the server, the
-  human, the time online, and a fake baud rate.
+  human and time online when space permits. Agent conversations use the bottom
+  bar for timeline state and feedback.
 - A splash screen with a large logo, shown on connect and skipped with any key.
   Its geometry is embedded from `assets/connect/logo.txt` and colored by the
   scheme's Logo role. Menu items have hot keys shown in brackets, `[A]gents`.
@@ -90,6 +91,13 @@ the current scheme; saved drafts keep their text/cursor and resolve styles as dr
 Split vertically. The top pane is the agent's timeline, scrollable, newest
 at the bottom, and following until you scroll up (as `bbs view` does). The
 bottom pane is the composer. Sending goes to the agent by direct message.
+The conversation title appears once in the app title bar. There is no separate
+entry-count row. The bottom bar shows following or paused, with new arrivals
+while paused, plus filter/view and search feedback. Prompts keep their visible
+tail and Enter/Esc hints; errors take priority over normal filter and connection
+details. While a prompt is active, an error badge remains visible and the full
+error returns after searching. Draft errors take precedence over preference,
+feed and activity errors. Connection details use any remaining space.
 
 The timeline merges, in time order, the agent's messages with its live
 activity: turns, thoughts, tool calls and errors, rendered by the same code as

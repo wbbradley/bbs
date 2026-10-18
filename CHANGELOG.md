@@ -27,6 +27,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
+- Agent conversations show their title once and move following/paused, new-arrival, filter/search and error feedback into the bottom bar, without an entry-count row. Bottom bars no longer include a baud rate.
+
 - `bbs connect` screens no longer draw an outer double-line border; each screen's heading sits above its content, and the bottom status bar's style fills the whole line like a traditional status bar. Dialogs keep their boundaries.
 
 - Focused composer hints start with the target name, and compact outgoing messages keep light blank padding between the dark separator and body.
