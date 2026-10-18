@@ -19,6 +19,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
+- Terminal views use shared semantic color schemes with Gruvbox dark medium by default. Select `terminal` or `no-color` with `--theme` or `BBS_THEME`; outgoing messages and input share a lighter surface, and Markdown, activity, dialogs, and the logo follow the selected scheme (#86).
+
 - The Agents list in `bbs connect` shows each agent's owner in a separate OWNER column instead of `name@owner` (#85).
 
 - Open agent conversations in `bbs connect` mark received mail read and activity seen in both views regardless of display filters. The Agents list separates unread inbox messages from unseen activity into INBOX and ACTIVITY columns (#84).
