@@ -66,6 +66,24 @@ and above the full-width status bar.
 | Config | Live local color scheme selection | local preferences |
 | Help | Key bindings | none |
 
+### Agent effort
+
+The agent bottom bar shows last reported effort and report age before timeline
+state. A separate next-turn value stays pending until the exact control outcome
+arrives; metadata changes alone never acknowledge it. Explicit newer driver-pending
+requests may supersede older local requests without implying success. Delayed
+requests remain visible as unconfirmed after 60 seconds, including across closing
+and reopening a conversation within the session. Applied means provider ACK;
+failed and unknown outcomes are separate feedback. Report age is not connectivity.
+
+Effort comes from the existing shared summaries and agent list, not retained
+activity or extra streams. Older servers/drivers show unknown/unavailable. Only
+advertised ranked choices participate in increase/decrease, clamped at boundaries;
+unranked current or pending values open an explicit picker with no default selected.
+The picker retains selection by opaque value across metadata changes and validates
+again at submission. Search prompts and other dialogs protect their input, and
+composer source/cursor/focus are unchanged. Group/feed behavior is unchanged.
+
 ### Saved drafts
 
 Agent and group drafts are stored in `~/.local/state/bbs/connect-drafts/`, separately

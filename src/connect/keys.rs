@@ -6,6 +6,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     NextUnread,
+    EffortDown,
+    EffortUp,
     PreviousConversation,
     Up,
     Down,

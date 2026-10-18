@@ -17,7 +17,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::connect::admin::GroupAdmin;
 use crate::connect::app::{Ctx, Screen, Transition, next_id};
 use crate::connect::composer::Composer;
+use crate::connect::dialog::{Dialog, Outcome};
 use crate::connect::drafts::{Draft, DraftStore};
+use crate::connect::effort::Decision;
 use crate::connect::event::{Data, Request};
 use crate::connect::keys::{Action, GroupOp};
 use crate::connect::theme;
@@ -59,6 +61,8 @@ pub struct Thread {
     stream: Option<Stream>,
     /// The newest activity marked seen.
     seen: i64,
+    effort_picker: Option<Dialog>,
+    effort_notice: Option<String>,
     /// The clock for activity freshness and animation; the app's, or a test's.
     now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
 }
@@ -87,6 +91,8 @@ impl Thread {
             draft_key: None,
             stream: None,
             seen: 0,
+            effort_picker: None,
+            effort_notice: None,
             now: std::sync::Arc::new(Instant::now),
         }
     }
@@ -330,6 +336,36 @@ impl Thread {
                 .as_ref()
                 .map(|e| ("inbox error", format!("Inbox unavailable: {e}")))
         });
+        let issue = issue.or_else(|| {
+            self.agent
+                .as_ref()
+                .and_then(|a| ctx.efforts.error(a))
+                .map(|e| ("effort error", e.to_string()))
+        });
+        let delayed = self
+            .agent
+            .as_ref()
+            .and_then(|a| ctx.efforts.delayed(a, (self.now)()));
+        let issue = issue.or_else(|| delayed.map(|e| ("effort unconfirmed", e)));
+        if !searching {
+            let budget = if issue.is_some()
+                || self.effort_notice.is_some()
+                || ctx.navigation_notice.is_some()
+            {
+                12
+            } else {
+                width.saturating_sub(mode.width() + 37).min(48)
+            };
+            let effort = self
+                .agent
+                .as_ref()
+                .map(|a| {
+                    ctx.efforts
+                        .summary(a, (self.now)(), chrono::Local::now(), budget)
+                })
+                .unwrap_or_default();
+            mode = format!("{} · {mode}", fit_status(&effort, budget, false));
+        }
         let error_style = issue.as_ref().map(|_| theme::error()).unwrap_or_default();
         if let Some(prompt) = &self.prompt {
             if let Some((badge, _)) = &issue {
@@ -348,6 +384,10 @@ impl Thread {
                 format!("{mode} · {}", fit_status(&message, available, false)),
                 error_style,
             );
+        }
+        if let Some(notice) = &self.effort_notice {
+            let available = width.saturating_sub(mode.width() + 3);
+            return Line::raw(format!("{mode} · {}", fit_status(notice, available, false)));
         }
         if let Some(notice) = &ctx.navigation_notice {
             let available = width.saturating_sub(mode.width() + 3);
@@ -390,6 +430,9 @@ impl Thread {
         };
         let mut filters = hints(false);
         let mut text = mode;
+        if text.width() + filters.width() + 3 > width {
+            filters = hints(true);
+        }
         if self.composer.as_ref().is_some_and(Composer::sending) {
             text.push_str(" · Sending…");
         }
@@ -540,6 +583,7 @@ impl Screen for Thread {
 
     fn navigation_blocked(&self) -> bool {
         self.prompt.is_some()
+            || self.effort_picker.is_some()
             || self
                 .group
                 .as_ref()
@@ -738,7 +782,12 @@ impl Screen for Thread {
 
     /// An open conversation marks received mail read and activity seen,
     /// independently of the display filters.
-    fn on_view(&mut self, _ctx: &Ctx) -> Vec<Request> {
+    fn on_view(&mut self, ctx: &Ctx) -> Vec<Request> {
+        if let Some(picker) = &mut self.effort_picker
+            && let Some(agent) = &self.agent
+        {
+            picker.set_choices(ctx.efforts.choices(agent));
+        }
         let Some(agent) = &self.agent else {
             return Vec::new();
         };
@@ -756,6 +805,23 @@ impl Screen for Thread {
     }
 
     fn raw_key(&mut self, key: KeyEvent) -> Option<Transition> {
+        if let Some(picker) = &mut self.effort_picker {
+            return Some(match picker.key(key) {
+                Outcome::Open => Transition::Stay,
+                Outcome::Cancel => {
+                    self.effort_picker = None;
+                    Transition::Stay
+                }
+                Outcome::Submit(values) => {
+                    self.effort_picker = None;
+                    Transition::Effort {
+                        agent: self.agent.clone().expect("agent picker"),
+                        value: values[0].clone(),
+                    }
+                }
+            });
+        }
+        self.effort_notice = None;
         if self.agent.is_some()
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('t')
@@ -793,7 +859,43 @@ impl Screen for Thread {
         Some(Transition::Stay)
     }
 
-    fn handle(&mut self, action: Action, _ctx: &Ctx) -> Transition {
+    fn handle(&mut self, action: Action, ctx: &Ctx) -> Transition {
+        if matches!(action, Action::EffortDown | Action::EffortUp) {
+            if self.navigation_blocked() {
+                return Transition::Stay;
+            }
+            let Some(agent) = &self.agent else {
+                return Transition::Stay;
+            };
+            return match ctx
+                .efforts
+                .decide(agent, &ctx.me, action == Action::EffortUp)
+            {
+                Decision::Value(value) => Transition::Effort {
+                    agent: agent.clone(),
+                    value,
+                },
+                Decision::Notice(notice) => {
+                    self.effort_notice = Some(notice);
+                    Transition::Stay
+                }
+                Decision::Choose => {
+                    self.effort_picker = Some(Dialog::choose(
+                        Line::from(vec![
+                            Span::raw("Effort · "),
+                            Span::styled(agent.clone(), theme::style(theme::Role::Agent)),
+                        ]),
+                        format!(
+                            "{}; next ordinary turn.",
+                            ctx.efforts
+                                .status(agent, (self.now)(), chrono::Local::now())
+                        ),
+                        ctx.efforts.choices(agent),
+                    ));
+                    Transition::Stay
+                }
+            };
+        }
         let page = self.view.page();
         match action {
             Action::Up => self.view.scroll_up(1),
@@ -835,6 +937,9 @@ impl Screen for Thread {
         self.draw(frame, area, ctx);
         if let Some((_, admin)) = &self.group {
             admin.render(frame, area);
+        }
+        if let Some(picker) = &self.effort_picker {
+            picker.render(frame, area);
         }
     }
 }

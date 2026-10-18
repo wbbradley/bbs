@@ -22,6 +22,10 @@ under the new package version and its publication date.
   the board shows the last confirmed level with its report age and never claims
   the agent is online. `SendResponse` returns the message id for correlation.
 
+- Agent conversations display last reported effort and age separately from pending
+  next-turn changes, with an explicit picker for unranked settings, correlated
+  outcomes and visible unconfirmed/failure feedback.
+
 ### Changed
 
 - Apply consistent categorical styles to agent and human names, groups, timestamps

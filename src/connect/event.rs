@@ -44,6 +44,12 @@ pub enum Request {
         id: u64,
         req: proto::SendRequest,
     },
+    /// A control send has a server request ID; it is not a composer send.
+    SetEffort {
+        id: u64,
+        agent: String,
+        value: String,
+    },
     /// Change a group for the screen `id`; the group list follows a success.
     Admin {
         id: u64,
@@ -139,6 +145,11 @@ pub enum Data {
         id: u64,
         result: Result<(), String>,
     },
+    EffortSent {
+        id: u64,
+        agent: String,
+        result: Result<Option<i64>, String>,
+    },
     /// Completion of an actual read request, for the local summary fence.
     MarkedRead {
         agent: String,
@@ -211,6 +222,19 @@ pub async fn serve(
             Request::Send { id, req } => Data::Sent {
                 id,
                 result: backend.send(req).await.map(drop).map_err(error),
+            },
+            Request::SetEffort { id, agent, value } => Data::EffortSent {
+                id,
+                result: backend
+                    .send(proto::SendRequest {
+                        to: agent.clone(),
+                        body: value,
+                        control: Some(proto::Control::SetEffort as i32),
+                    })
+                    .await
+                    .map(|r| r.id)
+                    .map_err(error),
+                agent,
             },
             Request::Admin { id, op } => {
                 let result = admin(&mut backend, op).await.map_err(error);
@@ -469,6 +493,50 @@ mod tests {
             agent: Some("Mateo".into()),
         };
         (dir, conn, opener, req)
+    }
+
+    #[tokio::test]
+    async fn effort_send_returns_control_message_id_without_a_draft_reply() {
+        let (_dir, conn, opener, _) = board();
+        conn.execute(
+            "INSERT INTO agent_owners (agent_id, human_id) VALUES (1, 1)",
+            [],
+        )
+        .unwrap();
+        let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Request::SetEffort {
+            id: 44,
+            agent: "Mateo".into(),
+            value: "high".into(),
+        })
+        .unwrap();
+        drop(tx);
+        serve(backend, opener, rx, events).await;
+        let Some(Event::Data(Data::EffortSent {
+            id: 44,
+            agent,
+            result: Ok(Some(id)),
+        })) = replies.recv().await
+        else {
+            panic!("correlated effort reply")
+        };
+        assert_eq!(agent, "Mateo");
+        let (body, control): (String, String) = conn
+            .query_row(
+                "SELECT body, control FROM messages WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((body.as_str(), control.as_str()), ("high", "set-effort"));
+        assert!(
+            replies.recv().await.is_none(),
+            "not a Data::Sent composer completion"
+        );
     }
 
     #[tokio::test]

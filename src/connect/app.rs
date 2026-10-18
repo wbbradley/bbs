@@ -41,6 +41,7 @@ pub struct Ctx {
     /// The clock for activity freshness and animation; tests pin it.
     pub now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
     pub inbox: Inbox,
+    pub efforts: super::effort::Efforts,
     pub navigation_notice: Option<Feedback>,
 }
 
@@ -53,6 +54,10 @@ pub enum Transition {
     Request(Request),
     /// Remember the agent conversation view locally for this and future sessions.
     Compact(bool),
+    Effort {
+        agent: String,
+        value: String,
+    },
     /// Apply and remember a local color scheme immediately.
     Theme(crate::ui::theme::Scheme),
 }
@@ -331,12 +336,19 @@ impl App {
                         {
                             known.extend(rows.iter().map(|s| s.agent.to_ascii_lowercase()));
                         }
+                        if let Ok(rows) = result {
+                            self.ctx.efforts.summarized(rows, (self.ctx.now)());
+                        }
                         self.ctx.inbox.snapshot(*id, result);
                         if matches!(self.ctx.navigation_notice, Some(Feedback::Summary(_))) {
                             self.ctx.navigation_notice = None;
                         }
                     }
+                    Data::EffortSent { id, agent, result } => {
+                        self.ctx.efforts.sent(agent, *id, result, (self.ctx.now)());
+                    }
                     Data::Agents(Ok(list)) => {
+                        self.ctx.efforts.listed(&list.agents, (self.ctx.now)());
                         self.known_agents = Some(
                             list.agents
                                 .iter()
@@ -444,6 +456,17 @@ impl App {
     fn apply(&mut self, transition: Transition) -> bool {
         match transition {
             Transition::Stay => {}
+            Transition::Effort { agent, value } => {
+                if let Some(request) = self.ctx.efforts.request(
+                    &agent,
+                    &self.ctx.me,
+                    value,
+                    next_id(),
+                    (self.ctx.now)(),
+                ) {
+                    self.send(vec![request]);
+                }
+            }
             Transition::Theme(scheme) => {
                 crate::ui::theme::select(scheme);
                 self.ctx.preferences.set_theme(scheme);
@@ -1375,6 +1398,7 @@ mod tests {
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
             inbox: Default::default(),
+            efforts: Default::default(),
             navigation_notice: None,
         };
         // Most interaction tests exercise an explicitly chosen verbose view.
@@ -1443,12 +1467,7 @@ mod tests {
                 let out = screen(&mut app, 80, 24);
                 assert_eq!(out.matches("Mateo conversation").count(), 1);
                 assert!(out.lines().nth(3).unwrap().contains("body-start"), "{out}");
-                assert!(
-                    out.lines()
-                        .last()
-                        .unwrap()
-                        .starts_with("following · A: all")
-                );
+                assert!(out.lines().last().unwrap().contains("following · A:all"));
                 assert!(
                     !out.contains("1 entries")
                         && !out.contains("1 messages")
@@ -1478,16 +1497,16 @@ mod tests {
         }));
         screen(&mut app, 80, 24);
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
-        assert!(bottom(&mut app).starts_with("paused"));
+        assert!(bottom(&mut app).contains(" · paused"));
         app.on_event(Event::Data(Data::Feed {
             id: feed,
             result: Ok(vec![message(51, "Mateo", "ada", "new arrival")]),
         }));
         assert!(bottom(&mut app).contains("paused · 1 new · G follows"));
         key(&mut app, 'G');
-        assert!(bottom(&mut app).starts_with("following"));
+        assert!(bottom(&mut app).contains(" · following"));
         key(&mut app, 'E');
-        assert!(bottom(&mut app).contains("E: no text"));
+        assert!(bottom(&mut app).contains("E:no text"));
         key(&mut app, '/');
         typed(&mut app, &"👍🏽🇺🇸👩‍💻é".repeat(20));
         let prompt = bottom(&mut app);
@@ -1544,6 +1563,268 @@ mod tests {
             result: Ok(Vec::new()),
         }));
         assert!(bottom(&mut app).contains("activity: activity failure"));
+    }
+
+    fn effort_report(current: Option<&str>) -> proto::EffortReport {
+        proto::EffortReport {
+            state: Some(proto::EffortState {
+                supported: true,
+                reason: String::new(),
+                current: current.map(str::to_string),
+                choices: [
+                    ("low", Some(1)),
+                    ("default", None),
+                    ("medium", Some(4)),
+                    ("high", Some(9)),
+                ]
+                .into_iter()
+                .map(|(value, rank)| proto::EffortChoice {
+                    value: value.into(),
+                    label: value.into(),
+                    rank,
+                })
+                .collect(),
+            }),
+            pending: None,
+            answered: None,
+        }
+    }
+
+    fn report_effort(app: &mut App, report: proto::EffortReport) {
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "Mateo".into(),
+                effort: Some(report),
+                effort_reported_at: Some(chrono::Utc::now().to_rfc3339()),
+                ..Default::default()
+            }]),
+        }));
+    }
+
+    #[test]
+    fn effort_picker_is_explicit_modal_and_preserves_draft_cursor_and_focus() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        report_effort(&mut app, effort_report(Some("default")));
+        typed(&mut app, "draft,.é");
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        let saved = app.top().draft().unwrap().1;
+        assert!(editor_focused(&mut app));
+        app.on_action(Action::EffortUp);
+        assert!(app.top().navigation_blocked());
+        assert!(screen(&mut app, 80, 24).contains("Enter apply"));
+        // No implicit first selection, no global jumps, no draft typing.
+        enter(&mut app);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        typed(&mut app, "bad");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.top().draft().unwrap().1, saved);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        // Selected low disappears while the dialog is open: Enter must not use
+        // its old index (now the provider default).
+        let mut changed = effort_report(Some("default"));
+        changed.state.as_mut().unwrap().choices.remove(0);
+        report_effort(&mut app, changed);
+        enter(&mut app);
+        assert!(rx.try_recv().is_err());
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        enter(&mut app);
+        let Request::SetEffort { id, agent, value } = rx.try_recv().unwrap() else {
+            panic!("effort control")
+        };
+        assert_eq!((agent.as_str(), value.as_str()), ("Mateo", "default"));
+        assert!(editor_focused(&mut app));
+        app.on_event(Event::Data(Data::EffortSent {
+            id,
+            agent,
+            result: Ok(Some(100)),
+        }));
+        assert_eq!(
+            app.top().draft().unwrap().1,
+            saved,
+            "control response cannot finish a draft send"
+        );
+        assert!(rx.try_recv().is_err());
+        app.on_action(Action::EffortDown);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.top().draft().unwrap().1, saved);
+        assert!(editor_focused(&mut app));
+    }
+
+    #[test]
+    fn effort_controls_use_pending_basis_survive_reopen_and_ignore_stale_streams() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        report_effort(&mut app, effort_report(Some("low")));
+        typed(&mut app, "keep");
+        app.on_action(Action::EffortUp);
+        let Request::SetEffort { id: a, value, .. } = rx.try_recv().unwrap() else {
+            panic!("first")
+        };
+        assert_eq!(value, "medium");
+        app.on_action(Action::EffortUp);
+        let Request::SetEffort { id: b, value, .. } = rx.try_recv().unwrap() else {
+            panic!("second")
+        };
+        assert_eq!(value, "high");
+        app.on_action(Action::EffortUp);
+        assert!(rx.try_recv().is_err(), "boundary does not enqueue");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let _ = rx.try_recv().unwrap();
+        let _ = rx.try_recv().unwrap();
+        app.on_event(Event::Data(Data::EffortSent {
+            id: a,
+            agent: "Mateo".into(),
+            result: Err("older".into()),
+        }));
+        app.on_event(Event::Data(Data::EffortSent {
+            id: b,
+            agent: "Mateo".into(),
+            result: Ok(Some(102)),
+        }));
+        app.open(
+            Box::new(Thread::agent("Mateo", "ada", false, app.ctx.now.clone())),
+            true,
+        );
+        rx.try_recv().unwrap();
+        rx.try_recv().unwrap();
+        assert_eq!(app.top().draft().unwrap().1.text, "keep");
+        let status = bottom(&mut app);
+        assert!(
+            status.contains("low→high next") && status.contains("following"),
+            "{status}"
+        );
+        let mut r = effort_report(Some("low"));
+        r.answered = Some(proto::EffortOutcome {
+            request_id: 101,
+            result: 1,
+            detail: String::new(),
+        });
+        report_effort(&mut app, r.clone());
+        assert!(bottom(&mut app).contains("next"));
+        r.state.as_mut().unwrap().current = Some("high".into());
+        r.answered.as_mut().unwrap().request_id = 102;
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id + 999,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "Mateo".into(),
+                effort: Some(r.clone()),
+                ..Default::default()
+            }]),
+        }));
+        assert!(
+            bottom(&mut app).contains("next"),
+            "obsolete generation cannot resolve request"
+        );
+        report_effort(&mut app, r);
+        assert!(bottom(&mut app).contains("effort high"));
+        assert!(!bottom(&mut app).contains("next"));
+        app.on_action(Action::EffortDown);
+        let Request::SetEffort { value, .. } = rx.try_recv().unwrap() else {
+            panic!("navigation action")
+        };
+        assert_eq!(value, "medium");
+    }
+
+    #[test]
+    fn effort_unavailable_and_group_actions_do_not_send_or_change_drafts() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        typed(&mut app, ",.");
+        app.on_action(Action::EffortDown);
+        assert!(bottom(&mut app).contains("no driver report"));
+        assert!(rx.try_recv().is_err());
+        let mut r = effort_report(None);
+        r.state.as_mut().unwrap().supported = false;
+        r.state.as_mut().unwrap().reason = "No effort configuration".into();
+        report_effort(&mut app, r);
+        app.on_action(Action::EffortUp);
+        assert!(bottom(&mut app).contains("No effort configuration"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.top().draft().unwrap().1.text, ",.");
+        app.open(Box::new(Thread::group("crew")), true);
+        while rx.try_recv().is_ok() {}
+        app.on_action(Action::EffortUp);
+        assert!(rx.try_recv().is_err());
+        assert!(!bottom(&mut app).contains("effort"));
+    }
+
+    #[test]
+    fn effort_feedback_fits_with_search_errors_mailbox_and_spinner_in_all_schemes() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let (mut app, mut rx) = app();
+                let (clock, now) = test_clock();
+                app.ctx.now = now;
+                let (_, act) = mateo_streams(&mut app, &mut rx);
+                let mut r = effort_report(Some("low"));
+                for c in &mut r.state.as_mut().unwrap().choices {
+                    c.label = "👩‍💻long provider label ".repeat(5);
+                }
+                report_effort(&mut app, r);
+                app.on_event(Event::Data(Data::Summary {
+                    id: app.ctx.inbox.id,
+                    result: Ok(vec![proto::AgentSummary {
+                        agent: "Other".into(),
+                        unread_messages: 1,
+                        ..Default::default()
+                    }]),
+                }));
+                app.on_event(Event::Data(Data::ActivityBaseline {
+                    id: act,
+                    through_id: 0,
+                    record: None,
+                }));
+                app.on_event(Event::Data(Data::Activity {
+                    id: act,
+                    result: Ok(vec![activity(1, "01", r#"{"event":"text"}"#)]),
+                }));
+                while rx.try_recv().is_ok() {}
+                for _ in 0..2 {
+                    app.on_action(Action::EffortUp);
+                    while rx.try_recv().is_ok() {}
+                    let row = bottom(&mut app);
+                    assert!(
+                        row.starts_with("effort")
+                            && row.contains("following")
+                            && row.contains("next"),
+                        "{row}"
+                    );
+                    assert!(row.ends_with("✉ ⠋"), "{row}");
+                    assert!(app.next_animation_frame().is_some());
+                    press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+                }
+                clock.advance(Duration::from_secs(61));
+                let delayed = bottom(&mut app);
+                assert!(
+                    delayed.contains("unconfirmed") || delayed.contains("unconf…"),
+                    "{delayed}"
+                );
+                app.ctx.preferences.error = Some("local preference failure".into());
+                let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let b = terminal.backend().buffer();
+                crate::ui::theme::testing::assert_buffer(b);
+                let bar = theme::base().patch(theme::style(theme::Role::StatusBar));
+                assert_eq!(b[(79, 23)].symbol(), "·");
+                assert_status_foreground(&b[(79, 23)], bar);
+                assert_eq!(b[(79, 23)].bg, bar.bg.unwrap());
+                assert!(bottom(&mut app).contains("local preference failure"));
+                press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+                key(&mut app, '/');
+                typed(&mut app, &"👩‍💻".repeat(40));
+                let search = bottom(&mut app);
+                assert!(
+                    search.contains("pref error")
+                        && search.contains("👩‍💻█")
+                        && search.contains("Enter search · Esc cancel"),
+                    "{search}"
+                );
+            });
+        }
     }
 
     fn editor_focused(app: &mut App) -> bool {
@@ -1625,6 +1906,7 @@ mod tests {
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
             inbox: Default::default(),
+            efforts: Default::default(),
             navigation_notice: None,
         };
         let mut app = App::new(ctx, tx);
@@ -1650,6 +1932,7 @@ mod tests {
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
             inbox: Default::default(),
+            efforts: Default::default(),
             navigation_notice: None,
         };
         let mut app = App::new(ctx, tx);
@@ -1860,7 +2143,7 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("elsewhere"), "{out}");
-        assert!(out.contains("following · A: all · E: all kinds"), "{out}");
+        assert!(out.contains("following · A:all E:all"), "{out}");
         // The search prompt takes every key, q included, until Enter.
         key(&mut app, '/');
         for c in "q needle".chars() {
