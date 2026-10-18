@@ -1,15 +1,15 @@
 //! The conversation's last-known turn state from its activity stream: a
 //! recorded turn end settles Done until a newer event arrives; only unfinished
-//! progress carries a freshness timeout, measured from the event's
-//! server-stored time so replayed or duplicate arrivals never look fresh.
+//! progress carries a freshness timeout, measured from local receipt.
 
-use chrono::{DateTime, Utc};
+use std::time::{Duration, Instant};
+
 use ratatui::text::Span;
 
 use super::theme::{self, Role};
 
 /// How long an unfinished event counts as fresh evidence.
-const FRESH: chrono::Duration = chrono::Duration::seconds(60);
+const FRESH: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Progress {
@@ -33,10 +33,10 @@ impl Progress {
     }
 }
 
-/// Unfinished progress: the spinner frame and the event's server-stored time.
+/// Unfinished progress: the spinner frame and its local receipt time.
 struct Fresh {
     frame: u8,
-    at: DateTime<Utc>,
+    at: Instant,
 }
 
 #[derive(Default)]
@@ -75,7 +75,7 @@ impl ProgressState {
         }
     }
 
-    pub fn observe(&mut self, id: i64, record: &str, at: DateTime<Utc>) {
+    pub fn observe(&mut self, id: i64, record: &str, now: Instant) {
         let Some(newest) = self.newest else { return };
         if self.closed || id <= newest {
             return;
@@ -94,7 +94,7 @@ impl ProgressState {
                     .fresh
                     .as_ref()
                     .map_or(0, |fresh| fresh.frame.wrapping_add(1));
-                self.fresh = Some(Fresh { frame, at });
+                self.fresh = Some(Fresh { frame, at: now });
             }
         }
     }
@@ -105,9 +105,9 @@ impl ProgressState {
         self.fresh = None;
     }
 
-    pub fn at(&self, now: DateTime<Utc>) -> Progress {
+    pub fn at(&self, now: Instant) -> Progress {
         if let Some(fresh) = &self.fresh
-            && now.signed_duration_since(fresh.at) < FRESH
+            && now.saturating_duration_since(fresh.at) < FRESH
         {
             return Progress::Progressing(fresh.frame);
         }
@@ -118,7 +118,6 @@ impl ProgressState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
 
     fn record(event: &str) -> String {
         format!(r#"{{"event":"{event}"}}"#)
@@ -126,28 +125,28 @@ mod tests {
 
     #[test]
     fn recorded_turn_end_settles_done_until_a_newer_event() {
-        let now = Utc::now();
+        let now = Instant::now();
         let mut p = ProgressState::default();
         // History ending in turn_end opens Done and never expires.
         p.baseline(500, Some(&record("turn_end")));
         assert_eq!(p.at(now), Progress::Done);
-        assert_eq!(p.at(now + Duration::hours(1)), Progress::Done);
+        assert_eq!(p.at(now + Duration::from_secs(3600)), Progress::Done);
         // Newer unfinished activity shows progress while fresh...
         p.observe(501, &record("text"), now);
         assert_eq!(p.at(now), Progress::Progressing(0));
         // ...but once it times out the older completion must not return.
-        assert_eq!(p.at(now + Duration::seconds(60)), Progress::Unknown);
-        assert_eq!(p.at(now + Duration::hours(1)), Progress::Unknown);
+        assert_eq!(p.at(now + Duration::from_secs(60)), Progress::Unknown);
+        assert_eq!(p.at(now + Duration::from_secs(3600)), Progress::Unknown);
         // A recorded failure or a new turn end resettles the state.
         p.observe(502, &record("turn_end"), now);
-        assert_eq!(p.at(now + Duration::hours(1)), Progress::Done);
+        assert_eq!(p.at(now + Duration::from_secs(3600)), Progress::Done);
         p.observe(503, &record("turn_error"), now);
         assert_eq!(p.at(now), Progress::Unknown);
     }
 
     #[test]
-    fn unfinished_history_stays_unknown_regardless_of_age() {
-        let now = Utc::now();
+    fn unfinished_history_stays_unknown() {
+        let now = Instant::now();
         let mut fresh = ProgressState::default();
         fresh.baseline(9, Some(&record("text")));
         assert_eq!(fresh.at(now), Progress::Unknown);
@@ -158,7 +157,7 @@ mod tests {
 
     #[test]
     fn history_duplicates_and_repaints_never_advance_or_refresh_activity() {
-        let now = Utc::now();
+        let now = Instant::now();
         let mut p = ProgressState::default();
         // Nothing observed before the baseline.
         p.observe(1, &record("text"), now);
@@ -178,24 +177,18 @@ mod tests {
     }
 
     #[test]
-    fn progress_is_fresh_only_by_server_stored_time() {
-        let now = Utc::now();
+    fn progress_is_fresh_from_receipt_for_a_minute() {
+        let now = Instant::now();
         let mut p = ProgressState::default();
         p.baseline(0, None);
-        // An event replayed late is fresh only by its stored time.
-        p.observe(1, &record("text"), now - Duration::seconds(30));
-        assert_eq!(p.at(now), Progress::Progressing(0));
-        assert_eq!(p.at(now + Duration::seconds(29)), Progress::Progressing(0));
-        assert_eq!(p.at(now + Duration::seconds(30)), Progress::Unknown);
-        let mut q = ProgressState::default();
-        q.baseline(0, None);
-        q.observe(1, &record("text"), now - Duration::minutes(5));
-        assert_eq!(q.at(now), Progress::Unknown);
+        p.observe(1, &record("text"), now);
+        assert_eq!(p.at(now + Duration::from_secs(59)), Progress::Progressing(0));
+        assert_eq!(p.at(now + Duration::from_secs(60)), Progress::Unknown);
     }
 
     #[test]
     fn events_wrap_frames_and_disconnect_keeps_recorded_completion() {
-        let now = Utc::now();
+        let now = Instant::now();
         let mut p = ProgressState::default();
         p.baseline(0, None);
         for id in 1..=257 {
@@ -203,17 +196,24 @@ mod tests {
         }
         assert_eq!(p.at(now), Progress::Progressing(0));
         p.observe(258, &record("turn_end"), now);
-        assert_eq!(p.at(now + Duration::hours(1)), Progress::Done);
+        assert_eq!(p.at(now + Duration::from_secs(3600)), Progress::Done);
         p.disconnect();
         assert_eq!(p.at(now), Progress::Done);
         p.observe(259, &record("text"), now);
         assert_eq!(p.at(now), Progress::Done, "closed stays closed");
-        // Without a recorded end, a disconnect drops fresh progress.
+        // Newer unfinished activity already replaced the completion, so a
+        // disconnect now leaves unknown.
         let mut q = ProgressState::default();
-        q.baseline(0, None);
-        q.observe(1, &record("text"), now);
-        assert_eq!(q.at(now), Progress::Progressing(0));
+        q.baseline(1, Some(&record("turn_end")));
+        q.observe(2, &record("text"), now);
         q.disconnect();
         assert_eq!(q.at(now), Progress::Unknown);
+        // Without a recorded end, a disconnect drops fresh progress.
+        let mut r = ProgressState::default();
+        r.baseline(0, None);
+        r.observe(1, &record("text"), now);
+        assert_eq!(r.at(now), Progress::Progressing(0));
+        r.disconnect();
+        assert_eq!(r.at(now), Progress::Unknown);
     }
 }

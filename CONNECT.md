@@ -180,10 +180,12 @@ In compact agent conversations, the hint's right edge shows the turn state:
 a Braille glyph advances on each new unfinished event, a check marks a recorded
 turn end, and `?` means unknown. Recorded completion is trusted history: a
 stored turn end checks the glyph when the conversation opens, and it persists
-until a later event, surviving freshness expiry and a lost connection. Unfinished
-events count as fresh only by their stored time — 60 seconds without new
-activity clears the spinner — so history replay and duplicate events never
-advance it. A turn error, cancellation or stop makes the glyph unknown.
+until a later event, surviving freshness expiry and a lost connection.
+Unfinished activity shows the spinner only for 60 seconds after it arrives;
+history replay and duplicate events never advance it, and newer unfinished
+activity replaces a recorded completion for good: once the spinner times out
+the glyph is unknown, never the stale check. A turn error, cancellation or stop
+makes the glyph unknown.
 The composer has no border and uses the same themed surface as your outgoing
 messages, with one blank display row above the hint using the conversation's
 background. It starts with two text rows plus the blank row and hint row and grows up to

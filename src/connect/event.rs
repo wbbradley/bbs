@@ -465,17 +465,12 @@ mod tests {
             .unwrap();
         let baseline = activity_baseline(&mut backend, &req).await.unwrap();
         assert_eq!(baseline.as_ref().map(|row| row.id), Some(500));
-        let now = chrono::Utc::now();
-        // The gap event is fresh by its stored time, not by when replay
-        // happened to deliver it.
+        let now = std::time::Instant::now();
         crate::db::post_activity(
             &conn,
             1,
             "u",
-            &[(
-                "text".into(),
-                format!(r#"{{"event":"text","ts":"{}"}}"#, now.to_rfc3339()),
-            )],
+            &[("text".into(), r#"{"event":"text"}"#.into())],
         )
         .unwrap();
         let mut progress = ProgressState::default();
