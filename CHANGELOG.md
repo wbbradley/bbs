@@ -8,6 +8,11 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Fixed
+
+- Textboxes start with three light rows (top padding, one text row and bottom
+  padding), growing to four when the draft wraps onto a second text row.
+
 ## 0.8.0 - 2026-10-18
 
 Protocol v2, database schema 14, config format 3 and Rust 1.89 remain unchanged.

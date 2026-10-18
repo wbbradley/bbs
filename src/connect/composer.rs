@@ -14,7 +14,7 @@ use layout::{Layout, Point};
 use super::theme;
 
 /// Text lines when empty; the box grows from here.
-const MIN_LINES: u16 = 2;
+const MIN_LINES: u16 = 1;
 
 pub struct Composer {
     text: TextArea<'static>,
@@ -127,7 +127,7 @@ impl Composer {
         )
     }
 
-    /// Two text rows and scrollable top padding, plus dark and bottom separators.
+    /// One text row and scrollable top padding, plus dark and bottom separators.
     pub fn height(&self, width: u16, max_lines: u16) -> u16 {
         let lines = u16::try_from(
             self.layout(width - gutter_width(width))
@@ -828,9 +828,45 @@ mod tests {
     }
 
     #[test]
+    fn initial_three_light_rows_grow_to_four_on_the_second_wrapped_row() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let mut c = Composer::new("Mateo");
+                for (source, light_rows) in [("", 3), ("abc", 3), ("abc defg", 4)] {
+                    c.restore(super::super::drafts::Draft {
+                        text: source.into(),
+                        cursor: (0, source.chars().count()),
+                    });
+                    let snapshot = c.draft();
+                    let height = c.height(8, 20);
+                    assert_eq!(height, light_rows + 1);
+                    let buffer = draw(&mut c, 8, height);
+                    let surface = theme::base().patch(theme::style(theme::Role::HumanSurface));
+                    let cursor = surface.patch(theme::style(theme::Role::Cursor));
+                    for x in 0..8 {
+                        for y in [1, height - 1] {
+                            let cell = &buffer[(x, y)];
+                            assert_eq!(cell.symbol(), " ");
+                            assert_eq!(cell.fg, surface.fg.unwrap());
+                            assert_eq!(cell.bg, surface.bg.unwrap());
+                        }
+                    }
+                    assert_eq!(buffer[(0, 2)].symbol(), "›");
+                    let caret = c.layout(c.area.width).point(c.text.cursor());
+                    let cell = &buffer[(c.area.x + caret.col as u16, 2 + caret.row as u16)];
+                    assert_eq!(cell.fg, cursor.fg.unwrap());
+                    assert_eq!(cell.bg, cursor.bg.unwrap());
+                    assert_eq!(c.draft(), snapshot);
+                }
+            });
+        }
+    }
+
+    #[test]
     fn the_box_grows_with_wrapped_text_up_to_its_limit() {
         let mut c = Composer::new("Mateo");
-        assert_eq!(c.height(22, 4), 5);
+        assert_eq!(c.height(22, 4), 4);
         typed(&mut c, &"x".repeat(60));
         // Three source rows plus top padding fill the four-row viewport cap.
         assert_eq!(c.height(22, 4), 6);
@@ -846,7 +882,7 @@ mod tests {
         );
         assert_eq!(c.text.cursor(), cursor);
         assert!(c.layout(c.area.width).point(cursor).row < c.top + 4);
-        // A limit under two lines still leaves two.
-        assert_eq!(c.height(22, 1), 5);
+        // Even a one-row limit retains a source row and the display padding.
+        assert_eq!(c.height(22, 1), 4);
     }
 }

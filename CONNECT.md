@@ -206,7 +206,7 @@ the first visual text row restores the padding. A two-column gutter shows
 The gutter is display-only; wrapping and cursor/selection share the remaining
 text width. A fixed light blank row below the viewport cannot hold the cursor.
 On very narrow or short displays, the gutter and bottom padding shrink to keep
-one text column and row when possible. The editor starts with two text rows,
+one text column and row when possible. The editor starts with one text row,
 scrollable light top padding, the dark separator and fixed light bottom padding.
 Its scrolling viewport grows up to `composer_max_height_percent` rows of the
 window height (default 20). One source-to-display layout drives wrapping, height, caret/selection

@@ -1954,7 +1954,7 @@ mod tests {
                 .unwrap();
             (0..29).filter(|y| buffer[(79, *y)].bg == surface).count()
         };
-        assert_eq!(rows(&mut app), 4);
+        assert_eq!(rows(&mut app), 3);
         for _ in 0..10 {
             key(&mut app, 'x');
             press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
@@ -2300,9 +2300,9 @@ mod tests {
                                 .bg
                                 .unwrap()
                         );
-                        // Dark spacer, light top padding, two text rows and fixed light bottom padding.
+                        // Dark spacer, light top padding, one text row and fixed light bottom padding.
                         assert_eq!(
-                            buffer[(width - 1, 18)].bg,
+                            buffer[(width - 1, 19)].bg,
                             theme::base()
                                 .patch(theme::style(theme::Role::Screen))
                                 .bg
