@@ -4,7 +4,6 @@
 //! group threads the admin dialogs.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -576,7 +575,7 @@ impl Thread {
                 .stream
                 .as_ref()
                 .filter(|_| self.compact)
-                .map(|stream| stream.progress(Instant::now()).indicator());
+                .map(|stream| stream.progress(chrono::Utc::now()).indicator());
             if indicator.is_some() {
                 c.render_with_indicator(
                     frame,

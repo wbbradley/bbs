@@ -27,6 +27,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
+- The compact conversation progress glyph in `bbs connect` trusts recorded history: a stored turn end shows the check from the moment the conversation opens and persists until a later event, surviving freshness expiry and lost connections. Only unfinished activity carries the 60-second freshness timeout, now measured from each event's stored time instead of its arrival.
+
 - `bbs connect` screens no longer draw an outer double-line border; each screen's heading sits above its content, and the bottom status bar's style fills the whole line like a traditional status bar. Dialogs keep their boundaries.
 
 - Focused composer hints start with the target name, and compact outgoing messages keep light blank padding between the dark separator and body.

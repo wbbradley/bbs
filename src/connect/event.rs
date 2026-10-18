@@ -84,10 +84,12 @@ pub enum Data {
         id: u64,
         result: Result<Vec<proto::Activity>, String>,
     },
-    /// History watermark established before subscribing to activity replay.
+    /// History watermark established before subscribing to activity replay,
+    /// with the newest activity record when there is one.
     ActivityBaseline {
         id: u64,
         through_id: i64,
+        record: Option<String>,
     },
     /// Summaries from the stream `id`. A stream ends after an error.
     Summary {
@@ -318,10 +320,11 @@ async fn watch_summary(opener: Opener, id: u64, tx: UnboundedSender<Event>) {
     }
 }
 
+/// The newest stored activity row for the agent, when there is one.
 async fn activity_baseline(
     backend: &mut Backend,
     req: &proto::ActivityRequest,
-) -> anyhow::Result<i64> {
+) -> anyhow::Result<Option<proto::Activity>> {
     let mut latest = backend
         .watch_activity(proto::ActivityRequest {
             backlog: 1,
@@ -329,13 +332,7 @@ async fn activity_baseline(
             agent: req.agent.clone(),
         })
         .await?;
-    Ok(latest
-        .next()
-        .await?
-        .iter()
-        .map(|event| event.id)
-        .max()
-        .unwrap_or(0))
+    Ok(latest.next().await?.into_iter().next())
 }
 
 /// Stream activity `id` until it fails or the app goes away.
@@ -347,9 +344,13 @@ async fn watch_activity(
 ) {
     let result: anyhow::Result<()> = async {
         let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller).await?;
-        let through_id = activity_baseline(&mut backend, &req).await?;
+        let baseline = activity_baseline(&mut backend, &req).await?;
         if tx
-            .send(Event::Data(Data::ActivityBaseline { id, through_id }))
+            .send(Event::Data(Data::ActivityBaseline {
+                id,
+                through_id: baseline.as_ref().map_or(0, |row| row.id),
+                record: baseline.map(|row| row.record),
+            }))
             .is_err()
         {
             return Ok(());
@@ -421,7 +422,8 @@ mod tests {
             next(&mut rx).await,
             Event::Data(Data::ActivityBaseline {
                 id: 9,
-                through_id: 500
+                through_id: 500,
+                record: Some(_),
             })
         ));
         for (len, last) in [(200, 200), (200, 400), (100, 500)] {
@@ -462,17 +464,26 @@ mod tests {
             .await
             .unwrap();
         let baseline = activity_baseline(&mut backend, &req).await.unwrap();
-        assert_eq!(baseline, 500);
+        assert_eq!(baseline.as_ref().map(|row| row.id), Some(500));
+        let now = chrono::Utc::now();
+        // The gap event is fresh by its stored time, not by when replay
+        // happened to deliver it.
         crate::db::post_activity(
             &conn,
             1,
             "u",
-            &[("text".into(), r#"{"event":"text"}"#.into())],
+            &[(
+                "text".into(),
+                format!(r#"{{"event":"text","ts":"{}"}}"#, now.to_rfc3339()),
+            )],
         )
         .unwrap();
         let mut progress = ProgressState::default();
-        progress.baseline(baseline);
-        let now = std::time::Instant::now();
+        progress.baseline(
+            baseline.as_ref().map_or(0, |row| row.id),
+            baseline.as_ref().map(|row| row.record.as_str()),
+            now,
+        );
         let mut replay = backend.watch_activity(req).await.unwrap();
         for batch in 0..3 {
             let events = replay.next().await.unwrap();

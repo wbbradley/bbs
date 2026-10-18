@@ -2,9 +2,8 @@
 //! shares, drawn as `bbs headless logs --pretty` draws it, in time order.
 
 use std::collections::VecDeque;
-use std::time::Instant;
 
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use ratatui::style::Style;
 use ratatui::text::Line;
 
@@ -248,7 +247,7 @@ impl Stream {
         };
     }
 
-    pub fn progress(&self, now: Instant) -> Progress {
+    pub fn progress(&self, now: DateTime<Utc>) -> Progress {
         self.progress.at(now)
     }
 
@@ -290,14 +289,18 @@ impl Stream {
 
     /// Take a batch of this stream's data; returns the new entries.
     pub fn on_data(&mut self, data: &Data) -> Vec<Entry> {
-        self.on_data_at(data, Instant::now())
+        self.on_data_at(data, Utc::now())
     }
 
-    fn on_data_at(&mut self, data: &Data, now: Instant) -> Vec<Entry> {
-        if let Data::ActivityBaseline { id, through_id } = data
+    fn on_data_at(&mut self, data: &Data, now: DateTime<Utc>) -> Vec<Entry> {
+        if let Data::ActivityBaseline {
+            id,
+            through_id,
+            record,
+        } = data
             && *id == self.id
         {
-            self.progress.baseline(*through_id);
+            self.progress.baseline(*through_id, record.as_deref(), now);
         }
         let Data::Activity { id, result } = data else {
             return Vec::new();
@@ -347,15 +350,18 @@ mod tests {
 
     #[test]
     fn progress_tracks_only_new_current_subscription_events_regardless_of_filters() {
-        use std::time::Duration;
-        let now = Instant::now();
+        use chrono::Duration;
+        let now = Utc::now();
         let mut stream = Stream::new("Mateo");
         let id = stream.id;
         let batch = |id, event_id, event: &str| Data::Activity {
             id,
             result: Ok(vec![proto::Activity {
                 id: event_id,
-                record: format!(r#"{{"event":"{event}","text":"hidden"}}"#),
+                record: format!(
+                    r#"{{"event":"{event}","text":"hidden","ts":"{}"}}"#,
+                    now.to_rfc3339()
+                ),
                 ..Default::default()
             }]),
         };
@@ -363,6 +369,7 @@ mod tests {
             &Data::ActivityBaseline {
                 id,
                 through_id: 500,
+                record: None,
             },
             now,
         );
@@ -372,16 +379,28 @@ mod tests {
         assert!(stream.on_data_at(&batch(id, 501, "text"), now).is_empty());
         assert_eq!(stream.progress(now), Progress::Progressing(0));
         stream.entries();
-        stream.on_data_at(&batch(id, 501, "text"), now + Duration::from_secs(59));
+        stream.on_data_at(&batch(id, 501, "text"), now + Duration::seconds(59));
         assert_eq!(
-            stream.progress(now + Duration::from_secs(60)),
+            stream.progress(now + Duration::seconds(60)),
             Progress::Unknown
         );
+        // Recorded completion persists instead of expiring.
         stream.on_data_at(&batch(id, 502, "turn_end"), now);
         assert_eq!(stream.progress(now), Progress::Done);
+        assert_eq!(
+            stream.progress(now + Duration::seconds(60)),
+            Progress::Done
+        );
         stream.reset();
         assert_ne!(stream.id, id);
-        stream.on_data_at(&Data::ActivityBaseline { id, through_id: 0 }, now);
+        stream.on_data_at(
+            &Data::ActivityBaseline {
+                id,
+                through_id: 0,
+                record: None,
+            },
+            now,
+        );
         stream.on_data_at(&batch(id, 503, "text"), now);
         assert_eq!(stream.progress(now), Progress::Unknown);
         let id = stream.id;
@@ -389,6 +408,7 @@ mod tests {
             &Data::ActivityBaseline {
                 id,
                 through_id: 503,
+                record: None,
             },
             now,
         );

@@ -2019,17 +2019,23 @@ mod tests {
         app.on_event(Event::Data(Data::ActivityBaseline {
             id: act,
             through_id: 500,
+            record: None,
         }));
+        let now = chrono::Utc::now().to_rfc3339();
         let batch = |id, kind| Data::Activity {
             id: act,
             result: Ok(vec![activity(
                 id,
                 "01",
-                &format!(r#"{{"event":"{kind}","text":"hidden"}}"#),
+                &format!(r#"{{"event":"{kind}","text":"hidden","ts":"{now}"}}"#),
             )]),
         };
         app.on_event(Event::Data(batch(500, "turn_end")));
-        assert_eq!(hint_cell(&mut app), '?', "history does not imply done");
+        assert_eq!(
+            hint_cell(&mut app),
+            '?',
+            "replayed events below the watermark stay inert"
+        );
         app.on_event(Event::Data(batch(501, "text")));
         assert_eq!(hint_cell(&mut app), '⠋');
         app.on_event(Event::Tick);
@@ -2048,7 +2054,11 @@ mod tests {
             id: act,
             result: Err("disconnected".into()),
         }));
-        assert_eq!(hint_cell(&mut app), '?');
+        assert_eq!(
+            hint_cell(&mut app),
+            '✓',
+            "recorded completion survives a lost connection"
+        );
         while rx.try_recv().is_ok() {}
         key(&mut app, 'X');
         enter(&mut app);
