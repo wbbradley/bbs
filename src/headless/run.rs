@@ -99,10 +99,17 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         json!({ "agent": agent, "harness": harness, "cwd": cwd, "pid": std::process::id() }),
     );
 
+    let mut mcp_args = vec!["headless".into(), "mcp".into()];
+    if harness_config.mcp_env == McpEnv::Process && config.server.is_none() {
+        mcp_args.extend([
+            "--local-state-dir".into(),
+            std::fs::canonicalize(dir)?.display().to_string(),
+        ]);
+    }
     let mcp = McpServer {
         name: "bbs".into(),
         command: std::env::current_exe()?.display().to_string(),
-        args: vec!["headless".into(), "mcp".into()],
+        args: mcp_args,
         env: std::iter::once((TOKEN_ENV.to_string(), token.clone()))
             .chain(
                 config

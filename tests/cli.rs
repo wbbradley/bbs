@@ -3040,15 +3040,20 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
 
 fn headless_process_mcp_env_routes_without_serializing_credentials(mode: Mode) {
     let bbs = Bbs::with_mode("process-mcp-env", mode);
+    // A harness may use another home whose global config selects a different board.
+    let child_home = bbs.home.join("harness-home");
+    let child_config = child_home.join(".config/bbs/config.toml");
+    std::fs::create_dir_all(child_config.parent().unwrap()).unwrap();
+    std::fs::write(&child_config, "server = \"127.0.0.1:2\"\n").unwrap();
     let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");
     headless_config(&bbs, &["python3", fake]);
     let config = config_path(&bbs);
     let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str(
-        "mcp_env = \"process\"\nshare_activity = false\n\
-         env = { BBS_HEADLESS_TOKEN = \"stale-token\", BBS_SERVER = \"127.0.0.1:1\", \
-         FAKE_MCP_PROCESS_ENV = \"1\", CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = \"0\" }\n",
-    );
+    text.push_str(&format!(
+        "mcp_env = \"process\"\nshare_activity = false\nmodel = \"synthetic/model\"\n\
+         env = {{ HOME = {child_home:?}, BBS_HEADLESS_TOKEN = \"stale-token\", BBS_SERVER = \"127.0.0.1:1\", \
+         FAKE_MCP_PROCESS_ENV = \"1\", CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = \"0\" }}\n",
+    ));
     std::fs::write(&config, &text).unwrap();
     bbs.ok(&["group", "register", "crew"]);
     let (_, peer_token) = bbs.register();
@@ -3119,6 +3124,16 @@ fn headless_process_mcp_env_routes_without_serializing_credentials(mode: Mode) {
         }
         assert!(!String::from_utf8_lossy(&output.stderr).contains(&token));
         assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+        let models = std::fs::read_to_string(bbs.home.join("fake-model-selections")).unwrap();
+        assert_eq!(
+            models.lines().collect::<Vec<_>>(),
+            vec!["synthetic/model"; index + 1]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&child_config).unwrap(),
+            "server = \"127.0.0.1:2\"\n"
+        );
+        assert!(!child_home.join(".local/state/bbs/bbs.db").exists());
     }
 }
 

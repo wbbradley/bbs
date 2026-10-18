@@ -347,7 +347,11 @@ pub enum HeadlessCommand {
     Cancel { agent: String },
     /// Serve the agent's BBS tools over MCP on stdio (started by the harness).
     #[command(hide = true)]
-    Mcp,
+    Mcp {
+        /// Pin a local board independently of inherited environment and config.
+        #[arg(long)]
+        local_state_dir: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]

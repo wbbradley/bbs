@@ -261,8 +261,11 @@ mcp_env = "process"
 
 `mcp_env = "process"` passes the runtime BBS token and effective `BBS_SERVER`
 to the harness through its child-process environment, overriding stale values
-in `env`. For a local board, `BBS_SERVER` is empty. The MCP session specification
-contains no environment values, so the SDK cannot copy the token into its
+in `env`. For a local board, `BBS_SERVER` is empty and the MCP command includes
+`--local-state-dir` with the original board's absolute directory. This pins local
+routing even if the child has a different home or a global remote-server config.
+The MCP session specification contains no environment values, so the SDK
+cannot copy the token into its
 `--mcp-config` command-line argument. No parent environment or configuration
 file is changed. The harness and its descendants can read these credentials.
 Other ACP harnesses keep the default `mcp_env = "server"`; process mode is
