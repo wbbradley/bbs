@@ -1879,6 +1879,44 @@ mod tests {
     }
 
     #[test]
+    fn effort_tabs_leave_non_conversation_screens_unchanged() {
+        let screens: Vec<Box<dyn Screen>> = vec![
+            Box::new(Menu::default()),
+            Box::new(crate::connect::screens::agents::Agents::default()),
+            Box::new(crate::connect::screens::groups::Groups::new()),
+            Box::new(Help::default()),
+            Box::new(crate::connect::screens::config::Config::new()),
+        ];
+        for page in screens {
+            let (mut app, mut rx) = app();
+            app.push(page);
+            report_effort(&mut app, effort_report(Some("low")));
+            while rx.try_recv().is_ok() {}
+            let title = app.top().title();
+            let before = screen(&mut app, 80, 24)
+                .lines()
+                .take(23)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for (code, modifiers) in [
+                (KeyCode::Tab, KeyModifiers::NONE),
+                (KeyCode::BackTab, KeyModifiers::NONE),
+                (KeyCode::Tab, KeyModifiers::SHIFT),
+            ] {
+                press(&mut app, code, modifiers);
+                assert!(rx.try_recv().is_err(), "no request from {title}");
+                assert_eq!(app.top().title(), title);
+                let after = screen(&mut app, 80, 24)
+                    .lines()
+                    .take(23)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert_eq!(after, before, "Tab cannot change {title}");
+            }
+        }
+    }
+
+    #[test]
     fn effort_tabs_leave_picker_search_and_other_screen_input_in_control() {
         let (mut app, mut rx) = app();
         mateo_streams(&mut app, &mut rx);
