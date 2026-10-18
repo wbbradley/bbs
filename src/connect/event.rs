@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ratatui::crossterm::event::{self, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -18,8 +18,6 @@ pub enum Event {
     Key(KeyEvent),
     Resize,
     Tick,
-    /// An animation frame is due; redraw only, no housekeeping.
-    Animate,
     Data(Data),
 }
 
@@ -142,43 +140,6 @@ pub fn spawn_ticks(tx: UnboundedSender<Event>) {
         loop {
             interval.tick().await;
             if tx.send(Event::Tick).is_err() {
-                return;
-            }
-        }
-    });
-}
-
-/// Animation frames while a screen shows progress; parked otherwise. The app
-/// arms the next frame's deadline through `armed` and must rearm after each
-/// `Event::Animate`; nothing wakes while it stays disarmed.
-pub fn spawn_animator(
-    tx: UnboundedSender<Event>,
-    mut armed: tokio::sync::watch::Receiver<Option<Instant>>,
-) {
-    tokio::spawn(async move {
-        loop {
-            // Wait for a deadline, then for it to pass or move.
-            while armed.borrow_and_update().is_none() {
-                if armed.changed().await.is_err() {
-                    return;
-                }
-            }
-            let deadline = armed.borrow().expect("checked above");
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline.into()) => {
-                    if tx.send(Event::Animate).is_err() {
-                        return;
-                    }
-                }
-                changed = armed.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                    continue;
-                }
-            }
-            // Never fire twice for one arming: the app rearms on Animate.
-            if armed.changed().await.is_err() {
                 return;
             }
         }

@@ -18,12 +18,34 @@ use std::io::IsTerminal;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+use self::event::Event;
 
 use crate::backend::Backend;
 use crate::proto::Kind;
 
 pub use event::Opener;
+
+/// What the run loop waits on: an event to handle, or a redraw when the next
+/// animation frame is due. With no deadline it waits for events only.
+enum Wait {
+    Event(Event),
+    Redraw,
+}
+
+async fn wait(rx: &mut UnboundedReceiver<Event>, next_frame: Option<Instant>) -> Option<Wait> {
+    let frame = async {
+        match next_frame {
+            Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        event = rx.recv() => event.map(Wait::Event),
+        () = frame => Some(Wait::Redraw),
+    }
+}
 
 pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> Result<()> {
     let me = backend.whoami().await?;
@@ -60,20 +82,19 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
     app.draft_store = draft_store;
     let mut terminal = ratatui::init();
     event::spawn_input(events.clone());
-    event::spawn_ticks(events.clone());
-    let (animator_tx, animator_rx) = tokio::sync::watch::channel(None);
-    event::spawn_animator(events, animator_rx);
-    app.animator = Some(animator_tx);
+    event::spawn_ticks(events);
     let result = async {
         loop {
             terminal.draw(|frame| app.draw(frame))?;
-            let Some(event) = rx.recv().await else {
-                return Ok(());
-            };
-            let quit = app.on_event(event);
-            app.arm_animator();
-            if quit {
-                return Ok(());
+            match wait(&mut rx, app.next_animation_frame(Instant::now())).await {
+                None => return Ok(()),
+                // A frame is due: only redraw, never housekeeping.
+                Some(Wait::Redraw) => {}
+                Some(Wait::Event(event)) => {
+                    if app.on_event(event) {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -81,4 +102,38 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
     let drafts_result = app.finish();
     ratatui::restore();
     result.and(drafts_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_takes_events_and_frames_never_housekeeping() {
+        let (tx, mut rx) = unbounded_channel();
+        // An event wins over a far-future frame.
+        tx.send(Event::Tick).unwrap();
+        assert!(matches!(
+            wait(&mut rx, Some(Instant::now() + Duration::from_secs(3600))).await,
+            Some(Wait::Event(Event::Tick))
+        ));
+        // A due frame redraws without consuming or producing events.
+        assert!(matches!(
+            wait(&mut rx, Some(Instant::now())).await,
+            Some(Wait::Redraw)
+        ));
+        assert!(rx.try_recv().is_err());
+        // No frame armed: only events can wake the loop.
+        let pending = tokio::time::timeout(Duration::from_secs(10), wait(&mut rx, None)).await;
+        assert!(pending.is_err(), "no deadline, no wake");
+        tx.send(Event::Resize).unwrap();
+        assert!(matches!(
+            wait(&mut rx, None).await,
+            Some(Wait::Event(Event::Resize))
+        ));
+        // The channel closing ends the loop.
+        drop(tx);
+        assert!(wait(&mut rx, None).await.is_none());
+    }
 }

@@ -35,20 +35,34 @@ impl Progress {
     }
 }
 
-/// Unfinished progress: when the newest unfinished event arrived locally.
+/// Unfinished progress: `received` drives the fast window and the freshness
+/// expiry; `clock` is the animation's virtual time (real time while fast, a
+/// fifth of it while slow), so events never reset or freeze the phase.
 struct Fresh {
-    at: Instant,
+    received: Instant,
+    clock: Duration,
+    set: Instant,
 }
 
-/// The animation frame `elapsed` after a fresh event: 100ms frames for the
-/// first FAST, then 500ms frames until the freshness expiry.
-fn frame(elapsed: Duration) -> u8 {
-    let frames = if elapsed < FAST {
-        elapsed.as_millis() / 100
-    } else {
-        30 + (elapsed - FAST).as_millis() / 500
-    };
-    frames as u8
+/// The virtual animation time at `now`.
+fn clock(fresh: &Fresh, now: Instant) -> Duration {
+    let fast_end = fresh.received + FAST;
+    let mut clock = fresh.clock;
+    let mut at = fresh.set;
+    if at < fast_end {
+        let end = now.min(fast_end);
+        clock += end - at;
+        at = end;
+    }
+    if now > fast_end && now > at {
+        clock += (now - fast_end.max(at)) / 5;
+    }
+    clock
+}
+
+/// The displayed frame: one per 100ms of animation time.
+fn frames(fresh: &Fresh, now: Instant) -> u32 {
+    (clock(fresh, now).as_millis() / 100) as u32
 }
 
 #[derive(Default)]
@@ -100,9 +114,18 @@ impl ProgressState {
             }
             None => {
                 // Newer unfinished activity invalidates any earlier
-                // completion; only while fresh does it show progress.
+                // completion; only while fresh does it show progress. The
+                // animation phase carries over, only its speed windows move.
                 self.settled = Progress::Unknown;
-                self.fresh = Some(Fresh { at: now });
+                let clock = self
+                    .fresh
+                    .as_ref()
+                    .map_or(Duration::ZERO, |fresh| clock(fresh, now));
+                self.fresh = Some(Fresh {
+                    received: now,
+                    clock,
+                    set: now,
+                });
             }
         }
     }
@@ -115,9 +138,9 @@ impl ProgressState {
 
     pub fn at(&self, now: Instant) -> Progress {
         if let Some(fresh) = &self.fresh
-            && now.saturating_duration_since(fresh.at) < FRESH
+            && now.saturating_duration_since(fresh.received) < FRESH
         {
-            return Progress::Progressing(frame(now.saturating_duration_since(fresh.at)));
+            return Progress::Progressing(frames(fresh, now) as u8);
         }
         self.settled
     }
@@ -125,16 +148,26 @@ impl ProgressState {
     /// When the displayed frame next changes, while progress is fresh.
     pub fn next_frame_at(&self, now: Instant) -> Option<Instant> {
         let fresh = self.fresh.as_ref()?;
-        let elapsed = now.saturating_duration_since(fresh.at);
+        let elapsed = now.saturating_duration_since(fresh.received);
         if elapsed >= FRESH {
             return None;
         }
-        let next = if elapsed < FAST {
-            Duration::from_millis((elapsed.as_millis() as u64 + 100) / 100 * 100)
-        } else {
-            FAST + Duration::from_millis(((elapsed - FAST).as_millis() as u64 + 500) / 500 * 500)
-        };
-        Some(fresh.at + next.min(FRESH))
+        let at_clock = clock(fresh, now);
+        let mut remaining =
+            Duration::from_millis(100) * ((at_clock.as_millis() / 100) as u32 + 1) - at_clock;
+        let fast_end = fresh.received + FAST;
+        let mut at = now;
+        // Clock time accrues in real time inside the fast window, then at a
+        // fifth of it, so crossing the boundary splits the wait.
+        if at < fast_end {
+            let fast_room = fast_end - at;
+            if fast_room >= remaining {
+                return Some((at + remaining).min(fresh.received + FRESH));
+            }
+            remaining -= fast_room;
+            at = fast_end;
+        }
+        Some((at + remaining * 5).min(fresh.received + FRESH))
     }
 }
 
@@ -215,12 +248,43 @@ mod tests {
         assert_eq!(p.at(now + Duration::from_millis(3500)), Progress::Progressing(31));
         assert_eq!(p.at(now + Duration::from_millis(59999)), Progress::Progressing(143));
         assert_eq!(p.at(now + Duration::from_secs(60)), Progress::Unknown);
-        // Repaints do not move the frame; a new event restarts the fast phase.
-        assert_eq!(p.at(now + Duration::from_millis(100)), Progress::Progressing(1));
-        p.observe(2, &record("text"), now + Duration::from_secs(4));
+    }
+
+    #[test]
+    fn frequent_events_keep_the_phase_moving() {
+        let now = Instant::now();
+        let mut p = ProgressState::default();
+        p.baseline(0, None);
+        // Ten events inside 500ms: the spinner advances with time, not events.
+        for i in 1..=10_u64 {
+            p.observe(
+                i as i64,
+                &record("text"),
+                now + Duration::from_millis(50 * i),
+            );
+        }
+        // The clock starts at the first event (50ms in), so four full frames.
+        assert_eq!(p.at(now + Duration::from_millis(500)), Progress::Progressing(4));
+        // A slow-phase arrival switches speed without a backward jump:
+        // 0.5s..3.5s fast (3000ms) plus 3.5s..10s slow (1300ms) on top of
+        // 450ms = 4750ms, so frame 47 continues.
+        p.observe(11, &record("text"), now + Duration::from_secs(10));
         assert_eq!(
-            p.at(now + Duration::from_secs(4) + Duration::from_millis(100)),
-            Progress::Progressing(1)
+            p.at(now + Duration::from_secs(10)),
+            Progress::Progressing(47)
+        );
+        assert_eq!(
+            p.at(now + Duration::from_secs(10) + Duration::from_millis(100)),
+            Progress::Progressing(48)
+        );
+        assert_eq!(
+            p.at(now + Duration::from_secs(10) + Duration::from_millis(499)),
+            Progress::Progressing(52)
+        );
+        // Freshness follows the newest receipt.
+        assert_eq!(
+            p.at(now + Duration::from_secs(10) + Duration::from_secs(60)),
+            Progress::Unknown
         );
     }
 

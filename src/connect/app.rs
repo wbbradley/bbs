@@ -107,8 +107,6 @@ pub struct App {
     requests: UnboundedSender<Request>,
     drafts: HashMap<String, Composer>,
     pub draft_store: DraftStore,
-    /// Arms the animator with the next frame's deadline; None parks it.
-    pub animator: Option<tokio::sync::watch::Sender<Option<Instant>>>,
 }
 
 impl App {
@@ -120,7 +118,6 @@ impl App {
             requests,
             drafts: HashMap::new(),
             draft_store: DraftStore::default(),
-            animator: None,
         };
         app.push(Box::new(Menu::default()));
         app.push(Box::new(Splash));
@@ -144,22 +141,11 @@ impl App {
         }
     }
 
-    /// Arm the animator with the top screen's next frame change, or park it.
-    pub fn arm_animator(&self) {
-        if let Some(animator) = &self.animator {
-            let next = self
-                .stack
-                .last()
-                .and_then(|screen| screen.next_animation_frame(Instant::now()));
-            animator.send_if_modified(|armed| {
-                if *armed != next {
-                    *armed = next;
-                    true
-                } else {
-                    false
-                }
-            });
-        }
+    /// When the top screen's animation frame next changes, if it animates.
+    pub fn next_animation_frame(&self, now: Instant) -> Option<Instant> {
+        self.stack
+            .last()
+            .and_then(|screen| screen.next_animation_frame(now))
     }
 
     fn pop(&mut self) {
@@ -218,8 +204,6 @@ impl App {
                 self.flush_drafts();
                 false
             }
-            // A repaint is due for an animating screen; no housekeeping.
-            Event::Animate => false,
             Event::Resize => false,
         }
     }
