@@ -139,7 +139,8 @@ and Home/End work everywhere too.
   `Alt-Enter` (or `Ctrl-j`) inserts a newline.
 
 The composer has no border and uses the same themed surface as your outgoing
-messages. It starts with two text rows plus one hint row and grows up to
+messages, with one blank display row above the hint. It starts with two text
+rows plus the blank row and hint row and grows up to
 `composer_max_height_percent` text rows of the window height (default 20), then
 scrolls. One source-to-display layout drives wrapping, height, caret/selection
 painting and visual row navigation. Separator spaces at soft line breaks are

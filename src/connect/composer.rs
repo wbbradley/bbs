@@ -107,12 +107,12 @@ impl Composer {
         )
     }
 
-    /// Two text rows when empty, one hint row, and no border overhead.
+    /// Two text rows when empty, plus a blank separator and the hint row.
     pub fn height(&self, width: u16, max_lines: u16) -> u16 {
         let lines = u16::try_from(self.layout(width).height()).unwrap_or(u16::MAX);
         lines
             .clamp(MIN_LINES, max_lines.max(MIN_LINES))
-            .saturating_add(1)
+            .saturating_add(2)
     }
 
     /// Only movements defined in display rows use the local map. Logical edits,
@@ -227,9 +227,16 @@ impl Composer {
             (None, true) => theme::style(theme::Role::Text),
             (None, false) => theme::style(theme::Role::Muted),
         };
+        frame.render_widget(Block::new().style(surface), area);
+        let gap = area.height.min(1);
+        let input = Rect {
+            y: area.y + gap,
+            height: area.height - gap,
+            ..area
+        };
         let block = Block::new().style(surface).title(title).title_style(hint);
-        self.area = block.inner(area);
-        frame.render_widget(block, area);
+        self.area = block.inner(input);
+        frame.render_widget(block, input);
         let layout = self.layout(self.area.width);
         let caret = layout.point(self.text.cursor());
         let height = usize::from(self.area.height);
@@ -281,6 +288,14 @@ mod tests {
                         .unwrap();
                     let buffer = terminal.backend().buffer();
                     assert_buffer(buffer);
+                    assert!((0..24).all(|x| buffer[(x, 0)].symbol() == " "));
+                    let title: String = (0..24).map(|x| buffer[(x, 1)].symbol()).collect();
+                    assert!(title.contains(if focused { "To Mateo" } else { "Navigation" }));
+                    assert_eq!(composer.area, Rect::new(0, 2, 24, 6));
+                    assert_eq!(
+                        composer.text.lines(),
+                        ["a wrapped input with enough text to fill several lines"]
+                    );
                     assert!(
                         !buffer
                             .content
@@ -409,9 +424,9 @@ mod tests {
         let buffer = draw(&mut c, 4, 4);
         let selected =
             theme::style(theme::Role::HumanSurface).patch(theme::style(theme::Role::Selection));
-        assert_eq!(buffer[(3, 1)].fg, selected.fg.unwrap());
-        assert_eq!(buffer[(3, 1)].bg, selected.bg.unwrap());
-        assert!(buffer[(3, 1)].modifier.contains(selected.add_modifier));
+        assert_eq!(buffer[(3, 2)].fg, selected.fg.unwrap());
+        assert_eq!(buffer[(3, 2)].bg, selected.bg.unwrap());
+        assert!(buffer[(3, 2)].modifier.contains(selected.add_modifier));
         c.text.copy();
         assert_eq!(c.text.yank_text(), "cd  ef");
         // Native yank/undo still operate on exact source, including hidden spaces.
@@ -432,8 +447,8 @@ mod tests {
             assert_eq!(c.text.lines().join("\n"), source);
             assert_eq!(c.text.cursor(), (0, 5));
             let caret = c.layout(width).point(c.text.cursor());
-            assert!(caret.row >= c.top && caret.row < c.top + 3);
-            let cell = &buffer[(caret.col as u16, (caret.row - c.top + 1) as u16)];
+            assert!(caret.row >= c.top && caret.row < c.top + 2);
+            let cell = &buffer[(caret.col as u16, (caret.row - c.top + 2) as u16)];
             let cursor =
                 theme::style(theme::Role::HumanSurface).patch(theme::style(theme::Role::Cursor));
             assert_eq!(cell.fg, cursor.fg.unwrap());
@@ -546,13 +561,23 @@ mod tests {
     #[test]
     fn the_box_grows_with_wrapped_text_up_to_its_limit() {
         let mut c = Composer::new("Mateo");
-        assert_eq!(c.height(22, 4), 3);
-        typed(&mut c, &"x".repeat(60));
-        // Full width is available: three text rows plus the hint.
         assert_eq!(c.height(22, 4), 4);
         typed(&mut c, &"x".repeat(60));
+        // Full width is available: three text rows plus gap and hint.
         assert_eq!(c.height(22, 4), 5);
+        typed(&mut c, &"x".repeat(60));
+        assert_eq!(c.height(22, 4), 6);
+        let cursor = c.text.cursor();
+        let height = c.height(22, 4);
+        draw(&mut c, 22, height);
+        assert_eq!(
+            c.area,
+            Rect::new(0, 2, 22, 4),
+            "gap and hint preserve four input rows"
+        );
+        assert_eq!(c.text.cursor(), cursor);
+        assert!(c.layout(22).point(cursor).row < c.top + 4);
         // A limit under two lines still leaves two.
-        assert_eq!(c.height(22, 1), 3);
+        assert_eq!(c.height(22, 1), 4);
     }
 }

@@ -19,6 +19,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
+- The `bbs connect` textbox has one blank row above its hint, using the same themed surface while keeping the text area and scrolling unchanged (#89).
+
 - The Agents list in `bbs connect` shows last activity as an age with at most two day/hour/minute units (`14m ago`, `3d4h ago`, never `3d4h17m ago`) instead of a full timestamp (#88).
 - The `bbs connect` textbox is borderless, shares the outgoing-message surface, and hides soft-wrap separator spaces while preserving indentation and draft bytes. One layout keeps wrapping, cursor/selection, scrolling and height aligned. Agent Insert mode restores `Ctrl-u` deletion/undo; only `PgUp` enters timeline navigation. Agent conversation titles say “reports to” (#87).
 
