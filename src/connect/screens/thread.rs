@@ -444,25 +444,22 @@ impl Screen for Thread {
         }
     }
 
-    /// Mark read the agent's mail to the viewer, and seen its activity, as far
-    /// as the timeline shows them.
-    fn on_view(&mut self, ctx: &Ctx) -> Vec<Request> {
+    /// An open conversation marks received mail read and activity seen,
+    /// independently of the display filters.
+    fn on_view(&mut self, _ctx: &Ctx) -> Vec<Request> {
         let Some(agent) = &self.agent else {
             return Vec::new();
         };
         let mut requests = Vec::new();
-        let unread = self.messages.iter().any(|m| {
-            m.read_at.is_none()
-                && m.from_name.eq_ignore_ascii_case(agent)
-                && m.to_name.as_deref() == Some(ctx.me.as_str())
-        });
-        if unread && (self.compact || self.show.messages()) {
+        let unread = self
+            .messages
+            .iter()
+            .any(|m| m.read_at.is_none() && self.direct_to_human(m));
+        if unread {
             requests.push(Request::MarkRead(agent.clone()));
         }
         if let Some(newest) = self.stream.as_ref().and_then(Stream::newest)
             && newest > self.seen
-            && !self.compact
-            && self.show.stream()
         {
             self.seen = newest;
             requests.push(Request::MarkSeen {
