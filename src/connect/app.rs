@@ -73,8 +73,10 @@ pub trait Screen {
     fn on_view(&mut self, _ctx: &Ctx) -> Vec<Request> {
         Vec::new()
     }
-    /// Before a reload re-sends `requests`: drop what they will send again.
-    fn reload(&mut self) {}
+    /// Reset before re-fetching; return any obsolete subscriptions to cancel.
+    fn reload(&mut self) -> Vec<Request> {
+        Vec::new()
+    }
     /// What to stop when the screen closes.
     fn on_close(&self) -> Vec<Request> {
         Vec::new()
@@ -223,7 +225,7 @@ impl App {
             }
             Action::Reload => {
                 let mut screen = self.stack.pop().expect("the menu is never popped");
-                screen.reload();
+                self.send(screen.reload());
                 self.fetch(screen.as_ref());
                 self.stack.push(screen);
                 return false;
@@ -821,6 +823,7 @@ mod tests {
         // Reload starts the stream again.
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         key(&mut app, 'r');
+        assert!(matches!(rx.try_recv().unwrap(), Request::Unwatch(_)));
         assert_eq!(watched(&mut rx).0, id);
     }
 
@@ -1031,11 +1034,7 @@ mod tests {
                 .unwrap()
                 .chars()
                 .collect();
-            let cell: String = row[active..active + 11]
-                .iter()
-                .collect::<String>()
-                .trim()
-                .to_string();
+            let cell: String = row[active..active + 11].iter().collect::<String>().trim().to_string();
             assert_eq!(cell, "103d23h ago", "{out}");
             // An unknown active time renders a dash.
             let row: Vec<_> = out
@@ -1145,7 +1144,7 @@ mod tests {
     fn the_composer_sends_to_the_agent_and_empties_on_success() {
         let (mut app, mut rx) = app();
         let id = mateo(&mut app, &mut rx);
-        assert!(screen(&mut app, 80, 24).contains("To Mateo · Enter sends"));
+        assert!(screen(&mut app, 80, 24).contains("Mateo · Enter sends"));
         // Keys are text now: q does not go back.
         for c in "quick".chars() {
             assert!(!key(&mut app, c));
@@ -1155,7 +1154,7 @@ mod tests {
             key(&mut app, c);
         }
         let out = screen(&mut app, 80, 24);
-        assert!(out.contains("To Mateo · Enter sends"), "{out}");
+        assert!(out.contains("Mateo · Enter sends"), "{out}");
         assert!(out.contains("quick") && out.contains("note"), "{out}");
         enter(&mut app);
         let Request::Send { id: sent, req } = rx.try_recv().unwrap() else {
@@ -1188,14 +1187,14 @@ mod tests {
                 .map(|id| message(id, "Zed", "Mateo", &format!("message {id}")))
                 .collect()),
         }));
-        assert!(screen(&mut app, 100, 24).contains("To Mateo · Enter sends"));
+        assert!(screen(&mut app, 100, 24).contains("Mateo · Enter sends"));
         typed(&mut app, "first");
         press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
         typed(&mut app, "second");
         // Up from either line stays in the editor, including at its top.
         for _ in 0..3 {
             press(&mut app, KeyCode::Up, KeyModifiers::NONE);
-            assert!(screen(&mut app, 100, 24).contains("To Mateo · Enter sends"));
+            assert!(screen(&mut app, 100, 24).contains("Mateo · Enter sends"));
         }
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         let out = screen(&mut app, 100, 24);
@@ -1219,7 +1218,7 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         let out = screen(&mut app, 100, 24);
         assert!(
-            out.contains("To Mateo · Enter sends")
+            out.contains("Mateo · Enter sends")
                 && out.contains("first")
                 && out.contains("second"),
             "{out}"
@@ -1242,7 +1241,7 @@ mod tests {
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         let out = screen(&mut app, 100, 24);
         assert!(
-            out.contains("To Mateo · Enter sends")
+            out.contains("Mateo · Enter sends")
                 && out.contains("PgUp scroll")
                 && !out.contains("Navigation"),
             "{out}"
@@ -1659,7 +1658,7 @@ mod tests {
         let rows = |app: &mut App| {
             screen(app, 80, 30)
                 .lines()
-                .skip_while(|l| !l.contains("To Mateo · Enter sends"))
+                .skip_while(|l| !l.contains("Mateo · Enter sends"))
                 .skip(1)
                 .take_while(|l| !l.starts_with(" bbs:7777"))
                 .count()
@@ -1938,8 +1937,12 @@ mod tests {
         // A reload starts both streams over without the activity it had.
         while rx.try_recv().is_ok() {}
         key(&mut app, 'r');
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(act));
         assert_eq!(watched(&mut rx).0, feed);
-        assert!(matches!(rx.try_recv().unwrap(), Request::WatchActivity { id, .. } if id == act));
+        let Request::WatchActivity { id: new_act, .. } = rx.try_recv().unwrap() else {
+            panic!("expected replacement activity watch");
+        };
+        assert_ne!(new_act, act);
         let out = screen(&mut app, 100, 24);
         assert!(
             !out.contains("reply sent") && out.contains("a request"),
@@ -1949,7 +1952,70 @@ mod tests {
         while rx.try_recv().is_ok() {}
         key(&mut app, 'q');
         assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(feed));
-        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(act));
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(new_act));
+    }
+
+    #[test]
+    fn compact_progress_uses_live_ids_and_never_advances_on_ticks_or_repaints() {
+        let (mut app, mut rx) = app();
+        let (_, act) = mateo_streams(&mut app, &mut rx);
+        typed(&mut app, "ab");
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        let hint_cell = |app: &mut App| {
+            screen(app, 100, 24)
+                .lines()
+                .find(|line| line.contains("Mateo · Enter sends"))
+                .unwrap()
+                .chars()
+                .nth(98)
+                .unwrap()
+        };
+        assert_eq!(hint_cell(&mut app), ' ', "verbose has no indicator");
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(hint_cell(&mut app), '?');
+        app.on_event(Event::Data(Data::ActivityBaseline {
+            id: act,
+            through_id: 500,
+        }));
+        let batch = |id, kind| Data::Activity {
+            id: act,
+            result: Ok(vec![activity(
+                id,
+                "01",
+                &format!(r#"{{"event":"{kind}","text":"hidden"}}"#),
+            )]),
+        };
+        app.on_event(Event::Data(batch(500, "turn_end")));
+        assert_eq!(hint_cell(&mut app), '?', "history does not imply done");
+        app.on_event(Event::Data(batch(501, "text")));
+        assert_eq!(hint_cell(&mut app), '⠋');
+        app.on_event(Event::Tick);
+        assert_eq!(hint_cell(&mut app), '⠋');
+        app.on_event(Event::Data(batch(501, "text")));
+        assert_eq!(hint_cell(&mut app), '⠋');
+        app.on_event(Event::Data(batch(502, "tool")));
+        assert_eq!(hint_cell(&mut app), '⠙');
+        app.on_event(Event::Data(batch(503, "turn_end")));
+        assert_eq!(hint_cell(&mut app), '✓');
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(hint_cell(&mut app), ' ');
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(hint_cell(&mut app), '✓');
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Err("disconnected".into()),
+        }));
+        assert_eq!(hint_cell(&mut app), '?');
+        while rx.try_recv().is_ok() {}
+        key(&mut app, 'X');
+        enter(&mut app);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("expected send")
+        };
+        assert_eq!(
+            req.body, "aXb",
+            "activity/toggle keeps editing focus and cursor"
+        );
     }
 
     #[test]
@@ -2124,7 +2190,7 @@ mod tests {
             );
             assert!((1..99).all(|x| buffer[(x, y)].bg == buffer[(98, y)].bg));
             if shaded {
-                for padding in [y - if compact { 1 } else { 2 }, y + 1] {
+                for padding in [y - 2, y + 1] {
                     assert!((1..99).all(|x| {
                         buffer[(x, padding)].bg
                             == theme::style(if compact && padding < y {
@@ -2136,6 +2202,11 @@ mod tests {
                             .unwrap()
                             && buffer[(x, padding)].symbol() == " "
                     }));
+                }
+                if compact {
+                    assert!((1..99).all(|x| buffer[(x, y - 1)].bg
+                        == theme::style(theme::Role::HumanSurface).bg.unwrap()
+                        && buffer[(x, y - 1)].symbol() == " "));
                 }
             }
         };
@@ -2224,7 +2295,7 @@ mod tests {
         assert!(
             out.contains("Cannot save view preference")
                 && out.contains("draft")
-                && out.contains("To Mateo · Enter sends"),
+                && out.contains("Mateo · Enter sends"),
             "{out}"
         );
         assert!(!app.ctx.preferences.compact());
@@ -2307,10 +2378,10 @@ mod tests {
         press(&mut app, KeyCode::Left, KeyModifiers::NONE);
         press(&mut app, KeyCode::Left, KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(screen(&mut app, 120, 24).contains("To Mateo · Enter sends"));
+        assert!(screen(&mut app, 120, 24).contains("Mateo · Enter sends"));
         typed(&mut app, "X");
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(screen(&mut app, 120, 24).contains("To Mateo · Enter sends"));
+        assert!(screen(&mut app, 120, 24).contains("Mateo · Enter sends"));
         typed(&mut app, "Y");
         enter(&mut app);
         let Request::Send { req, .. } = rx.try_recv().unwrap() else {
@@ -2543,7 +2614,13 @@ mod tests {
             )]),
         }));
         assert!(!screen(&mut app, 100, 24).contains("later thought"));
+        while rx.try_recv().is_ok() {}
         key(&mut app, 'r');
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(act));
+        watched(&mut rx);
+        let Request::WatchActivity { id: act, .. } = rx.try_recv().unwrap() else {
+            panic!("expected replacement activity watch");
+        };
         assert!(screen(&mut app, 100, 24).contains("E: problems"));
         // Showing activity alone, nothing of the chosen kinds says so.
         key(&mut app, 'A');

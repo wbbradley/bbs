@@ -225,13 +225,23 @@ impl Composer {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool, agent: bool) {
+        self.render_with_indicator(frame, area, focused, agent, None);
+    }
+
+    pub fn render_with_indicator(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        focused: bool,
+        agent: bool,
+        indicator: Option<Span<'static>>,
+    ) {
         let target = || Span::styled(self.to.as_str(), theme::style(theme::Role::Target));
         let keys = |text| Span::styled(text, theme::style(theme::Role::KeyHint));
         let title = match (&self.error, self.sending.is_some(), focused) {
             (Some(e), ..) => Line::from(format!(" Not sent: {e} ")),
             (None, true, _) => Line::from(" Sending… "),
             (None, false, true) => Line::from(vec![
-                Span::raw(" To "),
                 target(),
                 keys(if agent {
                     " · Enter sends · PgUp scroll · Esc back "
@@ -262,9 +272,28 @@ impl Composer {
             height: area.height - gap,
             ..area
         };
-        let block = Block::new().style(surface).title(title).title_style(hint);
+        let block = Block::new().style(surface).title(Line::default());
         self.area = block.inner(input);
         frame.render_widget(block, input);
+        if input.height > 0 {
+            let reserved = if indicator.is_some() {
+                input.width.min(2)
+            } else {
+                0
+            };
+            frame.render_widget(
+                Paragraph::new(title.style(hint)).style(surface),
+                Rect::new(input.x, input.y, input.width - reserved, 1),
+            );
+            if let Some(indicator) = indicator
+                && input.width > 0
+            {
+                frame.render_widget(
+                    Paragraph::new(indicator).style(surface),
+                    Rect::new(input.right() - 1, input.y, 1, 1),
+                );
+            }
+        }
         let layout = self.layout(self.area.width);
         let caret = layout.point(self.text.cursor());
         let height = usize::from(self.area.height);
@@ -319,6 +348,54 @@ mod tests {
     }
 
     #[test]
+    fn indicator_reserves_its_cell_without_changing_input_geometry_or_source() {
+        use crate::connect::progress::Progress;
+        use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
+        use ratatui::{Terminal, backend::TestBackend};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                for width in [1, 2, 8, 80] {
+                    for state in [Progress::Unknown, Progress::Done, Progress::Progressing(7)] {
+                        let mut composer = Composer::new("a-long-target-👩‍💻-that-will-be-clipped");
+                        typed(&mut composer, "draft");
+                        let cursor = composer.text.cursor();
+                        let mut terminal = Terminal::new(TestBackend::new(width, 6)).unwrap();
+                        terminal
+                            .draw(|frame| {
+                                frame
+                                    .render_widget(Block::new().style(theme::base()), frame.area());
+                                composer.render_with_indicator(
+                                    frame,
+                                    frame.area(),
+                                    true,
+                                    true,
+                                    Some(state.indicator()),
+                                );
+                            })
+                            .unwrap();
+                        let buffer = terminal.backend().buffer();
+                        assert_buffer(buffer);
+                        assert_eq!(buffer[(width - 1, 1)].symbol(), state.indicator().content);
+                        if width > 1 {
+                            assert_eq!(buffer[(width - 2, 1)].symbol(), " ");
+                        }
+                        assert_eq!(
+                            buffer[(width - 1, 1)].bg,
+                            theme::base()
+                                .patch(theme::style(theme::Role::HumanSurface))
+                                .bg
+                                .unwrap()
+                        );
+                        assert_eq!(composer.area, Rect::new(0, 2, width, 4));
+                        assert_eq!(composer.text.lines(), ["draft"]);
+                        assert_eq!(composer.text.cursor(), cursor);
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
     fn spacer_uses_screen_surface_while_input_uses_human_surface() {
         use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
         use ratatui::{Terminal, backend::TestBackend};
@@ -346,7 +423,7 @@ mod tests {
                         assert_eq!(buffer[(x, 0)].bg, screen.bg.unwrap());
                     }
                     let title: String = (0..24).map(|x| buffer[(x, 1)].symbol()).collect();
-                    assert!(title.contains(if focused { "To Mateo" } else { "Navigation" }));
+                    assert!(title.contains(if focused { "Mateo" } else { "Navigation" }));
                     assert_eq!(composer.area, Rect::new(0, 2, 24, 6));
                     assert_eq!(
                         composer.text.lines(),
@@ -426,15 +503,9 @@ mod tests {
                         assert_eq!(buffer[(keys_x, 1)].bg, keys.bg.unwrap());
                         assert!(buffer[(keys_x, 1)].modifier.contains(Modifier::ITALIC));
                         if focused {
-                            let prefix = title.find("To ").unwrap() as u16;
-                            assert_eq!(
-                                buffer[(prefix, 1)].fg,
-                                theme::style(theme::Role::Text)
-                                    .fg
-                                    .or(theme::base().fg)
-                                    .unwrap()
-                            );
-                            assert!(!buffer[(prefix, 1)].modifier.contains(Modifier::ITALIC));
+                            assert!(title.starts_with(to), "{title}");
+                            assert_eq!(target_x, 0);
+                            assert!(!title.contains("To "));
                         }
                     }
                 }

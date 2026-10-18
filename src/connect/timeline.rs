@@ -2,6 +2,7 @@
 //! shares, drawn as `bbs headless logs --pretty` draws it, in time order.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use chrono::DateTime;
 use ratatui::style::Style;
@@ -9,6 +10,7 @@ use ratatui::text::Line;
 
 use super::app::next_id;
 use super::event::{Data, Request};
+use super::progress::{Progress, ProgressState};
 use super::theme;
 use crate::backend::AGENT_ACTIVITY;
 use crate::proto::{self, Message};
@@ -71,6 +73,9 @@ impl Row for Entry {
                     message_lines(message, gap, query)
                 };
                 if *outgoing {
+                    if *compact {
+                        lines.insert(1 + usize::from(gap || *raw_gap), Line::default());
+                    }
                     for line in &mut lines {
                         line.style = theme::style(theme::Role::HumanSurface).patch(line.style);
                     }
@@ -202,6 +207,7 @@ pub struct Stream {
     pub loaded: bool,
     /// The stream's last error; it has ended until a reload.
     pub error: Option<String>,
+    progress: ProgressState,
 }
 
 impl Stream {
@@ -214,6 +220,7 @@ impl Stream {
             renderer: Activity::new(true).local_time(),
             loaded: false,
             error: None,
+            progress: ProgressState::default(),
         }
     }
 
@@ -236,10 +243,13 @@ impl Stream {
     /// Start over, as a reload does.
     pub fn reset(&mut self) {
         *self = Stream {
-            id: self.id,
             kinds: self.kinds,
             ..Stream::new(&self.agent)
         };
+    }
+
+    pub fn progress(&self, now: Instant) -> Progress {
+        self.progress.at(now)
     }
 
     /// The newest record received.
@@ -280,6 +290,15 @@ impl Stream {
 
     /// Take a batch of this stream's data; returns the new entries.
     pub fn on_data(&mut self, data: &Data) -> Vec<Entry> {
+        self.on_data_at(data, Instant::now())
+    }
+
+    fn on_data_at(&mut self, data: &Data, now: Instant) -> Vec<Entry> {
+        if let Data::ActivityBaseline { id, through_id } = data
+            && *id == self.id
+        {
+            self.progress.baseline(*through_id);
+        }
         let Data::Activity { id, result } = data else {
             return Vec::new();
         };
@@ -288,6 +307,9 @@ impl Stream {
         }
         match result {
             Ok(events) => {
+                for event in events {
+                    self.progress.observe(event.id, &event.record, now);
+                }
                 self.loaded = true;
                 self.error = None;
                 let entries = events.iter().filter_map(|e| self.entry(e)).collect();
@@ -297,12 +319,14 @@ impl Stream {
                 entries
             }
             Err(e) if e.contains(AGENT_ACTIVITY) => {
+                self.progress.disconnect();
                 self.error = Some(format!(
                     "Activity needs a newer server ({AGENT_ACTIVITY}). Ask its operator to upgrade."
                 ));
                 Vec::new()
             }
             Err(e) => {
+                self.progress.disconnect();
                 self.error = Some(e.clone());
                 Vec::new()
             }
@@ -314,7 +338,71 @@ impl Stream {
 mod tests {
     use super::*;
     use crate::ui::thread::ThreadView;
-    use ratatui::{Terminal, backend::TestBackend, style::Modifier, widgets::Block};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        style::Modifier,
+        widgets::{Block, Paragraph, Wrap},
+    };
+
+    #[test]
+    fn progress_tracks_only_new_current_subscription_events_regardless_of_filters() {
+        use std::time::Duration;
+        let now = Instant::now();
+        let mut stream = Stream::new("Mateo");
+        let id = stream.id;
+        let batch = |id, event_id, event: &str| Data::Activity {
+            id,
+            result: Ok(vec![proto::Activity {
+                id: event_id,
+                record: format!(r#"{{"event":"{event}","text":"hidden"}}"#),
+                ..Default::default()
+            }]),
+        };
+        stream.on_data_at(
+            &Data::ActivityBaseline {
+                id,
+                through_id: 500,
+            },
+            now,
+        );
+        stream.on_data_at(&batch(id, 500, "text"), now);
+        assert_eq!(stream.progress(now), Progress::Unknown);
+        stream.kinds = Kinds::Problems;
+        assert!(stream.on_data_at(&batch(id, 501, "text"), now).is_empty());
+        assert_eq!(stream.progress(now), Progress::Progressing(0));
+        stream.entries();
+        stream.on_data_at(&batch(id, 501, "text"), now + Duration::from_secs(59));
+        assert_eq!(
+            stream.progress(now + Duration::from_secs(60)),
+            Progress::Unknown
+        );
+        stream.on_data_at(&batch(id, 502, "turn_end"), now);
+        assert_eq!(stream.progress(now), Progress::Done);
+        stream.reset();
+        assert_ne!(stream.id, id);
+        stream.on_data_at(&Data::ActivityBaseline { id, through_id: 0 }, now);
+        stream.on_data_at(&batch(id, 503, "text"), now);
+        assert_eq!(stream.progress(now), Progress::Unknown);
+        let id = stream.id;
+        stream.on_data_at(
+            &Data::ActivityBaseline {
+                id,
+                through_id: 503,
+            },
+            now,
+        );
+        stream.on_data_at(&batch(id, 504, "text"), now);
+        assert_eq!(stream.progress(now), Progress::Progressing(0));
+        stream.on_data_at(
+            &Data::Activity {
+                id,
+                result: Err("disconnected".into()),
+            },
+            now,
+        );
+        assert_eq!(stream.progress(now), Progress::Unknown);
+    }
 
     #[test]
     fn outgoing_background_covers_padding_wrapping_and_scrolled_rows() {
@@ -345,11 +433,12 @@ mod tests {
                     compact,
                     gap: false,
                 };
-                let outgoing = make(
-                    2,
-                    true,
-                    "**needle** followed by enough words to wrap across several full rendered rows.\n\n`code` and [link](https://example.com)",
-                );
+                let body = "**needle** followed by enough words to wrap across several full rendered rows.\n\n`code` and [link](https://example.com)";
+                let outgoing = make(2, true, body);
+                let incoming = make(2, false, body);
+                let incoming_height = Paragraph::new(incoming.lines(false, None))
+                    .wrap(Wrap { trim: false })
+                    .line_count(width);
                 let raw_lines = outgoing.lines(false, None).len();
                 let mut view = ThreadView::new(
                     vec![make(1, false, "before"), outgoing, make(3, false, "after")],
@@ -366,6 +455,13 @@ mod tests {
                 let start = view.frame.starts[1] as u16;
                 let end = view.frame.starts[2] as u16;
                 assert!(usize::from(end - start) > raw_lines, "body must wrap");
+                if compact {
+                    assert_eq!(
+                        usize::from(end - start),
+                        incoming_height + 2,
+                        "compact outgoing adds one light row above and below the body"
+                    );
+                }
                 let buffer = terminal.backend().buffer();
                 for y in 0..60 {
                     for x in 0..width {
@@ -389,6 +485,13 @@ mod tests {
                 }
                 for y in [start, end - 1] {
                     assert!((0..width).all(|x| buffer[(x, y)].symbol() == " "));
+                }
+                if compact {
+                    assert!((0..width).all(|x| buffer[(x, start + 1)].symbol() == " "));
+                    let first_body: String = (0..width)
+                        .map(|x| buffer[(x, start + 2)].symbol())
+                        .collect();
+                    assert!(first_body.contains("needle"));
                 }
                 if !compact {
                     assert_eq!(
@@ -420,6 +523,19 @@ mod tests {
                     } else {
                         human.bg.unwrap()
                     }));
+                if compact {
+                    view.scroll_to(usize::from(start) + 1);
+                    terminal
+                        .draw(|frame| {
+                            frame.render_widget(Block::new().style(theme::base()), frame.area());
+                            view.render(frame, frame.area());
+                        })
+                        .unwrap();
+                    assert!((0..width).all(|x| {
+                        let cell = &terminal.backend().buffer()[(x, 0)];
+                        cell.symbol() == " " && cell.bg == human.bg.unwrap()
+                    }));
+                }
                 view.scroll_to(usize::from(start) + 2);
                 terminal
                     .draw(|frame| {

@@ -4,6 +4,7 @@
 //! group threads the admin dialogs.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -356,13 +357,16 @@ impl Screen for Thread {
         requests
     }
 
-    fn reload(&mut self) {
+    fn reload(&mut self) -> Vec<Request> {
         // The stream starts over from its oldest record.
         if let Some(stream) = &mut self.stream {
+            let cancel = stream.unwatch();
             stream.reset();
             self.seen = 0;
             self.rebuild();
+            return vec![cancel];
         }
+        Vec::new()
     }
 
     fn on_close(&self) -> Vec<Request> {
@@ -568,7 +572,22 @@ impl Thread {
         ])
         .areas(inner);
         if let Some(c) = &mut self.composer {
-            c.render(frame, composer, self.composing, self.agent.is_some());
+            let indicator = self
+                .stream
+                .as_ref()
+                .filter(|_| self.compact)
+                .map(|stream| stream.progress(Instant::now()).indicator());
+            if indicator.is_some() {
+                c.render_with_indicator(
+                    frame,
+                    composer,
+                    self.composing,
+                    self.agent.is_some(),
+                    indicator,
+                );
+            } else {
+                c.render(frame, composer, self.composing, self.agent.is_some());
+            }
         }
         if let Some(error) = &self.error {
             let text = vec![

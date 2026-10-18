@@ -13,6 +13,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 - Agent and group drafts in `bbs connect` save locally and restore their text and cursor when an existing discussion is reopened in a later session.
 
+- Compact agent conversation hints show event-driven activity progress, explicit turn completion, or unknown after a disconnect, turn error or 60 seconds without new activity; history replay does not animate it.
+
 - The main menu in `bbs connect` has a Config page that applies color schemes immediately and saves the choice locally for later launches.
 
 - Agent conversations in `bbs connect` use `Ctrl-t` to toggle a compact view of the agent's direct messages to you, with timestamp-only headers and preserved draft, cursor and verbose filter choices (#82).
@@ -26,6 +28,8 @@ request that bumps the package version; correct the date if publishing slips.
 ### Changed
 
 - `bbs connect` screens no longer draw an outer double-line border; each screen's heading sits above its content, and the bottom status bar's style fills the whole line like a traditional status bar. Dialogs keep their boundaries.
+
+- Focused composer hints start with the target name, and compact outgoing messages keep light blank padding between the dark separator and body.
 
 - Compact agent conversations omit message headers and timestamps, with a dark separator above outgoing messages. Composer targets use a semantic orange color and key hints use a distinct italic style.
 
