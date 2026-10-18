@@ -3,64 +3,64 @@
 Notable changes to `bbs`, based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are the package versions published as [GitHub releases](https://github.com/wbbradley/bbs/releases).
 
-Every pull request with a user-visible change adds a line under **Unreleased**. A
-release renames that section to the new version and planned date in the same pull
-request that bumps the package version; correct the date if publishing slips.
+Add user-visible changes under **Unreleased**. At release time, consolidate them
+under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.8.0 - 2026-10-18
+
+Protocol v2, database schema 14, config format 3 and Rust 1.89 remain unchanged.
+Existing configs need no migration. Older binaries reject the new optional
+`mcp_env` harness setting; process mode requires 0.8+ config readers, so remove
+that key before downgrading. Local UI preferences and drafts live separately
+from credentials. Agent listings and live summaries add
+optional last-sent timestamps; upgrade the server to enable the live ACTIVE
+last-sent ages. Old servers omit them and clients show a dash. Summary snapshots
+now include every live agent, including agents with zero
+unread messages and unseen activity; consumers needing unread-only results must
+filter those counts.
+
 ### Added
 
-- ACP harnesses can opt into `mcp_env = "process"` for Claude's ACP adapter, keeping BBS credentials out of serialized MCP configuration and command-line arguments.
-
-- Agent and group drafts in `bbs connect` save locally and restore their text and cursor when an existing discussion is reopened in a later session.
-
-- Compact agent conversation hints show event-driven activity progress, explicit turn completion, or unknown after a disconnect, turn error or 60 seconds without new activity; history replay does not animate it.
-
-- The main menu in `bbs connect` has a Config page that applies color schemes immediately and saves the choice locally for later launches.
-
-- Agent conversations in `bbs connect` use `Ctrl-t` to toggle a compact view of the agent's direct messages to you, with timestamp-only headers and preserved draft, cursor and verbose filter choices (#82).
-
-### Fixed
-
-- The blank row above the `bbs connect` textbox hint uses the conversation background; the hint and input keep the outgoing-message surface.
-
-- Tool activity in `bbs connect` and `bbs headless logs --pretty` keeps its title and duration across partial updates, and uses titles supplied by later updates (#80).
+- Agent and group drafts save locally by board, human and conversation, restoring
+  text and cursor across `bbs connect` launches.
+- Shared Gruvbox, terminal-palette and no-color themes for terminal views, with
+  `--theme`, `BBS_THEME`, `NO_COLOR` and a live Config page. Connect saves its theme
+  locally; Gruvbox uses quiet title/status bars and muted BBS art.
+- Compact agent conversations show animated progress for recent unfinished work,
+  a check for a recorded turn end, or a middle dot for unknown. Completed turns
+  survive reopening and disconnection until newer activity replaces them.
+- ACP harnesses can opt into `mcp_env = "process"` for Claude's ACP adapter.
+  BBS credentials stay out of serialized MCP configuration and command arguments;
+  incompatible credential scrubbing is rejected before agent registration.
 
 ### Changed
 
-- Gruvbox title/status bars use a quieter warm surface and the BBS art uses muted text. Compact progress glyphs match the status bar colors and modifiers in every theme, including error feedback.
+- Agent conversations default to compact direct messages in both directions,
+  without headers or timestamps. `Ctrl-t` switches to verbose activity and mail,
+  retaining filters, draft and cursor; the global choice is remembered locally.
+  Outgoing messages use a lighter surface with padding.
+- Agent conversations open in Insert mode. `PgUp` enters timeline navigation;
+  `Esc` returns to Insert, then closes the conversation. `Ctrl-u` deletes back to
+  the line start or joins at column zero; undo is `Ctrl-_` or `Ctrl-/`.
+- Borderless textboxes hide soft-wrap separator spaces while preserving explicit
+  indentation, Unicode graphemes, selection, undo and sent bytes. Light top
+  padding scrolls away as text fills the editor and cannot hold the cursor.
+- Open agent conversations mark received mail read and all received activity seen,
+  including activity hidden by compact view or filters.
+- The Agents list separates OWNER, INBOX and ACTIVITY columns. ACTIVE shows the
+  age of the agent's last sent message or activity, updated live.
+- Conversations show their title once as “{agent} conversation”. Following/paused,
+  arrivals, search, send feedback and progress use the full-width bottom bar;
+  redundant count and composer-hint rows are removed. Shortcuts remain in Help.
 
-- Conversation textboxes start with light top padding that scrolls out of view as text fills the editor, without adding draft text or a cursor position.
+### Fixed
 
-- Conversation composers omit their title/key-hint row, returning that row to the timeline. Compact agent progress moves to the bottom bar; send feedback stays visible there. Agent titles use “{agent} conversation”.
-
-- The compact conversation progress glyph in `bbs connect` trusts recorded history: a stored turn end shows the check from the moment the conversation opens and persists until a later event, surviving freshness expiry and lost connections. Only unfinished activity carries the 60-second freshness timeout, and newer unfinished activity replaces a recorded completion permanently rather than falling back to it. The spinner now animates on a timer — every 100ms for 3 seconds after an event arrives, then every 500ms — instead of only advancing per event.
-
-- Agent conversations show their title once and move following/paused, new-arrival, filter/search and error feedback into the bottom bar, without an entry-count row. Bottom bars no longer include a baud rate.
-
-- `bbs connect` screens no longer draw an outer double-line border; each screen's heading sits above its content, and the bottom status bar's style fills the whole line like a traditional status bar. Dialogs keep their boundaries.
-
-- Focused composer hints start with the target name, and compact outgoing messages keep light blank padding between the dark separator and body.
-
-- Compact agent conversations omit message headers and timestamps, with a dark separator above outgoing messages. Composer targets use a semantic orange color and key hints use a distinct italic style.
-
-- The `bbs connect` textbox has one blank row above its hint, using the same themed surface while keeping the text area and scrolling unchanged (#89).
-
-- The Agents list in `bbs connect` shows how long ago each agent last sent a message or posted an activity event, as an age with at most two day/hour/minute units (`14m ago`, `3d4h ago`, never `3d4h17m ago`), instead of a full timestamp (#88). The age updates live over the summary stream, and an agent with no known sent event shows `-`.
-
-- The `bbs connect` textbox is borderless, shares the outgoing-message surface, and hides soft-wrap separator spaces while preserving indentation and draft bytes. One layout keeps wrapping, cursor/selection, scrolling and height aligned. Agent Insert mode restores `Ctrl-u` deletion/undo; only `PgUp` enters timeline navigation. Agent conversation titles say “reports to” (#87).
-
-- Terminal views use shared semantic color schemes with Gruvbox dark medium by default. Select `terminal` or `no-color` with `--theme` or `BBS_THEME`; outgoing messages and input share a lighter surface, and Markdown, activity, dialogs, and the logo follow the selected scheme (#86).
-
-- The Agents list in `bbs connect` shows each agent's owner in a separate OWNER column instead of `name@owner` (#85).
-
-- Open agent conversations in `bbs connect` mark received mail read and activity seen in both views regardless of display filters. The Agents list separates unread inbox messages from unseen activity into INBOX and ACTIVITY columns (#84).
-
-- Agent conversations in `bbs connect` default to a compact view of direct messages in both directions and remember the global `Ctrl-t` choice locally across launches. Your outgoing messages have a lighter background with blank padding in compact and verbose views (#83).
-
-- In the `bbs connect` composer, `Ctrl-u` deletes back to the start of the line, as in readline; undo moves to `Ctrl-_` (or `Ctrl-/`) (#78).
-- Agent conversations in `bbs connect` open in Insert mode and retain each agent's draft and cursor when closed. `Ctrl-u`/`PgUp` enters navigation; `Esc` returns to Insert mode, then closes the conversation (#81).
+- Tool activity retains its title and duration across partial updates and accepts
+  titles supplied by later updates in `connect` and pretty headless logs.
+- Process-environment ACP tools retain the intended local or remote board even
+  when the adapter's child has different configuration.
 
 ## 0.7.1 - 2026-10-16
 

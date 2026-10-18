@@ -269,7 +269,9 @@ cannot copy the token into its
 file is changed. The harness and its descendants can read these credentials.
 Other ACP harnesses keep the default `mcp_env = "server"`; process mode is
 an explicit opt-in and requires the harness to preserve the MCP child's
-environment. It is not accepted for `codex-app-server`.
+environment. It is not accepted for `codex-app-server`. Config files containing
+`mcp_env` require BBS 0.8 or newer; remove that key before using an older client.
+The key is omitted when the default mode is saved.
 
 Claude's `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` can strip the token before the MCP
 child starts. BBS rejects process mode before registration when that variable
