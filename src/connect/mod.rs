@@ -74,6 +74,7 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
         started: Instant::now(),
         composer_max_height_percent: opener.config.composer_max_height_percent(),
         preferences,
+        now: std::sync::Arc::new(Instant::now),
     };
     let (events, mut rx) = unbounded_channel();
     let (requests, requests_rx) = unbounded_channel();
@@ -86,7 +87,7 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
     let result = async {
         loop {
             terminal.draw(|frame| app.draw(frame))?;
-            match wait(&mut rx, app.next_animation_frame(Instant::now())).await {
+            match wait(&mut rx, app.next_animation_frame()).await {
                 None => return Ok(()),
                 // A frame is due: only redraw, never housekeeping.
                 Some(Wait::Redraw) => {}
@@ -112,17 +113,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn wait_takes_events_and_frames_never_housekeeping() {
         let (tx, mut rx) = unbounded_channel();
+        // Deadlines ride the same paused tokio clock as the sleep.
+        let now = tokio::time::Instant::now().into_std();
         // An event wins over a far-future frame.
         tx.send(Event::Tick).unwrap();
         assert!(matches!(
-            wait(&mut rx, Some(Instant::now() + Duration::from_secs(3600))).await,
+            wait(&mut rx, Some(now + Duration::from_secs(3600))).await,
             Some(Wait::Event(Event::Tick))
         ));
         // A due frame redraws without consuming or producing events.
-        assert!(matches!(
-            wait(&mut rx, Some(Instant::now())).await,
-            Some(Wait::Redraw)
-        ));
+        assert!(matches!(wait(&mut rx, Some(now)).await, Some(Wait::Redraw)));
         assert!(rx.try_recv().is_err());
         // No frame armed: only events can wake the loop.
         let pending = tokio::time::timeout(Duration::from_secs(10), wait(&mut rx, None)).await;

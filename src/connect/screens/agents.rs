@@ -179,6 +179,7 @@ impl Screen for Agents {
                         a.owner.as_deref(),
                         &ctx.me,
                         ctx.preferences.compact(),
+                        ctx.now.clone(),
                     ))),
                     None => Transition::Stay,
                 }

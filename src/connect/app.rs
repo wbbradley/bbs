@@ -35,6 +35,8 @@ pub struct Ctx {
     /// `[connect] composer_max_height_percent`.
     pub composer_max_height_percent: u8,
     pub preferences: Preferences,
+    /// The clock for activity freshness and animation; tests pin it.
+    pub now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
 }
 
 pub enum Transition {
@@ -82,7 +84,7 @@ pub trait Screen {
         Vec::new()
     }
     /// When the screen's animation frame next changes, if it animates.
-    fn next_animation_frame(&self, _now: Instant) -> Option<Instant> {
+    fn next_animation_frame(&self) -> Option<Instant> {
         None
     }
     /// Move a discussion's composer between its screen and the session's drafts.
@@ -142,10 +144,8 @@ impl App {
     }
 
     /// When the top screen's animation frame next changes, if it animates.
-    pub fn next_animation_frame(&self, now: Instant) -> Option<Instant> {
-        self.stack
-            .last()
-            .and_then(|screen| screen.next_animation_frame(now))
+    pub fn next_animation_frame(&self) -> Option<Instant> {
+        self.stack.last().and_then(|screen| screen.next_animation_frame())
     }
 
     fn pop(&mut self) {
@@ -302,6 +302,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use crate::connect::event::Admin;
     use crate::proto;
     use ratatui::Terminal;
@@ -464,6 +465,7 @@ mod tests {
             started: Instant::now(),
             composer_max_height_percent: 20,
             preferences: Preferences::default(),
+            now: std::sync::Arc::new(Instant::now),
         };
         // Most interaction tests exercise an explicitly chosen verbose view.
         ctx.preferences.set_compact(false);
@@ -500,6 +502,40 @@ mod tests {
         out.lines().any(|l| l.trim_end() == text)
     }
 
+    /// A pinned clock a test advances; the app's clock function reads it.
+    #[derive(Clone)]
+    struct TestClock {
+        base: Instant,
+        millis: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    fn test_clock() -> (
+        TestClock,
+        std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) {
+        let clock = TestClock {
+            base: Instant::now(),
+            millis: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let read = clock.clone();
+        let now = std::sync::Arc::new(move || {
+            read.base
+                + Duration::from_millis(read.millis.load(std::sync::atomic::Ordering::Relaxed))
+        });
+        (clock, now as std::sync::Arc<dyn Fn() -> Instant + Send + Sync>)
+    }
+
+    impl TestClock {
+        fn now(&self) -> Instant {
+            self.base
+                + Duration::from_millis(self.millis.load(std::sync::atomic::Ordering::Relaxed))
+        }
+        fn advance(&self, by: Duration) {
+            self.millis
+                .fetch_add(by.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn agent(name: &str, owner: &str, groups: &[&str]) -> proto::Agent {
         proto::Agent {
             name: name.into(),
@@ -521,6 +557,7 @@ mod tests {
             started: Instant::now(),
             composer_max_height_percent: 20,
             preferences: Preferences::default(),
+            now: std::sync::Arc::new(Instant::now),
         };
         let mut app = App::new(ctx, tx);
         let out = screen(&mut app, 80, 24);
@@ -543,6 +580,7 @@ mod tests {
             started: Instant::now(),
             composer_max_height_percent: 20,
             preferences: Preferences::default(),
+            now: std::sync::Arc::new(Instant::now),
         };
         let mut app = App::new(ctx, tx);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -1134,34 +1172,34 @@ mod tests {
     #[test]
     fn animation_arms_only_while_progress_is_fresh() {
         let (mut app, mut rx) = app();
+        // A pinned clock shared with the thread makes the deadline exact.
+        let (clock, now_fn) = test_clock();
+        app.ctx.now = now_fn;
         let (_, act) = mateo_streams(&mut app, &mut rx);
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        let next = |app: &App| {
-            app.stack
-                .last()
-                .unwrap()
-                .next_animation_frame(Instant::now())
-        };
         app.on_event(Event::Data(Data::ActivityBaseline {
             id: act,
             through_id: 0,
             record: None,
         }));
-        assert!(next(&app).is_none(), "nothing fresh yet");
+        assert_eq!(app.next_animation_frame(), None, "nothing fresh yet");
         app.on_event(Event::Data(Data::Activity {
             id: act,
             result: Ok(vec![activity(1, "01", r#"{"event":"text"}"#)]),
         }));
-        let Some(deadline) = next(&app) else {
-            panic!("fresh progress animates");
-        };
-        let now = Instant::now();
-        assert!(deadline > now && deadline <= now + std::time::Duration::from_millis(100));
+        assert_eq!(
+            app.next_animation_frame(),
+            Some(clock.now() + Duration::from_millis(100))
+        );
         app.on_event(Event::Data(Data::Activity {
             id: act,
             result: Ok(vec![activity(2, "01", r#"{"event":"turn_end"}"#)]),
         }));
-        assert!(next(&app).is_none(), "recorded completion does not animate");
+        assert_eq!(
+            app.next_animation_frame(),
+            None,
+            "recorded completion does not animate"
+        );
     }
 
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -2035,6 +2073,9 @@ mod tests {
     #[test]
     fn compact_progress_uses_live_ids_and_never_advances_on_ticks_or_repaints() {
         let (mut app, mut rx) = app();
+        // Pin the clock before the thread opens so frames are deterministic.
+        let (clock, now_fn) = test_clock();
+        app.ctx.now = now_fn;
         let (_, act) = mateo_streams(&mut app, &mut rx);
         typed(&mut app, "ab");
         press(&mut app, KeyCode::Left, KeyModifiers::NONE);
@@ -2087,6 +2128,9 @@ mod tests {
         assert_eq!(hint_cell(&mut app), '⠋');
         app.on_event(Event::Data(batch(502, "tool")));
         assert_eq!(hint_cell(&mut app), '⠋', "frames are time-derived, not per event");
+        // Time advances the frame: 250ms in, the third frame shows.
+        clock.advance(Duration::from_millis(250));
+        assert_eq!(hint_cell(&mut app), '⠹', "frames follow the clock");
         app.on_event(Event::Data(batch(503, "turn_end")));
         assert_eq!(hint_cell(&mut app), '✓');
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);

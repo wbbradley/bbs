@@ -57,6 +57,8 @@ pub struct Thread {
     stream: Option<Stream>,
     /// The newest activity marked seen.
     seen: i64,
+    /// The clock for activity freshness and animation; the app's, or a test's.
+    now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
 }
 
 impl Thread {
@@ -83,11 +85,18 @@ impl Thread {
             draft_key: None,
             stream: None,
             seen: 0,
+            now: std::sync::Arc::new(Instant::now),
         }
     }
 
     /// What `agent` sent and what was sent to it directly.
-    pub fn agent(agent: &str, owner: Option<&str>, human: &str, compact: bool) -> Thread {
+    pub fn agent(
+        agent: &str,
+        owner: Option<&str>,
+        human: &str,
+        compact: bool,
+        now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Thread {
         let title = match owner {
             Some(owner) => format!("{agent}, reports to {owner}"),
             None => agent.to_string(),
@@ -103,6 +112,7 @@ impl Thread {
         thread.human = Some(human.to_string());
         thread.compact = compact;
         thread.stream = Some(Stream::new(agent));
+        thread.now = now;
         thread
     }
 
@@ -375,10 +385,10 @@ impl Screen for Thread {
         requests
     }
 
-    fn next_animation_frame(&self, now: Instant) -> Option<Instant> {
+    fn next_animation_frame(&self) -> Option<Instant> {
         let stream = self.stream.as_ref()?;
         if self.compact {
-            stream.next_frame_at(now)
+            stream.next_frame_at((self.now)())
         } else {
             None
         }
@@ -410,7 +420,7 @@ impl Screen for Thread {
 
     fn on_data(&mut self, data: &Data) {
         if let Some(stream) = &mut self.stream {
-            let entries = stream.on_data(data);
+            let entries = stream.on_data(data, (self.now)());
             if !self.compact && self.show.stream() && !entries.is_empty() {
                 self.view.ingest(entries);
             }
@@ -585,7 +595,7 @@ impl Thread {
                 .stream
                 .as_ref()
                 .filter(|_| self.compact)
-                .map(|stream| stream.progress(Instant::now()).indicator());
+                .map(|stream| stream.progress((self.now)()).indicator());
             if indicator.is_some() {
                 c.render_with_indicator(
                     frame,
