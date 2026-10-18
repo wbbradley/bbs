@@ -13,9 +13,9 @@ use super::theme;
 const WIDTH: u16 = 60;
 
 pub struct Dialog {
-    title: String,
+    title: Line<'static>,
     /// Shown above the fields: what the dialog does.
-    message: String,
+    message: Line<'static>,
     fields: Vec<Field>,
     focus: usize,
 }
@@ -23,6 +23,7 @@ pub struct Dialog {
 struct Field {
     label: &'static str,
     value: String,
+    role: theme::Role,
 }
 
 #[derive(Debug, PartialEq)]
@@ -35,21 +36,39 @@ pub enum Outcome {
 
 impl Dialog {
     /// A form: `Enter` submits, `Tab` and the arrows move between fields.
-    pub fn form(title: &str, message: &str, fields: Vec<(&'static str, String)>) -> Dialog {
+    pub fn form(
+        title: impl Into<Line<'static>>,
+        message: impl Into<Line<'static>>,
+        fields: Vec<(&'static str, String)>,
+    ) -> Dialog {
         Dialog {
-            title: title.to_string(),
-            message: message.to_string(),
+            title: title.into(),
+            message: message.into(),
             fields: fields
                 .into_iter()
-                .map(|(label, value)| Field { label, value })
+                .map(|(label, value)| Field {
+                    label,
+                    value,
+                    role: theme::Role::Text,
+                })
                 .collect(),
             focus: 0,
         }
     }
 
     /// A yes/no question: `y` or `Enter` answers yes.
-    pub fn confirm(title: &str, message: &str) -> Dialog {
+    pub fn confirm(title: impl Into<Line<'static>>, message: impl Into<Line<'static>>) -> Dialog {
         Dialog::form(title, message, Vec::new())
+    }
+
+    /// The form's typed field purpose, never inferred from its text.
+    pub fn field_role(mut self, label: &str, role: theme::Role) -> Self {
+        for field in &mut self.fields {
+            if field.label == label {
+                field.role = role;
+            }
+        }
+        self
     }
 
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
@@ -90,10 +109,10 @@ impl Dialog {
         } else {
             "Enter OK · Esc cancel"
         };
-        let mut lines = vec![Line::raw(self.message.clone()), Line::raw("")];
+        let mut lines = vec![self.message.clone(), Line::raw("")];
         for (i, field) in self.fields.iter().enumerate() {
             let focused = i == self.focus;
-            let mut value = Span::styled(field.value.clone(), theme::style(theme::Role::Text));
+            let mut value = Span::styled(field.value.clone(), theme::style(field.role));
             if focused {
                 value = value.add_modifier(Modifier::UNDERLINED);
             }
@@ -123,7 +142,12 @@ impl Dialog {
         let block = Block::bordered()
             .border_type(BorderType::Thick)
             .border_style(theme::style(theme::Role::Hotkey))
-            .title(Span::styled(format!(" {} ", self.title), theme::heading()))
+            .title({
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(self.title.spans.iter().cloned());
+                spans.push(Span::raw(" "));
+                Line::from(spans).style(theme::heading())
+            })
             .style(theme::base());
         frame.render_widget(Clear, rect);
         frame.render_widget(

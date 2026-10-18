@@ -55,13 +55,15 @@ impl Activity {
         match str_field(&r, "event") {
             "update" => {}
             "start" => {
-                let line = format!(
-                    "{time} started {} ({}) in {}",
-                    str_field(&r, "agent"),
-                    str_field(&r, "harness"),
-                    str_field(&r, "cwd")
-                );
-                self.line(&mut out, &line, dim());
+                out.extend(styled_parts(vec![
+                    Span::styled(time.clone(), style(Role::Timestamp)),
+                    Span::styled(" started ", dim()),
+                    Span::styled(str_field(&r, "agent").to_string(), style(Role::Agent)),
+                    Span::styled(" (", dim()),
+                    Span::styled(str_field(&r, "harness").to_string(), style(Role::Technical)),
+                    Span::styled(") in ", dim()),
+                    Span::styled(str_field(&r, "cwd").to_string(), style(Role::Technical)),
+                ]));
             }
             "session" => {
                 let resumed = if r.get("resumed") == Some(&Value::Bool(true)) {
@@ -69,8 +71,12 @@ impl Activity {
                 } else {
                     ""
                 };
-                let line = format!("{time} session {}{resumed}", str_field(&r, "id"));
-                self.line(&mut out, &line, dim());
+                self.timed(
+                    &mut out,
+                    &time,
+                    &format!("session {}{resumed}", str_field(&r, "id")),
+                    dim(),
+                );
             }
             "mail" => {
                 let from: Vec<&str> = r
@@ -83,18 +89,29 @@ impl Activity {
                 } else {
                     ""
                 };
-                let line = format!("{time} mail from {}{queued}", from.join(", "));
-                self.line(&mut out, &line, style(Role::Warning));
+                out.extend(styled_parts(vec![
+                    Span::styled(time.clone(), style(Role::Timestamp)),
+                    Span::styled(" mail from ", style(Role::Warning)),
+                    Span::styled(from.join(", "), style(Role::Text)),
+                    Span::styled(queued, style(Role::Warning)),
+                ]));
             }
             "prompt" => {
                 out.push(Line::default());
-                let header = format!("━━ {time} turn ━━");
-                self.line(&mut out, &header, style(Role::Accent).bold());
+                out.extend(styled_parts(vec![
+                    Span::styled("━━ ", style(Role::Accent).bold()),
+                    Span::styled(time.clone(), style(Role::Timestamp)),
+                    Span::styled(" turn ━━", style(Role::Accent).bold()),
+                ]));
                 self.block(&mut out, mail_part(text), style(Role::Text));
             }
             "steer" => {
-                let line = format!("{time} mail steered into the turn:");
-                self.line(&mut out, &line, style(Role::Accent));
+                self.timed(
+                    &mut out,
+                    &time,
+                    "mail steered into the turn:",
+                    style(Role::Accent),
+                );
                 self.block(&mut out, mail_part(text), style(Role::Text));
             }
             "thought" => {
@@ -110,41 +127,37 @@ impl Activity {
             "text" => self.markdown(&mut out, text),
             "tool" => self.tool(&mut out, &r),
             "permission" => {
-                let line = format!("{time} permission {}", rest(&r));
-                self.line(&mut out, &line, style(Role::Warning).bold());
+                let line = format!("permission {}", rest(&r));
+                self.timed(&mut out, &time, &line, style(Role::Warning).bold());
             }
             "turn_end" => {
-                let line = format!("{time} turn end ({})", str_field(&r, "stop_reason"));
-                self.line(&mut out, &line, style(Role::Success).bold());
+                let line = format!("turn end ({})", str_field(&r, "stop_reason"));
+                self.timed(&mut out, &time, &line, style(Role::Success).bold());
             }
             "turn_error" | "error" => {
-                let line = format!("{time} {}: {message}", str_field(&r, "event"));
-                self.line(&mut out, &line, style(Role::Error).bold());
+                let line = format!("{}: {message}", str_field(&r, "event"));
+                self.timed(&mut out, &time, &line, style(Role::Error).bold());
             }
             "warning" => {
-                let line = format!("{time} warning: {message}");
-                self.line(&mut out, &line, style(Role::Warning).bold());
+                let line = format!("warning: {message}");
+                self.timed(&mut out, &time, &line, style(Role::Warning).bold());
             }
-            "cancel" => self.line(&mut out, &format!("{time} cancel"), style(Role::Warning)),
+            "cancel" => self.timed(&mut out, &time, "cancel", style(Role::Warning)),
             "stop" => match r.get("error").and_then(Value::as_str) {
                 Some(err) => {
-                    let line = format!("{time} stopped: {err}");
-                    self.line(&mut out, &line, style(Role::Error).bold());
+                    let line = format!("stopped: {err}");
+                    self.timed(&mut out, &time, &line, style(Role::Error).bold());
                 }
-                None => self.line(
-                    &mut out,
-                    &format!("{time} stopped"),
-                    style(Role::Text).bold(),
-                ),
+                None => self.timed(&mut out, &time, "stopped", style(Role::Text).bold()),
             },
             "unprocessed" => {
-                let line = format!("{time} unprocessed mail:");
-                self.line(&mut out, &line, style(Role::Warning).bold());
+                let line = format!("unprocessed mail:");
+                self.timed(&mut out, &time, &line, style(Role::Warning).bold());
                 self.block(&mut out, text, style(Role::Text));
             }
             event => {
-                let line = format!("{time} {event} {}", rest(&r));
-                self.line(&mut out, &line, style(Role::Text));
+                let line = format!("{event} {}", rest(&r));
+                self.timed(&mut out, &time, &line, style(Role::Text));
             }
         }
         out
@@ -158,7 +171,7 @@ impl Activity {
         self.order
             .iter()
             .filter_map(|id| self.calls.get(id))
-            .flat_map(|call| styled(&format!("  … {} running", call.name), dim()))
+            .flat_map(|call| running_line(&call.name))
             .collect()
     }
 
@@ -168,7 +181,7 @@ impl Activity {
             let call = self.calls.get_mut(id).expect("ordered calls exist");
             if !call.shown {
                 call.shown = true;
-                out.extend(styled(&format!("  … {} running", call.name), dim()));
+                out.extend(running_line(&call.name));
             }
         }
         out
@@ -214,13 +227,24 @@ impl Activity {
             .zip(str_field(r, "ts").parse::<DateTime<Utc>>().ok())
             .map(|(start, end)| format!(" ({:.1}s)", (end - start).as_seconds_f64()))
             .unwrap_or_default();
-        let (mark, style) = match status {
+        let (mark, status_style) = match status {
             "completed" => ("✓", style(Role::Success)),
             "failed" => ("✗", style(Role::Error)),
             _ => ("•", style(Role::Text)),
         };
-        let line = format!("  {mark} {name} {status}{took}");
-        self.line(out, &line, style);
+        out.extend(styled_parts(vec![
+            Span::styled(format!("  {mark} "), status_style),
+            Span::styled(name, style(Role::Tool)),
+            Span::styled(format!(" {status}"), status_style),
+            Span::styled(took, style(Role::Timestamp)),
+        ]));
+    }
+
+    fn timed(&self, out: &mut Vec<Line<'static>>, time: &str, text: &str, status: Style) {
+        out.extend(styled_parts(vec![
+            Span::styled(time.to_string(), style(Role::Timestamp)),
+            Span::styled(format!(" {text}"), status),
+        ]));
     }
 
     fn line(&self, out: &mut Vec<Line<'static>>, text: &str, style: Style) {
@@ -247,6 +271,32 @@ impl Activity {
             out.push(Line::from(spans.collect::<Vec<_>>()));
         }
     }
+}
+
+fn running_line(name: &str) -> Vec<Line<'static>> {
+    styled_parts(vec![
+        Span::styled("  … ", dim()),
+        Span::styled(name.to_string(), style(Role::Tool)),
+        Span::styled(" running", dim()),
+    ])
+}
+
+/// Structured values keep their categories, even when a field contains newlines.
+fn styled_parts(spans: Vec<Span<'static>>) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::default()];
+    for span in spans {
+        for (i, part) in span.content.split('\n').enumerate() {
+            if i > 0 {
+                lines.push(Line::default());
+            }
+            lines
+                .last_mut()
+                .expect("one line")
+                .spans
+                .push(Span::styled(part.to_string(), span.style));
+        }
+    }
+    lines
 }
 
 /// `text` in one style, one `Line` per line of it: a `Line` drops newlines.
@@ -300,6 +350,57 @@ mod tests {
             .iter()
             .map(|l| to_ansi(&activity.render(l), false))
             .collect()
+    }
+
+    #[test]
+    fn structured_activity_times_agents_and_tools_are_independently_styled() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let mut renderer = Activity::new(false);
+                let start = renderer.render(r#"{"event":"start","agent":"Mateo","harness":"codex","cwd":"/src","ts":"2026-10-18T12:00:00Z"}"#);
+                assert_eq!(
+                    start[0].to_string(),
+                    "12:00:00 started Mateo (codex) in /src"
+                );
+                assert_eq!(start[0].spans[0].style, style(Role::Timestamp));
+                assert_eq!(
+                    start[0]
+                        .spans
+                        .iter()
+                        .find(|s| s.content == "Mateo")
+                        .unwrap()
+                        .style,
+                    style(Role::Agent)
+                );
+                let warning = renderer.render(
+                    r#"{"event":"warning","message":"Mateo said ada","ts":"2026-10-18T12:00:00Z"}"#,
+                );
+                assert_eq!(warning[0].spans[0].style, style(Role::Timestamp));
+                assert_eq!(warning[0].spans[1].style, style(Role::Warning).bold());
+                renderer.render(r#"{"event":"tool","id":"a","title":"shell","status":"pending","ts":"2026-10-18T12:00:00Z"}"#);
+                let running = renderer.in_progress();
+                assert_eq!(
+                    running[0]
+                        .spans
+                        .iter()
+                        .find(|s| s.content == "shell")
+                        .unwrap()
+                        .style,
+                    style(Role::Tool)
+                );
+                let done = renderer.render(
+                    r#"{"event":"tool","id":"a","status":"completed","ts":"2026-10-18T12:00:02Z"}"#,
+                );
+                assert_eq!(done[0].to_string(), "  ✓ shell completed (2.0s)");
+                assert_eq!(done[0].spans[1].style, style(Role::Tool));
+                assert_eq!(done[0].spans[3].style, style(Role::Timestamp));
+                assert_eq!(
+                    super::super::to_ansi(&done, false),
+                    "  ✓ shell completed (2.0s)\n"
+                );
+            });
+        }
     }
 
     #[test]

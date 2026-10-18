@@ -15,7 +15,7 @@ use super::theme;
 use crate::backend::AGENT_ACTIVITY;
 use crate::proto::{self, Message};
 use crate::ui::activity::Activity;
-use crate::ui::message::{compact_message_lines, find_matches, message_lines};
+use crate::ui::message::{compact_message_lines, find_matches, message_lines_with_recipient};
 use crate::ui::thread::Row;
 
 /// Events each batch holds; the stream catches up from the start in batches.
@@ -30,6 +30,7 @@ pub enum Entry {
         message: Message,
         /// Omit message headers in compact conversations.
         compact: bool,
+        recipient: Option<proto::Kind>,
         outgoing: bool,
         /// A possible gap in the raw feed before this visible message.
         gap: bool,
@@ -64,13 +65,14 @@ impl Row for Entry {
             Entry::Message {
                 message,
                 compact,
+                recipient,
                 outgoing,
                 gap: raw_gap,
             } => {
                 let mut lines = if *compact {
                     compact_message_lines(message, gap || *raw_gap, query)
                 } else {
-                    message_lines(message, gap, query)
+                    message_lines_with_recipient(message, gap, query, *recipient)
                 };
                 if *outgoing {
                     if *compact {
@@ -434,6 +436,7 @@ mod tests {
             with_scheme(scheme, || {
                 let human = theme::base().patch(theme::style(theme::Role::HumanSurface));
                 let make = |id, outgoing, body: &str| Entry::Message {
+                    recipient: None,
                     message: Message {
                         id,
                         created_at: "2026-10-16T18:00:00Z".into(),

@@ -55,20 +55,44 @@ pub fn fit(text: &str, width: usize) -> String {
     out
 }
 
-/// As many whole items of a comma-separated list as fit in `width` columns,
-/// then `+N` for the rest, so no item is cut mid-name.
-pub fn fit_list(items: &[String], width: usize) -> String {
-    let all = items.join(", ");
-    if unicode_width::UnicodeWidthStr::width(all.as_str()) <= width {
-        return all;
+/// A structured list keeps each whole item's styles when the +N suffix fits.
+pub fn fit_styled_list(
+    items: Vec<ratatui::text::Line<'static>>,
+    width: usize,
+) -> ratatui::text::Line<'static> {
+    use crate::ui::theme::{Role, style};
+    use ratatui::text::{Line, Span};
+    let joined_width =
+        |n: usize| items[..n].iter().map(Line::width).sum::<usize>() + n.saturating_sub(1) * 2;
+    let all = joined_width(items.len()) <= width;
+    let shown = if all {
+        items.len()
+    } else {
+        (1..items.len())
+            .rev()
+            .find(|n| joined_width(*n) + format!(" +{}", items.len() - n).len() <= width)
+            .unwrap_or(0)
+    };
+    if shown == 0 && !items.is_empty() {
+        return Line::styled(fit(&format!("+{}", items.len()), width), style(Role::Muted));
     }
-    for shown in (1..items.len()).rev() {
-        let line = format!("{} +{}", items[..shown].join(", "), items.len() - shown);
-        if unicode_width::UnicodeWidthStr::width(line.as_str()) <= width {
-            return line;
+    let mut spans = Vec::new();
+    for (i, item) in items.iter().take(shown).enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(", "));
         }
+        spans.extend(item.spans.iter().cloned().map(|mut span| {
+            span.style = item.style.patch(span.style);
+            span
+        }));
     }
-    fit(&format!("+{}", items.len()), width)
+    if !all {
+        spans.push(Span::styled(
+            format!(" +{}", items.len() - shown),
+            style(Role::Muted),
+        ));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -101,6 +125,17 @@ mod tests {
         assert_eq!(fit("a long status line", 8), "a long …");
         assert_eq!(fit("日本語テキスト", 7), "日本語…");
         let groups: Vec<String> = ["acme", "beta", "gamma"].map(String::from).into();
+        let fit_list = |groups: &[String], width| {
+            fit_styled_list(
+                groups
+                    .iter()
+                    .cloned()
+                    .map(ratatui::text::Line::raw)
+                    .collect(),
+                width,
+            )
+            .to_string()
+        };
         assert_eq!(fit_list(&groups, 20), "acme, beta, gamma");
         assert_eq!(fit_list(&groups, 16), "acme, beta +1");
         assert_eq!(fit_list(&groups, 8), "acme +2");

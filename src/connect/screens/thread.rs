@@ -153,6 +153,22 @@ impl Thread {
             .cloned()
             .map(|m| Entry::Message {
                 compact: self.compact,
+                recipient: if m.to_owner.is_some()
+                    || self.agent.as_ref().is_some_and(|a| {
+                        m.to_name
+                            .as_ref()
+                            .is_some_and(|to| to.eq_ignore_ascii_case(a))
+                    }) {
+                    Some(proto::Kind::Agent)
+                } else if self.human.as_ref().is_some_and(|h| {
+                    m.to_name
+                        .as_ref()
+                        .is_some_and(|to| to.eq_ignore_ascii_case(h))
+                }) {
+                    Some(proto::Kind::Human)
+                } else {
+                    None
+                },
                 outgoing: self.direct_from_human(&m),
                 gap: visible_gaps.contains(&m.id),
                 message: m,
@@ -378,21 +394,29 @@ impl Thread {
         }
         text.push_str(&format!(" · {filters}"));
         let secs = ctx.started.elapsed().as_secs();
-        for detail in [
-            &ctx.server,
-            &ctx.me,
-            &format!(
-                "online {:02}:{:02}:{:02}",
-                secs / 3600,
-                secs / 60 % 60,
-                secs % 60
+        let mut line = Line::raw(text);
+        for (detail, role) in [
+            (ctx.server.clone(), theme::Role::Text),
+            (ctx.me.clone(), theme::Role::Human),
+            (
+                format!(
+                    "online {:02}:{:02}:{:02}",
+                    secs / 3600,
+                    secs / 60 % 60,
+                    secs % 60
+                ),
+                theme::Role::Timestamp,
             ),
         ] {
-            if text.width() + detail.width() + 3 <= width {
-                text.push_str(&format!(" · {detail}"));
+            if line.width() + detail.width() + 3 <= width {
+                line.spans.push(Span::raw(" · "));
+                line.spans.push(Span::styled(
+                    detail,
+                    theme::on_surface(theme::style(theme::Role::StatusBar), theme::style(role)),
+                ));
             }
         }
-        Line::from(fit_status(&text, width, false))
+        theme::clip_line(line, width)
     }
 }
 
@@ -489,6 +513,19 @@ impl Screen for Thread {
         self.title.clone()
     }
 
+    fn title_line(&self) -> Line<'static> {
+        if let Some(agent) = &self.agent {
+            Line::from(vec![
+                Span::styled(agent.clone(), theme::style(theme::Role::Agent)),
+                Span::raw(" conversation"),
+            ])
+        } else if let Some((group, _)) = &self.group {
+            Line::styled(format!("@{}", group.name), theme::style(theme::Role::Group))
+        } else {
+            Line::raw(self.title.clone())
+        }
+    }
+
     fn bottom_status(
         &self,
         width: u16,
@@ -514,7 +551,6 @@ impl Screen for Thread {
         let indicator = self
             .stream
             .as_ref()
-            .filter(|_| self.compact)
             .map(|s| s.progress((self.now)()).indicator());
         let text_width = width.saturating_sub(if indicator.is_some() { 2 } else { 0 });
         let mut line = self.conversation_status(text_width, ctx, draft_error);
@@ -523,9 +559,10 @@ impl Screen for Thread {
         {
             indicator.style =
                 ratatui::style::Style::reset().patch(theme::style(theme::Role::StatusBar));
-            let text = fit_status(&line.to_string(), usize::from(text_width), false);
-            let padding = usize::from(width - 1).saturating_sub(text.width());
-            line.spans = vec![Span::raw(text), Span::raw(" ".repeat(padding)), indicator];
+            line = theme::clip_line(line, usize::from(text_width));
+            let padding = usize::from(width - 1).saturating_sub(line.width());
+            line.spans
+                .extend([Span::raw(" ".repeat(padding)), indicator]);
         }
         Some(line)
     }
@@ -563,11 +600,7 @@ impl Screen for Thread {
 
     fn next_animation_frame(&self) -> Option<Instant> {
         let stream = self.stream.as_ref()?;
-        if self.compact {
-            stream.next_frame_at((self.now)())
-        } else {
-            None
-        }
+        stream.next_frame_at((self.now)())
     }
 
     fn save_draft(&mut self, drafts: &mut HashMap<String, Composer>) {
@@ -757,7 +790,7 @@ impl Thread {
         let inner = if self.agent.is_some() {
             area
         } else {
-            theme::screen(frame, area, &self.title)
+            theme::screen_line(frame, area, self.title_line())
         };
         let max_lines = frame.area().height * u16::from(ctx.composer_max_height_percent) / 100;
         let composer_height = self

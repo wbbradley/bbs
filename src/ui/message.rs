@@ -3,19 +3,27 @@
 
 use crate::ui::theme::{Role, style};
 use chrono::{DateTime, Local};
-use ratatui::style::{Modifier, Style, Styled};
+use ratatui::style::{Modifier, Styled};
 use ratatui::text::{Line, Span};
 
 use crate::proto::{Kind, Message};
-
-/// Header spans that hold searchable text: the sender and the recipient or group.
-const HEADER_NAMES: [usize; 2] = [2, 4];
 
 /// A message as displayed: a blank separator, a marker when messages may be
 /// missing before it, the header, and the indented markdown body, with
 /// `query` matches highlighted in the names and body.
 pub fn message_lines<'a>(row: &'a Message, gap: bool, query: Option<&str>) -> Vec<Line<'a>> {
-    with_header(row, gap, query, Some(header(row)))
+    message_lines_with_recipient(row, gap, query, None)
+}
+
+/// A conversation can identify a bare recipient from its typed target/human.
+/// Board-wide views leave absent recipient metadata neutral.
+pub fn message_lines_with_recipient<'a>(
+    row: &'a Message,
+    gap: bool,
+    query: Option<&str>,
+    recipient: Option<Kind>,
+) -> Vec<Line<'a>> {
+    with_header(row, gap, query, Some(header(row, query, recipient)))
 }
 
 /// The same body and search rendering, without a header.
@@ -31,7 +39,7 @@ fn with_header<'a>(
     row: &'a Message,
     gap: bool,
     query: Option<&str>,
-    mut header: Option<Line<'static>>,
+    header: Option<Line<'static>>,
 ) -> Vec<Line<'a>> {
     let mut body = Vec::new();
     for mut line in crate::ui::markdown::render(&row.body).lines {
@@ -39,16 +47,6 @@ fn with_header<'a>(
         body.push(line);
     }
     if let Some(query) = query {
-        if let Some(header) = &mut header {
-            header.spans = std::mem::take(&mut header.spans)
-                .into_iter()
-                .enumerate()
-                .flat_map(|(i, span)| match HEADER_NAMES.contains(&i) {
-                    true => highlight(span, query),
-                    false => vec![span],
-                })
-                .collect();
-        }
         for line in &mut body {
             line.spans = std::mem::take(&mut line.spans)
                 .into_iter()
@@ -149,7 +147,7 @@ pub fn highlight<'a>(span: Span<'a>, query: &str) -> Vec<Span<'a>> {
     spans
 }
 
-fn header(row: &Message) -> Line<'static> {
+fn header(row: &Message, query: Option<&str>, recipient: Option<Kind>) -> Line<'static> {
     let sent = local(&row.created_at);
     let mut spans = vec![
         Span::styled(
@@ -157,21 +155,35 @@ fn header(row: &Message) -> Line<'static> {
                 || row.created_at.clone(),
                 |t| t.format("%Y-%m-%d %H:%M:%S").to_string(),
             ),
-            style(Role::Muted),
+            style(Role::Timestamp),
         ),
         Span::raw("  "),
-        name_span(&row.qualified_sender(), row.from_kind()),
-        Span::styled(" → ", style(Role::Muted)),
     ];
-    match (&row.to_group, row.qualified_recipient()) {
-        (Some(group), _) => spans.push(Span::styled(
-            format!("@{group}"),
-            style(Role::Warning).add_modifier(Modifier::BOLD),
+    spans.extend(highlight_names(
+        name_spans(&row.from_name, row.from_owner.as_deref(), row.from_kind()),
+        query,
+    ));
+    spans.push(Span::styled(" → ", style(Role::Muted)));
+    match (&row.to_group, row.to_name.as_deref()) {
+        (Some(group), _) => spans.extend(highlight_names(
+            vec![Span::styled(
+                format!("@{group}"),
+                style(Role::Group).add_modifier(Modifier::BOLD),
+            )],
+            query,
         )),
         (None, Some(to)) => {
-            spans.push(Span::styled(to, Style::new().add_modifier(Modifier::BOLD)));
+            let kind = recipient.unwrap_or(if row.to_owner.is_some() {
+                Kind::Agent
+            } else {
+                Kind::Unspecified
+            });
+            spans.extend(highlight_names(
+                name_spans(to, row.to_owner.as_deref(), kind),
+                query,
+            ));
             spans.push(Span::raw("  "));
-            spans.push(match row.read_at.as_deref().and_then(local) {
+            match row.read_at.as_deref().and_then(local) {
                 Some(read) => {
                     let same_day = sent.is_some_and(|s| s.date_naive() == read.date_naive());
                     let fmt = if same_day {
@@ -179,22 +191,81 @@ fn header(row: &Message) -> Line<'static> {
                     } else {
                         "%Y-%m-%d %H:%M:%S"
                     };
-                    Span::styled(format!("read {}", read.format(fmt)), style(Role::Success))
+                    spans.push(Span::styled("read ", style(Role::Success)));
+                    spans.push(Span::styled(
+                        read.format(fmt).to_string(),
+                        style(Role::Timestamp),
+                    ));
                 }
-                None => Span::styled("unread", style(Role::Error)),
-            });
+                None => spans.push(Span::styled("unread", style(Role::Error))),
+            }
         }
         (None, None) => spans.push(Span::raw("?")),
     }
     Line::from(spans)
 }
 
-fn name_span(name: &str, kind: Kind) -> Span<'static> {
-    let author = match kind {
+/// Only structured identity metadata decides a category; unknown names stay text.
+pub fn name_spans(name: &str, owner: Option<&str>, kind: Kind) -> Vec<Span<'static>> {
+    let role = match kind {
         Kind::Human => Role::Human,
-        Kind::Agent | Kind::Unspecified => Role::OwnAgent,
+        Kind::Agent => Role::Agent,
+        Kind::Unspecified if owner.is_some() => Role::Agent,
+        Kind::Unspecified => Role::Text,
     };
-    Span::styled(name.to_string(), style(author).add_modifier(Modifier::BOLD))
+    let mut spans = vec![Span::styled(
+        name.to_string(),
+        style(role).add_modifier(Modifier::BOLD),
+    )];
+    if kind != Kind::Human
+        && let Some(owner) = owner
+    {
+        spans.push(Span::raw("@"));
+        spans.push(Span::styled(
+            owner.to_string(),
+            style(Role::Human).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans
+}
+
+/// Match the entire qualified field, then retain each category's style when
+/// splitting the highlighted ranges, including a match crossing `agent@owner`.
+fn highlight_names(spans: Vec<Span<'static>>, query: Option<&str>) -> Vec<Span<'static>> {
+    let Some(query) = query else { return spans };
+    let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    let ranges = find_matches(&text, query);
+    let mut offset = 0;
+    let mut out = Vec::new();
+    for span in spans {
+        let end = offset + span.content.len();
+        let mut at = 0;
+        for range in &ranges {
+            let start = range.start.max(offset);
+            let stop = range.end.min(end);
+            if start >= stop {
+                continue;
+            }
+            let start = start - offset;
+            let stop = stop - offset;
+            if start > at {
+                out.push(Span::styled(
+                    span.content[at..start].to_string(),
+                    span.style,
+                ));
+            }
+            out.push(Span::styled(
+                span.content[start..stop].to_string(),
+                span.style.add_modifier(Modifier::REVERSED),
+            ));
+            at = stop;
+        }
+        if at < span.content.len() {
+            out.push(Span::styled(span.content[at..].to_string(), span.style));
+        }
+        offset = end;
+    }
+    out
 }
 
 fn local(stored: &str) -> Option<DateTime<Local>> {
@@ -212,7 +283,11 @@ pub fn age(stored: &str, now: DateTime<Local>) -> String {
         return String::new();
     };
     let minutes = (now.signed_duration_since(t).num_seconds().max(0) / 60) as u64;
-    let units = [(minutes / 1440, "d"), (minutes % 1440 / 60, "h"), (minutes % 60, "m")];
+    let units = [
+        (minutes / 1440, "d"),
+        (minutes % 1440 / 60, "h"),
+        (minutes % 60, "m"),
+    ];
     let shown: Vec<String> = units
         .iter()
         .filter(|(n, _)| *n > 0)
@@ -228,6 +303,93 @@ pub fn age(stored: &str, now: DateTime<Local>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_names_and_qualified_search_keep_their_categories() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let mut row = Message {
+                    from_name: "Mateo".into(),
+                    from_owner: Some("ada".into()),
+                    from_kind: Kind::Agent.into(),
+                    to_name: Some("Zed".into()),
+                    to_owner: Some("ben".into()),
+                    created_at: "2026-10-18T12:00:00Z".into(),
+                    read_at: Some("2026-10-18T12:01:00Z".into()),
+                    ..Default::default()
+                };
+                let line = header(&row, Some("eo@ad"), None);
+                assert!(line.to_string().contains("Mateo@ada → Zed@ben"));
+                let reversed: String = line
+                    .spans
+                    .iter()
+                    .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                assert_eq!(reversed, "eo@ad");
+                for (text, role) in [
+                    ("Mat", Role::Agent),
+                    ("ad", Role::Human),
+                    ("Zed", Role::Agent),
+                    ("ben", Role::Human),
+                    ("read ", Role::Success),
+                ] {
+                    assert_eq!(
+                        line.spans
+                            .iter()
+                            .find(|s| s.content == text)
+                            .unwrap()
+                            .style
+                            .fg,
+                        style(role).fg
+                    );
+                }
+                assert_eq!(line.spans[0].style, style(Role::Timestamp));
+                assert_eq!(line.spans.last().unwrap().style, style(Role::Timestamp));
+                row.to_owner = None;
+                let unknown = header(&row, None, None);
+                assert_eq!(
+                    unknown
+                        .spans
+                        .iter()
+                        .find(|s| s.content == "Zed")
+                        .unwrap()
+                        .style
+                        .fg,
+                    style(Role::Text).fg
+                );
+                let human = header(&row, None, Some(Kind::Human));
+                assert_eq!(
+                    human
+                        .spans
+                        .iter()
+                        .find(|s| s.content == "Zed")
+                        .unwrap()
+                        .style
+                        .fg,
+                    style(Role::Human).fg
+                );
+                row.to_group = Some("crew".into());
+                let group = header(&row, None, None);
+                assert_eq!(
+                    group
+                        .spans
+                        .iter()
+                        .find(|s| s.content == "@crew")
+                        .unwrap()
+                        .style
+                        .fg,
+                    style(Role::Group).fg
+                );
+                assert!(
+                    !compact_message_lines(&row, false, None)
+                        .iter()
+                        .any(|l| l.to_string().contains("Mateo"))
+                );
+            });
+        }
+    }
 
     #[test]
     fn compact_omits_headers_and_keeps_body_styles_search_and_gap_markers() {

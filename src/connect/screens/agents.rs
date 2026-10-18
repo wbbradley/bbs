@@ -12,7 +12,7 @@ use ratatui::widgets::{Paragraph, Row, Table, TableState};
 use std::collections::HashMap;
 
 use super::thread::Thread;
-use super::{fit, fit_list, navigate};
+use super::{fit, fit_styled_list, navigate};
 use crate::connect::app::{Ctx, Screen, Transition, next_id};
 use crate::connect::event::{Data, Request};
 use crate::connect::keys::Action;
@@ -110,7 +110,11 @@ fn pending(count: u32, marker: char) -> String {
     if count == 0 {
         String::new()
     } else {
-        format!("{marker}{}", count.min(99))
+        format!(
+            "{marker}{}{}",
+            if marker == '✉' { " " } else { "" },
+            count.min(99)
+        )
     }
 }
 
@@ -232,12 +236,7 @@ impl Screen for Agents {
         // AGENT fits the whole random name pool; OWNER fits most human names.
         // ACTIVE fits the widest rendered age ("103d23h ago" is 11), at the
         // header's 6 minimum and at most 14 so STATUS keeps 10 columns.
-        let active_width = ages
-            .iter()
-            .map(|a| a.len())
-            .max()
-            .unwrap_or(6)
-            .clamp(6, 14) as u16;
+        let active_width = ages.iter().map(|a| a.len()).max().unwrap_or(6).clamp(6, 14) as u16;
         let groups_width = inner
             .width
             .saturating_sub(10 + 9 + 5 + 8 + active_width + 10 + 6)
@@ -248,16 +247,15 @@ impl Screen for Agents {
             as usize;
         let rows = shown.iter().zip(&ages).map(|(a, age)| {
             let owner = a.owner.as_deref().unwrap_or("?");
-            let author_style = if owner == ctx.me {
-                theme::style(theme::Role::OwnAgent)
-            } else {
-                theme::style(theme::Role::OtherAgent)
-            };
+            let author_style = theme::style(theme::Role::Agent);
             let name = Line::from(vec![Span::styled(
                 a.name.clone(),
                 author_style.add_modifier(Modifier::BOLD),
             )]);
-            let owner = Line::from(vec![Span::styled(owner.to_string(), author_style)]);
+            let owner = Line::from(vec![Span::styled(
+                owner.to_string(),
+                theme::style(theme::Role::Human),
+            )]);
             let summary = self.summary(&a.name);
             Row::new(vec![
                 name,
@@ -270,8 +268,14 @@ impl Screen for Agents {
                     pending(summary.map_or(0, |s| s.unseen_stream), '•'),
                     theme::heading(),
                 ),
-                Line::raw(fit_list(&a.groups, groups_width as usize)),
-                Line::raw(age.clone()),
+                fit_styled_list(
+                    a.groups
+                        .iter()
+                        .map(|g| Line::styled(g.clone(), theme::style(theme::Role::Group)))
+                        .collect(),
+                    groups_width as usize,
+                ),
+                Line::styled(age.clone(), theme::style(theme::Role::Timestamp)),
                 Line::raw(fit(a.status.as_deref().unwrap_or_default(), status_width)),
             ])
         });
@@ -294,7 +298,10 @@ impl Screen for Agents {
             .style(theme::heading()),
         )
         .style(theme::base())
-        .row_highlight_style(theme::style(theme::Role::Selection));
+        .row_highlight_style(ratatui::style::Style {
+            fg: None,
+            ..theme::style(theme::Role::Selection)
+        });
         if self.state.selected().is_none() {
             self.state.select(Some(0));
         }

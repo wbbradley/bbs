@@ -7,7 +7,7 @@ use std::sync::RwLock;
 
 /// Components choose a purpose, never a palette color. Foreground-only roles
 /// inherit their enclosing surface, including human input and outgoing rows.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Screen,
     Text,
@@ -16,9 +16,11 @@ pub enum Role {
     Heading,
     Accent,
     HumanSurface,
-    OwnAgent,
-    OtherAgent,
+    Agent,
     Human,
+    Group,
+    Timestamp,
+    Tool,
     Hotkey,
     /// Keyboard guidance, distinct from message text.
     KeyHint,
@@ -90,6 +92,16 @@ pub fn style(role: Role) -> Style {
     current().style(role)
 }
 
+/// Preserve the surface while keeping a categorical foreground visible on it.
+pub fn on_surface(surface: Style, category: Style) -> Style {
+    let mut combined = surface.patch(category);
+    if current() != Scheme::NoColor && category.fg.is_some() && category.fg == surface.bg {
+        combined.fg = surface.fg;
+        combined = combined.underlined();
+    }
+    combined
+}
+
 impl Scheme {
     pub const ALL: [Self; 3] = [Self::Gruvbox, Self::Terminal, Self::NoColor];
 
@@ -106,9 +118,9 @@ impl Scheme {
         if self == Self::NoColor {
             return match role {
                 Screen => Style::new().fg(Color::Reset).bg(Color::Reset),
-                Muted => Style::new().dim(),
+                Muted | Timestamp => Style::new().dim(),
                 KeyHint => Style::new().italic(),
-                Heading | OwnAgent | OtherAgent | Human | Hotkey | Success | Warning | Error => {
+                Heading | Agent | Human | Group | Hotkey | Success | Warning | Error => {
                     Style::new().bold()
                 }
                 Selection | Cursor | TitleBar | StatusBar => Style::new().reversed(),
@@ -165,14 +177,14 @@ impl Scheme {
             Screen => Style::new().fg(text).bg(bg),
             Text => Style::new().fg(text),
             HumanSurface => Style::new().fg(text).bg(surface),
-            Muted => Style::new().fg(muted),
-            Technical => Style::new().fg(technical),
+            Muted | Timestamp => Style::new().fg(muted),
+            Technical | Tool => Style::new().fg(technical),
             Heading => Style::new().fg(accent).bold(),
             Logo if self == Self::Gruvbox => Style::new().fg(muted),
-            Accent | Logo | OwnAgent => Style::new().fg(accent),
-            Human | OtherAgent => Style::new().fg(participant),
+            Accent | Logo | Agent => Style::new().fg(accent),
+            Human => Style::new().fg(participant),
             KeyHint => Style::new().fg(participant).italic(),
-            Hotkey | Warning => Style::new().fg(warning),
+            Hotkey | Warning | Group => Style::new().fg(warning),
             Success => Style::new().fg(success),
             Error => Style::new().fg(error),
             Selection => Style::new().fg(text).bg(selection).bold(),
@@ -188,6 +200,54 @@ impl Scheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn categorical_roles_inherit_surfaces_and_bar_collisions_stay_visible() {
+        for scheme in testing::SCHEMES {
+            testing::with_scheme(scheme, || {
+                for role in [
+                    Role::Agent,
+                    Role::Human,
+                    Role::Group,
+                    Role::Timestamp,
+                    Role::Tool,
+                ] {
+                    let category = style(role);
+                    assert!(category.bg.is_none());
+                    for surface in [
+                        Role::Screen,
+                        Role::HumanSurface,
+                        Role::Selection,
+                        Role::TitleBar,
+                        Role::StatusBar,
+                    ] {
+                        let bar = style(surface);
+                        let combined = on_surface(bar, category);
+                        assert_eq!(combined.bg, bar.bg);
+                        assert!(combined.add_modifier.contains(bar.add_modifier));
+                        if scheme != Scheme::NoColor {
+                            assert_ne!(combined.fg, combined.bg);
+                        }
+                    }
+                }
+                if scheme != Scheme::NoColor {
+                    assert_ne!(style(Role::Agent).fg, style(Role::Human).fg);
+                    assert_ne!(style(Role::Agent).fg, style(Role::Group).fg);
+                }
+                if scheme == Scheme::Terminal {
+                    let bar = style(Role::TitleBar);
+                    let agent = on_surface(bar, style(Role::Agent));
+                    assert_eq!(agent.fg, bar.fg);
+                    assert!(
+                        agent
+                            .add_modifier
+                            .contains(ratatui::style::Modifier::UNDERLINED)
+                    );
+                }
+            });
+        }
+    }
+
     #[test]
     fn key_hints_inherit_surface_and_keep_non_color_cues() {
         for scheme in testing::SCHEMES {
@@ -285,9 +345,11 @@ pub(crate) mod testing {
             Heading,
             Accent,
             HumanSurface,
-            OwnAgent,
-            OtherAgent,
+            Agent,
             Human,
+            Group,
+            Timestamp,
+            Tool,
             Hotkey,
             KeyHint,
             Selection,

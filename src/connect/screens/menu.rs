@@ -119,7 +119,11 @@ impl Screen for Menu {
                 theme::dim(),
             ),
             Line::default(),
-            Line::styled(format!("Welcome, {}.", ctx.me), theme::base()),
+            Line::from(vec![
+                Span::raw("Welcome, "),
+                Span::styled(ctx.me.clone(), theme::style(theme::Role::Human)),
+                Span::raw("."),
+            ]),
             Line::default(),
         ]);
         for (i, (_, key, rest, _)) in ITEMS.iter().enumerate() {

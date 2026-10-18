@@ -56,6 +56,9 @@ pub enum Transition {
 pub trait Screen {
     /// Shown in the title bar.
     fn title(&self) -> String;
+    fn title_line(&self) -> Line<'static> {
+        Line::raw(self.title())
+    }
     /// A key press before the keymap sees it: `Some` when the screen took it,
     /// as the splash and a search prompt do.
     fn raw_key(&mut self, _key: KeyEvent) -> Option<Transition> {
@@ -292,7 +295,7 @@ impl App {
         }
         let [title, body, status] = theme::frame_areas(frame.area());
         let screen = self.stack.last_mut().expect("the menu is never popped");
-        frame.render_widget(Paragraph::new(theme::title_bar(&screen.title())), title);
+        frame.render_widget(Paragraph::new(theme::title_bar(screen.title_line())), title);
         screen.render(frame, body, &self.ctx);
         let online = self.ctx.started.elapsed();
         let bar = theme::status_bar(&self.ctx.server, &self.ctx.me, online);
@@ -347,6 +350,212 @@ mod tests {
     }
 
     #[test]
+    fn categories_survive_selection_titles_dialogs_status_and_live_scheme_changes() {
+        use crate::ui::theme::{
+            Scheme,
+            testing::{SCHEMES, with_scheme},
+        };
+        use ratatui::buffer::Buffer;
+        use ratatui::style::Modifier;
+        let find = |buffer: &Buffer, y: u16, text: &str| -> u16 {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            unicode_width::UnicodeWidthStr::width(
+                &row[..row
+                    .find(text)
+                    .unwrap_or_else(|| panic!("missing {text} in {row}"))],
+            ) as u16
+        };
+        let check = |buffer: &Buffer, y: u16, text: &str, role, surface| {
+            let x = find(buffer, y, text);
+            let expected =
+                theme::base().patch(theme::on_surface(theme::style(surface), theme::style(role)));
+            for dx in 0..text.len() as u16 {
+                let cell = &buffer[(x + dx, y)];
+                assert_eq!(cell.fg, expected.fg.unwrap(), "{text}: {cell:?}");
+                assert_eq!(cell.bg, expected.bg.unwrap(), "{text}: {cell:?}");
+                assert!(cell.modifier.contains(expected.add_modifier));
+            }
+        };
+        with_scheme(Scheme::Gruvbox, || {
+            let (mut app, mut rx) = app();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            for scheme in SCHEMES {
+                crate::ui::theme::select(scheme);
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let y = (1..23)
+                    .find(|&y| {
+                        let row: String = (0..80).map(|x| buffer[(x, y)].symbol()).collect();
+                        row.contains("Welcome, ada.")
+                    })
+                    .unwrap();
+                check(buffer, y, "ada", theme::Role::Human, theme::Role::Screen);
+                check(
+                    buffer,
+                    23,
+                    "ada",
+                    theme::Role::Human,
+                    theme::Role::StatusBar,
+                );
+                check(
+                    buffer,
+                    23,
+                    "00:00:",
+                    theme::Role::Timestamp,
+                    theme::Role::StatusBar,
+                );
+            }
+            open_agents(&mut app, &mut rx);
+            app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+                agents: vec![agent("Mateo", "ada", &["crew"])],
+                humans: vec![],
+            }))));
+            set_agents_now(&mut app, "2026-10-18T12:00:00Z");
+            for scheme in SCHEMES {
+                crate::ui::theme::select(scheme);
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let buffer = terminal.backend().buffer();
+                check(
+                    buffer,
+                    3,
+                    "Mateo",
+                    theme::Role::Agent,
+                    theme::Role::Selection,
+                );
+                check(buffer, 3, "ada", theme::Role::Human, theme::Role::Selection);
+                check(
+                    buffer,
+                    3,
+                    "crew",
+                    theme::Role::Group,
+                    theme::Role::Selection,
+                );
+                check(
+                    buffer,
+                    3,
+                    "ago",
+                    theme::Role::Timestamp,
+                    theme::Role::Selection,
+                );
+                if scheme == Scheme::NoColor {
+                    assert!(buffer[(0, 3)].modifier.contains(Modifier::REVERSED));
+                }
+            }
+            enter(&mut app);
+            watched(&mut rx);
+            rx.try_recv().unwrap();
+            for scheme in SCHEMES {
+                crate::ui::theme::select(scheme);
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let buffer = terminal.backend().buffer();
+                check(
+                    buffer,
+                    0,
+                    "Mateo",
+                    theme::Role::Agent,
+                    theme::Role::TitleBar,
+                );
+                check(
+                    buffer,
+                    23,
+                    "ada",
+                    theme::Role::Human,
+                    theme::Role::StatusBar,
+                );
+            }
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            key(&mut app, 'q');
+            key(&mut app, 'g');
+            rx.try_recv().unwrap();
+            app.on_event(Event::Data(Data::Groups(Ok(proto::GroupListResponse {
+                groups: vec![proto::Group {
+                    name: "crew".into(),
+                    members: vec!["Mateo".into()],
+                    ..Default::default()
+                }],
+            }))));
+            for scheme in SCHEMES {
+                crate::ui::theme::select(scheme);
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let buffer = terminal.backend().buffer();
+                check(
+                    buffer,
+                    3,
+                    "@crew",
+                    theme::Role::Group,
+                    theme::Role::Selection,
+                );
+                check(
+                    buffer,
+                    3,
+                    "Mateo",
+                    theme::Role::Agent,
+                    theme::Role::Selection,
+                );
+                // Dialog roles resolve at creation; no Config screen is accessible under a modal.
+                key(&mut app, '+');
+                typed(&mut app, "Zed");
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let y = (0..24)
+                    .find(|&y| {
+                        let row: String = (0..80).map(|x| buffer[(x, y)].symbol()).collect();
+                        row.contains("Add agents to @crew")
+                    })
+                    .unwrap();
+                let x = find(buffer, y, "@crew");
+                assert_eq!(
+                    buffer[(x, y)].fg,
+                    theme::style(theme::Role::Group)
+                        .fg
+                        .unwrap_or(buffer[(x, y)].fg)
+                );
+                let y = (0..24)
+                    .find(|&y| {
+                        let row: String = (0..80).map(|x| buffer[(x, y)].symbol()).collect();
+                        row.contains("Zed")
+                    })
+                    .unwrap();
+                let x = find(buffer, y, "Zed");
+                let expected = theme::base().patch(theme::style(theme::Role::Agent));
+                assert_eq!(buffer[(x, y)].fg, expected.fg.unwrap());
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            }
+            enter(&mut app);
+            for scheme in SCHEMES {
+                crate::ui::theme::select(scheme);
+                terminal.draw(|f| app.draw(f)).unwrap();
+                check(
+                    terminal.backend().buffer(),
+                    0,
+                    "@crew",
+                    theme::Role::Group,
+                    theme::Role::TitleBar,
+                );
+            }
+        });
+    }
+
+    fn assert_status_foreground(cell: &ratatui::buffer::Cell, bar: ratatui::style::Style) {
+        assert!(
+            [
+                theme::Role::Text,
+                theme::Role::Human,
+                theme::Role::Timestamp
+            ]
+            .into_iter()
+            .map(|role| theme::on_surface(bar, theme::style(role))
+                .fg
+                .unwrap_or(cell.fg))
+            .chain(bar.fg)
+            .any(|fg| cell.fg == fg),
+            "unexpected status foreground: {cell:?}"
+        );
+    }
+
+    #[test]
     fn config_applies_live_saves_and_returns_without_requests() {
         use crate::ui::theme::{self as scheme, Scheme, testing::with_scheme};
         with_scheme(Scheme::Gruvbox, || {
@@ -377,7 +586,7 @@ mod tests {
                     .patch(scheme::style(scheme::Role::StatusBar));
                 for x in 0..80 {
                     let cell = &terminal.backend().buffer()[(x, 23)];
-                    assert_eq!(cell.fg, bar.fg.unwrap());
+                    assert_status_foreground(cell, bar);
                     assert_eq!(cell.bg, bar.bg.unwrap());
                     assert!(cell.modifier.contains(bar.add_modifier));
                 }
@@ -569,7 +778,7 @@ mod tests {
                 let buffer = terminal.backend().buffer();
                 let expected = theme::base().patch(theme::style(theme::Role::StatusBar));
                 for x in 0..80 {
-                    assert_eq!(buffer[(x, 23)].fg, expected.fg.unwrap());
+                    assert_status_foreground(&buffer[(x, 23)], expected);
                     assert_eq!(buffer[(x, 23)].bg, expected.bg.unwrap());
                 }
             });
@@ -805,10 +1014,7 @@ mod tests {
         let bar = theme::style(theme::Role::StatusBar);
         for x in 0..80 {
             let cell = &buffer[(x, 23)];
-            assert!(
-                cell.fg == bar.fg.unwrap() && cell.bg == bar.bg.unwrap(),
-                "{text}"
-            );
+            assert!(cell.bg == bar.bg.unwrap(), "{text}");
         }
     }
 
@@ -1121,7 +1327,7 @@ mod tests {
         let rows = order(&out, &["Ana", "Bo", "Cy", "Di", "Ed"]);
         assert_eq!(rows, ["Ed", "Cy", "Di", "Bo", "Ana"], "{out}");
         assert!(
-            out.contains("✉1") && out.contains("•4") && out.contains("•99"),
+            out.contains("✉ 1") && out.contains("•4") && out.contains("•99"),
             "{out}"
         );
         enter(&mut app);
@@ -1238,7 +1444,7 @@ mod tests {
                     if mail == 0 {
                         String::new()
                     } else {
-                        format!("✉{}", mail.min(99))
+                        format!("✉ {}", mail.min(99))
                     },
                     "{out}"
                 );
@@ -1742,7 +1948,17 @@ mod tests {
                     .patch(theme::error());
                 for x in area.left()..area.right() {
                     let cell = &buffer[(x, area.bottom() - 1)];
-                    assert_eq!(cell.fg, expected.fg.unwrap());
+                    assert_eq!(
+                        cell.fg,
+                        if x + 1 >= area.right() {
+                            theme::base()
+                                .patch(theme::style(theme::Role::StatusBar))
+                                .fg
+                                .unwrap()
+                        } else {
+                            expected.fg.unwrap()
+                        }
+                    );
                     assert_eq!(cell.bg, expected.bg.unwrap());
                 }
             });
@@ -2323,9 +2539,9 @@ mod tests {
                                 .unwrap()
                         );
                         for x in 0..width {
-                            assert_eq!(buffer[(x, 23)].fg, style.fg.unwrap());
+                            assert_status_foreground(&buffer[(x, 23)], style);
                             assert_eq!(buffer[(x, 23)].bg, style.bg.unwrap());
-                            assert_eq!(buffer[(x, 23)].modifier, style.add_modifier);
+                            assert!(buffer[(x, 23)].modifier.contains(style.add_modifier));
                         }
                         app.ctx.preferences.error = Some("preference save failed".into());
                         terminal.draw(|frame| app.draw(frame)).unwrap();
@@ -2387,7 +2603,7 @@ mod tests {
                 .next()
                 .unwrap()
         };
-        assert_eq!(hint_cell(&mut app), ' ', "verbose has no indicator");
+        assert_eq!(hint_cell(&mut app), '·', "verbose also shows progress");
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert_eq!(hint_cell(&mut app), '·');
         app.on_event(Event::Data(Data::ActivityBaseline {
@@ -2424,10 +2640,22 @@ mod tests {
         // Time advances the frame: 250ms in, the third frame shows.
         clock.advance(Duration::from_millis(250));
         assert_eq!(hint_cell(&mut app), '⠹', "frames follow the clock");
+        let deadline = app.next_animation_frame();
+        assert_eq!(deadline, Some(clock.now() + Duration::from_millis(50)));
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(hint_cell(&mut app), '⠹', "verbose keeps the same phase");
+        assert_eq!(
+            app.next_animation_frame(),
+            deadline,
+            "verbose remains armed"
+        );
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(hint_cell(&mut app), '⠹');
+        assert_eq!(app.next_animation_frame(), deadline);
         app.on_event(Event::Data(batch(503, "turn_end")));
         assert_eq!(hint_cell(&mut app), '✓');
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert_eq!(hint_cell(&mut app), ' ');
+        assert_eq!(hint_cell(&mut app), '✓');
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert_eq!(hint_cell(&mut app), '✓');
         app.on_event(Event::Data(Data::Activity {

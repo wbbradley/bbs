@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 
 use super::app::Transition;
 use super::dialog::{Dialog, Outcome};
@@ -29,6 +29,12 @@ impl GroupAdmin {
             return;
         }
         let at = format!("@{name}");
+        let title = |prefix: &'static str| {
+            Line::from(vec![
+                Span::raw(prefix),
+                Span::styled(at.clone(), theme::style(theme::Role::Group)),
+            ])
+        };
         let dialog = match op {
             GroupOp::Create => Dialog::form(
                 "Create a group",
@@ -36,7 +42,7 @@ impl GroupAdmin {
                 vec![("name", String::new()), ("description", String::new())],
             ),
             GroupOp::Describe => Dialog::form(
-                &format!("Describe {at}"),
+                title("Describe "),
                 "One line, at most 200 characters. Empty clears it.",
                 vec![(
                     "description",
@@ -46,32 +52,40 @@ impl GroupAdmin {
                 )],
             ),
             GroupOp::Delete => Dialog::confirm(
-                &format!("Delete {at}"),
-                &format!(
-                    "Delete {at}? Its members are told, then it is archived: its history stays readable, but it takes no more messages or members."
-                ),
+                title("Delete "),
+                Line::from(vec![
+                    Span::raw("Delete "),
+                    Span::styled(at.clone(), theme::style(theme::Role::Group)),
+                    Span::raw(
+                        "? Its members are told, then it is archived: its history stays readable, but it takes no more messages or members.",
+                    ),
+                ]),
             ),
             GroupOp::Add => Dialog::form(
-                &format!("Add agents to {at}"),
+                title("Add agents to "),
                 "Agent names, separated by spaces or commas.",
                 vec![("agents", String::new())],
             ),
             GroupOp::Remove => Dialog::form(
-                &format!("Remove an agent from {at}"),
+                title("Remove an agent from "),
                 "The agent leaves the group.",
                 vec![("agent", String::new())],
             ),
             GroupOp::Grant => Dialog::form(
-                &format!("Grant write on {at}"),
+                title("Grant write on "),
                 "The agent may then broadcast to the group.",
                 vec![("agent", String::new())],
             ),
             GroupOp::Revoke => Dialog::form(
-                &format!("Revoke write on {at}"),
+                title("Revoke write on "),
                 "The agent may then only read the group.",
                 vec![("agent", String::new())],
             ),
         };
+        let dialog = dialog
+            .field_role("name", theme::Role::Group)
+            .field_role("agents", theme::Role::Agent)
+            .field_role("agent", theme::Role::Agent);
         self.dialog = Some((op, name, dialog));
     }
 

@@ -5,11 +5,11 @@ use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table, TableState};
 
 use super::thread::Thread;
-use super::{fit, fit_list, navigate};
+use super::{fit, fit_styled_list, navigate};
 use crate::connect::admin::GroupAdmin;
 use crate::connect::app::{Ctx, Screen, Transition, next_id};
 use crate::connect::event::{Data, Request};
@@ -46,17 +46,23 @@ impl Groups {
     }
 }
 
-/// Members in order, writers marked `[w]` as in `bbs group list`.
-fn members(group: &proto::Group) -> Vec<String> {
+/// Group members are agent names; the writer flag is a separate status.
+fn members(group: &proto::Group, width: usize) -> Line<'static> {
     let writers = group.writers.as_ref().map(|w| &w.names);
-    group
-        .members
-        .iter()
-        .map(|m| match writers.is_some_and(|w| w.contains(m)) {
-            true => format!("{m} [w]"),
-            false => m.clone(),
-        })
-        .collect()
+    fit_styled_list(
+        group
+            .members
+            .iter()
+            .map(|name| {
+                let mut spans = vec![Span::styled(name.clone(), theme::style(theme::Role::Agent))];
+                if writers.is_some_and(|w| w.contains(name)) {
+                    spans.push(Span::styled(" [w]", theme::style(theme::Role::Success)));
+                }
+                Line::from(spans)
+            })
+            .collect(),
+        width,
+    )
 }
 
 impl Screen for Groups {
@@ -156,10 +162,10 @@ impl Groups {
             Row::new(vec![
                 Line::styled(
                     format!("@{}", g.name),
-                    theme::style(theme::Role::Hotkey).add_modifier(Modifier::BOLD),
+                    theme::style(theme::Role::Group).add_modifier(Modifier::BOLD),
                 ),
                 Line::raw(fit(g.description.as_deref().unwrap_or_default(), 30)),
-                Line::raw(fit_list(&members(g), members_width)),
+                members(g, members_width),
             ])
         });
         let table = Table::new(
@@ -172,7 +178,10 @@ impl Groups {
         )
         .header(Row::new(["GROUP", "DESCRIPTION", "MEMBERS ([w] writes)"]).style(theme::heading()))
         .style(theme::base())
-        .row_highlight_style(theme::style(theme::Role::Selection));
+        .row_highlight_style(ratatui::style::Style {
+            fg: None,
+            ..theme::style(theme::Role::Selection)
+        });
         if self.state.selected().is_none() {
             self.state.select(Some(0));
         }

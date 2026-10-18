@@ -37,6 +37,13 @@ several separate `bbs group` commands.
   and menus. A status bar fills the whole bottom line with the server, the
   human and time online when space permits. Agent conversations use the bottom
   bar for timeline state and feedback.
+- Structured agent names use Agent blue, human names Human purple, groups Group
+  yellow, timestamps Timestamp muted gray, and tool labels Tool technical text in
+  Gruvbox. Terminal and No color keep the same semantic roles. Qualified names
+  split agent and owner styles; ambiguous names and prose remain unclassified.
+  Selection preserves categorical foregrounds. On bars, a foreground matching the
+  background falls back to the bar foreground with underline.
+
 - A splash screen with a large logo, shown on connect and skipped with any key.
   Its geometry is embedded from `assets/connect/logo.txt` and colored by the
   scheme's Logo role. Menu items have hot keys shown in brackets, `[A]gents`.
@@ -141,7 +148,7 @@ open.
 
 Any human may open any agent and message it, under the same rules as
 `bbs send`. Every agent shows its owner in a separate OWNER column, as in
-`bbs agents`; your own agents and other humans' agents use distinct colors.
+`bbs agents`; agent names use the Agent role and owners use the Human role, regardless of ownership.
 The conversation title uses the agent's name, for example "Mateo conversation".
 
 ### Group screen
@@ -182,7 +189,7 @@ and Home/End work everywhere too.
   `Alt-Enter` (or `Ctrl-j`) inserts a newline.
 
 The composer has no title or key-hint row; shortcuts remain available in Help.
-Send progress and failures appear in the bottom bar. In compact agent
+Send progress and failures appear in the bottom bar. In compact and verbose agent
 conversations, its reserved rightmost cell shows the turn state using exactly
 the bottom bar's style:
 a Braille glyph spins on unfinished work, a check marks a recorded

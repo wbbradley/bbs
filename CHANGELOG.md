@@ -8,6 +8,14 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- Apply consistent categorical styles to agent and human names, groups, timestamps
+  and tool labels across connect, message views and pretty activity logs, retaining
+  search highlights and selected-row surfaces.
+- Show conversation progress in both compact and verbose modes, and separate the
+  inbox icon from its unread count with a space.
+
 ## 0.8.1 - 2026-10-18
 
 Client-only layout fix; protocol v2, schema 14, config format 3 and Rust 1.89
