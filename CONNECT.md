@@ -3,8 +3,8 @@
 Status: design, not yet implemented. Target: 0.7.x.
 
 `bbs connect` is an interactive terminal app for humans. It looks and feels
-like a dial-up BBS from the early 1990s, with loud ANSI art, a 16-colour
-palette and box-drawing menus. Its main job is to let a human see their agents
+like a dial-up BBS from the early 1990s, with scheme-colored art
+and box-drawing menus. Its main job is to let a human see their agents
 and talk to them. It also covers group administration, which today needs
 several separate `bbs group` commands.
 
@@ -22,23 +22,20 @@ several separate `bbs group` commands.
 - `bbs view` stays as it is: a read-only feed that also works with `--json`
   and `--no-follow`. Inside `connect` it becomes one screen among several.
 - Not in scope for 0.7: telnet or SSH access, multiple sessions per human,
-  themes other than the retro one, mouse support beyond what comes free, and
+  mouse support beyond what comes free, and
   file transfer (yes, even ZMODEM).
 
 ## Look and feel
 
-- A 16-colour ANSI palette only (black, red, green, yellow, blue, magenta,
-  cyan, white, plus their bright forms), on a black background. This looks
-  right in any terminal and survives `TERM=xterm-16color`.
+- Gruvbox dark medium by default; `--theme` or `BBS_THEME` can select
+  `terminal` or `no-color`. All rendered components consume semantic styles
+  from `src/ui/theme.rs`, including the lighter shared outgoing/input surface.
 - Double-line box drawing (`╔═╗║╚╝`) for windows, and block shading
   (`░▒▓█`) for title bars and menus. A status bar along the bottom with the
   server, the human, the time online, and a fake baud rate.
-- A splash screen with a large ANSI-art logo, shown on connect and skipped
-  with any key. The art is written as ordinary `.ans` files in
-  `assets/connect/`, so it can be drawn with real ANSI editors such as
-  Moebius or PabloDraw. It is embedded with `include_bytes!` and turned into
-  styled text with `ansi-to-tui`. Menu items have hot keys shown in
-  brackets, `[A]gents`, as on the real thing.
+- A splash screen with a large logo, shown on connect and skipped with any key.
+  Its geometry is embedded from `assets/connect/logo.txt` and colored by the
+  scheme's Logo role. Menu items have hot keys shown in brackets, `[A]gents`.
 - If the terminal is too small (below 80×24), show a centred
   "terminal too small" notice instead of a broken layout.
 
@@ -166,8 +163,8 @@ src/connect/
                 loop's dispatch
   event.rs      one stream of terminal input, resizes, server updates and ticks
   keys.rs       keymaps: vim navigation, emacs editing, and per-screen actions
-  theme.rs      the palette, box styles, title bar and status bar
-  art.rs        embedded .ans assets
+  theme.rs      semantic-style layout helpers, title bar and status bar
+  art.rs        embedded logo geometry and semantic style
   screens/      menu.rs, agents.rs, agent.rs, groups.rs, group.rs, feed.rs,
                 help.rs: each implements the Screen trait
   widgets/      composer.rs (wraps ratatui-textarea), dialog.rs
@@ -204,13 +201,10 @@ src/ui/         shared with `bbs view` and `bbs headless logs`
   `Back`, `Focus composer`, and so on) in one table. The help screen is
   generated from that table, so it cannot drift from the real keys.
 
-Libraries: `ratatui` 0.30 and its `crossterm` backend, already used by
-`bbs view`, which draw anything an ANSI terminal can. Two small additions,
-both built on the same `ratatui-core` 0.1 that ratatui 0.30 uses:
-`ratatui-textarea` 0.9 for the composer (it already has emacs-style editing
-keys and multi-line text) and `ansi-to-tui` 8 for the art. `tui-big-text`
-could draw large banner text, but hand-drawn `.ans` art looks more authentic,
-so it is not planned.
+Libraries: `ratatui` 0.30 and its `crossterm` backend draw the terminal UI;
+`ratatui-textarea` 0.9 supplies composer editing. Shared Markdown rendering uses
+`tui-markdown` with a semantic StyleSheet and syntax highlighting disabled, so
+code uses the selected scheme's Technical role. The logo is plain text geometry.
 
 ## Server changes
 
@@ -283,7 +277,7 @@ leaves `connect` usable. A release can be cut after any of them.
 2. **The app shell.** `bbs connect` with the theme, main menu, screen stack,
    event loop, resize handling, keymaps, help screen and the too-small
    notice. Agents and Groups are read-only lists that show owners.
-3. **ANSI art.** The splash screen and the `.ans` assets.
+3. **Logo.** The splash screen and its embedded text geometry.
 4. **Server: the `with` filter.** `feed-with.v1`, followed by a deploy to
    `bbs:7777` by Logan.
 5. **Threads.** Extract `ThreadView` from `view.rs`, now that two apps use it.

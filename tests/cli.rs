@@ -3464,3 +3464,48 @@ both_modes!(
     headless_run_takes_over_an_owned_agent,
     headless_signals_during_setup_stop_the_harness,
 );
+
+#[test]
+fn themes_are_local_and_redirected_pretty_logs_stay_plain() {
+    let bbs = Bbs::new("theme-output");
+    let dir = bbs.home.join(".local/state/bbs/headless/zed");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("log.jsonl"),
+        "{\"event\":\"text\",\"text\":\"**body**\"}\n{\"event\":\"error\",\"message\":\"failure\"}\n"
+    ).unwrap();
+    for theme in ["gruvbox-dark-medium", "terminal", "no-color"] {
+        let out = bbs
+            .command(&["--theme", theme, "headless", "logs", "Zed", "--pretty"])
+            .env("BBS_THEME", "invalid-ignored-by-cli")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            text.contains("**body**") && text.contains("failure"),
+            "{text}"
+        );
+        assert!(!text.contains('\x1b'));
+    }
+    let invalid = bbs
+        .command(&["headless", "logs", "Zed", "--pretty"])
+        .env("BBS_THEME", "invalid")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("unknown theme"));
+    let env = bbs
+        .command(&["headless", "logs", "Zed", "--pretty"])
+        .env("BBS_THEME", "terminal")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(env.status.success());
+    assert!(!env.stdout.contains(&0x1b));
+}

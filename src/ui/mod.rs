@@ -1,7 +1,9 @@
 //! Rendering shared by `bbs view`, `bbs headless logs` and `bbs connect`.
 
 pub mod activity;
+pub mod markdown;
 pub mod message;
+pub mod theme;
 pub mod thread;
 
 use ratatui::backend::IntoCrossterm as _;

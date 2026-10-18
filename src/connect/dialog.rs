@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
-use ratatui::style::{Color, Modifier, Stylize};
+use ratatui::style::{Modifier, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 
@@ -93,7 +93,7 @@ impl Dialog {
         let mut lines = vec![Line::raw(self.message.clone()), Line::raw("")];
         for (i, field) in self.fields.iter().enumerate() {
             let focused = i == self.focus;
-            let mut value = Span::styled(field.value.clone(), theme::base().fg(Color::White));
+            let mut value = Span::styled(field.value.clone(), theme::style(theme::Role::Text));
             if focused {
                 value = value.add_modifier(Modifier::UNDERLINED);
             }
@@ -122,7 +122,7 @@ impl Dialog {
             .areas(row);
         let block = Block::bordered()
             .border_type(BorderType::Thick)
-            .border_style(theme::base().fg(theme::HOTKEY))
+            .border_style(theme::style(theme::Role::Hotkey))
             .title(Span::styled(format!(" {} ", self.title), theme::heading()))
             .style(theme::base());
         frame.render_widget(Clear, rect);

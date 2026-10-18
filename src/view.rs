@@ -2,6 +2,7 @@
 //! TUI, plain text, or JSONL. It never archives anything, so watching does not
 //! consume anyone's mail.
 
+use crate::ui::theme::{Role, style};
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::Stylize;
+use ratatui::style::Styled;
 use ratatui::text::Line;
 use ratatui::{DefaultTerminal, Frame};
 use serde::Serialize;
@@ -311,6 +312,10 @@ impl ViewState {
     }
 
     fn render(&mut self, frame: &mut Frame) {
+        frame.render_widget(
+            ratatui::widgets::Block::new().style(style(Role::Screen)),
+            frame.area(),
+        );
         let [title_area, feed_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(frame.area());
         // Lay out first, so the title reflects this frame.
@@ -321,11 +326,11 @@ impl ViewState {
     }
 
     fn title(&self) -> Line<'static> {
-        let mut spans = vec![" bbs view ".bold().reversed()];
+        let mut spans = vec![" bbs view ".set_style(style(Role::TitleBar))];
         if let Some(prompt) = &self.prompt {
             spans.push(format!("  /{prompt}").into());
-            spans.push("█".dark_gray());
-            spans.push("  Enter search · Esc cancel".dark_gray());
+            spans.push("█".set_style(style(Role::Muted)));
+            spans.push("  Enter search · Esc cancel".set_style(style(Role::Muted)));
             return Line::from(spans);
         }
         let state = match self.paused {
@@ -333,11 +338,13 @@ impl ViewState {
             Some(_) if self.new_count > 0 => format!("paused · {} new · G follows", self.new_count),
             Some(_) => "paused · G follows".to_string(),
         };
-        spans.push(format!("  {} messages · {state}", self.rows.len()).dark_gray());
+        spans.push(
+            format!("  {} messages · {state}", self.rows.len()).set_style(style(Role::Muted)),
+        );
         if let Some((query, hits)) = self.search_status() {
-            spans.push(format!(" · /{query}: {hits} matches · n/N").dark_gray());
+            spans.push(format!(" · /{query}: {hits} matches · n/N").set_style(style(Role::Muted)));
         }
-        spans.push("  ↑↓ PgUp/PgDn g/G scroll · / search · q quit".dark_gray());
+        spans.push("  ↑↓ PgUp/PgDn g/G scroll · / search · q quit".set_style(style(Role::Muted)));
         Line::from(spans)
     }
 }
@@ -352,6 +359,18 @@ mod tests {
     use ratatui::style::Modifier;
     use ratatui::text::Span;
     use std::collections::HashSet;
+
+    #[test]
+    fn standalone_feed_uses_each_scheme() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                renders_headers_and_markdown();
+                search_jumps_between_matches_and_highlights();
+                prompt_escape_cancels_instead_of_quitting();
+            });
+        }
+    }
 
     fn row(group: Option<&str>, to: Option<&str>, read_at: Option<&str>, body: &str) -> Message {
         Message {
@@ -393,6 +412,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| view.render(f)).unwrap();
         let buffer = terminal.backend().buffer();
+        crate::ui::theme::testing::assert_buffer(buffer);
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)

@@ -1,10 +1,11 @@
 //! A headless agent's event log as styled lines: what `bbs headless logs
 //! --pretty` prints.
 
+use crate::ui::theme::{Role, style};
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::{Map, Value};
 
@@ -45,7 +46,7 @@ impl Activity {
     /// One log line as styled lines; none for hidden records.
     pub fn render(&mut self, line: &str) -> Vec<Line<'static>> {
         let Ok(Value::Object(r)) = serde_json::from_str::<Value>(line) else {
-            return styled(line.trim_end_matches('\n'), Style::new());
+            return styled(line.trim_end_matches('\n'), style(Role::Text));
         };
         let time = super::clock(str_field(&r, "ts"), self.local);
         let text = str_field(&r, "text");
@@ -83,18 +84,18 @@ impl Activity {
                     ""
                 };
                 let line = format!("{time} mail from {}{queued}", from.join(", "));
-                self.line(&mut out, &line, Style::new().fg(Color::Yellow));
+                self.line(&mut out, &line, style(Role::Warning));
             }
             "prompt" => {
                 out.push(Line::default());
                 let header = format!("━━ {time} turn ━━");
-                self.line(&mut out, &header, Style::new().fg(Color::Cyan).bold());
-                self.block(&mut out, mail_part(text), Style::new());
+                self.line(&mut out, &header, style(Role::Accent).bold());
+                self.block(&mut out, mail_part(text), style(Role::Text));
             }
             "steer" => {
                 let line = format!("{time} mail steered into the turn:");
-                self.line(&mut out, &line, Style::new().fg(Color::Cyan));
-                self.block(&mut out, mail_part(text), Style::new());
+                self.line(&mut out, &line, style(Role::Accent));
+                self.block(&mut out, mail_part(text), style(Role::Text));
             }
             "thought" => {
                 for line in text.trim_end().lines() {
@@ -110,40 +111,40 @@ impl Activity {
             "tool" => self.tool(&mut out, &r),
             "permission" => {
                 let line = format!("{time} permission {}", rest(&r));
-                self.line(&mut out, &line, Style::new().fg(Color::Yellow).bold());
+                self.line(&mut out, &line, style(Role::Warning).bold());
             }
             "turn_end" => {
                 let line = format!("{time} turn end ({})", str_field(&r, "stop_reason"));
-                self.line(&mut out, &line, Style::new().fg(Color::Green).bold());
+                self.line(&mut out, &line, style(Role::Success).bold());
             }
             "turn_error" | "error" => {
                 let line = format!("{time} {}: {message}", str_field(&r, "event"));
-                self.line(&mut out, &line, Style::new().fg(Color::Red).bold());
+                self.line(&mut out, &line, style(Role::Error).bold());
             }
             "warning" => {
                 let line = format!("{time} warning: {message}");
-                self.line(&mut out, &line, Style::new().fg(Color::Yellow).bold());
+                self.line(&mut out, &line, style(Role::Warning).bold());
             }
-            "cancel" => self.line(
-                &mut out,
-                &format!("{time} cancel"),
-                Style::new().fg(Color::Yellow),
-            ),
+            "cancel" => self.line(&mut out, &format!("{time} cancel"), style(Role::Warning)),
             "stop" => match r.get("error").and_then(Value::as_str) {
                 Some(err) => {
                     let line = format!("{time} stopped: {err}");
-                    self.line(&mut out, &line, Style::new().fg(Color::Red).bold());
+                    self.line(&mut out, &line, style(Role::Error).bold());
                 }
-                None => self.line(&mut out, &format!("{time} stopped"), Style::new().bold()),
+                None => self.line(
+                    &mut out,
+                    &format!("{time} stopped"),
+                    style(Role::Text).bold(),
+                ),
             },
             "unprocessed" => {
                 let line = format!("{time} unprocessed mail:");
-                self.line(&mut out, &line, Style::new().fg(Color::Yellow).bold());
-                self.block(&mut out, text, Style::new());
+                self.line(&mut out, &line, style(Role::Warning).bold());
+                self.block(&mut out, text, style(Role::Text));
             }
             event => {
                 let line = format!("{time} {event} {}", rest(&r));
-                self.line(&mut out, &line, Style::new());
+                self.line(&mut out, &line, style(Role::Text));
             }
         }
         out
@@ -214,9 +215,9 @@ impl Activity {
             .map(|(start, end)| format!(" ({:.1}s)", (end - start).as_seconds_f64()))
             .unwrap_or_default();
         let (mark, style) = match status {
-            "completed" => ("✓", Style::new().fg(Color::Green)),
-            "failed" => ("✗", Style::new().fg(Color::Red)),
-            _ => ("•", Style::new()),
+            "completed" => ("✓", style(Role::Success)),
+            "failed" => ("✗", style(Role::Error)),
+            _ => ("•", style(Role::Text)),
         };
         let line = format!("  {mark} {name} {status}{took}");
         self.line(out, &line, style);
@@ -236,9 +237,9 @@ impl Activity {
     /// Markdown as styled lines, or the source text.
     fn markdown(&self, out: &mut Vec<Line<'static>>, text: &str) {
         if !self.markdown {
-            return self.block(out, text, Style::new());
+            return self.block(out, text, style(Role::Text));
         }
-        for line in tui_markdown::from_str(text.trim_end()).lines {
+        for line in crate::ui::markdown::render(text.trim_end()).lines {
             let spans = line
                 .spans
                 .iter()
@@ -256,7 +257,7 @@ fn styled(text: &str, style: Style) -> Vec<Line<'static>> {
 }
 
 fn dim() -> Style {
-    Style::new().add_modifier(Modifier::DIM)
+    style(Role::Muted)
 }
 
 fn str_field<'a>(r: &'a Map<String, Value>, key: &str) -> &'a str {

@@ -7,7 +7,7 @@ use std::hash::Hash;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Style, Stylize};
+use ratatui::style::{Style, Styled};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 
@@ -340,7 +340,10 @@ impl<R: Row> ThreadView<R> {
         let top = self.top();
         if self.rows.is_empty() {
             frame.render_widget(
-                Paragraph::new("No messages yet. Waiting…".dark_gray()),
+                Paragraph::new(
+                    "No messages yet. Waiting…"
+                        .set_style(super::theme::style(super::theme::Role::Muted)),
+                ),
                 area,
             );
             return;

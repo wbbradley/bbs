@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Block, BorderType};
 use ratatui_textarea::{TextArea, WrapMode};
 
@@ -126,17 +126,18 @@ impl Composer {
         };
         let border = match (&self.error, focused) {
             (Some(_), _) => theme::error(),
-            (None, true) => theme::base(),
+            (None, true) => theme::style(theme::Role::Text),
             (None, false) => theme::dim(),
         };
         self.text.set_block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
+                .style(theme::style(theme::Role::HumanSurface))
                 .border_style(border)
                 .title(title),
         );
         let cursor = if focused {
-            Style::new().add_modifier(Modifier::REVERSED)
+            theme::style(theme::Role::Cursor)
         } else {
             Style::new()
         };
@@ -149,13 +150,58 @@ fn blank() -> TextArea<'static> {
     let mut text = TextArea::default();
     text.set_wrap_mode(WrapMode::WordOrGlyph);
     text.set_cursor_line_style(Style::new());
-    text.set_style(theme::base());
+    text.set_style(theme::style(theme::Role::HumanSurface));
+    text.set_selection_style(theme::style(theme::Role::Selection));
+    text.set_placeholder_style(theme::style(theme::Role::Muted));
     text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_and_padding_share_the_human_surface() {
+        use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
+        use ratatui::{Terminal, backend::TestBackend};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let mut composer = Composer::new("Mateo");
+                typed(
+                    &mut composer,
+                    "a wrapped input with enough text to fill several lines",
+                );
+                for focused in [false, true] {
+                    let mut terminal = Terminal::new(TestBackend::new(24, 8)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            frame.render_widget(Block::new().style(theme::base()), frame.area());
+                            composer.render(frame, frame.area(), focused, true);
+                        })
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    assert_buffer(buffer);
+                    let surface = theme::style(theme::Role::HumanSurface)
+                        .bg
+                        .or(theme::base().bg)
+                        .unwrap();
+                    for y in 1..7 {
+                        for x in 1..23 {
+                            let cell = &buffer[(x, y)];
+                            assert!(
+                                cell.bg == surface
+                                    || (focused
+                                        && cell.bg
+                                            == theme::style(theme::Role::Cursor)
+                                                .bg
+                                                .unwrap_or(surface))
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     fn press(composer: &mut Composer, code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
         composer.key(KeyEvent::new(code, modifiers), 1)

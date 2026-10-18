@@ -4,7 +4,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table, TableState};
 
@@ -205,19 +205,20 @@ impl Screen for Agents {
             .clamp(11, 16);
         let status_width = inner
             .width
-            .saturating_sub(10 + 9 + 5 + 8 + groups_width + 19 + 6) as usize;
+            .saturating_sub(10 + 9 + 5 + 8 + groups_width + 19 + 6)
+            as usize;
         let rows = shown.iter().map(|a| {
             let owner = a.owner.as_deref().unwrap_or("?");
-            let color = if owner == ctx.me {
-                theme::OWN_AGENT
+            let author_style = if owner == ctx.me {
+                theme::style(theme::Role::OwnAgent)
             } else {
-                theme::OTHER_AGENT
+                theme::style(theme::Role::OtherAgent)
             };
             let name = Line::from(vec![Span::styled(
                 a.name.clone(),
-                Style::new().fg(color).add_modifier(Modifier::BOLD),
+                author_style.add_modifier(Modifier::BOLD),
             )]);
-            let owner = Line::from(vec![Span::styled(owner.to_string(), Style::new().fg(color))]);
+            let owner = Line::from(vec![Span::styled(owner.to_string(), author_style)]);
             let summary = self.summary(&a.name);
             Row::new(vec![
                 name,
@@ -254,7 +255,7 @@ impl Screen for Agents {
             .style(theme::heading()),
         )
         .style(theme::base())
-        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        .row_highlight_style(theme::style(theme::Role::Selection));
         if self.state.selected().is_none() {
             self.state.select(Some(0));
         }

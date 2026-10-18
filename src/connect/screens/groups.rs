@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Row, Table, TableState};
 
@@ -158,9 +158,7 @@ impl Groups {
             Row::new(vec![
                 Line::styled(
                     format!("@{}", g.name),
-                    Style::new()
-                        .fg(Color::LightYellow)
-                        .add_modifier(Modifier::BOLD),
+                    theme::style(theme::Role::Hotkey).add_modifier(Modifier::BOLD),
                 ),
                 Line::raw(fit(g.description.as_deref().unwrap_or_default(), 30)),
                 Line::raw(fit_list(&members(g), members_width)),
@@ -176,7 +174,7 @@ impl Groups {
         )
         .header(Row::new(["GROUP", "DESCRIPTION", "MEMBERS ([w] writes)"]).style(theme::heading()))
         .style(theme::base())
-        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        .row_highlight_style(theme::style(theme::Role::Selection));
         if self.state.selected().is_none() {
             self.state.select(Some(0));
         }
