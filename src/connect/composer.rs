@@ -175,16 +175,29 @@ impl Composer {
         let small = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
         self.text
             .move_cursor(CursorMove::Jump(small(target.0), small(target.1)));
-        while self.text.cursor().0 < target.0 {
+        // Each step is bounded and checked: a native movement can be inert at
+        // a grapheme boundary even when its logical character offset differs.
+        for _ in self.text.cursor().0..target.0 {
+            let before = self.text.cursor();
             self.text.move_cursor(CursorMove::Down);
+            if self.text.cursor().0 <= before.0 {
+                return;
+            }
+        }
+        if self.text.cursor().0 != target.0 {
+            return;
         }
         if self.text.cursor().1 < target.1 {
-            while self.text.cursor().1 < target.1 {
-                self.text.move_cursor(CursorMove::Forward);
-            }
-        } else {
-            while self.text.cursor().1 > target.1 {
-                self.text.move_cursor(CursorMove::Back);
+            // End addresses the exact logical boundary, unlike Forward from a
+            // u16-clamped offset inside a trailing combining grapheme.
+            self.text.move_cursor(CursorMove::End);
+        }
+        for _ in target.1..self.text.cursor().1 {
+            let before = self.text.cursor();
+            self.text.move_cursor(CursorMove::Back);
+            let after = self.text.cursor();
+            if after.0 != target.0 || after.1 >= before.1 {
+                return;
             }
         }
     }
@@ -461,6 +474,38 @@ mod tests {
             "a hard newline needs no extra blank row"
         );
         assert_eq!(layout.point(c.text.cursor()), Point { row: 1, col: 0 });
+    }
+
+    #[test]
+    fn large_combining_tail_moves_to_its_logical_end_without_forward_looping() {
+        let mut c = Composer::new("Mateo");
+        c.text = TextArea::new(vec![format!("{}\u{301}", "x".repeat(65_535))]);
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            c.text.cancel_selection();
+            c.jump(DataCursor(0, 65_527));
+            draw(&mut c, 8, 4);
+            let layout = c.layout(8);
+            let from = layout.point(c.text.cursor());
+            assert_eq!(
+                layout.source(Point {
+                    row: from.row + 1,
+                    col: from.col
+                }),
+                DataCursor(0, 65_536)
+            );
+            // Every movement in jump has a finite range and a no-progress guard.
+            press(&mut c, KeyCode::Down, modifiers);
+            assert_eq!(c.text.cursor(), (0, 65_536));
+            assert_eq!(
+                c.text.selection_range(),
+                if modifiers.is_empty() {
+                    None
+                } else {
+                    Some(((0, 65_527), (0, 65_536)))
+                }
+            );
+            assert_eq!(c.text.lines()[0].chars().count(), 65_536);
+        }
     }
 
     #[test]
