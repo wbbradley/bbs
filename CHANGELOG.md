@@ -12,7 +12,8 @@ under the new package version and its publication date.
 
 - `bbs connect` turns on bracketed paste, so a paste with newlines lands in
   the composer as one undoable edit instead of sending its first line and
-  leaving the rest behind. Search and dialog fields take a paste on one line.
+  leaving the rest behind. Search and dialog fields take a paste on one line
+  (#91).
 
 ## 0.9.0 - 2026-10-18
 
