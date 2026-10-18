@@ -15,28 +15,23 @@ const HEADER_NAMES: [usize; 2] = [2, 4];
 /// missing before it, the header, and the indented markdown body, with
 /// `query` matches highlighted in the names and body.
 pub fn message_lines<'a>(row: &'a Message, gap: bool, query: Option<&str>) -> Vec<Line<'a>> {
-    with_header(row, gap, query, header(row))
+    with_header(row, gap, query, Some(header(row)))
 }
 
-/// The same body and search rendering, with only the timestamp as its header.
+/// The same body and search rendering, without a header.
 pub fn compact_message_lines<'a>(
     row: &'a Message,
     gap: bool,
     query: Option<&str>,
 ) -> Vec<Line<'a>> {
-    with_header(
-        row,
-        gap,
-        query,
-        Line::styled(local_time(&row.created_at), style(Role::Muted)),
-    )
+    with_header(row, gap, query, None)
 }
 
 fn with_header<'a>(
     row: &'a Message,
     gap: bool,
     query: Option<&str>,
-    mut header: Line<'static>,
+    mut header: Option<Line<'static>>,
 ) -> Vec<Line<'a>> {
     let mut body = Vec::new();
     for mut line in crate::ui::markdown::render(&row.body).lines {
@@ -44,15 +39,16 @@ fn with_header<'a>(
         body.push(line);
     }
     if let Some(query) = query {
-        header.spans = header
-            .spans
-            .into_iter()
-            .enumerate()
-            .flat_map(|(i, span)| match HEADER_NAMES.contains(&i) {
-                true => highlight(span, query),
-                false => vec![span],
-            })
-            .collect();
+        if let Some(header) = &mut header {
+            header.spans = std::mem::take(&mut header.spans)
+                .into_iter()
+                .enumerate()
+                .flat_map(|(i, span)| match HEADER_NAMES.contains(&i) {
+                    true => highlight(span, query),
+                    false => vec![span],
+                })
+                .collect();
+        }
         for line in &mut body {
             line.spans = std::mem::take(&mut line.spans)
                 .into_iter()
@@ -69,7 +65,7 @@ fn with_header<'a>(
     [Line::default()]
         .into_iter()
         .chain(marker)
-        .chain([header])
+        .chain(header)
         .chain(body)
         .collect()
 }
@@ -201,14 +197,6 @@ fn name_span(name: &str, kind: Kind) -> Span<'static> {
     Span::styled(name.to_string(), style(author).add_modifier(Modifier::BOLD))
 }
 
-/// A stored time in local time, as message headers show it.
-pub fn local_time(stored: &str) -> String {
-    local(stored).map_or_else(
-        || stored.to_string(),
-        |t| t.format("%Y-%m-%d %H:%M:%S").to_string(),
-    )
-}
-
 fn local(stored: &str) -> Option<DateTime<Local>> {
     DateTime::parse_from_rfc3339(stored)
         .ok()
@@ -242,7 +230,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compact_headers_only_show_time_and_keep_body_styles_and_search() {
+    fn compact_omits_headers_and_keeps_body_styles_search_and_gap_markers() {
         let row = Message {
             created_at: "2026-10-16T18:00:00Z".into(),
             from_name: "Mateo".into(),
@@ -252,9 +240,17 @@ mod tests {
         };
         let full = message_lines(&row, false, Some("answer"));
         let compact = compact_message_lines(&row, false, Some("answer"));
-        assert_eq!(compact[1].to_string(), local_time(&row.created_at));
-        assert_eq!(&compact[2..], &full[2..]);
-        let answer = compact[2]
+        assert_eq!(&compact[1..], &full[2..]);
+        assert_eq!(compact.len() + 1, full.len());
+        assert!(
+            compact
+                .iter()
+                .all(|line| !line.to_string().contains("2026-"))
+        );
+        let with_gap = compact_message_lines(&row, true, Some("answer"));
+        assert!(with_gap[1].to_string().contains("messages may be missing"));
+        assert_eq!(&with_gap[2..], &compact[1..]);
+        let answer = compact[1]
             .spans
             .iter()
             .find(|s| s.content == "answer")

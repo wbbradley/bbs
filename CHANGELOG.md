@@ -23,6 +23,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
+- Compact agent conversations omit message headers and timestamps, with a dark separator above outgoing messages. Composer targets use a semantic orange color and key hints use a distinct italic style.
+
 - The `bbs connect` textbox has one blank row above its hint, using the same themed surface while keeping the text area and scrolling unchanged (#89).
 
 - The Agents list in `bbs connect` shows how long ago each agent last sent a message or posted an activity event, as an age with at most two day/hour/minute units (`14m ago`, `3d4h ago`, never `3d4h17m ago`), instead of a full timestamp (#88). The age updates live over the summary stream, and an agent with no known sent event shows `-`.

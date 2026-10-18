@@ -26,7 +26,7 @@ const MAX_RECORDS: usize = 5000;
 pub enum Entry {
     Message {
         message: Message,
-        /// Use a timestamp-only header in compact conversations.
+        /// Omit message headers in compact conversations.
         compact: bool,
         outgoing: bool,
         /// A possible gap in the raw feed before this visible message.
@@ -87,6 +87,18 @@ impl Row for Entry {
             Entry::Message { outgoing: true, .. } => theme::style(theme::Role::HumanSurface),
             _ => Style::default(),
         }
+    }
+
+    fn separator_style(&self) -> Option<Style> {
+        matches!(
+            self,
+            Entry::Message {
+                compact: true,
+                outgoing: true,
+                ..
+            }
+        )
+        .then(|| theme::style(theme::Role::Screen))
     }
 
     fn matches(&self, query: &str) -> bool {
@@ -306,8 +318,14 @@ mod tests {
 
     #[test]
     fn outgoing_background_covers_padding_wrapping_and_scrolled_rows() {
-        for compact in [false, true] {
-            for width in [24, 48] {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for (scheme, compact, width) in SCHEMES.into_iter().flat_map(|scheme| {
+            [false, true]
+                .into_iter()
+                .flat_map(move |compact| [24, 48].map(|width| (scheme, compact, width)))
+        }) {
+            with_scheme(scheme, || {
+                let human = theme::base().patch(theme::style(theme::Role::HumanSurface));
                 let make = |id, outgoing, body: &str| Entry::Message {
                     message: Message {
                         id,
@@ -354,29 +372,33 @@ mod tests {
                         let cell = &buffer[(x, y)];
                         assert_eq!(
                             cell.bg,
-                            if (start..end).contains(&y) {
-                                theme::style(theme::Role::HumanSurface).bg.unwrap()
+                            if (start..end).contains(&y) && !(compact && y == start) {
+                                human.bg.unwrap()
                             } else {
                                 theme::base().bg.unwrap()
                             },
                             "at {x},{y}, compact={compact}"
                         );
-                        if (start..end).contains(&y) && cell.symbol() != " " {
-                            assert_ne!(
-                                cell.fg,
-                                theme::style(theme::Role::HumanSurface).bg.unwrap(),
-                                "text must remain readable"
-                            );
+                        if (start..end).contains(&y)
+                            && cell.symbol() != " "
+                            && theme::base().fg != theme::base().bg
+                        {
+                            assert_ne!(cell.fg, human.bg.unwrap(), "text must remain readable");
                         }
                     }
                 }
                 for y in [start, end - 1] {
                     assert!((0..width).all(|x| buffer[(x, y)].symbol() == " "));
                 }
-                assert_eq!(
-                    buffer[(0, start + 1)].fg,
-                    theme::style(theme::Role::Muted).fg.unwrap()
-                );
+                if !compact {
+                    assert_eq!(
+                        buffer[(0, start + 1)].fg,
+                        theme::style(theme::Role::Muted)
+                            .fg
+                            .or(theme::base().fg)
+                            .unwrap()
+                    );
+                }
                 assert!(buffer.content.iter().any(|c| c.symbol() == "n"
                     && c.modifier.contains(Modifier::BOLD | Modifier::REVERSED)));
                 // The same full-row background survives a viewport clipped into the message.
@@ -385,6 +407,19 @@ mod tests {
                     .resize(ratatui::layout::Rect::new(0, 0, width, 3))
                     .unwrap();
                 view.layout(width, 3);
+                view.scroll_to(usize::from(start));
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(Block::new().style(theme::base()), frame.area());
+                        view.render(frame, frame.area());
+                    })
+                    .unwrap();
+                assert!((0..width).all(|x| terminal.backend().buffer()[(x, 0)].bg
+                    == if compact {
+                        theme::base().bg.unwrap()
+                    } else {
+                        human.bg.unwrap()
+                    }));
                 view.scroll_to(usize::from(start) + 2);
                 terminal
                     .draw(|frame| {
@@ -398,9 +433,9 @@ mod tests {
                         .buffer()
                         .content
                         .iter()
-                        .all(|c| c.bg == theme::style(theme::Role::HumanSurface).bg.unwrap())
+                        .all(|c| c.bg == human.bg.unwrap())
                 );
-            }
+            });
         }
     }
 }

@@ -83,8 +83,10 @@ shares its activity, wherever it runs: `bbs headless run` sends it to the
 server unless its harness sets `share_activity = false` (see Server changes).
 
 Agent conversations default to compact view, showing direct messages between
-that agent and the connected human, with just the timestamp above each message. In both views, the connected human's outgoing
-messages have a lighter background, including one blank row above and below.
+that agent and the connected human, without message headers or timestamps.
+The connected human's outgoing messages have a lighter background and one
+blank row below. Compact view puts a conversation-background separator above
+the body; verbose view keeps its header and lighter blank row above.
 The toggle works while writing and while navigating, preserving the draft,
 cursor and focus. `Ctrl-t` toggles verbose view with the agent's other messages
 and activity; returning to verbose restores the previous `A` and `E` filters.
@@ -155,6 +157,8 @@ and Home/End work everywhere too.
   `Ctrl-p`/`Ctrl-n` previous and next line. `Enter` sends;
   `Alt-Enter` (or `Ctrl-j`) inserts a newline.
 
+The composer's target agent or group uses the theme's Target color (orange in
+Gruvbox); key hints use a distinct italic KeyHint style.
 The composer has no border and uses the same themed surface as your outgoing
 messages, with one blank display row above the hint using the conversation's
 background. It starts with two text rows plus the blank row and hint row and grows up to

@@ -4,6 +4,7 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui_textarea::{CursorMove, DataCursor, TextArea, WrapMode};
 
@@ -206,20 +207,29 @@ impl Composer {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool, agent: bool) {
+        let target = || Span::styled(self.to.as_str(), theme::style(theme::Role::Target));
+        let keys = |text| Span::styled(text, theme::style(theme::Role::KeyHint));
         let title = match (&self.error, self.sending.is_some(), focused) {
-            (Some(e), ..) => format!(" Not sent: {e} "),
-            (None, true, _) => " Sending… ".to_string(),
-            (None, false, true) if agent => {
-                format!(" To {} · Enter sends · PgUp scroll · Esc back ", self.to)
+            (Some(e), ..) => Line::from(format!(" Not sent: {e} ")),
+            (None, true, _) => Line::from(" Sending… "),
+            (None, false, true) => Line::from(vec![
+                Span::raw(" To "),
+                target(),
+                keys(if agent {
+                    " · Enter sends · PgUp scroll · Esc back "
+                } else {
+                    " · Enter sends · Alt-Enter new line · Esc done "
+                }),
+            ]),
+            (None, false, false) if agent => Line::from(vec![
+                Span::raw(" Navigation · "),
+                keys("Esc/i write to "),
+                target(),
+                Span::raw(" "),
+            ]),
+            (None, false, false) => {
+                Line::from(vec![keys(" i: write to "), target(), Span::raw(" ")])
             }
-            (None, false, false) if agent => format!(" Navigation · Esc/i write to {} ", self.to),
-            (None, false, true) => {
-                format!(
-                    " To {} · Enter sends · Alt-Enter new line · Esc done ",
-                    self.to
-                )
-            }
-            (None, false, false) => format!(" i: write to {} ", self.to),
         };
         let surface = theme::style(theme::Role::HumanSurface);
         let hint = match (&self.error, focused) {
@@ -322,6 +332,68 @@ mod tests {
                                                 .bg
                                                 .unwrap_or(surface))
                             );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn title_targets_and_key_hints_use_semantic_styles_for_agents_and_groups() {
+        use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
+        use ratatui::{Terminal, backend::TestBackend, style::Modifier};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                for (to, agent) in [("Mateo", true), ("@crew", false)] {
+                    for focused in [false, true] {
+                        let mut composer = Composer::new(to);
+                        let mut terminal = Terminal::new(TestBackend::new(100, 6)).unwrap();
+                        terminal
+                            .draw(|frame| {
+                                frame
+                                    .render_widget(Block::new().style(theme::base()), frame.area());
+                                composer.render(frame, frame.area(), focused, agent);
+                            })
+                            .unwrap();
+                        let buffer = terminal.backend().buffer();
+                        assert_buffer(buffer);
+                        let title: String = (0..100).map(|x| buffer[(x, 1)].symbol()).collect();
+                        let target_x = title[..title.find(to).unwrap()].chars().count() as u16;
+                        let target = theme::base()
+                            .patch(theme::style(theme::Role::HumanSurface))
+                            .patch(theme::style(theme::Role::Target));
+                        for x in target_x..target_x + to.len() as u16 {
+                            assert_eq!(buffer[(x, 1)].fg, target.fg.unwrap());
+                            assert_eq!(buffer[(x, 1)].bg, target.bg.unwrap());
+                            assert!(!buffer[(x, 1)].modifier.contains(Modifier::ITALIC));
+                        }
+                        let keys_byte = title
+                            .find(if focused {
+                                "Enter"
+                            } else if agent {
+                                "Esc/i"
+                            } else {
+                                "i:"
+                            })
+                            .unwrap();
+                        let keys_x = title[..keys_byte].chars().count() as u16;
+                        let keys = theme::base()
+                            .patch(theme::style(theme::Role::HumanSurface))
+                            .patch(theme::style(theme::Role::KeyHint));
+                        assert_eq!(buffer[(keys_x, 1)].fg, keys.fg.unwrap());
+                        assert_eq!(buffer[(keys_x, 1)].bg, keys.bg.unwrap());
+                        assert!(buffer[(keys_x, 1)].modifier.contains(Modifier::ITALIC));
+                        if focused {
+                            let prefix = title.find("To ").unwrap() as u16;
+                            assert_eq!(
+                                buffer[(prefix, 1)].fg,
+                                theme::style(theme::Role::Text)
+                                    .fg
+                                    .or(theme::base().fg)
+                                    .unwrap()
+                            );
+                            assert!(!buffer[(prefix, 1)].modifier.contains(Modifier::ITALIC));
                         }
                     }
                 }

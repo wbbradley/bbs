@@ -9,7 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Style, Styled};
 use ratatui::text::{Line, Text};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::proto::Message;
 use crate::ui::message::{find_matches, fold, message_lines};
@@ -31,6 +31,10 @@ pub trait Row: PartialEq {
     /// Style applied across each rendered row, including wrapped continuations.
     fn style(&self) -> Style {
         Style::default()
+    }
+    /// Optional full-width surface for a blank first display row.
+    fn separator_style(&self) -> Option<Style> {
+        None
     }
     /// Whether the row matches a case-folded search.
     fn matches(&self, query: &str) -> bool;
@@ -372,6 +376,15 @@ impl<R: Row> ThreadView<R> {
                 .wrap(Wrap { trim: false })
                 .scroll(((visible_start - start).min(u16::MAX as usize) as u16, 0));
             frame.render_widget(paragraph, row_area);
+            if visible_start == start
+                && row_area.height > 0
+                && let Some(style) = row.separator_style()
+            {
+                frame.render_widget(
+                    Block::new().style(style),
+                    Rect::new(row_area.x, row_area.y, row_area.width, 1),
+                );
+            }
             if end >= top + self.frame.height {
                 break;
             }

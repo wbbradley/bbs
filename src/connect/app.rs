@@ -1679,7 +1679,6 @@ mod tests {
             ..message(8, "Mateo", "ada", "owned-recipient-body")
         };
         let direct = message(1, "Mateo", "ada", "**direct-one**");
-        let timestamp = crate::ui::message::local_time(&direct.created_at);
         app.on_event(Event::Data(Data::Feed {
             id: feed,
             result: Ok(vec![
@@ -1751,16 +1750,7 @@ mod tests {
             order(&compact, &["direct-one", "outbound-body", "direct-two"]),
             ["direct-one", "outbound-body", "direct-two"]
         );
-        let headers: Vec<_> = compact
-            .lines()
-            .filter(|line| line.contains(&timestamp))
-            .collect();
-        assert_eq!(headers.len(), 1, "{compact}");
-        assert!(
-            headers
-                .iter()
-                .all(|line| line.trim_matches('║').trim() == timestamp)
-        );
+        assert!(!compact.contains("2026-10-16"), "{compact}");
         app.on_event(Event::Data(Data::Feed {
             id: feed,
             result: Ok(vec![
@@ -1813,7 +1803,7 @@ mod tests {
             rx.try_recv().is_err(),
             "outgoing mail must not mark mail read or activity seen"
         );
-        let assert_background = |app: &mut App, shaded: bool| {
+        let assert_background = |app: &mut App, shaded: bool, compact: bool| {
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
             terminal.draw(|f| app.draw(f)).unwrap();
             let buffer = terminal.backend().buffer();
@@ -1836,16 +1826,24 @@ mod tests {
             );
             assert!((1..99).all(|x| buffer[(x, y)].bg == buffer[(98, y)].bg));
             if shaded {
-                for padding in [y - 2, y + 1] {
-                    assert!((1..99).all(|x| buffer[(x, padding)].bg
-                        == theme::style(theme::Role::HumanSurface).bg.unwrap()
-                        && buffer[(x, padding)].symbol() == " "));
+                for padding in [y - if compact { 1 } else { 2 }, y + 1] {
+                    assert!((1..99).all(|x| {
+                        buffer[(x, padding)].bg
+                            == theme::style(if compact && padding < y {
+                                theme::Role::Screen
+                            } else {
+                                theme::Role::HumanSurface
+                            })
+                            .bg
+                            .unwrap()
+                            && buffer[(x, padding)].symbol() == " "
+                    }));
                 }
             }
         };
-        assert_background(&mut app, true);
+        assert_background(&mut app, true, false);
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert_background(&mut app, true);
+        assert_background(&mut app, true, true);
         assert!(rx.try_recv().is_err());
         // Leave Insert mode, then close the conversation and open the board feed.
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
@@ -1858,7 +1856,7 @@ mod tests {
             id: feed,
             result: Ok(vec![outgoing]),
         }));
-        assert_background(&mut app, false);
+        assert_background(&mut app, false, false);
     }
 
     #[test]
