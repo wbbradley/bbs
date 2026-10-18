@@ -13,6 +13,9 @@ under the new package version and its publication date.
 - `bbs connect` turns on bracketed paste, so a paste with newlines lands in
   the composer as one undoable edit instead of sending its first line and
   leaving the rest behind. Search and dialog fields take a paste on one line.
+- Control messages (`cancel`, effort changes) no longer appear as ordinary
+  messages in feeds or archived history. They still reach the agent's inbox and
+  drive its driver, and effort report correlation is unchanged.
 
 ## 0.9.0 - 2026-10-18
 

@@ -1000,7 +1000,8 @@ pub fn archived_since(
     limit: Option<u32>,
 ) -> Result<Vec<MessageView>> {
     let sql = format!(
-        "{INBOX_SELECT} AND d.archived_at IS NOT NULL AND (?3 IS NULL OR m.created_at >= ?3)
+        "{INBOX_SELECT} AND d.archived_at IS NOT NULL AND m.control IS NULL
+         AND (?3 IS NULL OR m.created_at >= ?3)
          ORDER BY m.created_at, m.id LIMIT ?4"
     );
     let limit = limit.map_or(i64::MAX, i64::from);
@@ -1225,6 +1226,9 @@ fn feed_predicates(filter: &FeedFilter, expanded: Expanded) -> (String, Args) {
         clauses.push("m.id > ?".into());
         args.push(Value::Integer(after));
     }
+    // Control messages (cancel, set-effort) act through the inbox and are
+    // never ordinary feed or history content.
+    clauses.push("m.control IS NULL".into());
     let mut sql = String::new();
     for clause in clauses {
         sql.push_str(" AND ");
@@ -2186,6 +2190,92 @@ mod tests {
             .map(|m| m.body)
             .collect();
         assert_eq!(bodies, ["direct"]);
+    }
+
+    #[test]
+    fn controls_are_delivered_live_but_never_feed_or_history_content() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let t = "2026-10-09T00:00:00.000000Z";
+        let will = Principal {
+            kind: Kind::Human,
+            id: insert_human(&conn, "will", t).unwrap(),
+            name: "will".into(),
+        };
+        let bram = Principal {
+            kind: Kind::Agent,
+            id: insert_agent(
+                &conn,
+                &NewAgent {
+                    name: "Bram",
+                    token: "t",
+                    owner_id: will.id,
+                    status: None,
+                    pwd: "/",
+                    hostname: "h",
+                    now: t,
+                },
+            )
+            .unwrap(),
+            name: "Bram".into(),
+        };
+        let ordinary = insert_message(&conn, &will, None, "hi Bram", t).unwrap();
+        insert_delivery(&conn, ordinary, Kind::Agent, bram.id).unwrap();
+        for control in ["cancel", "set-effort"] {
+            let m = insert_message(&conn, &will, None, control, t).unwrap();
+            set_message_control(&conn, m, control).unwrap();
+            insert_delivery(&conn, m, Kind::Agent, bram.id).unwrap();
+        }
+        // Default feed, cursor continuation, and a one-row window all exclude
+        // controls without crowding out ordinary mail.
+        for filter in [
+            FeedFilter::default(),
+            FeedFilter {
+                after_id: Some(0),
+                ..Default::default()
+            },
+        ] {
+            let bodies: Vec<_> = feed_messages(&conn, 10, &filter)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.body)
+                .collect();
+            assert_eq!(bodies, ["hi Bram"]);
+        }
+        let bodies: Vec<_> = feed_messages(&conn, 1, &FeedFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
+        assert_eq!(bodies, ["hi Bram"]);
+        // Live delivery still hands both controls to the driver, and report
+        // correlation still finds the set-effort one.
+        let delivered: Vec<_> = take_unread(&conn, &bram, None, "2026-10-09T01:00:00.000000Z")
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.body, m.control))
+            .collect();
+        assert_eq!(
+            delivered,
+            [
+                ("hi Bram".to_string(), None),
+                ("cancel".to_string(), Some("cancel".to_string())),
+                ("set-effort".to_string(), Some("set-effort".to_string())),
+            ]
+        );
+        assert!(effort_control_body(&conn, bram.id, ordinary).unwrap().is_none());
+        let set_effort = ordinary + 2;
+        assert_eq!(
+            effort_control_body(&conn, bram.id, set_effort).unwrap().as_deref(),
+            Some("set-effort")
+        );
+        // Archived history excludes controls too.
+        let history: Vec<_> = archived_since(&conn, &bram, None, None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
+        assert_eq!(history, ["hi Bram"]);
     }
 
     #[test]
