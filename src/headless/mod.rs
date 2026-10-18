@@ -3,6 +3,7 @@
 
 mod acp;
 mod codex;
+mod effort;
 mod harness;
 mod log;
 mod mcp;

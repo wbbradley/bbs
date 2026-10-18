@@ -14,10 +14,15 @@ use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 
-use super::harness::{Event, MAX_INPUT_CHARS, SETUP_TIMEOUT, truncate};
+use super::effort;
+use super::harness::{
+    EffortUnconfirmed, Event, MAX_INPUT_CHARS, PromptNotStarted, SETUP_TIMEOUT, truncate,
+};
 use super::mcp::{Tools, tool_list};
 use super::rpc::{Incoming, Process, Rpc};
 use super::settings::HarnessConfig;
+use crate::proto::effort_outcome::Result as Outcome;
+use crate::proto::{EffortRequest, EffortState};
 
 /// Longest wait for a starting turn's id before steering or interrupting it.
 const TURN_ID_WAIT: Duration = Duration::from_secs(10);
@@ -63,10 +68,60 @@ struct Turn {
     done: Option<oneshot::Sender<Result<String>>>,
 }
 
+struct CodexEffort {
+    state: EffortState,
+    models: Vec<Value>,
+    model: String,
+    current: Option<String>,
+}
+
+impl Default for CodexEffort {
+    fn default() -> Self {
+        Self {
+            state: effort::unavailable("model effort metadata unavailable"),
+            models: Vec::new(),
+            model: String::new(),
+            current: None,
+        }
+    }
+}
+
+impl CodexEffort {
+    fn refresh(&mut self) {
+        let choices = self
+            .models
+            .iter()
+            .find(|m| m["model"] == self.model || m["id"] == self.model)
+            .and_then(|m| m["supportedReasoningEfforts"].as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|item| {
+                        let value = item["reasoningEffort"].as_str()?;
+                        Some(effort::choice(value, value, false, true))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.state = EffortState {
+            supported: !choices.is_empty(),
+            choices,
+            current: self.current.clone(),
+            reason: if self.model.is_empty() {
+                "model effort metadata unavailable".into()
+            } else {
+                String::new()
+            },
+        };
+    }
+}
+
 /// One running app-server and the thread it serves.
 #[derive(Clone)]
 pub struct Codex {
     rpc: Rpc,
+    effort: Arc<Mutex<CodexEffort>>,
+    events: mpsc::UnboundedSender<Event>,
     thread_id: String,
     pub resumed: bool,
     turn: Arc<TurnState>,
@@ -84,14 +139,19 @@ impl Codex {
     ) -> Result<(Codex, Process, mpsc::UnboundedReceiver<Event>)> {
         let (events, rx) = mpsc::unbounded_channel();
         let turn = Arc::new(TurnState::default());
+        let effort = Arc::new(Mutex::new(CodexEffort::default()));
         let handler = {
             let turn = turn.clone();
             let tools = Arc::new(tokio::sync::Mutex::new(tools));
-            move |rpc: &Rpc, msg: Incoming| handle(rpc, msg, &turn, &tools, &events)
+            let effort = effort.clone();
+            let events = events.clone();
+            move |rpc: &Rpc, msg: Incoming| handle(rpc, msg, &turn, &tools, &effort, &events)
         };
         let (rpc, mut process) = Rpc::spawn(&config.command, &config.env, cwd, stderr, handler)?;
         let mut codex = Codex {
             rpc,
+            effort,
+            events,
             thread_id: String::new(),
             resumed: false,
             turn,
@@ -142,7 +202,8 @@ impl Codex {
             let mut resume_params = params.clone();
             resume_params["threadId"] = id.into();
             match self.rpc.request("thread/resume", resume_params).await {
-                Ok(_) => {
+                Ok(result) => {
+                    self.discover_effort(&result).await;
                     self.thread_id = id.to_string();
                     self.resumed = true;
                     return Ok(());
@@ -152,6 +213,7 @@ impl Codex {
         }
         params["dynamicTools"] = dynamic_tools();
         let result = self.rpc.request("thread/start", params).await?;
+        self.discover_effort(&result).await;
         self.thread_id = result["thread"]["id"]
             .as_str()
             .context("thread/start returned no thread id")?
@@ -163,16 +225,123 @@ impl Codex {
         &self.thread_id
     }
 
+    pub fn effort_state(&self) -> EffortState {
+        self.effort.lock().unwrap().state.clone()
+    }
+
+    async fn discover_effort(&self, opened: &Value) {
+        let mut models = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let result = timeout(
+                effort::SET_TIMEOUT,
+                self.rpc.request("model/list", json!({ "cursor": cursor })),
+            )
+            .await;
+            let Ok(Ok(page)) = result else {
+                break;
+            };
+            if let Some(data) = page["data"].as_array() {
+                models.extend(data.iter().cloned());
+            }
+            cursor = page["nextCursor"].as_str().map(str::to_string);
+            match &cursor {
+                Some(c) if seen.insert(c.clone()) => {}
+                _ => break,
+            }
+            if seen.len() >= 32 {
+                break;
+            }
+        }
+        let mut e = self.effort.lock().unwrap();
+        e.models = models;
+        e.model = opened["model"].as_str().unwrap_or_default().into();
+        e.current = opened["reasoningEffort"].as_str().map(str::to_string);
+        e.refresh();
+    }
+
     /// Run one turn; returns its status (`completed` or `interrupted`).
-    pub async fn prompt(&self, text: &str) -> Result<String> {
+    pub async fn prompt(&self, text: &str, effort: Option<EffortRequest>) -> Result<String> {
         let (tx, rx) = oneshot::channel();
         self.turn.set(|turn| turn.done = Some(tx));
-        let params = json!({ "threadId": self.thread_id, "input": input(text) });
-        let result = match self.rpc.request("turn/start", params).await {
-            Ok(result) => result,
-            Err(err) => {
+        let mut params = json!({ "threadId": self.thread_id, "input": input(text) });
+        let effort =
+            effort.filter(
+                |request| match effort::validate(&self.effort_state(), &request.value) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        let _ = self.events.send(Event::EffortOutcome(effort::outcome(
+                            request.request_id,
+                            Outcome::Failed,
+                            err.to_string(),
+                        )));
+                        false
+                    }
+                },
+            );
+        if let Some(request) = &effort {
+            params["effort"] = request.value.clone().into();
+        }
+        // Only the start ACK is bounded, not the duration of the model's turn.
+        let changing_effort = effort.is_some();
+        let call = self.rpc.call("turn/start", params);
+        let result = if changing_effort {
+            timeout(effort::SET_TIMEOUT, call).await
+        } else {
+            Ok(call.await)
+        };
+        let result = match result {
+            Ok(Ok(result)) => {
+                if let Some(request) = effort {
+                    let mut e = self.effort.lock().unwrap();
+                    e.current = Some(request.value);
+                    e.refresh();
+                    let _ = self.events.send(Event::EffortOutcome(effort::outcome(
+                        request.request_id,
+                        Outcome::Applied,
+                        "",
+                    )));
+                }
+                result
+            }
+            other => {
+                let (definite, message) = match other {
+                    Ok(Err(err)) => (effort::definite_rejection(err.code), err.message),
+                    _ => (
+                        false,
+                        "turn/start acknowledgment timed out; prompt acceptance is unknown".into(),
+                    ),
+                };
+                if let Some(request) = effort {
+                    if !definite {
+                        let mut e = self.effort.lock().unwrap();
+                        e.current = None;
+                        e.refresh();
+                        e.state.reason = effort::bounded_detail(&message);
+                    }
+                    let _ = self.events.send(Event::EffortOutcome(effort::outcome(
+                        request.request_id,
+                        if definite {
+                            Outcome::Failed
+                        } else {
+                            Outcome::Unknown
+                        },
+                        message.clone(),
+                    )));
+                }
                 self.turn.set(|turn| *turn = Turn::default());
-                return Err(err);
+                if definite && changing_effort {
+                    return Err(PromptNotStarted(message).into());
+                }
+                if changing_effort {
+                    return Err(EffortUnconfirmed {
+                        message,
+                        prompt_sent: true,
+                    }
+                    .into());
+                }
+                return Err(anyhow!(message));
             }
         };
         self.turn.set(|turn| {
@@ -232,6 +401,7 @@ fn handle(
     msg: Incoming,
     turn: &TurnState,
     tools: &Arc<tokio::sync::Mutex<Tools>>,
+    effort: &Mutex<CodexEffort>,
     events: &mpsc::UnboundedSender<Event>,
 ) {
     match msg {
@@ -257,6 +427,16 @@ fn handle(
             rpc.respond_later(id, answer(&method, &params, events));
         }
         Incoming::Notification { method, params } => {
+            if method == "thread/settings/updated" {
+                let settings = &params["threadSettings"];
+                let mut e = effort.lock().unwrap();
+                if let Some(model) = settings["model"].as_str() {
+                    e.model = model.into();
+                }
+                e.current = settings["effort"].as_str().map(str::to_string);
+                e.refresh();
+                let _ = events.send(Event::EffortChanged);
+            }
             if let Some(event) = notification_event(&method, &params, turn) {
                 let _ = events.send(event);
             }
@@ -377,6 +557,31 @@ fn item_event(method: &str, item: &Value) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_current_is_not_the_catalog_default_or_choice_order() {
+        let mut e = CodexEffort {
+            model: "m".into(),
+            models: vec![json!({
+                "model":"m", "defaultReasoningEffort":"medium", "supportedReasoningEfforts":[
+                    {"reasoningEffort":"max"}, {"reasoningEffort":"low"}, {"reasoningEffort":"ultra"}
+                ]
+            })],
+            ..Default::default()
+        };
+        e.refresh();
+        assert!(e.state.supported);
+        assert!(e.state.current.is_none());
+        assert_eq!(e.state.choices[0].value, "max");
+        assert!(e.state.choices[0].rank > e.state.choices[1].rank);
+        assert_eq!(e.state.choices[2].rank, None);
+        e.current = Some("low".into());
+        e.refresh();
+        assert_eq!(e.state.current.as_deref(), Some("low"));
+        e.model = "other".into();
+        e.refresh();
+        assert!(!e.state.supported);
+    }
 
     #[test]
     fn maps_notifications() {

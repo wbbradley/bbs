@@ -22,6 +22,9 @@ pub const MAX_INPUT_CHARS: usize = 2000;
 #[derive(Debug)]
 pub enum Event {
     Text(String),
+    /// Provider metadata changed; read the latest snapshot. Never an ACK.
+    EffortChanged,
+    EffortOutcome(crate::proto::EffortOutcome),
     Thought(String),
     /// A tool call started or changed: id, and the fields worth logging.
     Tool(String, Value),
@@ -98,11 +101,22 @@ impl Harness {
         matches!(self, Harness::Codex(_))
     }
 
-    /// Run one turn; returns how it ended.
-    pub async fn prompt(&self, text: &str) -> Result<String> {
+    pub fn effort_state(&self) -> crate::proto::EffortState {
         match self {
-            Harness::Acp(acp) => acp.prompt(text).await,
-            Harness::Codex(codex) => codex.prompt(text).await,
+            Self::Acp(a) => a.effort_state(),
+            Self::Codex(c) => c.effort_state(),
+        }
+    }
+
+    /// Run one turn; returns how it ended.
+    pub async fn prompt(
+        &self,
+        text: &str,
+        effort: Option<crate::proto::EffortRequest>,
+    ) -> Result<String> {
+        match self {
+            Harness::Acp(acp) => acp.prompt(text, effort).await,
+            Harness::Codex(codex) => codex.prompt(text, effort).await,
         }
     }
 
@@ -131,3 +145,27 @@ pub fn truncate(mut s: String, max: usize) -> String {
     }
     s
 }
+
+/// Definite rejection before a prompt was accepted. Its mail can be retried.
+#[derive(Debug)]
+pub struct PromptNotStarted(pub String);
+impl std::fmt::Display for PromptNotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for PromptNotStarted {}
+
+/// A configuration/start request may still be executing. Stop rather than
+/// starting another turn or allowing a late setter to change an active turn.
+#[derive(Debug)]
+pub struct EffortUnconfirmed {
+    pub message: String,
+    pub prompt_sent: bool,
+}
+impl std::fmt::Display for EffortUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for EffortUnconfirmed {}

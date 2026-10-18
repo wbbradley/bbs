@@ -6,17 +6,20 @@
 //! reported by kind rather than rejected, so harness extensions do not break it.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use super::harness::{Event, MAX_INPUT_CHARS, SETUP_TIMEOUT, truncate};
+use super::effort;
+use super::harness::{EffortUnconfirmed, Event, MAX_INPUT_CHARS, SETUP_TIMEOUT, truncate};
 use super::rpc::{Incoming, Process, Rpc};
 use super::settings::{HarnessConfig, McpEnv};
+use crate::proto::effort_outcome::Result as Outcome;
+use crate::proto::{EffortRequest, EffortState};
 
 const PROTOCOL_VERSION: u64 = 1;
 /// JSON-RPC error code ACP uses when the agent needs `authenticate` first.
@@ -45,10 +48,68 @@ impl McpServer {
 #[derive(Clone)]
 pub struct Acp {
     rpc: Rpc,
+    effort: Arc<Mutex<AcpEffort>>,
+    events: mpsc::UnboundedSender<Event>,
     /// While a loaded session replays its history, updates are not events.
     replaying: Arc<AtomicBool>,
     session_id: String,
     pub session_resumed: bool,
+}
+
+struct AcpEffort {
+    state: EffortState,
+    id: Option<String>,
+    claude: bool,
+}
+
+impl Default for AcpEffort {
+    fn default() -> Self {
+        Self {
+            state: effort::unavailable("no thought-level option advertised"),
+            id: None,
+            claude: false,
+        }
+    }
+}
+
+impl AcpEffort {
+    fn update(&mut self, options: &Value) {
+        self.state = effort::unavailable("no thought-level option advertised");
+        self.id = None;
+        let Some(option) = options.as_array().and_then(|options| {
+            options
+                .iter()
+                .find(|o| o["category"] == "thought_level" && o["type"] == "select")
+        }) else {
+            return;
+        };
+        self.id = option["id"].as_str().map(str::to_string);
+        let mut choices = Vec::new();
+        if let Some(options) = option["options"].as_array() {
+            for option in options {
+                let values = option["options"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(std::slice::from_ref(option));
+                for item in values {
+                    if let Some(value) = item["value"].as_str() {
+                        choices.push(effort::choice(
+                            value,
+                            item["name"].as_str().unwrap_or(value),
+                            self.claude,
+                            false,
+                        ));
+                    }
+                }
+            }
+        }
+        self.state = EffortState {
+            supported: self.id.is_some() && !choices.is_empty(),
+            choices,
+            current: option["currentValue"].as_str().map(str::to_string),
+            reason: String::new(),
+        };
+    }
 }
 
 /// What the agent advertised at `initialize`.
@@ -73,14 +134,19 @@ impl Acp {
             env.extend(std::mem::take(&mut mcp.env));
         }
         let (events, rx) = mpsc::unbounded_channel();
+        let effort = Arc::new(Mutex::new(AcpEffort::default()));
         let replaying = Arc::new(AtomicBool::new(false));
         let handler = {
             let replaying = replaying.clone();
-            move |rpc: &Rpc, msg: Incoming| handle(rpc, msg, &replaying, &events)
+            let effort = effort.clone();
+            let events = events.clone();
+            move |rpc: &Rpc, msg: Incoming| handle(rpc, msg, &replaying, &effort, &events)
         };
         let (rpc, mut process) = Rpc::spawn(&config.command, &env, cwd, stderr, handler)?;
         let mut acp = Acp {
             rpc,
+            effort,
+            events,
             replaying,
             session_id: String::new(),
             session_resumed: false,
@@ -137,6 +203,7 @@ impl Acp {
         let result = match opened {
             Some(result) => result,
             None => {
+                acp.effort.lock().unwrap().update(&Value::Null);
                 let params = json!({ "cwd": cwd, "mcpServers": servers });
                 let result = match acp.rpc.call("session/new", params).await {
                     // Logging in may be interactive; it belongs outside headless.
@@ -179,6 +246,8 @@ impl Acp {
         if version != PROTOCOL_VERSION {
             bail!("harness speaks ACP version {version}; bbs supports {PROTOCOL_VERSION}");
         }
+        self.effort.lock().unwrap().claude =
+            result["agentInfo"]["name"] == "@agentclientprotocol/claude-agent-acp";
         let caps = &result["agentCapabilities"];
         Ok(AgentCaps {
             load: caps["loadSession"].as_bool().unwrap_or(false),
@@ -191,6 +260,7 @@ impl Acp {
     /// session may not describe its options; it keeps the model it had, so a
     /// missing model option is a warning there and an error for a new session.
     async fn configure(&self, opened: &Value, config: &HarnessConfig) -> Result<Vec<String>> {
+        self.capture_options(opened);
         let mut warnings = Vec::new();
         let options = opened["configOptions"]
             .as_array()
@@ -226,18 +296,98 @@ impl Acp {
     }
 
     async fn set_option(&self, id: &str, value: &str) -> Result<()> {
-        self.rpc
+        let result = self
+            .rpc
             .request(
                 "session/set_config_option",
                 json!({ "sessionId": self.session_id, "configId": id, "value": value }),
             )
             .await
             .with_context(|| format!("setting session option {id} to {value:?}"))?;
+        self.capture_options(&result);
         Ok(())
     }
 
-    /// Run one turn; returns the stop reason.
-    pub async fn prompt(&self, text: &str) -> Result<String> {
+    pub fn effort_state(&self) -> EffortState {
+        self.effort.lock().unwrap().state.clone()
+    }
+
+    fn capture_options(&self, result: &Value) {
+        if result.get("configOptions").is_some() {
+            self.effort.lock().unwrap().update(&result["configOptions"]);
+            let _ = self.events.send(Event::EffortChanged);
+        }
+    }
+
+    async fn apply_effort(&self, request: EffortRequest) -> Result<()> {
+        let mut uncertain = false;
+        let state = self.effort_state();
+        let result = if let Err(err) = effort::validate(&state, &request.value) {
+            effort::outcome(request.request_id, Outcome::Failed, err.to_string())
+        } else {
+            let id = self.effort.lock().unwrap().id.clone();
+            let call = self.rpc.call(
+                "session/set_config_option",
+                json!({
+                    "sessionId": self.session_id, "configId": id, "value": request.value,
+                }),
+            );
+            match timeout(effort::SET_TIMEOUT, call).await {
+                Ok(Ok(result)) => {
+                    // The full returned list may also change supported levels.
+                    self.effort.lock().unwrap().update(&result["configOptions"]);
+                    if self.effort_state().current.as_deref() == Some(request.value.as_str()) {
+                        effort::outcome(request.request_id, Outcome::Applied, "")
+                    } else if let Some(actual) = self.effort_state().current {
+                        effort::outcome(
+                            request.request_id,
+                            Outcome::Failed,
+                            format!(
+                                "requested {:?}, provider returned {:?}",
+                                request.value, actual
+                            ),
+                        )
+                    } else {
+                        effort::outcome(
+                            request.request_id,
+                            Outcome::Unknown,
+                            "setter returned no current effort",
+                        )
+                    }
+                }
+                Ok(Err(err)) if effort::definite_rejection(err.code) => {
+                    effort::outcome(request.request_id, Outcome::Failed, err.message)
+                }
+                other => {
+                    uncertain = true;
+                    let detail = match other {
+                        Ok(Err(err)) => err.message,
+                        _ => "effort setter timed out".into(),
+                    };
+                    let mut guard = self.effort.lock().unwrap();
+                    guard.state.current = None;
+                    guard.state.reason = effort::bounded_detail(&detail);
+                    effort::outcome(request.request_id, Outcome::Unknown, detail)
+                }
+            }
+        };
+        let message = result.detail.clone();
+        let _ = self.events.send(Event::EffortOutcome(result));
+        if uncertain {
+            return Err(EffortUnconfirmed {
+                message,
+                prompt_sent: false,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Run one turn; a rejected effort change never consumes its prompt mail.
+    pub async fn prompt(&self, text: &str, effort: Option<EffortRequest>) -> Result<String> {
+        if let Some(request) = effort {
+            self.apply_effort(request).await?;
+        }
         let result = self
             .rpc
             .request(
@@ -262,13 +412,25 @@ impl Acp {
     }
 }
 
-fn handle(rpc: &Rpc, msg: Incoming, replaying: &AtomicBool, events: &mpsc::UnboundedSender<Event>) {
+fn handle(
+    rpc: &Rpc,
+    msg: Incoming,
+    replaying: &AtomicBool,
+    effort: &Mutex<AcpEffort>,
+    events: &mpsc::UnboundedSender<Event>,
+) {
     match msg {
         Incoming::Request { id, method, params } => {
             rpc.respond_later(id, answer(&method, &params, events));
         }
         Incoming::Notification { method, params } if method == "session/update" => {
-            if !replaying.load(Ordering::SeqCst)
+            if params["update"]["sessionUpdate"] == "config_option_update" {
+                effort
+                    .lock()
+                    .unwrap()
+                    .update(&params["update"]["configOptions"]);
+                let _ = events.send(Event::EffortChanged);
+            } else if !replaying.load(Ordering::SeqCst)
                 && let Some(event) = update_event(&params["update"])
             {
                 let _ = events.send(event);
@@ -350,6 +512,29 @@ fn update_event(update: &Value) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_options_preserve_default_grouped_choices_and_provider_rank() {
+        let mut e = AcpEffort {
+            claude: true,
+            ..Default::default()
+        };
+        e.update(&json!([{
+            "id":"effort-level", "category":"thought_level", "type":"select", "currentValue":"default",
+            "options":[{"group":"levels", "options":[
+                {"value":"default", "name":"Default"}, {"value":"max", "name":"Maximum"},
+                {"value":"low", "name":"Low"}, {"value":"new", "name":"Future"}
+            ]}]
+        }]));
+        assert_eq!(e.id.as_deref(), Some("effort-level"));
+        assert_eq!(e.state.current.as_deref(), Some("default"));
+        assert_eq!(e.state.choices[0].rank, None);
+        assert!(e.state.choices[1].rank > e.state.choices[2].rank);
+        assert_eq!(e.state.choices[3].rank, None);
+        e.update(&json!([]));
+        assert!(!e.state.supported);
+        assert!(e.state.current.is_none());
+    }
 
     #[test]
     fn maps_session_updates() {

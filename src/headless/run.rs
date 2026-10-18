@@ -11,7 +11,8 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use super::acp::McpServer;
-use super::harness::{BbsTools, Event, Harness};
+use super::effort;
+use super::harness::{BbsTools, EffortUnconfirmed, Event, Harness, PromptNotStarted};
 use super::log::Log;
 use super::mcp::{TOKEN_ENV, Tools};
 use super::settings::{DEFAULT_MAX_TURN_ERRORS, McpEnv, MidTurn, Settings};
@@ -89,8 +90,12 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     let mut log = Log::open(&agent_dir.log_path())?;
     let (share_warn, mut share_warnings) = mpsc::unbounded_channel();
     let sharing = harness_config.shares_activity().then(|| {
-        let (queue, task) =
-            share::start(config.clone(), dir.to_path_buf(), token.clone(), share_warn);
+        let (queue, task) = share::start(
+            config.clone(),
+            dir.to_path_buf(),
+            token.clone(),
+            share_warn.clone(),
+        );
         log.share(queue);
         task
     });
@@ -175,6 +180,10 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         let timers = server_has(&config, dir, crate::backend::TIMERS).await;
         Some(preamble(&agent, instructions.as_deref(), timers))
     };
+    let (effort_reports, reporting) =
+        effort::reporter(config.clone(), dir.to_path_buf(), token.clone(), share_warn);
+    let mut effort_control = effort::Control::default();
+    let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
     let (mail_tx, mut mail_rx) = mpsc::unbounded_channel();
     let mail_task = tokio::spawn(wait_for_mail(
         config.clone(),
@@ -185,6 +194,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
 
     let mut queue: Vec<proto::Message> = Vec::new();
     let mut turn: Option<JoinHandle<Result<String>>> = None;
+    let mut active_mail = Vec::new();
+    let mut active_preamble = None;
+    let mut active_effort = false;
     let mut last_start: Option<Instant> = None;
     let mut turn_errors = 0;
     // A resumed session that never completes a turn may be what fails.
@@ -194,14 +206,17 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             .map(|t| t + interval)
             .unwrap_or_else(Instant::now);
         if turn.is_none() && !queue.is_empty() && Instant::now() >= ready_at {
-            let mut prompt = preamble.take().unwrap_or_default();
+            active_preamble = preamble.take();
+            let mut prompt = active_preamble.clone().unwrap_or_default();
             prompt.push_str(&mail_prompt(&queue)?);
-            queue.clear();
+            active_mail = std::mem::take(&mut queue);
             log.event("prompt", json!({ "text": prompt }));
             let agent_harness = agent_harness.clone();
-            turn = Some(tokio::spawn(
-                async move { agent_harness.prompt(&prompt).await },
-            ));
+            let requested_effort = effort_control.dispatch();
+            active_effort = requested_effort.is_some();
+            turn = Some(tokio::spawn(async move {
+                agent_harness.prompt(&prompt, requested_effort).await
+            }));
             last_start = Some(Instant::now());
             continue;
         }
@@ -211,6 +226,14 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 Some(Ok(mut batch)) => {
                     // Control messages act now and are not prompts. The server
                     // accepts them only from the agent's owner.
+                    for message in &batch {
+                        if message.control() == proto::Control::SetEffort {
+                            effort_control.request(proto::EffortRequest {
+                                request_id: message.id, value: message.body.clone(),
+                            }, &agent_harness.effort_state());
+                            let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
+                        }
+                    }
                     let cancels = batch.iter().filter(|m| m.control() == proto::Control::Cancel).count();
                     batch.retain(|m| m.control.is_none());
                     if cancels > 0 {
@@ -224,7 +247,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                         continue;
                     }
                     let from: Vec<_> = batch.iter().map(|m| m.sender_display_name()).collect();
-                    if steer && turn.is_some() {
+                    if steer && turn.is_some() && effort_control.pending.is_none() {
                         // Steering fails when the turn is ending; the mail is
                         // then queued for the next turn.
                         let text = mail_prompt(&batch)?;
@@ -250,12 +273,32 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 turn = None;
                 let message = match done {
                     Ok(Ok(stop)) => {
+                        active_mail.clear();
+                        active_preamble = None;
                         log.event("turn_end", json!({ "stop_reason": stop }));
                         turn_errors = 0;
                         session_proven = true;
                         continue;
                     }
-                    Ok(Err(err)) => format!("{err:#}"),
+                    Ok(Err(err)) => {
+                        if let Some(uncertain) = err.downcast_ref::<EffortUnconfirmed>() {
+                            log.event(if uncertain.prompt_sent { "delivery_uncertain" } else { "unprocessed" }, json!({ "text": format_messages(&active_mail, false)?, "acceptance": if uncertain.prompt_sent { "unknown" } else { "not_sent" } }));
+                            active_mail.clear();
+                            break Err(err);
+                        }
+                        if err.downcast_ref::<PromptNotStarted>().is_some() {
+                            // The override was definitively rejected before turn acceptance.
+                            // Retry only the ordinary mail, never the rejected control.
+                            active_mail.append(&mut queue);
+                            queue = std::mem::take(&mut active_mail);
+                            preamble = active_preamble.take();
+                        } else if active_effort && !active_mail.is_empty() {
+                            // Acceptance may be ambiguous: preserve evidence without resend.
+                            log.event("delivery_uncertain", json!({ "text": format_messages(&active_mail, false)?, "acceptance": "unknown" }));
+                            active_mail.clear();
+                        }
+                        format!("{err:#}")
+                    },
                     Err(err) => err.to_string(),
                 };
                 log.event("turn_error", json!({ "message": message }));
@@ -275,6 +318,16 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             }
             event = events.recv() => match event {
                 Some(Event::Exited) | None => break Err(anyhow::anyhow!("the harness exited")),
+                Some(Event::EffortChanged) => {
+                    let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
+                }
+                Some(Event::EffortOutcome(outcome)) => {
+                    if !outcome.detail.is_empty() {
+                        log.event("warning", json!({ "message": outcome.detail, "effort_request": outcome.request_id }));
+                    }
+                    effort_control.complete(outcome);
+                    let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
+                }
                 Some(event) => record(&mut log, event),
             },
             _ = tokio::time::sleep_until(ready_at), if throttled => {}
@@ -309,12 +362,34 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         Ok(()) => log.event("stop", json!({})),
         Err(err) => log.event("stop", json!({ "error": format!("{err:#}") })),
     }
+    // Drain effort ACKs already emitted before harness exit/turn completion.
+    while let Ok(event) = events.try_recv() {
+        match event {
+            Event::EffortOutcome(outcome) => effort_control.complete(outcome),
+            Event::EffortChanged => {}
+            other => record(&mut log, other),
+        }
+    }
+    let mut final_effort = agent_harness.effort_state();
+    if effort_control.interrupted() {
+        final_effort.current = None;
+        final_effort.reason = "driver stopped before effort confirmation".into();
+    }
+    if active_effort && !active_mail.is_empty() {
+        log.event(
+            "delivery_uncertain",
+            json!({ "text": format_messages(&active_mail, false)?, "acceptance": "unknown" }),
+        );
+    }
+    let _ = effort_reports.send(effort_control.report(final_effort));
+    drop(effort_reports);
     log.unshare();
     process.stop().await;
     if let Some(task) = sharing {
         // Let the last records, "stop" among them, reach the server.
         let _ = tokio::time::timeout(SHARE_FLUSH, task).await;
     }
+    let _ = tokio::time::timeout(SHARE_FLUSH, reporting).await;
     result
 }
 
@@ -329,7 +404,7 @@ fn record(log: &mut Log, event: Event) {
         Event::Permission(fields) => log.event("permission", fields),
         Event::Warning(message) => log.event("warning", json!({ "message": message })),
         Event::Other(kind) => log.event("update", json!({ "kind": kind })),
-        Event::Exited => {}
+        Event::Exited | Event::EffortChanged | Event::EffortOutcome(_) => {}
     }
 }
 
