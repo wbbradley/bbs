@@ -28,6 +28,9 @@ const DEFAULT_HISTORY_LIMIT: usize = 50;
 const DEFAULT_HISTORY_SINCE: &str = "7d";
 
 pub async fn run(dir: &Path, local: bool) -> Result<()> {
+    if local && !dir.is_absolute() {
+        bail!("--local-state-dir must be an absolute path");
+    }
     let token = std::env::var(TOKEN_ENV)
         .ok()
         .filter(|t| !t.is_empty())

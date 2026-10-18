@@ -42,7 +42,9 @@ class Mcp:
             assert token and token != "stale-token", "runtime token missing"
             assert not spec["env"], "MCP spec must not contain credentials"
             for pid in (os.getpid(), self.proc.pid):
-                assert token.encode() not in Path(f"/proc/{pid}/cmdline").read_bytes(), "token in argv"
+                cmdline = Path(f"/proc/{pid}/cmdline")
+                if cmdline.is_file():
+                    assert token.encode() not in cmdline.read_bytes(), "token in argv"
             with open("fake-mcp-specs.jsonl", "a") as f:
                 f.write(json.dumps(spec) + "\n")
         self.next_id = 0

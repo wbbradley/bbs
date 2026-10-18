@@ -3138,6 +3138,17 @@ fn headless_process_mcp_env_routes_without_serializing_credentials(mode: Mode) {
 }
 
 #[test]
+fn headless_mcp_local_state_dir_must_be_absolute() {
+    let bbs = Bbs::new("relative-mcp-state");
+    let err = bbs.err(&["headless", "mcp", "--local-state-dir", "relative-board"]);
+    assert!(
+        err.contains("--local-state-dir must be an absolute path"),
+        "{err}"
+    );
+    assert!(!bbs.home.join("relative-board").exists());
+}
+
+#[test]
 fn headless_process_mcp_env_rejects_scrub_before_registration() {
     let bbs = Bbs::new("scrub-mcp-env");
     headless_config(&bbs, &["true"]);

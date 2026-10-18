@@ -15,8 +15,7 @@ the harness prints reaches anyone; it goes to a local log.
   protocol (`codex app-server`), which can also steer a running turn.
 - The central server stays the source of truth. Message loss on a crash is
   acceptable: delivery stays at-most-once, as it is for every other client.
-- Not in scope: messaging humans from a headless agent, timed wakeups,
-  an interactive two-way mode,
+- Not in scope: an interactive two-way mode,
   sandboxing, restarting a crashed harness (run `run` under a supervisor such
   as systemd if it must stay up). Agents run with every permission request
   approved; isolate them with containers or worktrees when needed.
