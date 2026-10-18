@@ -1685,16 +1685,34 @@ mod tests {
             [],
         )
         .unwrap();
-        post_activity(&conn, 1, "2026-10-17T09:00:00Z", &[("text".into(), "e".into())]).unwrap();
+        post_activity(
+            &conn,
+            1,
+            "2026-10-17T09:00:00Z",
+            &[("text".into(), "e".into())],
+        )
+        .unwrap();
         assert_eq!(last_sent("Mateo").as_deref(), Some("2026-10-17T10:00:00Z"));
         // Zed only posts activity.
-        post_activity(&conn, 2, "2026-10-17T11:00:00Z", &[("text".into(), "e".into())]).unwrap();
+        post_activity(
+            &conn,
+            2,
+            "2026-10-17T11:00:00Z",
+            &[("text".into(), "e".into())],
+        )
+        .unwrap();
         assert_eq!(last_sent("Zed").as_deref(), Some("2026-10-17T11:00:00Z"));
         // Trimming keeps the newest events, so the max survives it.
         let events = |n: i64| -> Vec<(String, String)> {
             (0..n).map(|i| ("text".into(), format!("e{i}"))).collect()
         };
-        post_activity(&conn, 2, "2026-10-17T12:00:00Z", &events(ACTIVITY_PER_AGENT)).unwrap();
+        post_activity(
+            &conn,
+            2,
+            "2026-10-17T12:00:00Z",
+            &events(ACTIVITY_PER_AGENT),
+        )
+        .unwrap();
         post_activity(&conn, 2, "2026-10-17T13:00:00Z", &events(5)).unwrap();
         assert_eq!(last_sent("Zed").as_deref(), Some("2026-10-17T13:00:00Z"));
     }

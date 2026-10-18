@@ -17,6 +17,8 @@ use crate::service::Caller;
 
 pub enum Event {
     Key(KeyEvent),
+    /// Text the terminal reported as one bracketed paste.
+    Paste(String),
     Resize,
     Tick,
     Data(Data),
@@ -214,6 +216,7 @@ pub fn spawn_input(tx: UnboundedSender<Event>) {
         loop {
             let event = match event::read() {
                 Ok(event::Event::Key(key)) if key.kind == KeyEventKind::Press => Event::Key(key),
+                Ok(event::Event::Paste(text)) => Event::Paste(text),
                 Ok(event::Event::Resize(..)) => Event::Resize,
                 Ok(_) => continue,
                 Err(_) => return,

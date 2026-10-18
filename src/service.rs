@@ -1207,7 +1207,10 @@ pub fn report_effort(
 fn validate_effort(ctx: &Ctx, agent: i64, report: &proto::EffortReport) -> Result<()> {
     let state = report.state.as_ref().context("report without state")?;
     if state.choices.len() > MAX_EFFORT_CHOICES {
-        bail!("{} choices; the limit is {MAX_EFFORT_CHOICES}", state.choices.len());
+        bail!(
+            "{} choices; the limit is {MAX_EFFORT_CHOICES}",
+            state.choices.len()
+        );
     }
     let mut seen = HashSet::new();
     for choice in &state.choices {
@@ -1237,8 +1240,8 @@ fn validate_effort(ctx: &Ctx, agent: i64, report: &proto::EffortReport) -> Resul
         if pending.value.len() > MAX_EFFORT_VALUE {
             bail!("requested value is too long");
         }
-        let body = db::effort_control_body(ctx.conn, agent, pending.request_id)?
-            .expect("checked above");
+        let body =
+            db::effort_control_body(ctx.conn, agent, pending.request_id)?.expect("checked above");
         if pending.value != body {
             bail!(
                 "pending request {} value {:?} does not match the control's {:?}",
@@ -1260,7 +1263,10 @@ fn validate_effort(ctx: &Ctx, agent: i64, report: &proto::EffortReport) -> Resul
     if let (Some(pending), Some(answered)) = (&report.pending, &report.answered)
         && pending.request_id == answered.request_id
     {
-        bail!("request {} is both pending and answered", pending.request_id);
+        bail!(
+            "request {} is both pending and answered",
+            pending.request_id
+        );
     }
     Ok(())
 }
@@ -1305,9 +1311,8 @@ fn effort_from_json(stored: &str) -> Option<proto::EffortReport> {
         }
         Some(proto::EffortOutcome {
             request_id: o.get("request_id")?.as_i64()?,
-            result: proto::effort_outcome::Result::from_str_name(
-                o.get("result")?.as_str()?,
-            )? as i32,
+            result: proto::effort_outcome::Result::from_str_name(o.get("result")?.as_str()?)?
+                as i32,
             detail: o.get("detail")?.as_str()?.to_string(),
         })
     });
@@ -1320,13 +1325,9 @@ fn effort_from_json(stored: &str) -> Option<proto::EffortReport> {
                 .get("current")
                 .and_then(|c| c.as_str().map(str::to_string)),
         }),
-        pending: v.get("pending").and_then(|p| {
-            if p.is_null() {
-                None
-            } else {
-                request(p)
-            }
-        }),
+        pending: v
+            .get("pending")
+            .and_then(|p| if p.is_null() { None } else { request(p) }),
         answered: outcome,
     })
 }
@@ -1959,28 +1960,30 @@ mod tests {
         let mateo = agents[0].clone();
         let zed = agents[1].clone();
         let report = |pending: Option<proto::EffortRequest>,
-                      answered: Option<proto::EffortOutcome>| proto::ReportEffortRequest {
-            report: Some(proto::EffortReport {
-                state: Some(proto::EffortState {
-                    supported: true,
-                    reason: String::new(),
-                    choices: vec![
-                        proto::EffortChoice {
-                            value: "low".into(),
-                            label: "Low".into(),
-                            rank: Some(1),
-                        },
-                        proto::EffortChoice {
-                            value: "high".into(),
-                            label: "High".into(),
-                            rank: Some(2),
-                        },
-                    ],
-                    current: Some("low".into()),
+                      answered: Option<proto::EffortOutcome>| {
+            proto::ReportEffortRequest {
+                report: Some(proto::EffortReport {
+                    state: Some(proto::EffortState {
+                        supported: true,
+                        reason: String::new(),
+                        choices: vec![
+                            proto::EffortChoice {
+                                value: "low".into(),
+                                label: "Low".into(),
+                                rank: Some(1),
+                            },
+                            proto::EffortChoice {
+                                value: "high".into(),
+                                label: "High".into(),
+                                rank: Some(2),
+                            },
+                        ],
+                        current: Some("low".into()),
+                    }),
+                    pending,
+                    answered,
                 }),
-                pending,
-                answered,
-            }),
+            }
         };
         // Humans cannot report.
         assert!(report_effort(&mut conn, &will, report(None, None)).is_err());
@@ -2048,7 +2051,10 @@ mod tests {
             None,
         );
         let err = report_effort(&mut conn, &mateo, bad).unwrap_err();
-        assert!(format!("{err:#}").contains("not a set-effort control"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("not a set-effort control"),
+            "{err:#}"
+        );
         // A real control's id validates, and the send returns it.
         let sent = send(
             &mut conn,
@@ -2086,7 +2092,10 @@ mod tests {
             ),
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains("not a set-effort control"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("not a set-effort control"),
+            "{err:#}"
+        );
         // The control reads back with its kind, and retirement clears reports.
         let mail = read(&mut conn, &mateo, proto::ReadRequest::default())
             .unwrap()
@@ -2119,10 +2128,7 @@ mod tests {
             .unwrap();
         let answered = e.answered.unwrap();
         assert_eq!(answered.request_id, id);
-        assert_eq!(
-            answered.result(),
-            proto::effort_outcome::Result::Applied
-        );
+        assert_eq!(answered.result(), proto::effort_outcome::Result::Applied);
         // A request cannot be pending and answered in one report.
         let both = report(
             Some(proto::EffortRequest {
@@ -2136,7 +2142,10 @@ mod tests {
             }),
         );
         let err = report_effort(&mut conn, &mateo, both).unwrap_err();
-        assert!(format!("{err:#}").contains("both pending and answered"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("both pending and answered"),
+            "{err:#}"
+        );
         // Pending values must match the control's body exactly.
         let mismatched = report(
             Some(proto::EffortRequest {
@@ -2481,7 +2490,10 @@ mod tests {
         // they are messages the joining agent sent, so they set last_sent_at.
         let s = summary(&mut conn);
         assert_eq!(s.len(), 3, "{s:?}");
-        assert!(s.iter().all(|s| s.unread_messages == 0 && s.unseen_stream == 0));
+        assert!(
+            s.iter()
+                .all(|s| s.unread_messages == 0 && s.unseen_stream == 0)
+        );
         assert!(find(&s, "Lu").last_sent_at.is_none());
         assert!(find(&s, "Mateo").last_sent_at.is_some());
         let dm = proto::SendRequest {

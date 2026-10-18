@@ -93,6 +93,15 @@ impl GroupAdmin {
         self.dialog = Some((op, name, dialog));
     }
 
+    /// A paste into the open dialog; `false` when none is.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let Some((_, _, dialog)) = &mut self.dialog else {
+            return false;
+        };
+        dialog.paste(text);
+        true
+    }
+
     /// A key while a dialog is open; `None` when none is (or for Ctrl-C).
     pub fn key(&mut self, id: u64, key: KeyEvent) -> Option<Transition> {
         let (op, group, dialog) = self.dialog.as_mut()?;

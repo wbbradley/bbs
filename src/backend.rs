@@ -377,9 +377,8 @@ impl Backend {
     ) -> Result<proto::ReportEffortResponse> {
         match self {
             Backend::Local(l) => service::report_effort(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => {
-                rpc!(r, report_effort, req, &[AGENT_EFFORT]).map_err(|e| missing_rpc(e, AGENT_EFFORT))
-            }
+            Backend::Remote(r) => rpc!(r, report_effort, req, &[AGENT_EFFORT])
+                .map_err(|e| missing_rpc(e, AGENT_EFFORT)),
         }
     }
 

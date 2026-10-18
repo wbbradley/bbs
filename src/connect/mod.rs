@@ -20,6 +20,7 @@ use std::io::IsTerminal;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
+use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use self::event::Event;
@@ -46,6 +47,25 @@ async fn wait(rx: &mut UnboundedReceiver<Event>, next_frame: Option<Instant>) ->
     tokio::select! {
         event = rx.recv() => event.map(Wait::Event),
         () = frame => Some(Wait::Redraw),
+    }
+}
+
+/// Bracketed paste for the session: the terminal reports a paste as one
+/// event, not as keystrokes in which each newline is `Enter`. Dropping it,
+/// on any exit including a panic, turns the mode back off.
+struct BracketedPaste;
+
+impl BracketedPaste {
+    /// A terminal that refuses still works; pastes then arrive as keys.
+    fn enable() -> BracketedPaste {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
+        BracketedPaste
+    }
+}
+
+impl Drop for BracketedPaste {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     }
 }
 
@@ -87,6 +107,7 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
     let mut app = app::App::new(ctx, requests);
     app.draft_store = draft_store;
     let mut terminal = ratatui::init();
+    let _paste = BracketedPaste::enable();
     event::spawn_input(events.clone());
     event::spawn_ticks(events);
     let result = async {
