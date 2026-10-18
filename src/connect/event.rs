@@ -482,7 +482,6 @@ mod tests {
         progress.baseline(
             baseline.as_ref().map_or(0, |row| row.id),
             baseline.as_ref().map(|row| row.record.as_str()),
-            now,
         );
         let mut replay = backend.watch_activity(req).await.unwrap();
         for batch in 0..3 {

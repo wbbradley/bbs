@@ -2024,11 +2024,12 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let batch = |id, kind| Data::Activity {
             id: act,
-            result: Ok(vec![activity(
+            result: Ok(vec![proto::Activity {
                 id,
-                "01",
-                &format!(r#"{{"event":"{kind}","text":"hidden","ts":"{now}"}}"#),
-            )]),
+                created_at: now.clone(),
+                record: format!(r#"{{"event":"{kind}","text":"hidden"}}"#),
+                ..Default::default()
+            }]),
         };
         app.on_event(Event::Data(batch(500, "turn_end")));
         assert_eq!(

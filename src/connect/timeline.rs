@@ -289,10 +289,6 @@ impl Stream {
 
     /// Take a batch of this stream's data; returns the new entries.
     pub fn on_data(&mut self, data: &Data) -> Vec<Entry> {
-        self.on_data_at(data, Utc::now())
-    }
-
-    fn on_data_at(&mut self, data: &Data, now: DateTime<Utc>) -> Vec<Entry> {
         if let Data::ActivityBaseline {
             id,
             through_id,
@@ -300,7 +296,7 @@ impl Stream {
         } = data
             && *id == self.id
         {
-            self.progress.baseline(*through_id, record.as_deref(), now);
+            self.progress.baseline(*through_id, record.as_deref());
         }
         let Data::Activity { id, result } = data else {
             return Vec::new();
@@ -311,7 +307,13 @@ impl Stream {
         match result {
             Ok(events) => {
                 for event in events {
-                    self.progress.observe(event.id, &event.record, now);
+                    self.progress.observe(
+                        event.id,
+                        &event.record,
+                        DateTime::parse_from_rfc3339(&event.created_at)
+                            .map(|t| t.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now()),
+                    );
                 }
                 self.loaded = true;
                 self.error = None;
@@ -358,34 +360,29 @@ mod tests {
             id,
             result: Ok(vec![proto::Activity {
                 id: event_id,
-                record: format!(
-                    r#"{{"event":"{event}","text":"hidden","ts":"{}"}}"#,
-                    now.to_rfc3339()
-                ),
+                record: format!(r#"{{"event":"{event}","text":"hidden"}}"#),
+                created_at: now.to_rfc3339(),
                 ..Default::default()
             }]),
         };
-        stream.on_data_at(
-            &Data::ActivityBaseline {
-                id,
-                through_id: 500,
-                record: None,
-            },
-            now,
-        );
-        stream.on_data_at(&batch(id, 500, "text"), now);
+        stream.on_data(&Data::ActivityBaseline {
+            id,
+            through_id: 500,
+            record: None,
+        });
+        stream.on_data(&batch(id, 500, "text"));
         assert_eq!(stream.progress(now), Progress::Unknown);
         stream.kinds = Kinds::Problems;
-        assert!(stream.on_data_at(&batch(id, 501, "text"), now).is_empty());
+        assert!(stream.on_data(&batch(id, 501, "text")).is_empty());
         assert_eq!(stream.progress(now), Progress::Progressing(0));
         stream.entries();
-        stream.on_data_at(&batch(id, 501, "text"), now + Duration::seconds(59));
+        stream.on_data(&batch(id, 501, "text"));
         assert_eq!(
             stream.progress(now + Duration::seconds(60)),
             Progress::Unknown
         );
         // Recorded completion persists instead of expiring.
-        stream.on_data_at(&batch(id, 502, "turn_end"), now);
+        stream.on_data(&batch(id, 502, "turn_end"));
         assert_eq!(stream.progress(now), Progress::Done);
         assert_eq!(
             stream.progress(now + Duration::seconds(60)),
@@ -393,34 +390,25 @@ mod tests {
         );
         stream.reset();
         assert_ne!(stream.id, id);
-        stream.on_data_at(
-            &Data::ActivityBaseline {
-                id,
-                through_id: 0,
-                record: None,
-            },
-            now,
-        );
-        stream.on_data_at(&batch(id, 503, "text"), now);
+        stream.on_data(&Data::ActivityBaseline {
+            id,
+            through_id: 0,
+            record: None,
+        });
+        stream.on_data(&batch(id, 503, "text"));
         assert_eq!(stream.progress(now), Progress::Unknown);
         let id = stream.id;
-        stream.on_data_at(
-            &Data::ActivityBaseline {
-                id,
-                through_id: 503,
-                record: None,
-            },
-            now,
-        );
-        stream.on_data_at(&batch(id, 504, "text"), now);
+        stream.on_data(&Data::ActivityBaseline {
+            id,
+            through_id: 503,
+            record: None,
+        });
+        stream.on_data(&batch(id, 504, "text"));
         assert_eq!(stream.progress(now), Progress::Progressing(0));
-        stream.on_data_at(
-            &Data::Activity {
-                id,
-                result: Err("disconnected".into()),
-            },
-            now,
-        );
+        stream.on_data(&Data::Activity {
+            id,
+            result: Err("disconnected".into()),
+        });
         assert_eq!(stream.progress(now), Progress::Unknown);
     }
 
