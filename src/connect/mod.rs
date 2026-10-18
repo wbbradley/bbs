@@ -60,14 +60,19 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
     app.draft_store = draft_store;
     let mut terminal = ratatui::init();
     event::spawn_input(events.clone());
-    event::spawn_ticks(events);
+    event::spawn_ticks(events.clone());
+    let (animator_tx, animator_rx) = tokio::sync::watch::channel(None);
+    event::spawn_animator(events, animator_rx);
+    app.animator = Some(animator_tx);
     let result = async {
         loop {
             terminal.draw(|frame| app.draw(frame))?;
             let Some(event) = rx.recv().await else {
                 return Ok(());
             };
-            if app.on_event(event) {
+            let quit = app.on_event(event);
+            app.arm_animator();
+            if quit {
                 return Ok(());
             }
         }

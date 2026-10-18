@@ -81,6 +81,10 @@ pub trait Screen {
     fn on_close(&self) -> Vec<Request> {
         Vec::new()
     }
+    /// When the screen's animation frame next changes, if it animates.
+    fn next_animation_frame(&self, _now: Instant) -> Option<Instant> {
+        None
+    }
     /// Move a discussion's composer between its screen and the session's drafts.
     fn save_draft(&mut self, _drafts: &mut HashMap<String, Composer>) {}
     fn restore_draft(&mut self, _drafts: &mut HashMap<String, Composer>, _store: &mut DraftStore) {}
@@ -103,6 +107,8 @@ pub struct App {
     requests: UnboundedSender<Request>,
     drafts: HashMap<String, Composer>,
     pub draft_store: DraftStore,
+    /// Arms the animator with the next frame's deadline; None parks it.
+    pub animator: Option<tokio::sync::watch::Sender<Option<Instant>>>,
 }
 
 impl App {
@@ -114,6 +120,7 @@ impl App {
             requests,
             drafts: HashMap::new(),
             draft_store: DraftStore::default(),
+            animator: None,
         };
         app.push(Box::new(Menu::default()));
         app.push(Box::new(Splash));
@@ -134,6 +141,24 @@ impl App {
         for request in requests {
             // The server task outlives the app; a send cannot fail first.
             let _ = self.requests.send(request);
+        }
+    }
+
+    /// Arm the animator with the top screen's next frame change, or park it.
+    pub fn arm_animator(&self) {
+        if let Some(animator) = &self.animator {
+            let next = self
+                .stack
+                .last()
+                .and_then(|screen| screen.next_animation_frame(Instant::now()));
+            animator.send_if_modified(|armed| {
+                if *armed != next {
+                    *armed = next;
+                    true
+                } else {
+                    false
+                }
+            });
         }
     }
 
@@ -193,6 +218,8 @@ impl App {
                 self.flush_drafts();
                 false
             }
+            // A repaint is due for an animating screen; no housekeeping.
+            Event::Animate => false,
             Event::Resize => false,
         }
     }
@@ -1120,6 +1147,39 @@ mod tests {
         assert!(!screen(&mut app, 80, 24).contains("ago"));
     }
 
+    #[test]
+    fn animation_arms_only_while_progress_is_fresh() {
+        let (mut app, mut rx) = app();
+        let (_, act) = mateo_streams(&mut app, &mut rx);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let next = |app: &App| {
+            app.stack
+                .last()
+                .unwrap()
+                .next_animation_frame(Instant::now())
+        };
+        app.on_event(Event::Data(Data::ActivityBaseline {
+            id: act,
+            through_id: 0,
+            record: None,
+        }));
+        assert!(next(&app).is_none(), "nothing fresh yet");
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![activity(1, "01", r#"{"event":"text"}"#)]),
+        }));
+        let Some(deadline) = next(&app) else {
+            panic!("fresh progress animates");
+        };
+        let now = Instant::now();
+        assert!(deadline > now && deadline <= now + std::time::Duration::from_millis(100));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![activity(2, "01", r#"{"event":"turn_end"}"#)]),
+        }));
+        assert!(next(&app).is_none(), "recorded completion does not animate");
+    }
+
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
         app.on_event(Event::Key(KeyEvent::new(code, modifiers)))
     }
@@ -2021,15 +2081,13 @@ mod tests {
             through_id: 500,
             record: None,
         }));
-        let now = chrono::Utc::now().to_rfc3339();
         let batch = |id, kind| Data::Activity {
             id: act,
-            result: Ok(vec![proto::Activity {
+            result: Ok(vec![activity(
                 id,
-                created_at: now.clone(),
-                record: format!(r#"{{"event":"{kind}","text":"hidden"}}"#),
-                ..Default::default()
-            }]),
+                "01",
+                &format!(r#"{{"event":"{kind}","text":"hidden"}}"#),
+            )]),
         };
         app.on_event(Event::Data(batch(500, "turn_end")));
         assert_eq!(
@@ -2044,7 +2102,7 @@ mod tests {
         app.on_event(Event::Data(batch(501, "text")));
         assert_eq!(hint_cell(&mut app), '⠋');
         app.on_event(Event::Data(batch(502, "tool")));
-        assert_eq!(hint_cell(&mut app), '⠙');
+        assert_eq!(hint_cell(&mut app), '⠋', "frames are time-derived, not per event");
         app.on_event(Event::Data(batch(503, "turn_end")));
         assert_eq!(hint_cell(&mut app), '✓');
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);

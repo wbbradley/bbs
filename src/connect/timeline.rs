@@ -252,6 +252,11 @@ impl Stream {
         self.progress.at(now)
     }
 
+    /// When the progress frame next changes, while it is fresh.
+    pub fn next_frame_at(&self, now: Instant) -> Option<Instant> {
+        self.progress.next_frame_at(now)
+    }
+
     /// The newest record received.
     pub fn newest(&self) -> Option<i64> {
         self.records.back().map(|r| r.id)

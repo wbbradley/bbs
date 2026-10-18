@@ -10,6 +10,8 @@ use super::theme::{self, Role};
 
 /// How long an unfinished event counts as fresh evidence.
 const FRESH: Duration = Duration::from_secs(60);
+/// Frames advance every 100ms for this long, then every 500ms.
+const FAST: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Progress {
@@ -33,10 +35,20 @@ impl Progress {
     }
 }
 
-/// Unfinished progress: the spinner frame and its local receipt time.
+/// Unfinished progress: when the newest unfinished event arrived locally.
 struct Fresh {
-    frame: u8,
     at: Instant,
+}
+
+/// The animation frame `elapsed` after a fresh event: 100ms frames for the
+/// first FAST, then 500ms frames until the freshness expiry.
+fn frame(elapsed: Duration) -> u8 {
+    let frames = if elapsed < FAST {
+        elapsed.as_millis() / 100
+    } else {
+        30 + (elapsed - FAST).as_millis() / 500
+    };
+    frames as u8
 }
 
 #[derive(Default)]
@@ -90,11 +102,7 @@ impl ProgressState {
                 // Newer unfinished activity invalidates any earlier
                 // completion; only while fresh does it show progress.
                 self.settled = Progress::Unknown;
-                let frame = self
-                    .fresh
-                    .as_ref()
-                    .map_or(0, |fresh| fresh.frame.wrapping_add(1));
-                self.fresh = Some(Fresh { frame, at: now });
+                self.fresh = Some(Fresh { at: now });
             }
         }
     }
@@ -109,9 +117,24 @@ impl ProgressState {
         if let Some(fresh) = &self.fresh
             && now.saturating_duration_since(fresh.at) < FRESH
         {
-            return Progress::Progressing(fresh.frame);
+            return Progress::Progressing(frame(now.saturating_duration_since(fresh.at)));
         }
         self.settled
+    }
+
+    /// When the displayed frame next changes, while progress is fresh.
+    pub fn next_frame_at(&self, now: Instant) -> Option<Instant> {
+        let fresh = self.fresh.as_ref()?;
+        let elapsed = now.saturating_duration_since(fresh.at);
+        if elapsed >= FRESH {
+            return None;
+        }
+        let next = if elapsed < FAST {
+            Duration::from_millis((elapsed.as_millis() as u64 + 100) / 100 * 100)
+        } else {
+            FAST + Duration::from_millis(((elapsed - FAST).as_millis() as u64 + 500) / 500 * 500)
+        };
+        Some(fresh.at + next.min(FRESH))
     }
 }
 
@@ -177,13 +200,54 @@ mod tests {
     }
 
     #[test]
-    fn progress_is_fresh_from_receipt_for_a_minute() {
+    fn progress_frames_follow_elapsed_time_until_expiry() {
         let now = Instant::now();
         let mut p = ProgressState::default();
         p.baseline(0, None);
         p.observe(1, &record("text"), now);
-        assert_eq!(p.at(now + Duration::from_secs(59)), Progress::Progressing(0));
+        // 100ms frames for the first three seconds.
+        assert_eq!(p.at(now + Duration::from_millis(99)), Progress::Progressing(0));
+        assert_eq!(p.at(now + Duration::from_millis(100)), Progress::Progressing(1));
+        assert_eq!(p.at(now + Duration::from_millis(2900)), Progress::Progressing(29));
+        // Then 500ms frames.
+        assert_eq!(p.at(now + Duration::from_millis(3000)), Progress::Progressing(30));
+        assert_eq!(p.at(now + Duration::from_millis(3499)), Progress::Progressing(30));
+        assert_eq!(p.at(now + Duration::from_millis(3500)), Progress::Progressing(31));
+        assert_eq!(p.at(now + Duration::from_millis(59999)), Progress::Progressing(143));
         assert_eq!(p.at(now + Duration::from_secs(60)), Progress::Unknown);
+        // Repaints do not move the frame; a new event restarts the fast phase.
+        assert_eq!(p.at(now + Duration::from_millis(100)), Progress::Progressing(1));
+        p.observe(2, &record("text"), now + Duration::from_secs(4));
+        assert_eq!(
+            p.at(now + Duration::from_secs(4) + Duration::from_millis(100)),
+            Progress::Progressing(1)
+        );
+    }
+
+    #[test]
+    fn next_frame_tracks_boundaries_and_stops_at_expiry() {
+        let now = Instant::now();
+        let mut p = ProgressState::default();
+        assert_eq!(p.next_frame_at(now), None, "nothing observed");
+        p.baseline(0, Some(&record("turn_end")));
+        assert_eq!(p.next_frame_at(now), None, "settled does not animate");
+        let mut p = ProgressState::default();
+        p.baseline(0, None);
+        p.observe(1, &record("text"), now);
+        assert_eq!(p.next_frame_at(now), Some(now + Duration::from_millis(100)));
+        assert_eq!(
+            p.next_frame_at(now + Duration::from_millis(100)),
+            Some(now + Duration::from_millis(200))
+        );
+        assert_eq!(
+            p.next_frame_at(now + Duration::from_secs(3)),
+            Some(now + Duration::from_millis(3500))
+        );
+        assert_eq!(
+            p.next_frame_at(now + Duration::from_millis(59950)),
+            Some(now + Duration::from_secs(60))
+        );
+        assert_eq!(p.next_frame_at(now + Duration::from_secs(60)), None);
     }
 
     #[test]

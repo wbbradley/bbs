@@ -375,6 +375,15 @@ impl Screen for Thread {
         requests
     }
 
+    fn next_animation_frame(&self, now: Instant) -> Option<Instant> {
+        let stream = self.stream.as_ref()?;
+        if self.compact {
+            stream.next_frame_at(now)
+        } else {
+            None
+        }
+    }
+
     fn save_draft(&mut self, drafts: &mut HashMap<String, Composer>) {
         if let Some(key) = &self.draft_key
             && let Some(composer) = self.composer.take()
