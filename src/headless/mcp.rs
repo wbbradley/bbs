@@ -27,12 +27,16 @@ const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// ...from this far back, when it gives no start.
 const DEFAULT_HISTORY_SINCE: &str = "7d";
 
-pub async fn run(dir: &Path) -> Result<()> {
+pub async fn run(dir: &Path, local: bool) -> Result<()> {
+    if local && !dir.is_absolute() {
+        bail!("--local-state-dir must be an absolute path");
+    }
     let token = std::env::var(TOKEN_ENV)
         .ok()
         .filter(|t| !t.is_empty())
         .with_context(|| format!("{TOKEN_ENV} is not set"))?;
     let mut tools = Tools::new(dir, token);
+    tools.local = local;
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
     let mut line = String::new();
@@ -67,6 +71,7 @@ pub struct Tools {
     dir: std::path::PathBuf,
     token: String,
     backend: Option<Backend>,
+    local: bool,
 }
 
 impl Tools {
@@ -75,6 +80,7 @@ impl Tools {
             dir: dir.to_path_buf(),
             token,
             backend: None,
+            local: false,
         }
     }
 
@@ -110,7 +116,12 @@ impl Tools {
                 token: Some(self.token.clone()),
                 ..Default::default()
             };
-            self.backend = Some(Backend::open(&Config::load()?, &self.dir, caller).await?);
+            let config = if self.local {
+                Config::default()
+            } else {
+                Config::load()?
+            };
+            self.backend = Some(Backend::open(&config, &self.dir, caller).await?);
         }
         Ok(self.backend.as_mut().unwrap())
     }

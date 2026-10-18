@@ -14,7 +14,7 @@ use super::acp::McpServer;
 use super::harness::{BbsTools, Event, Harness};
 use super::log::Log;
 use super::mcp::{TOKEN_ENV, Tools};
-use super::settings::{DEFAULT_MAX_TURN_ERRORS, MidTurn, Settings};
+use super::settings::{DEFAULT_MAX_TURN_ERRORS, McpEnv, MidTurn, Settings};
 use super::share;
 use super::state::{AgentDir, State};
 use crate::app::format_messages;
@@ -35,6 +35,11 @@ const SLOT_RETRIES: u32 = 3;
 pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> Result<()> {
     let settings = Settings::load()?;
     let (harness, mut harness_config) = settings.harness(args.harness.as_deref())?;
+    harness_config.check_mcp_env(
+        std::env::var("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB")
+            .ok()
+            .as_deref(),
+    )?;
     if args.model.is_some() {
         harness_config.model = args.model.clone();
     }
@@ -94,12 +99,25 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         json!({ "agent": agent, "harness": harness, "cwd": cwd, "pid": std::process::id() }),
     );
 
+    let mut mcp_args = vec!["headless".into(), "mcp".into()];
+    if harness_config.mcp_env == McpEnv::Process && config.server.is_none() {
+        mcp_args.extend([
+            "--local-state-dir".into(),
+            std::fs::canonicalize(dir)?.display().to_string(),
+        ]);
+    }
     let mcp = McpServer {
         name: "bbs".into(),
         command: std::env::current_exe()?.display().to_string(),
-        args: vec!["headless".into(), "mcp".into()],
+        args: mcp_args,
         env: std::iter::once((TOKEN_ENV.to_string(), token.clone()))
-            .chain(config.server.clone().map(|s| ("BBS_SERVER".to_string(), s)))
+            .chain(
+                config
+                    .server
+                    .clone()
+                    .or_else(|| (harness_config.mcp_env == McpEnv::Process).then(String::new))
+                    .map(|s| ("BBS_SERVER".to_string(), s)),
+            )
             .collect(),
     };
     let resume = state

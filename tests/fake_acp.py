@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 
 def out(msg):
@@ -36,6 +37,16 @@ class Mcp:
             text=True,
             env=env,
         )
+        if os.environ.get("FAKE_MCP_PROCESS_ENV"):
+            token = os.environ.get("BBS_HEADLESS_TOKEN", "")
+            assert token and token != "stale-token", "runtime token missing"
+            assert not spec["env"], "MCP spec must not contain credentials"
+            for pid in (os.getpid(), self.proc.pid):
+                cmdline = Path(f"/proc/{pid}/cmdline")
+                if cmdline.is_file():
+                    assert token.encode() not in cmdline.read_bytes(), "token in argv"
+            with open("fake-mcp-specs.jsonl", "a") as f:
+                f.write(json.dumps(spec) + "\n")
         self.next_id = 0
         self.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})
 
@@ -58,20 +69,38 @@ def main():
         f.write(str(child.pid))
     mcp = None
     session = "fake-session"
+    model_selected = False
     while (msg := read()) is not None:
         method, mid, params = msg.get("method"), msg.get("id"), msg.get("params", {})
         if method == "initialize":
+            caps = {"loadSession": True}
+            if os.environ.get("FAKE_ACP_RESUME"):
+                caps["sessionCapabilities"] = {"resume": {}}
             out({"jsonrpc": "2.0", "id": mid, "result": {
                 "protocolVersion": 1,
-                "agentCapabilities": {"loadSession": True},
+                "agentCapabilities": caps,
                 "authMethods": [],
             }})
-        elif method in ("session/new", "session/load"):
+        elif method in ("session/new", "session/load", "session/resume"):
             mcp = Mcp(params["mcpServers"][0])
+            if os.environ.get("FAKE_MCP_PROCESS_ENV"):
+                with open("fake-session-methods", "a") as f:
+                    f.write(method + "\n")
             session = params.get("sessionId", session)
             result = {"sessionId": session} if method == "session/new" else {}
+            if os.environ.get("FAKE_MCP_PROCESS_ENV"):
+                model_selected = False
+                result["configOptions"] = [{"id": "model", "category": "model"}]
             out({"jsonrpc": "2.0", "id": mid, "result": result})
+        elif method == "session/set_config_option":
+            assert params == {"sessionId": session, "configId": "model", "value": "synthetic/model"}
+            model_selected = True
+            with open("fake-model-selections", "a") as f:
+                f.write(params["value"] + "\n")
+            out({"jsonrpc": "2.0", "id": mid, "result": {"configOptions": []}})
         elif method == "session/prompt":
+            if os.environ.get("FAKE_MCP_PROCESS_ENV"):
+                assert model_selected, "configured model must be reapplied before prompting"
             text = params["prompt"][0]["text"]
             sender = re.findall(r"\] from (\S+)", text)[-1]
             update(session, {"sessionUpdate": "agent_message_chunk",

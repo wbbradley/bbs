@@ -63,6 +63,21 @@ impl HarnessType {
     }
 }
 
+/// Where an ACP harness receives the BBS MCP server's environment.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpEnv {
+    #[default]
+    Server,
+    Process,
+}
+
+impl McpEnv {
+    fn is_default(&self) -> bool {
+        *self == Self::Server
+    }
+}
+
 /// One named harness, started as a subprocess.
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +95,9 @@ pub struct HarnessConfig {
     /// Extra environment for the subprocess.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// ACP only: use the harness process environment instead of the MCP spec.
+    #[serde(default, skip_serializing_if = "McpEnv::is_default")]
+    pub mcp_env: McpEnv,
     /// Opaque model value for the session's `model` config option.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -98,6 +116,33 @@ pub struct HarnessConfig {
 impl HarnessConfig {
     pub fn shares_activity(&self) -> bool {
         self.share_activity.unwrap_or(true)
+    }
+
+    /// Check before registration so an incompatible launch cannot take over an agent.
+    pub fn check_mcp_env(&self, inherited_scrub: Option<&str>) -> Result<()> {
+        if self.mcp_env != McpEnv::Process {
+            return Ok(());
+        }
+        if self.kind != HarnessType::Acp {
+            bail!("mcp_env = \"process\" is only supported for ACP harnesses");
+        }
+        let scrub = self
+            .env
+            .get("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB")
+            .map(String::as_str)
+            .or(inherited_scrub);
+        if scrub.is_some_and(|s| {
+            !matches!(
+                s.to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        }) {
+            bail!(
+                "mcp_env = \"process\" is incompatible with CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: \
+                 credential scrubbing can remove the BBS token from the MCP child"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -260,6 +305,33 @@ env = { RUST_LOG = "warn" }
         let s = parse("human = \"will\"\n").unwrap();
         assert!(s.harnesses.is_empty());
         assert!(s.harness(None).is_err());
+    }
+
+    #[test]
+    fn process_mcp_env_is_explicit_and_rejects_incompatible_launches() {
+        let default = parse("[headless.harness.a]\ncommand = [\"x\"]\n").unwrap();
+        let config = default.harness(None).unwrap().1;
+        assert_eq!(config.mcp_env, McpEnv::Server);
+        assert!(config.check_mcp_env(Some("1")).is_ok());
+        let text = "[headless.harness.a]\ncommand = [\"x\"]\nmcp_env = \"process\"\n";
+        let parsed: Config = toml::from_str(text).unwrap();
+        let written = toml::to_string(&parsed).unwrap();
+        let mut config = parse(&written).unwrap().harness(None).unwrap().1;
+        assert_eq!(config.mcp_env, McpEnv::Process);
+        assert!(config.check_mcp_env(None).is_ok());
+        assert!(config.check_mcp_env(Some("1")).is_err());
+        config
+            .env
+            .insert("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB".into(), "0".into());
+        assert!(config.check_mcp_env(Some("1")).is_ok());
+        config
+            .env
+            .insert("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB".into(), "true".into());
+        assert!(config.check_mcp_env(Some("0")).is_err());
+        config.env.clear();
+        config.kind = HarnessType::CodexAppServer;
+        assert!(config.check_mcp_env(None).is_err());
+        assert!(parse(&text.replace("process", "bogus")).is_err());
     }
 
     #[test]

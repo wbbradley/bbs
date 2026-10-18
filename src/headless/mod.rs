@@ -32,7 +32,13 @@ pub async fn run(command: HeadlessCommand, dir: &Path, as_human: Option<&str>) -
             pretty,
         } => log::print(&state::AgentDir::new(&agent)?.log_path(), follow, pretty).await,
         HeadlessCommand::Cancel { agent } => cancel(dir, as_human, agent).await,
-        HeadlessCommand::Mcp => mcp::run(dir).await,
+        HeadlessCommand::Mcp { local_state_dir } => {
+            mcp::run(
+                local_state_dir.as_deref().unwrap_or(dir),
+                local_state_dir.is_some(),
+            )
+            .await
+        }
     }
 }
 
