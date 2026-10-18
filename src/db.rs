@@ -2221,17 +2221,33 @@ mod tests {
         };
         let ordinary = insert_message(&conn, &will, None, "hi Bram", t).unwrap();
         insert_delivery(&conn, ordinary, Kind::Agent, bram.id).unwrap();
-        for control in ["cancel", "set-effort"] {
-            let m = insert_message(&conn, &will, None, control, t).unwrap();
-            set_message_control(&conn, m, control).unwrap();
-            insert_delivery(&conn, m, Kind::Agent, bram.id).unwrap();
-        }
-        // Default feed, cursor continuation, and a one-row window all exclude
-        // controls without crowding out ordinary mail.
+        // Controls straddle the ordinary message in time: one older (pins
+        // archived history's oldest-first limit), one newer (pins the feed's
+        // newest-first limit). A post-LIMIT filter would fail either window.
+        let cancel = insert_message(&conn, &will, None, "cancel", "2026-10-09T00:00:00.000000Z")
+            .unwrap();
+        set_message_control(&conn, cancel, "cancel").unwrap();
+        insert_delivery(&conn, cancel, Kind::Agent, bram.id).unwrap();
+        let effort = insert_message(
+            &conn,
+            &will,
+            None,
+            "set-effort",
+            "2026-10-09T00:00:02.000000Z",
+        )
+        .unwrap();
+        set_message_control(&conn, effort, "set-effort").unwrap();
+        insert_delivery(&conn, effort, Kind::Agent, bram.id).unwrap();
+        // Default feed, cursor continuation, the agent thread (--with), and
+        // one-row windows all exclude controls without crowding out mail.
         for filter in [
             FeedFilter::default(),
             FeedFilter {
                 after_id: Some(0),
+                ..Default::default()
+            },
+            FeedFilter {
+                with: Some(vec![(Kind::Agent, bram.id)]),
                 ..Default::default()
             },
         ] {
@@ -2269,13 +2285,19 @@ mod tests {
             effort_control_body(&conn, bram.id, set_effort).unwrap().as_deref(),
             Some("set-effort")
         );
-        // Archived history excludes controls too.
+        // Archived history excludes controls too, oldest-first and limited.
         let history: Vec<_> = archived_since(&conn, &bram, None, None)
             .unwrap()
             .into_iter()
             .map(|m| m.body)
             .collect();
         assert_eq!(history, ["hi Bram"]);
+        let history: Vec<_> = archived_since(&conn, &bram, None, Some(1))
+            .unwrap()
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
+        assert_eq!(history, ["hi Bram"], "the oldest row is a control");
     }
 
     #[test]
