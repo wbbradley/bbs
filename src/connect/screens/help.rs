@@ -2,7 +2,6 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
-use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Row, Table, TableState};
 
@@ -60,24 +59,24 @@ impl Screen for Help {
             .map(|b| {
                 let keys: Vec<String> = b.keys.iter().map(|k| k.label()).collect();
                 Row::new(vec![
-                    Line::styled(keys.join(" / "), theme::base().fg(theme::HOTKEY)),
+                    Line::styled(keys.join(" / "), theme::style(theme::Role::Hotkey)),
                     Line::raw(b.help),
                 ])
             })
             .collect();
         rows.push(Row::new(vec![
-            Line::styled("[X]", theme::base().fg(theme::HOTKEY)),
+            Line::styled("[X]", theme::style(theme::Role::Hotkey)),
             Line::raw("a menu item's hot key"),
         ]));
         rows.extend(AGENT_KEYS.iter().map(|(key, help)| {
             Row::new(vec![
-                Line::styled(*key, theme::base().fg(theme::HOTKEY)),
+                Line::styled(*key, theme::style(theme::Role::Hotkey)),
                 Line::raw(*help),
             ])
         }));
         let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(10)])
             .style(theme::base())
-            .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+            .row_highlight_style(theme::style(theme::Role::Selection));
         if self.state.selected().is_none() {
             self.state.select(Some(0));
         }

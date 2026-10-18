@@ -29,6 +29,7 @@ pub(crate) fn display_time(stored: &str) -> String {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    crate::ui::theme::init(cli.theme.as_deref())?;
     let dir = match &cli.command {
         Command::Serve {
             state_dir: Some(dir),

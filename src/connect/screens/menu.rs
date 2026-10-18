@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -133,7 +133,7 @@ impl Screen for Menu {
                 Span::styled(
                     *key,
                     style
-                        .patch(Style::new().fg(theme::HOTKEY))
+                        .patch(theme::style(theme::Role::Hotkey))
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("]", style),

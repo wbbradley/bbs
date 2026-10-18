@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 
 use chrono::DateTime;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 
 use super::app::next_id;
@@ -71,18 +71,8 @@ impl Row for Entry {
                     message_lines(message, gap, query)
                 };
                 if *outgoing {
-                    // Dark-gray timestamps disappear against the outgoing background.
                     for line in &mut lines {
-                        line.style.bg = Some(theme::OUTGOING);
-                        if line.style.fg == Some(Color::DarkGray) {
-                            line.style.fg = Some(Color::Gray);
-                        }
-                        for span in &mut line.spans {
-                            span.style.bg = Some(theme::OUTGOING);
-                            if span.style.fg == Some(Color::DarkGray) {
-                                span.style.fg = Some(Color::Gray);
-                            }
-                        }
+                        line.style = theme::style(theme::Role::HumanSurface).patch(line.style);
                     }
                     lines.push(Line::default());
                 }
@@ -94,7 +84,7 @@ impl Row for Entry {
 
     fn style(&self) -> Style {
         match self {
-            Entry::Message { outgoing: true, .. } => Style::new().bg(theme::OUTGOING),
+            Entry::Message { outgoing: true, .. } => theme::style(theme::Role::HumanSurface),
             _ => Style::default(),
         }
     }
@@ -365,21 +355,28 @@ mod tests {
                         assert_eq!(
                             cell.bg,
                             if (start..end).contains(&y) {
-                                theme::OUTGOING
+                                theme::style(theme::Role::HumanSurface).bg.unwrap()
                             } else {
-                                theme::BACKGROUND
+                                theme::base().bg.unwrap()
                             },
                             "at {x},{y}, compact={compact}"
                         );
                         if (start..end).contains(&y) && cell.symbol() != " " {
-                            assert_ne!(cell.fg, theme::OUTGOING, "text must remain readable");
+                            assert_ne!(
+                                cell.fg,
+                                theme::style(theme::Role::HumanSurface).bg.unwrap(),
+                                "text must remain readable"
+                            );
                         }
                     }
                 }
                 for y in [start, end - 1] {
                     assert!((0..width).all(|x| buffer[(x, y)].symbol() == " "));
                 }
-                assert_eq!(buffer[(0, start + 1)].fg, Color::Gray);
+                assert_eq!(
+                    buffer[(0, start + 1)].fg,
+                    theme::style(theme::Role::Muted).fg.unwrap()
+                );
                 assert!(buffer.content.iter().any(|c| c.symbol() == "n"
                     && c.modifier.contains(Modifier::BOLD | Modifier::REVERSED)));
                 // The same full-row background survives a viewport clipped into the message.
@@ -401,7 +398,7 @@ mod tests {
                         .buffer()
                         .content
                         .iter()
-                        .all(|c| c.bg == theme::OUTGOING)
+                        .all(|c| c.bg == theme::style(theme::Role::HumanSurface).bg.unwrap())
                 );
             }
         }

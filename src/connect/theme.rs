@@ -1,11 +1,10 @@
-//! The retro look: 16 ANSI colours on black, double-line windows, and shaded
-//! title and status bars.
+//! Shared-theme layout helpers for the connect screens.
 
 use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
@@ -15,28 +14,19 @@ pub const MIN_HEIGHT: u16 = 24;
 /// Shown in the status bar, for the look of a dial-up line.
 const BAUD: &str = "14400 baud";
 
-pub const BACKGROUND: Color = Color::Black;
-/// Current human's direct messages in agent conversations.
-pub const OUTGOING: Color = Color::DarkGray;
-/// Agents the viewing human owns, and other humans' agents.
-pub const OWN_AGENT: Color = Color::LightCyan;
-pub const OTHER_AGENT: Color = Color::LightMagenta;
-pub const HOTKEY: Color = Color::LightYellow;
+pub use crate::ui::theme::{Role, style};
 
 pub fn base() -> Style {
-    Style::new().fg(Color::Gray).bg(BACKGROUND)
+    style(Role::Screen)
 }
-
 pub fn dim() -> Style {
-    base().fg(Color::DarkGray)
+    style(Role::Muted)
 }
-
 pub fn heading() -> Style {
-    base().fg(Color::White).add_modifier(Modifier::BOLD)
+    style(Role::Heading)
 }
-
 pub fn error() -> Style {
-    base().fg(Color::LightRed)
+    style(Role::Error)
 }
 
 /// A double-line window with its title in the top border.
@@ -44,23 +34,17 @@ pub fn window(title: &str) -> Block<'static> {
     Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(base().fg(Color::LightBlue))
+        .border_style(style(Role::Border))
         .title(Span::styled(format!(" {title} "), heading()))
         .style(base())
 }
 
 /// The bar across the top: the board's name and the current screen.
 pub fn title_bar(screen: &str) -> Line<'static> {
-    let shade = Style::new().fg(Color::Blue).bg(BACKGROUND);
+    let shade = style(Role::Logo);
     Line::from(vec![
         Span::styled("░▒▓█", shade),
-        Span::styled(
-            format!(" BBS · {screen} "),
-            Style::new()
-                .fg(Color::White)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!(" BBS · {screen} "), style(Role::TitleBar)),
         Span::styled("█▓▒░", shade),
     ])
     .alignment(Alignment::Center)
@@ -70,7 +54,7 @@ pub fn title_bar(screen: &str) -> Line<'static> {
 pub fn status_bar(server: &str, human: &str, online: Duration) -> Line<'static> {
     let secs = online.as_secs();
     let clock = format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
-    let bar = Style::new().fg(Color::Black).bg(Color::Cyan);
+    let bar = style(Role::StatusBar);
     Line::from(vec![
         Span::styled(format!(" {server} "), bar.add_modifier(Modifier::BOLD)),
         Span::styled("│", bar),

@@ -213,6 +213,10 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        frame.render_widget(
+            ratatui::widgets::Block::new().style(theme::base()),
+            frame.area(),
+        );
         if theme::too_small(frame.area()) {
             theme::render_too_small(frame);
             return;
@@ -236,6 +240,26 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+    #[test]
+    fn all_screens_use_only_the_selected_scheme() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                the_splash_comes_first_and_any_key_passes_it();
+                a_small_terminal_gets_a_notice();
+                agents_load_on_open_and_show_owners();
+                errors_show_in_the_window();
+                groups_show_members_and_writers();
+                help_lists_the_keys();
+                groups_and_the_feed_open_threads();
+                creating_a_group_takes_a_name_and_a_description();
+                each_dialog_makes_its_change_to_the_selected_group();
+                a_failed_send_keeps_the_text_and_says_why();
+                an_agents_timeline_merges_messages_and_activity_in_time_order();
+            });
+        }
+    }
 
     fn app() -> (App, UnboundedReceiver<Request>) {
         let (tx, rx) = unbounded_channel();
@@ -265,6 +289,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
+        crate::ui::theme::testing::assert_buffer(buffer);
         (0..height)
             .map(|y| {
                 (0..width)
@@ -1534,6 +1559,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
             terminal.draw(|f| app.draw(f)).unwrap();
             let buffer = terminal.backend().buffer();
+            crate::ui::theme::testing::assert_buffer(buffer);
             let y = (0..30)
                 .find(|y| {
                     (0..100)
@@ -1545,15 +1571,16 @@ mod tests {
             assert_eq!(
                 buffer[(98, y)].bg,
                 if shaded {
-                    theme::OUTGOING
+                    theme::style(theme::Role::HumanSurface).bg.unwrap()
                 } else {
-                    theme::BACKGROUND
+                    theme::base().bg.unwrap()
                 }
             );
             assert!((1..99).all(|x| buffer[(x, y)].bg == buffer[(98, y)].bg));
             if shaded {
                 for padding in [y - 2, y + 1] {
-                    assert!((1..99).all(|x| buffer[(x, padding)].bg == theme::OUTGOING
+                    assert!((1..99).all(|x| buffer[(x, padding)].bg
+                        == theme::style(theme::Role::HumanSurface).bg.unwrap()
                         && buffer[(x, padding)].symbol() == " "));
                 }
             }

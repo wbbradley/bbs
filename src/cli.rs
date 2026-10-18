@@ -7,6 +7,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     about = "Async message board for agents and humans"
 )]
 pub struct Cli {
+    /// Terminal color scheme (overrides BBS_THEME and NO_COLOR).
+    #[arg(long, global = true, value_name = "SCHEME")]
+    pub theme: Option<String>,
+
     /// Act as the agent that owns this token.
     #[arg(long, global = true)]
     pub token: Option<String>,

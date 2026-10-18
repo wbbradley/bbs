@@ -1,16 +1,13 @@
-//! ANSI art from `assets/connect/`, embedded in the binary. The files are
-//! UTF-8 text with 16-colour SGR codes, as ANSI editors such as Moebius and
-//! PabloDraw export them.
-
-use ansi_to_tui::IntoText as _;
-use ratatui::text::Text;
-
-const LOGO: &[u8] = include_bytes!("../../assets/connect/logo.ans");
-
-/// The board's logo.
+//! Embedded logo geometry, colored by the selected scheme.
+use crate::ui::theme::{Role, style};
+use ratatui::text::{Line, Text};
+const LOGO: &str = include_str!("../../assets/connect/logo.txt");
 pub fn logo() -> Text<'static> {
-    LOGO.into_text()
-        .expect("assets/connect/logo.ans is valid ANSI")
+    Text::from(
+        LOGO.lines()
+            .map(|line| Line::styled(line, style(Role::Logo)))
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[cfg(test)]
@@ -24,6 +21,6 @@ mod tests {
         assert!(logo.width() <= 76, "{}", logo.width());
         let text: String = logo.lines[1].spans.iter().map(|s| &*s.content).collect();
         assert!(text.contains('█'), "{text:?}");
-        assert!(logo.lines[1].spans.iter().any(|s| s.style.fg.is_some()));
+        assert_eq!(logo.lines[1].style, style(Role::Logo));
     }
 }

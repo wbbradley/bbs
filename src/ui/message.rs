@@ -1,8 +1,9 @@
 //! A message as styled lines: its header and markdown body, with search
 //! matches highlighted. Shared by `bbs view` and `bbs connect`.
 
+use crate::ui::theme::{Role, style};
 use chrono::{DateTime, Local};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Modifier, Style, Styled};
 use ratatui::text::{Line, Span};
 
 use crate::proto::{Kind, Message};
@@ -27,10 +28,7 @@ pub fn compact_message_lines<'a>(
         row,
         gap,
         query,
-        Line::styled(
-            local_time(&row.created_at),
-            Style::new().fg(Color::DarkGray),
-        ),
+        Line::styled(local_time(&row.created_at), style(Role::Muted)),
     )
 }
 
@@ -41,7 +39,7 @@ fn with_header<'a>(
     mut header: Line<'static>,
 ) -> Vec<Line<'a>> {
     let mut body = Vec::new();
-    for mut line in tui_markdown::from_str(&row.body).lines {
+    for mut line in crate::ui::markdown::render(&row.body).lines {
         line.spans.insert(0, Span::raw("  "));
         body.push(line);
     }
@@ -65,7 +63,7 @@ fn with_header<'a>(
     let marker = gap.then(|| {
         Line::from(
             "  ⋯ messages may be missing here: more than --limit arrived at once; use --since/--until or a larger --limit"
-                .yellow(),
+                .set_style(style(Role::Warning)),
         )
     });
     [Line::default()]
@@ -163,16 +161,16 @@ fn header(row: &Message) -> Line<'static> {
                 || row.created_at.clone(),
                 |t| t.format("%Y-%m-%d %H:%M:%S").to_string(),
             ),
-            Style::new().fg(Color::DarkGray),
+            style(Role::Muted),
         ),
         Span::raw("  "),
         name_span(&row.qualified_sender(), row.from_kind()),
-        Span::styled(" → ", Style::new().fg(Color::DarkGray)),
+        Span::styled(" → ", style(Role::Muted)),
     ];
     match (&row.to_group, row.qualified_recipient()) {
         (Some(group), _) => spans.push(Span::styled(
             format!("@{group}"),
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            style(Role::Warning).add_modifier(Modifier::BOLD),
         )),
         (None, Some(to)) => {
             spans.push(Span::styled(to, Style::new().add_modifier(Modifier::BOLD)));
@@ -185,12 +183,9 @@ fn header(row: &Message) -> Line<'static> {
                     } else {
                         "%Y-%m-%d %H:%M:%S"
                     };
-                    Span::styled(
-                        format!("read {}", read.format(fmt)),
-                        Style::new().fg(Color::Green),
-                    )
+                    Span::styled(format!("read {}", read.format(fmt)), style(Role::Success))
                 }
-                None => Span::styled("unread", Style::new().fg(Color::Red)),
+                None => Span::styled("unread", style(Role::Error)),
             });
         }
         (None, None) => spans.push(Span::raw("?")),
@@ -199,14 +194,11 @@ fn header(row: &Message) -> Line<'static> {
 }
 
 fn name_span(name: &str, kind: Kind) -> Span<'static> {
-    let color = match kind {
-        Kind::Human => Color::Magenta,
-        Kind::Agent | Kind::Unspecified => Color::Cyan,
+    let author = match kind {
+        Kind::Human => Role::Human,
+        Kind::Agent | Kind::Unspecified => Role::OwnAgent,
     };
-    Span::styled(
-        name.to_string(),
-        Style::new().fg(color).add_modifier(Modifier::BOLD),
-    )
+    Span::styled(name.to_string(), style(author).add_modifier(Modifier::BOLD))
 }
 
 /// A stored time in local time, as message headers show it.

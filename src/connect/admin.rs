@@ -138,7 +138,7 @@ impl GroupAdmin {
     /// The last change's outcome, for the screen to show.
     pub fn notice(&self) -> Option<Line<'static>> {
         Some(match self.notice.as_ref()? {
-            Ok(done) => Line::styled(done.clone(), theme::base().fg(theme::HOTKEY)),
+            Ok(done) => Line::styled(done.clone(), theme::style(theme::Role::Hotkey)),
             Err(e) => Line::styled(e.clone(), theme::error()),
         })
     }

@@ -43,7 +43,7 @@ impl Screen for Splash {
                 theme::heading(),
             ),
             Line::default(),
-            Line::styled("press any key", theme::base().fg(theme::HOTKEY)),
+            Line::styled("press any key", theme::style(theme::Role::Hotkey)),
         ]);
         let height = text.height() as u16;
         let [middle] = Layout::vertical([Constraint::Length(height)])
