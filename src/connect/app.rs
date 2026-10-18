@@ -580,7 +580,10 @@ mod tests {
         let bar = theme::style(theme::Role::StatusBar);
         for x in 0..80 {
             let cell = &buffer[(x, 23)];
-            assert!(cell.fg == bar.fg.unwrap() && cell.bg == bar.bg.unwrap(), "{text}");
+            assert!(
+                cell.fg == bar.fg.unwrap() && cell.bg == bar.bg.unwrap(),
+                "{text}"
+            );
         }
     }
 
@@ -1034,7 +1037,11 @@ mod tests {
                 .unwrap()
                 .chars()
                 .collect();
-            let cell: String = row[active..active + 11].iter().collect::<String>().trim().to_string();
+            let cell: String = row[active..active + 11]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string();
             assert_eq!(cell, "103d23h ago", "{out}");
             // An unknown active time renders a dash.
             let row: Vec<_> = out
@@ -1218,9 +1225,7 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         let out = screen(&mut app, 100, 24);
         assert!(
-            out.contains("Mateo · Enter sends")
-                && out.contains("first")
-                && out.contains("second"),
+            out.contains("Mateo · Enter sends") && out.contains("first") && out.contains("second"),
             "{out}"
         );
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
@@ -1464,6 +1469,34 @@ mod tests {
             panic!("send")
         };
         assert_eq!(req.body, "unconfirmed");
+    }
+
+    #[test]
+    fn draft_errors_keep_the_status_bar_surface_across_the_full_width() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().join("drafts");
+                let (mut app, mut rx) = persistent_app(&root);
+                mateo(&mut app, &mut rx);
+                typed(&mut app, "draft");
+                std::fs::write(&root, "blocked").unwrap();
+                app.on_event(Event::Tick);
+                let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+                terminal.draw(|frame| app.draw(frame)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let area = buffer.area;
+                let expected = theme::base()
+                    .patch(theme::style(theme::Role::StatusBar))
+                    .patch(theme::error());
+                for x in area.left()..area.right() {
+                    let cell = &buffer[(x, area.bottom() - 1)];
+                    assert_eq!(cell.fg, expected.fg.unwrap());
+                    assert_eq!(cell.bg, expected.bg.unwrap());
+                }
+            });
+        }
     }
 
     #[test]
@@ -1962,12 +1995,22 @@ mod tests {
         typed(&mut app, "ab");
         press(&mut app, KeyCode::Left, KeyModifiers::NONE);
         let hint_cell = |app: &mut App| {
-            screen(app, 100, 24)
-                .lines()
-                .find(|line| line.contains("Mateo · Enter sends"))
-                .unwrap()
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let area = buffer.area;
+            let y = (area.top()..area.bottom())
+                .find(|y| {
+                    (area.left()..area.right())
+                        .map(|x| buffer[(x, *y)].symbol())
+                        .collect::<String>()
+                        .contains("Mateo · Enter sends")
+                })
+                .unwrap();
+            buffer[(area.right() - 1, y)]
+                .symbol()
                 .chars()
-                .nth(98)
+                .next()
                 .unwrap()
         };
         assert_eq!(hint_cell(&mut app), ' ', "verbose has no indicator");
@@ -2172,26 +2215,30 @@ mod tests {
             terminal.draw(|f| app.draw(f)).unwrap();
             let buffer = terminal.backend().buffer();
             crate::ui::theme::testing::assert_buffer(buffer);
-            let y = (0..30)
+            let area = buffer.area;
+            let y = (area.top()..area.bottom())
                 .find(|y| {
-                    (0..100)
+                    (area.left()..area.right())
                         .map(|x| buffer[(x, *y)].symbol())
                         .collect::<String>()
                         .contains("my-outgoing-message")
                 })
                 .unwrap();
             assert_eq!(
-                buffer[(98, y)].bg,
+                buffer[(area.right() - 1, y)].bg,
                 if shaded {
                     theme::style(theme::Role::HumanSurface).bg.unwrap()
                 } else {
                     theme::base().bg.unwrap()
                 }
             );
-            assert!((1..99).all(|x| buffer[(x, y)].bg == buffer[(98, y)].bg));
+            assert!(
+                (area.left()..area.right())
+                    .all(|x| buffer[(x, y)].bg == buffer[(area.right() - 1, y)].bg)
+            );
             if shaded {
                 for padding in [y - 2, y + 1] {
-                    assert!((1..99).all(|x| {
+                    assert!((area.left()..area.right()).all(|x| {
                         buffer[(x, padding)].bg
                             == theme::style(if compact && padding < y {
                                 theme::Role::Screen
@@ -2204,7 +2251,7 @@ mod tests {
                     }));
                 }
                 if compact {
-                    assert!((1..99).all(|x| buffer[(x, y - 1)].bg
+                    assert!((area.left()..area.right()).all(|x| buffer[(x, y - 1)].bg
                         == theme::style(theme::Role::HumanSurface).bg.unwrap()
                         && buffer[(x, y - 1)].symbol() == " "));
                 }
