@@ -114,6 +114,47 @@ backoff and drops records that overflow the queue. Against a server without
 `agent-activity.v1`, or once the agent's token is no longer valid, `run` logs a
 warning and stops sending. On a local board the records go into its database.
 
+## Effort control
+
+In an agent conversation, `Tab` increases effort and `Shift-Tab` decreases it in
+both compact/verbose and typing/navigation modes. Only the agent's owner may
+request a change. These keys do not insert indentation there; group conversations,
+search prompts and dialogs keep their existing input behavior.
+
+Upgrade the server to one advertising `agent-effort.v1` and restart the headless
+runner on the new version. ACP discovers a selectable `thought_level` session
+option; Codex app-server discovers the selected model's advertised reasoning
+choices. Only recognized advertised values receive an ordering. Provider default,
+unknown and unrecognized values stay unranked and require an explicit picker
+choice; no model-catalog default is treated as the confirmed current setting.
+Unsupported harnesses and older runners show unknown/unavailable.
+
+A set-effort control is not prompt text and does not start or interrupt a turn.
+The newest request waits for the next ordinary prompt. With a pending change,
+mail that would otherwise steer a running Codex turn queues for that next turn.
+ACP sets the session option before the prompt; Codex sends the choice on
+`turn/start`. Applied requires a provider acknowledgment. An ACP setter returning a different
+setting reports that actual value with a failure explaining the mismatch. Metadata
+updates alone do not acknowledge controls, and an older completion cannot clear a
+newer pending request.
+
+The bottom bar separates last reported current/report age, pending next-turn
+intent and errors. Delayed requests remain visibly unconfirmed. A definite refusal
+clears the matching request; a timeout/disconnect reports uncertainty instead of
+claiming success. When a setter or turn-start has ambiguous acceptance, the driver
+stops, records unsent mail as `unprocessed` or possibly delivered mail as
+`delivery_uncertain`, and does not automatically resend it. Inspect the local log
+before deciding whether to send those messages again.
+
+Effort reports are durable state visible to humans through agent lists and shared
+summaries, even with `share_activity = false`; they are independent of the 2,000-row
+activity window and never prove that the runner is currently connected. The server
+migrates to schema 15 automatically, so back up first; older local/server binaries
+need the pre-upgrade database to downgrade. Protocol v2 and config format 3 remain
+unchanged. Against older servers, a new runner warns and disables effort reporting
+while ordinary mail handling continues. Keep one runner per agent; no new config
+keys, credentials or identity changes are required.
+
 ## Turns
 
 Only mail starts a turn. The process keeps one mail wait open at all times,

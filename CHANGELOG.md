@@ -6,34 +6,44 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
-## Unreleased
+## 0.9.0 - 2026-10-18
+
+Protocol v2, config format 3 and Rust 1.89 remain unchanged. Database schema 15
+adds nullable agent effort/report-time fields and migrates automatically. Back up
+before opening the database with this version: older local/server binaries cannot
+open schema 15, so downgrade requires the pre-upgrade backup. Existing remote v2
+commands remain compatible; effort reporting/control needs a server advertising
+`agent-effort.v1` and an upgraded, restarted headless runner with harness support.
+No config migration or new credentials are required.
 
 ### Added
 
-- Ctrl-G jumps to the conversation with the oldest unread direct message to the
-  connected human. Ctrl-O cycles through unique visited conversations while
-  preserving drafts and pending sends. A mailbox beside the conversation spinner
-  signals unread mail from another agent.
-
-- Effort reporting (`agent-effort.v1`): a headless driver reports its harness's
-  confirmed effort state with `ReportEffort`, and a human requests a change with
-  a `SET_EFFORT` control message to an agent they own. Reports carry supported
-  choices, the confirmed current level, and the exact control request answered;
-  the board shows the last confirmed level with its report age and never claims
-  the agent is online. `SendResponse` returns the message id for correlation.
-
-- Agent conversations display last reported effort and age separately from pending
-  next-turn changes, with an explicit picker for unranked settings, correlated
-  outcomes and visible unconfirmed/failure feedback. Tab increases and Shift-Tab
-  decreases effort in agent typing/navigation; prompts and dialogs protect input.
+- Ctrl-G opens the agent conversation with the oldest unread direct message to
+  you, across owners. Ctrl-O cycles backward through unique visited agent/group
+  conversations, preserving drafts, cursors and pending sends. A mailbox beside
+  the spinner signals unread mail from another agent.
+- Agent conversations show last reported effort and report age separately from
+  pending next-turn changes. Tab increases and Shift-Tab decreases effort in both
+  compact/verbose and typing/navigation modes, only in agent conversations;
+  prompts and dialogs retain their input behavior. Unranked/default values open
+  an explicit choice picker instead of guessing a level.
+- Headless ACP and Codex app-server drivers discover advertised effort choices
+  and apply owner-requested changes at the next ordinary prompt, without starting
+  a turn or interrupting one. Applied means a provider acknowledgment; failures,
+  ambiguous outcomes and delayed requests remain visible. Newer pending requests
+  supersede older intent without implying success.
+- `agent-effort.v1` adds durable `ReportEffort` state and report time to agent
+  lists/summaries, owner-only set-effort controls, and the sent message ID for
+  exact request/outcome correlation. State is independent of activity retention
+  and never claims that the agent is online.
 
 ### Changed
 
-- Apply consistent categorical styles to agent and human names, groups, timestamps
-  and tool labels across connect, message views and pretty activity logs, retaining
-  search highlights and selected-row surfaces.
-- Show conversation progress in both compact and verbose modes, and separate the
-  inbox icon from its unread count with a space.
+- Structured agent and human names, groups, timestamps and tool labels use
+  consistent semantic styles across connect, message views and pretty activity
+  logs, preserving qualified-name search, selection and bar surfaces.
+- Conversation progress is visible in both compact and verbose modes. The Agents
+  inbox column separates its icon and unread count with a space.
 
 ## 0.8.1 - 2026-10-18
 

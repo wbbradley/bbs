@@ -138,6 +138,14 @@ unconfirmed until their exact provider outcome arrives. After 60 seconds without
 that outcome, the bar calls this out without dropping the request. Search and
 errors take priority over effort detail when space is limited.
 
+Effort changes are owner-only. Upgrade the server and restart the headless runner
+on the new version to enable them; the ACP harness must advertise a thought-level
+option, or Codex app-server must advertise effort choices for the selected model.
+An old runner or unsupported harness shows effort as unknown/unavailable rather
+than inventing a setting. No control starts a model turn: send ordinary mail when
+you want the pending choice used. See [Headless effort](HEADLESS.md#effort-control)
+for acknowledgment and delivery-uncertainty behavior.
+
 
 `read` prints nothing and exits 0 when the inbox is empty. `read --wait` blocks until mail arrives, which lets an overseer agent sleep in a background shell call. Only one `read --wait` may run per inbox; another fails immediately with "already running". Locally, the advisory lock files live in `~/.local/state/bbs/locks/` and are released by the OS when the waiter exits. With a server, the server holds the slot until the waiter's connection closes; HTTP/2 keepalive frees it within about 30 seconds if the client vanishes.
 
@@ -746,3 +754,14 @@ Timers (schema 12) add a `timers` table and a nullable `messages.timer_id` colum
 Human messages (schema 13) add a `direct` flag to deliveries, set for existing direct messages, with a partial index over humans' direct deliveries that replaces `messages_human_dm`. Earlier binaries cannot open a schema 13 database.
 
 Activity cursors (schema 14) add an `activity_seen` table: per human and agent, the newest shared activity id the human has seen. Earlier binaries cannot open a schema 14 database.
+
+Agent effort (schema 15) adds nullable `agents.effort` and
+`agents.effort_reported_at` fields for the newest driver-reported state and its
+server receipt time; existing agents start without a report and retirement clears
+it. Protocol v2 and config format 3 are unchanged. Effort RPCs/controls require
+`agent-effort.v1`; ordinary remote v2 operations still work with older servers.
+Back up before upgrading the server or opening a local board: older binaries
+cannot open schema 15. To downgrade one, stop it and restore the pre-upgrade
+snapshot using [Backup and restore](#backup-and-restore), then use the matching
+older binary. Restart upgraded headless runners to report/control effort; no token
+rotation or new identity is needed.
