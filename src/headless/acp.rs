@@ -16,12 +16,13 @@ use tokio::time::timeout;
 
 use super::harness::{Event, MAX_INPUT_CHARS, SETUP_TIMEOUT, truncate};
 use super::rpc::{Incoming, Process, Rpc};
-use super::settings::HarnessConfig;
+use super::settings::{HarnessConfig, McpEnv};
 
 const PROTOCOL_VERSION: u64 = 1;
 /// JSON-RPC error code ACP uses when the agent needs `authenticate` first.
 const AUTH_REQUIRED: i64 = -32000;
 /// The MCP server the harness should start for the agent's BBS tools.
+#[derive(Clone)]
 pub struct McpServer {
     pub name: String,
     pub command: String,
@@ -66,20 +67,25 @@ impl Acp {
         mcp: &McpServer,
         resume: Option<&str>,
     ) -> Result<(Acp, Process, mpsc::UnboundedReceiver<Event>, Vec<String>)> {
+        let mut env = config.env.clone();
+        let mut mcp = mcp.clone();
+        if config.mcp_env == McpEnv::Process {
+            env.extend(std::mem::take(&mut mcp.env));
+        }
         let (events, rx) = mpsc::unbounded_channel();
         let replaying = Arc::new(AtomicBool::new(false));
         let handler = {
             let replaying = replaying.clone();
             move |rpc: &Rpc, msg: Incoming| handle(rpc, msg, &replaying, &events)
         };
-        let (rpc, mut process) = Rpc::spawn(&config.command, &config.env, cwd, stderr, handler)?;
+        let (rpc, mut process) = Rpc::spawn(&config.command, &env, cwd, stderr, handler)?;
         let mut acp = Acp {
             rpc,
             replaying,
             session_id: String::new(),
             session_resumed: false,
         };
-        let setup = timeout(SETUP_TIMEOUT, acp.open_session(config, cwd, mcp, resume)).await;
+        let setup = timeout(SETUP_TIMEOUT, acp.open_session(config, cwd, &mcp, resume)).await;
         match setup {
             Ok(Ok(warnings)) => Ok((acp, process, rx, warnings)),
             Ok(Err(err)) => {

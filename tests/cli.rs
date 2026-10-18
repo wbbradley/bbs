@@ -3038,6 +3038,113 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
     });
 }
 
+fn headless_process_mcp_env_routes_without_serializing_credentials(mode: Mode) {
+    let bbs = Bbs::with_mode("process-mcp-env", mode);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");
+    headless_config(&bbs, &["python3", fake]);
+    let config = config_path(&bbs);
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "mcp_env = \"process\"\nshare_activity = false\n\
+         env = { BBS_HEADLESS_TOKEN = \"stale-token\", BBS_SERVER = \"127.0.0.1:1\", \
+         FAKE_MCP_PROCESS_ENV = \"1\", CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = \"0\" }\n",
+    );
+    std::fs::write(&config, &text).unwrap();
+    bbs.ok(&["group", "register", "crew"]);
+    let (_, peer_token) = bbs.register();
+    bbs.ok(&["--token", &peer_token, "group", "join", "crew"]);
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    for (index, expected) in [
+        "session/new",
+        "session/load",
+        "session/resume",
+        "session/new",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index == 2 {
+            text = text.replace(
+                "FAKE_MCP_PROCESS_ENV =",
+                "FAKE_ACP_RESUME = \"1\", FAKE_MCP_PROCESS_ENV =",
+            );
+            std::fs::write(&config, &text).unwrap();
+        }
+        let extra: &[&str] = if index == 3 { &["--new-session"] } else { &[] };
+        let run = RunGuard::start_with(&bbs, "Zed", extra);
+        eventually("session method", || {
+            let s = std::fs::read_to_string(bbs.home.join("fake-session-methods")).ok()?;
+            (s.lines().count() == index + 1 && s.lines().last() == Some(expected)).then_some(())
+        });
+        if index == 0 {
+            let token = headless_state(&bbs, "Zed")["token"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            bbs.ok(&["--token", &token, "group", "join", "crew"]);
+        }
+        bbs.ok(&["--token", &peer_token, "send", "--to", "Zed", "hello"]);
+        eventually("reply through inherited MCP credentials", || {
+            bbs.ok(&["--token", &peer_token, "read"])
+                .contains("echo (yes)")
+                .then_some(())
+        });
+        if index == 3 {
+            bbs.ok(&["--token", &peer_token, "send", "--to", "Zed", "WAITCANCEL"]);
+            eventually("running turn", || {
+                std::fs::read_to_string(&log)
+                    .ok()
+                    .filter(|s| s.contains("waiting-cancel"))
+            });
+            bbs.ok(&["headless", "cancel", "Zed"]);
+            eventually("cancelled turn", || {
+                std::fs::read_to_string(&log)
+                    .ok()
+                    .filter(|s| s.contains("\"stop_reason\":\"cancelled\""))
+            });
+        }
+        let output = run.stop();
+        assert!(output.status.success());
+        let token = headless_state(&bbs, "Zed")["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for path in [
+            log.clone(),
+            bbs.home.join("fake-mcp-specs.jsonl"),
+            bbs.home
+                .join(".local/state/bbs/headless/zed/harness.stderr"),
+        ] {
+            assert!(!std::fs::read_to_string(path).unwrap().contains(&token));
+        }
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(&token));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+    }
+}
+
+#[test]
+fn headless_process_mcp_env_rejects_scrub_before_registration() {
+    let bbs = Bbs::new("scrub-mcp-env");
+    headless_config(&bbs, &["true"]);
+    let config = config_path(&bbs);
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("mcp_env = \"process\"\n");
+    std::fs::write(&config, text).unwrap();
+    let output = bbs
+        .command(&["headless", "run", "Zed"])
+        .env("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("incompatible"));
+    assert!(
+        !bbs.home
+            .join(".local/state/bbs/headless/zed/state.json")
+            .exists()
+    );
+    assert!(!bbs.ok(&["agents"]).contains("Zed"));
+}
+
 /// The `event` of each activity row the board holds for `agent`, oldest first.
 fn shared_activity(bbs: &Bbs, agent: &str) -> Vec<String> {
     bbs.db()
@@ -3455,6 +3562,7 @@ both_modes!(
     view_json_follow_emits_each_message_once,
     view_json_follow_survives_full_windows_and_bursts,
     headless_replies_through_tools_and_cancels,
+    headless_process_mcp_env_routes_without_serializing_credentials,
     headless_shares_activity_by_default,
     headless_codex_replies_steers_and_interrupts,
     headless_stops_after_repeated_turn_errors,

@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 
 def out(msg):
@@ -36,6 +37,14 @@ class Mcp:
             text=True,
             env=env,
         )
+        if os.environ.get("FAKE_MCP_PROCESS_ENV"):
+            token = os.environ.get("BBS_HEADLESS_TOKEN", "")
+            assert token and token != "stale-token", "runtime token missing"
+            assert not spec["env"], "MCP spec must not contain credentials"
+            for pid in (os.getpid(), self.proc.pid):
+                assert token.encode() not in Path(f"/proc/{pid}/cmdline").read_bytes(), "token in argv"
+            with open("fake-mcp-specs.jsonl", "a") as f:
+                f.write(json.dumps(spec) + "\n")
         self.next_id = 0
         self.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})
 
@@ -61,13 +70,19 @@ def main():
     while (msg := read()) is not None:
         method, mid, params = msg.get("method"), msg.get("id"), msg.get("params", {})
         if method == "initialize":
+            caps = {"loadSession": True}
+            if os.environ.get("FAKE_ACP_RESUME"):
+                caps["sessionCapabilities"] = {"resume": {}}
             out({"jsonrpc": "2.0", "id": mid, "result": {
                 "protocolVersion": 1,
-                "agentCapabilities": {"loadSession": True},
+                "agentCapabilities": caps,
                 "authMethods": [],
             }})
-        elif method in ("session/new", "session/load"):
+        elif method in ("session/new", "session/load", "session/resume"):
             mcp = Mcp(params["mcpServers"][0])
+            if os.environ.get("FAKE_MCP_PROCESS_ENV"):
+                with open("fake-session-methods", "a") as f:
+                    f.write(method + "\n")
             session = params.get("sessionId", session)
             result = {"sessionId": session} if method == "session/new" else {}
             out({"jsonrpc": "2.0", "id": mid, "result": result})

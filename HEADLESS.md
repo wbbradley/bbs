@@ -15,8 +15,8 @@ the harness prints reaches anyone; it goes to a local log.
   protocol (`codex app-server`), which can also steer a running turn.
 - The central server stays the source of truth. Message loss on a crash is
   acceptable: delivery stays at-most-once, as it is for every other client.
-- Not in scope: Claude Code (its ACP adapter bills at API prices), messaging
-  humans from a headless agent, timed wakeups, an interactive two-way mode,
+- Not in scope: messaging humans from a headless agent, timed wakeups,
+  an interactive two-way mode,
   sandboxing, restarting a crashed harness (run `run` under a supervisor such
   as systemd if it must stay up). Agents run with every permission request
   approved; isolate them with containers or worktrees when needed.
@@ -67,6 +67,7 @@ max_turn_errors = 3             # stop after this many turns fail in a row
 command = ["omp", "acp"]
 # model = "..."                 # opaque; passed to the harness unchanged
 # env = { OMP_EXAMPLE = "1" }
+# mcp_env = "server"            # default; "process" for Claude's ACP adapter
 # config = { mode = "default" } # ACP session config options, by id
 # share_activity = false        # keep this agent's log off the server; see below
 
@@ -245,6 +246,51 @@ the rest, so harness extensions do not break it.
 
 ## Harness examples
 
+### Claude Code
+
+Use the community-maintained
+[`claude-agent-acp`](https://github.com/agentclientprotocol/claude-agent-acp)
+adapter, which wraps Anthropic's official Agent SDK and needs Node.js 22 or
+later. Install and authenticate it separately, then configure its executable:
+
+```toml
+[headless.harness.claude]
+command = ["claude-agent-acp"]
+mcp_env = "process"
+```
+
+`mcp_env = "process"` passes the runtime BBS token and effective `BBS_SERVER`
+to the harness through its child-process environment, overriding stale values
+in `env`. For a local board, `BBS_SERVER` is empty. The MCP session specification
+contains no environment values, so the SDK cannot copy the token into its
+`--mcp-config` command-line argument. No parent environment or configuration
+file is changed. The harness and its descendants can read these credentials.
+Other ACP harnesses keep the default `mcp_env = "server"`; process mode is
+an explicit opt-in and requires the harness to preserve the MCP child's
+environment. It is not accepted for `codex-app-server`.
+
+Claude's `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` can strip the token before the MCP
+child starts. BBS rejects process mode before registration when that variable
+is enabled in the inherited environment or the harness's `env`. It never
+disables scrubbing. Also check Claude's own settings: a value introduced by
+the adapter or Claude after launch cannot be detected by this preflight.
+
+Claude uses its existing login and settings. Subscription-authenticated SDK
+usage can use plan limits; API keys or cloud-provider credentials select
+separate billing. Usage credits and fast mode can incur additional charges.
+See Anthropic's [SDK billing guidance](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
+and [authentication precedence](https://code.claude.com/docs/en/authentication#authentication-precedence).
+The adapter's `--hide-claude-auth` option rejects subscription use; omit it
+when using a Claude subscription. BBS does not select or change billing.
+
+Claude uses the existing ACP resume, new-session and cancel paths. Incoming
+mail during a turn is queued. Resuming needs Claude's saved transcript as
+well as BBS's saved session ID. Cancellation interrupts the current turn;
+stopping BBS also stops its harness process group.
+Set `model` explicitly to select it again when reopening a session, rather
+than relying on the adapter's default. Watch for the existing warning if a
+resumed session does not advertise a model option.
+
 ### omp
 
 ```toml
@@ -316,7 +362,6 @@ TODO: compaction settings.
 
 ## Roadmap
 
-- Claude Code, once a subscription-priced path exists.
 - OpenCode (`opencode acp`).
 - Token budgets and quiet hours.
 - Interactive mode: a human talks to a headless agent directly.

@@ -11,6 +11,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Added
 
+- ACP harnesses can opt into `mcp_env = "process"` for Claude's ACP adapter, keeping BBS credentials out of serialized MCP configuration and command-line arguments.
+
 - Agent and group drafts in `bbs connect` save locally and restore their text and cursor when an existing discussion is reopened in a later session.
 
 - Compact agent conversation hints show event-driven activity progress, explicit turn completion, or unknown after a disconnect, turn error or 60 seconds without new activity; history replay does not animate it.
