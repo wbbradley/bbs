@@ -648,6 +648,23 @@ mod tests {
         assert!(bottom(&mut app).contains("activity: activity failure"));
     }
 
+    fn editor_focused(app: &mut App) -> bool {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let cursor = theme::base()
+            .patch(theme::style(theme::Role::HumanSurface))
+            .patch(theme::style(theme::Role::Cursor));
+        (17..23).any(|y| {
+            (0..80).any(|x| {
+                let cell = &buffer[(x, y)];
+                cell.fg == cursor.fg.unwrap()
+                    && cell.bg == cursor.bg.unwrap()
+                    && cell.modifier.contains(cursor.add_modifier)
+            })
+        })
+    }
+
     /// Whether a rendered line is exactly `text`, ignoring trailing padding.
     fn has_line(out: &str, text: &str) -> bool {
         out.lines().any(|l| l.trim_end() == text)
@@ -1381,7 +1398,7 @@ mod tests {
     fn the_composer_sends_to_the_agent_and_empties_on_success() {
         let (mut app, mut rx) = app();
         let id = mateo(&mut app, &mut rx);
-        assert!(screen(&mut app, 80, 24).contains("Mateo · Enter sends"));
+        assert!(editor_focused(&mut app));
         // Keys are text now: q does not go back.
         for c in "quick".chars() {
             assert!(!key(&mut app, c));
@@ -1391,7 +1408,7 @@ mod tests {
             key(&mut app, c);
         }
         let out = screen(&mut app, 80, 24);
-        assert!(out.contains("Mateo · Enter sends"), "{out}");
+        assert!(editor_focused(&mut app), "{out}");
         assert!(out.contains("quick") && out.contains("note"), "{out}");
         enter(&mut app);
         let Request::Send { id: sent, req } = rx.try_recv().unwrap() else {
@@ -1424,21 +1441,18 @@ mod tests {
                 .map(|id| message(id, "Zed", "Mateo", &format!("message {id}")))
                 .collect()),
         }));
-        assert!(screen(&mut app, 100, 24).contains("Mateo · Enter sends"));
+        assert!(editor_focused(&mut app));
         typed(&mut app, "first");
         press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
         typed(&mut app, "second");
         // Up from either line stays in the editor, including at its top.
         for _ in 0..3 {
             press(&mut app, KeyCode::Up, KeyModifiers::NONE);
-            assert!(screen(&mut app, 100, 24).contains("Mateo · Enter sends"));
+            assert!(editor_focused(&mut app));
         }
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         let out = screen(&mut app, 100, 24);
-        assert!(
-            out.contains("Navigation · Esc/i write to Mateo") && out.contains("paused"),
-            "{out}"
-        );
+        assert!(!editor_focused(&mut app) && out.contains("paused"), "{out}");
         for key in [
             KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -1450,12 +1464,12 @@ mod tests {
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
         ] {
             app.on_event(Event::Key(key));
-            assert!(screen(&mut app, 100, 24).contains("Navigation · Esc/i write to Mateo"));
+            assert!(!editor_focused(&mut app));
         }
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         let out = screen(&mut app, 100, 24);
         assert!(
-            out.contains("Mateo · Enter sends") && out.contains("first") && out.contains("second"),
+            editor_focused(&mut app) && out.contains("first") && out.contains("second"),
             "{out}"
         );
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
@@ -1476,9 +1490,7 @@ mod tests {
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         let out = screen(&mut app, 100, 24);
         assert!(
-            out.contains("Mateo · Enter sends")
-                && out.contains("PgUp scroll")
-                && !out.contains("Navigation"),
+            editor_focused(&mut app) && !out.contains("PgUp scroll"),
             "{out}"
         );
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
@@ -1897,10 +1909,16 @@ mod tests {
         assert!(!has_line(&screen(&mut app, 80, 24), "x"));
         key(&mut app, 'x');
         enter(&mut app);
-        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+        let Request::Send { id: sent, req } = rx.try_recv().unwrap() else {
             panic!("expected a send");
         };
         assert_eq!(req.to, "@crew");
+        assert!(bottom(&mut app).contains("Sending…"));
+        app.on_event(Event::Data(Data::Sent {
+            id: sent,
+            result: Err("offline".into()),
+        }));
+        assert!(bottom(&mut app).contains("Not sent: offline"));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         key(&mut app, 'q');
         rx.try_recv().unwrap();
@@ -1919,13 +1937,14 @@ mod tests {
         let (mut app, mut rx) = app();
         mateo(&mut app, &mut rx);
         let rows = |app: &mut App| {
-            screen(app, 80, 30)
-                .lines()
-                .take(29)
-                .skip_while(|l| !l.contains("Mateo · Enter sends"))
-                .skip(1)
-                .take_while(|l| !l.starts_with(" bbs:7777"))
-                .count()
+            let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let surface = theme::base()
+                .patch(theme::style(theme::Role::HumanSurface))
+                .bg
+                .unwrap();
+            (0..29).filter(|y| buffer[(79, *y)].bg == surface).count()
         };
         assert_eq!(rows(&mut app), 2);
         for _ in 0..10 {
@@ -2177,7 +2196,7 @@ mod tests {
         );
         assert!(out.contains("cargo test running"), "{out}");
         assert!(out.contains("following · A: all · E: all kinds"), "{out}");
-        assert!(out.contains("Navigation · Esc/i write to Mateo"), "{out}");
+        assert!(!editor_focused(&mut app), "{out}");
 
         // A cycles messages only, activity only, then everything again.
         key(&mut app, 'A');
@@ -2220,6 +2239,111 @@ mod tests {
     }
 
     #[test]
+    fn compact_bottom_progress_reserves_its_cell_and_preserves_input_and_search() {
+        use crate::connect::progress::Progress;
+        use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let (mut app, mut rx) = app();
+                let (_, now_fn) = test_clock();
+                app.ctx.now = now_fn;
+                let (_, act) = mateo_streams(&mut app, &mut rx);
+                press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+                typed(&mut app, "draft");
+                press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+                press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+                app.on_event(Event::Data(Data::ActivityBaseline {
+                    id: act,
+                    through_id: 0,
+                    record: None,
+                }));
+                for (id, event, state) in [
+                    (0, None, Progress::Unknown),
+                    (1, Some("text"), Progress::Progressing(0)),
+                    (2, Some("turn_end"), Progress::Done),
+                ] {
+                    if let Some(event) = event {
+                        app.on_event(Event::Data(Data::Activity {
+                            id: act,
+                            result: Ok(vec![activity(
+                                id,
+                                "01",
+                                &format!(r#"{{"event":"{event}"}}"#),
+                            )]),
+                        }));
+                    }
+                    for width in [80, 100] {
+                        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                        terminal.draw(|frame| app.draw(frame)).unwrap();
+                        let buffer = terminal.backend().buffer();
+                        assert_buffer(buffer);
+                        let cell = &buffer[(width - 1, 23)];
+                        let indicator = state.indicator();
+                        let style = theme::base()
+                            .patch(theme::style(theme::Role::StatusBar))
+                            .patch(theme::style(theme::Role::Screen))
+                            .patch(indicator.style);
+                        assert_eq!(cell.symbol(), indicator.content);
+                        assert_eq!(cell.fg, style.fg.unwrap());
+                        assert_eq!(cell.bg, style.bg.unwrap());
+                        assert_eq!(buffer[(width - 2, 23)].symbol(), " ");
+                        assert_eq!(
+                            buffer[(width - 2, 23)].bg,
+                            theme::base()
+                                .patch(theme::style(theme::Role::StatusBar))
+                                .bg
+                                .unwrap()
+                        );
+                        // One dark spacer, then two input rows: no hint row.
+                        assert_eq!(
+                            buffer[(width - 1, 20)].bg,
+                            theme::base()
+                                .patch(theme::style(theme::Role::Screen))
+                                .bg
+                                .unwrap()
+                        );
+                        assert_eq!(
+                            buffer[(width - 1, 21)].bg,
+                            theme::base()
+                                .patch(theme::style(theme::Role::HumanSurface))
+                                .bg
+                                .unwrap()
+                        );
+                        assert_eq!(
+                            buffer[(width - 1, 22)].bg,
+                            theme::base()
+                                .patch(theme::style(theme::Role::HumanSurface))
+                                .bg
+                                .unwrap()
+                        );
+                        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+                        assert!(!text.contains("Enter sends") && !text.contains("Navigation"));
+                    }
+                }
+                press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+                key(&mut app, '/');
+                typed(&mut app, &"👩‍💻".repeat(60));
+                app.ctx.preferences.error = Some("save failure".into());
+                let status = bottom(&mut app);
+                assert!(
+                    status.contains("pref error") && status.contains("Enter search · Esc cancel"),
+                    "{status}"
+                );
+                assert!(status.ends_with(" ✓"), "{status}");
+                while rx.try_recv().is_ok() {}
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                typed(&mut app, "X");
+                enter(&mut app);
+                let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+                    panic!("expected send");
+                };
+                assert_eq!(req.body, "draXft");
+            });
+        }
+    }
+
+    #[test]
     fn compact_progress_uses_live_ids_and_never_advances_on_ticks_or_repaints() {
         let (mut app, mut rx) = app();
         // Pin the clock before the thread opens so frames are deterministic.
@@ -2233,15 +2357,7 @@ mod tests {
             terminal.draw(|frame| app.draw(frame)).unwrap();
             let buffer = terminal.backend().buffer();
             let area = buffer.area;
-            let y = (area.top()..area.bottom())
-                .find(|y| {
-                    (area.left()..area.right())
-                        .map(|x| buffer[(x, *y)].symbol())
-                        .collect::<String>()
-                        .contains("Mateo · Enter sends")
-                })
-                .unwrap();
-            buffer[(area.right() - 1, y)]
+            buffer[(area.right() - 1, area.bottom() - 1)]
                 .symbol()
                 .chars()
                 .next()
@@ -2477,7 +2593,10 @@ mod tests {
             assert_eq!(
                 buffer[(area.right() - 1, y)].bg,
                 if shaded {
-                    theme::style(theme::Role::HumanSurface).bg.unwrap()
+                    theme::base()
+                        .patch(theme::style(theme::Role::HumanSurface))
+                        .bg
+                        .unwrap()
                 } else {
                     theme::base().bg.unwrap()
                 }
@@ -2501,9 +2620,14 @@ mod tests {
                     }));
                 }
                 if compact {
-                    assert!((area.left()..area.right()).all(|x| buffer[(x, y - 1)].bg
-                        == theme::style(theme::Role::HumanSurface).bg.unwrap()
-                        && buffer[(x, y - 1)].symbol() == " "));
+                    assert!((area.left()..area.right()).all(|x| {
+                        buffer[(x, y - 1)].bg
+                            == theme::base()
+                                .patch(theme::style(theme::Role::HumanSurface))
+                                .bg
+                                .unwrap()
+                            && buffer[(x, y - 1)].symbol() == " "
+                    }));
                 }
             }
         };
@@ -2548,7 +2672,7 @@ mod tests {
         assert!(screen(&mut first_app, 120, 24).contains("Ctrl-T: compact"));
         press(&mut first_app, KeyCode::PageUp, KeyModifiers::NONE);
         press(&mut first_app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(screen(&mut first_app, 120, 24).contains("Navigation · Esc/i write to Zed"));
+        assert!(!editor_focused(&mut first_app));
         assert!(Preferences::load(path.clone()).unwrap().compact());
         press(&mut first_app, KeyCode::Esc, KeyModifiers::NONE);
         close_conversation(&mut first_app, &mut rx);
@@ -2592,7 +2716,7 @@ mod tests {
         assert!(
             out.contains("Cannot save view preference")
                 && out.contains("draft")
-                && out.contains("Mateo · Enter sends"),
+                && editor_focused(&mut app),
             "{out}"
         );
         assert!(!app.ctx.preferences.compact());
@@ -2667,7 +2791,7 @@ mod tests {
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let out = screen(&mut app, 120, 24);
         assert!(
-            out.contains("write to Mateo") && out.contains("Ctrl-T: verbose"),
+            !editor_focused(&mut app) && out.contains("Ctrl-T: verbose"),
             "{out}"
         );
         key(&mut app, 'i');
@@ -2675,10 +2799,10 @@ mod tests {
         press(&mut app, KeyCode::Left, KeyModifiers::NONE);
         press(&mut app, KeyCode::Left, KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(screen(&mut app, 120, 24).contains("Mateo · Enter sends"));
+        assert!(editor_focused(&mut app));
         typed(&mut app, "X");
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(screen(&mut app, 120, 24).contains("Mateo · Enter sends"));
+        assert!(editor_focused(&mut app));
         typed(&mut app, "Y");
         enter(&mut app);
         let Request::Send { req, .. } = rx.try_recv().unwrap() else {

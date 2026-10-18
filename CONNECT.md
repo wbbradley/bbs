@@ -97,7 +97,7 @@ while paused, plus filter/view and search feedback. Prompts keep their visible
 tail and Enter/Esc hints; errors take priority over normal filter and connection
 details. While a prompt is active, an error badge remains visible and the full
 error returns after searching. Draft errors take precedence over preference,
-feed and activity errors. Connection details use any remaining space.
+send, feed and activity errors. Connection details use any remaining space.
 
 The timeline merges, in time order, the agent's messages with its live
 activity: turns, thoughts, tool calls and errors, rendered by the same code as
@@ -182,9 +182,10 @@ and Home/End work everywhere too.
   `Ctrl-p`/`Ctrl-n` previous and next line. `Enter` sends;
   `Alt-Enter` (or `Ctrl-j`) inserts a newline.
 
-The focused composer hint starts with the target agent or group, using the
-theme's Target color (orange in Gruvbox); key hints use a distinct italic KeyHint style.
-In compact agent conversations, the hint's right edge shows the turn state:
+The composer has no title or key-hint row; shortcuts remain available in Help.
+Send progress and failures appear in the bottom bar. In compact agent
+conversations, its reserved rightmost cell shows the turn state on the
+conversation background:
 a Braille glyph spins on unfinished work, a check marks a recorded
 turn end, and a middle dot `·` means unknown. The spinner advances every 100ms for the
 first 3 seconds after an event arrives, then every 500ms; a new event restarts
@@ -197,8 +198,8 @@ activity replaces a recorded completion for good: once the spinner times out
 the glyph is unknown, never the stale check. A turn error, cancellation or stop
 makes the glyph unknown.
 The composer has no border and uses the same themed surface as your outgoing
-messages, with one blank display row above the hint using the conversation's
-background. It starts with two text rows plus the blank row and hint row and grows up to
+messages, with one blank display row above the input using the conversation's
+background. It starts with two text rows plus the blank row and grows up to
 `composer_max_height_percent` text rows of the window height (default 20), then
 scrolls. One source-to-display layout drives wrapping, height, caret/selection
 painting and visual row navigation. Separator spaces at soft line breaks are

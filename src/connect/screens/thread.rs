@@ -299,6 +299,12 @@ impl Thread {
                     .as_ref()
                     .map(|e| ("pref error", e.clone()))
             })
+            .or_else(|| {
+                self.composer
+                    .as_ref()
+                    .and_then(|c| c.error())
+                    .map(|e| ("send error", format!("Not sent: {e}")))
+            })
             .or_else(|| self.error.as_ref().map(|e| ("feed error", e.clone())))
             .or_else(|| {
                 self.stream
@@ -359,6 +365,9 @@ impl Thread {
         };
         let mut filters = hints(false);
         let mut text = mode;
+        if self.composer.as_ref().is_some_and(Composer::sending) {
+            text.push_str(" · Sending…");
+        }
         if let Some((query, hits)) = self.view.search_status() {
             let suffix = format!(": {hits} matches · n/N");
             if text.width() + filters.width() + query.width() + suffix.width() + 7 > width {
@@ -490,8 +499,38 @@ impl Screen for Thread {
         ctx: &Ctx,
         draft_error: Option<&str>,
     ) -> Option<Line<'static>> {
-        self.agent.as_ref()?;
-        Some(self.conversation_status(width, ctx, draft_error))
+        if self.agent.is_none() {
+            if draft_error.is_some() {
+                return None;
+            }
+            let composer = self.composer.as_ref()?;
+            return if let Some(error) = composer.error() {
+                Some(Line::styled(
+                    fit_status(&format!("Not sent: {error}"), usize::from(width), false),
+                    theme::error(),
+                ))
+            } else if composer.sending() {
+                Some(Line::from("Sending…"))
+            } else {
+                None
+            };
+        }
+        let indicator = self
+            .stream
+            .as_ref()
+            .filter(|_| self.compact)
+            .map(|s| s.progress((self.now)()).indicator());
+        let text_width = width.saturating_sub(if indicator.is_some() { 2 } else { 0 });
+        let mut line = self.conversation_status(text_width, ctx, draft_error);
+        if let Some(mut indicator) = indicator
+            && width > 0
+        {
+            indicator.style = theme::style(theme::Role::Screen).patch(indicator.style);
+            let text = fit_status(&line.to_string(), usize::from(text_width), false);
+            let padding = usize::from(width - 1).saturating_sub(text.width());
+            line.spans = vec![Span::raw(text), Span::raw(" ".repeat(padding)), indicator];
+        }
+        Some(line)
     }
 
     fn requests(&self) -> Vec<Request> {
@@ -735,22 +774,7 @@ impl Thread {
         ])
         .areas(inner);
         if let Some(c) = &mut self.composer {
-            let indicator = self
-                .stream
-                .as_ref()
-                .filter(|_| self.compact)
-                .map(|stream| stream.progress((self.now)()).indicator());
-            if indicator.is_some() {
-                c.render_with_indicator(
-                    frame,
-                    composer,
-                    self.composing,
-                    self.agent.is_some(),
-                    indicator,
-                );
-            } else {
-                c.render(frame, composer, self.composing, self.agent.is_some());
-            }
+            c.render(frame, composer, self.composing);
         }
         if let Some(error) = &self.error {
             let text = vec![

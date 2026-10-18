@@ -4,7 +4,6 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui_textarea::{CursorMove, DataCursor, TextArea, WrapMode};
 
@@ -126,12 +125,12 @@ impl Composer {
         )
     }
 
-    /// Two text rows when empty, plus a blank separator and the hint row.
+    /// Two text rows when empty, plus a blank separator.
     pub fn height(&self, width: u16, max_lines: u16) -> u16 {
         let lines = u16::try_from(self.layout(width).height()).unwrap_or(u16::MAX);
         lines
             .clamp(MIN_LINES, max_lines.max(MIN_LINES))
-            .saturating_add(2)
+            .saturating_add(1)
     }
 
     /// Only movements defined in display rows use the local map. Logical edits,
@@ -224,76 +223,23 @@ impl Composer {
         }
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool, agent: bool) {
-        self.render_with_indicator(frame, area, focused, agent, None);
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
-    pub fn render_with_indicator(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        focused: bool,
-        agent: bool,
-        indicator: Option<Span<'static>>,
-    ) {
-        let target = || Span::styled(self.to.as_str(), theme::style(theme::Role::Target));
-        let keys = |text| Span::styled(text, theme::style(theme::Role::KeyHint));
-        let title = match (&self.error, self.sending.is_some(), focused) {
-            (Some(e), ..) => Line::from(format!(" Not sent: {e} ")),
-            (None, true, _) => Line::from(" Sending… "),
-            (None, false, true) => Line::from(vec![
-                target(),
-                keys(if agent {
-                    " · Enter sends · PgUp scroll · Esc back "
-                } else {
-                    " · Enter sends · Alt-Enter new line · Esc done "
-                }),
-            ]),
-            (None, false, false) if agent => Line::from(vec![
-                Span::raw(" Navigation · "),
-                keys("Esc/i write to "),
-                target(),
-                Span::raw(" "),
-            ]),
-            (None, false, false) => {
-                Line::from(vec![keys(" i: write to "), target(), Span::raw(" ")])
-            }
-        };
+    pub fn sending(&self) -> bool {
+        self.sending.is_some()
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         let surface = theme::style(theme::Role::HumanSurface);
-        let hint = match (&self.error, focused) {
-            (Some(_), _) => theme::style(theme::Role::Error),
-            (None, true) => theme::style(theme::Role::Text),
-            (None, false) => theme::style(theme::Role::Muted),
-        };
         frame.render_widget(Block::new().style(theme::style(theme::Role::Screen)), area);
         let gap = area.height.min(1);
-        let input = Rect {
+        self.area = Rect {
             y: area.y + gap,
             height: area.height - gap,
             ..area
         };
-        let block = Block::new().style(surface).title(Line::default());
-        self.area = block.inner(input);
-        frame.render_widget(block, input);
-        if input.height > 0 {
-            let reserved = if indicator.is_some() {
-                input.width.min(2)
-            } else {
-                0
-            };
-            frame.render_widget(
-                Paragraph::new(title.style(hint)).style(surface),
-                Rect::new(input.x, input.y, input.width - reserved, 1),
-            );
-            if let Some(indicator) = indicator
-                && input.width > 0
-            {
-                frame.render_widget(
-                    Paragraph::new(indicator).style(surface),
-                    Rect::new(input.right() - 1, input.y, 1, 1),
-                );
-            }
-        }
         let layout = self.layout(self.area.width);
         let caret = layout.point(self.text.cursor());
         let height = usize::from(self.area.height);
@@ -348,54 +294,6 @@ mod tests {
     }
 
     #[test]
-    fn indicator_reserves_its_cell_without_changing_input_geometry_or_source() {
-        use crate::connect::progress::Progress;
-        use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
-        use ratatui::{Terminal, backend::TestBackend};
-        for scheme in SCHEMES {
-            with_scheme(scheme, || {
-                for width in [1, 2, 8, 80] {
-                    for state in [Progress::Unknown, Progress::Done, Progress::Progressing(7)] {
-                        let mut composer = Composer::new("a-long-target-👩‍💻-that-will-be-clipped");
-                        typed(&mut composer, "draft");
-                        let cursor = composer.text.cursor();
-                        let mut terminal = Terminal::new(TestBackend::new(width, 6)).unwrap();
-                        terminal
-                            .draw(|frame| {
-                                frame
-                                    .render_widget(Block::new().style(theme::base()), frame.area());
-                                composer.render_with_indicator(
-                                    frame,
-                                    frame.area(),
-                                    true,
-                                    true,
-                                    Some(state.indicator()),
-                                );
-                            })
-                            .unwrap();
-                        let buffer = terminal.backend().buffer();
-                        assert_buffer(buffer);
-                        assert_eq!(buffer[(width - 1, 1)].symbol(), state.indicator().content);
-                        if width > 1 {
-                            assert_eq!(buffer[(width - 2, 1)].symbol(), " ");
-                        }
-                        assert_eq!(
-                            buffer[(width - 1, 1)].bg,
-                            theme::base()
-                                .patch(theme::style(theme::Role::HumanSurface))
-                                .bg
-                                .unwrap()
-                        );
-                        assert_eq!(composer.area, Rect::new(0, 2, width, 4));
-                        assert_eq!(composer.text.lines(), ["draft"]);
-                        assert_eq!(composer.text.cursor(), cursor);
-                    }
-                }
-            });
-        }
-    }
-
-    #[test]
     fn spacer_uses_screen_surface_while_input_uses_human_surface() {
         use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
         use ratatui::{Terminal, backend::TestBackend};
@@ -411,7 +309,7 @@ mod tests {
                     terminal
                         .draw(|frame| {
                             frame.render_widget(Block::new().style(theme::base()), frame.area());
-                            composer.render(frame, frame.area(), focused, true);
+                            composer.render(frame, frame.area(), focused);
                         })
                         .unwrap();
                     let buffer = terminal.backend().buffer();
@@ -422,9 +320,9 @@ mod tests {
                         assert_eq!(buffer[(x, 0)].fg, screen.fg.unwrap());
                         assert_eq!(buffer[(x, 0)].bg, screen.bg.unwrap());
                     }
-                    let title: String = (0..24).map(|x| buffer[(x, 1)].symbol()).collect();
-                    assert!(title.contains(if focused { "Mateo" } else { "Navigation" }));
-                    assert_eq!(composer.area, Rect::new(0, 2, 24, 6));
+                    let first: String = (0..24).map(|x| buffer[(x, 1)].symbol()).collect();
+                    assert!(first.starts_with("a wrapped input"));
+                    assert_eq!(composer.area, Rect::new(0, 1, 24, 7));
                     assert_eq!(
                         composer.text.lines(),
                         ["a wrapped input with enough text to fill several lines"]
@@ -458,55 +356,31 @@ mod tests {
     }
 
     #[test]
-    fn title_targets_and_key_hints_use_semantic_styles_for_agents_and_groups() {
+    fn hintless_input_keeps_full_width_draft_and_caret_in_every_scheme() {
         use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
-        use ratatui::{Terminal, backend::TestBackend, style::Modifier};
         for scheme in SCHEMES {
             with_scheme(scheme, || {
-                for (to, agent) in [("Mateo", true), ("@crew", false)] {
-                    for focused in [false, true] {
-                        let mut composer = Composer::new(to);
-                        let mut terminal = Terminal::new(TestBackend::new(100, 6)).unwrap();
-                        terminal
-                            .draw(|frame| {
-                                frame
-                                    .render_widget(Block::new().style(theme::base()), frame.area());
-                                composer.render(frame, frame.area(), focused, agent);
-                            })
-                            .unwrap();
-                        let buffer = terminal.backend().buffer();
-                        assert_buffer(buffer);
-                        let title: String = (0..100).map(|x| buffer[(x, 1)].symbol()).collect();
-                        let target_x = title[..title.find(to).unwrap()].chars().count() as u16;
-                        let target = theme::base()
+                for width in [1, 2, 8, 80] {
+                    for to in ["Mateo", "@crew"] {
+                        let mut c = Composer::new(to);
+                        c.restore(super::super::drafts::Draft {
+                            text: "  é👩‍💻\nsecond".into(),
+                            cursor: (0, 3),
+                        });
+                        let before = c.draft();
+                        let buffer = draw(&mut c, width, 5);
+                        assert_buffer(&buffer);
+                        assert_eq!(c.area, Rect::new(0, 1, width, 4));
+                        assert_eq!(c.draft(), before);
+                        let caret = c.layout(width).point(c.text.cursor());
+                        let cursor = theme::base()
                             .patch(theme::style(theme::Role::HumanSurface))
-                            .patch(theme::style(theme::Role::Target));
-                        for x in target_x..target_x + to.len() as u16 {
-                            assert_eq!(buffer[(x, 1)].fg, target.fg.unwrap());
-                            assert_eq!(buffer[(x, 1)].bg, target.bg.unwrap());
-                            assert!(!buffer[(x, 1)].modifier.contains(Modifier::ITALIC));
-                        }
-                        let keys_byte = title
-                            .find(if focused {
-                                "Enter"
-                            } else if agent {
-                                "Esc/i"
-                            } else {
-                                "i:"
-                            })
-                            .unwrap();
-                        let keys_x = title[..keys_byte].chars().count() as u16;
-                        let keys = theme::base()
-                            .patch(theme::style(theme::Role::HumanSurface))
-                            .patch(theme::style(theme::Role::KeyHint));
-                        assert_eq!(buffer[(keys_x, 1)].fg, keys.fg.unwrap());
-                        assert_eq!(buffer[(keys_x, 1)].bg, keys.bg.unwrap());
-                        assert!(buffer[(keys_x, 1)].modifier.contains(Modifier::ITALIC));
-                        if focused {
-                            assert!(title.starts_with(to), "{title}");
-                            assert_eq!(target_x, 0);
-                            assert!(!title.contains("To "));
-                        }
+                            .patch(theme::style(theme::Role::Cursor));
+                        let cell = &buffer[(caret.col as u16, 1 + (caret.row - c.top) as u16)];
+                        assert_eq!(cell.fg, cursor.fg.unwrap());
+                        assert_eq!(cell.bg, cursor.bg.unwrap());
+                        let all: String = buffer.content.iter().map(|c| c.symbol()).collect();
+                        assert!(!all.contains(to) && !all.contains("Enter sends"));
                     }
                 }
             });
@@ -591,7 +465,7 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| c.render(frame, frame.area(), true, true))
+            .draw(|frame| c.render(frame, frame.area(), true))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -613,9 +487,9 @@ mod tests {
         let buffer = draw(&mut c, 4, 4);
         let selected =
             theme::style(theme::Role::HumanSurface).patch(theme::style(theme::Role::Selection));
-        assert_eq!(buffer[(3, 2)].fg, selected.fg.unwrap());
-        assert_eq!(buffer[(3, 2)].bg, selected.bg.unwrap());
-        assert!(buffer[(3, 2)].modifier.contains(selected.add_modifier));
+        assert_eq!(buffer[(3, 1)].fg, selected.fg.unwrap());
+        assert_eq!(buffer[(3, 1)].bg, selected.bg.unwrap());
+        assert!(buffer[(3, 1)].modifier.contains(selected.add_modifier));
         c.text.copy();
         assert_eq!(c.text.yank_text(), "cd  ef");
         // Native yank/undo still operate on exact source, including hidden spaces.
@@ -636,8 +510,11 @@ mod tests {
             assert_eq!(c.text.lines().join("\n"), source);
             assert_eq!(c.text.cursor(), (0, 5));
             let caret = c.layout(width).point(c.text.cursor());
-            assert!(caret.row >= c.top && caret.row < c.top + 2);
-            let cell = &buffer[(caret.col as u16, (caret.row - c.top + 2) as u16)];
+            assert!(caret.row >= c.top && caret.row < c.top + usize::from(c.area.height));
+            let cell = &buffer[(
+                caret.col as u16,
+                (caret.row - c.top + usize::from(c.area.y)) as u16,
+            )];
             let cursor =
                 theme::style(theme::Role::HumanSurface).patch(theme::style(theme::Role::Cursor));
             assert_eq!(cell.fg, cursor.fg.unwrap());
@@ -750,23 +627,23 @@ mod tests {
     #[test]
     fn the_box_grows_with_wrapped_text_up_to_its_limit() {
         let mut c = Composer::new("Mateo");
+        assert_eq!(c.height(22, 4), 3);
+        typed(&mut c, &"x".repeat(60));
+        // Full width is available: three text rows plus gap.
         assert_eq!(c.height(22, 4), 4);
         typed(&mut c, &"x".repeat(60));
-        // Full width is available: three text rows plus gap and hint.
         assert_eq!(c.height(22, 4), 5);
-        typed(&mut c, &"x".repeat(60));
-        assert_eq!(c.height(22, 4), 6);
         let cursor = c.text.cursor();
         let height = c.height(22, 4);
         draw(&mut c, 22, height);
         assert_eq!(
             c.area,
-            Rect::new(0, 2, 22, 4),
-            "gap and hint preserve four input rows"
+            Rect::new(0, 1, 22, 4),
+            "gap preserves four input rows"
         );
         assert_eq!(c.text.cursor(), cursor);
         assert!(c.layout(22).point(cursor).row < c.top + 4);
         // A limit under two lines still leaves two.
-        assert_eq!(c.height(22, 1), 4);
+        assert_eq!(c.height(22, 1), 3);
     }
 }
