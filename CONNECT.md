@@ -118,15 +118,16 @@ and Home/End work everywhere too.
   `Enter` open, `q` back, `?` help. `Esc` goes back in lists, group threads
   and the Feed; agent conversations use the modes below. Menu hot keys jump
   straight to a screen.
-- Agent conversations open in Insert mode, with the composer active. `Ctrl-u`
-  or `PgUp` switches to navigation and scrolls the timeline. In navigation,
+- Agent conversations open in Insert mode, with the composer active. `PgUp` switches to navigation and scrolls the timeline. In navigation,
   `Esc` returns to Insert mode; in Insert mode, `Esc` goes back to Agents.
   Each agent's draft and cursor position are restored when its conversation
   is reopened during the same `connect` session. Arrow keys, including `Up`
   on the first line, stay within the editor while in Insert mode.
 - In a group thread, `i` (or `Tab`) focuses the composer and `Esc` returns
-  to navigation. Its `Ctrl-u` deletes back to the start of the line (at the
-  start, join onto the previous line).
+  to navigation.
+- In every composer, `Ctrl-u` deletes back to the start of the logical line;
+  at column zero it joins onto the previous line, and undo restores the edit.
+  In navigation mode, `Ctrl-u` continues to scroll half a page.
 - In the composer: `Ctrl-a`/`Ctrl-e` start and end of line, `Ctrl-f`/`Ctrl-b`
   forward and back a character, `Alt-f`/`Alt-b` a word, `Ctrl-k` kill to end of
   line, `Ctrl-y` yank, `Ctrl-w`/`Alt-Backspace` delete a word back, `Ctrl-d`
@@ -134,8 +135,14 @@ and Home/End work everywhere too.
   `Ctrl-p`/`Ctrl-n` previous and next line. `Enter` sends;
   `Alt-Enter` (or `Ctrl-j`) inserts a newline.
 
-The composer starts two lines tall and grows with its content, up to
-`composer_max_height_percent` of the window height (default 20), then scrolls.
+The composer has no border and uses the same themed surface as your outgoing
+messages. It starts with two text rows plus one hint row and grows up to
+`composer_max_height_percent` text rows of the window height (default 20), then
+scrolls. One source-to-display layout drives wrapping, height, caret/selection
+painting and visual row navigation. Separator spaces at soft line breaks are
+hidden; explicit indentation, draft bytes, editing history and sent text remain
+intact. Long words wrap at grapheme boundaries; a grapheme wider than the input
+uses a visible placeholder.
 
 Keymaps belong to each app. `bbs view` keeps its own keys (`g`, `b`, space,
 `F`, and `q` to quit), which clash with `gg` and with `q` meaning back;
@@ -167,7 +174,7 @@ src/connect/
   art.rs        embedded logo geometry and semantic style
   screens/      menu.rs, agents.rs, agent.rs, groups.rs, group.rs, feed.rs,
                 help.rs: each implements the Screen trait
-  widgets/      composer.rs (wraps ratatui-textarea), dialog.rs
+  widgets/      composer.rs (TextArea editing, local display layout), dialog.rs
 src/ui/         shared with `bbs view` and `bbs headless logs`
   thread.rs     ThreadView: scroll and follow geometry plus search matching
   message.rs    the message header and body lines (from view.rs)

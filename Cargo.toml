@@ -55,6 +55,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tui-markdown = { version = "0.3.10", default-features = false }
 unicode-width = "0.2.2"
+unicode-segmentation = "1.13"
 ratatui-textarea = "0.9.3"
 croner = "4.0.1"
 

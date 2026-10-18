@@ -496,7 +496,7 @@ mod tests {
             panic!("expected an activity watch");
         };
         assert_eq!(req.backlog, 200);
-        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         assert!(screen(&mut app, 80, 24).contains("No messages yet"));
         app.on_event(Event::Data(Data::Feed {
             id,
@@ -564,7 +564,7 @@ mod tests {
             ]),
         };
         // Covered by help, the thread is not being viewed.
-        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         key(&mut app, '?');
         app.on_event(Event::Data(feed(false)));
         assert!(rx.try_recv().is_err());
@@ -594,7 +594,7 @@ mod tests {
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("needs a newer server (feed-with.v1)"), "{out}");
         // Reload starts the stream again.
-        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         key(&mut app, 'r');
         assert_eq!(watched(&mut rx).0, id);
     }
@@ -870,58 +870,82 @@ mod tests {
 
     #[test]
     fn agent_insert_and_navigation_modes_use_explicit_switches() {
-        for switch in [
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
-            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-        ] {
-            let (mut app, mut rx) = app();
-            let id = mateo(&mut app, &mut rx);
-            app.on_event(Event::Data(Data::Feed {
-                id,
-                result: Ok((1..50)
-                    .map(|id| message(id, "Zed", "Mateo", &format!("message {id}")))
-                    .collect()),
-            }));
+        let (mut app, mut rx) = app();
+        let id = mateo(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id,
+            result: Ok((1..50)
+                .map(|id| message(id, "Zed", "Mateo", &format!("message {id}")))
+                .collect()),
+        }));
+        assert!(screen(&mut app, 100, 24).contains("To Mateo · Enter sends"));
+        typed(&mut app, "first");
+        press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+        typed(&mut app, "second");
+        // Up from either line stays in the editor, including at its top.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert!(screen(&mut app, 100, 24).contains("To Mateo · Enter sends"));
-            typed(&mut app, "first");
-            press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
-            typed(&mut app, "second");
-            // Up from either line stays in the editor, including at its top.
-            for _ in 0..3 {
-                press(&mut app, KeyCode::Up, KeyModifiers::NONE);
-                assert!(screen(&mut app, 100, 24).contains("To Mateo · Enter sends"));
-            }
-            app.on_event(Event::Key(switch));
-            let out = screen(&mut app, 100, 24);
-            assert!(
-                out.contains("Navigation · Esc/i write to Mateo") && out.contains("paused"),
-                "{out}"
-            );
-            for key in [
-                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
-                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
-                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
-                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
-                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
-            ] {
-                app.on_event(Event::Key(key));
-                assert!(screen(&mut app, 100, 24).contains("Navigation · Esc/i write to Mateo"));
-            }
-            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            let out = screen(&mut app, 100, 24);
-            assert!(
-                out.contains("To Mateo · Enter sends")
-                    && out.contains("first")
-                    && out.contains("second"),
-                "{out}"
-            );
-            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(screen(&mut app, 100, 24).contains("Your agents"));
-            assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
         }
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        let out = screen(&mut app, 100, 24);
+        assert!(
+            out.contains("Navigation · Esc/i write to Mateo") && out.contains("paused"),
+            "{out}"
+        );
+        for key in [
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        ] {
+            app.on_event(Event::Key(key));
+            assert!(screen(&mut app, 100, 24).contains("Navigation · Esc/i write to Mateo"));
+        }
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let out = screen(&mut app, 100, 24);
+        assert!(
+            out.contains("To Mateo · Enter sends")
+                && out.contains("first")
+                && out.contains("second"),
+            "{out}"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(screen(&mut app, 100, 24).contains("Your agents"));
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
+    }
+
+    #[test]
+    fn ctrl_u_edits_and_undoes_in_agent_insert_mode_without_navigating() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        typed(&mut app, "first");
+        press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+        typed(&mut app, "second");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        let out = screen(&mut app, 100, 24);
+        assert!(
+            out.contains("To Mateo · Enter sends")
+                && out.contains("PgUp scroll")
+                && !out.contains("Navigation"),
+            "{out}"
+        );
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(screen(&mut app, 100, 24).contains("firstond"));
+        press(&mut app, KeyCode::Char('7'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('7'), KeyModifiers::CONTROL);
+        enter(&mut app);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("expected send");
+        };
+        assert_eq!(req.body, "first\nsecond");
     }
 
     /// Reopen the selected agent after a conversation has closed.
@@ -957,7 +981,7 @@ mod tests {
 
         key(&mut app, 'j');
         reopen(&mut app, &mut rx);
-        assert!(!screen(&mut app, 80, 24).contains("│one"));
+        assert!(!screen(&mut app, 80, 24).contains("║one"));
         typed(&mut app, "other");
         for _ in 0..3 {
             press(&mut app, KeyCode::Left, KeyModifiers::NONE);
@@ -1034,7 +1058,7 @@ mod tests {
                         assert!(rx.try_recv().is_err());
                     } else {
                         assert!(rx.try_recv().is_err(), "success clears the submitted draft");
-                        assert!(!out.contains("│draft"), "{out}");
+                        assert!(!out.contains("║draft"), "{out}");
                     }
                 }
             }
@@ -1056,7 +1080,7 @@ mod tests {
         }));
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("Not sent: no agent named Mateo"), "{out}");
-        assert!(out.contains("│x"), "{out}");
+        assert!(out.contains("║x"), "{out}");
         // Ctrl-C still quits from the composer.
         assert!(press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL));
     }
@@ -1078,7 +1102,7 @@ mod tests {
         key(&mut app, 'i');
         key(&mut app, 'x');
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
-        assert!(!screen(&mut app, 80, 24).contains("│x"));
+        assert!(!screen(&mut app, 80, 24).contains("║x"));
         key(&mut app, 'x');
         enter(&mut app);
         let Request::Send { req, .. } = rx.try_recv().unwrap() else {
@@ -1105,7 +1129,9 @@ mod tests {
         let rows = |app: &mut App| {
             screen(app, 80, 30)
                 .lines()
-                .filter(|l| l.starts_with("║│"))
+                .skip_while(|l| !l.contains("To Mateo · Enter sends"))
+                .skip(1)
+                .take_while(|l| !l.starts_with('╚'))
                 .count()
         };
         assert_eq!(rows(&mut app), 2);
@@ -1337,7 +1363,7 @@ mod tests {
     fn an_agents_timeline_merges_messages_and_activity_in_time_order() {
         let (mut app, mut rx) = app();
         let (feed, act) = mateo_streams(&mut app, &mut rx);
-        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         // Activity's history often arrives after newer messages.
         app.on_event(Event::Data(Data::Feed {
             id: feed,
@@ -1400,7 +1426,7 @@ mod tests {
     fn compact_conversations_filter_direct_mail_and_live_arrivals() {
         let (mut app, mut rx) = app();
         let (feed, act) = mateo_streams(&mut app, &mut rx);
-        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         let broadcast = proto::Message {
             to_name: None,
             to_group: Some("crew".into()),
@@ -1624,7 +1650,7 @@ mod tests {
         key(&mut first_app, 'j');
         reopen(&mut first_app, &mut rx);
         assert!(screen(&mut first_app, 120, 24).contains("Ctrl-T: compact"));
-        press(&mut first_app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut first_app, KeyCode::PageUp, KeyModifiers::NONE);
         press(&mut first_app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert!(screen(&mut first_app, 120, 24).contains("Navigation · Esc/i write to Zed"));
         assert!(Preferences::load(path.clone()).unwrap().compact());
@@ -1683,7 +1709,7 @@ mod tests {
     fn compact_keeps_verbose_filters_while_marking_hidden_activity_seen() {
         let (mut app, mut rx) = app();
         let (feed, act) = mateo_streams(&mut app, &mut rx);
-        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         key(&mut app, 'A');
         key(&mut app, 'A');
         key(&mut app, 'E');
@@ -1741,7 +1767,7 @@ mod tests {
     fn compact_toggle_preserves_navigation_focus_and_composer_cursor() {
         let (mut app, mut rx) = app();
         mateo(&mut app, &mut rx);
-        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let out = screen(&mut app, 120, 24);
         assert!(
@@ -1770,7 +1796,7 @@ mod tests {
         for all_hidden in [true, false] {
             let (mut app, mut rx) = app();
             let (feed, _) = mateo_streams(&mut app, &mut rx);
-            press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
             app.on_event(Event::Data(Data::Feed {
                 id: feed,
                 result: Ok(vec![message(1, "Mateo", "ada", "before-gap")]),
@@ -1822,7 +1848,7 @@ mod tests {
         }
         let (mut app, mut rx) = app();
         let (feed, _) = mateo_streams(&mut app, &mut rx);
-        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         app.on_event(Event::Data(Data::Feed {
             id: feed,
             result: Ok((1..200)
@@ -1905,7 +1931,7 @@ mod tests {
     fn activity_alone_says_when_nothing_is_shared_or_the_server_is_old() {
         let (mut app, mut rx) = app();
         let (_, act) = mateo_streams(&mut app, &mut rx);
-        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         key(&mut app, 'A');
         key(&mut app, 'A');
         assert!(screen(&mut app, 100, 24).contains("Loading…"));
@@ -1950,7 +1976,7 @@ mod tests {
     fn e_cycles_the_kinds_of_activity_shown() {
         let (mut app, mut rx) = app();
         let (_, act) = mateo_streams(&mut app, &mut rx);
-        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         app.on_event(Event::Data(Data::Activity {
             id: act,
             result: Ok(vec![
@@ -2015,7 +2041,7 @@ mod tests {
             let (mut app, mut rx) = app();
             app.ctx.preferences.set_compact(compact);
             let (feed, act) = mateo_streams(&mut app, &mut rx);
-            press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
             for _ in 0..show_steps {
                 key(&mut app, 'A');
             }
@@ -2105,7 +2131,7 @@ mod tests {
     fn viewing_activity_marks_received_records_seen_even_when_filtered() {
         let (mut app, mut rx) = app();
         let (_, act) = mateo_streams(&mut app, &mut rx);
-        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         let batch = |id: i64| Data::Activity {
             id: act,
             result: Ok(vec![activity(
