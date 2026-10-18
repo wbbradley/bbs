@@ -227,7 +227,7 @@ impl Composer {
             (None, true) => theme::style(theme::Role::Text),
             (None, false) => theme::style(theme::Role::Muted),
         };
-        frame.render_widget(Block::new().style(surface), area);
+        frame.render_widget(Block::new().style(theme::style(theme::Role::Screen)), area);
         let gap = area.height.min(1);
         let input = Rect {
             y: area.y + gap,
@@ -268,7 +268,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_and_padding_share_the_human_surface() {
+    fn spacer_uses_screen_surface_while_input_uses_human_surface() {
         use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
         use ratatui::{Terminal, backend::TestBackend};
         for scheme in SCHEMES {
@@ -289,6 +289,11 @@ mod tests {
                     let buffer = terminal.backend().buffer();
                     assert_buffer(buffer);
                     assert!((0..24).all(|x| buffer[(x, 0)].symbol() == " "));
+                    let screen = theme::style(theme::Role::Screen);
+                    for x in 0..24 {
+                        assert_eq!(buffer[(x, 0)].fg, screen.fg.unwrap());
+                        assert_eq!(buffer[(x, 0)].bg, screen.bg.unwrap());
+                    }
                     let title: String = (0..24).map(|x| buffer[(x, 1)].symbol()).collect();
                     assert!(title.contains(if focused { "To Mateo" } else { "Navigation" }));
                     assert_eq!(composer.area, Rect::new(0, 2, 24, 6));
@@ -306,7 +311,7 @@ mod tests {
                         .bg
                         .or(theme::base().bg)
                         .unwrap();
-                    for y in 0..8 {
+                    for y in 1..8 {
                         for x in 0..24 {
                             let cell = &buffer[(x, y)];
                             assert!(

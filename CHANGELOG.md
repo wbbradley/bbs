@@ -15,6 +15,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Fixed
 
+- The blank row above the `bbs connect` textbox hint uses the conversation background; the hint and input keep the outgoing-message surface.
+
 - Tool activity in `bbs connect` and `bbs headless logs --pretty` keeps its title and duration across partial updates, and uses titles supplied by later updates (#80).
 
 ### Changed
