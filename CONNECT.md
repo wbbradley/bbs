@@ -196,8 +196,12 @@ the glyph is unknown, never the stale check. A turn error, cancellation or stop
 makes the glyph unknown.
 The composer has no border and uses the same themed surface as your outgoing
 messages, with one blank display row above the input using the conversation's
-background. It starts with two text rows plus the blank row and grows up to
-`composer_max_height_percent` text rows of the window height (default 20), then
+background. A second blank row inside the input uses its light surface as
+padding above the first text line. This row is display-only and cannot hold the
+cursor or selection. Text can occupy it as the viewport scrolls; returning to
+the first visual text row restores the padding. It starts with two text rows,
+the light padding and the dark separator, growing up to
+`composer_max_height_percent` input rows of the window height (default 20), then
 scrolls. One source-to-display layout drives wrapping, height, caret/selection
 painting and visual row navigation. Separator spaces at soft line breaks are
 hidden; explicit indentation, draft bytes, editing history and sent text remain
