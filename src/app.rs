@@ -29,7 +29,7 @@ pub(crate) fn display_time(stored: &str) -> String {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    crate::ui::theme::init(cli.theme.as_deref())?;
+    let theme_explicit = crate::ui::theme::init(cli.theme.as_deref())?;
     let dir = match &cli.command {
         Command::Serve {
             state_dir: Some(dir),
@@ -119,7 +119,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     ..Default::default()
                 },
             };
-            crate::connect::run(backend, opener).await
+            crate::connect::run(backend, opener, theme_explicit).await
         }
         Command::Read {
             limit,

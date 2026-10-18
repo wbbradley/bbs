@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::agents::Agents;
+use super::config::Config;
 use super::groups::Groups;
 use super::help::Help;
 use super::thread::Thread;
@@ -21,12 +22,13 @@ enum Item {
     Agents,
     Groups,
     Feed,
+    Config,
     Help,
     Quit,
 }
 
 /// Each item: its hot key, its label with the hot key first, and the rest.
-const ITEMS: [(char, &str, &str, Item); 5] = [
+const ITEMS: [(char, &str, &str, Item); 6] = [
     (
         'a',
         "A",
@@ -45,11 +47,12 @@ const ITEMS: [(char, &str, &str, Item); 5] = [
         "eed       every message, as bbs view shows it",
         Item::Feed,
     ),
+    ('c', "C", "onfig     color scheme", Item::Config),
     ('?', "?", "          help: the keys", Item::Help),
     ('q', "Q", "uit       hang up", Item::Quit),
 ];
 
-const HOTKEYS: [char; 3] = [ITEMS[0].0, ITEMS[1].0, ITEMS[2].0];
+const HOTKEYS: [char; 4] = [ITEMS[0].0, ITEMS[1].0, ITEMS[2].0, ITEMS[3].0];
 
 #[derive(Default)]
 pub struct Menu {
@@ -62,6 +65,7 @@ impl Menu {
             Item::Agents => Transition::Push(Box::new(Agents::default())),
             Item::Groups => Transition::Push(Box::new(Groups::new())),
             Item::Feed => Transition::Push(Box::new(Thread::feed())),
+            Item::Config => Transition::Push(Box::new(Config::new())),
             Item::Help => Transition::Push(Box::new(Help::default())),
             Item::Quit => Transition::Quit,
         }

@@ -1,8 +1,9 @@
-//! Startup-selected semantic styles shared by every terminal renderer.
+//! Semantic styles shared by every terminal renderer; connect can switch live.
 
 use anyhow::{Result, bail};
 use ratatui::style::{Color, Style};
-use std::sync::OnceLock;
+use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 
 /// Components choose a purpose, never a palette color. Foreground-only roles
 /// inherit their enclosing surface, including human input and outgoing rows.
@@ -19,6 +20,10 @@ pub enum Role {
     OtherAgent,
     Human,
     Hotkey,
+    /// Agent or group addressed by the composer.
+    Target,
+    /// Keyboard guidance, distinct from message text and target labels.
+    KeyHint,
     Border,
     Selection,
     Cursor,
@@ -30,15 +35,17 @@ pub enum Role {
     Logo,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Scheme {
     #[default]
+    #[serde(rename = "gruvbox-dark-medium")]
     Gruvbox,
     Terminal,
     NoColor,
 }
 
-static SCHEME: OnceLock<Scheme> = OnceLock::new();
+static SCHEME: RwLock<Scheme> = RwLock::new(Scheme::Gruvbox);
 
 /// Explicit selectors override NO_COLOR; empty environment values are absent.
 pub fn resolve(cli: Option<&str>, env: Option<&str>, no_color: bool) -> Result<Scheme> {
@@ -52,34 +59,56 @@ pub fn resolve(cli: Option<&str>, env: Option<&str>, no_color: bool) -> Result<S
     }
 }
 
-pub fn init(cli: Option<&str>) -> Result<()> {
+/// Resolve startup options; CLI, BBS_THEME and NO_COLOR override saved preferences.
+pub fn init(cli: Option<&str>) -> Result<bool> {
     let env = std::env::var("BBS_THEME").ok();
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-    let scheme = resolve(cli, env.as_deref(), no_color)?;
-    SCHEME
-        .set(scheme)
-        .expect("theme initialized once before rendering");
-    Ok(())
+    select(resolve(cli, env.as_deref(), no_color)?);
+    Ok(cli.is_some() || env.is_some_and(|s| !s.is_empty()) || no_color)
+}
+
+pub fn current() -> Scheme {
+    #[cfg(test)]
+    if let Some(scheme) = testing::OVERRIDE.get() {
+        return scheme;
+    }
+    *SCHEME.read().expect("theme lock")
+}
+
+/// Change appearance without changing any application data or navigation state.
+pub fn select(scheme: Scheme) {
+    #[cfg(test)]
+    if testing::OVERRIDE.get().is_some() {
+        testing::OVERRIDE.set(Some(scheme));
+        return;
+    }
+    *SCHEME.write().expect("theme lock") = scheme;
 }
 
 pub fn style(role: Role) -> Style {
-    #[cfg(test)]
-    if let Some(scheme) = testing::OVERRIDE.get() {
-        return scheme.style(role);
-    }
-    SCHEME.get().copied().unwrap_or_default().style(role)
+    current().style(role)
 }
 
 impl Scheme {
+    pub const ALL: [Self; 3] = [Self::Gruvbox, Self::Terminal, Self::NoColor];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Gruvbox => "Gruvbox dark medium",
+            Self::Terminal => "Terminal palette",
+            Self::NoColor => "No color",
+        }
+    }
+
     pub fn style(self, role: Role) -> Style {
         use Role::*;
         if self == Self::NoColor {
             return match role {
                 Screen => Style::new().fg(Color::Reset).bg(Color::Reset),
                 Muted => Style::new().dim(),
-                Heading | OwnAgent | OtherAgent | Human | Hotkey | Success | Warning | Error => {
-                    Style::new().bold()
-                }
+                KeyHint => Style::new().italic(),
+                Heading | OwnAgent | OtherAgent | Human | Hotkey | Target | Success | Warning
+                | Error => Style::new().bold(),
                 Selection | Cursor | TitleBar | StatusBar => Style::new().reversed(),
                 _ => Style::new(),
             };
@@ -93,6 +122,7 @@ impl Scheme {
             technical,
             accent,
             participant,
+            target,
             success,
             warning,
             error,
@@ -111,6 +141,7 @@ impl Scheme {
                 Color::Rgb(235, 219, 178),
                 Color::Rgb(131, 165, 152),
                 Color::Rgb(211, 134, 155),
+                Color::Rgb(254, 128, 25),
                 Color::Rgb(184, 187, 38),
                 Color::Rgb(250, 189, 47),
                 Color::Rgb(251, 73, 52),
@@ -124,6 +155,7 @@ impl Scheme {
                 Color::White,
                 Color::LightCyan,
                 Color::LightMagenta,
+                Color::Indexed(208),
                 Color::LightGreen,
                 Color::LightYellow,
                 Color::LightRed,
@@ -139,6 +171,8 @@ impl Scheme {
             Heading => Style::new().fg(accent).bold(),
             Accent | Border | Logo | OwnAgent => Style::new().fg(accent),
             Human | OtherAgent => Style::new().fg(participant),
+            Target => Style::new().fg(target),
+            KeyHint => Style::new().fg(participant).italic(),
             Hotkey | Warning => Style::new().fg(warning),
             Success => Style::new().fg(success),
             Error => Style::new().fg(error),
@@ -152,6 +186,24 @@ impl Scheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn composer_roles_inherit_surface_and_keep_non_color_cues() {
+        for scheme in testing::SCHEMES {
+            let target = scheme.style(Role::Target);
+            let hint = scheme.style(Role::KeyHint);
+            assert!(target.bg.is_none() && hint.bg.is_none());
+            assert!(hint.add_modifier.contains(ratatui::style::Modifier::ITALIC));
+            if scheme != Scheme::NoColor {
+                assert_ne!(target.fg, hint.fg);
+                assert_ne!(hint.fg, scheme.style(Role::Text).fg);
+            }
+        }
+        assert_eq!(
+            Scheme::Gruvbox.style(Role::Target).fg,
+            Some(Color::Rgb(254, 128, 25))
+        );
+    }
+
     #[test]
     fn selector_precedence_and_validation() {
         assert_eq!(resolve(None, None, false).unwrap(), Scheme::Gruvbox);
@@ -185,7 +237,7 @@ pub(crate) mod testing {
         let _restore = Restore(OVERRIDE.replace(Some(scheme)));
         f();
     }
-    pub const SCHEMES: [Scheme; 3] = [Scheme::Gruvbox, Scheme::Terminal, Scheme::NoColor];
+    pub const SCHEMES: [Scheme; 3] = Scheme::ALL;
     pub fn assert_buffer(buffer: &ratatui::buffer::Buffer) {
         use Role::*;
         let roles = [
@@ -200,6 +252,8 @@ pub(crate) mod testing {
             OtherAgent,
             Human,
             Hotkey,
+            Target,
+            KeyHint,
             Border,
             Selection,
             Cursor,

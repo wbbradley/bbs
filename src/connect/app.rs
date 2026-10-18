@@ -45,6 +45,8 @@ pub enum Transition {
     Request(Request),
     /// Remember the agent conversation view locally for this and future sessions.
     Compact(bool),
+    /// Apply and remember a local color scheme immediately.
+    Theme(crate::ui::theme::Scheme),
 }
 
 pub trait Screen {
@@ -208,6 +210,10 @@ impl App {
     fn apply(&mut self, transition: Transition) -> bool {
         match transition {
             Transition::Stay => {}
+            Transition::Theme(scheme) => {
+                crate::ui::theme::select(scheme);
+                self.ctx.preferences.set_theme(scheme);
+            }
             Transition::Compact(compact) => self.ctx.preferences.set_compact(compact),
             Transition::Push(screen) => self.push(screen),
             Transition::Pop if self.stack.len() > 1 => self.pop(),
@@ -264,6 +270,133 @@ mod tests {
                 an_agents_timeline_merges_messages_and_activity_in_time_order();
             });
         }
+    }
+
+    #[test]
+    fn config_applies_live_saves_and_returns_without_requests() {
+        use crate::ui::theme::{self as scheme, Scheme, testing::with_scheme};
+        with_scheme(Scheme::Gruvbox, || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("connect.json");
+            let (mut app, mut rx) = app();
+            app.ctx.preferences = Preferences::load(path.clone()).unwrap();
+            assert!(screen(&mut app, 80, 24).contains("[C]onfig"));
+            key(&mut app, 'c');
+            assert_eq!(app.stack.len(), 2, "Config opens directly over the menu");
+            assert!(screen(&mut app, 80, 24).contains("Current: Gruvbox dark medium"));
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            for target in [Scheme::Terminal, Scheme::NoColor, Scheme::Gruvbox] {
+                let code = if target == Scheme::Gruvbox {
+                    KeyCode::Home
+                } else {
+                    KeyCode::Down
+                };
+                press(&mut app, code, KeyModifiers::NONE);
+                let before = scheme::current();
+                terminal.draw(|f| app.draw(f)).unwrap();
+                assert_eq!(scheme::current(), before, "navigation alone does not save");
+                enter(&mut app);
+                assert_eq!(scheme::current(), target);
+                terminal.draw(|f| app.draw(f)).unwrap();
+                scheme::testing::assert_buffer(terminal.backend().buffer());
+                assert!(screen(&mut app, 80, 24).contains(&format!("Current: {}", target.label())));
+                assert!(app.ctx.preferences.error.is_none());
+                with_scheme(Scheme::Terminal, || {
+                    Preferences::load(path.clone())
+                        .unwrap()
+                        .restore_theme(false);
+                    assert_eq!(scheme::current(), target);
+                });
+            }
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(app.stack.len(), 1);
+            assert!(screen(&mut app, 80, 24).contains("Main menu"));
+            assert!(rx.try_recv().is_err(), "Config makes no backend requests");
+            // Also open through the normal menu selection rather than its hotkey.
+            for _ in 0..3 {
+                key(&mut app, 'j');
+            }
+            enter(&mut app);
+            assert!(screen(&mut app, 80, 24).contains("Color scheme"));
+        });
+    }
+
+    #[test]
+    fn config_shows_save_failure_without_reverting_the_live_theme() {
+        use crate::ui::theme::{self as scheme, Scheme, testing::with_scheme};
+        with_scheme(Scheme::Gruvbox, || {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().join("state");
+            let (mut app, _rx) = app();
+            app.ctx.preferences = Preferences::load(parent.join("connect.json")).unwrap();
+            std::fs::write(&parent, "blocked").unwrap();
+            key(&mut app, 'c');
+            key(&mut app, 'j');
+            enter(&mut app);
+            let out = screen(&mut app, 80, 24);
+            assert!(out.contains("Cannot save color scheme"), "{out}");
+            assert!(out.contains("Current: Terminal palette"), "{out}");
+            assert_eq!(scheme::current(), Scheme::Terminal);
+        });
+    }
+
+    #[test]
+    fn reopening_after_config_repaints_activity_and_retains_draft_and_cursor() {
+        use crate::ui::theme::{self as scheme, Scheme, testing::with_scheme};
+        with_scheme(Scheme::Gruvbox, || {
+            let (mut app, mut rx) = app();
+            let (feed, act) = mateo_streams(&mut app, &mut rx);
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(vec![proto::Message {
+                    read_at: Some("2026-10-16T18:01:00Z".into()),
+                    ..message(1, "Mateo", "ada", "**answer**")
+                }]),
+            }));
+            let record = activity(1, "01", r#"{"event":"warning","message":"activity-body"}"#);
+            app.on_event(Event::Data(Data::Activity {
+                id: act,
+                result: Ok(vec![record.clone()]),
+            }));
+            assert!(matches!(rx.try_recv(), Ok(Request::MarkSeen { .. })));
+            typed(&mut app, "draft");
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            assert!(screen(&mut app, 100, 30).contains("activity-body"));
+            close_conversation(&mut app, &mut rx);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(matches!(rx.try_recv(), Ok(Request::Unwatch(_))));
+            assert_eq!(app.stack.len(), 1);
+            assert!(rx.try_recv().is_err());
+            key(&mut app, 'c');
+            key(&mut app, 'j');
+            enter(&mut app);
+            assert_eq!(scheme::current(), Scheme::Terminal);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let (feed, act) = mateo_streams(&mut app, &mut rx);
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(vec![proto::Message {
+                    read_at: Some("2026-10-16T18:01:00Z".into()),
+                    ..message(1, "Mateo", "ada", "**answer**")
+                }]),
+            }));
+            app.on_event(Event::Data(Data::Activity {
+                id: act,
+                result: Ok(vec![record]),
+            }));
+            let out = screen(&mut app, 100, 30);
+            assert!(
+                out.contains("activity-body") && out.contains("draft"),
+                "{out}"
+            );
+            assert!(matches!(rx.try_recv(), Ok(Request::MarkSeen { .. })));
+            key(&mut app, 'X');
+            enter(&mut app);
+            let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+                panic!("expected send");
+            };
+            assert_eq!(req.body, "drafXt", "saved cursor survives the theme change");
+        });
     }
 
     fn app() -> (App, UnboundedReceiver<Request>) {
@@ -824,7 +957,11 @@ mod tests {
                 .unwrap()
                 .chars()
                 .collect();
-            let cell: String = row[active..active + 11].iter().collect::<String>().trim().to_string();
+            let cell: String = row[active..active + 11]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string();
             assert_eq!(cell, "103d23h ago", "{out}");
             // An unknown active time renders a dash.
             let row: Vec<_> = out

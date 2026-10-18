@@ -23,7 +23,7 @@ use crate::proto::Kind;
 
 pub use event::Opener;
 
-pub async fn run(mut backend: Backend, opener: Opener) -> Result<()> {
+pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> Result<()> {
     let me = backend.whoami().await?;
     if me.kind() != Kind::Human {
         bail!("bbs connect is for humans; agents use the other bbs commands");
@@ -31,6 +31,9 @@ pub async fn run(mut backend: Backend, opener: Opener) -> Result<()> {
     if !std::io::stdout().is_terminal() {
         bail!("bbs connect needs a terminal");
     }
+    let preferences =
+        preferences::Preferences::load(crate::app::state_dir()?.join("connect.json"))?;
+    preferences.restore_theme(theme_explicit);
     let ctx = app::Ctx {
         me: me.name,
         server: opener
@@ -40,7 +43,7 @@ pub async fn run(mut backend: Backend, opener: Opener) -> Result<()> {
             .unwrap_or_else(|| "local".into()),
         started: Instant::now(),
         composer_max_height_percent: opener.config.composer_max_height_percent(),
-        preferences: preferences::Preferences::load(crate::app::state_dir()?.join("connect.json"))?,
+        preferences,
     };
     let (events, mut rx) = unbounded_channel();
     let (requests, requests_rx) = unbounded_channel();
