@@ -867,6 +867,7 @@ impl Screen for Thread {
             let Some(agent) = &self.agent else {
                 return Transition::Stay;
             };
+            self.effort_notice = None;
             return match ctx
                 .efforts
                 .decide(agent, &ctx.me, action == Action::EffortUp)

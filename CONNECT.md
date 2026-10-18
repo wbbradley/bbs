@@ -80,6 +80,13 @@ a transport failure retains it as unconfirmed. A fresh authoritative agent list
 can clear an old driver's current/choices without discarding unresolved intent.
 Report age is not connectivity.
 
+Tab increases effort and Shift-Tab decreases it in both agent typing and timeline
+navigation, before composer input. Shift-Tab accepts terminal BackTab and enhanced
+Shift+Tab encodings. Neither inserts source indentation; explicit source spaces and
+all other editing keys are unchanged. `i`/Esc still enter typing from navigation.
+Search prompts and dialogs retain Tab for their own input; groups, feed and forms
+keep their existing behavior. Plain comma and period remain ordinary text.
+
 Effort comes from the existing shared summaries and agent list, not retained
 activity or extra streams. Older servers/drivers show unknown/unavailable. Only
 advertised ranked choices participate in increase/decrease, clamped at boundaries;

@@ -316,6 +316,17 @@ impl App {
                     return false;
                 }
                 self.ctx.navigation_notice = None;
+                if let Some(action) = super::keys::effort_action(key)
+                    && matches!(self.top().conversation(), Some(Conversation::Agent(_)))
+                    && !self.top().navigation_blocked()
+                {
+                    self.keymap = Keymap::default();
+                    let quit = self.on_action(action);
+                    if !quit {
+                        self.viewed();
+                    }
+                    return quit;
+                }
                 let quit = if let Some(transition) = self.top().raw_key(key) {
                     self.keymap = Keymap::default();
                     self.apply(transition)
@@ -1808,6 +1819,121 @@ mod tests {
             "stale choices cannot open picker"
         );
         assert!(rx.try_recv().is_err(), "stale rank cannot emit request");
+    }
+
+    #[test]
+    fn effort_tabs_step_in_both_agent_modes_without_indenting_or_moving_the_draft() {
+        for compact in [false, true] {
+            let (mut app, mut rx) = app();
+            mateo_streams(&mut app, &mut rx);
+            if compact {
+                press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+            }
+            report_effort(&mut app, effort_report(Some("low")));
+            typed(&mut app, "é ab,.");
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            let draft = app.top().draft().unwrap().1;
+            for navigation in [false, true] {
+                if navigation {
+                    press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+                }
+                for (code, modifiers, expected) in [
+                    (KeyCode::Tab, KeyModifiers::NONE, "medium"),
+                    (KeyCode::Tab, KeyModifiers::NONE, "high"),
+                    (KeyCode::BackTab, KeyModifiers::SHIFT, "medium"),
+                    (KeyCode::Tab, KeyModifiers::SHIFT, "low"),
+                ] {
+                    press(&mut app, code, modifiers);
+                    let Request::SetEffort { agent, value, .. } = rx.try_recv().unwrap() else {
+                        panic!("effort tab")
+                    };
+                    assert_eq!(agent, "Mateo");
+                    assert_eq!(value, expected);
+                    assert_eq!(app.top().draft().unwrap().1, draft);
+                    assert_eq!(editor_focused(&mut app), !navigation);
+                    let status = bottom(&mut app);
+                    assert!(
+                        !status.contains("boundary") && status.contains("next"),
+                        "{status}"
+                    );
+                    if expected == "high" {
+                        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+                        assert!(rx.try_recv().is_err(), "upper boundary is a no-op");
+                    }
+                }
+                press(&mut app, KeyCode::BackTab, KeyModifiers::NONE);
+                assert!(rx.try_recv().is_err(), "lower boundary is a no-op");
+                assert_eq!(app.top().draft().unwrap().1, draft);
+            }
+            // i and Esc remain ways to enter typing; punctuation is ordinary text.
+            key(&mut app, 'i');
+            assert!(editor_focused(&mut app));
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(editor_focused(&mut app));
+            assert_eq!(app.top().draft().unwrap().1, draft);
+            key(&mut app, ',');
+            key(&mut app, '.');
+            assert_eq!(app.top().draft().unwrap().1.text, "é ab,,..");
+        }
+    }
+
+    #[test]
+    fn effort_tabs_leave_picker_search_and_other_screen_input_in_control() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        report_effort(&mut app, effort_report(Some("default")));
+        typed(&mut app, "draft");
+        let draft = app.top().draft().unwrap().1;
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.top().navigation_blocked());
+        assert!(screen(&mut app, 80, 24).contains("Enter apply"));
+        enter(&mut app);
+        assert!(rx.try_recv().is_err(), "no implicit picker value");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::BackTab, KeyModifiers::NONE);
+        assert!(rx.try_recv().is_err(), "picker Tab only moves selection");
+        enter(&mut app);
+        let Request::SetEffort { value, .. } = rx.try_recv().unwrap() else {
+            panic!("explicit choice")
+        };
+        assert_eq!(value, "low");
+        assert_eq!(app.top().draft().unwrap().1, draft);
+        assert!(editor_focused(&mut app));
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, '/');
+        typed(&mut app, "search");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::BackTab, KeyModifiers::NONE);
+        assert!(bottom(&mut app).contains("/search█"));
+        assert!(rx.try_recv().is_err());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        for (code, modifiers) in [
+            (KeyCode::Tab, KeyModifiers::ALT),
+            (KeyCode::Tab, KeyModifiers::CONTROL),
+            (KeyCode::BackTab, KeyModifiers::ALT),
+        ] {
+            press(&mut app, code, modifiers);
+            assert!(
+                rx.try_recv().is_err(),
+                "unrelated modifiers cannot set effort"
+            );
+        }
+        app.open(Box::new(Thread::group("crew")), true);
+        while rx.try_recv().is_ok() {}
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(
+            editor_focused(&mut app),
+            "group Tab still enters its composer"
+        );
+        typed(&mut app, "group draft");
+        assert_eq!(app.top().draft().unwrap().1.text, "group draft");
+        assert!(rx.try_recv().is_err());
+        app.open(Box::new(Thread::feed()), true);
+        while rx.try_recv().is_ok() {}
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::BackTab, KeyModifiers::NONE);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

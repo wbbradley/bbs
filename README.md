@@ -128,7 +128,11 @@ Agent conversations show the driver's last reported effort before following/paus
 with report age, separately from a next-turn request. An arrow and `next` identify
 a pending value in the narrow status bar; its parenthesized age belongs to the last
 report. Reports require `agent-effort.v1` and never imply the agent is online.
-Controls use only advertised choices and ranks; provider default/unknown values
+`Tab` increases effort and `Shift-Tab` decreases it in agent typing and navigation
+modes; these keys do not indent that textbox. Search prompts and dialogs retain
+their input behavior; group/feed/form behavior is unchanged. `i` and `Esc` still
+enter agent typing from navigation. Controls use only advertised choices and ranks;
+provider default/unknown values
 need an explicit choice. Changes wait for the next ordinary prompt and remain
 unconfirmed until their exact provider outcome arrives. After 60 seconds without
 that outcome, the bar calls this out without dropping the request. Search and

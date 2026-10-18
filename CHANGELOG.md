@@ -24,7 +24,8 @@ under the new package version and its publication date.
 
 - Agent conversations display last reported effort and age separately from pending
   next-turn changes, with an explicit picker for unranked settings, correlated
-  outcomes and visible unconfirmed/failure feedback.
+  outcomes and visible unconfirmed/failure feedback. Tab increases and Shift-Tab
+  decreases effort in agent typing/navigation; prompts and dialogs protect input.
 
 ### Changed
 

@@ -36,6 +36,20 @@ pub enum Action {
     Quit,
 }
 
+/// Agent-only overrides, before the composer/keymap; modal input owns Tab.
+/// Legacy Shift-Tab is BackTab; enhanced keyboards may send Tab + SHIFT.
+pub fn effort_action(key: KeyEvent) -> Option<Action> {
+    if !(key.modifiers - KeyModifiers::SHIFT).is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::BackTab => Some(Action::EffortDown),
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Some(Action::EffortDown),
+        KeyCode::Tab => Some(Action::EffortUp),
+        _ => None,
+    }
+}
+
 /// A group change, each one dialog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupOp {
@@ -128,7 +142,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: &[Key::Char('i'), Key::Code(KeyCode::Tab)],
         action: Action::Compose,
-        help: "threads: write (agents start in insert mode)",
+        help: "threads: i writes; groups also accept Tab",
     },
     Binding {
         keys: &[Key::Char('n')],
@@ -293,6 +307,40 @@ mod tests {
             Key::Ctrl(c) => vec![press(KeyCode::Char(c), KeyModifiers::CONTROL)],
             Key::Twice(c) => vec![press(KeyCode::Char(c), KeyModifiers::NONE); 2],
             Key::Code(code) => vec![press(code, KeyModifiers::NONE)],
+        }
+    }
+
+    #[test]
+    fn effort_tabs_accept_both_shift_encodings_without_claiming_other_modifiers() {
+        assert_eq!(
+            effort_action(press(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(Action::EffortUp)
+        );
+        for (code, modifiers) in [
+            (KeyCode::BackTab, KeyModifiers::NONE),
+            (KeyCode::BackTab, KeyModifiers::SHIFT),
+            (KeyCode::Tab, KeyModifiers::SHIFT),
+        ] {
+            assert_eq!(
+                effort_action(press(code, modifiers)),
+                Some(Action::EffortDown)
+            );
+        }
+        for modifiers in [
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            for code in [KeyCode::Tab, KeyCode::BackTab] {
+                assert_eq!(effort_action(press(code, modifiers)), None);
+            }
+        }
+        for c in [',', '.', 'i'] {
+            assert_eq!(
+                effort_action(press(KeyCode::Char(c), KeyModifiers::NONE)),
+                None
+            );
         }
     }
 

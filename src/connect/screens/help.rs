@@ -21,6 +21,10 @@ const AGENT_KEYS: &[(&str, &str)] = &[
     ("Esc", "agent navigation: return to insert mode"),
     ("↑ / ↓", "agent insert: move within the draft"),
     ("Ctrl-T", "agents: compact/verbose (remembered locally)"),
+    (
+        "Tab / Shift-Tab",
+        "agents: increase / decrease effort; default opens picker",
+    ),
 ];
 
 /// The keys, one per row; it scrolls when they outgrow the window.
