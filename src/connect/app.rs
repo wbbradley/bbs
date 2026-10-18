@@ -323,9 +323,13 @@ impl App {
             Event::Data(data) => {
                 match &data {
                     Data::Summary { id, result } if *id == self.ctx.inbox.id => {
-                        if let Ok(rows) = result {
-                            self.known_agents =
-                                Some(rows.iter().map(|s| s.agent.to_ascii_lowercase()).collect());
+                        // Only ListAgents establishes absence. Sparse summary servers
+                        // omit agents with zero counts; positive rows can also describe
+                        // agents created after the last list.
+                        if let Ok(rows) = result
+                            && let Some(known) = &mut self.known_agents
+                        {
+                            known.extend(rows.iter().map(|s| s.agent.to_ascii_lowercase()));
                         }
                         self.ctx.inbox.snapshot(*id, result);
                         if matches!(self.ctx.navigation_notice, Some(Feedback::Summary(_))) {
@@ -808,6 +812,42 @@ mod tests {
     }
 
     #[test]
+    fn sparse_or_empty_summaries_do_not_remove_existing_agents_from_history() {
+        let (mut app, mut rx) = app();
+        open_agents(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            agents: vec![agent("A", "ada", &[]), agent("B", "ben", &[])],
+            humans: vec![],
+        }))));
+        inbox_rows(&mut app, &[("A", 1, "2026-10-18T12:00:00Z")]);
+        ctrl(&mut app, 'g');
+        while rx.try_recv().is_ok() {}
+        inbox_rows(&mut app, &[("B", 1, "2026-10-18T12:00:01Z")]);
+        ctrl(&mut app, 'g');
+        while rx.try_recv().is_ok() {}
+        assert_eq!(opened(&app), Some(Conversation::Agent("B".into())));
+        for snapshot in [vec![("A", 1, "2026-10-18T12:00:00Z")], vec![]] {
+            inbox_rows(&mut app, &snapshot);
+            for name in ["A", "B", "A", "B"] {
+                ctrl(&mut app, 'o');
+                while rx.try_recv().is_ok() {}
+                assert_eq!(opened(&app), Some(Conversation::Agent(name.into())));
+                assert_eq!(app.stack.len(), 3, "menu, Agents and one conversation");
+            }
+        }
+        // A positive sparse row can describe a new agent absent from an older list.
+        inbox_rows(&mut app, &[("New", 1, "2026-10-18T12:00:02Z")]);
+        ctrl(&mut app, 'g');
+        while rx.try_recv().is_ok() {}
+        inbox_rows(&mut app, &[]);
+        for name in ["B", "A", "New"] {
+            ctrl(&mut app, 'o');
+            while rx.try_recv().is_ok() {}
+            assert_eq!(opened(&app), Some(Conversation::Agent(name.into())));
+        }
+    }
+
+    #[test]
     fn history_ring_keeps_pending_sends_and_skips_deleted_targets() {
         for success in [true, false] {
             let (mut app, mut rx) = app();
@@ -849,8 +889,11 @@ mod tests {
                 Some(Conversation::Agent("Zed".into())),
                 "history wraps without reordering"
             );
-            // Latest successful live-agent snapshot says Zed was removed.
-            inbox_rows(&mut app, &[("Mateo", 0, "")]);
+            // A successful ListAgents result, not summary omission, establishes removal.
+            app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+                agents: vec![agent("Mateo", "ada", &[])],
+                humans: vec![],
+            }))));
             ctrl(&mut app, 'o');
             while rx.try_recv().is_ok() {}
             assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
