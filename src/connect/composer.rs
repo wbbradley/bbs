@@ -4,6 +4,7 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
+use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 use ratatui_textarea::{CursorMove, DataCursor, TextArea, WrapMode};
 
@@ -126,13 +127,17 @@ impl Composer {
         )
     }
 
-    /// Two text rows and light padding when empty, plus a dark separator.
+    /// Two text rows and scrollable top padding, plus dark and bottom separators.
     pub fn height(&self, width: u16, max_lines: u16) -> u16 {
-        let lines =
-            u16::try_from(self.layout(width).height().saturating_add(1)).unwrap_or(u16::MAX);
+        let lines = u16::try_from(
+            self.layout(width - gutter_width(width))
+                .height()
+                .saturating_add(1),
+        )
+        .unwrap_or(u16::MAX);
         lines
             .clamp(MIN_LINES + 1, max_lines.max(MIN_LINES + 1))
-            .saturating_add(1)
+            .saturating_add(2)
     }
 
     /// Only movements defined in display rows use the local map. Logical edits,
@@ -242,10 +247,20 @@ impl Composer {
         let surface = theme::style(theme::Role::HumanSurface);
         frame.render_widget(Block::new().style(theme::style(theme::Role::Screen)), area);
         let gap = area.height.min(1);
-        self.area = Rect {
+        let input = Rect {
             y: area.y + gap,
             height: area.height - gap,
             ..area
+        };
+        frame.render_widget(Block::new().style(surface), input);
+        let gutter = gutter_width(input.width);
+        // Keep a caret row when a tiny rectangle cannot fit the bottom pad too.
+        let bottom = u16::from(input.height > 1);
+        self.area = Rect {
+            x: input.x + gutter,
+            width: input.width - gutter,
+            height: input.height - bottom,
+            ..input
         };
         let layout = self.layout(self.area.width);
         let caret = layout.point(self.text.cursor()).row.saturating_add(1);
@@ -266,7 +281,12 @@ impl Composer {
             height: self.area.height - padding,
             ..self.area
         };
-        frame.render_widget(Block::new().style(surface), self.area);
+        if self.top <= 1 && text_area.height > 0 && gutter > 0 {
+            frame.render_widget(
+                Paragraph::new(Span::styled("›", theme::style(theme::Role::Muted))).style(surface),
+                Rect::new(input.x, text_area.y, gutter, 1),
+            );
+        }
         let text = layout.text(
             self.text.cursor(),
             focused,
@@ -276,6 +296,11 @@ impl Composer {
         );
         frame.render_widget(Paragraph::new(text).style(surface), text_area);
     }
+}
+
+/// Preserve one source column on narrow displays.
+fn gutter_width(width: u16) -> u16 {
+    width.saturating_sub(1).min(2)
 }
 
 fn blank() -> TextArea<'static> {
@@ -339,8 +364,8 @@ mod tests {
                         assert_eq!(buffer[(x, 0)].bg, screen.bg.unwrap());
                     }
                     let first: String = (0..24).map(|x| buffer[(x, 2)].symbol()).collect();
-                    assert!(first.starts_with("a wrapped input"));
-                    assert_eq!(composer.area, Rect::new(0, 1, 24, 7));
+                    assert!(first.starts_with("› a wrapped input"));
+                    assert_eq!(composer.area, Rect::new(2, 1, 22, 6));
                     assert_eq!(
                         composer.text.lines(),
                         ["a wrapped input with enough text to fill several lines"]
@@ -388,13 +413,19 @@ mod tests {
                         let before = c.draft();
                         let buffer = draw(&mut c, width, 5);
                         assert_buffer(&buffer);
-                        assert_eq!(c.area, Rect::new(0, 1, width, 4));
+                        assert_eq!(
+                            c.area,
+                            Rect::new(gutter_width(width), 1, width - gutter_width(width), 3)
+                        );
                         assert_eq!(c.draft(), before);
-                        let caret = c.layout(width).point(c.text.cursor());
+                        let caret = c.layout(c.area.width).point(c.text.cursor());
                         let cursor = theme::base()
                             .patch(theme::style(theme::Role::HumanSurface))
                             .patch(theme::style(theme::Role::Cursor));
-                        let cell = &buffer[(caret.col as u16, 1 + (caret.row + 1 - c.top) as u16)];
+                        let cell = &buffer[(
+                            c.area.x + caret.col as u16,
+                            1 + (caret.row + 1 - c.top) as u16,
+                        )];
                         assert_eq!(cell.fg, cursor.fg.unwrap());
                         assert_eq!(cell.bg, cursor.bg.unwrap());
                         let all: String = buffer.content.iter().map(|c| c.symbol()).collect();
@@ -493,7 +524,7 @@ mod tests {
         let mut c = Composer::new("Mateo");
         c.text.insert_str("abcd  efgh ij");
         c.jump(DataCursor(0, 3));
-        draw(&mut c, 4, 4);
+        draw(&mut c, 6, 5);
         press(&mut c, KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(c.text.cursor(), (0, 9));
         press(&mut c, KeyCode::Char('n'), KeyModifiers::CONTROL);
@@ -502,12 +533,12 @@ mod tests {
         assert_eq!(c.text.cursor(), (0, 8));
         press(&mut c, KeyCode::Up, KeyModifiers::SHIFT);
         assert_eq!(c.text.selection_range(), Some(((0, 2), (0, 8))));
-        let buffer = draw(&mut c, 4, 4);
+        let buffer = draw(&mut c, 6, 5);
         let selected =
             theme::style(theme::Role::HumanSurface).patch(theme::style(theme::Role::Selection));
-        assert_eq!(buffer[(3, 2)].fg, selected.fg.unwrap());
-        assert_eq!(buffer[(3, 2)].bg, selected.bg.unwrap());
-        assert!(buffer[(3, 2)].modifier.contains(selected.add_modifier));
+        assert_eq!(buffer[(5, 2)].fg, selected.fg.unwrap());
+        assert_eq!(buffer[(5, 2)].bg, selected.bg.unwrap());
+        assert!(buffer[(5, 2)].modifier.contains(selected.add_modifier));
         c.text.copy();
         assert_eq!(c.text.yank_text(), "cd  ef");
         // Native yank/undo still operate on exact source, including hidden spaces.
@@ -527,10 +558,10 @@ mod tests {
             let buffer = draw(&mut c, width, 4);
             assert_eq!(c.text.lines().join("\n"), source);
             assert_eq!(c.text.cursor(), (0, 5));
-            let caret = c.layout(width).point(c.text.cursor());
+            let caret = c.layout(c.area.width).point(c.text.cursor());
             assert!(caret.row + 1 >= c.top && caret.row + 1 < c.top + usize::from(c.area.height));
             let cell = &buffer[(
-                caret.col as u16,
+                c.area.x + caret.col as u16,
                 (caret.row + 1 - c.top + usize::from(c.area.y)) as u16,
             )];
             let cursor =
@@ -538,10 +569,10 @@ mod tests {
             assert_eq!(cell.fg, cursor.fg.unwrap());
             assert_eq!(cell.bg, cursor.bg.unwrap());
             press(&mut c, KeyCode::PageDown, KeyModifiers::NONE);
-            let after_page = c.layout(width).point(c.text.cursor());
+            let after_page = c.layout(c.area.width).point(c.text.cursor());
             assert!(after_page.row >= caret.row);
             press(&mut c, KeyCode::Char('v'), KeyModifiers::ALT);
-            assert!(c.layout(width).point(c.text.cursor()).row <= after_page.row);
+            assert!(c.layout(c.area.width).point(c.text.cursor()).row <= after_page.row);
         }
         assert_eq!(
             press(&mut c, KeyCode::Enter, KeyModifiers::NONE).as_deref(),
@@ -561,7 +592,7 @@ mod tests {
     fn exact_width_end_caret_is_reachable_in_both_directions() {
         let mut c = Composer::new("Mateo");
         c.text.insert_str("abcd");
-        draw(&mut c, 4, 4);
+        draw(&mut c, 6, 5);
         assert_eq!(c.layout(4).point(c.text.cursor()), Point { row: 1, col: 0 });
         press(&mut c, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(c.text.cursor(), (0, 0));
@@ -585,7 +616,7 @@ mod tests {
         for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
             c.text.cancel_selection();
             c.jump(DataCursor(0, 65_527));
-            draw(&mut c, 8, 4);
+            draw(&mut c, 10, 5);
             let layout = c.layout(8);
             let from = layout.point(c.text.cursor());
             assert_eq!(
@@ -634,7 +665,7 @@ mod tests {
         c.jump(DataCursor(0, 65_539));
         assert_eq!(c.text.cursor(), (0, 65_539));
         // No silent u16 truncation when a visual move lands past column 65535.
-        draw(&mut c, 8, 4);
+        draw(&mut c, 10, 5);
         press(&mut c, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(c.text.cursor(), (0, 65_531));
         c.text = TextArea::new(vec![String::new(); 65_538]);
@@ -653,14 +684,14 @@ mod tests {
                     cursor: (0, 0),
                 });
                 let source = c.draft();
-                let buffer = draw(&mut c, 8, 4);
+                let buffer = draw(&mut c, 10, 5);
                 let surface = theme::base().patch(theme::style(theme::Role::HumanSurface));
                 for x in 0..8 {
                     assert_eq!(buffer[(x, 1)].symbol(), " ");
                     assert_eq!(buffer[(x, 1)].fg, surface.fg.unwrap());
                     assert_eq!(buffer[(x, 1)].bg, surface.bg.unwrap());
                 }
-                assert_eq!(buffer[(0, 2)].symbol(), "o");
+                assert_eq!(buffer[(2, 2)].symbol(), "o");
                 // Moving or selecting up at the first source caret never enters padding.
                 for (code, modifiers) in [
                     (KeyCode::Up, KeyModifiers::NONE),
@@ -669,28 +700,28 @@ mod tests {
                     (KeyCode::PageUp, KeyModifiers::NONE),
                 ] {
                     press(&mut c, code, modifiers);
-                    draw(&mut c, 8, 4);
+                    draw(&mut c, 10, 5);
                     assert_eq!(c.draft(), source);
                     assert_eq!(c.top, 0);
                 }
                 c.jump(DataCursor(3, 0));
-                let buffer = draw(&mut c, 8, 4);
+                let buffer = draw(&mut c, 10, 5);
                 assert_eq!(c.top, 2);
                 assert_eq!(
-                    buffer[(0, 1)].symbol(),
+                    buffer[(2, 1)].symbol(),
                     "t",
                     "text occupies old padding row"
                 );
                 for _ in 0..3 {
                     press(&mut c, KeyCode::Up, KeyModifiers::NONE);
-                    draw(&mut c, 8, 4);
+                    draw(&mut c, 10, 5);
                 }
                 assert_eq!(c.draft(), source);
                 assert_eq!(
                     c.top, 0,
                     "returning to first visual text row restores padding"
                 );
-                let buffer = draw(&mut c, 8, 4);
+                let buffer = draw(&mut c, 10, 5);
                 assert_eq!(buffer[(0, 1)].symbol(), " ");
                 press(&mut c, KeyCode::Down, KeyModifiers::SHIFT);
                 assert_eq!(c.text.selection_range(), Some(((0, 0), (1, 0))));
@@ -727,10 +758,11 @@ mod tests {
                     let buffer = draw(&mut c, width, height);
                     assert_eq!(c.draft(), before);
                     assert_eq!(c.draft().text, source);
-                    let caret = c.layout(width).point(c.text.cursor());
+                    let caret = c.layout(c.area.width).point(c.text.cursor());
                     let row = caret.row + 1;
                     assert!(row >= c.top && row < c.top + usize::from(c.area.height));
-                    let cell = &buffer[(caret.col as u16, c.area.y + (row - c.top) as u16)];
+                    let cell =
+                        &buffer[(c.area.x + caret.col as u16, c.area.y + (row - c.top) as u16)];
                     let style = theme::base()
                         .patch(theme::style(theme::Role::HumanSurface))
                         .patch(theme::style(theme::Role::Cursor));
@@ -746,25 +778,75 @@ mod tests {
     }
 
     #[test]
+    fn gutter_and_bottom_padding_are_display_only_and_never_selected() {
+        use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let mut c = Composer::new("Mateo");
+                c.restore(super::super::drafts::Draft {
+                    text: "abcdef ghij\n  indented".into(),
+                    cursor: (0, 0),
+                });
+                let snapshot = c.draft();
+                let buffer = draw(&mut c, 8, 8);
+                assert_buffer(&buffer);
+                let line = |y| (0..8).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+                assert_eq!(line(2), "› abcdef");
+                assert!(line(3).starts_with("  ghij"));
+                let surface = theme::base().patch(theme::style(theme::Role::HumanSurface));
+                assert_eq!(line(7), "        ");
+                for x in 0..8 {
+                    let cell = &buffer[(x, 7)];
+                    assert_eq!(cell.fg, surface.fg.unwrap());
+                    assert_eq!(cell.bg, surface.bg.unwrap());
+                    assert_eq!(cell.modifier, surface.add_modifier);
+                }
+                assert_eq!(c.draft(), snapshot);
+                press(&mut c, KeyCode::Down, KeyModifiers::SHIFT);
+                let selected = c.text.selection_range().unwrap();
+                let buffer = draw(&mut c, 8, 8);
+                assert_eq!(c.text.selection_range(), Some(selected));
+                for y in 1..8 {
+                    for x in 0..2 {
+                        let cell = &buffer[(x, y)];
+                        assert_eq!(cell.bg, surface.bg.unwrap());
+                        assert!(!cell.modifier.contains(ratatui::style::Modifier::REVERSED));
+                    }
+                }
+                c.text.copy();
+                assert_eq!(c.text.yank_text(), "abcdef ");
+                c.text.cancel_selection();
+                c.text.move_cursor(CursorMove::Bottom);
+                c.text.move_cursor(CursorMove::End);
+                let buffer = draw(&mut c, 8, 5);
+                assert!(c.top > 1, "first source row scrolled out");
+                assert!((0..5).all(|y| buffer[(0, y)].symbol() != "›"));
+                assert!((0..8).all(|x| buffer[(x, 4)].symbol() == " "));
+                assert_eq!(c.draft().text, snapshot.text);
+            });
+        }
+    }
+
+    #[test]
     fn the_box_grows_with_wrapped_text_up_to_its_limit() {
         let mut c = Composer::new("Mateo");
-        assert_eq!(c.height(22, 4), 4);
-        typed(&mut c, &"x".repeat(60));
-        // Three source rows plus padding fill the four-row input cap.
         assert_eq!(c.height(22, 4), 5);
         typed(&mut c, &"x".repeat(60));
-        assert_eq!(c.height(22, 4), 5);
+        // Three source rows plus top padding fill the four-row viewport cap.
+        assert_eq!(c.height(22, 4), 6);
+        typed(&mut c, &"x".repeat(60));
+        assert_eq!(c.height(22, 4), 6);
         let cursor = c.text.cursor();
         let height = c.height(22, 4);
         draw(&mut c, 22, height);
         assert_eq!(
             c.area,
-            Rect::new(0, 1, 22, 4),
-            "gap preserves four input rows"
+            Rect::new(2, 1, 20, 4),
+            "outer padding preserves four viewport rows"
         );
         assert_eq!(c.text.cursor(), cursor);
-        assert!(c.layout(22).point(cursor).row < c.top + 4);
+        assert!(c.layout(c.area.width).point(cursor).row < c.top + 4);
         // A limit under two lines still leaves two.
-        assert_eq!(c.height(22, 1), 4);
+        assert_eq!(c.height(22, 1), 5);
     }
 }

@@ -46,7 +46,8 @@ filter those counts.
   the line start or joins at column zero; undo is `Ctrl-_` or `Ctrl-/`.
 - Borderless textboxes hide soft-wrap separator spaces while preserving explicit
   indentation, Unicode graphemes, selection, undo and sent bytes. Light top
-  padding scrolls away as text fills the editor and cannot hold the cursor.
+  padding scrolls away as text fills the editor; a two-column chevron gutter
+  and fixed light bottom padding remain display-only and cannot hold the cursor.
 - Open agent conversations mark received mail read and all received activity seen,
   including activity hidden by compact view or filters.
 - The Agents list separates OWNER, INBOX and ACTIVITY columns. ACTIVE shows the

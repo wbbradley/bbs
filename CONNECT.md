@@ -201,10 +201,15 @@ messages, with one blank display row above the input using the conversation's
 background. A second blank row inside the input uses its light surface as
 padding above the first text line. This row is display-only and cannot hold the
 cursor or selection. Text can occupy it as the viewport scrolls; returning to
-the first visual text row restores the padding. It starts with two text rows,
-the light padding and the dark separator, growing up to
-`composer_max_height_percent` input rows of the window height (default 20), then
-scrolls. One source-to-display layout drives wrapping, height, caret/selection
+the first visual text row restores the padding. A two-column gutter shows
+`› ` beside the first visual text row and spaces beside later and wrapped rows.
+The gutter is display-only; wrapping and cursor/selection share the remaining
+text width. A fixed light blank row below the viewport cannot hold the cursor.
+On very narrow or short displays, the gutter and bottom padding shrink to keep
+one text column and row when possible. The editor starts with two text rows,
+scrollable light top padding, the dark separator and fixed light bottom padding.
+Its scrolling viewport grows up to `composer_max_height_percent` rows of the
+window height (default 20). One source-to-display layout drives wrapping, height, caret/selection
 painting and visual row navigation. Separator spaces at soft line breaks are
 hidden; explicit indentation, draft bytes, editing history and sent text remain
 intact. Long words wrap at grapheme boundaries; a grapheme wider than the input

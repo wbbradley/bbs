@@ -1793,7 +1793,7 @@ mod tests {
 
         key(&mut app, 'j');
         reopen(&mut app, &mut rx);
-        assert!(!has_line(&screen(&mut app, 80, 24), "one"));
+        assert!(!has_line(&screen(&mut app, 80, 24), "› one"));
         typed(&mut app, "other");
         for _ in 0..3 {
             press(&mut app, KeyCode::Left, KeyModifiers::NONE);
@@ -1870,7 +1870,7 @@ mod tests {
                         assert!(rx.try_recv().is_err());
                     } else {
                         assert!(rx.try_recv().is_err(), "success clears the submitted draft");
-                        assert!(!has_line(&out, "draft"), "{out}");
+                        assert!(!has_line(&out, "› draft"), "{out}");
                     }
                 }
             }
@@ -1892,7 +1892,7 @@ mod tests {
         }));
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("Not sent: no agent named Mateo"), "{out}");
-        assert!(has_line(&out, "x"), "{out}");
+        assert!(has_line(&out, "› x"), "{out}");
         // Ctrl-C still quits from the composer.
         assert!(press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL));
     }
@@ -1914,7 +1914,7 @@ mod tests {
         key(&mut app, 'i');
         key(&mut app, 'x');
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
-        assert!(!has_line(&screen(&mut app, 80, 24), "x"));
+        assert!(!has_line(&screen(&mut app, 80, 24), "› x"));
         key(&mut app, 'x');
         enter(&mut app);
         let Request::Send { id: sent, req } = rx.try_recv().unwrap() else {
@@ -1954,13 +1954,13 @@ mod tests {
                 .unwrap();
             (0..29).filter(|y| buffer[(79, *y)].bg == surface).count()
         };
-        assert_eq!(rows(&mut app), 3);
+        assert_eq!(rows(&mut app), 4);
         for _ in 0..10 {
             key(&mut app, 'x');
             press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
         }
         // 20% of 30 rows.
-        assert_eq!(rows(&mut app), 6);
+        assert_eq!(rows(&mut app), 7);
     }
 
     fn typed(app: &mut App, text: &str) {
@@ -2300,9 +2300,9 @@ mod tests {
                                 .bg
                                 .unwrap()
                         );
-                        // One dark spacer, then light padding and two input rows.
+                        // Dark spacer, light top padding, two text rows and fixed light bottom padding.
                         assert_eq!(
-                            buffer[(width - 1, 19)].bg,
+                            buffer[(width - 1, 18)].bg,
                             theme::base()
                                 .patch(theme::style(theme::Role::Screen))
                                 .bg
