@@ -435,17 +435,18 @@ pub fn set_effort(conn: &Connection, id: i64, report: &str, now: &str) -> Result
     Ok(())
 }
 
-/// Whether message `id` is a set-effort control delivered to agent `agent`.
-pub fn is_effort_control_for(conn: &Connection, agent: i64, id: i64) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM deliveries d JOIN messages m ON m.id = d.message_id
-           WHERE d.recipient_kind = 'agent' AND d.recipient_id = ?1
-             AND m.id = ?2 AND m.control = 'set-effort')",
+/// The body of message `id` when it is a set-effort control delivered to
+/// agent `agent`.
+pub fn effort_control_body(conn: &Connection, agent: i64, id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT m.body FROM deliveries d JOIN messages m ON m.id = d.message_id
+         WHERE d.recipient_kind = 'agent' AND d.recipient_id = ?1
+           AND m.id = ?2 AND m.control = 'set-effort'",
         params![agent, id],
         |r| r.get(0),
-    )?;
-    Ok(n != 0)
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 /// Lowercased names currently held by live agents or humans.

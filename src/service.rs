@@ -846,7 +846,13 @@ fn send_control(
 ) -> Result<proto::SendResponse> {
     let control = match proto::Control::try_from(control) {
         Ok(proto::Control::Cancel) => "cancel",
-        Ok(proto::Control::SetEffort) => "set-effort",
+        Ok(proto::Control::SetEffort) => {
+            // The body is the requested level; reports match it exactly.
+            if body.is_empty() || body.len() > MAX_EFFORT_VALUE {
+                bail!("an effort request names a level of at most {MAX_EFFORT_VALUE} bytes");
+            }
+            "set-effort"
+        }
         _ => bail!("unknown control {control}"),
     };
     if me.kind != db::Kind::Human {
@@ -1224,7 +1230,23 @@ fn validate_effort(ctx: &Ctx, agent: i64, report: &proto::EffortReport) -> Resul
         bail!("current is too long");
     }
     if let Some(pending) = &report.pending {
-        check_effort_request(ctx, agent, pending.request_id, pending.value.as_str())?;
+        check_effort_request(ctx, agent, pending.request_id)?;
+        if pending.value.is_empty() {
+            bail!("pending request without a value");
+        }
+        if pending.value.len() > MAX_EFFORT_VALUE {
+            bail!("requested value is too long");
+        }
+        let body = db::effort_control_body(ctx.conn, agent, pending.request_id)?
+            .expect("checked above");
+        if pending.value != body {
+            bail!(
+                "pending request {} value {:?} does not match the control's {:?}",
+                pending.request_id,
+                pending.value,
+                body
+            );
+        }
     }
     if let Some(outcome) = &report.answered {
         if outcome.result() == proto::effort_outcome::Result::Unspecified {
@@ -1233,20 +1255,22 @@ fn validate_effort(ctx: &Ctx, agent: i64, report: &proto::EffortReport) -> Resul
         if outcome.detail.len() > MAX_EFFORT_TEXT {
             bail!("outcome detail is too long");
         }
-        check_effort_request(ctx, agent, outcome.request_id, "")?;
+        check_effort_request(ctx, agent, outcome.request_id)?;
+    }
+    if let (Some(pending), Some(answered)) = (&report.pending, &report.answered)
+        && pending.request_id == answered.request_id
+    {
+        bail!("request {} is both pending and answered", pending.request_id);
     }
     Ok(())
 }
 
 /// Report references must name a set-effort control delivered to this agent.
-fn check_effort_request(ctx: &Ctx, agent: i64, id: i64, value: &str) -> Result<()> {
+fn check_effort_request(ctx: &Ctx, agent: i64, id: i64) -> Result<()> {
     if id <= 0 {
         bail!("invalid request id {id}");
     }
-    if value.len() > MAX_EFFORT_VALUE {
-        bail!("requested value is too long");
-    }
-    if !db::is_effort_control_for(ctx.conn, agent, id)? {
+    if db::effort_control_body(ctx.conn, agent, id)?.is_none() {
         bail!("request id {id} is not a set-effort control delivered to this agent");
     }
     Ok(())
@@ -2069,6 +2093,95 @@ mod tests {
             .messages;
         let control = mail.iter().find(|m| m.control.is_some()).unwrap();
         assert_eq!(control.control, Some(proto::Control::SetEffort.into()));
+        // An answered outcome round-trips and clears nothing else.
+        report_effort(
+            &mut conn,
+            &mateo,
+            report(
+                None,
+                Some(proto::EffortOutcome {
+                    request_id: id,
+                    result: proto::effort_outcome::Result::Applied as i32,
+                    detail: String::new(),
+                }),
+            ),
+        )
+        .unwrap();
+        let agents = list_agents(&mut conn, &will, proto::ListAgentsRequest { all: false })
+            .unwrap()
+            .agents;
+        let e = agents
+            .iter()
+            .find(|a| a.name == "Mateo")
+            .unwrap()
+            .effort
+            .clone()
+            .unwrap();
+        let answered = e.answered.unwrap();
+        assert_eq!(answered.request_id, id);
+        assert_eq!(
+            answered.result(),
+            proto::effort_outcome::Result::Applied
+        );
+        // A request cannot be pending and answered in one report.
+        let both = report(
+            Some(proto::EffortRequest {
+                request_id: id,
+                value: "high".into(),
+            }),
+            Some(proto::EffortOutcome {
+                request_id: id,
+                result: proto::effort_outcome::Result::Applied as i32,
+                detail: String::new(),
+            }),
+        );
+        let err = report_effort(&mut conn, &mateo, both).unwrap_err();
+        assert!(format!("{err:#}").contains("both pending and answered"), "{err:#}");
+        // Pending values must match the control's body exactly.
+        let mismatched = report(
+            Some(proto::EffortRequest {
+                request_id: id,
+                value: "low".into(),
+            }),
+            None,
+        );
+        let err = report_effort(&mut conn, &mateo, mismatched).unwrap_err();
+        assert!(format!("{err:#}").contains("does not match"), "{err:#}");
+        // Empty pending values, empty or oversized control values rejected.
+        let empty_pending = report(
+            Some(proto::EffortRequest {
+                request_id: id,
+                value: String::new(),
+            }),
+            None,
+        );
+        let err = report_effort(&mut conn, &mateo, empty_pending).unwrap_err();
+        assert!(format!("{err:#}").contains("without a value"), "{err:#}");
+        let send_effort = |conn: &mut Connection, body: &str| {
+            send(
+                conn,
+                &will,
+                proto::SendRequest {
+                    to: "Mateo".into(),
+                    body: body.into(),
+                    control: Some(proto::Control::SetEffort.into()),
+                },
+            )
+        };
+        assert!(send_effort(&mut conn, "").is_err());
+        assert!(send_effort(&mut conn, &"x".repeat(129)).is_err());
+        // A report without state is rejected.
+        let err = report_effort(
+            &mut conn,
+            &mateo,
+            proto::ReportEffortRequest { report: None },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("missing report"), "{err:#}");
+        let mut no_state = report(None, None);
+        no_state.report.as_mut().unwrap().state = None;
+        let err = report_effort(&mut conn, &mateo, no_state).unwrap_err();
+        assert!(format!("{err:#}").contains("state"), "{err:#}");
         bye(&mut conn, &mateo).unwrap();
         let agents = list_agents(&mut conn, &will, proto::ListAgentsRequest { all: true })
             .unwrap()
