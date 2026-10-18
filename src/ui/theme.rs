@@ -1,8 +1,9 @@
-//! Startup-selected semantic styles shared by every terminal renderer.
+//! Semantic styles shared by every terminal renderer; connect can switch live.
 
 use anyhow::{Result, bail};
 use ratatui::style::{Color, Style};
-use std::sync::OnceLock;
+use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 
 /// Components choose a purpose, never a palette color. Foreground-only roles
 /// inherit their enclosing surface, including human input and outgoing rows.
@@ -34,15 +35,17 @@ pub enum Role {
     Logo,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Scheme {
     #[default]
+    #[serde(rename = "gruvbox-dark-medium")]
     Gruvbox,
     Terminal,
     NoColor,
 }
 
-static SCHEME: OnceLock<Scheme> = OnceLock::new();
+static SCHEME: RwLock<Scheme> = RwLock::new(Scheme::Gruvbox);
 
 /// Explicit selectors override NO_COLOR; empty environment values are absent.
 pub fn resolve(cli: Option<&str>, env: Option<&str>, no_color: bool) -> Result<Scheme> {
@@ -56,25 +59,47 @@ pub fn resolve(cli: Option<&str>, env: Option<&str>, no_color: bool) -> Result<S
     }
 }
 
-pub fn init(cli: Option<&str>) -> Result<()> {
+/// Resolve startup options and report whether CLI/environment selected explicitly.
+pub fn init(cli: Option<&str>) -> Result<bool> {
     let env = std::env::var("BBS_THEME").ok();
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-    let scheme = resolve(cli, env.as_deref(), no_color)?;
-    SCHEME
-        .set(scheme)
-        .expect("theme initialized once before rendering");
-    Ok(())
+    select(resolve(cli, env.as_deref(), no_color)?);
+    Ok(cli.is_some() || env.is_some_and(|s| !s.is_empty()))
+}
+
+pub fn current() -> Scheme {
+    #[cfg(test)]
+    if let Some(scheme) = testing::OVERRIDE.get() {
+        return scheme;
+    }
+    *SCHEME.read().expect("theme lock")
+}
+
+/// Change appearance without changing any application data or navigation state.
+pub fn select(scheme: Scheme) {
+    #[cfg(test)]
+    if testing::OVERRIDE.get().is_some() {
+        testing::OVERRIDE.set(Some(scheme));
+        return;
+    }
+    *SCHEME.write().expect("theme lock") = scheme;
 }
 
 pub fn style(role: Role) -> Style {
-    #[cfg(test)]
-    if let Some(scheme) = testing::OVERRIDE.get() {
-        return scheme.style(role);
-    }
-    SCHEME.get().copied().unwrap_or_default().style(role)
+    current().style(role)
 }
 
 impl Scheme {
+    pub const ALL: [Self; 3] = [Self::Gruvbox, Self::Terminal, Self::NoColor];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Gruvbox => "Gruvbox dark medium",
+            Self::Terminal => "Terminal palette",
+            Self::NoColor => "No color",
+        }
+    }
+
     pub fn style(self, role: Role) -> Style {
         use Role::*;
         if self == Self::NoColor {
@@ -212,7 +237,7 @@ pub(crate) mod testing {
         let _restore = Restore(OVERRIDE.replace(Some(scheme)));
         f();
     }
-    pub const SCHEMES: [Scheme; 3] = [Scheme::Gruvbox, Scheme::Terminal, Scheme::NoColor];
+    pub const SCHEMES: [Scheme; 3] = Scheme::ALL;
     pub fn assert_buffer(buffer: &ratatui::buffer::Buffer) {
         use Role::*;
         let roles = [

@@ -52,7 +52,21 @@ shared title bar and status bar.
 | Groups | Groups with members, writers and descriptions | `GroupList` |
 | Group | One group's broadcasts, a composer, and admin actions | `WatchFeed`, `Send`, group RPCs |
 | Feed | What `bbs view` shows today, with its filters | `WatchFeed` |
+| Config | Live local color scheme selection | local preferences |
 | Help | Key bindings | none |
+
+### Config screen
+
+`[C]onfig` on the main menu lists Gruvbox dark medium, Terminal palette, and No color.
+Up/Down selects a row; Enter applies it immediately and saves it beside the compact
+view choice in `~/.local/state/bbs/connect.json`. Esc returns to the menu. Startup
+`--theme` and `BBS_THEME` override the saved preference; a saved preference overrides
+automatic `NO_COLOR`/Gruvbox selection. Changing it in Config wins for the current
+session. A save error leaves that session choice active and appears on the page.
+
+Config is reached only from the main menu, after conversation screens and their
+cached activity have closed. Reopening a conversation renders fresh history with
+the current scheme; saved drafts keep their text/cursor and resolve styles as drawn.
 
 ### Agent screen
 

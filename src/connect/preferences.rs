@@ -6,19 +6,26 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::ui::theme::{self, Scheme};
+
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
 struct Values {
     compact: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theme: Option<Scheme>,
 }
 
 impl Default for Values {
     fn default() -> Self {
-        Self { compact: true }
+        Self {
+            compact: true,
+            theme: None,
+        }
     }
 }
 
-/// One preference shared by all agent conversations in this app.
+/// Local appearance choices shared by every screen in this app.
 #[derive(Default)]
 pub struct Preferences {
     values: Values,
@@ -40,6 +47,23 @@ impl Preferences {
             path: Some(path),
             error: None,
         })
+    }
+
+    /// CLI and BBS_THEME override the saved preference at startup. An explicit
+    /// saved choice otherwise takes precedence over the automatic NO_COLOR default.
+    pub fn restore_theme(&self, explicit: bool) {
+        if !explicit && let Some(scheme) = self.values.theme {
+            theme::select(scheme);
+        }
+    }
+
+    pub fn set_theme(&mut self, scheme: Scheme) {
+        self.values.theme = Some(scheme);
+        // Retain the live choice if persistence fails, and let the screen explain it.
+        self.error = self
+            .save()
+            .err()
+            .map(|e| format!("Cannot save color scheme: {e:#}"));
     }
 
     pub fn compact(&self) -> bool {
@@ -73,6 +97,73 @@ impl Preferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_theme_round_trips_without_changing_compact_and_honors_startup_overrides() {
+        use crate::ui::theme::testing::with_scheme;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connect.json");
+        // Existing preference files need no migration.
+        std::fs::write(&path, r#"{"compact":false}"#).unwrap();
+        let mut prefs = Preferences::load(path.clone()).unwrap();
+        with_scheme(Scheme::Terminal, || {
+            prefs.restore_theme(false);
+            assert_eq!(theme::current(), Scheme::Terminal);
+        });
+        for saved in Scheme::ALL {
+            prefs.set_theme(saved);
+            assert!(prefs.error.is_none());
+            prefs = Preferences::load(path.clone()).unwrap();
+            assert!(!prefs.compact());
+            with_scheme(Scheme::NoColor, || {
+                prefs.restore_theme(true);
+                assert_eq!(
+                    theme::current(),
+                    Scheme::NoColor,
+                    "explicit startup choice wins"
+                );
+                prefs.restore_theme(false);
+                assert_eq!(
+                    theme::current(),
+                    saved,
+                    "saved choice overrides automatic NO_COLOR"
+                );
+            });
+        }
+        prefs.set_compact(true);
+        let prefs = Preferences::load(path).unwrap();
+        assert_eq!(prefs.values.theme, Some(Scheme::NoColor));
+        assert!(prefs.compact());
+    }
+
+    #[test]
+    fn failed_theme_save_keeps_live_choice_and_can_be_retried() {
+        use crate::ui::theme::testing::with_scheme;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state");
+        let path = parent.join("connect.json");
+        let mut prefs = Preferences::load(path.clone()).unwrap();
+        std::fs::write(&parent, "blocked").unwrap();
+        with_scheme(Scheme::Gruvbox, || {
+            theme::select(Scheme::Terminal);
+            prefs.set_theme(Scheme::Terminal);
+            assert_eq!(theme::current(), Scheme::Terminal);
+            assert!(
+                prefs
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Cannot save color scheme")
+            );
+            std::fs::remove_file(&parent).unwrap();
+            prefs.set_theme(Scheme::Terminal);
+            assert!(prefs.error.is_none());
+            assert_eq!(
+                Preferences::load(path).unwrap().values.theme,
+                Some(Scheme::Terminal)
+            );
+        });
+    }
 
     #[test]
     fn missing_preferences_default_to_compact_and_both_choices_round_trip() {
