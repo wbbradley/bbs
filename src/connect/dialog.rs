@@ -170,12 +170,18 @@ impl Dialog {
         } else {
             "Enter OK · Esc cancel"
         };
-        let mut lines = vec![self.message.clone(), Line::raw("")];
+        let mut message = self.message.clone();
+        if self.choices.is_some() {
+            for span in &mut message.spans {
+                span.content = span.content.replace(['\n', '\r'], " ").into();
+            }
+            message = theme::clip_line(message, usize::from(WIDTH - 2));
+        }
+        let mut lines = vec![message, Line::raw("")];
         if let Some(choices) = &self.choices {
-            let message_rows = self.message.width().div_ceil(usize::from(WIDTH - 2)).max(1);
-            let visible = usize::from(area.height)
-                .saturating_sub(message_rows + 5)
-                .max(1);
+            // The choice explanation is one display row; keep the action hint
+            // visible independently of a provider's label/reason length.
+            let visible = usize::from(area.height).saturating_sub(6).max(1);
             let start = choices.selected.unwrap_or(0).saturating_sub(visible - 1);
             for (i, (_, label)) in choices.items.iter().enumerate().skip(start).take(visible) {
                 let selected = choices.selected == Some(i);
@@ -306,7 +312,10 @@ mod tests {
             with_scheme(scheme, || {
                 let mut d = Dialog::choose(
                     "Effort",
-                    "Current: unknown",
+                    format!(
+                        "Current: unknown\n{}",
+                        "provider default has no ordinal rank ".repeat(60)
+                    ),
                     (0..20)
                         .map(|i| (format!("id{i}"), format!("choice{i} {}", "👩‍💻é".repeat(30))))
                         .collect(),

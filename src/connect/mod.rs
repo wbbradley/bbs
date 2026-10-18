@@ -6,6 +6,7 @@ mod art;
 mod composer;
 mod dialog;
 mod drafts;
+mod effort;
 mod event;
 mod keys;
 mod navigation;
