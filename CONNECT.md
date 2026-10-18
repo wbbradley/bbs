@@ -74,7 +74,11 @@ arrives; metadata changes alone never acknowledge it. Explicit newer driver-pend
 requests may supersede older local requests without implying success. Delayed
 requests remain visible as unconfirmed after 60 seconds, including across closing
 and reopening a conversation within the session. Applied means provider ACK;
-failed and unknown outcomes are separate feedback. Report age is not connectivity.
+failed and unknown outcomes are separate feedback. A definite capability,
+authentication or validation refusal clears only the matching local request;
+a transport failure retains it as unconfirmed. A fresh authoritative agent list
+can clear an old driver's current/choices without discarding unresolved intent.
+Report age is not connectivity.
 
 Effort comes from the existing shared summaries and agent list, not retained
 activity or extra streams. Older servers/drivers show unknown/unavailable. Only

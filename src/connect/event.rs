@@ -26,6 +26,9 @@ pub enum Event {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     Agents,
+    AgentsAt {
+        effort_revision: u64,
+    },
     Groups,
     /// Stream a feed, replacing any stream with the same id.
     Watch {
@@ -114,9 +117,44 @@ impl Notice {
     }
 }
 
+/// Preserve definite refusal separately from a reply lost after delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EffortSendError {
+    Rejected(String),
+    Unknown(String),
+}
+
+fn effort_send_error(local: bool, error: anyhow::Error) -> EffortSendError {
+    use tonic::Code;
+    let rejected = local
+        || error.downcast_ref::<tonic::Status>().is_some_and(|s| {
+            matches!(
+                s.code(),
+                Code::InvalidArgument
+                    | Code::NotFound
+                    | Code::AlreadyExists
+                    | Code::PermissionDenied
+                    | Code::Unauthenticated
+                    | Code::FailedPrecondition
+                    | Code::OutOfRange
+                    | Code::Unimplemented
+            )
+        });
+    let text = format!("{error:#}");
+    if rejected {
+        EffortSendError::Rejected(text)
+    } else {
+        EffortSendError::Unknown(text)
+    }
+}
+
 /// A server reply; errors are messages to show.
 pub enum Data {
     Agents(Result<proto::ListAgentsResponse, String>),
+    AgentsAt {
+        effort_revision: u64,
+        result: Result<proto::ListAgentsResponse, String>,
+    },
     Groups(Result<proto::GroupListResponse, String>),
     /// A snapshot of the feed stream `id`. A stream ends after an error.
     Feed {
@@ -148,7 +186,7 @@ pub enum Data {
     EffortSent {
         id: u64,
         agent: String,
-        result: Result<Option<i64>, String>,
+        result: Result<Option<i64>, EffortSendError>,
     },
     /// Completion of an actual read request, for the local summary fence.
     MarkedRead {
@@ -218,24 +256,34 @@ pub async fn serve(
                     .await
                     .map_err(error),
             ),
+            Request::AgentsAt { effort_revision } => Data::AgentsAt {
+                effort_revision,
+                result: backend
+                    .list_agents(proto::ListAgentsRequest { all: false })
+                    .await
+                    .map_err(error),
+            },
             Request::Groups => Data::Groups(backend.group_list().await.map_err(error)),
             Request::Send { id, req } => Data::Sent {
                 id,
                 result: backend.send(req).await.map(drop).map_err(error),
             },
-            Request::SetEffort { id, agent, value } => Data::EffortSent {
-                id,
-                result: backend
-                    .send(proto::SendRequest {
-                        to: agent.clone(),
-                        body: value,
-                        control: Some(proto::Control::SetEffort as i32),
-                    })
-                    .await
-                    .map(|r| r.id)
-                    .map_err(error),
-                agent,
-            },
+            Request::SetEffort { id, agent, value } => {
+                let local = matches!(backend, Backend::Local(_));
+                Data::EffortSent {
+                    id,
+                    result: backend
+                        .send(proto::SendRequest {
+                            to: agent.clone(),
+                            body: value,
+                            control: Some(proto::Control::SetEffort as i32),
+                        })
+                        .await
+                        .map(|r| r.id)
+                        .map_err(|e| effort_send_error(local, e)),
+                    agent,
+                }
+            }
             Request::Admin { id, op } => {
                 let result = admin(&mut backend, op).await.map_err(error);
                 let changed = result.is_ok();
@@ -493,6 +541,86 @@ mod tests {
             agent: Some("Mateo".into()),
         };
         (dir, conn, opener, req)
+    }
+
+    #[test]
+    fn effort_send_failures_preserve_rejection_codes_without_text_inference() {
+        use tonic::Code;
+        for code in [
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::PermissionDenied,
+            Code::Unauthenticated,
+            Code::FailedPrecondition,
+            Code::Unimplemented,
+        ] {
+            let error = anyhow::Error::new(tonic::Status::new(code, "same text"));
+            assert!(
+                matches!(
+                    effort_send_error(false, error),
+                    EffortSendError::Rejected(_)
+                ),
+                "{code}"
+            );
+        }
+        for code in [
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+            Code::Unknown,
+            Code::Internal,
+            Code::Cancelled,
+            Code::DataLoss,
+        ] {
+            let error = anyhow::Error::new(tonic::Status::new(
+                code,
+                "permission denied: capability unsupported",
+            ));
+            assert!(
+                matches!(effort_send_error(false, error), EffortSendError::Unknown(_)),
+                "{code}"
+            );
+        }
+        assert!(matches!(
+            effort_send_error(false, anyhow::anyhow!("validation failure")),
+            EffortSendError::Unknown(_)
+        ));
+        // A local service call is transactional: a returned error rolls back.
+        assert!(matches!(
+            effort_send_error(true, anyhow::anyhow!("local refusal")),
+            EffortSendError::Rejected(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn refused_effort_control_is_typed_and_does_not_insert_a_message() {
+        let (_dir, conn, opener, _) = board();
+        let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
+        // No owner row grants this human control over Mateo.
+        tx.send(Request::SetEffort {
+            id: 45,
+            agent: "Mateo".into(),
+            value: "high".into(),
+        })
+        .unwrap();
+        drop(tx);
+        serve(backend, opener, rx, events).await;
+        assert!(matches!(
+            replies.recv().await,
+            Some(Event::Data(Data::EffortSent {
+                id: 45,
+                result: Err(EffortSendError::Rejected(_)),
+                ..
+            }))
+        ));
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

@@ -195,6 +195,12 @@ impl App {
     fn send(&self, requests: Vec<Request>) {
         for request in requests {
             // The server task outlives the app; a send cannot fail first.
+            let request = match request {
+                Request::Agents => Request::AgentsAt {
+                    effort_revision: self.ctx.efforts.revision(),
+                },
+                request => request,
+            };
             let _ = self.requests.send(request);
         }
     }
@@ -326,6 +332,13 @@ impl App {
                 quit
             }
             Event::Data(data) => {
+                let (data, list_revision) = match data {
+                    Data::AgentsAt {
+                        effort_revision,
+                        result,
+                    } => (Data::Agents(result), effort_revision),
+                    data => (data, self.ctx.efforts.revision()),
+                };
                 match &data {
                     Data::Summary { id, result } if *id == self.ctx.inbox.id => {
                         // Only ListAgents establishes absence. Sparse summary servers
@@ -348,7 +361,9 @@ impl App {
                         self.ctx.efforts.sent(agent, *id, result, (self.ctx.now)());
                     }
                     Data::Agents(Ok(list)) => {
-                        self.ctx.efforts.listed(&list.agents, (self.ctx.now)());
+                        self.ctx
+                            .efforts
+                            .listed(&list.agents, list_revision, (self.ctx.now)());
                         self.known_agents = Some(
                             list.agents
                                 .iter()
@@ -1677,7 +1692,9 @@ mod tests {
         app.on_event(Event::Data(Data::EffortSent {
             id: a,
             agent: "Mateo".into(),
-            result: Err("older".into()),
+            result: Err(crate::connect::event::EffortSendError::Unknown(
+                "older".into(),
+            )),
         }));
         app.on_event(Event::Data(Data::EffortSent {
             id: b,
@@ -1726,6 +1743,71 @@ mod tests {
             panic!("navigation action")
         };
         assert_eq!(value, "medium");
+    }
+
+    #[test]
+    fn cleared_effort_stays_unknown_on_reopen_and_crossed_list_cannot_erase_new_report() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        report_effort(&mut app, effort_report(Some("low")));
+        app.on_action(Action::EffortUp);
+        let Request::SetEffort { id, .. } = rx.try_recv().unwrap() else {
+            panic!("control")
+        };
+        app.on_event(Event::Data(Data::EffortSent {
+            id,
+            agent: "Mateo".into(),
+            result: Ok(Some(100)),
+        }));
+        app.send(vec![Request::Agents]);
+        let Request::AgentsAt {
+            effort_revision: old,
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("fenced list")
+        };
+        report_effort(&mut app, effort_report(Some("high")));
+        let cleared = || proto::ListAgentsResponse {
+            humans: vec![],
+            agents: vec![agent("Mateo", "ada", &[])],
+        };
+        app.on_event(Event::Data(Data::AgentsAt {
+            effort_revision: old,
+            result: Ok(cleared()),
+        }));
+        assert!(
+            app.ctx
+                .efforts
+                .status("Mateo", (app.ctx.now)(), chrono::Local::now())
+                .contains("effort high")
+        );
+        app.send(vec![Request::Agents]);
+        let Request::AgentsAt { effort_revision } = rx.try_recv().unwrap() else {
+            panic!("fresh list")
+        };
+        app.on_event(Event::Data(Data::AgentsAt {
+            effort_revision,
+            result: Ok(cleared()),
+        }));
+        app.open(
+            Box::new(Thread::agent("Mateo", "ada", true, app.ctx.now.clone())),
+            true,
+        );
+        while rx.try_recv().is_ok() {}
+        let status = app
+            .ctx
+            .efforts
+            .status("Mateo", (app.ctx.now)(), chrono::Local::now());
+        assert!(
+            status.contains("effort unknown (not reported)") && status.contains("medium next turn"),
+            "{status}"
+        );
+        app.on_action(Action::EffortUp);
+        assert!(
+            !app.top().navigation_blocked(),
+            "stale choices cannot open picker"
+        );
+        assert!(rx.try_recv().is_err(), "stale rank cannot emit request");
     }
 
     #[test]
@@ -1990,7 +2072,7 @@ mod tests {
     fn agents_load_on_open_and_show_owners() {
         let (mut app, mut rx) = app();
         assert!(!key(&mut app, 'a'));
-        assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        assert!(matches!(rx.try_recv().unwrap(), Request::AgentsAt { .. }));
         assert!(screen(&mut app, 80, 24).contains("Loading"));
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
@@ -2015,7 +2097,7 @@ mod tests {
         assert!(out.contains("bob"), "{out}");
         // Reload asks again; q goes back, and q on the menu quits.
         key(&mut app, 'r');
-        assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        assert!(matches!(rx.try_recv().unwrap(), Request::AgentsAt { .. }));
         assert!(!key(&mut app, 'q'));
         assert!(screen(&mut app, 80, 24).contains("Main menu"));
         assert!(key(&mut app, 'q'));
@@ -2065,7 +2147,7 @@ mod tests {
     /// Open the Agents screen, taking its list and summary requests.
     fn open_agents(app: &mut App, rx: &mut UnboundedReceiver<Request>) {
         key(app, 'a');
-        assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        assert!(matches!(rx.try_recv().unwrap(), Request::AgentsAt { .. }));
     }
 
     /// Fix the render time of every Agents screen on the stack.
@@ -2259,7 +2341,7 @@ mod tests {
     fn agents_with_unread_mail_then_unseen_activity_come_first() {
         let (mut app, mut rx) = app();
         key(&mut app, 'a');
-        assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        assert!(matches!(rx.try_recv().unwrap(), Request::AgentsAt { .. }));
         let id = app.ctx.inbox.id;
         let names = ["Ana", "Bo", "Cy", "Di", "Ed"];
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
@@ -2315,7 +2397,7 @@ mod tests {
     fn agents_show_separate_inbox_and_activity_counts_at_minimum_width() {
         let (mut app, mut rx) = app();
         key(&mut app, 'a');
-        assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        assert!(matches!(rx.try_recv().unwrap(), Request::AgentsAt { .. }));
         let id = app.ctx.inbox.id;
         // Ages are rendered against a fixed time; Old's age needs an 11-wide
         // ACTIVE column, the rest show "1d18h ago".
@@ -2473,7 +2555,7 @@ mod tests {
     fn agents_active_ages_update_live_from_the_summary_stream() {
         let (mut app, mut rx) = app();
         key(&mut app, 'a');
-        assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        assert!(matches!(rx.try_recv().unwrap(), Request::AgentsAt { .. }));
         let id = app.ctx.inbox.id;
         let mut mateo = agent("Mateo", "ada", &["crew"]);
         mateo.last_sent_at = None;

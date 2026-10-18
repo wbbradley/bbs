@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::event::Request;
+use super::event::{EffortSendError, Request};
 use crate::proto;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -47,11 +47,13 @@ pub fn step<'a>(
 #[derive(Default)]
 pub struct Efforts {
     agents: HashMap<String, Agent>,
+    revision: u64,
 }
 
 #[derive(Default)]
 struct Agent {
     report: Option<proto::EffortReport>,
+    revision: u64,
     reported_at: Option<String>,
     owner: Option<String>,
     pending: Option<Pending>,
@@ -76,18 +78,53 @@ pub enum Decision {
 }
 
 impl Efforts {
-    pub fn listed(&mut self, agents: &[proto::Agent], now: Instant) {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn listed(&mut self, agents: &[proto::Agent], requested_at: u64, now: Instant) {
+        let absent: Vec<_> = self
+            .agents
+            .keys()
+            .filter(|name| !agents.iter().any(|a| a.name.eq_ignore_ascii_case(name)))
+            .cloned()
+            .collect();
+        for name in absent {
+            self.clear(&name, requested_at);
+        }
         for agent in agents {
             self.agents
                 .entry(agent.name.to_ascii_lowercase())
                 .or_default()
                 .owner = agent.owner.clone();
-            self.report(
-                &agent.name,
-                agent.effort.as_ref(),
-                agent.effort_reported_at.as_deref(),
-                now,
-            );
+            let known = self
+                .agents
+                .get(&agent.name.to_ascii_lowercase())
+                .expect("listed agent");
+            if known.revision > requested_at {
+                continue;
+            }
+            if agent.effort.is_none() {
+                self.clear(&agent.name, requested_at);
+            } else {
+                self.report(
+                    &agent.name,
+                    agent.effort.as_ref(),
+                    agent.effort_reported_at.as_deref(),
+                    now,
+                );
+            }
+        }
+    }
+
+    fn clear(&mut self, name: &str, requested_at: u64) {
+        let Some(agent) = self.agents.get_mut(&name.to_ascii_lowercase()) else {
+            return;
+        };
+        if agent.revision <= requested_at && agent.report.take().is_some() {
+            self.revision += 1;
+            agent.revision = self.revision;
+            // Timestamp fences pre-clear replay; unresolved intent stays separate.
         }
     }
 
@@ -118,10 +155,15 @@ impl Efforts {
                 chrono::DateTime::parse_from_rfc3339(old),
                 chrono::DateTime::parse_from_rfc3339(new),
             )
-            && new < old
+            && (new < old || (agent.report.is_none() && new == old))
         {
             return;
         }
+        if agent.report.as_ref() == Some(report) && agent.reported_at.as_deref() == at {
+            return;
+        }
+        self.revision += 1;
+        agent.revision = self.revision;
         agent.report = Some(report.clone());
         agent.reported_at = at.map(str::to_string);
         agent.reconcile(now);
@@ -238,7 +280,7 @@ impl Efforts {
         &mut self,
         name: &str,
         id: u64,
-        result: &Result<Option<i64>, String>,
+        result: &Result<Option<i64>, EffortSendError>,
         now: Instant,
     ) {
         let Some(agent) = self.agents.get_mut(&name.to_ascii_lowercase()) else {
@@ -262,7 +304,17 @@ impl Efforts {
                 agent.error =
                     Some("Effort request unconfirmed: server returned no request ID.".into())
             }
-            Err(error) => agent.error = Some(format!("Effort request unconfirmed: {error}")),
+            Err(EffortSendError::Rejected(error)) => {
+                agent.pending = None;
+                agent.reconcile(now);
+                if agent.pending.is_none() {
+                    agent.error = Some(format!("Effort request rejected: {error}"));
+                }
+                return;
+            }
+            Err(EffortSendError::Unknown(error)) => {
+                agent.error = Some(format!("Effort request unconfirmed: {error}"))
+            }
         }
         agent.reconcile(now);
     }
@@ -301,8 +353,9 @@ impl Efforts {
             .map(|v| agent.label(v))
             .unwrap_or_else(|| "unknown".into());
         let age = agent
-            .reported_at
-            .as_deref()
+            .report
+            .as_ref()
+            .and(agent.reported_at.as_deref())
             .map(|at| crate::ui::message::age(at, wall))
             .unwrap_or_else(|| "not reported".into());
         let fixed = format!("effort → next ({age})").width();
@@ -343,8 +396,9 @@ impl Efforts {
             .map(|v| agent.label(v))
             .unwrap_or_else(|| "unknown".into());
         let age = agent
-            .reported_at
-            .as_deref()
+            .report
+            .as_ref()
+            .and(agent.reported_at.as_deref())
             .map(|at| crate::ui::message::age(at, wall));
         let mut text = if state.is_some_and(|s| !s.supported) {
             "effort unsupported".into()
@@ -560,7 +614,12 @@ mod tests {
         update(&mut e, "B", &r, now);
         e.request("A", "ada", "medium".into(), 10, now);
         e.request("A", "ada", "high".into(), 11, now);
-        e.sent("A", 10, &Err("old error".into()), now);
+        e.sent(
+            "A",
+            10,
+            &Err(EffortSendError::Unknown("old error".into())),
+            now,
+        );
         assert!(e.error("A").is_none());
         assert!(!e.status("B", now, wall()).contains("next turn"));
         r.state.as_mut().unwrap().current = Some("high".into());
@@ -631,12 +690,120 @@ mod tests {
                 effort: Some(r),
                 ..Default::default()
             }],
+            e.revision(),
             now,
         );
         assert!(e.error("A").unwrap().contains("clamped"));
         assert!(matches!(e.decide("A", "ada", true), Decision::Notice(_)));
         assert!(e.request("A", "ada", "high".into(), 1, now).is_none());
         assert!(!e.status("A", now, wall()).contains("next turn"));
+    }
+
+    #[test]
+    fn authoritative_absence_clears_facts_and_choices_but_keeps_unresolved_intent() {
+        let now = Instant::now();
+        let mut e = Efforts::default();
+        let mut r = report(Some("low"));
+        update(&mut e, "A", &r, now);
+        e.request("A", "ada", "medium".into(), 10, now);
+        e.sent("A", 10, &Ok(Some(100)), now);
+        let old_list = e.revision();
+        r.state.as_mut().unwrap().current = Some("high".into());
+        e.report("A", Some(&r), Some("2026-10-18T20:00:00Z"), now);
+        let empty = proto::Agent {
+            name: "A".into(),
+            owner: Some("ada".into()),
+            ..Default::default()
+        };
+        e.listed(std::slice::from_ref(&empty), old_list, now);
+        assert!(
+            e.status("A", now, wall()).contains("effort high"),
+            "crossed old list cannot clear a new report"
+        );
+        let before_clear = e.revision();
+        e.listed(&[empty], before_clear, now);
+        let status = e.status("A", now, wall());
+        assert!(
+            status.contains("effort unknown (not reported)") && status.contains("medium next turn"),
+            "{status}"
+        );
+        assert!(e.choices("A").is_empty());
+        assert!(matches!(e.decide("A", "ada", true), Decision::Notice(_)));
+        // An in-flight old list and replayed old summary cannot restore stale
+        // capability/current after retirement or a driver with no report.
+        let old = proto::Agent {
+            name: "A".into(),
+            effort: Some(r.clone()),
+            effort_reported_at: Some("2026-10-18T20:00:00Z".into()),
+            ..Default::default()
+        };
+        e.listed(&[old], before_clear, now);
+        e.report("A", Some(&r), Some("2026-10-18T20:00:00Z"), now);
+        assert!(e.choices("A").is_empty());
+        e.report("A", Some(&r), Some("2026-10-18T20:01:00Z"), now);
+        assert!(!e.choices("A").is_empty());
+        assert!(e.status("A", now, wall()).contains("medium next turn"));
+        e.listed(&[], e.revision(), now);
+        assert!(
+            e.choices("A").is_empty(),
+            "retired/absent agents also clear old capability"
+        );
+        assert!(e.status("A", now, wall()).contains("medium next turn"));
+    }
+
+    #[test]
+    fn definite_refusal_clears_only_matching_intent_and_unknown_delivery_keeps_it() {
+        let now = Instant::now();
+        let mut e = Efforts::default();
+        let mut r = report(Some("low"));
+        update(&mut e, "A", &r, now);
+        e.request("A", "ada", "medium".into(), 10, now);
+        e.sent(
+            "A",
+            10,
+            &Err(EffortSendError::Rejected("capability unavailable".into())),
+            now,
+        );
+        assert!(!e.status("A", now, wall()).contains("next turn"));
+        assert!(e.error("A").unwrap().contains("rejected"));
+        assert!(
+            matches!(e.decide("A", "ada", true), Decision::Value(v) if v == "medium"),
+            "refused value is not a stepping basis"
+        );
+        e.request("A", "ada", "medium".into(), 11, now);
+        e.request("A", "ada", "high".into(), 12, now);
+        e.sent(
+            "A",
+            11,
+            &Err(EffortSendError::Rejected("older A refused".into())),
+            now,
+        );
+        assert!(e.status("A", now, wall()).contains("high next turn"));
+        assert!(e.error("A").is_none());
+        e.sent(
+            "A",
+            12,
+            &Err(EffortSendError::Unknown("deadline".into())),
+            now,
+        );
+        assert!(e.status("A", now, wall()).contains("high next turn"));
+        assert!(e.error("A").unwrap().contains("unconfirmed"));
+        // New pending evidence arriving before a refused local send's reply
+        // remains pending, without claiming either request succeeded.
+        e.request("A", "ada", "medium".into(), 13, now);
+        r.pending = Some(proto::EffortRequest {
+            request_id: 200,
+            value: "high".into(),
+        });
+        update(&mut e, "A", &r, now);
+        e.sent(
+            "A",
+            13,
+            &Err(EffortSendError::Rejected("permission".into())),
+            now,
+        );
+        assert!(e.status("A", now, wall()).contains("high next turn"));
+        assert!(e.status("A", now, wall()).contains("effort low"));
     }
 
     #[test]
