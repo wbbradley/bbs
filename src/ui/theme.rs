@@ -19,6 +19,10 @@ pub enum Role {
     OtherAgent,
     Human,
     Hotkey,
+    /// Agent or group addressed by the composer.
+    Target,
+    /// Keyboard guidance, distinct from message text and target labels.
+    KeyHint,
     Border,
     Selection,
     Cursor,
@@ -77,9 +81,9 @@ impl Scheme {
             return match role {
                 Screen => Style::new().fg(Color::Reset).bg(Color::Reset),
                 Muted => Style::new().dim(),
-                Heading | OwnAgent | OtherAgent | Human | Hotkey | Success | Warning | Error => {
-                    Style::new().bold()
-                }
+                KeyHint => Style::new().italic(),
+                Heading | OwnAgent | OtherAgent | Human | Hotkey | Target | Success | Warning
+                | Error => Style::new().bold(),
                 Selection | Cursor | TitleBar | StatusBar => Style::new().reversed(),
                 _ => Style::new(),
             };
@@ -93,6 +97,7 @@ impl Scheme {
             technical,
             accent,
             participant,
+            target,
             success,
             warning,
             error,
@@ -111,6 +116,7 @@ impl Scheme {
                 Color::Rgb(235, 219, 178),
                 Color::Rgb(131, 165, 152),
                 Color::Rgb(211, 134, 155),
+                Color::Rgb(254, 128, 25),
                 Color::Rgb(184, 187, 38),
                 Color::Rgb(250, 189, 47),
                 Color::Rgb(251, 73, 52),
@@ -124,6 +130,7 @@ impl Scheme {
                 Color::White,
                 Color::LightCyan,
                 Color::LightMagenta,
+                Color::Indexed(208),
                 Color::LightGreen,
                 Color::LightYellow,
                 Color::LightRed,
@@ -139,6 +146,8 @@ impl Scheme {
             Heading => Style::new().fg(accent).bold(),
             Accent | Border | Logo | OwnAgent => Style::new().fg(accent),
             Human | OtherAgent => Style::new().fg(participant),
+            Target => Style::new().fg(target),
+            KeyHint => Style::new().fg(participant).italic(),
             Hotkey | Warning => Style::new().fg(warning),
             Success => Style::new().fg(success),
             Error => Style::new().fg(error),
@@ -152,6 +161,24 @@ impl Scheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn composer_roles_inherit_surface_and_keep_non_color_cues() {
+        for scheme in testing::SCHEMES {
+            let target = scheme.style(Role::Target);
+            let hint = scheme.style(Role::KeyHint);
+            assert!(target.bg.is_none() && hint.bg.is_none());
+            assert!(hint.add_modifier.contains(ratatui::style::Modifier::ITALIC));
+            if scheme != Scheme::NoColor {
+                assert_ne!(target.fg, hint.fg);
+                assert_ne!(hint.fg, scheme.style(Role::Text).fg);
+            }
+        }
+        assert_eq!(
+            Scheme::Gruvbox.style(Role::Target).fg,
+            Some(Color::Rgb(254, 128, 25))
+        );
+    }
+
     #[test]
     fn selector_precedence_and_validation() {
         assert_eq!(resolve(None, None, false).unwrap(), Scheme::Gruvbox);
@@ -200,6 +227,8 @@ pub(crate) mod testing {
             OtherAgent,
             Human,
             Hotkey,
+            Target,
+            KeyHint,
             Border,
             Selection,
             Cursor,
