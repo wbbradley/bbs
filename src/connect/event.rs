@@ -17,6 +17,8 @@ use crate::service::Caller;
 
 pub enum Event {
     Key(KeyEvent),
+    /// Text the terminal reported as one bracketed paste.
+    Paste(String),
     Resize,
     Tick,
     Data(Data),
@@ -208,14 +210,25 @@ pub struct Opener {
     pub caller: Caller,
 }
 
+/// The app's event for a terminal event, if it has one.
+fn input(event: event::Event) -> Option<Event> {
+    match event {
+        event::Event::Key(key) if key.kind == KeyEventKind::Press => Some(Event::Key(key)),
+        event::Event::Paste(text) => Some(Event::Paste(text)),
+        event::Event::Resize(..) => Some(Event::Resize),
+        _ => None,
+    }
+}
+
 /// Read terminal input on a thread of its own: crossterm's reads block.
 pub fn spawn_input(tx: UnboundedSender<Event>) {
     std::thread::spawn(move || {
         loop {
             let event = match event::read() {
-                Ok(event::Event::Key(key)) if key.kind == KeyEventKind::Press => Event::Key(key),
-                Ok(event::Event::Resize(..)) => Event::Resize,
-                Ok(_) => continue,
+                Ok(event) => match input(event) {
+                    Some(event) => event,
+                    None => continue,
+                },
                 Err(_) => return,
             };
             if tx.send(event).is_err() {
@@ -509,6 +522,28 @@ async fn watch_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_pastes_become_one_paste_event_not_keys() {
+        use ratatui::crossterm::event::{KeyCode, KeyEventState, KeyModifiers};
+        assert!(matches!(
+            input(event::Event::Paste("a\r\nb".into())),
+            Some(Event::Paste(text)) if text == "a\r\nb"
+        ));
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(input(event::Event::Key(enter)), Some(Event::Key(k)) if k == enter));
+        let release = KeyEvent {
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+            ..enter
+        };
+        assert!(input(event::Event::Key(release)).is_none());
+        assert!(matches!(
+            input(event::Event::Resize(80, 24)),
+            Some(Event::Resize)
+        ));
+        assert!(input(event::Event::FocusGained).is_none());
+    }
 
     fn board() -> (
         tempfile::TempDir,

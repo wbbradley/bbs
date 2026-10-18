@@ -6,6 +6,14 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Fixed
+
+- `bbs connect` turns on bracketed paste, so a paste with newlines lands in
+  the composer as one undoable edit instead of sending its first line and
+  leaving the rest behind. Search and dialog fields take a paste on one line.
+
 ## 0.9.0 - 2026-10-18
 
 Protocol v2, config format 3 and Rust 1.89 remain unchanged. Database schema 15

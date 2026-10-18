@@ -100,6 +100,19 @@ impl Composer {
         None
     }
 
+    /// Insert a bracketed paste as one edit: its newlines are text, never a
+    /// send. Terminals often paste line breaks as CR, so CRLF and CR become
+    /// LF; other control characters but tab are dropped.
+    pub fn paste(&mut self, text: &str) {
+        let text: String = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .chars()
+            .filter(|&c| matches!(c, '\n' | '\t') || !c.is_control())
+            .collect();
+        self.text.insert_str(text);
+    }
+
     /// Consume a matching send result; success clears only unchanged text.
     pub fn sent(&mut self, id: u64, result: Result<(), String>) -> bool {
         if self.sending.as_ref().map(|(pending, _)| *pending) != Some(id) {
@@ -463,6 +476,33 @@ mod tests {
         assert!(press(&mut c, KeyCode::Enter, KeyModifiers::NONE).is_some());
         c.sent(1, Ok(()));
         assert_eq!(c.text.lines(), [""]);
+    }
+
+    #[test]
+    fn paste_inserts_line_breaks_as_text_in_one_undoable_edit() {
+        let mut c = Composer::new("Mateo");
+        typed(&mut c, "ab");
+        press(&mut c, KeyCode::Left, KeyModifiers::NONE);
+        c.paste("x\r\ny\rz\u{1b}\tq");
+        assert_eq!(c.text.lines(), ["ax", "y", "z\tqb"]);
+        assert_eq!(c.text.cursor(), (2, 3));
+        press(&mut c, KeyCode::Char('7'), KeyModifiers::CONTROL);
+        assert_eq!(c.text.lines(), ["ab"]);
+        c.paste("one\ntwo");
+        let body = press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(body.as_deref(), Some("aone\ntwob"));
+        // A paste while sending is an edit and sends nothing, so success
+        // keeps the text, as does failure.
+        c.paste("!\r\u{3}\t");
+        assert_eq!(press(&mut c, KeyCode::Enter, KeyModifiers::NONE), None);
+        c.sent(1, Ok(()));
+        assert_eq!(c.text.lines(), ["aone", "two!", "\tb"]);
+        let body = press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(body.as_deref(), Some("aone\ntwo!\n\tb"));
+        c.paste("more");
+        c.sent(1, Err("offline".into()));
+        assert_eq!(c.text.lines(), ["aone", "two!", "\tmoreb"]);
+        assert_eq!(c.error.as_deref(), Some("offline"));
     }
 
     #[test]

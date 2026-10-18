@@ -859,6 +859,28 @@ impl Screen for Thread {
         Some(Transition::Stay)
     }
 
+    /// The same order as `raw_key`: the effort picker (choices take no
+    /// text), the composer, a group dialog, then the search prompt.
+    fn paste(&mut self, text: &str) {
+        if self.effort_picker.is_some() {
+            return;
+        }
+        if self.composing {
+            if let Some(composer) = &mut self.composer {
+                composer.paste(text);
+            }
+            return;
+        }
+        if let Some((_, admin)) = &mut self.group
+            && admin.paste(text)
+        {
+            return;
+        }
+        if let Some(prompt) = &mut self.prompt {
+            prompt.push_str(&crate::connect::dialog::one_line(text));
+        }
+    }
+
     fn handle(&mut self, action: Action, ctx: &Ctx) -> Transition {
         if matches!(action, Action::EffortDown | Action::EffortUp) {
             if self.navigation_blocked() {

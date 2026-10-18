@@ -242,7 +242,9 @@ and Home/End work everywhere too.
   line, `Ctrl-y` yank, `Ctrl-w`/`Alt-Backspace` delete a word back, `Ctrl-d`
   delete forward, `Ctrl-_` (or `Ctrl-/`) undo, `Ctrl-r` redo,
   `Ctrl-p`/`Ctrl-n` previous and next line. `Enter` sends;
-  `Alt-Enter` (or `Ctrl-j`) inserts a newline.
+  `Alt-Enter` (or `Ctrl-j`) inserts a newline. A paste is inserted as
+  text, newlines included, and never sends; one undo removes it. Search and
+  dialog fields take a paste on one line.
 
 The composer has no title or key-hint row; shortcuts remain available in Help.
 Send progress and failures appear in the bottom bar. In compact and verbose agent

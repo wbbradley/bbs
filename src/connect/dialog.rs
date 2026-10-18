@@ -12,6 +12,15 @@ use super::theme;
 
 const WIDTH: u16 = 60;
 
+/// Pasted text for a one-line input: each line break or other control
+/// character becomes a space.
+pub fn one_line(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 pub struct Dialog {
     title: Line<'static>,
     /// Shown above the fields: what the dialog does.
@@ -103,6 +112,17 @@ impl Dialog {
             }
         }
         self
+    }
+
+    /// Append a paste to the focused field as one line; choices and
+    /// questions ignore it, so pasted text never answers them.
+    pub fn paste(&mut self, text: &str) {
+        if self.choices.is_some() {
+            return;
+        }
+        if let Some(field) = self.fields.get_mut(self.focus) {
+            field.value.push_str(&one_line(text));
+        }
     }
 
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
@@ -385,5 +405,27 @@ mod tests {
             press(&mut d, KeyCode::Char('y')),
             Outcome::Submit(Vec::new())
         );
+    }
+
+    #[test]
+    fn pastes_fill_one_field_on_one_line_and_never_answer() {
+        let mut d = Dialog::form(
+            "Add",
+            "",
+            vec![("Agent", String::new()), ("Note", String::new())],
+        );
+        d.paste("Ma\r\nteo\n");
+        press(&mut d, KeyCode::Tab);
+        d.paste("a\tb");
+        assert_eq!(
+            press(&mut d, KeyCode::Enter),
+            Outcome::Submit(vec!["Ma teo ".into(), "a b".into()])
+        );
+        let mut q = Dialog::confirm("Delete", "");
+        q.paste("y\n");
+        assert_eq!(press(&mut q, KeyCode::Char('x')), Outcome::Open);
+        let mut c = Dialog::choose("Effort", "", vec![("low".into(), "low".into())]);
+        c.paste("low\n");
+        assert_eq!(press(&mut c, KeyCode::Enter), Outcome::Open);
     }
 }

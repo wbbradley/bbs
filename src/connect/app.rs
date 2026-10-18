@@ -85,6 +85,9 @@ pub trait Screen {
     fn raw_key(&mut self, _key: KeyEvent) -> Option<Transition> {
         None
     }
+    /// A bracketed paste: text for the focused input, never keys, so it
+    /// cannot send or reach a shortcut. Screens without an input ignore it.
+    fn paste(&mut self, _text: &str) {}
     /// Keys this screen claims before the shared keymap.
     fn hotkeys(&self) -> &[char] {
         &[]
@@ -341,6 +344,13 @@ impl App {
                     self.viewed();
                 }
                 quit
+            }
+            Event::Paste(text) => {
+                self.keymap = Keymap::default();
+                self.ctx.navigation_notice = None;
+                self.top().paste(&text);
+                self.viewed();
+                false
             }
             Event::Data(data) => {
                 let (data, list_revision) = match data {
@@ -2923,6 +2933,39 @@ mod tests {
             panic!("expected send");
         };
         assert_eq!(req.body, "first\nsecond");
+    }
+
+    #[test]
+    fn pastes_are_text_never_sends_or_shortcuts() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        report_effort(&mut app, effort_report(Some("default")));
+        typed(&mut app, "say ");
+        app.on_event(Event::Paste("first\r\nsecond\r\n\t/q".into()));
+        assert!(rx.try_recv().is_err(), "a pasted newline is not Enter");
+        assert!(editor_focused(&mut app));
+        assert_eq!(app.top().draft().unwrap().1.text, "say first\nsecond\n\t/q");
+        enter(&mut app);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("expected one send");
+        };
+        assert_eq!(req.body, "say first\nsecond\n\t/q");
+        assert!(rx.try_recv().is_err());
+        // Navigation mode has no input: pasted keys do not search or quit.
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        assert!(!app.on_event(Event::Paste("/q\n".into())));
+        assert!(!editor_focused(&mut app) && !bottom(&mut app).contains("/q"));
+        key(&mut app, '/');
+        app.on_event(Event::Paste("a\r\nb".into()));
+        assert!(bottom(&mut app).contains("/a b█"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        // The effort picker's choices take no text.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.top().navigation_blocked());
+        app.on_event(Event::Paste("low\n".into()));
+        assert!(app.top().navigation_blocked());
+        assert!(rx.try_recv().is_err());
     }
 
     /// Reopen the selected agent after a conversation has closed.

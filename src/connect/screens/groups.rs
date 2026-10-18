@@ -101,6 +101,10 @@ impl Screen for Groups {
         self.admin.key(self.id, key)
     }
 
+    fn paste(&mut self, text: &str) {
+        self.admin.paste(text);
+    }
+
     fn handle(&mut self, action: Action, _ctx: &Ctx) -> Transition {
         let len = match &self.groups {
             Some(Ok(groups)) => groups.len(),
