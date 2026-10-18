@@ -1946,7 +1946,7 @@ mod tests {
                 .unwrap();
             (0..29).filter(|y| buffer[(79, *y)].bg == surface).count()
         };
-        assert_eq!(rows(&mut app), 2);
+        assert_eq!(rows(&mut app), 3);
         for _ in 0..10 {
             key(&mut app, 'x');
             press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
@@ -2294,9 +2294,9 @@ mod tests {
                                 .bg
                                 .unwrap()
                         );
-                        // One dark spacer, then two input rows: no hint row.
+                        // One dark spacer, then light padding and two input rows.
                         assert_eq!(
-                            buffer[(width - 1, 20)].bg,
+                            buffer[(width - 1, 19)].bg,
                             theme::base()
                                 .patch(theme::style(theme::Role::Screen))
                                 .bg
