@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{self, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
+use super::theme::Role;
 use crate::backend::Backend;
 use crate::config::Config;
 use crate::proto;
@@ -70,6 +71,43 @@ pub enum Admin {
     Writer(proto::SetGroupWriterRequest),
 }
 
+/// A successful admin reply carries typed categories, resolved on the UI thread.
+#[derive(Clone, Debug)]
+pub struct Notice(pub Vec<(String, Role)>);
+
+impl From<&str> for Notice {
+    fn from(text: &str) -> Self {
+        Self(vec![(text.to_string(), Role::Text)])
+    }
+}
+
+impl Notice {
+    fn text(mut self, text: &str) -> Self {
+        self.0.push((text.to_string(), Role::Text));
+        self
+    }
+
+    fn group(mut self, name: &str) -> Self {
+        self.0.push((format!("@{name}"), Role::Group));
+        self
+    }
+
+    fn agent(mut self, name: &str) -> Self {
+        self.0.push((name.to_string(), Role::Agent));
+        self
+    }
+
+    fn agents(mut self, names: &[String]) -> Self {
+        for (i, name) in names.iter().enumerate() {
+            if i > 0 {
+                self = self.text(", ");
+            }
+            self = self.agent(name);
+        }
+        self
+    }
+}
+
 /// A server reply; errors are messages to show.
 pub enum Data {
     Agents(Result<proto::ListAgentsResponse, String>),
@@ -104,7 +142,7 @@ pub enum Data {
     /// What a group change did, for the screen `id`.
     Admin {
         id: u64,
-        result: Result<String, String>,
+        result: Result<Notice, String>,
     },
 }
 
@@ -232,52 +270,72 @@ pub async fn serve(
 }
 
 /// Make a group change and describe what it did.
-async fn admin(backend: &mut Backend, op: Admin) -> anyhow::Result<String> {
+async fn admin(backend: &mut Backend, op: Admin) -> anyhow::Result<Notice> {
     Ok(match op {
         Admin::Create(req) => {
             let group = backend.group_register(req).await?.group;
-            format!("Created @{group}.")
+            Notice::from("Created ").group(&group).text(".")
         }
         Admin::Describe(req) => {
             let cleared = req.description.is_none();
             let group = backend.group_describe(req).await?.group;
             match cleared {
-                true => format!("Cleared the description of @{group}."),
-                false => format!("Described @{group}."),
+                true => Notice::from("Cleared the description of ")
+                    .group(&group)
+                    .text("."),
+                false => Notice::from("Described ").group(&group).text("."),
             }
         }
         Admin::Delete(req) => {
             let group = backend.group_delete(req).await?.group;
-            format!("Deleted @{group}.")
+            Notice::from("Deleted ").group(&group).text(".")
         }
         Admin::Add(req) => {
             let r = backend.group_add(req).await?;
-            let mut parts = Vec::new();
+            let mut notice = Notice::from("");
             if !r.added.is_empty() {
-                parts.push(format!("Added {} to @{}.", r.added.join(", "), r.group));
+                notice = notice
+                    .text("Added ")
+                    .agents(&r.added)
+                    .text(" to ")
+                    .group(&r.group)
+                    .text(".");
             }
             if !r.already.is_empty() {
-                parts.push(format!(
-                    "Already in @{}: {}.",
-                    r.group,
-                    r.already.join(", ")
-                ));
+                if !r.added.is_empty() {
+                    notice = notice.text(" ");
+                }
+                notice = notice
+                    .text("Already in ")
+                    .group(&r.group)
+                    .text(": ")
+                    .agents(&r.already)
+                    .text(".");
             }
-            parts.join(" ")
+            notice
         }
         Admin::Remove(req) => {
             let r = backend.group_remove(req).await?;
-            format!("Removed {} from @{}.", r.agent, r.group)
+            Notice::from("Removed ")
+                .agent(&r.agent)
+                .text(" from ")
+                .group(&r.group)
+                .text(".")
         }
         Admin::Writer(req) => {
             let grant = req.grant;
             let r = backend.set_group_writer(req).await?;
-            match (grant, r.changed) {
-                (true, true) => format!("{} can now write to @{}.", r.agent, r.group),
-                (true, false) => format!("{} could already write to @{}.", r.agent, r.group),
-                (false, true) => format!("{} can no longer write to @{}.", r.agent, r.group),
-                (false, false) => format!("{} could not write to @{}.", r.agent, r.group),
-            }
+            let verb = match (grant, r.changed) {
+                (true, true) => " can now write to ",
+                (true, false) => " could already write to ",
+                (false, true) => " can no longer write to ",
+                (false, false) => " could not write to ",
+            };
+            Notice::from("")
+                .agent(&r.agent)
+                .text(verb)
+                .group(&r.group)
+                .text(".")
         }
     })
 }
@@ -405,6 +463,109 @@ mod tests {
             agent: Some("Mateo".into()),
         };
         (dir, conn, opener, req)
+    }
+
+    #[tokio::test]
+    async fn admin_success_notices_keep_typed_fields_until_the_ui_renders() {
+        use super::super::admin::GroupAdmin;
+        use crate::ui::theme::{
+            style,
+            testing::{SCHEMES, with_scheme},
+        };
+        let (_dir, conn, opener, _) = board();
+        conn.execute_batch(
+            "INSERT INTO agents (id,name,token,pwd,hostname,created_at,active_at)
+             VALUES (2,'Zed','b','/','h','t','t')",
+        )
+        .unwrap();
+        let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller)
+            .await
+            .unwrap();
+        admin(
+            &mut backend,
+            Admin::Create(proto::GroupRegisterRequest {
+                group: "crew".into(),
+                description: None,
+            }),
+        )
+        .await
+        .unwrap();
+        admin(
+            &mut backend,
+            Admin::Add(proto::GroupAddRequest {
+                group: "crew".into(),
+                agents: vec!["Mateo".into()],
+            }),
+        )
+        .await
+        .unwrap();
+        let added = admin(
+            &mut backend,
+            Admin::Add(proto::GroupAddRequest {
+                group: "crew".into(),
+                agents: vec!["Mateo".into(), "Zed".into()],
+            }),
+        )
+        .await
+        .unwrap();
+        let writer = admin(
+            &mut backend,
+            Admin::Writer(proto::SetGroupWriterRequest {
+                group: "crew".into(),
+                agent: "Zed".into(),
+                grant: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let deleted = admin(
+            &mut backend,
+            Admin::Delete(proto::GroupRequest {
+                group: "crew".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        for (notice, expected) in [
+            (added, "Added Zed to @crew. Already in @crew: Mateo."),
+            (writer, "Zed can now write to @crew."),
+            (deleted, "Deleted @crew."),
+        ] {
+            let mut ui = GroupAdmin::default();
+            ui.on_data(
+                7,
+                &Data::Admin {
+                    id: 7,
+                    result: Ok(notice),
+                },
+            );
+            for scheme in SCHEMES {
+                with_scheme(scheme, || {
+                    let line = ui.notice().unwrap();
+                    assert_eq!(line.to_string(), expected);
+                    for span in &line.spans {
+                        let role = match span.content.as_ref() {
+                            "@crew" => Role::Group,
+                            "Zed" | "Mateo" => Role::Agent,
+                            _ => Role::Text,
+                        };
+                        assert_eq!(span.style, style(role), "{span:?}");
+                    }
+                });
+            }
+        }
+        let mut ui = GroupAdmin::default();
+        ui.on_data(
+            7,
+            &Data::Admin {
+                id: 7,
+                result: Err("Mateo cannot change @crew".into()),
+            },
+        );
+        let line = ui.notice().unwrap();
+        assert_eq!(line.to_string(), "Mateo cannot change @crew");
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.style, style(Role::Error));
     }
 
     #[tokio::test(start_paused = true)]

@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 
 use super::app::Transition;
 use super::dialog::{Dialog, Outcome};
-use super::event::{Admin, Data, Request};
+use super::event::{Admin, Data, Notice, Request};
 use super::keys::GroupOp;
 use super::theme;
 use crate::proto;
@@ -18,7 +18,7 @@ pub struct GroupAdmin {
     /// The open dialog, the change it makes, and its group (empty to create).
     dialog: Option<(GroupOp, String, Dialog)>,
     /// What the last change did, or why it failed.
-    notice: Option<Result<String, String>>,
+    notice: Option<Result<Notice, String>>,
 }
 
 impl GroupAdmin {
@@ -152,7 +152,12 @@ impl GroupAdmin {
     /// The last change's outcome, for the screen to show.
     pub fn notice(&self) -> Option<Line<'static>> {
         Some(match self.notice.as_ref()? {
-            Ok(done) => Line::styled(done.clone(), theme::style(theme::Role::Hotkey)),
+            Ok(done) => Line::from(
+                done.0
+                    .iter()
+                    .map(|(text, role)| Span::styled(text.clone(), theme::style(*role)))
+                    .collect::<Vec<_>>(),
+            ),
             Err(e) => Line::styled(e.clone(), theme::error()),
         })
     }
