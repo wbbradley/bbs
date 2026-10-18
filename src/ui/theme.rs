@@ -168,6 +168,7 @@ impl Scheme {
             Muted => Style::new().fg(muted),
             Technical => Style::new().fg(technical),
             Heading => Style::new().fg(accent).bold(),
+            Logo if self == Self::Gruvbox => Style::new().fg(muted),
             Accent | Logo | OwnAgent => Style::new().fg(accent),
             Human | OtherAgent => Style::new().fg(participant),
             KeyHint => Style::new().fg(participant).italic(),
@@ -176,6 +177,9 @@ impl Scheme {
             Error => Style::new().fg(error),
             Selection => Style::new().fg(text).bg(selection).bold(),
             Cursor => Style::new().fg(bg).bg(text),
+            TitleBar | StatusBar if self == Self::Gruvbox => {
+                Style::new().fg(text).bg(selection).bold()
+            }
             TitleBar | StatusBar => Style::new().fg(bg).bg(accent).bold(),
         }
     }
@@ -194,6 +198,29 @@ mod tests {
                 assert_ne!(hint.fg, scheme.style(Role::Text).fg);
             }
         }
+    }
+
+    #[test]
+    fn gruvbox_bars_and_logo_use_quiet_existing_roles() {
+        for role in [Role::TitleBar, Role::StatusBar] {
+            let bar = Scheme::Gruvbox.style(role);
+            assert_eq!(bar.fg, Scheme::Gruvbox.style(Role::Text).fg);
+            assert_eq!(bar.bg, Scheme::Gruvbox.style(Role::Selection).bg);
+            assert!(bar.add_modifier.contains(ratatui::style::Modifier::BOLD));
+            let terminal = Scheme::Terminal.style(role);
+            assert_eq!(terminal.fg, Scheme::Terminal.style(Role::Screen).bg);
+            assert_eq!(terminal.bg, Scheme::Terminal.style(Role::Accent).fg);
+            assert_eq!(Scheme::NoColor.style(role), Style::new().reversed());
+        }
+        assert_eq!(
+            Scheme::Gruvbox.style(Role::Logo),
+            Scheme::Gruvbox.style(Role::Muted)
+        );
+        assert_eq!(
+            Scheme::Terminal.style(Role::Logo),
+            Scheme::Terminal.style(Role::Accent)
+        );
+        assert_eq!(Scheme::NoColor.style(Role::Logo), Style::new());
     }
 
     #[test]

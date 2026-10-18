@@ -373,6 +373,14 @@ mod tests {
                 assert_eq!(scheme::current(), target);
                 terminal.draw(|f| app.draw(f)).unwrap();
                 scheme::testing::assert_buffer(terminal.backend().buffer());
+                let bar = scheme::style(scheme::Role::Screen)
+                    .patch(scheme::style(scheme::Role::StatusBar));
+                for x in 0..80 {
+                    let cell = &terminal.backend().buffer()[(x, 23)];
+                    assert_eq!(cell.fg, bar.fg.unwrap());
+                    assert_eq!(cell.bg, bar.bg.unwrap());
+                    assert!(cell.modifier.contains(bar.add_modifier));
+                }
                 assert!(screen(&mut app, 80, 24).contains(&format!("Current: {}", target.label())));
                 assert!(app.ctx.preferences.error.is_none());
                 with_scheme(Scheme::Terminal, || {
@@ -2279,13 +2287,11 @@ mod tests {
                         assert_buffer(buffer);
                         let cell = &buffer[(width - 1, 23)];
                         let indicator = state.indicator();
-                        let style = theme::base()
-                            .patch(theme::style(theme::Role::StatusBar))
-                            .patch(theme::style(theme::Role::Screen))
-                            .patch(indicator.style);
+                        let style = theme::base().patch(theme::style(theme::Role::StatusBar));
                         assert_eq!(cell.symbol(), indicator.content);
                         assert_eq!(cell.fg, style.fg.unwrap());
                         assert_eq!(cell.bg, style.bg.unwrap());
+                        assert_eq!(cell.modifier, style.add_modifier);
                         assert_eq!(buffer[(width - 2, 23)].symbol(), " ");
                         assert_eq!(
                             buffer[(width - 2, 23)].bg,
@@ -2316,6 +2322,24 @@ mod tests {
                                 .bg
                                 .unwrap()
                         );
+                        for x in 0..width {
+                            assert_eq!(buffer[(x, 23)].fg, style.fg.unwrap());
+                            assert_eq!(buffer[(x, 23)].bg, style.bg.unwrap());
+                            assert_eq!(buffer[(x, 23)].modifier, style.add_modifier);
+                        }
+                        app.ctx.preferences.error = Some("preference save failed".into());
+                        terminal.draw(|frame| app.draw(frame)).unwrap();
+                        let error_buffer = terminal.backend().buffer();
+                        let glyph = &error_buffer[(width - 1, 23)];
+                        assert_eq!(glyph.symbol(), indicator.content);
+                        assert_eq!(glyph.fg, style.fg.unwrap());
+                        assert_eq!(glyph.bg, style.bg.unwrap());
+                        assert_eq!(glyph.modifier, style.add_modifier);
+                        for x in 0..width {
+                            assert_eq!(error_buffer[(x, 23)].bg, style.bg.unwrap());
+                        }
+                        app.ctx.preferences.error = None;
+                        let buffer = terminal.backend().buffer();
                         let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
                         assert!(!text.contains("Enter sends") && !text.contains("Navigation"));
                     }

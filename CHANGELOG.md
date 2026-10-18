@@ -29,6 +29,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
+- Gruvbox title/status bars use a quieter warm surface and the BBS art uses muted text. Compact progress glyphs match the status bar colors and modifiers in every theme, including error feedback.
+
 - Conversation textboxes start with light top padding that scrolls out of view as text fills the editor, without adding draft text or a cursor position.
 
 - Conversation composers omit their title/key-hint row, returning that row to the timeline. Compact agent progress moves to the bottom bar; send feedback stays visible there. Agent titles use “{agent} conversation”.

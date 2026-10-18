@@ -28,8 +28,10 @@ several separate `bbs group` commands.
 ## Look and feel
 
 - Gruvbox dark medium by default; `--theme` or `BBS_THEME` can select
-  `terminal` or `no-color`. All rendered components consume semantic styles
-  from `src/ui/theme.rs`, including the lighter shared outgoing/input surface.
+  `terminal` or `no-color`. Gruvbox title/status bars use a quiet warm gray
+  surface with light text; the BBS logo uses muted text. All rendered components
+  consume semantic styles from `src/ui/theme.rs`, including the lighter shared
+  outgoing/input surface.
 - Screens have no outer border; list/menu headings sit above their content
   and dialogs keep their own boundaries. Block shading (`░▒▓█`) for title bars
   and menus. A status bar fills the whole bottom line with the server, the
@@ -181,8 +183,8 @@ and Home/End work everywhere too.
 
 The composer has no title or key-hint row; shortcuts remain available in Help.
 Send progress and failures appear in the bottom bar. In compact agent
-conversations, its reserved rightmost cell shows the turn state on the
-conversation background:
+conversations, its reserved rightmost cell shows the turn state using exactly
+the bottom bar's style:
 a Braille glyph spins on unfinished work, a check marks a recorded
 turn end, and a middle dot `·` means unknown. The spinner advances every 100ms for the
 first 3 seconds after an event arrives, then every 500ms; a new event restarts

@@ -521,7 +521,8 @@ impl Screen for Thread {
         if let Some(mut indicator) = indicator
             && width > 0
         {
-            indicator.style = theme::style(theme::Role::Screen).patch(indicator.style);
+            indicator.style =
+                ratatui::style::Style::reset().patch(theme::style(theme::Role::StatusBar));
             let text = fit_status(&line.to_string(), usize::from(text_width), false);
             let padding = usize::from(width - 1).saturating_sub(text.width());
             line.spans = vec![Span::raw(text), Span::raw(" ".repeat(padding)), indicator];
