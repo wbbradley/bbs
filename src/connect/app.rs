@@ -6,6 +6,7 @@ use std::time::Instant;
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -93,6 +94,15 @@ pub trait Screen {
     fn draft(&self) -> Option<(&str, Draft)> {
         None
     }
+    /// Optional screen feedback for the shared bottom bar, after layout.
+    fn bottom_status(
+        &self,
+        _width: u16,
+        _ctx: &Ctx,
+        _draft_error: Option<&str>,
+    ) -> Option<Line<'static>> {
+        None
+    }
     /// Test access to an Agents screen in the stack.
     #[cfg(test)]
     fn as_agents_mut(&mut self) -> Option<&mut super::screens::agents::Agents> {
@@ -145,7 +155,9 @@ impl App {
 
     /// When the top screen's animation frame next changes, if it animates.
     pub fn next_animation_frame(&self) -> Option<Instant> {
-        self.stack.last().and_then(|screen| screen.next_animation_frame())
+        self.stack
+            .last()
+            .and_then(|screen| screen.next_animation_frame())
     }
 
     fn pop(&mut self) {
@@ -284,7 +296,11 @@ impl App {
         screen.render(frame, body, &self.ctx);
         let online = self.ctx.started.elapsed();
         let bar = theme::status_bar(&self.ctx.server, &self.ctx.me, online);
-        if let Some(error) = self.draft_store.error() {
+        if let Some(line) = screen.bottom_status(status.width, &self.ctx, self.draft_store.error())
+        {
+            let style = theme::style(theme::Role::StatusBar).patch(line.style);
+            frame.render_widget(Paragraph::new(line).style(style), status);
+        } else if let Some(error) = self.draft_store.error() {
             frame.render_widget(
                 Paragraph::new(error)
                     .style(theme::style(theme::Role::StatusBar).patch(theme::error())),
@@ -302,12 +318,12 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use crate::connect::event::Admin;
     use crate::proto;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Duration;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     #[test]
@@ -497,6 +513,141 @@ mod tests {
             .collect()
     }
 
+    fn bottom(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut covered = 0;
+        let mut line = String::new();
+        for x in 0..80 {
+            if covered > 0 {
+                covered -= 1;
+                continue;
+            }
+            let symbol = buffer[(x, 23)].symbol();
+            line.push_str(symbol);
+            covered = unicode_width::UnicodeWidthStr::width(symbol).saturating_sub(1);
+        }
+        line.trim_end().to_string()
+    }
+
+    #[test]
+    fn agent_title_is_single_and_mode_uses_the_full_width_bottom_bar() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let (mut app, mut rx) = app();
+                let (feed, _) = mateo_streams(&mut app, &mut rx);
+                app.on_event(Event::Data(Data::Feed {
+                    id: feed,
+                    result: Ok(vec![message(1, "Mateo", "ada", "body-start")]),
+                }));
+                let out = screen(&mut app, 80, 24);
+                assert_eq!(out.matches("Mateo, reports to ada").count(), 1);
+                assert!(out.lines().nth(3).unwrap().contains("body-start"), "{out}");
+                assert!(
+                    out.lines()
+                        .last()
+                        .unwrap()
+                        .starts_with("following · A: all")
+                );
+                assert!(
+                    !out.contains("1 entries")
+                        && !out.contains("1 messages")
+                        && !out.contains("baud")
+                );
+                let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                terminal.draw(|frame| app.draw(frame)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let expected = theme::base().patch(theme::style(theme::Role::StatusBar));
+                for x in 0..80 {
+                    assert_eq!(buffer[(x, 23)].fg, expected.fg.unwrap());
+                    assert_eq!(buffer[(x, 23)].bg, expected.bg.unwrap());
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn bottom_bar_keeps_pause_new_arrivals_filters_and_unicode_search_at_minimum_width() {
+        let (mut app, mut rx) = app();
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok((1..=50)
+                .map(|id| message(id, "Mateo", "ada", "body"))
+                .collect()),
+        }));
+        screen(&mut app, 80, 24);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        assert!(bottom(&mut app).starts_with("paused"));
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(51, "Mateo", "ada", "new arrival")]),
+        }));
+        assert!(bottom(&mut app).contains("paused · 1 new · G follows"));
+        key(&mut app, 'G');
+        assert!(bottom(&mut app).starts_with("following"));
+        key(&mut app, 'E');
+        assert!(bottom(&mut app).contains("E: no text"));
+        key(&mut app, '/');
+        typed(&mut app, &"👍🏽🇺🇸👩‍💻é".repeat(20));
+        let prompt = bottom(&mut app);
+        assert!(prompt.contains("…") && prompt.contains("👩‍💻é█"), "{prompt}");
+        assert!(prompt.contains("Enter search · Esc cancel"), "{prompt}");
+        enter(&mut app);
+        let committed = bottom(&mut app);
+        assert!(committed.contains("0 matches · n/N"), "{committed}");
+        assert!(
+            committed.contains("A:all E:no text Ctrl-T:compact"),
+            "{committed}"
+        );
+        assert!(unicode_width::UnicodeWidthStr::width(committed.as_str()) <= 80);
+    }
+
+    #[test]
+    fn bottom_bar_prioritizes_errors_without_hiding_the_active_search_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("drafts");
+        let (mut app, mut rx) = persistent_app(&root);
+        let (feed, act) = mateo_streams(&mut app, &mut rx);
+        typed(&mut app, "draft");
+        app.ctx.preferences.error = Some("preference failure".into());
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Err("feed failure".into()),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Err("activity failure".into()),
+        }));
+        assert!(bottom(&mut app).contains("preference failure"));
+        std::fs::write(&root, "blocked").unwrap();
+        app.on_event(Event::Tick);
+        assert!(bottom(&mut app).contains("Draft save failed; retrying"));
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, '/');
+        typed(&mut app, &"👩‍💻".repeat(40));
+        let prompt = bottom(&mut app);
+        assert!(
+            prompt.contains("draft error") && prompt.contains("👩‍💻█"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Enter search · Esc cancel"), "{prompt}");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bottom(&mut app).contains("Draft save failed; retrying"));
+        std::fs::remove_file(root).unwrap();
+        app.on_event(Event::Tick);
+        assert!(bottom(&mut app).contains("preference failure"));
+        app.ctx.preferences.error = None;
+        assert!(bottom(&mut app).contains("feed failure"));
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(Vec::new()),
+        }));
+        assert!(bottom(&mut app).contains("activity: activity failure"));
+    }
+
     /// Whether a rendered line is exactly `text`, ignoring trailing padding.
     fn has_line(out: &str, text: &str) -> bool {
         out.lines().any(|l| l.trim_end() == text)
@@ -509,10 +660,7 @@ mod tests {
         millis: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
-    fn test_clock() -> (
-        TestClock,
-        std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
-    ) {
+    fn test_clock() -> (TestClock, std::sync::Arc<dyn Fn() -> Instant + Send + Sync>) {
         let clock = TestClock {
             base: Instant::now(),
             millis: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -522,7 +670,10 @@ mod tests {
             read.base
                 + Duration::from_millis(read.millis.load(std::sync::atomic::Ordering::Relaxed))
         });
-        (clock, now as std::sync::Arc<dyn Fn() -> Instant + Send + Sync>)
+        (
+            clock,
+            now as std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
+        )
     }
 
     impl TestClock {
@@ -596,7 +747,7 @@ mod tests {
         assert!(out.contains("[G]roups"), "{out}");
         assert!(out.contains("bbs:7777"), "{out}");
         assert!(out.contains("ada"), "{out}");
-        assert!(out.contains("baud"), "{out}");
+        assert!(!out.contains("baud"), "{out}");
     }
 
     #[test]
@@ -796,10 +947,7 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("elsewhere"), "{out}");
-        assert!(
-            out.contains("2 entries · A: all · E: all kinds · following"),
-            "{out}"
-        );
+        assert!(out.contains("following · A: all · E: all kinds"), "{out}");
         // The search prompt takes every key, q included, until Enter.
         key(&mut app, '/');
         for c in "q needle".chars() {
@@ -1773,6 +1921,7 @@ mod tests {
         let rows = |app: &mut App| {
             screen(app, 80, 30)
                 .lines()
+                .take(29)
                 .skip_while(|l| !l.contains("Mateo · Enter sends"))
                 .skip(1)
                 .take_while(|l| !l.starts_with(" bbs:7777"))
@@ -2027,13 +2176,13 @@ mod tests {
             ["working on the build", "a request", "reply sent"]
         );
         assert!(out.contains("cargo test running"), "{out}");
-        assert!(out.contains("3 entries · A: all · E: all kinds"), "{out}");
+        assert!(out.contains("following · A: all · E: all kinds"), "{out}");
         assert!(out.contains("Navigation · Esc/i write to Mateo"), "{out}");
 
         // A cycles messages only, activity only, then everything again.
         key(&mut app, 'A');
         let out = screen(&mut app, 100, 24);
-        assert!(out.contains("1 entries · A: messages ·"), "{out}");
+        assert!(out.contains("A: messages ·"), "{out}");
         assert!(
             out.contains("a request") && !out.contains("reply sent"),
             "{out}"
@@ -2047,7 +2196,7 @@ mod tests {
             "{out}"
         );
         key(&mut app, 'A');
-        assert!(screen(&mut app, 100, 24).contains("3 entries · A: all"));
+        assert!(screen(&mut app, 100, 24).contains("A: all"));
 
         // A reload starts both streams over without the activity it had.
         while rx.try_recv().is_ok() {}
@@ -2127,7 +2276,11 @@ mod tests {
         app.on_event(Event::Data(batch(501, "text")));
         assert_eq!(hint_cell(&mut app), '⠋');
         app.on_event(Event::Data(batch(502, "tool")));
-        assert_eq!(hint_cell(&mut app), '⠋', "frames are time-derived, not per event");
+        assert_eq!(
+            hint_cell(&mut app),
+            '⠋',
+            "frames are time-derived, not per event"
+        );
         // Time advances the frame: 250ms in, the third frame shows.
         clock.advance(Duration::from_millis(250));
         assert_eq!(hint_cell(&mut app), '⠹', "frames follow the clock");
@@ -2227,7 +2380,7 @@ mod tests {
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let compact = screen(&mut app, 120, 40);
         assert!(
-            compact.contains("3 messages") && compact.contains("Ctrl-T: verbose"),
+            !compact.contains("3 messages") && compact.contains("Ctrl-T: verbose"),
             "{compact}"
         );
         for shown in ["direct-one", "outbound-body", "direct-two"] {
@@ -2272,7 +2425,7 @@ mod tests {
         }));
         let compact = screen(&mut app, 120, 40);
         assert!(
-            compact.contains("5 messages")
+            !compact.contains("5 messages")
                 && compact.contains("live-direct")
                 && !compact.contains("live-hidden"),
             "{compact}"

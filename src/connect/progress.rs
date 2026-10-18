@@ -239,14 +239,35 @@ mod tests {
         p.baseline(0, None);
         p.observe(1, &record("text"), now);
         // 100ms frames for the first three seconds.
-        assert_eq!(p.at(now + Duration::from_millis(99)), Progress::Progressing(0));
-        assert_eq!(p.at(now + Duration::from_millis(100)), Progress::Progressing(1));
-        assert_eq!(p.at(now + Duration::from_millis(2900)), Progress::Progressing(29));
+        assert_eq!(
+            p.at(now + Duration::from_millis(99)),
+            Progress::Progressing(0)
+        );
+        assert_eq!(
+            p.at(now + Duration::from_millis(100)),
+            Progress::Progressing(1)
+        );
+        assert_eq!(
+            p.at(now + Duration::from_millis(2900)),
+            Progress::Progressing(29)
+        );
         // Then 500ms frames.
-        assert_eq!(p.at(now + Duration::from_millis(3000)), Progress::Progressing(30));
-        assert_eq!(p.at(now + Duration::from_millis(3499)), Progress::Progressing(30));
-        assert_eq!(p.at(now + Duration::from_millis(3500)), Progress::Progressing(31));
-        assert_eq!(p.at(now + Duration::from_millis(59999)), Progress::Progressing(143));
+        assert_eq!(
+            p.at(now + Duration::from_millis(3000)),
+            Progress::Progressing(30)
+        );
+        assert_eq!(
+            p.at(now + Duration::from_millis(3499)),
+            Progress::Progressing(30)
+        );
+        assert_eq!(
+            p.at(now + Duration::from_millis(3500)),
+            Progress::Progressing(31)
+        );
+        assert_eq!(
+            p.at(now + Duration::from_millis(59999)),
+            Progress::Progressing(143)
+        );
         assert_eq!(p.at(now + Duration::from_secs(60)), Progress::Unknown);
     }
 
@@ -264,7 +285,10 @@ mod tests {
             );
         }
         // The clock starts at the first event (50ms in), so four full frames.
-        assert_eq!(p.at(now + Duration::from_millis(500)), Progress::Progressing(4));
+        assert_eq!(
+            p.at(now + Duration::from_millis(500)),
+            Progress::Progressing(4)
+        );
         // A slow-phase arrival switches speed without a backward jump:
         // 0.5s..3.5s fast (3000ms) plus 3.5s..10s slow (1300ms) on top of
         // 450ms = 4750ms, so frame 47 continues.

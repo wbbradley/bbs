@@ -11,6 +11,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::connect::admin::GroupAdmin;
 use crate::connect::app::{Ctx, Screen, Transition, next_id};
@@ -254,24 +256,7 @@ impl Thread {
                 Span::styled("  Enter search · Esc cancel", theme::dim()),
             ]);
         }
-        let mut text = if self.compact {
-            format!("{} messages · ", self.view.rows.len())
-        } else {
-            match &self.stream {
-                Some(stream) => {
-                    let mut text = format!(
-                        "{} entries · A: {}",
-                        self.view.rows.len(),
-                        self.show.label()
-                    );
-                    if self.show.stream() {
-                        text.push_str(&format!(" · E: {}", stream.kinds.label()));
-                    }
-                    text + " · "
-                }
-                None => format!("{} messages · ", self.view.rows.len()),
-            }
-        };
+        let mut text = format!("{} messages · ", self.view.rows.len());
         if self.view.following() {
             text.push_str("following");
         } else if self.view.new_count > 0 {
@@ -282,20 +267,165 @@ impl Thread {
         if let Some((query, hits)) = self.view.search_status() {
             text.push_str(&format!(" · /{query}: {hits} matches · n/N"));
         }
-        if !self.compact
-            && let Some(error) = self.stream.as_ref().and_then(|s| s.error.as_ref())
-            && self.show != Show::Stream
-        {
-            text.push_str(&format!(" · activity: {error}"));
-        }
-        if self.agent.is_some() {
-            text.push_str(if self.compact {
-                " · Ctrl-T: verbose"
-            } else {
-                " · Ctrl-T: compact"
-            });
-        }
         Line::styled(text, theme::dim())
+    }
+
+    fn conversation_status(
+        &self,
+        width: u16,
+        ctx: &Ctx,
+        draft_error: Option<&str>,
+    ) -> Line<'static> {
+        let width = usize::from(width);
+        let searching = self.prompt.is_some() || self.view.search_status().is_some();
+        let mut mode = if self.view.following() {
+            "following".to_string()
+        } else {
+            "paused".to_string()
+        };
+        if !self.view.following() {
+            if self.view.new_count > 0 {
+                mode.push_str(&format!(" · {} new", self.view.new_count));
+            }
+            if !searching {
+                mode.push_str(" · G follows");
+            }
+        }
+        let issue = draft_error
+            .map(|e| ("draft error", e.to_string()))
+            .or_else(|| {
+                ctx.preferences
+                    .error
+                    .as_ref()
+                    .map(|e| ("pref error", e.clone()))
+            })
+            .or_else(|| self.error.as_ref().map(|e| ("feed error", e.clone())))
+            .or_else(|| {
+                self.stream
+                    .as_ref()
+                    .and_then(|s| s.error.as_ref())
+                    .map(|e| ("activity error", format!("activity: {e}")))
+            });
+        let error_style = issue.as_ref().map(|_| theme::error()).unwrap_or_default();
+        if let Some(prompt) = &self.prompt {
+            if let Some((badge, _)) = &issue {
+                mode.push_str(&format!(" · {badge}"));
+            }
+            let suffix = "█ · Enter search · Esc cancel";
+            let available = width.saturating_sub(mode.width() + 3 + 1 + suffix.width());
+            return Line::styled(
+                format!("{mode} · /{}{suffix}", fit_status(prompt, available, true)),
+                error_style,
+            );
+        }
+        if let Some((_, message)) = issue {
+            let available = width.saturating_sub(mode.width() + 3);
+            return Line::styled(
+                format!("{mode} · {}", fit_status(&message, available, false)),
+                error_style,
+            );
+        }
+        let hints = |short: bool| {
+            let mut parts = Vec::new();
+            if !self.compact {
+                parts.push(if short {
+                    format!("A:{}", self.show.label())
+                } else {
+                    format!("A: {}", self.show.label())
+                });
+                if self.show.stream()
+                    && let Some(stream) = &self.stream
+                {
+                    let label = stream.kinds.label();
+                    parts.push(if short {
+                        format!("E:{}", label.strip_suffix(" kinds").unwrap_or(label))
+                    } else {
+                        format!("E: {label}")
+                    });
+                }
+            }
+            parts.push(if short {
+                format!(
+                    "Ctrl-T:{}",
+                    if self.compact { "verbose" } else { "compact" }
+                )
+            } else {
+                format!(
+                    "Ctrl-T: {}",
+                    if self.compact { "verbose" } else { "compact" }
+                )
+            });
+            parts.join(if short { " " } else { " · " })
+        };
+        let mut filters = hints(false);
+        let mut text = mode;
+        if let Some((query, hits)) = self.view.search_status() {
+            let suffix = format!(": {hits} matches · n/N");
+            if text.width() + filters.width() + query.width() + suffix.width() + 7 > width {
+                filters = hints(true);
+            }
+            let available =
+                width.saturating_sub(text.width() + filters.width() + suffix.width() + 7);
+            text.push_str(&format!(
+                " · /{}{suffix}",
+                fit_status(query, available, true)
+            ));
+        }
+        text.push_str(&format!(" · {filters}"));
+        let secs = ctx.started.elapsed().as_secs();
+        for detail in [
+            &ctx.server,
+            &ctx.me,
+            &format!(
+                "online {:02}:{:02}:{:02}",
+                secs / 3600,
+                secs / 60 % 60,
+                secs % 60
+            ),
+        ] {
+            if text.width() + detail.width() + 3 <= width {
+                text.push_str(&format!(" · {detail}"));
+            }
+        }
+        Line::from(fit_status(&text, width, false))
+    }
+}
+
+/// Clip feedback by display columns without splitting emoji or combining marks.
+fn fit_status(text: &str, width: usize, tail: bool) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut used = 0;
+    let mut take = |part: &&str| {
+        used += part.width();
+        used < width
+    };
+    if tail {
+        let mut parts: Vec<_> = text.graphemes(true).rev().take_while(&mut take).collect();
+        parts.reverse();
+        format!("…{}", parts.concat())
+    } else {
+        let prefix: String = text.graphemes(true).take_while(&mut take).collect();
+        format!("{prefix}…")
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::fit_status;
+
+    #[test]
+    fn feedback_clipping_keeps_whole_graphemes_from_either_end() {
+        assert_eq!(fit_status("👍🏽🇺🇸👩‍💻", 3, false), "👍🏽…");
+        assert_eq!(fit_status("👍🏽🇺🇸👩‍💻", 3, true), "…👩‍💻");
+        assert_eq!(fit_status("éé", 2, false), "éé");
+        assert_eq!(fit_status("ééé", 2, true), "…é");
+        assert_eq!(fit_status("👩‍💻", 1, true), "…");
+        assert_eq!(fit_status("x", 0, false), "");
     }
 }
 
@@ -352,6 +482,16 @@ fn describe(error: &str) -> String {
 impl Screen for Thread {
     fn title(&self) -> String {
         self.title.clone()
+    }
+
+    fn bottom_status(
+        &self,
+        width: u16,
+        ctx: &Ctx,
+        draft_error: Option<&str>,
+    ) -> Option<Line<'static>> {
+        self.agent.as_ref()?;
+        Some(self.conversation_status(width, ctx, draft_error))
     }
 
     fn requests(&self) -> Vec<Request> {
@@ -578,14 +718,18 @@ impl Screen for Thread {
 
 impl Thread {
     fn draw(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
-        let inner = theme::screen(frame, area, &self.title);
+        let inner = if self.agent.is_some() {
+            area
+        } else {
+            theme::screen(frame, area, &self.title)
+        };
         let max_lines = frame.area().height * u16::from(ctx.composer_max_height_percent) / 100;
         let composer_height = self
             .composer
             .as_ref()
             .map_or(0, |c| c.height(inner.width, max_lines));
         let [status, body, composer] = Layout::vertical([
-            Constraint::Length(1),
+            Constraint::Length(u16::from(self.agent.is_none())),
             Constraint::Min(0),
             Constraint::Length(composer_height),
         ])
@@ -625,11 +769,9 @@ impl Thread {
         }
         // Lay out first, so the status line reflects this frame.
         self.view.layout(body.width, body.height as usize);
-        let status_line = match &ctx.preferences.error {
-            Some(error) if self.agent.is_some() => Line::styled(error.clone(), theme::error()),
-            _ => self.status(),
-        };
-        frame.render_widget(Paragraph::new(status_line), status);
+        if self.agent.is_none() {
+            frame.render_widget(Paragraph::new(self.status()), status);
+        }
         if let Some(notice) = self.empty_activity() {
             frame.render_widget(Paragraph::new(notice).wrap(Wrap { trim: false }), body);
             return;

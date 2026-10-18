@@ -11,8 +11,6 @@ use ratatui::widgets::{Block, Paragraph};
 /// The smallest terminal the layout is drawn for.
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
-/// Shown in the status bar, for the look of a dial-up line.
-const BAUD: &str = "14400 baud";
 
 pub use crate::ui::theme::{Role, style};
 
@@ -52,7 +50,7 @@ pub fn title_bar(screen: &str) -> Line<'static> {
     .alignment(Alignment::Center)
 }
 
-/// The bar across the bottom: server, human, time online, and line speed.
+/// The bar across the bottom: server, human and time online.
 pub fn status_bar(server: &str, human: &str, online: Duration) -> Line<'static> {
     let secs = online.as_secs();
     let clock = format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
@@ -63,8 +61,6 @@ pub fn status_bar(server: &str, human: &str, online: Duration) -> Line<'static> 
         Span::styled(format!(" {human} "), bar),
         Span::styled("│", bar),
         Span::styled(format!(" online {clock} "), bar),
-        Span::styled("│", bar),
-        Span::styled(format!(" {BAUD} "), bar),
     ])
     .style(bar)
 }

@@ -29,6 +29,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 - The compact conversation progress glyph in `bbs connect` trusts recorded history: a stored turn end shows the check from the moment the conversation opens and persists until a later event, surviving freshness expiry and lost connections. Only unfinished activity carries the 60-second freshness timeout, and newer unfinished activity replaces a recorded completion permanently rather than falling back to it. The spinner now animates on a timer — every 100ms for 3 seconds after an event arrives, then every 500ms — instead of only advancing per event.
 
+- Agent conversations show their title once and move following/paused, new-arrival, filter/search and error feedback into the bottom bar, without an entry-count row. Bottom bars no longer include a baud rate.
+
 - `bbs connect` screens no longer draw an outer double-line border; each screen's heading sits above its content, and the bottom status bar's style fills the whole line like a traditional status bar. Dialogs keep their boundaries.
 
 - Focused composer hints start with the target name, and compact outgoing messages keep light blank padding between the dark separator and body.
