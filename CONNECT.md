@@ -55,6 +55,22 @@ shared title bar and status bar.
 | Config | Live local color scheme selection | local preferences |
 | Help | Key bindings | none |
 
+### Saved drafts
+
+Agent and group drafts are stored in `~/.local/state/bbs/connect-drafts/`, separately
+for each board, connected human, and discussion. Opening an existing discussion
+restores its raw text and cursor; drafts never create or open discussions.
+Changes save on the one-second tick, on closing a discussion, after send results,
+and on normal exit. Empty drafts and successfully sent unchanged text are removed;
+edits made while a send is pending remain. Within a session, reopening also keeps
+undo history. A later session restores text and cursor only, so unconfirmed sends
+remain editable drafts.
+
+Save errors appear in the bottom bar and retry on the next tick. A draft that cannot
+be loaded is left untouched; its error asks you to repair the file and restart.
+The session remains usable, but that discussion's new edits cannot be saved until
+the load error is resolved. Exit reports the affected path if loading failed.
+
 ### Config screen
 
 `[C]onfig` on the main menu lists Gruvbox dark medium, Terminal palette, and No color.
@@ -142,8 +158,8 @@ and Home/End work everywhere too.
   straight to a screen.
 - Agent conversations open in Insert mode, with the composer active. `PgUp` switches to navigation and scrolls the timeline. In navigation,
   `Esc` returns to Insert mode; in Insert mode, `Esc` goes back to Agents.
-  Each agent's draft and cursor position are restored when its conversation
-  is reopened during the same `connect` session. Arrow keys, including `Up`
+  Agent and group drafts and cursor positions are restored when their discussions
+  are reopened, including in a later `connect` session. Arrow keys, including `Up`
   on the first line, stay within the editor while in Insert mode.
 - In a group thread, `i` (or `Tab`) focuses the composer and `Esc` returns
   to navigation.

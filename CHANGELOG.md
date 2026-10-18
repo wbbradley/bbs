@@ -11,6 +11,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Added
 
+- Agent and group drafts in `bbs connect` save locally and restore their text and cursor when an existing discussion is reopened in a later session.
+
 - The main menu in `bbs connect` has a Config page that applies color schemes immediately and saves the choice locally for later launches.
 
 - Agent conversations in `bbs connect` use `Ctrl-t` to toggle a compact view of the agent's direct messages to you, with timestamp-only headers and preserved draft, cursor and verbose filter choices (#82).

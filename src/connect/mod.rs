@@ -5,6 +5,7 @@ mod app;
 mod art;
 mod composer;
 mod dialog;
+mod drafts;
 mod event;
 mod keys;
 mod preferences;
@@ -34,6 +35,12 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
     let preferences =
         preferences::Preferences::load(crate::app::state_dir()?.join("connect.json"))?;
     preferences.restore_theme(theme_explicit);
+    let draft_store = drafts::DraftStore::new(
+        &crate::app::state_dir()?.join("connect-drafts"),
+        opener.config.server.as_deref(),
+        &opener.dir,
+        &me.name,
+    )?;
     let ctx = app::Ctx {
         me: me.name,
         server: opener
@@ -49,6 +56,7 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
     let (requests, requests_rx) = unbounded_channel();
     tokio::spawn(event::serve(backend, opener, requests_rx, events.clone()));
     let mut app = app::App::new(ctx, requests);
+    app.draft_store = draft_store;
     let mut terminal = ratatui::init();
     event::spawn_input(events.clone());
     event::spawn_ticks(events);
@@ -64,6 +72,7 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
         }
     }
     .await;
+    let drafts_result = app.finish();
     ratatui::restore();
-    result
+    result.and(drafts_result)
 }

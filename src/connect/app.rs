@@ -10,6 +10,7 @@ use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::composer::Composer;
+use super::drafts::{Draft, DraftStore};
 use super::event::{Data, Event, Request};
 use super::keys::{Action, Keymap};
 use super::preferences::Preferences;
@@ -78,9 +79,12 @@ pub trait Screen {
     fn on_close(&self) -> Vec<Request> {
         Vec::new()
     }
-    /// Move an agent's composer between its screen and the session's saved drafts.
+    /// Move a discussion's composer between its screen and the session's drafts.
     fn save_draft(&mut self, _drafts: &mut HashMap<String, Composer>) {}
-    fn restore_draft(&mut self, _drafts: &mut HashMap<String, Composer>) {}
+    fn restore_draft(&mut self, _drafts: &mut HashMap<String, Composer>, _store: &mut DraftStore) {}
+    fn draft(&self) -> Option<(&str, Draft)> {
+        None
+    }
     /// Test access to an Agents screen in the stack.
     #[cfg(test)]
     fn as_agents_mut(&mut self) -> Option<&mut super::screens::agents::Agents> {
@@ -96,6 +100,7 @@ pub struct App {
     keymap: Keymap,
     requests: UnboundedSender<Request>,
     drafts: HashMap<String, Composer>,
+    pub draft_store: DraftStore,
 }
 
 impl App {
@@ -106,6 +111,7 @@ impl App {
             keymap: Keymap::default(),
             requests,
             drafts: HashMap::new(),
+            draft_store: DraftStore::default(),
         };
         app.push(Box::new(Menu::default()));
         app.push(Box::new(Splash));
@@ -113,7 +119,7 @@ impl App {
     }
 
     fn push(&mut self, mut screen: Box<dyn Screen>) {
-        screen.restore_draft(&mut self.drafts);
+        screen.restore_draft(&mut self.drafts, &mut self.draft_store);
         self.fetch(screen.as_ref());
         self.stack.push(screen);
     }
@@ -133,6 +139,7 @@ impl App {
         if let Some(mut screen) = self.stack.pop() {
             self.send(screen.on_close());
             screen.save_draft(&mut self.drafts);
+            self.flush_drafts();
         }
     }
 
@@ -175,10 +182,36 @@ impl App {
                     screen.on_data(&data);
                 }
                 self.viewed();
+                if matches!(data, Data::Sent { .. }) {
+                    self.flush_drafts();
+                }
                 false
             }
-            Event::Resize | Event::Tick => false,
+            Event::Tick => {
+                self.flush_drafts();
+                false
+            }
+            Event::Resize => false,
         }
+    }
+
+    fn flush_drafts(&mut self) {
+        for (key, composer) in &self.drafts {
+            self.draft_store.save(key, composer.draft());
+        }
+        for screen in &self.stack {
+            if let Some((key, draft)) = screen.draft() {
+                self.draft_store.save(key, draft);
+            }
+        }
+    }
+
+    pub fn finish(&mut self) -> anyhow::Result<()> {
+        self.flush_drafts();
+        if let Some(error) = self.draft_store.error() {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
     }
 
     fn on_action(&mut self, action: Action) -> bool {
@@ -238,7 +271,15 @@ impl App {
         screen.render(frame, body, &self.ctx);
         let online = self.ctx.started.elapsed();
         let bar = theme::status_bar(&self.ctx.server, &self.ctx.me, online);
-        frame.render_widget(Paragraph::new(bar), status);
+        if let Some(error) = self.draft_store.error() {
+            frame.render_widget(
+                Paragraph::new(error)
+                    .style(theme::style(theme::Role::StatusBar).patch(theme::error())),
+                status,
+            );
+        } else {
+            frame.render_widget(Paragraph::new(bar), status);
+        }
     }
 }
 
@@ -970,7 +1011,11 @@ mod tests {
                 .unwrap()
                 .chars()
                 .collect();
-            let cell: String = row[active..active + 11].iter().collect::<String>().trim().to_string();
+            let cell: String = row[active..active + 11]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string();
             assert_eq!(cell, "-", "{out}");
         }
     }
@@ -1192,6 +1237,226 @@ mod tests {
         press(app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(rx.try_recv(), Ok(Request::Unwatch(_))));
         assert!(matches!(rx.try_recv(), Ok(Request::Unwatch(_))));
+    }
+
+    fn persistent_app(root: &std::path::Path) -> (App, UnboundedReceiver<Request>) {
+        let (mut app, rx) = app();
+        app.draft_store = DraftStore::new(root, Some("bbs:7777"), root, "ada").unwrap();
+        (app, rx)
+    }
+
+    #[test]
+    fn draft_ticks_and_shutdown_restore_text_and_cursor_in_a_new_session() {
+        for tick in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut first, mut rx) = persistent_app(dir.path());
+            mateo(&mut first, &mut rx);
+            typed(&mut first, "one");
+            press(&mut first, KeyCode::Enter, KeyModifiers::ALT);
+            typed(&mut first, "界two");
+            press(&mut first, KeyCode::Left, KeyModifiers::NONE);
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                0,
+                "no keystroke writes"
+            );
+            if tick {
+                // Also capture drafts under help, not just the top screen.
+                first.push(Box::new(Help::default()));
+                first.on_event(Event::Tick);
+            } else {
+                first.finish().unwrap();
+            }
+            let (mut next, mut rx) = persistent_app(dir.path());
+            assert!(
+                screen(&mut next, 80, 24).contains("Main menu"),
+                "drafts never open threads"
+            );
+            mateo(&mut next, &mut rx);
+            typed(&mut next, "X");
+            enter(&mut next);
+            let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+                panic!("send")
+            };
+            assert_eq!(req.body, "one\n界twXo");
+        }
+    }
+
+    #[test]
+    fn group_drafts_restore_across_sessions_and_keep_undo_within_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let open_group = |app: &mut App, rx: &mut UnboundedReceiver<Request>| {
+            key(app, 'g');
+            assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+            app.on_event(Event::Data(Data::Groups(Ok(proto::GroupListResponse {
+                groups: vec![proto::Group {
+                    name: "crew".into(),
+                    ..Default::default()
+                }],
+            }))));
+            enter(app);
+            watched(rx);
+            assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+            key(app, 'i');
+        };
+        let (mut first, mut rx) = persistent_app(dir.path());
+        open_group(&mut first, &mut rx);
+        typed(&mut first, "group draft");
+        press(&mut first, KeyCode::Left, KeyModifiers::NONE);
+        first.finish().unwrap();
+        let (mut next, mut rx) = persistent_app(dir.path());
+        open_group(&mut next, &mut rx);
+        typed(&mut next, "X");
+        // Esc leaves group composing; a second Esc closes its screen.
+        press(&mut next, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut next, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(rx.try_recv(), Ok(Request::Unwatch(_))));
+        enter(&mut next);
+        watched(&mut rx);
+        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+        key(&mut next, 'i');
+        press(&mut next, KeyCode::Char('7'), KeyModifiers::CONTROL);
+        enter(&mut next);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("send")
+        };
+        assert_eq!(req.to, "@crew");
+        assert_eq!(
+            req.body, "group draft",
+            "session reopen preserved undo history"
+        );
+    }
+
+    #[test]
+    fn persisted_sends_clear_only_successful_unchanged_text_even_after_close() {
+        for success in [false, true] {
+            for edited in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let (mut first, mut rx) = persistent_app(dir.path());
+                mateo(&mut first, &mut rx);
+                typed(&mut first, "draft");
+                first.on_event(Event::Tick);
+                enter(&mut first);
+                let Request::Send { id, .. } = rx.try_recv().unwrap() else {
+                    panic!("send")
+                };
+                if edited {
+                    typed(&mut first, "X");
+                }
+                close_conversation(&mut first, &mut rx);
+                first.on_event(Event::Data(Data::Sent {
+                    id,
+                    result: if success {
+                        Ok(())
+                    } else {
+                        Err("offline".into())
+                    },
+                }));
+                let (mut next, mut rx) = persistent_app(dir.path());
+                mateo(&mut next, &mut rx);
+                assert!(!screen(&mut next, 80, 24).contains("Sending…"));
+                enter(&mut next);
+                if success && !edited {
+                    assert!(rx.try_recv().is_err());
+                } else {
+                    let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+                        panic!("send")
+                    };
+                    assert_eq!(req.body, if edited { "draftX" } else { "draft" });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unopened_or_removed_discussions_never_load_drafts_and_load_errors_stay_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut first, mut rx) = persistent_app(dir.path());
+        mateo(&mut first, &mut rx);
+        typed(&mut first, "saved");
+        first.finish().unwrap();
+        let scope = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let file = std::fs::read_dir(scope)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(&file, "broken").unwrap();
+        let (mut absent, mut rx) = persistent_app(dir.path());
+        open_agents(&mut absent, &mut rx);
+        absent.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: Vec::new(),
+        }))));
+        enter(&mut absent);
+        assert!(
+            absent.draft_store.error().is_none(),
+            "only opened listed targets load"
+        );
+        assert!(screen(&mut absent, 80, 24).contains("Your agents"));
+        absent.finish().unwrap();
+        let (mut existing, mut rx) = persistent_app(dir.path());
+        mateo(&mut existing, &mut rx);
+        typed(&mut existing, "session-only");
+        existing.on_event(Event::Tick);
+        let out = screen(&mut existing, 100, 24);
+        assert!(
+            out.contains("Draft load failed; repair file and restart")
+                && out.contains("session-only"),
+            "{out}"
+        );
+        assert!(existing.finish().is_err());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "broken");
+    }
+
+    #[test]
+    fn pending_send_restores_as_editable_draft_in_another_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut first, mut rx) = persistent_app(dir.path());
+        mateo(&mut first, &mut rx);
+        typed(&mut first, "unconfirmed");
+        enter(&mut first);
+        assert!(matches!(rx.try_recv(), Ok(Request::Send { .. })));
+        first.finish().unwrap();
+        let (mut next, mut rx) = persistent_app(dir.path());
+        mateo(&mut next, &mut rx);
+        assert!(!screen(&mut next, 80, 24).contains("Sending…"));
+        enter(&mut next);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("send")
+        };
+        assert_eq!(req.body, "unconfirmed");
+    }
+
+    #[test]
+    fn draft_save_errors_are_visible_and_retry_on_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("drafts");
+        let (mut app, mut rx) = persistent_app(&root);
+        mateo(&mut app, &mut rx);
+        typed(&mut app, "session draft");
+        std::fs::write(&root, "blocked").unwrap();
+        app.on_event(Event::Tick);
+        let out = screen(&mut app, 100, 24);
+        assert!(
+            out.contains("Draft save failed; retrying (agent:mateo)")
+                && out.contains("session draft"),
+            "{out}"
+        );
+        assert!(
+            app.finish().is_err(),
+            "shutdown surfaces unsaved drafts too"
+        );
+        std::fs::remove_file(&root).unwrap();
+        app.on_event(Event::Tick);
+        assert!(app.draft_store.error().is_none());
+        app.finish().unwrap();
     }
 
     #[test]

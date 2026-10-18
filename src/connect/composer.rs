@@ -40,6 +40,24 @@ impl Composer {
         }
     }
 
+    pub fn draft(&self) -> super::drafts::Draft {
+        let cursor = self.text.cursor();
+        super::drafts::Draft {
+            text: self.text.lines().join("\n"),
+            cursor: (cursor.0, cursor.1),
+        }
+    }
+
+    /// Restore text and a logical cursor; pending sends and undo are session-only.
+    pub fn restore(&mut self, draft: super::drafts::Draft) {
+        self.text = TextArea::new(draft.text.split('\n').map(str::to_string).collect());
+        self.text.set_wrap_mode(WrapMode::None);
+        self.sending = None;
+        self.error = None;
+        self.top = 0;
+        self.jump(DataCursor(draft.cursor.0, draft.cursor.1));
+    }
+
     pub fn to(&self) -> &str {
         &self.to
     }
@@ -276,6 +294,29 @@ fn blank() -> TextArea<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_draft_preserves_raw_unicode_and_cursor_without_pending_send() {
+        let mut original = Composer::new("Mateo");
+        original.restore(super::super::drafts::Draft {
+            text: "  界é\nsecond\n".into(),
+            cursor: (1, 3),
+        });
+        let snapshot = original.draft();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(original.key(enter, 1), Some(snapshot.text.clone()));
+        let mut restored = Composer::new("Mateo");
+        restored.restore(original.draft());
+        assert_eq!(restored.draft(), snapshot);
+        restored.key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE), 2);
+        assert_eq!(restored.key(enter, 3).as_deref(), Some("  界é\nsecXond\n"));
+        restored.restore(super::super::drafts::Draft {
+            text: "short".into(),
+            cursor: (usize::MAX, usize::MAX),
+        });
+        assert!(restored.draft().cursor.0 == 0);
+        assert!(restored.draft().cursor.1 <= 5);
+    }
 
     #[test]
     fn spacer_uses_screen_surface_while_input_uses_human_surface() {

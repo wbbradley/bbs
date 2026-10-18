@@ -14,6 +14,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::connect::admin::GroupAdmin;
 use crate::connect::app::{Ctx, Screen, Transition, next_id};
 use crate::connect::composer::Composer;
+use crate::connect::drafts::{Draft, DraftStore};
 use crate::connect::event::{Data, Request};
 use crate::connect::keys::{Action, GroupOp};
 use crate::connect::theme;
@@ -49,7 +50,7 @@ pub struct Thread {
     group: Option<(proto::Group, GroupAdmin)>,
     /// An agent thread's agent, whose mail to the human viewing marks read.
     agent: Option<String>,
-    /// Agent and owner identify a draft independently of its feed stream.
+    /// A typed target identifies a draft independently of its feed stream.
     draft_key: Option<String>,
     /// An agent thread's activity, which viewing marks seen.
     stream: Option<Stream>,
@@ -96,11 +97,7 @@ impl Thread {
         };
         let mut thread = Thread::new(title, req, Some(agent));
         thread.agent = Some(agent.to_string());
-        thread.draft_key = Some(format!(
-            "{}@{}",
-            agent.to_ascii_lowercase(),
-            owner.unwrap_or_default().to_ascii_lowercase()
-        ));
+        thread.draft_key = Some(format!("agent:{}", agent.to_ascii_lowercase()));
         thread.composing = true;
         thread.human = Some(human.to_string());
         thread.compact = compact;
@@ -219,6 +216,7 @@ impl Thread {
             ..Default::default()
         };
         thread.group = Some((listed, GroupAdmin::default()));
+        thread.draft_key = Some(format!("group:{}", group.to_ascii_lowercase()));
         thread
     }
 
@@ -381,12 +379,20 @@ impl Screen for Thread {
         }
     }
 
-    fn restore_draft(&mut self, drafts: &mut HashMap<String, Composer>) {
-        if let Some(key) = &self.draft_key
-            && let Some(composer) = drafts.remove(key)
-        {
-            self.composer = Some(composer);
+    fn restore_draft(&mut self, drafts: &mut HashMap<String, Composer>, store: &mut DraftStore) {
+        if let Some(key) = &self.draft_key {
+            if let Some(composer) = drafts.remove(key) {
+                self.composer = Some(composer);
+            } else if let Some(draft) = store.load(key)
+                && let Some(composer) = &mut self.composer
+            {
+                composer.restore(draft);
+            }
         }
+    }
+
+    fn draft(&self) -> Option<(&str, Draft)> {
+        Some((self.draft_key.as_deref()?, self.composer.as_ref()?.draft()))
     }
 
     fn on_data(&mut self, data: &Data) {
