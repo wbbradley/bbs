@@ -63,7 +63,11 @@ pub fn resolve(cli: Option<&str>, env: Option<&str>, no_color: bool) -> Result<S
 pub fn init(cli: Option<&str>) -> Result<bool> {
     let env = std::env::var("BBS_THEME").ok();
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-    select(resolve(cli, env.as_deref(), no_color)?);
+    init_options(cli, env.as_deref(), no_color)
+}
+
+fn init_options(cli: Option<&str>, env: Option<&str>, no_color: bool) -> Result<bool> {
+    select(resolve(cli, env, no_color)?);
     Ok(cli.is_some() || env.is_some_and(|s| !s.is_empty()) || no_color)
 }
 
@@ -202,6 +206,24 @@ mod tests {
             Scheme::Gruvbox.style(Role::Target).fg,
             Some(Color::Rgb(254, 128, 25))
         );
+    }
+
+    #[test]
+    fn startup_opt_out_blocks_saved_theme_but_allows_live_selection() {
+        testing::with_scheme(Scheme::Gruvbox, || {
+            for env in [None, Some("")] {
+                assert!(init_options(None, env, true).unwrap());
+                assert_eq!(current(), Scheme::NoColor);
+                select(Scheme::Terminal);
+                assert_eq!(current(), Scheme::Terminal);
+                assert!(!init_options(None, env, false).unwrap());
+                assert_eq!(current(), Scheme::Gruvbox);
+            }
+            assert!(init_options(None, Some("terminal"), true).unwrap());
+            assert_eq!(current(), Scheme::Terminal);
+            assert!(init_options(Some("gruvbox-dark-medium"), Some("terminal"), true).unwrap());
+            assert_eq!(current(), Scheme::Gruvbox);
+        });
     }
 
     #[test]
