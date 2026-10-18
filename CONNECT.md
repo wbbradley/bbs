@@ -138,12 +138,9 @@ carries each agent's last-sent time, so ACTIVE updates live while the list is
 open.
 
 Any human may open any agent and message it, under the same rules as
-`bbs send`. Ownership is always visible:
-- every agent shows its owner in a separate OWNER column, as in `bbs agents`;
-- your own agents are drawn in one colour and other humans' agents in
-  another;
-- the agent screen's title says whose agent it is, for example
-  "Mateo, reports to ada".
+`bbs send`. Every agent shows its owner in a separate OWNER column, as in
+`bbs agents`; your own agents and other humans' agents use distinct colors.
+The conversation title uses the agent's name, for example "Mateo conversation".
 
 ### Group screen
 

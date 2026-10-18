@@ -94,15 +94,11 @@ impl Thread {
     /// What `agent` sent and what was sent to it directly.
     pub fn agent(
         agent: &str,
-        owner: Option<&str>,
         human: &str,
         compact: bool,
         now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
     ) -> Thread {
-        let title = match owner {
-            Some(owner) => format!("{agent}, reports to {owner}"),
-            None => agent.to_string(),
-        };
+        let title = format!("{agent} conversation");
         let req = FeedRequest {
             with: Some(agent.to_string()),
             ..Default::default()

@@ -543,7 +543,7 @@ mod tests {
                     result: Ok(vec![message(1, "Mateo", "ada", "body-start")]),
                 }));
                 let out = screen(&mut app, 80, 24);
-                assert_eq!(out.matches("Mateo, reports to ada").count(), 1);
+                assert_eq!(out.matches("Mateo conversation").count(), 1);
                 assert!(out.lines().nth(3).unwrap().contains("body-start"), "{out}");
                 assert!(
                     out.lines()
@@ -958,7 +958,7 @@ mod tests {
             result: Ok(vec![message(9, "Zed", "Lu", "elsewhere")]),
         }));
         let out = screen(&mut app, 80, 24);
-        assert!(out.contains("Mateo, reports to ada"), "{out}");
+        assert!(out.contains("Mateo conversation"), "{out}");
         assert!(
             out.contains("first needle") && out.contains("second"),
             "{out}"
