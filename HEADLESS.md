@@ -250,13 +250,31 @@ the rest, so harness extensions do not break it.
 Use the community-maintained
 [`claude-agent-acp`](https://github.com/agentclientprotocol/claude-agent-acp)
 adapter, which wraps Anthropic's official Agent SDK and needs Node.js 22 or
-later. Install and authenticate it separately, then configure its executable:
+later. Install the pinned adapter globally with npm:
+
+```sh
+npm install -g @agentclientprotocol/claude-agent-acp@0.93.0
+```
+
+Then configure its executable:
 
 ```toml
 [headless.harness.claude]
 command = ["claude-agent-acp"]
 mcp_env = "process"
 ```
+
+Alternatively, use npx without a global installation:
+
+```toml
+[headless.harness.claude]
+command = ["npx", "--yes", "--package", "@agentclientprotocol/claude-agent-acp@0.93.0", "claude-agent-acp"]
+mcp_env = "process"
+```
+
+The npx route fetches and caches the pinned package on first launch, requiring
+network access then. Complete Claude's normal login setup outside the headless
+runner first; the adapter uses that existing login and settings.
 
 `mcp_env = "process"` passes the runtime BBS token and effective `BBS_SERVER`
 to the harness through its child-process environment, overriding stale values
