@@ -159,6 +159,13 @@ and Home/End work everywhere too.
 
 The composer's target agent or group uses the theme's Target color (orange in
 Gruvbox); key hints use a distinct italic KeyHint style.
+In compact agent conversations, the hint's right edge shows recent stream
+activity: a Braille glyph advances on each new event, a check marks an explicit
+turn end, and `?` means unknown. History replay and duplicate events do not
+advance it. A turn error, cancellation, stop or disconnected stream makes it
+unknown immediately; 60 seconds without new activity also makes it unknown.
+The glyph does not animate between events. Reopening or reloading starts unknown
+until fresh activity arrives.
 The composer has no border and uses the same themed surface as your outgoing
 messages, with one blank display row above the hint using the conversation's
 background. It starts with two text rows plus the blank row and hint row and grows up to

@@ -8,6 +8,7 @@ mod dialog;
 mod event;
 mod keys;
 mod preferences;
+mod progress;
 mod screens;
 mod theme;
 mod timeline;

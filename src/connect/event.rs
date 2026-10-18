@@ -84,6 +84,11 @@ pub enum Data {
         id: u64,
         result: Result<Vec<proto::Activity>, String>,
     },
+    /// History watermark established before subscribing to activity replay.
+    ActivityBaseline {
+        id: u64,
+        through_id: i64,
+    },
     /// Summaries from the stream `id`. A stream ends after an error.
     Summary {
         id: u64,
@@ -322,6 +327,28 @@ async fn watch_activity(
 ) {
     let result: anyhow::Result<()> = async {
         let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller).await?;
+        let through_id = {
+            let mut latest = backend
+                .watch_activity(proto::ActivityRequest {
+                    backlog: 1,
+                    after_id: None,
+                    agent: req.agent.clone(),
+                })
+                .await?;
+            latest
+                .next()
+                .await?
+                .iter()
+                .map(|event| event.id)
+                .max()
+                .unwrap_or(0)
+        };
+        if tx
+            .send(Event::Data(Data::ActivityBaseline { id, through_id }))
+            .is_err()
+        {
+            return Ok(());
+        }
         let mut activity = backend.watch_activity(req).await?;
         loop {
             let result = Ok(activity.next().await?);
@@ -334,5 +361,84 @@ async fn watch_activity(
     if let Err(e) = result {
         let result = Err(format!("{e:#}"));
         let _ = tx.send(Event::Data(Data::Activity { id, result }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_worker_marks_all_replay_batches_before_live_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("bbs.db")).unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO humans (id, name, created_at, active_at) VALUES (1, 'ada', 't', 't');
+             INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at)
+             VALUES (1, 'Mateo', 'a', '/', 'h', 't', 't')",
+        )
+        .unwrap();
+        let events = vec![("text".into(), r#"{"event":"text","text":"history"}"#.into()); 500];
+        crate::db::post_activity(&conn, 1, "t", &events).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::spawn(watch_activity(
+            Opener {
+                config: Config::default(),
+                dir: dir.path().into(),
+                caller: Caller {
+                    human: Some("ada".into()),
+                    ..Default::default()
+                },
+            },
+            9,
+            proto::ActivityRequest {
+                backlog: 200,
+                after_id: Some(0),
+                agent: Some("Mateo".into()),
+            },
+            tx,
+        ));
+        async fn next(rx: &mut UnboundedReceiver<Event>) -> Event {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        assert!(matches!(
+            next(&mut rx).await,
+            Event::Data(Data::ActivityBaseline {
+                id: 9,
+                through_id: 500
+            })
+        ));
+        for (len, last) in [(200, 200), (200, 400), (100, 500)] {
+            let Event::Data(Data::Activity {
+                id: 9,
+                result: Ok(events),
+            }) = next(&mut rx).await
+            else {
+                panic!("expected replay batch");
+            };
+            assert_eq!(events.len(), len);
+            assert_eq!(events.last().unwrap().id, last);
+        }
+        crate::db::post_activity(
+            &conn,
+            1,
+            "u",
+            &[("turn_end".into(), r#"{"event":"turn_end"}"#.into())],
+        )
+        .unwrap();
+        let Event::Data(Data::Activity {
+            id: 9,
+            result: Ok(events),
+        }) = next(&mut rx).await
+        else {
+            panic!("expected live batch");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, 501);
+        worker.abort();
     }
 }
