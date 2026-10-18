@@ -42,7 +42,7 @@ for line in sys.stdin:
     method, mid, p = msg.get('method'), msg.get('id'), msg.get('params', {})
     if method == 'initialize':
         if kind == 'acp':
-            reply(mid, dict(protocolVersion=1, agentInfo=dict(name='@agentclientprotocol/claude-agent-acp'), agentCapabilities=dict(loadSession=True, sessionCapabilities=dict(resume={}))))
+            reply(mid, dict(protocolVersion=1, agentInfo=dict(name='@agentclientprotocol/claude-agent-acp'), agentCapabilities=dict(loadSession=True, sessionCapabilities={} if scenario == 'load' else dict(resume={}))))
         else:
             reply(mid, {})
     elif method in ['session/new', 'session/resume', 'session/load']:
@@ -50,6 +50,7 @@ for line in sys.stdin:
         if method != 'session/new':
             current = 'medium'
             note('session/update', dict(sessionId='session', update=dict(sessionUpdate='config_option_update', configOptions=options())))
+            note('session/update', dict(sessionId='child', update=dict(sessionUpdate='config_option_update', configOptions=[])))
             # Replay text must not leak, but the effort metadata must survive.
             note('session/update', dict(sessionId='session', update=dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='OLD REPLAY'))))
             reply(mid, {})
@@ -88,6 +89,14 @@ for line in sys.stdin:
                 continue
             current = p.get('effort', current)
             reply(mid, dict(turn=dict(id=tid, status='inProgress')))
+        if 'METADATA' in text:
+            current = 'high'
+            if kind == 'acp':
+                note('session/update', dict(sessionId='session', update=dict(sessionUpdate='config_option_update', configOptions=options())))
+                note('session/update', dict(sessionId='child', update=dict(sessionUpdate='config_option_update', configOptions=[])))
+            else:
+                note('thread/settings/updated', dict(threadId='thread', threadSettings=dict(model='fixture', effort=current)))
+                note('thread/settings/updated', dict(threadId='child', threadSettings=dict(model='other', effort='max')))
         if 'HOLD' in text:
             held = (mid, text, tid)
             record('held', effort=current)

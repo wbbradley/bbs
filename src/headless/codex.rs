@@ -69,6 +69,7 @@ struct Turn {
 }
 
 struct CodexEffort {
+    parent: Option<String>,
     state: EffortState,
     models: Vec<Value>,
     model: String,
@@ -78,6 +79,7 @@ struct CodexEffort {
 impl Default for CodexEffort {
     fn default() -> Self {
         Self {
+            parent: None,
             state: effort::unavailable("model effort metadata unavailable"),
             models: Vec::new(),
             model: String::new(),
@@ -87,6 +89,23 @@ impl Default for CodexEffort {
 }
 
 impl CodexEffort {
+    fn notification(&mut self, params: &Value) -> bool {
+        if !self
+            .parent
+            .as_deref()
+            .is_some_and(|id| params["threadId"].as_str() == Some(id))
+        {
+            return false;
+        }
+        let settings = &params["threadSettings"];
+        if let Some(model) = settings["model"].as_str() {
+            self.model = model.into();
+        }
+        self.current = settings["effort"].as_str().map(str::to_string);
+        self.refresh();
+        true
+    }
+
     fn refresh(&mut self) {
         let choices = self
             .models
@@ -199,6 +218,7 @@ impl Codex {
             params["modelProvider"] = provider.clone().into();
         }
         if let Some(id) = resume {
+            self.effort.lock().unwrap().parent = Some(id.to_string());
             let mut resume_params = params.clone();
             resume_params["threadId"] = id.into();
             match self.rpc.request("thread/resume", resume_params).await {
@@ -211,13 +231,15 @@ impl Codex {
                 Err(err) => tracing::warn!("resuming codex thread {id} failed: {err:#}"),
             }
         }
+        self.effort.lock().unwrap().parent = None;
         params["dynamicTools"] = dynamic_tools();
         let result = self.rpc.request("thread/start", params).await?;
-        self.discover_effort(&result).await;
         self.thread_id = result["thread"]["id"]
             .as_str()
             .context("thread/start returned no thread id")?
             .to_string();
+        self.effort.lock().unwrap().parent = Some(self.thread_id.clone());
+        self.discover_effort(&result).await;
         Ok(())
     }
 
@@ -427,14 +449,7 @@ fn handle(
             rpc.respond_later(id, answer(&method, &params, events));
         }
         Incoming::Notification { method, params } => {
-            if method == "thread/settings/updated" {
-                let settings = &params["threadSettings"];
-                let mut e = effort.lock().unwrap();
-                if let Some(model) = settings["model"].as_str() {
-                    e.model = model.into();
-                }
-                e.current = settings["effort"].as_str().map(str::to_string);
-                e.refresh();
+            if method == "thread/settings/updated" && effort.lock().unwrap().notification(&params) {
                 let _ = events.send(Event::EffortChanged);
             }
             if let Some(event) = notification_event(&method, &params, turn) {
@@ -557,6 +572,25 @@ fn item_event(method: &str, item: &Value) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_metadata_ignores_foreign_and_missing_thread_ids() {
+        let mut e = CodexEffort::default();
+        let update = |id: &str, model: &str, level: &str| {
+            json!({
+                "threadId":id, "threadSettings":{"model":model,"effort":level}
+            })
+        };
+        assert!(!e.notification(&update("parent", "m", "high")));
+        e.parent = Some("parent".into());
+        assert!(e.notification(&update("parent", "m", "high")));
+        assert!(!e.notification(&update("child", "other", "max")));
+        assert!(!e.notification(&json!({"threadSettings":{"effort":"low"}})));
+        assert_eq!(e.state.current.as_deref(), Some("high"));
+        assert_eq!(e.model, "m");
+        assert!(e.notification(&update("parent", "m", "low")));
+        assert_eq!(e.state.current.as_deref(), Some("low"));
+    }
 
     #[test]
     fn effort_current_is_not_the_catalog_default_or_choice_order() {

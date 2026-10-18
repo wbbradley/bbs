@@ -57,6 +57,7 @@ pub struct Acp {
 }
 
 struct AcpEffort {
+    parent: Option<String>,
     state: EffortState,
     id: Option<String>,
     claude: bool,
@@ -65,6 +66,7 @@ struct AcpEffort {
 impl Default for AcpEffort {
     fn default() -> Self {
         Self {
+            parent: None,
             state: effort::unavailable("no thought-level option advertised"),
             id: None,
             claude: false,
@@ -73,6 +75,18 @@ impl Default for AcpEffort {
 }
 
 impl AcpEffort {
+    fn notification(&mut self, params: &Value) -> bool {
+        if !self
+            .parent
+            .as_deref()
+            .is_some_and(|id| params["sessionId"].as_str() == Some(id))
+        {
+            return false;
+        }
+        self.update(&params["update"]["configOptions"]);
+        true
+    }
+
     fn update(&mut self, options: &Value) {
         self.state = effort::unavailable("no thought-level option advertised");
         self.id = None;
@@ -187,6 +201,7 @@ impl Acp {
                 None
             };
             if let Some(method) = method {
+                acp.effort.lock().unwrap().parent = Some(id.to_string());
                 acp.replaying.store(true, Ordering::SeqCst);
                 let result = acp.rpc.request(method, params).await;
                 acp.replaying.store(false, Ordering::SeqCst);
@@ -203,7 +218,11 @@ impl Acp {
         let result = match opened {
             Some(result) => result,
             None => {
-                acp.effort.lock().unwrap().update(&Value::Null);
+                {
+                    let mut effort = acp.effort.lock().unwrap();
+                    effort.parent = None;
+                    effort.update(&Value::Null);
+                }
                 let params = json!({ "cwd": cwd, "mcpServers": servers });
                 let result = match acp.rpc.call("session/new", params).await {
                     // Logging in may be interactive; it belongs outside headless.
@@ -217,6 +236,7 @@ impl Acp {
                     .as_str()
                     .context("session/new returned no sessionId")?
                     .to_string();
+                acp.effort.lock().unwrap().parent = Some(acp.session_id.clone());
                 result
             }
         };
@@ -425,11 +445,9 @@ fn handle(
         }
         Incoming::Notification { method, params } if method == "session/update" => {
             if params["update"]["sessionUpdate"] == "config_option_update" {
-                effort
-                    .lock()
-                    .unwrap()
-                    .update(&params["update"]["configOptions"]);
-                let _ = events.send(Event::EffortChanged);
+                if effort.lock().unwrap().notification(&params) {
+                    let _ = events.send(Event::EffortChanged);
+                }
             } else if !replaying.load(Ordering::SeqCst)
                 && let Some(event) = update_event(&params["update"])
             {
@@ -512,6 +530,27 @@ fn update_event(update: &Value) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_metadata_requires_the_opened_parent_even_during_replay() {
+        let mut e = AcpEffort::default();
+        let update = |id: &str| {
+            json!({ "sessionId":id, "update": { "configOptions":[{
+            "id":"e", "type":"select", "category":"thought_level", "currentValue":"high",
+            "options":[{"value":"high"}]
+        }] } })
+        };
+        assert!(!e.notification(&update("parent"))); // Not bound yet.
+        e.parent = Some("parent".into()); // Set before resume/load starts replay.
+        assert!(!e.notification(&update("child")));
+        assert!(!e.notification(&json!({"update":{"configOptions":[]}})));
+        assert!(e.state.current.is_none());
+        assert!(e.notification(&update("parent")));
+        assert_eq!(e.state.current.as_deref(), Some("high"));
+        assert!(!e.notification(&json!({"sessionId":"child", "update":{"configOptions":[]}})));
+        assert!(e.state.supported);
+        assert_eq!(e.state.current.as_deref(), Some("high"));
+    }
 
     #[test]
     fn effort_options_preserve_default_grouped_choices_and_provider_rank() {

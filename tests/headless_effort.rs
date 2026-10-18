@@ -177,8 +177,8 @@ impl Drop for Rig {
     }
 }
 
-async fn lifecycle(kind: &str) {
-    let mut r = Rig::new(kind, "lifecycle").await;
+async fn lifecycle(kind: &str, scenario: &str) {
+    let mut r = Rig::new(kind, scenario).await;
     let id = r.send("high", Some(proto::Control::SetEffort)).await;
     r.report(|s| s.pending.as_ref().is_some_and(|p| p.request_id == id))
         .await;
@@ -233,6 +233,24 @@ async fn lifecycle(kind: &str) {
         .await;
     assert!(resumed.pending.is_none());
     assert!(resumed.answered.is_none());
+    r.send("METADATA", None).await;
+    r.wait_wire(|v| {
+        v.iter()
+            .any(|v| v["kind"] == "delivered" && v["text"].as_str().unwrap().contains("METADATA"))
+    })
+    .await;
+    let metadata = r
+        .report(|s| {
+            s.state
+                .as_ref()
+                .is_some_and(|s| s.current.as_deref() == Some("high"))
+        })
+        .await;
+    assert!(metadata.state.unwrap().supported);
+    assert!(
+        metadata.answered.is_none(),
+        "provider metadata is not a control ACK"
+    );
     let log = std::fs::read_to_string(
         r.home
             .join(".local/state/bbs/headless/efforttest/log.jsonl"),
@@ -243,11 +261,11 @@ async fn lifecycle(kind: &str) {
 
 #[tokio::test]
 async fn codex_next_turn_and_resume() {
-    lifecycle("codex").await;
+    lifecycle("codex", "lifecycle").await;
 }
 #[tokio::test]
 async fn acp_next_turn_and_replay_metadata() {
-    lifecycle("acp").await;
+    lifecycle("acp", "lifecycle").await;
 }
 
 async fn rejection(kind: &str) {
@@ -424,4 +442,9 @@ async fn acp_timeout_preserves_unsent_mail_and_stops() {
 #[tokio::test]
 async fn codex_timeout_records_uncertain_delivery_without_resend() {
     timeout_boundary("codex").await;
+}
+
+#[tokio::test]
+async fn acp_load_replay_accepts_only_parent_effort_metadata() {
+    lifecycle("acp", "load").await;
 }
