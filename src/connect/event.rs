@@ -318,6 +318,26 @@ async fn watch_summary(opener: Opener, id: u64, tx: UnboundedSender<Event>) {
     }
 }
 
+async fn activity_baseline(
+    backend: &mut Backend,
+    req: &proto::ActivityRequest,
+) -> anyhow::Result<i64> {
+    let mut latest = backend
+        .watch_activity(proto::ActivityRequest {
+            backlog: 1,
+            after_id: None,
+            agent: req.agent.clone(),
+        })
+        .await?;
+    Ok(latest
+        .next()
+        .await?
+        .iter()
+        .map(|event| event.id)
+        .max()
+        .unwrap_or(0))
+}
+
 /// Stream activity `id` until it fails or the app goes away.
 async fn watch_activity(
     opener: Opener,
@@ -327,22 +347,7 @@ async fn watch_activity(
 ) {
     let result: anyhow::Result<()> = async {
         let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller).await?;
-        let through_id = {
-            let mut latest = backend
-                .watch_activity(proto::ActivityRequest {
-                    backlog: 1,
-                    after_id: None,
-                    agent: req.agent.clone(),
-                })
-                .await?;
-            latest
-                .next()
-                .await?
-                .iter()
-                .map(|event| event.id)
-                .max()
-                .unwrap_or(0)
-        };
+        let through_id = activity_baseline(&mut backend, &req).await?;
         if tx
             .send(Event::Data(Data::ActivityBaseline { id, through_id }))
             .is_err()
@@ -368,8 +373,12 @@ async fn watch_activity(
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
-    async fn activity_worker_marks_all_replay_batches_before_live_events() {
+    fn board() -> (
+        tempfile::TempDir,
+        rusqlite::Connection,
+        Opener,
+        proto::ActivityRequest,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = crate::db::open(&dir.path().join("bbs.db")).unwrap();
         crate::db::migrate(&mut conn).unwrap();
@@ -381,24 +390,27 @@ mod tests {
         .unwrap();
         let events = vec![("text".into(), r#"{"event":"text","text":"history"}"#.into()); 500];
         crate::db::post_activity(&conn, 1, "t", &events).unwrap();
+        let opener = Opener {
+            config: Config::default(),
+            dir: dir.path().into(),
+            caller: Caller {
+                human: Some("ada".into()),
+                ..Default::default()
+            },
+        };
+        let req = proto::ActivityRequest {
+            backlog: 200,
+            after_id: Some(0),
+            agent: Some("Mateo".into()),
+        };
+        (dir, conn, opener, req)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_worker_marks_all_replay_batches_before_live_events() {
+        let (_dir, conn, opener, req) = board();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let worker = tokio::spawn(watch_activity(
-            Opener {
-                config: Config::default(),
-                dir: dir.path().into(),
-                caller: Caller {
-                    human: Some("ada".into()),
-                    ..Default::default()
-                },
-            },
-            9,
-            proto::ActivityRequest {
-                backlog: 200,
-                after_id: Some(0),
-                agent: Some("Mateo".into()),
-            },
-            tx,
-        ));
+        let worker = tokio::spawn(watch_activity(opener, 9, req, tx));
         async fn next(rx: &mut UnboundedReceiver<Event>) -> Event {
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
@@ -440,5 +452,62 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, 501);
         worker.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_arriving_between_baseline_and_history_is_fresh() {
+        use crate::connect::progress::{Progress, ProgressState};
+        let (_dir, conn, opener, req) = board();
+        let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller)
+            .await
+            .unwrap();
+        let baseline = activity_baseline(&mut backend, &req).await.unwrap();
+        assert_eq!(baseline, 500);
+        crate::db::post_activity(
+            &conn,
+            1,
+            "u",
+            &[("text".into(), r#"{"event":"text"}"#.into())],
+        )
+        .unwrap();
+        let mut progress = ProgressState::default();
+        progress.baseline(baseline);
+        let now = std::time::Instant::now();
+        let mut replay = backend.watch_activity(req).await.unwrap();
+        for batch in 0..3 {
+            let events = replay.next().await.unwrap();
+            for event in &events {
+                progress.observe(event.id, &event.record, now);
+            }
+            assert_eq!(
+                progress.at(now),
+                if batch == 2 {
+                    assert_eq!(events.last().unwrap().id, 501);
+                    Progress::Progressing(0)
+                } else {
+                    Progress::Unknown
+                }
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn baseline_failure_is_reported_without_replaying_as_fresh() {
+        let (_dir, _conn, opener, mut req) = board();
+        req.agent = Some("missing".into());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        watch_activity(opener, 9, req, tx).await;
+        let Some(Event::Data(Data::Activity {
+            id: 9,
+            result: Err(error),
+        })) = rx.recv().await
+        else {
+            panic!("expected the ordinary activity error path");
+        };
+        assert!(error.contains("no agent named"), "{error}");
+        assert!(
+            rx.recv().await.is_none(),
+            "no baseline or replay emitted after failure"
+        );
     }
 }

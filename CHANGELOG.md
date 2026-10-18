@@ -25,6 +25,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
+- Focused composer hints start with the target name, and compact outgoing messages keep light blank padding between the dark separator and body.
+
 - Compact agent conversations omit message headers and timestamps, with a dark separator above outgoing messages. Composer targets use a semantic orange color and key hints use a distinct italic style.
 
 - The `bbs connect` textbox has one blank row above its hint, using the same themed surface while keeping the text area and scrolling unchanged (#89).

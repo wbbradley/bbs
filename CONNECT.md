@@ -85,8 +85,8 @@ server unless its harness sets `share_activity = false` (see Server changes).
 Agent conversations default to compact view, showing direct messages between
 that agent and the connected human, without message headers or timestamps.
 The connected human's outgoing messages have a lighter background and one
-blank row below. Compact view puts a conversation-background separator above
-the body; verbose view keeps its header and lighter blank row above.
+blank row above and below the body. Compact view puts a conversation-background
+separator above that padding; verbose view keeps its header.
 The toggle works while writing and while navigating, preserving the draft,
 cursor and focus. `Ctrl-t` toggles verbose view with the agent's other messages
 and activity; returning to verbose restores the previous `A` and `E` filters.
@@ -157,8 +157,8 @@ and Home/End work everywhere too.
   `Ctrl-p`/`Ctrl-n` previous and next line. `Enter` sends;
   `Alt-Enter` (or `Ctrl-j`) inserts a newline.
 
-The composer's target agent or group uses the theme's Target color (orange in
-Gruvbox); key hints use a distinct italic KeyHint style.
+The focused composer hint starts with the target agent or group, using the
+theme's Target color (orange in Gruvbox); key hints use a distinct italic KeyHint style.
 In compact agent conversations, the hint's right edge shows recent stream
 activity: a Braille glyph advances on each new event, a check marks an explicit
 turn end, and `?` means unknown. History replay and duplicate events do not

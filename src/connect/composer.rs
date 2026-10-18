@@ -224,7 +224,6 @@ impl Composer {
             (Some(e), ..) => Line::from(format!(" Not sent: {e} ")),
             (None, true, _) => Line::from(" Sending… "),
             (None, false, true) => Line::from(vec![
-                Span::raw(" To "),
                 target(),
                 keys(if agent {
                     " · Enter sends · PgUp scroll · Esc back "
@@ -383,7 +382,7 @@ mod tests {
                         assert_eq!(buffer[(x, 0)].bg, screen.bg.unwrap());
                     }
                     let title: String = (0..24).map(|x| buffer[(x, 1)].symbol()).collect();
-                    assert!(title.contains(if focused { "To Mateo" } else { "Navigation" }));
+                    assert!(title.contains(if focused { "Mateo" } else { "Navigation" }));
                     assert_eq!(composer.area, Rect::new(0, 2, 24, 6));
                     assert_eq!(
                         composer.text.lines(),
@@ -463,15 +462,9 @@ mod tests {
                         assert_eq!(buffer[(keys_x, 1)].bg, keys.bg.unwrap());
                         assert!(buffer[(keys_x, 1)].modifier.contains(Modifier::ITALIC));
                         if focused {
-                            let prefix = title.find("To ").unwrap() as u16;
-                            assert_eq!(
-                                buffer[(prefix, 1)].fg,
-                                theme::style(theme::Role::Text)
-                                    .fg
-                                    .or(theme::base().fg)
-                                    .unwrap()
-                            );
-                            assert!(!buffer[(prefix, 1)].modifier.contains(Modifier::ITALIC));
+                            assert!(title.starts_with(to), "{title}");
+                            assert_eq!(target_x, 0);
+                            assert!(!title.contains("To "));
                         }
                     }
                 }

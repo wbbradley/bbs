@@ -1066,7 +1066,7 @@ mod tests {
     fn the_composer_sends_to_the_agent_and_empties_on_success() {
         let (mut app, mut rx) = app();
         let id = mateo(&mut app, &mut rx);
-        assert!(screen(&mut app, 80, 24).contains("To Mateo · Enter sends"));
+        assert!(screen(&mut app, 80, 24).contains("Mateo · Enter sends"));
         // Keys are text now: q does not go back.
         for c in "quick".chars() {
             assert!(!key(&mut app, c));
@@ -1076,7 +1076,7 @@ mod tests {
             key(&mut app, c);
         }
         let out = screen(&mut app, 80, 24);
-        assert!(out.contains("To Mateo · Enter sends"), "{out}");
+        assert!(out.contains("Mateo · Enter sends"), "{out}");
         assert!(out.contains("quick") && out.contains("note"), "{out}");
         enter(&mut app);
         let Request::Send { id: sent, req } = rx.try_recv().unwrap() else {
@@ -1109,14 +1109,14 @@ mod tests {
                 .map(|id| message(id, "Zed", "Mateo", &format!("message {id}")))
                 .collect()),
         }));
-        assert!(screen(&mut app, 100, 24).contains("To Mateo · Enter sends"));
+        assert!(screen(&mut app, 100, 24).contains("Mateo · Enter sends"));
         typed(&mut app, "first");
         press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
         typed(&mut app, "second");
         // Up from either line stays in the editor, including at its top.
         for _ in 0..3 {
             press(&mut app, KeyCode::Up, KeyModifiers::NONE);
-            assert!(screen(&mut app, 100, 24).contains("To Mateo · Enter sends"));
+            assert!(screen(&mut app, 100, 24).contains("Mateo · Enter sends"));
         }
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         let out = screen(&mut app, 100, 24);
@@ -1140,7 +1140,7 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         let out = screen(&mut app, 100, 24);
         assert!(
-            out.contains("To Mateo · Enter sends")
+            out.contains("Mateo · Enter sends")
                 && out.contains("first")
                 && out.contains("second"),
             "{out}"
@@ -1163,7 +1163,7 @@ mod tests {
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         let out = screen(&mut app, 100, 24);
         assert!(
-            out.contains("To Mateo · Enter sends")
+            out.contains("Mateo · Enter sends")
                 && out.contains("PgUp scroll")
                 && !out.contains("Navigation"),
             "{out}"
@@ -1360,7 +1360,7 @@ mod tests {
         let rows = |app: &mut App| {
             screen(app, 80, 30)
                 .lines()
-                .skip_while(|l| !l.contains("To Mateo · Enter sends"))
+                .skip_while(|l| !l.contains("Mateo · Enter sends"))
                 .skip(1)
                 .take_while(|l| !l.starts_with('╚'))
                 .count()
@@ -1666,7 +1666,7 @@ mod tests {
         let hint_cell = |app: &mut App| {
             screen(app, 100, 24)
                 .lines()
-                .find(|line| line.contains("To Mateo"))
+                .find(|line| line.contains("Mateo · Enter sends"))
                 .unwrap()
                 .chars()
                 .nth(98)
@@ -1892,7 +1892,7 @@ mod tests {
             );
             assert!((1..99).all(|x| buffer[(x, y)].bg == buffer[(98, y)].bg));
             if shaded {
-                for padding in [y - if compact { 1 } else { 2 }, y + 1] {
+                for padding in [y - 2, y + 1] {
                     assert!((1..99).all(|x| {
                         buffer[(x, padding)].bg
                             == theme::style(if compact && padding < y {
@@ -1904,6 +1904,11 @@ mod tests {
                             .unwrap()
                             && buffer[(x, padding)].symbol() == " "
                     }));
+                }
+                if compact {
+                    assert!((1..99).all(|x| buffer[(x, y - 1)].bg
+                        == theme::style(theme::Role::HumanSurface).bg.unwrap()
+                        && buffer[(x, y - 1)].symbol() == " "));
                 }
             }
         };
@@ -1992,7 +1997,7 @@ mod tests {
         assert!(
             out.contains("Cannot save view preference")
                 && out.contains("draft")
-                && out.contains("To Mateo · Enter sends"),
+                && out.contains("Mateo · Enter sends"),
             "{out}"
         );
         assert!(!app.ctx.preferences.compact());
@@ -2075,10 +2080,10 @@ mod tests {
         press(&mut app, KeyCode::Left, KeyModifiers::NONE);
         press(&mut app, KeyCode::Left, KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(screen(&mut app, 120, 24).contains("To Mateo · Enter sends"));
+        assert!(screen(&mut app, 120, 24).contains("Mateo · Enter sends"));
         typed(&mut app, "X");
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(screen(&mut app, 120, 24).contains("To Mateo · Enter sends"));
+        assert!(screen(&mut app, 120, 24).contains("Mateo · Enter sends"));
         typed(&mut app, "Y");
         enter(&mut app);
         let Request::Send { req, .. } = rx.try_recv().unwrap() else {

@@ -73,6 +73,9 @@ impl Row for Entry {
                     message_lines(message, gap, query)
                 };
                 if *outgoing {
+                    if *compact {
+                        lines.insert(1 + usize::from(gap || *raw_gap), Line::default());
+                    }
                     for line in &mut lines {
                         line.style = theme::style(theme::Role::HumanSurface).patch(line.style);
                     }
@@ -335,7 +338,12 @@ impl Stream {
 mod tests {
     use super::*;
     use crate::ui::thread::ThreadView;
-    use ratatui::{Terminal, backend::TestBackend, style::Modifier, widgets::Block};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        style::Modifier,
+        widgets::{Block, Paragraph, Wrap},
+    };
 
     #[test]
     fn progress_tracks_only_new_current_subscription_events_regardless_of_filters() {
@@ -425,11 +433,12 @@ mod tests {
                     compact,
                     gap: false,
                 };
-                let outgoing = make(
-                    2,
-                    true,
-                    "**needle** followed by enough words to wrap across several full rendered rows.\n\n`code` and [link](https://example.com)",
-                );
+                let body = "**needle** followed by enough words to wrap across several full rendered rows.\n\n`code` and [link](https://example.com)";
+                let outgoing = make(2, true, body);
+                let incoming = make(2, false, body);
+                let incoming_height = Paragraph::new(incoming.lines(false, None))
+                    .wrap(Wrap { trim: false })
+                    .line_count(width);
                 let raw_lines = outgoing.lines(false, None).len();
                 let mut view = ThreadView::new(
                     vec![make(1, false, "before"), outgoing, make(3, false, "after")],
@@ -446,6 +455,13 @@ mod tests {
                 let start = view.frame.starts[1] as u16;
                 let end = view.frame.starts[2] as u16;
                 assert!(usize::from(end - start) > raw_lines, "body must wrap");
+                if compact {
+                    assert_eq!(
+                        usize::from(end - start),
+                        incoming_height + 2,
+                        "compact outgoing adds one light row above and below the body"
+                    );
+                }
                 let buffer = terminal.backend().buffer();
                 for y in 0..60 {
                     for x in 0..width {
@@ -469,6 +485,13 @@ mod tests {
                 }
                 for y in [start, end - 1] {
                     assert!((0..width).all(|x| buffer[(x, y)].symbol() == " "));
+                }
+                if compact {
+                    assert!((0..width).all(|x| buffer[(x, start + 1)].symbol() == " "));
+                    let first_body: String = (0..width)
+                        .map(|x| buffer[(x, start + 2)].symbol())
+                        .collect();
+                    assert!(first_body.contains("needle"));
                 }
                 if !compact {
                     assert_eq!(
@@ -500,6 +523,19 @@ mod tests {
                     } else {
                         human.bg.unwrap()
                     }));
+                if compact {
+                    view.scroll_to(usize::from(start) + 1);
+                    terminal
+                        .draw(|frame| {
+                            frame.render_widget(Block::new().style(theme::base()), frame.area());
+                            view.render(frame, frame.area());
+                        })
+                        .unwrap();
+                    assert!((0..width).all(|x| {
+                        let cell = &terminal.backend().buffer()[(x, 0)];
+                        cell.symbol() == " " && cell.bg == human.bg.unwrap()
+                    }));
+                }
                 view.scroll_to(usize::from(start) + 2);
                 terminal
                     .draw(|frame| {
