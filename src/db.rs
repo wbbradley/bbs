@@ -477,13 +477,21 @@ pub fn set_status(conn: &Connection, id: i64, status: &str, now: &str) -> Result
 
 pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<AgentRow>> {
     // last_sent_at is the newest server-stamped message or activity the agent
-    // sent; both subqueries are index-backed (messages_sender, activity_agent).
+    // sent. Ids grow with server time, so each source's newest row comes from
+    // one bounded index walk (messages_sender, activity_agent), not a scan of
+    // the sender's history.
     let mut stmt = conn.prepare(
         "SELECT a.id, a.name, a.status, a.pwd, a.hostname, a.active_at, a.retired_at, h.name,
                 (SELECT MAX(created_at) FROM (
-                   SELECT created_at FROM messages WHERE from_kind = 'agent' AND from_id = a.id
+                   SELECT created_at FROM (
+                     SELECT created_at FROM messages
+                     WHERE from_kind = 'agent' AND from_id = a.id
+                     ORDER BY id DESC LIMIT 1)
                    UNION ALL
-                   SELECT created_at FROM activity WHERE agent_id = a.id))
+                   SELECT created_at FROM (
+                     SELECT created_at FROM activity
+                     WHERE agent_id = a.id
+                     ORDER BY id DESC LIMIT 1)))
          FROM agents a
          LEFT JOIN agent_owners o ON o.agent_id = a.id
          LEFT JOIN humans h ON h.id = o.human_id
@@ -857,10 +865,15 @@ const AGENT_SUMMARIES: &str = "
                 WHERE act.agent_id = g.id AND act.id > coalesce(s.seen_id, 0)
                 ORDER BY act.id LIMIT 1) AS unseen_oldest,
                (SELECT MAX(created_at) FROM (
-                   SELECT created_at FROM messages
-                   WHERE from_kind = 'agent' AND from_id = g.id
+                   SELECT created_at FROM (
+                     SELECT created_at FROM messages
+                     WHERE from_kind = 'agent' AND from_id = g.id
+                     ORDER BY id DESC LIMIT 1)
                    UNION ALL
-                   SELECT created_at FROM activity WHERE agent_id = g.id)) AS last_sent
+                   SELECT created_at FROM (
+                     SELECT created_at FROM activity
+                     WHERE agent_id = g.id
+                     ORDER BY id DESC LIMIT 1))) AS last_sent
         FROM agents g
         LEFT JOIN activity_seen s ON s.human_id = ?1 AND s.agent_id = g.id
         LEFT JOIN unread u ON u.agent_id = g.id
