@@ -729,6 +729,10 @@ mod tests {
         let mut old = agent("Old", "ada", &["crew"]);
         old.active_at = "2026-07-06T13:00:00Z".into();
         agents.push(old);
+        // An unknown active time renders a dash, not an age.
+        let mut blank = agent("Blank", "ada", &["crew"]);
+        blank.active_at = String::new();
+        agents.push(blank);
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
             agents,
@@ -820,6 +824,15 @@ mod tests {
                 .collect();
             let cell: String = row[active..active + 11].iter().collect::<String>().trim().to_string();
             assert_eq!(cell, "103d23h ago", "{out}");
+            // An unknown active time renders a dash.
+            let row: Vec<_> = out
+                .lines()
+                .find(|line| line.contains("Blank"))
+                .unwrap()
+                .chars()
+                .collect();
+            let cell: String = row[active..active + 11].iter().collect::<String>().trim().to_string();
+            assert_eq!(cell, "-", "{out}");
         }
     }
 
