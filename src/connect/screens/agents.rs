@@ -2,6 +2,7 @@
 //! Those with mail to the viewer unread come first, then those with activity
 //! unseen, each oldest first.
 
+use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::Modifier;
@@ -17,7 +18,7 @@ use crate::connect::event::{Data, Request};
 use crate::connect::keys::Action;
 use crate::connect::theme;
 use crate::proto;
-use crate::ui::message::local_time;
+use crate::ui::message::age;
 
 pub struct Agents {
     /// The summary stream.
@@ -31,6 +32,8 @@ pub struct Agents {
     selected: Option<String>,
     /// Everyone's agents rather than only the viewer's.
     all: bool,
+    /// A fixed render time for tests; live renders use the current time.
+    now: Option<DateTime<Local>>,
     state: TableState,
     /// Rows in view at the last draw, for paging.
     page: usize,
@@ -44,6 +47,7 @@ impl Default for Agents {
             summaries: HashMap::new(),
             selected: None,
             all: false,
+            now: None,
             state: TableState::default(),
             page: 0,
         }
@@ -51,6 +55,12 @@ impl Default for Agents {
 }
 
 impl Agents {
+    /// Fix the render time for tests.
+    #[cfg(test)]
+    pub fn set_now(&mut self, now: DateTime<Local>) {
+        self.now = Some(now);
+    }
+
     fn summary(&self, agent: &str) -> Option<&proto::AgentSummary> {
         self.summaries.get(&agent.to_lowercase())
     }
@@ -105,6 +115,11 @@ fn pending(count: u32, marker: char) -> String {
 }
 
 impl Screen for Agents {
+    #[cfg(test)]
+    fn as_agents_mut(&mut self) -> Option<&mut Agents> {
+        Some(self)
+    }
+
     fn title(&self) -> String {
         "Agents".into()
     }
@@ -197,17 +212,28 @@ impl Screen for Agents {
             frame.render_widget(Paragraph::new(line), inner);
             return;
         }
+        // One render time for every row in the frame.
+        let now = self.now.unwrap_or_else(Local::now);
+        let ages: Vec<String> = shown.iter().map(|a| age(&a.active_at, now)).collect();
         // Keep both counts and a readable status at the minimum terminal width.
         // AGENT fits the whole random name pool; OWNER fits most human names.
+        // ACTIVE fits the widest rendered age ("103d23h ago" is 11), at the
+        // header's 6 minimum and at most 14 so STATUS keeps 10 columns.
+        let active_width = ages
+            .iter()
+            .map(|a| a.len())
+            .max()
+            .unwrap_or(6)
+            .clamp(6, 14) as u16;
         let groups_width = inner
             .width
-            .saturating_sub(10 + 9 + 5 + 8 + 19 + 10 + 6)
+            .saturating_sub(10 + 9 + 5 + 8 + active_width + 10 + 6)
             .clamp(11, 16);
         let status_width = inner
             .width
-            .saturating_sub(10 + 9 + 5 + 8 + groups_width + 19 + 6)
+            .saturating_sub(10 + 9 + 5 + 8 + groups_width + active_width + 6)
             as usize;
-        let rows = shown.iter().map(|a| {
+        let rows = shown.iter().zip(&ages).map(|(a, age)| {
             let owner = a.owner.as_deref().unwrap_or("?");
             let author_style = if owner == ctx.me {
                 theme::style(theme::Role::OwnAgent)
@@ -232,7 +258,7 @@ impl Screen for Agents {
                     theme::heading(),
                 ),
                 Line::raw(fit_list(&a.groups, groups_width as usize)),
-                Line::raw(local_time(&a.active_at)),
+                Line::raw(age.clone()),
                 Line::raw(fit(a.status.as_deref().unwrap_or_default(), status_width)),
             ])
         });
@@ -244,7 +270,7 @@ impl Screen for Agents {
                 Constraint::Length(5),
                 Constraint::Length(8),
                 Constraint::Length(groups_width),
-                Constraint::Length(19),
+                Constraint::Length(active_width),
                 Constraint::Min(10),
             ],
         )
