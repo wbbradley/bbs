@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- Ctrl-G jumps to the conversation with the oldest unread direct message to the
+  connected human. Ctrl-O cycles through unique visited conversations while
+  preserving drafts and pending sends. A mailbox beside the conversation spinner
+  signals unread mail from another agent.
+
 ### Changed
 
 - Apply consistent categorical styles to agent and human names, groups, timestamps

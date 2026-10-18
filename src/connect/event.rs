@@ -139,6 +139,11 @@ pub enum Data {
         id: u64,
         result: Result<(), String>,
     },
+    /// Completion of an actual read request, for the local summary fence.
+    MarkedRead {
+        agent: String,
+        result: Result<(), String>,
+    },
     /// What a group change did, for the screen `id`.
     Admin {
         id: u64,
@@ -218,13 +223,14 @@ pub async fn serve(
                 }
                 Data::Groups(backend.group_list().await.map_err(error))
             }
-            Request::MarkRead(from) => {
-                // A failure leaves the mail unread, to be marked on a later view.
-                if let Err(err) = backend.mark_read(proto::MarkReadRequest { from }).await {
-                    tracing::warn!("marking mail read: {err:#}");
-                }
-                continue;
-            }
+            Request::MarkRead(from) => Data::MarkedRead {
+                agent: from.clone(),
+                result: backend
+                    .mark_read(proto::MarkReadRequest { from })
+                    .await
+                    .map(drop)
+                    .map_err(error),
+            },
             Request::MarkSeen { agent, through_id } => {
                 let req = proto::MarkSeenRequest { agent, through_id };
                 if let Err(err) = backend.mark_seen(req).await {
@@ -463,6 +469,30 @@ mod tests {
             agent: Some("Mateo".into()),
         };
         (dir, conn, opener, req)
+    }
+
+    #[tokio::test]
+    async fn read_requests_report_real_backend_completion_to_the_app() {
+        let (_dir, _conn, opener, _) = board();
+        let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
+            .await
+            .unwrap();
+        let (requests, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
+        requests.send(Request::MarkRead("Mateo".into())).unwrap();
+        requests.send(Request::MarkRead("missing".into())).unwrap();
+        drop(requests);
+        serve(backend, opener, rx, events).await;
+        let Some(Event::Data(Data::MarkedRead { agent, result })) = replies.recv().await else {
+            panic!("read acknowledgement")
+        };
+        assert_eq!(agent, "Mateo");
+        assert!(result.is_ok());
+        let Some(Event::Data(Data::MarkedRead { agent, result })) = replies.recv().await else {
+            panic!("read error")
+        };
+        assert_eq!(agent, "missing");
+        assert!(result.unwrap_err().contains("no such agent or human"));
     }
 
     #[tokio::test]

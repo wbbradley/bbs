@@ -14,6 +14,10 @@ use crate::connect::theme;
 pub struct Splash;
 
 impl Screen for Splash {
+    fn navigation_blocked(&self) -> bool {
+        true
+    }
+
     fn title(&self) -> String {
         "Connecting".into()
     }

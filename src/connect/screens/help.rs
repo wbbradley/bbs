@@ -32,6 +32,10 @@ pub struct Help {
 }
 
 impl Screen for Help {
+    fn navigation_blocked(&self) -> bool {
+        true
+    }
+
     fn title(&self) -> String {
         "Help".into()
     }

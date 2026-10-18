@@ -22,6 +22,10 @@ pub struct GroupAdmin {
 }
 
 impl GroupAdmin {
+    pub fn is_open(&self) -> bool {
+        self.dialog.is_some()
+    }
+
     /// Open the dialog for `op` on `group`; creating needs none.
     pub fn open(&mut self, op: GroupOp, group: Option<&proto::Group>) {
         let name = group.map(|g| g.name.clone()).unwrap_or_default();

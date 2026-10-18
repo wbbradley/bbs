@@ -5,6 +5,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    NextUnread,
+    PreviousConversation,
     Up,
     Down,
     Top,
@@ -61,6 +63,16 @@ pub struct Binding {
 }
 
 pub const BINDINGS: &[Binding] = &[
+    Binding {
+        keys: &[Key::Ctrl('g')],
+        action: Action::NextUnread,
+        help: "oldest unread agent mail (outside prompts/dialogs)",
+    },
+    Binding {
+        keys: &[Key::Ctrl('o')],
+        action: Action::PreviousConversation,
+        help: "previous conversation; unique history wraps",
+    },
     Binding {
         keys: &[Key::Char('j'), Key::Code(KeyCode::Down)],
         action: Action::Down,

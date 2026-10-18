@@ -324,6 +324,12 @@ impl Thread {
                     .and_then(|s| s.error.as_ref())
                     .map(|e| ("activity error", format!("activity: {e}")))
             });
+        let issue = issue.or_else(|| {
+            ctx.inbox
+                .error
+                .as_ref()
+                .map(|e| ("inbox error", format!("Inbox unavailable: {e}")))
+        });
         let error_style = issue.as_ref().map(|_| theme::error()).unwrap_or_default();
         if let Some(prompt) = &self.prompt {
             if let Some((badge, _)) = &issue {
@@ -342,6 +348,13 @@ impl Thread {
                 format!("{mode} · {}", fit_status(&message, available, false)),
                 error_style,
             );
+        }
+        if let Some(notice) = &ctx.navigation_notice {
+            let available = width.saturating_sub(mode.width() + 3);
+            return Line::raw(format!(
+                "{mode} · {}",
+                fit_status(notice.text(), available, false)
+            ));
         }
         let hints = |short: bool| {
             let mut parts = Vec::new();
@@ -509,6 +522,41 @@ fn describe(error: &str) -> String {
 }
 
 impl Screen for Thread {
+    fn is_thread(&self) -> bool {
+        true
+    }
+
+    fn conversation(&self) -> Option<crate::connect::navigation::Conversation> {
+        use crate::connect::navigation::Conversation;
+        self.agent
+            .as_ref()
+            .map(|a| Conversation::Agent(a.clone()))
+            .or_else(|| {
+                self.group
+                    .as_ref()
+                    .map(|(g, _)| Conversation::Group(g.name.clone()))
+            })
+    }
+
+    fn navigation_blocked(&self) -> bool {
+        self.prompt.is_some()
+            || self
+                .group
+                .as_ref()
+                .is_some_and(|(_, admin)| admin.is_open())
+    }
+
+    fn unread_mail(&self) -> Option<(String, i64)> {
+        let agent = self.agent.as_ref()?;
+        let through = self
+            .messages
+            .iter()
+            .filter(|m| m.read_at.is_none() && self.direct_to_human(m))
+            .map(|m| m.id)
+            .max()?;
+        Some((agent.clone(), through))
+    }
+
     fn title(&self) -> String {
         self.title.clone()
     }
@@ -552,7 +600,16 @@ impl Screen for Thread {
             .stream
             .as_ref()
             .map(|s| s.progress((self.now)()).indicator());
-        let text_width = width.saturating_sub(if indicator.is_some() { 2 } else { 0 });
+        let mailbox = self
+            .agent
+            .as_ref()
+            .is_some_and(|agent| ctx.inbox.other_mail(agent));
+        let reserved = if indicator.is_some() {
+            if mailbox { 4 } else { 2 }
+        } else {
+            0
+        };
+        let text_width = width.saturating_sub(reserved);
         let mut line = self.conversation_status(text_width, ctx, draft_error);
         if let Some(mut indicator) = indicator
             && width > 0
@@ -560,9 +617,13 @@ impl Screen for Thread {
             indicator.style =
                 ratatui::style::Style::reset().patch(theme::style(theme::Role::StatusBar));
             line = theme::clip_line(line, usize::from(text_width));
-            let padding = usize::from(width - 1).saturating_sub(line.width());
-            line.spans
-                .extend([Span::raw(" ".repeat(padding)), indicator]);
+            let suffix = if mailbox && width >= 4 { "✉ " } else { "" };
+            let padding = usize::from(width - 1).saturating_sub(line.width() + suffix.width());
+            line.spans.push(Span::raw(" ".repeat(padding)));
+            if !suffix.is_empty() {
+                line.spans.push(Span::styled(suffix, indicator.style));
+            }
+            line.spans.push(indicator);
         }
         Some(line)
     }
@@ -682,13 +743,6 @@ impl Screen for Thread {
             return Vec::new();
         };
         let mut requests = Vec::new();
-        let unread = self
-            .messages
-            .iter()
-            .any(|m| m.read_at.is_none() && self.direct_to_human(m));
-        if unread {
-            requests.push(Request::MarkRead(agent.clone()));
-        }
         if let Some(newest) = self.stream.as_ref().and_then(Stream::newest)
             && newest > self.seen
         {

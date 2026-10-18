@@ -1,10 +1,10 @@
 //! The app: a stack of screens under a shared title bar and status bar.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::KeyEvent;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -14,10 +14,12 @@ use super::composer::Composer;
 use super::drafts::{Draft, DraftStore};
 use super::event::{Data, Event, Request};
 use super::keys::{Action, Keymap};
+use super::navigation::{Conversation, Feedback, History, Inbox};
 use super::preferences::Preferences;
 use super::screens::help::Help;
 use super::screens::menu::Menu;
 use super::screens::splash::Splash;
+use super::screens::thread::Thread;
 use super::theme;
 
 /// A fresh id for a screen, stream or send request.
@@ -38,6 +40,8 @@ pub struct Ctx {
     pub preferences: Preferences,
     /// The clock for activity freshness and animation; tests pin it.
     pub now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
+    pub inbox: Inbox,
+    pub navigation_notice: Option<Feedback>,
 }
 
 pub enum Transition {
@@ -58,6 +62,18 @@ pub trait Screen {
     fn title(&self) -> String;
     fn title_line(&self) -> Line<'static> {
         Line::raw(self.title())
+    }
+    fn conversation(&self) -> Option<Conversation> {
+        None
+    }
+    fn is_thread(&self) -> bool {
+        false
+    }
+    fn navigation_blocked(&self) -> bool {
+        false
+    }
+    fn unread_mail(&self) -> Option<(String, i64)> {
+        None
     }
     /// A key press before the keymap sees it: `Some` when the screen took it,
     /// as the splash and a search prompt do.
@@ -122,6 +138,9 @@ pub struct App {
     requests: UnboundedSender<Request>,
     drafts: HashMap<String, Composer>,
     pub draft_store: DraftStore,
+    history: History,
+    known_agents: Option<HashSet<String>>,
+    known_groups: Option<HashSet<String>>,
 }
 
 impl App {
@@ -133,13 +152,32 @@ impl App {
             requests,
             drafts: HashMap::new(),
             draft_store: DraftStore::default(),
+            history: History::default(),
+            known_agents: None,
+            known_groups: None,
         };
+        app.send(vec![Request::WatchSummary(app.ctx.inbox.id)]);
         app.push(Box::new(Menu::default()));
         app.push(Box::new(Splash));
         app
     }
 
-    fn push(&mut self, mut screen: Box<dyn Screen>) {
+    fn push(&mut self, screen: Box<dyn Screen>) {
+        self.open(screen, true);
+    }
+
+    fn open(&mut self, mut screen: Box<dyn Screen>, record: bool) {
+        if let Some(target) = screen.conversation() {
+            if let Conversation::Agent(agent) = &target {
+                self.ctx.inbox.retry_failed(agent);
+            }
+            if self.stack.last().is_some_and(|s| s.is_thread()) {
+                self.pop();
+            }
+            if record {
+                self.history.visit(target);
+            }
+        }
         screen.restore_draft(&mut self.drafts, &mut self.draft_store);
         self.fetch(screen.as_ref());
         self.stack.push(screen);
@@ -173,8 +211,79 @@ impl App {
 
     fn viewed(&mut self) {
         let screen = self.stack.last_mut().expect("the menu is never popped");
-        let requests = screen.on_view(&self.ctx);
+        let unread = screen.unread_mail();
+        let mut requests = screen.on_view(&self.ctx);
+        if let Some((agent, through)) = unread
+            && self.ctx.inbox.begin_read(&agent, through)
+        {
+            requests.insert(0, Request::MarkRead(agent));
+        }
         self.send(requests);
+        let refresh = self.ctx.inbox.refresh_after_reads();
+        self.send(refresh);
+    }
+
+    fn jump(&mut self, oldest: bool) {
+        let target = if oldest {
+            if let Some(error) = &self.ctx.inbox.error {
+                self.ctx.navigation_notice =
+                    Some(Feedback::Summary(format!("Inbox unavailable: {error}")));
+                return;
+            }
+            if !self.ctx.inbox.loaded {
+                self.ctx.navigation_notice =
+                    Some(Feedback::Summary("Inbox summaries are loading.".into()));
+                return;
+            }
+            match self.ctx.inbox.oldest() {
+                Some(agent) => {
+                    self.ctx.inbox.retry_failed(&agent);
+                    Conversation::Agent(agent)
+                }
+                None => {
+                    self.ctx.navigation_notice =
+                        Some(Feedback::Summary("No unread agent messages.".into()));
+                    return;
+                }
+            }
+        } else {
+            let agents = &self.known_agents;
+            let groups = &self.known_groups;
+            match self.history.back(|target| match target {
+                Conversation::Agent(name) => agents
+                    .as_ref()
+                    .is_none_or(|a| a.contains(&name.to_ascii_lowercase())),
+                Conversation::Group(name) => groups
+                    .as_ref()
+                    .is_none_or(|g| g.contains(&name.to_ascii_lowercase())),
+            }) {
+                Some(target) => target,
+                None => {
+                    self.ctx.navigation_notice =
+                        Some(Feedback::Other("No conversation history.".into()));
+                    return;
+                }
+            }
+        };
+        self.ctx.navigation_notice = None;
+        if self
+            .stack
+            .last()
+            .and_then(|s| s.conversation())
+            .is_some_and(|c| c.same(&target))
+        {
+            return;
+        }
+        let screen = match &target {
+            Conversation::Agent(agent) => Thread::agent(
+                agent,
+                &self.ctx.me,
+                self.ctx.preferences.compact(),
+                self.ctx.now.clone(),
+            ),
+            Conversation::Group(group) => Thread::group(group),
+        };
+        self.open(Box::new(screen), oldest);
     }
 
     fn top(&mut self) -> &mut Box<dyn Screen> {
@@ -185,6 +294,17 @@ impl App {
     pub fn on_event(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('g' | 'o'))
+                {
+                    self.keymap = Keymap::default();
+                    if !self.top().navigation_blocked() {
+                        self.jump(key.code == KeyCode::Char('g'));
+                        self.viewed();
+                    }
+                    return false;
+                }
+                self.ctx.navigation_notice = None;
                 let quit = if let Some(transition) = self.top().raw_key(key) {
                     self.keymap = Keymap::default();
                     self.apply(transition)
@@ -201,6 +321,48 @@ impl App {
                 quit
             }
             Event::Data(data) => {
+                match &data {
+                    Data::Summary { id, result } if *id == self.ctx.inbox.id => {
+                        if let Ok(rows) = result {
+                            self.known_agents =
+                                Some(rows.iter().map(|s| s.agent.to_ascii_lowercase()).collect());
+                        }
+                        self.ctx.inbox.snapshot(*id, result);
+                        if matches!(self.ctx.navigation_notice, Some(Feedback::Summary(_))) {
+                            self.ctx.navigation_notice = None;
+                        }
+                    }
+                    Data::Agents(Ok(list)) => {
+                        self.known_agents = Some(
+                            list.agents
+                                .iter()
+                                .map(|a| a.name.to_ascii_lowercase())
+                                .collect(),
+                        );
+                    }
+                    Data::Groups(Ok(list)) => {
+                        self.known_groups = Some(
+                            list.groups
+                                .iter()
+                                .map(|g| g.name.to_ascii_lowercase())
+                                .collect(),
+                        );
+                    }
+                    Data::MarkedRead { agent, result } => {
+                        self.ctx.inbox.acknowledged(agent, result);
+                        if let Err(error) = result {
+                            self.ctx.navigation_notice = Some(Feedback::ReadError {
+                                agent: agent.clone(),
+                                text: format!("Could not mark mail read: {error}"),
+                            });
+                        } else if matches!(&self.ctx.navigation_notice,
+                            Some(Feedback::ReadError { agent: failed, .. }) if failed.eq_ignore_ascii_case(agent))
+                        {
+                            self.ctx.navigation_notice = None;
+                        }
+                    }
+                    _ => {}
+                }
                 if let Data::Sent { id, result } = &data {
                     for draft in self.drafts.values_mut() {
                         draft.sent(*id, result.clone());
@@ -235,6 +397,7 @@ impl App {
     }
 
     pub fn finish(&mut self) -> anyhow::Result<()> {
+        self.send(vec![Request::Unwatch(self.ctx.inbox.id)]);
         self.flush_drafts();
         if let Some(error) = self.draft_store.error() {
             anyhow::bail!("{error}");
@@ -244,6 +407,10 @@ impl App {
 
     fn on_action(&mut self, action: Action) -> bool {
         match action {
+            Action::NextUnread | Action::PreviousConversation => {
+                self.jump(action == Action::NextUnread);
+                return false;
+            }
             Action::Quit => return true,
             Action::Help => {
                 self.push(Box::new(Help::default()));
@@ -254,6 +421,8 @@ impl App {
                 self.send(screen.reload());
                 self.fetch(screen.as_ref());
                 self.stack.push(screen);
+                let refresh = self.ctx.inbox.restart();
+                self.send(refresh);
                 return false;
             }
             _ => {}
@@ -310,6 +479,21 @@ impl App {
                 status,
             );
         } else {
+            let notice = self
+                .ctx
+                .inbox
+                .error
+                .as_ref()
+                .map(|e| format!("Inbox unavailable: {e}"))
+                .or_else(|| {
+                    self.ctx
+                        .navigation_notice
+                        .as_ref()
+                        .map(|n| n.text().to_string())
+                });
+            let bar = notice
+                .map(|notice| theme::clip_line(Line::raw(notice), status.width as usize))
+                .unwrap_or(bar);
             frame.render_widget(
                 Paragraph::new(bar).style(theme::style(theme::Role::StatusBar)),
                 status,
@@ -345,6 +529,455 @@ mod tests {
                 each_dialog_makes_its_change_to_the_selected_group();
                 a_failed_send_keeps_the_text_and_says_why();
                 an_agents_timeline_merges_messages_and_activity_in_time_order();
+            });
+        }
+    }
+
+    #[test]
+    fn shared_summary_lives_across_screens_and_reload_fences_old_streams() {
+        let (mut app, mut rx) = app();
+        let summary = app.ctx.inbox.id;
+        open_agents(&mut app, &mut rx);
+        key(&mut app, 'q');
+        assert!(
+            rx.try_recv().is_err(),
+            "closing Agents keeps the one app subscription"
+        );
+        key(&mut app, 'f');
+        let (feed, _) = watched(&mut rx);
+        inbox_rows(&mut app, &[("Zed", 1, "2026-10-18T12:00:00Z")]);
+        ctrl(&mut app, 'g');
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(feed));
+        watched(&mut rx);
+        assert!(matches!(rx.try_recv(), Ok(Request::WatchActivity { .. })));
+        assert_eq!(
+            app.stack.len(),
+            2,
+            "Feed's stream is not hidden under the conversation"
+        );
+        assert!(rx.try_recv().is_err());
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, 'r');
+        let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| matches!(r, Request::WatchSummary(_)))
+                .count(),
+            1
+        );
+        assert!(requests.contains(&Request::Unwatch(summary)));
+        let generation = app.ctx.inbox.id;
+        assert_ne!(summary, generation);
+        app.on_event(Event::Data(Data::Summary {
+            id: summary,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "old".into(),
+                unread_messages: 1,
+                oldest_unread_message: Some("2026-10-18T10:00:00Z".into()),
+                ..Default::default()
+            }]),
+        }));
+        assert!(!app.ctx.inbox.loaded);
+        app.on_event(Event::Data(Data::Summary {
+            id: generation,
+            result: Err("offline".into()),
+        }));
+        ctrl(&mut app, 'g');
+        assert!(bottom(&mut app).contains("Inbox unavailable"));
+        assert_eq!(opened(&app), Some(Conversation::Agent("Zed".into())));
+        assert!(
+            rx.try_recv().is_err(),
+            "failure does not poll/reconnect itself"
+        );
+        key(&mut app, 'r');
+        while rx.try_recv().is_ok() {}
+        inbox_rows(&mut app, &[]);
+        ctrl(&mut app, 'g');
+        assert!(bottom(&mut app).contains("No unread agent messages"));
+        assert!(rx.try_recv().is_err());
+        app.finish().unwrap();
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(app.ctx.inbox.id));
+    }
+
+    #[test]
+    fn app_read_acknowledgments_coalesce_without_losing_fresh_unread_mail() {
+        let (mut app, mut rx) = app();
+        let rows = [
+            ("A", 1, "2026-10-18T12:00:00Z"),
+            ("B", 1, "2026-10-18T12:00:01Z"),
+        ];
+        inbox_rows(&mut app, &rows);
+        ctrl(&mut app, 'g');
+        let (feed_a, _) = watched(&mut rx);
+        rx.try_recv().unwrap();
+        app.on_event(Event::Data(Data::Feed {
+            id: feed_a,
+            result: Ok(vec![message(11, "A", "ada", "one")]),
+        }));
+        assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("A".into()));
+        ctrl(&mut app, 'g');
+        assert_eq!(opened(&app), Some(Conversation::Agent("B".into())));
+        rx.try_recv().unwrap();
+        rx.try_recv().unwrap();
+        let (feed_b, _) = watched(&mut rx);
+        rx.try_recv().unwrap();
+        app.on_event(Event::Data(Data::Feed {
+            id: feed_b,
+            result: Ok(vec![message(12, "B", "ada", "two")]),
+        }));
+        assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("B".into()));
+        let old = app.ctx.inbox.id;
+        app.on_event(Event::Data(Data::MarkedRead {
+            agent: "A".into(),
+            result: Ok(()),
+        }));
+        assert!(
+            rx.try_recv().is_err(),
+            "wait for outstanding B acknowledgement"
+        );
+        inbox_rows(&mut app, &rows); // queued stale snapshot from the old generation
+        ctrl(&mut app, 'g');
+        assert_eq!(opened(&app), Some(Conversation::Agent("B".into())));
+        assert!(rx.try_recv().is_err());
+        app.on_event(Event::Data(Data::MarkedRead {
+            agent: "B".into(),
+            result: Ok(()),
+        }));
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(old));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Request::WatchSummary(app.ctx.inbox.id)
+        );
+        for _ in 0..3 {
+            key(&mut app, 'x');
+            app.on_event(Event::Tick);
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "stale local unread rows cause no repeat requests"
+        );
+        // A's next unread message can even have the same timestamp as before.
+        inbox_rows(&mut app, &[rows[0], ("B", 0, "")]);
+        ctrl(&mut app, 'g');
+        assert_eq!(opened(&app), Some(Conversation::Agent("A".into())));
+        while rx.try_recv().is_ok() {}
+        // Queued batches for the closed A subscription must not mark anything.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed_a,
+            result: Ok(vec![message(13, "A", "ada", "late")]),
+        }));
+        assert!(rx.try_recv().is_err());
+        let requests = app.top().requests();
+        let Request::Watch { id: new_a, .. } = requests[0] else {
+            panic!("feed")
+        };
+        app.on_event(Event::Data(Data::Feed {
+            id: new_a,
+            result: Ok(vec![message(13, "A", "ada", "new")]),
+        }));
+        assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("A".into()));
+        app.on_event(Event::Data(Data::MarkedRead {
+            agent: "A".into(),
+            result: Err("offline".into()),
+        }));
+        assert!(
+            rx.try_recv().is_err(),
+            "failure does not hot-loop on the stale unread row"
+        );
+        assert!(bottom(&mut app).contains("Could not mark"));
+        key(&mut app, 'z');
+        assert!(rx.try_recv().is_err());
+        ctrl(&mut app, 'g');
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Request::MarkRead("A".into()),
+            "explicit retry is allowed"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn group_discussions_participate_in_history_and_keep_their_own_draft_cursor() {
+        let (mut app, mut rx) = app();
+        crew_list(&mut app, &mut rx);
+        enter(&mut app);
+        let (group, _) = watched(&mut rx);
+        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+        key(&mut app, 'i');
+        typed(&mut app, "group draft");
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        inbox_rows(&mut app, &[("Zed", 1, "2026-10-18T12:00:00Z")]);
+        ctrl(&mut app, 'g');
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(group));
+        watched(&mut rx);
+        rx.try_recv().unwrap();
+        typed(&mut app, "agent draft");
+        ctrl(&mut app, 'o');
+        rx.try_recv().unwrap();
+        rx.try_recv().unwrap();
+        let (_, req) = watched(&mut rx);
+        assert_eq!(req.group.as_deref(), Some("crew"));
+        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+        assert_eq!(opened(&app), Some(Conversation::Group("crew".into())));
+        key(&mut app, 'i');
+        typed(&mut app, "X");
+        enter(&mut app);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("send")
+        };
+        assert_eq!(req.body, "group drafXt");
+        assert_eq!(req.to, "@crew");
+        assert_eq!(app.stack.len(), 3, "menu, Groups and exactly one thread");
+    }
+
+    fn inbox_rows(app: &mut App, rows: &[(&str, u32, &str)]) {
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id,
+            result: Ok(rows
+                .iter()
+                .map(|(agent, count, time)| proto::AgentSummary {
+                    agent: (*agent).into(),
+                    unread_messages: *count,
+                    oldest_unread_message: (*count > 0).then(|| (*time).into()),
+                    ..Default::default()
+                })
+                .collect()),
+        }));
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        press(app, KeyCode::Char(c), KeyModifiers::CONTROL);
+    }
+
+    fn opened(app: &App) -> Option<Conversation> {
+        app.stack.last().unwrap().conversation()
+    }
+
+    #[test]
+    fn unread_jumps_are_global_and_current_target_is_not_reopened_before_feed_arrives() {
+        let (mut app, mut rx) = app();
+        ctrl(&mut app, 'g');
+        assert!(bottom(&mut app).contains("loading"));
+        inbox_rows(
+            &mut app,
+            &[
+                ("Zed", 1, "2026-10-18T12:00:00Z"),
+                ("Mateo", 1, "2026-10-18T12:01:00Z"),
+            ],
+        );
+        ctrl(&mut app, 'g');
+        assert_eq!(opened(&app), Some(Conversation::Agent("Zed".into())));
+        let (feed, req) = watched(&mut rx);
+        assert_eq!(
+            req.with.as_deref(),
+            Some("Zed"),
+            "not limited to the connected human's agents"
+        );
+        assert!(matches!(rx.try_recv(), Ok(Request::WatchActivity { .. })));
+        typed(&mut app, "abc");
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        ctrl(&mut app, 'g');
+        assert!(
+            rx.try_recv().is_err(),
+            "selection alone issues no mark or replacement streams"
+        );
+        assert_eq!(app.stack.len(), 2);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(10, "Zed", "ada", "mail")]),
+        }));
+        assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("Zed".into()));
+        ctrl(&mut app, 'g');
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        assert!(matches!(rx.try_recv(),Ok(Request::Unwatch(id)) if id==feed));
+        assert!(matches!(rx.try_recv(), Ok(Request::Unwatch(_))));
+        watched(&mut rx);
+        assert!(matches!(rx.try_recv(), Ok(Request::WatchActivity { .. })));
+        assert!(rx.try_recv().is_err());
+        ctrl(&mut app, 'o');
+        assert_eq!(opened(&app), Some(Conversation::Agent("Zed".into())));
+        while rx.try_recv().is_ok() {}
+        typed(&mut app, "X");
+        enter(&mut app);
+        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+            panic!("send")
+        };
+        assert_eq!(req.body, "abXc", "draft and cursor survive keyboard jumps");
+        assert_eq!(app.stack.len(), 2, "no duplicate hidden conversations");
+    }
+
+    #[test]
+    fn history_ring_keeps_pending_sends_and_skips_deleted_targets() {
+        for success in [true, false] {
+            let (mut app, mut rx) = app();
+            let (_, _) = mateo_streams(&mut app, &mut rx);
+            typed(&mut app, "pending");
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            enter(&mut app);
+            let Request::Send { id: send, .. } = rx.try_recv().unwrap() else {
+                panic!("send")
+            };
+            inbox_rows(
+                &mut app,
+                &[("Zed", 1, "2026-10-18T12:00:00Z"), ("Mateo", 0, "")],
+            );
+            ctrl(&mut app, 'g');
+            assert_eq!(opened(&app), Some(Conversation::Agent("Zed".into())));
+            while rx.try_recv().is_ok() {}
+            app.on_event(Event::Data(Data::Sent {
+                id: send,
+                result: if success {
+                    Ok(())
+                } else {
+                    Err("send failed".into())
+                },
+            }));
+            ctrl(&mut app, 'o');
+            while rx.try_recv().is_ok() {}
+            assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+            typed(&mut app, "X");
+            enter(&mut app);
+            let Request::Send { req, .. } = rx.try_recv().unwrap() else {
+                panic!("send")
+            };
+            assert_eq!(req.body, if success { "X" } else { "pendinXg" });
+            ctrl(&mut app, 'o');
+            while rx.try_recv().is_ok() {}
+            assert_eq!(
+                opened(&app),
+                Some(Conversation::Agent("Zed".into())),
+                "history wraps without reordering"
+            );
+            // Latest successful live-agent snapshot says Zed was removed.
+            inbox_rows(&mut app, &[("Mateo", 0, "")]);
+            ctrl(&mut app, 'o');
+            while rx.try_recv().is_ok() {}
+            assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+            ctrl(&mut app, 'o');
+            assert!(
+                rx.try_recv().is_err(),
+                "one remaining history target is a no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn global_navigation_leaves_prompts_dialogs_help_and_config_untouched() {
+        let (mut app, mut rx) = app();
+        let (_, _) = mateo_streams(&mut app, &mut rx);
+        inbox_rows(&mut app, &[("Zed", 1, "2026-10-18T12:00:00Z")]);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, '/');
+        typed(&mut app, "needle");
+        for c in ['g', 'o'] {
+            ctrl(&mut app, c);
+        }
+        assert!(bottom(&mut app).contains("/needle█"));
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        assert!(rx.try_recv().is_err());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        key(&mut app, '?');
+        ctrl(&mut app, 'g');
+        assert_eq!(app.top().title(), "Help");
+        key(&mut app, 'q');
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        while rx.try_recv().is_ok() {}
+        key(&mut app, 'q');
+        key(&mut app, 'c');
+        for c in ['g', 'o'] {
+            ctrl(&mut app, c);
+        }
+        assert_eq!(app.top().title(), "Config");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        crew_list(&mut app, &mut rx);
+        key(&mut app, '+');
+        typed(&mut app, "Zed");
+        for c in ['g', 'o'] {
+            ctrl(&mut app, c);
+        }
+        assert!(screen(&mut app, 80, 24).contains("agents: Zed"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn mailbox_and_spinner_share_the_bar_in_both_modes_and_hide_unknown_state() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                for compact in [false, true] {
+                    let (mut app, mut rx) = app();
+                    let (_, now) = test_clock();
+                    app.ctx.now = now;
+                    let (_, act) = mateo_streams(&mut app, &mut rx);
+                    inbox_rows(
+                        &mut app,
+                        &[
+                            ("Mateo", 1, "2026-10-18T12:00:00Z"),
+                            ("Zed", 1, "2026-10-18T12:00:01Z"),
+                        ],
+                    );
+                    if compact {
+                        ctrl(&mut app, 't');
+                    }
+                    for (event, glyph) in
+                        [(None, "·"), (Some("text"), "⠋"), (Some("turn_end"), "✓")]
+                    {
+                        if let Some(event) = event {
+                            app.on_event(Event::Data(Data::ActivityBaseline {
+                                id: act,
+                                through_id: 0,
+                                record: None,
+                            }));
+                            app.on_event(Event::Data(Data::Activity {
+                                id: act,
+                                result: Ok(vec![activity(
+                                    if event == "text" { 1 } else { 2 },
+                                    "00",
+                                    &format!(r#"{{"event":"{event}"}}"#),
+                                )]),
+                            }));
+                        }
+                        // Reload progress for the next mode's unknown case.
+                        if event.is_none() {
+                            app.on_event(Event::Data(Data::ActivityBaseline {
+                                id: act,
+                                through_id: 0,
+                                record: None,
+                            }));
+                        }
+                        app.ctx.preferences.error = Some("cannot save preference".into());
+                        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                        terminal.draw(|f| app.draw(f)).unwrap();
+                        let b = terminal.backend().buffer();
+                        assert_eq!(b[(77, 23)].symbol(), "✉");
+                        assert_eq!(b[(78, 23)].symbol(), " ");
+                        assert_eq!(b[(79, 23)].symbol(), glyph);
+                        let bar = theme::base().patch(theme::style(theme::Role::StatusBar));
+                        for x in [77, 78, 79] {
+                            assert_eq!(b[(x, 23)].fg, bar.fg.unwrap());
+                            assert_eq!(b[(x, 23)].bg, bar.bg.unwrap());
+                            assert_eq!(b[(x, 23)].modifier, bar.add_modifier);
+                        }
+                        assert!(
+                            bottom(&mut app).contains("pref error")
+                                || bottom(&mut app).contains("cannot save")
+                        );
+                        app.ctx.preferences.error = None;
+                    }
+                    inbox_rows(&mut app, &[("Mateo", 1, "2026-10-18T12:00:00Z")]);
+                    assert!(
+                        !bottom(&mut app).contains('✉'),
+                        "current-agent mail does not count as elsewhere"
+                    );
+                    app.on_event(Event::Data(Data::Summary {
+                        id: app.ctx.inbox.id,
+                        result: Err("offline".into()),
+                    }));
+                    let b = bottom(&mut app);
+                    assert!(b.contains("Inbox unavailable") && !b.contains('✉'), "{b}");
+                }
             });
         }
     }
@@ -655,7 +1288,6 @@ mod tests {
             assert!(screen(&mut app, 100, 30).contains("activity-body"));
             close_conversation(&mut app, &mut rx);
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(matches!(rx.try_recv(), Ok(Request::Unwatch(_))));
             assert_eq!(app.stack.len(), 1);
             assert!(rx.try_recv().is_err());
             key(&mut app, 'c');
@@ -691,7 +1323,7 @@ mod tests {
     }
 
     fn app() -> (App, UnboundedReceiver<Request>) {
-        let (tx, rx) = unbounded_channel();
+        let (tx, mut rx) = unbounded_channel();
         let mut ctx = Ctx {
             me: "ada".into(),
             server: "bbs:7777".into(),
@@ -699,10 +1331,16 @@ mod tests {
             composer_max_height_percent: 20,
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
+            inbox: Default::default(),
+            navigation_notice: None,
         };
         // Most interaction tests exercise an explicitly chosen verbose view.
         ctx.preferences.set_compact(false);
         let mut app = App::new(ctx, tx);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Request::WatchSummary(app.ctx.inbox.id)
+        );
         // Past the splash.
         key(&mut app, ' ');
         (app, rx)
@@ -943,6 +1581,8 @@ mod tests {
             composer_max_height_percent: 20,
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
+            inbox: Default::default(),
+            navigation_notice: None,
         };
         let mut app = App::new(ctx, tx);
         let out = screen(&mut app, 80, 24);
@@ -966,6 +1606,8 @@ mod tests {
             composer_max_height_percent: 20,
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
+            inbox: Default::default(),
+            navigation_notice: None,
         };
         let mut app = App::new(ctx, tx);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -1023,7 +1665,6 @@ mod tests {
         let (mut app, mut rx) = app();
         assert!(!key(&mut app, 'a'));
         assert_eq!(rx.try_recv().unwrap(), Request::Agents);
-        assert!(matches!(rx.try_recv().unwrap(), Request::WatchSummary(_)));
         assert!(screen(&mut app, 80, 24).contains("Loading"));
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
@@ -1049,7 +1690,6 @@ mod tests {
         // Reload asks again; q goes back, and q on the menu quits.
         key(&mut app, 'r');
         assert_eq!(rx.try_recv().unwrap(), Request::Agents);
-        assert!(matches!(rx.try_recv().unwrap(), Request::WatchSummary(_)));
         assert!(!key(&mut app, 'q'));
         assert!(screen(&mut app, 80, 24).contains("Main menu"));
         assert!(key(&mut app, 'q'));
@@ -1100,7 +1740,6 @@ mod tests {
     fn open_agents(app: &mut App, rx: &mut UnboundedReceiver<Request>) {
         key(app, 'a');
         assert_eq!(rx.try_recv().unwrap(), Request::Agents);
-        assert!(matches!(rx.try_recv().unwrap(), Request::WatchSummary(_)));
     }
 
     /// Fix the render time of every Agents screen on the stack.
@@ -1295,9 +1934,7 @@ mod tests {
         let (mut app, mut rx) = app();
         key(&mut app, 'a');
         assert_eq!(rx.try_recv().unwrap(), Request::Agents);
-        let Request::WatchSummary(id) = rx.try_recv().unwrap() else {
-            panic!("expected a summary watch");
-        };
+        let id = app.ctx.inbox.id;
         let names = ["Ana", "Bo", "Cy", "Di", "Ed"];
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
@@ -1351,9 +1988,7 @@ mod tests {
         let (mut app, mut rx) = app();
         key(&mut app, 'a');
         assert_eq!(rx.try_recv().unwrap(), Request::Agents);
-        let Request::WatchSummary(id) = rx.try_recv().unwrap() else {
-            panic!("expected summary watch");
-        };
+        let id = app.ctx.inbox.id;
         // Ages are rendered against a fixed time; Old's age needs an 11-wide
         // ACTIVE column, the rest show "1d18h ago".
         let cases = [
@@ -1511,9 +2146,7 @@ mod tests {
         let (mut app, mut rx) = app();
         key(&mut app, 'a');
         assert_eq!(rx.try_recv().unwrap(), Request::Agents);
-        let Request::WatchSummary(id) = rx.try_recv().unwrap() else {
-            panic!("expected summary watch");
-        };
+        let id = app.ctx.inbox.id;
         let mut mateo = agent("Mateo", "ada", &["crew"]);
         mateo.last_sent_at = None;
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
@@ -3333,6 +3966,15 @@ mod tests {
                     result: Ok(vec![message(id, "Mateo", "ada", "received mail")]),
                 }));
                 assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("Mateo".into()));
+                app.on_event(Event::Data(Data::MarkedRead {
+                    agent: "Mateo".into(),
+                    result: Ok(()),
+                }));
+                assert!(matches!(rx.try_recv(), Ok(Request::Unwatch(_))));
+                assert_eq!(
+                    rx.try_recv().unwrap(),
+                    Request::WatchSummary(app.ctx.inbox.id)
+                );
                 app.on_event(Event::Data(Data::Feed {
                     id: feed,
                     result: Ok(vec![proto::Message {

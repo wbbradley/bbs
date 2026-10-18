@@ -9,11 +9,9 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table, TableState};
 
-use std::collections::HashMap;
-
 use super::thread::Thread;
 use super::{fit, fit_styled_list, navigate};
-use crate::connect::app::{Ctx, Screen, Transition, next_id};
+use crate::connect::app::{Ctx, Screen, Transition};
 use crate::connect::event::{Data, Request};
 use crate::connect::keys::Action;
 use crate::connect::theme;
@@ -21,13 +19,8 @@ use crate::proto;
 use crate::ui::message::age;
 
 pub struct Agents {
-    /// The summary stream.
-    id: u64,
     /// None until the first reply.
     agents: Option<Result<Vec<proto::Agent>, String>>,
-    /// What the viewer has yet to read or see, by lower-cased agent name. An
-    /// older server has no summaries; the list keeps the server's order.
-    summaries: HashMap<String, proto::AgentSummary>,
     /// The selected agent, kept selected as the order changes.
     selected: Option<String>,
     /// Everyone's agents rather than only the viewer's.
@@ -42,9 +35,7 @@ pub struct Agents {
 impl Default for Agents {
     fn default() -> Agents {
         Agents {
-            id: next_id(),
             agents: None,
-            summaries: HashMap::new(),
             selected: None,
             all: false,
             now: None,
@@ -61,43 +52,41 @@ impl Agents {
         self.now = Some(now);
     }
 
-    fn summary(&self, agent: &str) -> Option<&proto::AgentSummary> {
-        self.summaries.get(&agent.to_lowercase())
-    }
-
     /// Unread mail first, then unseen activity, each oldest first; the rest
     /// keep the server's order.
-    fn shown<'a>(&'a self, me: &str) -> Vec<&'a proto::Agent> {
+    fn shown<'a>(&'a self, ctx: &Ctx) -> Vec<&'a proto::Agent> {
         let Some(Ok(agents)) = &self.agents else {
             return Vec::new();
         };
         let mut shown: Vec<_> = agents
             .iter()
-            .filter(|a| self.all || a.owner.as_deref() == Some(me))
+            .filter(|a| self.all || a.owner.as_deref() == Some(ctx.me.as_str()))
             .collect();
-        shown.sort_by_key(|a| match self.summary(&a.name) {
-            Some(s) if s.unread_messages > 0 => (0, s.oldest_unread_message.clone()),
-            Some(s) if s.unseen_stream > 0 => (1, s.oldest_unseen_stream.clone()),
-            _ => (2, None),
-        });
+        shown.sort_by_key(
+            |a| match ctx.inbox.summaries.get(&a.name.to_ascii_lowercase()) {
+                Some(s) if s.unread_messages > 0 => (0, s.oldest_unread_message.clone()),
+                Some(s) if s.unseen_stream > 0 => (1, s.oldest_unseen_stream.clone()),
+                _ => (2, None),
+            },
+        );
         shown
     }
 
     /// Remember the selected agent's name.
-    fn remember(&mut self, me: &str) {
+    fn remember(&mut self, ctx: &Ctx) {
         let name = self
             .state
             .selected()
-            .and_then(|i| self.shown(me).get(i).map(|a| a.name.clone()));
+            .and_then(|i| self.shown(ctx).get(i).map(|a| a.name.clone()));
         self.selected = name;
     }
 
     /// Select the remembered agent wherever it now is.
-    fn reselect(&mut self, me: &str) {
+    fn reselect(&mut self, ctx: &Ctx) {
         let at = self
             .selected
             .as_ref()
-            .and_then(|name| self.shown(me).iter().position(|a| &a.name == name));
+            .and_then(|name| self.shown(ctx).iter().position(|a| &a.name == name));
         if let Some(i) = at {
             self.state.select(Some(i));
         }
@@ -129,26 +118,10 @@ impl Screen for Agents {
     }
 
     fn requests(&self) -> Vec<Request> {
-        vec![Request::Agents, Request::WatchSummary(self.id)]
-    }
-
-    fn on_close(&self) -> Vec<Request> {
-        vec![Request::Unwatch(self.id)]
+        vec![Request::Agents]
     }
 
     fn on_data(&mut self, data: &Data) {
-        if let Data::Summary { id, result } = data
-            && *id == self.id
-        {
-            // Without summaries (an older server, say) the order is the server's.
-            self.summaries = match result {
-                Ok(summaries) => summaries
-                    .iter()
-                    .map(|s| (s.agent.to_lowercase(), s.clone()))
-                    .collect(),
-                Err(_) => HashMap::new(),
-            };
-        }
         if let Data::Agents(result) = data {
             self.agents = Some(
                 result
@@ -163,20 +136,20 @@ impl Screen for Agents {
     }
 
     fn handle(&mut self, action: Action, ctx: &Ctx) -> Transition {
-        let len = self.shown(&ctx.me).len();
+        let len = self.shown(ctx).len();
         if navigate(&mut self.state, len, self.page, action) {
-            self.remember(&ctx.me);
+            self.remember(ctx);
             return Transition::Stay;
         }
         match action {
             Action::ToggleAll => {
                 self.all = !self.all;
                 self.state.select(Some(0));
-                self.remember(&ctx.me);
+                self.remember(ctx);
                 Transition::Stay
             }
             Action::Open => {
-                let shown = self.shown(&ctx.me);
+                let shown = self.shown(ctx);
                 match self.state.selected().and_then(|i| shown.get(i)) {
                     Some(a) => Transition::Push(Box::new(Thread::agent(
                         &a.name,
@@ -193,8 +166,8 @@ impl Screen for Agents {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
-        self.reselect(&ctx.me);
-        let shown = self.shown(&ctx.me);
+        self.reselect(ctx);
+        let shown = self.shown(ctx);
         let title = match (self.all, &self.agents) {
             (false, Some(Ok(_))) => format!("Your agents ({}) · a: everyone's", shown.len()),
             (true, Some(Ok(_))) => format!("All agents ({}) · a: yours", shown.len()),
@@ -222,8 +195,10 @@ impl Screen for Agents {
         let ages: Vec<String> = shown
             .iter()
             .map(|a| {
-                let sent = self
-                    .summary(&a.name)
+                let sent = ctx
+                    .inbox
+                    .summaries
+                    .get(&a.name.to_ascii_lowercase())
                     .and_then(|s| s.last_sent_at.as_deref())
                     .or(a.last_sent_at.as_deref());
                 match sent.map(|s| age(s, now)) {
@@ -256,7 +231,7 @@ impl Screen for Agents {
                 owner.to_string(),
                 theme::style(theme::Role::Human),
             )]);
-            let summary = self.summary(&a.name);
+            let summary = ctx.inbox.summaries.get(&a.name.to_ascii_lowercase());
             Row::new(vec![
                 name,
                 owner,
@@ -307,6 +282,6 @@ impl Screen for Agents {
         }
         self.page = inner.height.saturating_sub(1) as usize;
         frame.render_stateful_widget(table, inner, &mut self.state);
-        self.remember(&ctx.me);
+        self.remember(ctx);
     }
 }

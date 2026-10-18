@@ -26,6 +26,10 @@ impl Config {
 }
 
 impl Screen for Config {
+    fn navigation_blocked(&self) -> bool {
+        true
+    }
+
     fn title(&self) -> String {
         "Config".into()
     }

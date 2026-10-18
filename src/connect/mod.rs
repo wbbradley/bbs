@@ -8,6 +8,7 @@ mod dialog;
 mod drafts;
 mod event;
 mod keys;
+mod navigation;
 mod preferences;
 mod progress;
 mod screens;
@@ -75,6 +76,8 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
         composer_max_height_percent: opener.config.composer_max_height_percent(),
         preferences,
         now: std::sync::Arc::new(Instant::now),
+        inbox: Default::default(),
+        navigation_notice: None,
     };
     let (events, mut rx) = unbounded_channel();
     let (requests, requests_rx) = unbounded_channel();

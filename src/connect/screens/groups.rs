@@ -66,6 +66,10 @@ fn members(group: &proto::Group, width: usize) -> Line<'static> {
 }
 
 impl Screen for Groups {
+    fn navigation_blocked(&self) -> bool {
+        self.admin.is_open()
+    }
+
     fn title(&self) -> String {
         "Groups".into()
     }
