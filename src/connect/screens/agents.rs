@@ -198,13 +198,14 @@ impl Screen for Agents {
             return;
         }
         // Keep both counts and a readable status at the minimum terminal width.
+        // AGENT fits the whole random name pool; OWNER fits most human names.
         let groups_width = inner
             .width
-            .saturating_sub(20 + 5 + 8 + 19 + 10 + 5)
+            .saturating_sub(10 + 9 + 5 + 8 + 19 + 10 + 6)
             .clamp(11, 16);
         let status_width = inner
             .width
-            .saturating_sub(20 + 5 + 8 + groups_width + 19 + 5) as usize;
+            .saturating_sub(10 + 9 + 5 + 8 + groups_width + 19 + 6) as usize;
         let rows = shown.iter().map(|a| {
             let owner = a.owner.as_deref().unwrap_or("?");
             let color = if owner == ctx.me {
@@ -212,16 +213,15 @@ impl Screen for Agents {
             } else {
                 theme::OTHER_AGENT
             };
-            let name = Line::from(vec![
-                Span::styled(
-                    a.name.clone(),
-                    Style::new().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("@{owner}"), Style::new().fg(color)),
-            ]);
+            let name = Line::from(vec![Span::styled(
+                a.name.clone(),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            )]);
+            let owner = Line::from(vec![Span::styled(owner.to_string(), Style::new().fg(color))]);
             let summary = self.summary(&a.name);
             Row::new(vec![
                 name,
+                owner,
                 Line::styled(
                     pending(summary.map_or(0, |s| s.unread_messages), '✉'),
                     theme::heading(),
@@ -238,7 +238,8 @@ impl Screen for Agents {
         let table = Table::new(
             rows,
             [
-                Constraint::Length(20),
+                Constraint::Length(10),
+                Constraint::Length(9),
                 Constraint::Length(5),
                 Constraint::Length(8),
                 Constraint::Length(groups_width),
@@ -247,8 +248,10 @@ impl Screen for Agents {
             ],
         )
         .header(
-            Row::new(["AGENT", "INBOX", "ACTIVITY", "GROUPS", "ACTIVE", "STATUS"])
-                .style(theme::heading()),
+            Row::new([
+                "AGENT", "OWNER", "INBOX", "ACTIVITY", "GROUPS", "ACTIVE", "STATUS",
+            ])
+            .style(theme::heading()),
         )
         .style(theme::base())
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));

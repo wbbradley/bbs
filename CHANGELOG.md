@@ -19,6 +19,8 @@ request that bumps the package version; correct the date if publishing slips.
 
 ### Changed
 
+- The Agents list in `bbs connect` shows each agent's owner in a separate OWNER column instead of `name@owner` (#85).
+
 - Open agent conversations in `bbs connect` mark received mail read and activity seen in both views regardless of display filters. The Agents list separates unread inbox messages from unseen activity into INBOX and ACTIVITY columns (#84).
 
 - Agent conversations in `bbs connect` default to a compact view of direct messages in both directions and remember the global `Ctrl-t` choice locally across launches. Your outgoing messages have a lighter background with blank padding in compact and verbose views (#83).
