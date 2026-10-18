@@ -178,7 +178,7 @@ The focused composer hint starts with the target agent or group, using the
 theme's Target color (orange in Gruvbox); key hints use a distinct italic KeyHint style.
 In compact agent conversations, the hint's right edge shows the turn state:
 a Braille glyph spins on unfinished work, a check marks a recorded
-turn end, and `?` means unknown. The spinner advances every 100ms for the
+turn end, and a middle dot `·` means unknown. The spinner advances every 100ms for the
 first 3 seconds after an event arrives, then every 500ms; a new event restarts
 the fast phase. Recorded completion is trusted history: a
 stored turn end checks the glyph when the conversation opens, and it persists

@@ -2059,7 +2059,7 @@ mod tests {
         };
         assert_eq!(hint_cell(&mut app), ' ', "verbose has no indicator");
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert_eq!(hint_cell(&mut app), '?');
+        assert_eq!(hint_cell(&mut app), '·');
         app.on_event(Event::Data(Data::ActivityBaseline {
             id: act,
             through_id: 500,
@@ -2076,7 +2076,7 @@ mod tests {
         app.on_event(Event::Data(batch(500, "turn_end")));
         assert_eq!(
             hint_cell(&mut app),
-            '?',
+            '·',
             "replayed events below the watermark stay inert"
         );
         app.on_event(Event::Data(batch(501, "text")));

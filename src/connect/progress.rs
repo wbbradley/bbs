@@ -29,7 +29,7 @@ impl Progress {
                 Role::Accent,
             ),
             Self::Done => ("✓", Role::Success),
-            Self::Unknown => ("?", Role::Muted),
+            Self::Unknown => ("·", Role::Muted),
         };
         Span::styled(glyph, theme::style(role))
     }
