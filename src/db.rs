@@ -825,7 +825,7 @@ pub fn mark_read_from(
     )?)
 }
 
-/// What a human has yet to look at from one agent.
+/// What a human has yet to look at from one agent, and when it last sent.
 #[derive(Debug, PartialEq)]
 pub struct AgentSummary {
     pub agent: String,
@@ -833,11 +833,14 @@ pub struct AgentSummary {
     pub oldest_unread_message: Option<String>,
     pub unseen_stream: u32,
     pub oldest_unseen_stream: Option<String>,
+    /// The newest message or activity event the agent sent; None when never.
+    pub last_sent_at: Option<String>,
 }
 
 /// Unread mail through the human's inbox index; unseen activity per live
 /// agent through `activity_agent`, from the human's cursor, so neither walks
-/// the whole activity table.
+/// the whole activity table. Last-sent times come from `messages_sender` and
+/// `activity_agent` the same way.
 const AGENT_SUMMARIES: &str = "
     WITH unread AS (
         SELECT m.from_id AS agent_id, count(*) AS n, min(m.created_at) AS oldest
@@ -852,18 +855,22 @@ const AGENT_SUMMARIES: &str = "
                -- Ids grow with arrival, so the first unseen is the oldest.
                (SELECT act.created_at FROM activity act
                 WHERE act.agent_id = g.id AND act.id > coalesce(s.seen_id, 0)
-                ORDER BY act.id LIMIT 1) AS unseen_oldest
+                ORDER BY act.id LIMIT 1) AS unseen_oldest,
+               (SELECT MAX(created_at) FROM (
+                   SELECT created_at FROM messages
+                   WHERE from_kind = 'agent' AND from_id = g.id
+                   UNION ALL
+                   SELECT created_at FROM activity WHERE agent_id = g.id)) AS last_sent
         FROM agents g
         LEFT JOIN activity_seen s ON s.human_id = ?1 AND s.agent_id = g.id
         LEFT JOIN unread u ON u.agent_id = g.id
         WHERE g.retired_at IS NULL)
-    SELECT name, unread, unread_oldest, unseen, unseen_oldest FROM summaries
-    WHERE unread > 0 OR unseen > 0
+    SELECT name, unread, unread_oldest, unseen, unseen_oldest, last_sent FROM summaries
     ORDER BY lower(name)";
 
-/// For each live agent with any, the direct messages it sent `human` that are
-/// unread and the shared activity `human` has not seen. Broadcasts don't count:
-/// humans receive every one.
+/// For each live agent, the direct messages it sent `human` that are unread,
+/// the shared activity `human` has not seen, and when it last sent anything.
+/// Broadcasts don't count as unread: humans receive every one.
 pub fn agent_summaries(conn: &Connection, human: i64) -> Result<Vec<AgentSummary>> {
     let mut stmt = conn.prepare_cached(AGENT_SUMMARIES)?;
     let rows = stmt
@@ -874,6 +881,7 @@ pub fn agent_summaries(conn: &Connection, human: i64) -> Result<Vec<AgentSummary
                 oldest_unread_message: r.get(2)?,
                 unseen_stream: r.get(3)?,
                 oldest_unseen_stream: r.get(4)?,
+                last_sent_at: r.get(5)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -1953,6 +1961,17 @@ mod tests {
         // The cursor is one primary-key lookup per agent.
         let cursor = "SEARCH s USING PRIMARY KEY (human_id=? AND agent_id=?)";
         assert!(plan.iter().any(|l| l.starts_with(cursor)), "{plan:#?}");
+        // The last-sent lookups use the sender and per-agent activity indexes.
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("messages_sender (from_kind=? AND from_id=?)")),
+            "{plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|l| l.starts_with("SEARCH activity USING INDEX activity_agent (agent_id=?)")),
+            "{plan:#?}"
+        );
     }
 
     #[test]

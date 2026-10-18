@@ -213,14 +213,21 @@ impl Screen for Agents {
             return;
         }
         // One render time for every row in the frame. ACTIVE is the age of the
-        // agent's last sent message or activity event; an agent without any
-        // (or a server too old to say) shows a dash rather than a false age.
+        // agent's last sent message or activity event, live from the summary
+        // stream when it has one and otherwise from the list; an agent without
+        // any (or a server too old to say) shows a dash rather than a false age.
         let now = self.now.unwrap_or_else(Local::now);
         let ages: Vec<String> = shown
             .iter()
-            .map(|a| match a.last_sent_at.as_deref().map(|s| age(s, now)) {
-                Some(s) if !s.is_empty() => s,
-                _ => "-".to_string(),
+            .map(|a| {
+                let sent = self
+                    .summary(&a.name)
+                    .and_then(|s| s.last_sent_at.as_deref())
+                    .or(a.last_sent_at.as_deref());
+                match sent.map(|s| age(s, now)) {
+                    Some(s) if !s.is_empty() => s,
+                    _ => "-".to_string(),
+                }
             })
             .collect();
         // Keep both counts and a readable status at the minimum terminal width.

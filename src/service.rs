@@ -1329,6 +1329,7 @@ pub fn agent_summary(
                 oldest_unread_message: s.oldest_unread_message,
                 unseen_stream: s.unseen_stream,
                 oldest_unseen_stream: s.oldest_unseen_stream,
+                last_sent_at: s.last_sent_at,
             })
             .collect();
         Ok(proto::AgentSummarySnapshot { agents })
@@ -2043,8 +2044,17 @@ mod tests {
                 .unwrap()
                 .agents
         };
-        // Join notices are broadcasts, which never count.
-        assert!(summary(&mut conn).is_empty());
+        let find = |s: &[proto::AgentSummary], name: &str| {
+            s.iter().find(|s| s.agent == name).unwrap().clone()
+        };
+        // Every live agent is listed, with zeros when nothing is unread or
+        // unseen. Join notices are broadcasts, which never count as unread;
+        // they are messages the joining agent sent, so they set last_sent_at.
+        let s = summary(&mut conn);
+        assert_eq!(s.len(), 3, "{s:?}");
+        assert!(s.iter().all(|s| s.unread_messages == 0 && s.unseen_stream == 0));
+        assert!(find(&s, "Lu").last_sent_at.is_none());
+        assert!(find(&s, "Mateo").last_sent_at.is_some());
         let dm = proto::SendRequest {
             to: "will".into(),
             body: "a question".into(),
@@ -2066,25 +2076,14 @@ mod tests {
         };
         post_activity(&mut conn, &zed, record(3)).unwrap();
         let s = summary(&mut conn);
-        assert_eq!(s.len(), 2, "{s:?}");
-        assert_eq!(
-            (
-                s[0].agent.as_str(),
-                s[0].unread_messages,
-                s[0].unseen_stream
-            ),
-            ("Mateo", 1, 0)
-        );
-        assert!(s[0].oldest_unread_message.is_some());
-        assert_eq!(
-            (
-                s[1].agent.as_str(),
-                s[1].unread_messages,
-                s[1].unseen_stream
-            ),
-            ("Zed", 0, 3)
-        );
-        assert!(s[1].oldest_unseen_stream.is_some());
+        assert_eq!(s.len(), 3, "{s:?}");
+        let mateo_s = find(&s, "Mateo");
+        assert_eq!((mateo_s.unread_messages, mateo_s.unseen_stream), (1, 0));
+        assert!(mateo_s.oldest_unread_message.is_some());
+        let zed_s = find(&s, "Zed");
+        assert_eq!((zed_s.unread_messages, zed_s.unseen_stream), (0, 3));
+        assert!(zed_s.oldest_unseen_stream.is_some());
+        assert!(zed_s.last_sent_at.is_some());
 
         let ids: Vec<i64> = conn
             .prepare("SELECT id FROM activity ORDER BY id")
@@ -2101,13 +2100,13 @@ mod tests {
             mark_seen(conn, &will, req).unwrap().moved
         };
         assert!(seen(&mut conn, ids[1]));
-        assert_eq!(summary(&mut conn)[1].unseen_stream, 1);
+        assert_eq!(find(&summary(&mut conn), "Zed").unseen_stream, 1);
         // Never back, and never past the newest record, so later ones stay unseen.
         assert!(!seen(&mut conn, ids[0]));
         assert!(seen(&mut conn, i64::MAX));
         assert!(!seen(&mut conn, i64::MAX));
         post_activity(&mut conn, &zed, record(1)).unwrap();
-        assert_eq!(summary(&mut conn)[1].unseen_stream, 1);
+        assert_eq!(find(&summary(&mut conn), "Zed").unseen_stream, 1);
 
         // Reading clears unread mail; agents get no summary.
         let req = proto::MarkReadRequest {
@@ -2115,14 +2114,15 @@ mod tests {
         };
         mark_read(&mut conn, &will, req).unwrap();
         let s = summary(&mut conn);
-        assert_eq!(
-            s.iter().map(|s| s.agent.as_str()).collect::<Vec<_>>(),
-            ["Zed"]
-        );
+        assert_eq!(find(&s, "Mateo").unread_messages, 0);
         assert!(agent_summary(&mut conn, &zed, proto::AgentSummaryRequest {}).is_err());
         // Retiring removes the agent and its cursors.
         bye(&mut conn, &zed).unwrap();
-        assert!(summary(&mut conn).is_empty());
+        let s = summary(&mut conn);
+        assert_eq!(
+            s.iter().map(|s| s.agent.as_str()).collect::<Vec<_>>(),
+            ["Lu", "Mateo"]
+        );
         let cursors: i64 = conn
             .query_row("SELECT count(*) FROM activity_seen", [], |r| r.get(0))
             .unwrap();

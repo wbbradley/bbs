@@ -272,8 +272,11 @@ message AgentSummary {
   optional string oldest_unread_message = 3;  // RFC 3339 UTC
   uint32 unseen_stream = 4;                   // activity records
   optional string oldest_unseen_stream = 5;
+  // Newest server time the agent sent a message or posted an activity event;
+  // absent when it never did (or the server is too old to say).
+  optional string last_sent_at = 6;
 }
-// Only agents with something unread or unseen, by name.
+// Every live agent, by name.
 message AgentSummarySnapshot { repeated AgentSummary agents = 1; }
 message MarkSeenRequest {
   string agent = 1;

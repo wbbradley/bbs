@@ -669,6 +669,7 @@ mod tests {
                 oldest_unread_message: (mail > 0).then(|| format!("2026-10-16T18:00:{mail_at}Z")),
                 unseen_stream: seen,
                 oldest_unseen_stream: (seen > 0).then(|| format!("2026-10-16T18:00:{seen_at}Z")),
+                last_sent_at: None,
             };
         // Selecting Bo, who then moves; the selection moves with it.
         key(&mut app, 'j');
@@ -854,6 +855,48 @@ mod tests {
         assert!(out.contains("reviewing the ve…"), "{out}");
         // ACTIVE shows an age against the fixed render time.
         assert!(out.contains("14m ago"), "{out}");
+    }
+
+    #[test]
+    fn agents_active_ages_update_live_from_the_summary_stream() {
+        let (mut app, mut rx) = app();
+        key(&mut app, 'a');
+        assert_eq!(rx.try_recv().unwrap(), Request::Agents);
+        let Request::WatchSummary(id) = rx.try_recv().unwrap() else {
+            panic!("expected summary watch");
+        };
+        let mut mateo = agent("Mateo", "ada", &["crew"]);
+        mateo.last_sent_at = None;
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![mateo],
+        }))));
+        set_agents_now(&mut app, "2026-10-18T12:00:00Z");
+        // No known send yet: a dash, no age.
+        assert!(!screen(&mut app, 80, 24).contains("ago"));
+        let sum = |last_sent_at: Option<&str>| proto::AgentSummary {
+            agent: "Mateo".into(),
+            last_sent_at: last_sent_at.map(Into::into),
+            ..Default::default()
+        };
+        // The agent's first send arrives over the summary stream...
+        app.on_event(Event::Data(Data::Summary {
+            id,
+            result: Ok(vec![sum(Some("2026-10-18T11:46:00Z"))]),
+        }));
+        assert!(screen(&mut app, 80, 24).contains("14m ago"));
+        // ...and a newer one replaces it.
+        app.on_event(Event::Data(Data::Summary {
+            id,
+            result: Ok(vec![sum(Some("2026-10-18T11:56:00Z"))]),
+        }));
+        assert!(screen(&mut app, 80, 24).contains("4m ago"));
+        // An old server has no summaries; the list's value (none here) rules.
+        app.on_event(Event::Data(Data::Summary {
+            id,
+            result: Err("required capability agent-summary.v1 is unavailable".into()),
+        }));
+        assert!(!screen(&mut app, 80, 24).contains("ago"));
     }
 
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {

@@ -699,7 +699,10 @@ async fn agent_summaries_stream_what_a_human_has_yet_to_read_or_see() {
             .unwrap()
             .agents
     };
-    assert!(next().await.is_empty());
+    // Every live agent is listed, with zeros when nothing is unread or unseen.
+    let s = next().await;
+    assert_eq!(s.len(), 1, "{s:?}");
+    assert_eq!((s[0].unread_messages, s[0].unseen_stream), (0, 0), "{s:?}");
 
     let dm = proto::SendRequest {
         to: "will".into(),
