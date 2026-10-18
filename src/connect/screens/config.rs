@@ -87,7 +87,7 @@ impl Screen for Config {
                 scheme::style(Role::Muted),
             ),
             Line::styled(
-                " Startup --theme or BBS_THEME overrides the saved choice.",
+                " Startup --theme, BBS_THEME or NO_COLOR overrides the saved choice.",
                 scheme::style(Role::Muted),
             ),
         ]);

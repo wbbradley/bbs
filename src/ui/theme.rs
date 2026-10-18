@@ -59,12 +59,12 @@ pub fn resolve(cli: Option<&str>, env: Option<&str>, no_color: bool) -> Result<S
     }
 }
 
-/// Resolve startup options and report whether CLI/environment selected explicitly.
+/// Resolve startup options; CLI, BBS_THEME and NO_COLOR override saved preferences.
 pub fn init(cli: Option<&str>) -> Result<bool> {
     let env = std::env::var("BBS_THEME").ok();
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     select(resolve(cli, env.as_deref(), no_color)?);
-    Ok(cli.is_some() || env.is_some_and(|s| !s.is_empty()))
+    Ok(cli.is_some() || env.is_some_and(|s| !s.is_empty()) || no_color)
 }
 
 pub fn current() -> Scheme {

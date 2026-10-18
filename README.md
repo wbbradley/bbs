@@ -99,7 +99,7 @@ Terminal colors for `connect`, `view`, and `headless logs --pretty` come from a 
 The default is `gruvbox-dark-medium`; `terminal` uses terminal palette colors and `no-color`
 uses terminal defaults with bold/dim/reverse cues. Select with `bbs --theme terminal connect`
 or `BBS_THEME=terminal bbs connect`. Startup precedence is `--theme`, nonempty `BBS_THEME`,
-the saved connect choice (for `connect` only), nonempty `NO_COLOR` (selects `no-color`),
+nonempty `NO_COLOR` (selects `no-color`), the saved connect choice (for `connect` only),
 then Gruvbox. Unknown selectors fail clearly. In `connect`, open `[C]onfig` from the
 main menu, select a scheme with ↑/↓ and press Enter to apply it immediately and save
 it locally in `~/.local/state/bbs/connect.json`; Esc returns to the menu. This live

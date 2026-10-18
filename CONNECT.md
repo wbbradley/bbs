@@ -60,8 +60,8 @@ shared title bar and status bar.
 `[C]onfig` on the main menu lists Gruvbox dark medium, Terminal palette, and No color.
 Up/Down selects a row; Enter applies it immediately and saves it beside the compact
 view choice in `~/.local/state/bbs/connect.json`. Esc returns to the menu. Startup
-`--theme` and `BBS_THEME` override the saved preference; a saved preference overrides
-automatic `NO_COLOR`/Gruvbox selection. Changing it in Config wins for the current
+`--theme`, nonempty `BBS_THEME`, and nonempty `NO_COLOR` override the saved preference;
+a saved preference overrides the Gruvbox default. Changing it in Config wins for the current
 session. A save error leaves that session choice active and appears on the page.
 
 Config is reached only from the main menu, after conversation screens and their

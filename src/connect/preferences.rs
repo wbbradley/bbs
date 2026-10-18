@@ -49,8 +49,8 @@ impl Preferences {
         })
     }
 
-    /// CLI and BBS_THEME override the saved preference at startup. An explicit
-    /// saved choice otherwise takes precedence over the automatic NO_COLOR default.
+    /// CLI, BBS_THEME and NO_COLOR override the saved preference at startup.
+    /// A saved choice otherwise takes precedence over the Gruvbox default.
     pub fn restore_theme(&self, explicit: bool) {
         if !explicit && let Some(scheme) = self.values.theme {
             theme::select(scheme);
@@ -120,14 +120,11 @@ mod tests {
                 assert_eq!(
                     theme::current(),
                     Scheme::NoColor,
-                    "explicit startup choice wins"
+                    "NO_COLOR startup opt-out wins"
                 );
+                theme::select(Scheme::Gruvbox);
                 prefs.restore_theme(false);
-                assert_eq!(
-                    theme::current(),
-                    saved,
-                    "saved choice overrides automatic NO_COLOR"
-                );
+                assert_eq!(theme::current(), saved, "saved choice overrides default");
             });
         }
         prefs.set_compact(true);
