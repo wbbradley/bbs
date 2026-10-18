@@ -511,7 +511,7 @@ mod tests {
             result: Ok(vec![message(9, "Zed", "Lu", "elsewhere")]),
         }));
         let out = screen(&mut app, 80, 24);
-        assert!(out.contains("Mateo, owned by ada"), "{out}");
+        assert!(out.contains("Mateo, reports to ada"), "{out}");
         assert!(
             out.contains("first needle") && out.contains("second"),
             "{out}"

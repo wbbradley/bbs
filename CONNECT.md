@@ -96,7 +96,7 @@ Any human may open any agent and message it, under the same rules as
 - your own agents are drawn in one colour and other humans' agents in
   another;
 - the agent screen's title says whose agent it is, for example
-  "Mateo, owned by ada".
+  "Mateo, reports to ada".
 
 ### Group screen
 

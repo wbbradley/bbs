@@ -87,7 +87,7 @@ impl Thread {
     /// What `agent` sent and what was sent to it directly.
     pub fn agent(agent: &str, owner: Option<&str>, human: &str, compact: bool) -> Thread {
         let title = match owner {
-            Some(owner) => format!("{agent}, owned by {owner}"),
+            Some(owner) => format!("{agent}, reports to {owner}"),
             None => agent.to_string(),
         };
         let req = FeedRequest {
