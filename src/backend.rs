@@ -30,6 +30,7 @@ pub const AGENT_ACTIVITY: &str = "agent-activity.v1";
 pub const TIMERS: &str = "timers.v1";
 const HUMAN_MESSAGES: &str = "human-messages.v1";
 pub const AGENT_SUMMARY: &str = "agent-summary.v1";
+pub const AGENT_EFFORT: &str = "agent-effort.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -356,12 +357,30 @@ impl Backend {
     }
 
     pub async fn send(&mut self, req: proto::SendRequest) -> Result<proto::SendResponse> {
+        let effort = req.control == Some(proto::Control::SetEffort as i32);
         match self {
             Backend::Local(l) => service::send(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) if effort => rpc!(r, send, req, &[AGENT_CONTROL, AGENT_EFFORT])
+                .map_err(|e| missing_rpc(e, AGENT_EFFORT)),
             Backend::Remote(r) if req.control.is_some() => {
                 rpc!(r, send, req, &[AGENT_CONTROL]).map_err(|e| missing_rpc(e, AGENT_CONTROL))
             }
             Backend::Remote(r) => rpc!(r, send, req),
+        }
+    }
+
+    /// Report the calling agent's own effort state. A server needs
+    /// `agent-effort.v1`.
+    #[allow(dead_code)] // the headless driver lands next
+    pub async fn report_effort(
+        &mut self,
+        req: proto::ReportEffortRequest,
+    ) -> Result<proto::ReportEffortResponse> {
+        match self {
+            Backend::Local(l) => service::report_effort(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, report_effort, req, &[AGENT_EFFORT]).map_err(|e| missing_rpc(e, AGENT_EFFORT))
+            }
         }
     }
 

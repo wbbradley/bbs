@@ -81,6 +81,10 @@ service Bbs {
   rpc BindSession(BindSessionRequest) returns (BindSessionResponse);
   // Required-token mode: returns credentials only to the owning human.
   rpc SessionAgent(SessionAgentRequest) returns (SessionAgentResponse);
+
+  // A headless agent's driver reports its harness-confirmed effort state.
+  // Agent token, self only; requires agent-effort.v1.
+  rpc ReportEffort(ReportEffortRequest) returns (ReportEffortResponse);
 }
 
 message Empty {}
@@ -167,6 +171,9 @@ message SetGroupWriterResponse { string group = 1; string agent = 2; bool change
 enum Control {
   CONTROL_UNSPECIFIED = 0;
   CONTROL_CANCEL = 1;  // cancel the agent's running turn
+  // Set the agent's effort to the level named in `body`; also requires
+  // agent-effort.v1.
+  CONTROL_SET_EFFORT = 2;
 }
 
 message SendRequest {
@@ -178,7 +185,45 @@ message SendRequest {
 message SendResponse {
   string to = 1;                   // canonical recipient: "Juliana" or "@acme"
   optional uint32 recipients = 2;  // broadcasts only: recipients visible to the caller
+  optional int64 id = 3;           // the message's id, for control correlation
 }
+
+// Effort reporting (agent-effort.v1). A driver reports only
+// provider-confirmed state, never inferred or synthesized values.
+message EffortChoice {
+  string value = 1;
+  string label = 2;
+  // Provider-documented ordering, when one exists; unranked otherwise.
+  optional uint32 rank = 3;
+}
+message EffortState {
+  bool supported = 1;
+  string reason = 2;                 // why unsupported, or why current is unknown
+  repeated EffortChoice choices = 3;
+  optional string current = 4;       // provider-confirmed session config; never measured work
+}
+message EffortRequest {
+  int64 request_id = 1;              // the SET_EFFORT control message's id
+  string value = 2;
+}
+message EffortOutcome {
+  int64 request_id = 1;              // the control message answered
+  enum Result {
+    RESULT_UNSPECIFIED = 0;
+    RESULT_APPLIED = 1;              // the provider acknowledged the setting
+    RESULT_FAILED = 2;               // definite rejection; current preserved
+    RESULT_UNKNOWN = 3;              // ambiguous timeout/disconnect
+  }
+  Result result = 2;
+  string detail = 3;
+}
+message EffortReport {
+  EffortState state = 1;
+  optional EffortRequest pending = 2;   // the runner's in-flight request
+  optional EffortOutcome answered = 3;  // historical correlation only, never synthesized
+}
+message ReportEffortRequest { EffortReport report = 1; }
+message ReportEffortResponse {}
 
 message ReadRequest {
   optional uint32 limit = 1;
@@ -222,6 +267,12 @@ message Agent {
   // The newest server time the agent sent a message or posted an activity
   // event; absent when it never did (or the server is too old to say).
   optional string last_sent_at = 9;
+  // The newest reported effort state (agent-effort.v1); absent when the agent
+  // never reported or the server is older.
+  optional EffortReport effort = 10;
+  // When the server received that report; labels report age, never a claim
+  // the agent is running now.
+  optional string effort_reported_at = 11;
 }
 
 // The window is the most recent `backlog` (1 to 1000) messages that match every
@@ -275,6 +326,11 @@ message AgentSummary {
   // Newest server time the agent sent a message or posted an activity event;
   // absent when it never did (or the server is too old to say).
   optional string last_sent_at = 6;
+  // The newest reported effort state (agent-effort.v1); absent when the agent
+  // never reported or the server is older.
+  optional EffortReport effort = 7;
+  // When the server received that report; labels report age only.
+  optional string effort_reported_at = 8;
 }
 // Every live agent, by name.
 message AgentSummarySnapshot { repeated AgentSummary agents = 1; }

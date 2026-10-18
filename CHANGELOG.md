@@ -15,6 +15,13 @@ under the new package version and its publication date.
   preserving drafts and pending sends. A mailbox beside the conversation spinner
   signals unread mail from another agent.
 
+- Effort reporting (`agent-effort.v1`): a headless driver reports its harness's
+  confirmed effort state with `ReportEffort`, and a human requests a change with
+  a `SET_EFFORT` control message to an agent they own. Reports carry supported
+  choices, the confirmed current level, and the exact control request answered;
+  the board shows the last confirmed level with its report age and never claims
+  the agent is online. `SendResponse` returns the message id for correlation.
+
 ### Changed
 
 - Apply consistent categorical styles to agent and human names, groups, timestamps

@@ -1037,6 +1037,14 @@ impl Bbs for Server {
         Ok(response)
     }
 
+    async fn report_effort(
+        &self,
+        req: Request<proto::ReportEffortRequest>,
+    ) -> Result<Response<proto::ReportEffortResponse>, Status> {
+        self.unary("report_effort", req, Effect::Write, service::report_effort)
+            .await
+    }
+
     async fn timer_add(
         &self,
         req: Request<proto::TimerAddRequest>,

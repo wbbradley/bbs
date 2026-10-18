@@ -26,6 +26,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0012_timers.sql"),
     include_str!("../migrations/0013_human_dms.sql"),
     include_str!("../migrations/0014_activity_seen.sql"),
+    include_str!("../migrations/0015_agent_effort.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,9 @@ pub struct AgentRow {
     pub owner: Option<String>,
     /// The newest message or activity event the agent sent; None when never.
     pub last_sent_at: Option<String>,
+    /// The newest validated effort report (JSON) and when the server got it.
+    pub effort: Option<String>,
+    pub effort_reported_at: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -415,7 +419,33 @@ pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
     conn.execute("DELETE FROM activity WHERE agent_id = ?1", params![id])?;
     conn.execute("DELETE FROM timers WHERE target_id = ?1", params![id])?;
     conn.execute("DELETE FROM activity_seen WHERE agent_id = ?1", params![id])?;
+    conn.execute(
+        "UPDATE agents SET effort = NULL, effort_reported_at = NULL WHERE id = ?1",
+        params![id],
+    )?;
     Ok(())
+}
+
+/// Store an agent's validated effort report JSON and when it arrived.
+pub fn set_effort(conn: &Connection, id: i64, report: &str, now: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE agents SET effort = ?2, effort_reported_at = ?3 WHERE id = ?1",
+        params![id, report, now],
+    )?;
+    Ok(())
+}
+
+/// Whether message `id` is a set-effort control delivered to agent `agent`.
+pub fn is_effort_control_for(conn: &Connection, agent: i64, id: i64) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM deliveries d JOIN messages m ON m.id = d.message_id
+           WHERE d.recipient_kind = 'agent' AND d.recipient_id = ?1
+             AND m.id = ?2 AND m.control = 'set-effort')",
+        params![agent, id],
+        |r| r.get(0),
+    )?;
+    Ok(n != 0)
 }
 
 /// Lowercased names currently held by live agents or humans.
@@ -482,6 +512,7 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
     // the sender's history.
     let mut stmt = conn.prepare(
         "SELECT a.id, a.name, a.status, a.pwd, a.hostname, a.active_at, a.retired_at, h.name,
+                a.effort, a.effort_reported_at,
                 (SELECT MAX(created_at) FROM (
                    SELECT created_at FROM (
                      SELECT created_at FROM messages
@@ -509,7 +540,9 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                 active_at: r.get(5)?,
                 retired_at: r.get(6)?,
                 owner: r.get(7)?,
-                last_sent_at: r.get(8)?,
+                effort: r.get(8)?,
+                effort_reported_at: r.get(9)?,
+                last_sent_at: r.get(10)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -843,6 +876,9 @@ pub struct AgentSummary {
     pub oldest_unseen_stream: Option<String>,
     /// The newest message or activity event the agent sent; None when never.
     pub last_sent_at: Option<String>,
+    /// The newest validated effort report (JSON) and when the server got it.
+    pub effort: Option<String>,
+    pub effort_reported_at: Option<String>,
 }
 
 /// Unread mail through the human's inbox index; unseen activity per live
@@ -858,6 +894,7 @@ const AGENT_SUMMARIES: &str = "
         GROUP BY m.from_id),
     summaries AS MATERIALIZED (
         SELECT g.name, coalesce(u.n, 0) AS unread, u.oldest AS unread_oldest,
+               g.effort, g.effort_reported_at,
                (SELECT count(*) FROM activity act
                 WHERE act.agent_id = g.id AND act.id > coalesce(s.seen_id, 0)) AS unseen,
                -- Ids grow with arrival, so the first unseen is the oldest.
@@ -878,7 +915,8 @@ const AGENT_SUMMARIES: &str = "
         LEFT JOIN activity_seen s ON s.human_id = ?1 AND s.agent_id = g.id
         LEFT JOIN unread u ON u.agent_id = g.id
         WHERE g.retired_at IS NULL)
-    SELECT name, unread, unread_oldest, unseen, unseen_oldest, last_sent FROM summaries
+    SELECT name, unread, unread_oldest, unseen, unseen_oldest, last_sent, effort,
+           effort_reported_at FROM summaries
     ORDER BY lower(name)";
 
 /// For each live agent, the direct messages it sent `human` that are unread,
@@ -895,6 +933,8 @@ pub fn agent_summaries(conn: &Connection, human: i64) -> Result<Vec<AgentSummary
                 unseen_stream: r.get(3)?,
                 oldest_unseen_stream: r.get(4)?,
                 last_sent_at: r.get(5)?,
+                effort: r.get(6)?,
+                effort_reported_at: r.get(7)?,
             })
         })?
         .collect::<Result<_, _>>()?;

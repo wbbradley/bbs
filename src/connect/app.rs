@@ -1991,6 +1991,8 @@ mod tests {
                 unseen_stream: seen,
                 oldest_unseen_stream: (seen > 0).then(|| format!("2026-10-16T18:00:{seen_at}Z")),
                 last_sent_at: None,
+                effort: None,
+                effort_reported_at: None,
             };
         // Selecting Bo, who then moves; the selection moves with it.
         key(&mut app, 'j');

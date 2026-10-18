@@ -181,6 +181,7 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
         body: m.body,
         control: match m.control.as_deref() {
             Some("cancel") => Some(proto::Control::Cancel.into()),
+            Some("set-effort") => Some(proto::Control::SetEffort.into()),
             _ => None,
         },
         timer_id: m.timer_id,
@@ -845,6 +846,7 @@ fn send_control(
 ) -> Result<proto::SendResponse> {
     let control = match proto::Control::try_from(control) {
         Ok(proto::Control::Cancel) => "cancel",
+        Ok(proto::Control::SetEffort) => "set-effort",
         _ => bail!("unknown control {control}"),
     };
     if me.kind != db::Kind::Human {
@@ -871,6 +873,7 @@ fn send_control(
     Ok(proto::SendResponse {
         to: target.name,
         recipients: None,
+        id: Some(msg),
     })
 }
 
@@ -917,6 +920,7 @@ pub fn send(
             return Ok(proto::SendResponse {
                 to: format!("@{group}"),
                 recipients: Some(visible as u32),
+                id: None,
             });
         }
 
@@ -950,6 +954,7 @@ pub fn send(
         Ok(proto::SendResponse {
             to: target.name,
             recipients: None,
+            id: Some(msg),
         })
     })
 }
@@ -1045,6 +1050,8 @@ pub fn list_agents(
                 retired: a.retired_at.is_some(),
                 owner: a.owner,
                 last_sent_at: a.last_sent_at,
+                effort: a.effort.as_deref().and_then(effort_from_json),
+                effort_reported_at: a.effort_reported_at,
             })
             .collect();
         Ok(proto::ListAgentsResponse { humans, agents })
@@ -1166,6 +1173,165 @@ pub fn advance_feed_cursor(req: &mut proto::FeedRequest, sent: &proto::FeedSnaps
         *after = last.id;
     }
     sent.messages.len() >= req.backlog as usize
+}
+
+// ---- agent effort (agent-effort.v1) -----------------------------------------
+
+/// Bounds on one effort report.
+const MAX_EFFORT_CHOICES: usize = 32;
+const MAX_EFFORT_VALUE: usize = 128;
+const MAX_EFFORT_TEXT: usize = 512;
+
+/// Store the calling agent's own effort report after validation.
+pub fn report_effort(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::ReportEffortRequest,
+) -> Result<proto::ReportEffortResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        let report = req.report.as_ref().context("missing report")?;
+        validate_effort(ctx, me.id, report)?;
+        let json = effort_json(report);
+        db::set_effort(ctx.conn, me.id, &json, &ctx.now_s)?;
+        Ok(proto::ReportEffortResponse {})
+    })
+}
+
+fn validate_effort(ctx: &Ctx, agent: i64, report: &proto::EffortReport) -> Result<()> {
+    let state = report.state.as_ref().context("report without state")?;
+    if state.choices.len() > MAX_EFFORT_CHOICES {
+        bail!("{} choices; the limit is {MAX_EFFORT_CHOICES}", state.choices.len());
+    }
+    let mut seen = HashSet::new();
+    for choice in &state.choices {
+        if choice.value.is_empty()
+            || choice.value.len() > MAX_EFFORT_VALUE
+            || choice.label.len() > MAX_EFFORT_VALUE
+        {
+            bail!("invalid choice {choice:?}");
+        }
+        if !seen.insert(&choice.value) {
+            bail!("duplicate effort choice {:?}", choice.value);
+        }
+    }
+    if state.reason.len() > MAX_EFFORT_TEXT {
+        bail!("reason is too long");
+    }
+    if let Some(current) = &state.current
+        && current.len() > MAX_EFFORT_VALUE
+    {
+        bail!("current is too long");
+    }
+    if let Some(pending) = &report.pending {
+        check_effort_request(ctx, agent, pending.request_id, pending.value.as_str())?;
+    }
+    if let Some(outcome) = &report.answered {
+        if outcome.result() == proto::effort_outcome::Result::Unspecified {
+            bail!("unspecified outcome");
+        }
+        if outcome.detail.len() > MAX_EFFORT_TEXT {
+            bail!("outcome detail is too long");
+        }
+        check_effort_request(ctx, agent, outcome.request_id, "")?;
+    }
+    Ok(())
+}
+
+/// Report references must name a set-effort control delivered to this agent.
+fn check_effort_request(ctx: &Ctx, agent: i64, id: i64, value: &str) -> Result<()> {
+    if id <= 0 {
+        bail!("invalid request id {id}");
+    }
+    if value.len() > MAX_EFFORT_VALUE {
+        bail!("requested value is too long");
+    }
+    if !db::is_effort_control_for(ctx.conn, agent, id)? {
+        bail!("request id {id} is not a set-effort control delivered to this agent");
+    }
+    Ok(())
+}
+
+/// A stored report back to its typed form; validated at write, so a parse
+/// failure here means hand-edited storage and reads as no report.
+fn effort_from_json(stored: &str) -> Option<proto::EffortReport> {
+    let v: serde_json::Value = serde_json::from_str(stored).ok()?;
+    let state = v.get("state")?;
+    let choices = state
+        .get("choices")?
+        .as_array()?
+        .iter()
+        .map(|c| {
+            Some(proto::EffortChoice {
+                value: c.get("value")?.as_str()?.to_string(),
+                label: c.get("label")?.as_str()?.to_string(),
+                rank: c.get("rank").and_then(|r| r.as_u64()).map(|r| r as u32),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let request = |v: &serde_json::Value| {
+        Some(proto::EffortRequest {
+            request_id: v.get("request_id")?.as_i64()?,
+            value: v.get("value")?.as_str()?.to_string(),
+        })
+    };
+    let outcome = v.get("answered").and_then(|o| {
+        if o.is_null() {
+            return None;
+        }
+        Some(proto::EffortOutcome {
+            request_id: o.get("request_id")?.as_i64()?,
+            result: proto::effort_outcome::Result::from_str_name(
+                o.get("result")?.as_str()?,
+            )? as i32,
+            detail: o.get("detail")?.as_str()?.to_string(),
+        })
+    });
+    Some(proto::EffortReport {
+        state: Some(proto::EffortState {
+            supported: state.get("supported")?.as_bool()?,
+            reason: state.get("reason")?.as_str()?.to_string(),
+            choices,
+            current: state
+                .get("current")
+                .and_then(|c| c.as_str().map(str::to_string)),
+        }),
+        pending: v.get("pending").and_then(|p| {
+            if p.is_null() {
+                None
+            } else {
+                request(p)
+            }
+        }),
+        answered: outcome,
+    })
+}
+
+/// The validated report as stored JSON.
+fn effort_json(report: &proto::EffortReport) -> String {
+    let state = report.state.as_ref().expect("validated");
+    serde_json::json!({
+        "state": {
+            "supported": state.supported,
+            "reason": state.reason,
+            "choices": state.choices.iter().map(|c| serde_json::json!({
+                "value": c.value,
+                "label": c.label,
+                "rank": c.rank,
+            })).collect::<Vec<_>>(),
+            "current": state.current,
+        },
+        "pending": report.pending.as_ref().map(|p| serde_json::json!({
+            "request_id": p.request_id,
+            "value": p.value,
+        })),
+        "answered": report.answered.as_ref().map(|o| serde_json::json!({
+            "request_id": o.request_id,
+            "result": o.result().as_str_name(),
+            "detail": o.detail,
+        })),
+    })
+    .to_string()
 }
 
 // ---- agent activity --------------------------------------------------------
@@ -1330,6 +1496,8 @@ pub fn agent_summary(
                 unseen_stream: s.unseen_stream,
                 oldest_unseen_stream: s.oldest_unseen_stream,
                 last_sent_at: s.last_sent_at,
+                effort: s.effort.as_deref().and_then(effort_from_json),
+                effort_reported_at: s.effort_reported_at,
             })
             .collect();
         Ok(proto::AgentSummarySnapshot { agents })
@@ -1759,6 +1927,154 @@ mod tests {
 
     fn time(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn effort_reports_validate_and_round_trip() {
+        let (mut conn, will, agents) = board();
+        let mateo = agents[0].clone();
+        let zed = agents[1].clone();
+        let report = |pending: Option<proto::EffortRequest>,
+                      answered: Option<proto::EffortOutcome>| proto::ReportEffortRequest {
+            report: Some(proto::EffortReport {
+                state: Some(proto::EffortState {
+                    supported: true,
+                    reason: String::new(),
+                    choices: vec![
+                        proto::EffortChoice {
+                            value: "low".into(),
+                            label: "Low".into(),
+                            rank: Some(1),
+                        },
+                        proto::EffortChoice {
+                            value: "high".into(),
+                            label: "High".into(),
+                            rank: Some(2),
+                        },
+                    ],
+                    current: Some("low".into()),
+                }),
+                pending,
+                answered,
+            }),
+        };
+        // Humans cannot report.
+        assert!(report_effort(&mut conn, &will, report(None, None)).is_err());
+        // A valid report round-trips through the list and the summaries.
+        report_effort(&mut conn, &mateo, report(None, None)).unwrap();
+        let agents = list_agents(&mut conn, &will, proto::ListAgentsRequest { all: false })
+            .unwrap()
+            .agents;
+        let m = agents.iter().find(|a| a.name == "Mateo").unwrap();
+        let e = m.effort.as_ref().unwrap();
+        assert_eq!(e.state.as_ref().unwrap().current.as_deref(), Some("low"));
+        assert_eq!(e.state.as_ref().unwrap().choices.len(), 2);
+        assert!(m.effort_reported_at.is_some());
+        let summaries = agent_summary(&mut conn, &will, proto::AgentSummaryRequest {})
+            .unwrap()
+            .agents;
+        assert!(
+            summaries
+                .iter()
+                .find(|s| s.agent == "Mateo")
+                .unwrap()
+                .effort
+                .is_some()
+        );
+        // Duplicate choice values, unspecified outcomes and bad ids rejected.
+        let mut bad = report(None, None);
+        bad.report
+            .as_mut()
+            .unwrap()
+            .state
+            .as_mut()
+            .unwrap()
+            .choices
+            .push(proto::EffortChoice {
+                value: "low".into(),
+                label: "Also low".into(),
+                rank: None,
+            });
+        let err = report_effort(&mut conn, &mateo, bad).unwrap_err();
+        assert!(format!("{err:#}").contains("duplicate"), "{err:#}");
+        let bad = report(
+            None,
+            Some(proto::EffortOutcome {
+                request_id: 1,
+                result: 0,
+                detail: String::new(),
+            }),
+        );
+        let err = report_effort(&mut conn, &mateo, bad).unwrap_err();
+        assert!(format!("{err:#}").contains("unspecified"), "{err:#}");
+        let bad = report(
+            Some(proto::EffortRequest {
+                request_id: 0,
+                value: "high".into(),
+            }),
+            None,
+        );
+        assert!(report_effort(&mut conn, &mateo, bad).is_err());
+        // A request id must name a set-effort control delivered to this agent.
+        let bad = report(
+            Some(proto::EffortRequest {
+                request_id: 42,
+                value: "high".into(),
+            }),
+            None,
+        );
+        let err = report_effort(&mut conn, &mateo, bad).unwrap_err();
+        assert!(format!("{err:#}").contains("not a set-effort control"), "{err:#}");
+        // A real control's id validates, and the send returns it.
+        let sent = send(
+            &mut conn,
+            &will,
+            proto::SendRequest {
+                to: "Mateo".into(),
+                body: "high".into(),
+                control: Some(proto::Control::SetEffort.into()),
+            },
+        )
+        .unwrap();
+        let id = sent.id.unwrap();
+        report_effort(
+            &mut conn,
+            &mateo,
+            report(
+                Some(proto::EffortRequest {
+                    request_id: id,
+                    value: "high".into(),
+                }),
+                None,
+            ),
+        )
+        .unwrap();
+        // ...but not to another agent.
+        let err = report_effort(
+            &mut conn,
+            &zed,
+            report(
+                Some(proto::EffortRequest {
+                    request_id: id,
+                    value: "high".into(),
+                }),
+                None,
+            ),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("not a set-effort control"), "{err:#}");
+        // The control reads back with its kind, and retirement clears reports.
+        let mail = read(&mut conn, &mateo, proto::ReadRequest::default())
+            .unwrap()
+            .messages;
+        let control = mail.iter().find(|m| m.control.is_some()).unwrap();
+        assert_eq!(control.control, Some(proto::Control::SetEffort.into()));
+        bye(&mut conn, &mateo).unwrap();
+        let agents = list_agents(&mut conn, &will, proto::ListAgentsRequest { all: true })
+            .unwrap()
+            .agents;
+        let m = agents.iter().find(|a| a.name == "Mateo").unwrap();
+        assert!(m.effort.is_none());
     }
 
     #[test]
