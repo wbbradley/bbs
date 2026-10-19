@@ -31,6 +31,7 @@ pub const TIMERS: &str = "timers.v1";
 const HUMAN_MESSAGES: &str = "human-messages.v1";
 pub const AGENT_SUMMARY: &str = "agent-summary.v1";
 pub const AGENT_EFFORT: &str = "agent-effort.v1";
+pub const AUTO_REPLY: &str = "auto-reply.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -366,6 +367,20 @@ impl Backend {
                 rpc!(r, send, req, &[AGENT_CONTROL]).map_err(|e| missing_rpc(e, AGENT_CONTROL))
             }
             Backend::Remote(r) => rpc!(r, send, req),
+        }
+    }
+
+    /// Send the owning human an automatic reply, deduplicated by the
+    /// request's delivery key. A server needs `auto-reply.v1`.
+    pub async fn auto_reply(
+        &mut self,
+        req: proto::AutoReplyRequest,
+    ) -> Result<proto::AutoReplyResponse> {
+        match self {
+            Backend::Local(l) => service::auto_reply(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, auto_reply, req, &[AUTO_REPLY]).map_err(|e| missing_rpc(e, AUTO_REPLY))
+            }
         }
     }
 

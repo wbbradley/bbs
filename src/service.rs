@@ -924,7 +924,14 @@ pub fn auto_reply(
             bail!("only agents send automatic owner replies");
         }
         validate_delivery_key(&req.key)?;
-        validate_body(&req.body)?;
+        // Unlike an ordinary send, whitespace-only bodies are kept: runners
+        // stream parts whose bytes must survive byte-for-byte.
+        if req.body.is_empty() {
+            bail!("message body is empty");
+        }
+        if req.body.len() > MAX_BODY_BYTES {
+            bail!("message body exceeds {} KiB", MAX_BODY_BYTES / 1024);
+        }
         let owner = db::agent_owner_id(ctx.conn, me.id)?
             .ok_or_else(|| anyhow!("{} has no registered owner", me.name))?;
         if let Some((message_id, body, recipient)) =
@@ -2499,6 +2506,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("exceeds"), "{err}");
+        // Whitespace-only bodies are valid streamed parts, kept byte-for-byte.
+        let spaces = reply(&mut conn, "part-1", "  \n ").unwrap();
+        let mail = inbox(&mut conn, &will);
+        assert!(mail
+            .iter()
+            .any(|m| m.id == spaces.id && m.body == "  \n "));
 
         // The destination is the registered owner, resolved server-side.
         let first = reply(&mut conn, "turn-1", "done").unwrap();
@@ -2540,7 +2553,9 @@ mod tests {
             .iter()
             .any(|m| m.id == first.id && m.auto_reply == Some(true)));
 
-        // The normal send effects happened exactly once.
+        // The normal send effects happened exactly once. Make the pair's
+        // timestamp observably old so a replay that wrongly touches recency
+        // cannot hide behind back-to-back timestamps.
         let recency = |conn: &mut Connection| -> String {
             conn.query_row(
                 "SELECT last_at FROM agent_human_conversations WHERE agent_id = 1 AND human_id = 1",
@@ -2549,22 +2564,34 @@ mod tests {
             )
             .unwrap()
         };
-        let first_recency = recency(&mut conn);
+        conn.execute(
+            "UPDATE agent_human_conversations SET last_at = '2020-01-01T00:00:00.000000Z'
+             WHERE agent_id = 1 AND human_id = 1",
+            [],
+        )
+        .unwrap();
+        let old_recency = recency(&mut conn);
 
         // A retry after a lost reply returns the same mail and changes
-        // nothing: no second delivery, unread, or recency update.
+        // nothing: no second delivery, no recreated unread (the owner already
+        // read it above), no recency update.
         let again = reply(&mut conn, "turn-1", "done").unwrap();
         assert!(again.replayed && again.id == first.id);
         let deliveries: i64 = conn
             .query_row(
-                "SELECT count(*) FROM deliveries d JOIN messages m ON m.id = d.message_id
-                 WHERE m.auto_reply = 1",
-                [],
+                "SELECT count(*) FROM deliveries WHERE message_id = ?1",
+                [first.id],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(deliveries, 1);
-        assert_eq!(recency(&mut conn), first_recency);
+        assert!(
+            !inbox(&mut conn, &will)
+                .iter()
+                .any(|m| m.auto_reply == Some(true) && m.body == "done"),
+            "a replay must not recreate unread mail"
+        );
+        assert_eq!(recency(&mut conn), old_recency);
 
         // The same key with a different body is rejected; nothing is sent.
         let err = reply(&mut conn, "turn-1", "changed")
