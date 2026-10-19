@@ -109,6 +109,8 @@ pub struct Activity {
     local: bool,
     /// Mark turns: a separator before each prompt and a `turn end` line.
     turns: bool,
+    /// Render reasoning Markdown without blank display lines in connect.
+    compact_thoughts: bool,
     calls: HashMap<String, Call>,
     /// Ids in start order, so running calls are reported in order.
     order: Vec<String>,
@@ -122,6 +124,7 @@ impl Activity {
             markdown,
             local: false,
             turns: true,
+            compact_thoughts: false,
             calls: HashMap::new(),
             order: Vec::new(),
             finished: None,
@@ -138,6 +141,12 @@ impl Activity {
     /// something else shows turn state, as `bbs connect`'s progress mark does.
     pub fn without_turns(mut self) -> Activity {
         self.turns = false;
+        self
+    }
+
+    /// Use compact Markdown reasoning in the conversation, leaving logs unchanged.
+    pub fn compact_thoughts(mut self) -> Activity {
+        self.compact_thoughts = true;
         self
     }
 
@@ -215,6 +224,7 @@ impl Activity {
                 );
                 self.block(&mut out, mail_part(text), style(Role::Text));
             }
+            "thought" if self.compact_thoughts => self.thought(&mut out, text),
             "thought" => {
                 for line in text.trim_end().lines() {
                     let line = format!("│ {line}");
@@ -376,6 +386,25 @@ impl Activity {
         }
     }
 
+    fn thought(&self, out: &mut Vec<Line<'static>>, text: &str) {
+        // Parse before removing blank display lines so paragraph and code syntax
+        // retain their meaning. Only the rendered conversation is compacted.
+        for line in crate::ui::markdown::render(text.trim()).lines {
+            if line.spans.iter().all(|span| span.content.trim().is_empty()) {
+                continue;
+            }
+            let mut spans = vec![Span::styled("│ ", dim().italic())];
+            spans.extend(line.spans.iter().map(|span| {
+                let mut rendered = line.style.patch(span.style);
+                if rendered.fg == style(Role::Text).fg {
+                    rendered.fg = dim().fg;
+                }
+                Span::styled(span.content.to_string(), dim().italic().patch(rendered))
+            }));
+            out.push(Line::from(spans));
+        }
+    }
+
     /// Markdown as styled lines, or the source text.
     fn markdown(&self, out: &mut Vec<Line<'static>>, text: &str) {
         if !self.markdown {
@@ -513,6 +542,66 @@ mod tests {
                     super::super::to_ansi(&done, false),
                     "  ✓ shell completed (2.0s)\n"
                 );
+            });
+        }
+    }
+
+    #[test]
+    fn compact_reasoning_keeps_markdown_styles_and_code_indentation() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        let record = serde_json::json!({"event":"thought", "text":
+            "\n**Planning** and *checking* `config`\n\n[docs](https://example.com)\n\n- first\n- second\n\n```python\nif ready:\n    run()\n\n    finish()\n```\n"}).to_string();
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let mut renderer = Activity::new(true).compact_thoughts();
+                let lines = renderer.render(&record);
+                let text = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+                assert!(
+                    text.iter()
+                        .all(|line| line.starts_with("│ ") && !line[4..].trim().is_empty()),
+                    "{text:?}"
+                );
+                assert!(
+                    text.contains(&"│ Planning and checking config".into()),
+                    "{text:?}"
+                );
+                assert!(text.contains(&"│     run()".into()), "{text:?}");
+                assert!(text.contains(&"│     finish()".into()), "{text:?}");
+                let span = |name: &str| {
+                    lines
+                        .iter()
+                        .flat_map(|l| &l.spans)
+                        .find(|s| s.content == name)
+                        .unwrap()
+                };
+                assert!(span("Planning").style.add_modifier.contains(Modifier::BOLD));
+                assert!(
+                    span("checking")
+                        .style
+                        .add_modifier
+                        .contains(Modifier::ITALIC)
+                );
+                assert_eq!(span("config").style.fg, style(Role::Technical).fg);
+                assert!(
+                    span("docs")
+                        .style
+                        .add_modifier
+                        .contains(Modifier::UNDERLINED)
+                );
+                assert!(
+                    renderer
+                        .render(r#"{"event":"thought","text":" \n\t"}"#)
+                        .is_empty()
+                );
+                for markdown in [false, true] {
+                    let pretty = Activity::new(markdown).render(&record);
+                    assert!(
+                        pretty
+                            .iter()
+                            .any(|line| line.to_string().contains("**Planning**"))
+                    );
+                    assert!(pretty.iter().any(|line| line.to_string() == "│"));
+                }
             });
         }
     }

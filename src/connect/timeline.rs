@@ -325,7 +325,10 @@ impl Stream {
             agent: agent.to_string(),
             kinds: Kinds::All,
             records: VecDeque::new(),
-            renderer: Activity::new(true).local_time().without_turns(),
+            renderer: Activity::new(true)
+                .local_time()
+                .without_turns()
+                .compact_thoughts(),
             loaded: false,
             history_end: None,
             history_ready: false,
@@ -426,12 +429,6 @@ impl Stream {
                 return None;
             }
             ("mail" | "steer", _) if echoed => return None,
-            ("thought", _) => {
-                if let Some(text) = value["text"].as_str() {
-                    value["text"] = text.trim_start().to_owned().into();
-                }
-                self.renderer.render(&value.to_string())
-            }
             ("prompt", _) if echoed => {
                 value["text"] = serde_json::Value::Null;
                 self.renderer.render(&value.to_string())
@@ -449,7 +446,10 @@ impl Stream {
     /// Every record kept, drawn afresh, as after changing the kinds or
     /// loading or evicting mail that records name.
     pub fn entries(&mut self, loaded: &Loaded) -> Vec<Entry> {
-        self.renderer = Activity::new(true).local_time().without_turns();
+        self.renderer = Activity::new(true)
+            .local_time()
+            .without_turns()
+            .compact_thoughts();
         self.drawn.clear();
         let records = std::mem::take(&mut self.records);
         let entries = records
@@ -629,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_drops_leading_whitespace_but_keeps_paragraphs_and_raw_logs() {
+    fn reasoning_renders_markdown_without_blank_lines_and_preserves_raw_logs() {
         let mut stream = Stream::new("Mateo");
         let source = serde_json::json!({"event":"thought", "text":"\n \n\t**Pushing changes upstream**\n\n**Clarifying GitHub installation**"}).to_string();
         let record = proto::Activity {
@@ -643,11 +643,18 @@ mod tests {
         assert_eq!(
             lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
             [
-                "│ **Pushing changes upstream**",
-                "│",
-                "│ **Clarifying GitHub installation**"
+                "│ Pushing changes upstream",
+                "│ Clarifying GitHub installation"
             ]
         );
+        assert!(lines.iter().all(|line| line.spans.iter().any(|span| {
+            span.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        })));
+        stream.records.push_back(Kept::new(&record));
+        let rebuilt = stream.entries(&Loaded::new());
+        assert_eq!(rebuilt[0].lines(false, None), lines);
         assert_eq!(kept.activity.record, source);
         let pretty = Activity::new(false).render(&source);
         assert_eq!(pretty[0].to_string(), "│", "CLI logs are unchanged");

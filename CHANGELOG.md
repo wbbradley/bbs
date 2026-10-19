@@ -14,6 +14,11 @@ under the new package version and its publication date.
   after a temporary connection failure, including laptop sleep. Activity resumes
   after the last received record. Failed sends are not automatically retried.
 
+### Changed
+
+- Reasoning in `bbs connect` renders Markdown instead of literal formatting
+  marks and omits blank display lines. Raw activity and pretty logs are unchanged.
+
 ## 0.10.1 - 2026-10-19
 
 Client display and navigation improvements. Protocol v2, database schema 17,

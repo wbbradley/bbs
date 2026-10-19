@@ -158,7 +158,8 @@ blank line already there; calls within a run sit on consecutive lines, and so
 do calls still running. Each call takes one line of the width: a long or multi-line command is
 flattened and cut with an ellipsis before its status and duration, a wider
 window shows more of it, and search still finds all of it. Logs keep the whole
-call. `A`
+call. Reasoning renders Markdown (including bold and inline code) without blank
+lines, keeping its `│` prefix. Raw activity and pretty logs are unchanged. `A`
 cycles between everything, messages only and activity only; `E` cycles which
 kinds of activity show. This works for any headless agent on the board that
 shares its activity, wherever it runs: `bbs headless run` sends it to the
