@@ -14,8 +14,12 @@ history on first open while holding the write lock, so a large board takes a
 moment), the `auto_replies` table and a nullable `messages.auto_reply` column,
 and migrates automatically. Back up before opening the database with this
 version: older local/server binaries cannot open schema 17, so downgrade
-requires the pre-upgrade backup. Existing v2 clients and 0.9 headless runners
-keep working against an upgraded server. An updated `bbs headless run` requires
+requires the pre-upgrade backup, and restoring it is not lossless: changes made
+since the backup are lost. Existing v2 clients need no new capability and 0.9
+headless runners keep working against an upgraded server, sending with
+`bbs_send` as before. A 0.9 `bbs connect` in verbose view shows an updated
+runner's delivered replies twice, as mail and as activity; its default compact
+view is unaffected, and upgrading the client fixes it. An updated `bbs headless run` requires
 a server advertising `auto-reply.v1` and an agent with a registered owner, and
 refuses to start otherwise: upgrade the server first, then restart runners.
 Resumed sessions keep their earlier instructions; use `--new-session` to give an
