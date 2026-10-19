@@ -2985,6 +2985,31 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
         reply.contains(&format!("from Zed to {peer}:\necho (yes)")),
         "{reply}"
     );
+    // The MCP reply is visible on the board before the runner necessarily
+    // consumes its event queue. Completion is the barrier for inspecting logs.
+    let completed = eventually("the first completed turn", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|l| l.contains("\"event\":\"turn_end\""))
+    });
+    let events: Vec<String> = completed
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["event"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    let permission = events
+        .iter()
+        .position(|event| event == "permission")
+        .expect("completed turn must retain the permission event");
+    let end = events.iter().position(|event| event == "turn_end").unwrap();
+    assert!(
+        permission < end,
+        "permission must be recorded before completion: {events:?}"
+    );
     let shown = bbs.ok(&["headless", "logs", "Zed"]);
     assert!(shown.contains("You are Zed"), "{shown}");
     // This harness opts out of sharing.
