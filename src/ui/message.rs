@@ -23,7 +23,7 @@ pub fn message_lines_with_recipient<'a>(
     query: Option<&str>,
     recipient: Option<Kind>,
 ) -> Vec<Line<'a>> {
-    with_header(row, gap, query, Some(header(row, query, recipient)))
+    with_header(row, gap, query, Some(header(row, query, recipient)), true)
 }
 
 /// A side conversation identifies its participants without delivery metadata
@@ -34,6 +34,18 @@ pub fn side_message_lines<'a>(
     query: Option<&str>,
     recipient: Option<Kind>,
 ) -> Vec<Line<'a>> {
+    with_header(
+        row,
+        gap,
+        query,
+        Some(side_header(row, query, recipient)),
+        false,
+    )
+}
+
+/// Header-only rendering lets the conversation lay out its gutter without
+/// parsing the message body a second time.
+pub fn side_header(row: &Message, query: Option<&str>, recipient: Option<Kind>) -> Line<'static> {
     let sender = if row.from_kind() == Kind::Unspecified && row.from_owner.is_some() {
         Kind::Agent
     } else {
@@ -60,17 +72,17 @@ pub fn side_message_lines<'a>(
         )),
         (None, None) => spans.push(Span::raw("?")),
     }
-    let header = Line::from(spans).style(style(Role::OtherConversationHeader));
-    with_header(row, gap, query, Some(header))
+    Line::from(spans).style(style(Role::OtherConversationHeader))
 }
 
-/// The same body and search rendering, without a header.
+/// The body and search rendering without a header or literal inset; the
+/// conversation supplies its margin so wrapped lines keep the same inset.
 pub fn compact_message_lines<'a>(
     row: &'a Message,
     gap: bool,
     query: Option<&str>,
 ) -> Vec<Line<'a>> {
-    with_header(row, gap, query, None)
+    with_header(row, gap, query, None, false)
 }
 
 fn with_header<'a>(
@@ -78,10 +90,13 @@ fn with_header<'a>(
     gap: bool,
     query: Option<&str>,
     header: Option<Line<'static>>,
+    indent: bool,
 ) -> Vec<Line<'a>> {
     let mut body = Vec::new();
     for mut line in crate::ui::markdown::render(&row.body).lines {
-        line.spans.insert(0, Span::raw("  "));
+        if indent {
+            line.spans.insert(0, Span::raw("  "));
+        }
         body.push(line);
     }
     if let Some(query) = query {
@@ -92,18 +107,23 @@ fn with_header<'a>(
                 .collect();
         }
     }
-    let marker = gap.then(|| {
-        Line::from(
-            "  ⋯ messages may be missing here: more than --limit arrived at once; use --since/--until or a larger --limit"
-                .set_style(style(Role::Warning)),
-        )
-    });
-    [Line::default()]
+    message_prefix(gap)
         .into_iter()
-        .chain(marker)
         .chain(header)
         .chain(body)
         .collect()
+}
+
+/// The separator and optional missing-message warning before a header/body.
+pub fn message_prefix(gap: bool) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::default()];
+    if gap {
+        lines.push(Line::from(
+            "  ⋯ messages may be missing here: more than --limit arrived at once; use --since/--until or a larger --limit"
+                .set_style(style(Role::Warning)),
+        ));
+    }
+    lines
 }
 
 /// Case folding for search: a character's lowercase form when that is one
@@ -476,7 +496,11 @@ mod tests {
         };
         let full = message_lines(&row, false, Some("answer"));
         let compact = compact_message_lines(&row, false, Some("answer"));
-        assert_eq!(&compact[1..], &full[2..]);
+        let mut body = full[2..].to_vec();
+        for line in &mut body {
+            line.spans.remove(0);
+        }
+        assert_eq!(&compact[1..], &body);
         assert_eq!(compact.len() + 1, full.len());
         assert!(
             compact

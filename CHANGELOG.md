@@ -16,6 +16,10 @@ under the new package version and its publication date.
 
 ### Changed
 
+- Conversation replies use a two-space margin on every displayed line, including
+  wrapped continuations. Side-conversation headers align with their bodies and
+  show a themed bullet in the first column.
+
 - Reasoning in `bbs connect` renders Markdown instead of literal formatting
   marks and omits blank lines within reasoning. Consecutive reasoning rows stay together,
   with one blank line above each group. Raw activity and pretty logs are unchanged.

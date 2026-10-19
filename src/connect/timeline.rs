@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use chrono::DateTime;
 use ratatui::style::Style;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use super::app::next_id;
 use super::event::{Data, Request};
@@ -16,7 +17,8 @@ use crate::backend::AGENT_ACTIVITY;
 use crate::proto::{self, Message};
 use crate::ui::activity::{Activity, ToolLine};
 use crate::ui::message::{
-    compact_message_lines, find_matches, message_lines_with_recipient, side_message_lines,
+    compact_message_lines, find_matches, message_lines_with_recipient, message_prefix, side_header,
+    side_message_lines,
 };
 use crate::ui::thread::Row;
 
@@ -50,6 +52,8 @@ pub enum Entry {
         call: Option<ToolLine>,
         /// Reasoning rows form tight groups with a blank line above.
         thought: bool,
+        /// Assistant reply text uses the same inset as its delivered mail.
+        reply: bool,
     },
 }
 
@@ -153,6 +157,52 @@ impl Row for Entry {
             } => theme::style(theme::Role::OtherConversation),
             _ => Style::default(),
         }
+    }
+
+    fn inset(&self) -> u16 {
+        match self {
+            Entry::Message {
+                headerless: true, ..
+            }
+            | Entry::Message {
+                other_participants: true,
+                ..
+            }
+            | Entry::Stream { reply: true, .. } => 2,
+            _ => 0,
+        }
+    }
+
+    fn gutter(&self, gap: bool, query: Option<&str>, width: u16) -> Vec<Line<'_>> {
+        let Entry::Message {
+            other_participants: true,
+            message,
+            recipient,
+            gap: raw_gap,
+            ..
+        } = self
+        else {
+            return Vec::new();
+        };
+        let measure = |lines: Vec<Line>| {
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+        };
+        let prefix_height = measure(message_prefix(gap || *raw_gap));
+        let header_height = measure(vec![side_header(message, query, *recipient)]);
+        let surface = theme::style(theme::Role::OtherConversationHeader);
+        let mut gutter = vec![Line::default(); prefix_height];
+        for index in 0..header_height {
+            gutter.push(
+                Line::from(Span::styled(
+                    if index == 0 { "• " } else { "  " },
+                    surface.patch(theme::style(theme::Role::Accent)),
+                ))
+                .style(surface),
+            );
+        }
+        gutter
     }
 
     fn separator_style(&self) -> Option<Style> {
@@ -450,6 +500,7 @@ impl Stream {
             lines,
             call: self.renderer.take_tool(),
             thought: event == "thought",
+            reply: event == "text",
         })
     }
 
@@ -684,6 +735,7 @@ mod tests {
             lines,
             call: tool.then(|| ToolLine::running("a")),
             thought: false,
+            reply: false,
         };
         let call = row(true, vec![Line::raw("✓ a")]);
         let text = row(false, vec![Line::raw("text")]);
@@ -707,6 +759,151 @@ mod tests {
         assert!(opens_run(None) && opens_run(Some(&text)) && !opens_run(Some(&call)));
         assert!(call.spaced_after(None) && call.spaced_last());
         assert!(!call.spaced_after(Some(&call)) && text.spaced_after(Some(&call)));
+    }
+
+    #[test]
+    fn reply_inset_survives_wrapping_resize_search_and_side_header_scroll() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let body = format!(
+                    "**needle** {}\n\nSecond paragraph.\n\n- item\n\n```python\n    code()\n```",
+                    "Unicode 界 café words ".repeat(12)
+                );
+                let message = Message {
+                    id: 1,
+                    from_name: "Theo".into(),
+                    from_kind: proto::Kind::Agent.into(),
+                    to_name: Some("Tim".into()),
+                    body: body.clone(),
+                    ..Default::default()
+                };
+                let entry = Entry::Message {
+                    message: message.clone(),
+                    headerless: true,
+                    recipient: Some(proto::Kind::Agent),
+                    outgoing: false,
+                    other_participants: false,
+                    gap: false,
+                };
+                let mut view = ThreadView::new(vec![entry], 100);
+                view.set_query("needle");
+                for width in [80, 32, 100] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 80)).unwrap();
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(Block::new().style(theme::base()), f.area());
+                            view.render(f, f.area());
+                        })
+                        .unwrap();
+                    let buf = terminal.backend().buffer();
+                    crate::ui::theme::testing::assert_buffer(buf);
+                    let lines: Vec<_> = (0..view.frame.total as u16)
+                        .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                        .collect();
+                    assert!(lines.iter().all(|line| line.starts_with("  ")), "{lines:?}");
+                    assert!(
+                        lines[1].starts_with("  needle"),
+                        "no extra first-line inset"
+                    );
+                    assert!(
+                        lines[2].starts_with("  ") && !lines[2][2..].starts_with(' '),
+                        "wrapped continuation: {:?}",
+                        lines[2]
+                    );
+                    assert!(
+                        lines.iter().any(|line| line.trim_end() == "      code()"),
+                        "code keeps its own indentation: {lines:?}"
+                    );
+                    assert!(buf.content.iter().any(|cell| cell.symbol() == "n"
+                        && cell.modifier.contains(Modifier::BOLD | Modifier::REVERSED)));
+                    assert_eq!(
+                        view.frame.total,
+                        Paragraph::new(view.rows[0].lines(false, None))
+                            .wrap(Wrap { trim: false })
+                            .line_count(width - 2)
+                    );
+                    view.scroll_to(2);
+                    terminal.backend_mut().resize(width, 3);
+                    terminal
+                        .resize(ratatui::layout::Rect::new(0, 0, width, 3))
+                        .unwrap();
+                    terminal.draw(|f| view.render(f, f.area())).unwrap();
+                    assert!((0..3).all(|y| {
+                        (0..2).all(|x| terminal.backend().buffer()[(x, y)].symbol() == " ")
+                    }));
+                    view.follow();
+                }
+                // Undelivered/legacy text activity uses the identical wrapping margin.
+                let mut stream = Stream::new("Theo");
+                let record = proto::Activity {
+                    id: 1,
+                    record: serde_json::json!({"event":"text","text":body}).to_string(),
+                    ..Default::default()
+                };
+                let text = stream.entry(&Kept::new(&record), &Loaded::new()).unwrap();
+                assert_eq!(text.inset(), 2);
+                // A wrapped side header keeps one bullet in column zero, names
+                // at column two, and its tint through the gutter and scrolling.
+                let side = Entry::Message {
+                    message: Message {
+                        from_name: "Theo長い名前".repeat(4),
+                        ..message
+                    },
+                    headerless: false,
+                    recipient: Some(proto::Kind::Agent),
+                    outgoing: false,
+                    other_participants: true,
+                    gap: true,
+                };
+                let mut view = ThreadView::new(vec![side], 100);
+                let width = 32;
+                let mut terminal = Terminal::new(TestBackend::new(width, 80)).unwrap();
+                terminal
+                    .draw(|f| {
+                        f.render_widget(Block::new().style(theme::base()), f.area());
+                        view.render(f, f.area());
+                    })
+                    .unwrap();
+                let buf = terminal.backend().buffer();
+                let header = (0..view.frame.total as u16)
+                    .find(|&y| buf[(0, y)].symbol() == "•")
+                    .unwrap();
+                assert!(header > 2, "wrapped gap warning comes before header");
+                assert_eq!(buf[(2, header)].symbol(), "T");
+                assert_eq!(
+                    buf[(0, header)].fg,
+                    theme::base()
+                        .patch(theme::style(theme::Role::Accent))
+                        .fg
+                        .unwrap()
+                );
+                assert_eq!(buf[(0, header + 1)].symbol(), " ");
+                assert_eq!(
+                    buf[(0, header + 1)].bg,
+                    theme::base()
+                        .patch(theme::style(theme::Role::OtherConversationHeader))
+                        .bg
+                        .unwrap()
+                );
+                assert_eq!(buf.content.iter().filter(|c| c.symbol() == "•").count(), 1);
+                view.layout(width, 3);
+                view.scroll_to(header as usize + 1);
+                terminal.backend_mut().resize(width, 3);
+                terminal
+                    .resize(ratatui::layout::Rect::new(0, 0, width, 3))
+                    .unwrap();
+                terminal.draw(|f| view.render(f, f.area())).unwrap();
+                assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+                assert_eq!(
+                    terminal.backend().buffer()[(0, 0)].bg,
+                    theme::base()
+                        .patch(theme::style(theme::Role::OtherConversationHeader))
+                        .bg
+                        .unwrap()
+                );
+            });
+        }
     }
 
     #[test]
@@ -756,26 +953,26 @@ mod tests {
         assert_eq!(
             render(&mut view),
             [
-                "Before.",
+                "  Before.",
                 "",
                 "│ Checking output",
                 "│ Checking bold",
                 "│ Checking spacing",
-                "After."
+                "  After."
             ]
         );
         // A late row splits the visible group, regardless of arrival order.
         let middle = make(&mut stream, 30, "text", "Interruption.");
         view.ingest(vec![middle.clone()]);
         let expected = [
-            "Before.",
+            "  Before.",
             "",
             "│ Checking output",
             "│ Checking bold",
-            "Interruption.",
+            "  Interruption.",
             "",
             "│ Checking spacing",
-            "After.",
+            "  After.",
         ];
         assert_eq!(render(&mut view), expected);
         let mut rebuilt = ThreadView::new(vec![before, first.clone(), middle, second, after], 100);
@@ -788,6 +985,7 @@ mod tests {
             lines: vec![Line::raw(" \t")],
             call: None,
             thought: false,
+            reply: false,
         };
         assert!(
             !first.spaced_after(Some(&padded)),
@@ -799,6 +997,7 @@ mod tests {
             lines: vec![Line::raw("tool")],
             call: Some(ToolLine::running("read")),
             thought: false,
+            reply: false,
         };
         assert!(
             first.spaced_after(Some(&tool)),

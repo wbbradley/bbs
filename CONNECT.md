@@ -168,14 +168,17 @@ server unless its harness sets `share_activity = false` (see Server changes).
 
 An agent conversation is one view: every message in the agent's feed and its
 shared activity, in time order. Mail between that agent and the connected human
-has no header or timestamp; anyone else's mail (other humans, other agents, the
-agent's group posts) keeps a sender/recipient header. The connected
+has no header or timestamp. Reply Markdown has a two-space left margin on every
+displayed line, including wrapped continuations, while code and lists keep their
+own indentation inside that margin. Anyone else's mail (other humans, other
+agents, the agent's group posts) keeps a sender/recipient header. The connected
 human's outgoing messages have a lighter background, one blank row above and
 below the body, and a conversation-background separator above that padding.
 Mail neither from nor addressed to the connected human has a subtle contrasting
 background across its header and body. These side-message headers show only
-`Sender → Recipient`, without timestamps, read status, or `@owner` suffixes;
-group names keep their `@group` prefix. The attribution text has a slightly
+`• Sender → Recipient`, with the themed bullet in column one and the names
+aligned with the body after a two-space margin, without timestamps, read status,
+or `@owner` suffixes; group names keep their `@group` prefix. The attribution text has a slightly
 stronger tint than the body. Gruvbox uses a muted teal surface;
 Terminal uses a dark gray surface, and No color keeps its uncolored display.
 `A` and `E` still narrow the view to messages or activity and to kinds of

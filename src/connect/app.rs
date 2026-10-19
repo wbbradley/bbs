@@ -4596,7 +4596,7 @@ mod tests {
                     .map(|x| buffer[(x, first - 1)].symbol())
                     .collect::<String>();
                 if conversation {
-                    assert_eq!(header.trim(), "Zed → Mateo");
+                    assert_eq!(header.trim(), "• Zed → Mateo");
                 } else {
                     assert!(header.contains("Zed@ada → Mateo@ada"), "{header}");
                     assert!(header.contains("2026-10-16"), "{header}");
@@ -5064,12 +5064,12 @@ mod tests {
             lines[a..=b + 1].iter().map(|l| l.to_string()).collect()
         };
         let expected = [
-            "Looking.",
+            "  Looking.",
             "",
             "  ✓ Read a.rs completed (1.0s)",
             "  ✓ Read b.rs completed (1.0s)",
             "",
-            "Done.",
+            "  Done.",
             "group note",
             "",
             "  ✓ Read c.rs completed (1.0s)",

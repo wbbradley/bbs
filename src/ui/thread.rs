@@ -36,6 +36,14 @@ pub trait Row: PartialEq {
     fn separator_style(&self) -> Option<Style> {
         None
     }
+    /// A left margin outside the wrapping area, including continuation lines.
+    fn inset(&self) -> u16 {
+        0
+    }
+    /// Content of that margin, in display-line order at the inner width.
+    fn gutter(&self, _gap: bool, _query: Option<&str>, _width: u16) -> Vec<Line<'_>> {
+        Vec::new()
+    }
     /// Whether the row matches a case-folded search.
     fn matches(&self, query: &str) -> bool;
     /// The row's lines at `width` columns, for a row that fits itself to
@@ -263,9 +271,10 @@ impl<R: Row> ThreadView<R> {
             total += match self.heights[i] {
                 Some((w, h)) if w == width => h,
                 _ => {
-                    let h = Paragraph::new(Text::from(self.row_lines(i, None, width)))
+                    let inner_width = width.saturating_sub(self.rows[i].inset());
+                    let h = Paragraph::new(Text::from(self.row_lines(i, None, inner_width)))
                         .wrap(Wrap { trim: false })
-                        .line_count(width);
+                        .line_count(inner_width);
                     self.heights[i] = Some((width, h));
                     h
                 }
@@ -431,11 +440,36 @@ impl<R: Row> ThreadView<R> {
                 area.width,
                 (visible_end - visible_start) as u16,
             );
-            let paragraph = Paragraph::new(self.row_lines(i, self.query.as_deref(), area.width))
-                .style(row.style())
-                .wrap(Wrap { trim: false })
-                .scroll(((visible_start - start).min(u16::MAX as usize) as u16, 0));
-            frame.render_widget(paragraph, row_area);
+            let inset = row.inset().min(row_area.width);
+            let content_area = Rect::new(
+                row_area.x + inset,
+                row_area.y,
+                row_area.width - inset,
+                row_area.height,
+            );
+            let scroll = (visible_start - start).min(u16::MAX as usize) as u16;
+            let paragraph =
+                Paragraph::new(self.row_lines(i, self.query.as_deref(), content_area.width))
+                    .style(row.style())
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0));
+            frame.render_widget(paragraph, content_area);
+            if inset > 0 {
+                let mut gutter = row.gutter(
+                    self.gaps.contains(&row.key()),
+                    self.query.as_deref(),
+                    content_area.width,
+                );
+                if row.spaced_after(i.checked_sub(1).map(|j| &self.rows[j])) {
+                    gutter.insert(0, Line::default());
+                }
+                frame.render_widget(
+                    Paragraph::new(gutter)
+                        .style(row.style())
+                        .scroll((scroll, 0)),
+                    Rect::new(row_area.x, row_area.y, inset, row_area.height),
+                );
+            }
             if visible_start == start
                 && row_area.height > 0
                 && let Some(style) = row.separator_style()
