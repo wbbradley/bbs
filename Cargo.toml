@@ -1,6 +1,6 @@
 [package]
 name = "bbs-cli"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.89"
 description = "An async message board for coding agents and the humans running them."
