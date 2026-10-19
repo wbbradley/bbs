@@ -23,7 +23,7 @@ use crate::connect::effort::Decision;
 use crate::connect::event::{Data, Request};
 use crate::connect::keys::{Action, GroupOp};
 use crate::connect::theme;
-use crate::connect::timeline::{Entry, Kinds, Show, Stream};
+use crate::connect::timeline::{Entry, Kinds, Loaded, Show, Stream};
 use crate::proto::{self, FeedRequest, Message, SendRequest};
 use crate::ui::thread::{MAX_ROWS, ThreadView};
 
@@ -134,9 +134,25 @@ impl Thread {
         }
     }
 
-    /// The ids of every message held, which activity records may name.
-    fn loaded(&self) -> HashSet<i64> {
-        self.messages.iter().map(|m| m.id).collect()
+    /// The messages shown, which activity records may stand for, marking
+    /// automatic replies from this agent. None while messages are filtered
+    /// out, so activity is never hidden along with the mail it stands for.
+    fn loaded(&self) -> Loaded {
+        if !self.show.messages() {
+            return Loaded::new();
+        }
+        self.messages
+            .iter()
+            .map(|m| {
+                let reply = m.auto_reply == Some(true)
+                    && m.from_kind() == proto::Kind::Agent
+                    && self
+                        .agent
+                        .as_ref()
+                        .is_some_and(|a| m.from_name.eq_ignore_ascii_case(a));
+                (m.id, reply)
+            })
+            .collect()
     }
 
     /// Redraw after loading mail that kept activity records name, keeping
@@ -210,7 +226,8 @@ impl Thread {
     }
 
     /// Keep a snapshot's messages, refreshing those held, oldest first.
-    fn keep(&mut self, snapshot: &[Message]) {
+    /// Hold a snapshot's messages; returns the ids evicted to stay bounded.
+    fn keep(&mut self, snapshot: &[Message]) -> Vec<i64> {
         if let Some(first) = snapshot.first()
             && snapshot.len() >= BACKLOG as usize
             && self.messages.last().is_none_or(|last| first.id > last.id)
@@ -224,10 +241,11 @@ impl Thread {
             }
         }
         let over = self.messages.len().saturating_sub(MAX_ROWS);
-        self.messages.drain(..over);
+        let evicted = self.messages.drain(..over).map(|m| m.id).collect();
         if let Some(oldest) = self.messages.first() {
             self.message_gaps.retain(|id| *id >= oldest.id);
         }
+        evicted
     }
 
     /// Broadcasts to `group`.
@@ -742,18 +760,20 @@ impl Screen for Thread {
             Data::Feed { id, result } if *id == self.id => match result {
                 Ok(messages) => {
                     self.error = None;
-                    let arrived: Vec<i64> = messages
+                    let held: HashSet<i64> = self.messages.iter().map(|m| m.id).collect();
+                    let mut changed: Vec<i64> = messages
                         .iter()
                         .map(|m| m.id)
-                        .filter(|id| !loaded.contains(id))
+                        .filter(|id| !held.contains(id))
                         .collect();
-                    self.keep(messages);
+                    changed.extend(self.keep(messages));
                     if self
                         .stream
                         .as_ref()
-                        .is_some_and(|s| self.show.stream() && s.references(arrived))
+                        .is_some_and(|s| self.show.stream() && s.references(&changed))
                     {
-                        // Records drawn before this mail arrived give way to it.
+                        // Records drawn before this mail arrived give way to
+                        // it, and records for evicted mail draw again.
                         self.reconcile();
                     } else if self.show.messages() {
                         let entries = self.message_entries(messages);

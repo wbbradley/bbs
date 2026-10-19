@@ -1,7 +1,7 @@
 //! A thread's timeline: messages and, in an agent's thread, the activity it
 //! shares, drawn as `bbs headless logs --pretty` draws it, in time order.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use chrono::DateTime;
@@ -21,7 +21,7 @@ use crate::ui::thread::Row;
 /// Events each batch holds; the stream catches up from the start in batches.
 const BACKLOG: u32 = 200;
 /// Activity records kept; the oldest go first.
-const MAX_RECORDS: usize = 5000;
+pub(crate) const MAX_RECORDS: usize = 5000;
 
 /// One row of a timeline.
 #[derive(Clone, Debug, PartialEq)]
@@ -197,29 +197,47 @@ pub struct Stream {
     id: u64,
     agent: String,
     pub kinds: Kinds,
-    /// Every record received, so another filter can redraw them all.
-    records: VecDeque<proto::Activity>,
+    /// Every record kept, so another filter can redraw them all.
+    records: VecDeque<Kept>,
     renderer: Activity,
     /// A batch has arrived, so no records means nothing is shared.
     pub loaded: bool,
     /// The stream's last error; it has ended until a reload.
     pub error: Option<String>,
     progress: ProgressState,
-    /// Messages that kept records say they delivered or echo, so their
-    /// arrival can redraw those records.
-    referenced: HashSet<i64>,
+    /// Delivered-as ids already drawn since the last full redraw, so a
+    /// retried copy of the same text draws once.
+    drawn: HashSet<i64>,
 }
 
-/// The messages a record names: the owner mail an agent's text was
-/// delivered as (`mail_id`), or the mail a receipt or turn echoes
+/// The messages a thread holds, by id: true for an automatic reply from the
+/// thread's agent, the only mail a `text` record's `mail_id` may stand for.
+/// Empty while messages are filtered out, so activity then stands in.
+pub type Loaded = HashMap<i64, bool>;
+
+/// A kept record and the messages it names: the owner mail its text was
+/// delivered as (`mail_id`), and the mail a receipt or turn echoes
 /// (`mail_ids`).
-fn mail_refs(record: &serde_json::Value) -> Vec<i64> {
-    let ids = record["mail_ids"].as_array().into_iter().flatten();
-    record["mail_id"]
-        .as_i64()
-        .into_iter()
-        .chain(ids.filter_map(serde_json::Value::as_i64))
-        .collect()
+struct Kept {
+    activity: proto::Activity,
+    mail_id: Option<i64>,
+    mail_ids: Vec<i64>,
+}
+
+impl Kept {
+    fn new(activity: &proto::Activity) -> Kept {
+        let value: serde_json::Value = serde_json::from_str(&activity.record).unwrap_or_default();
+        Kept {
+            activity: activity.clone(),
+            mail_id: value["mail_id"].as_i64(),
+            mail_ids: value["mail_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_i64)
+                .collect(),
+        }
+    }
 }
 
 impl Stream {
@@ -233,7 +251,7 @@ impl Stream {
             loaded: false,
             error: None,
             progress: ProgressState::default(),
-            referenced: HashSet::new(),
+            drawn: HashSet::new(),
         }
     }
 
@@ -272,7 +290,7 @@ impl Stream {
 
     /// The newest record received.
     pub fn newest(&self) -> Option<i64> {
-        self.records.back().map(|r| r.id)
+        self.records.back().map(|r| r.activity.id)
     }
 
     /// Tool calls still running, to show below the newest activity.
@@ -284,27 +302,36 @@ impl Stream {
         self.records.is_empty()
     }
 
-    /// Whether a record names any of `ids`, so their arrival redraws it.
-    pub fn references(&self, ids: impl IntoIterator<Item = i64>) -> bool {
-        ids.into_iter().any(|id| self.referenced.contains(&id))
+    /// Whether a kept record names any of `ids`, so loading or evicting
+    /// them redraws it.
+    pub fn references(&self, ids: &[i64]) -> bool {
+        self.records.iter().any(|r| {
+            r.mail_id.is_some_and(|id| ids.contains(&id))
+                || r.mail_ids.iter().any(|id| ids.contains(id))
+        })
     }
 
     /// Draw `record` as an entry, if the kinds shown include it and the
-    /// thread does not already show it as mail (`loaded` message ids). Text
-    /// delivered as owner mail and receipts echoing mail drop out; a turn
-    /// keeps its separator without the echoed mail. Records without these
-    /// ids, as older runners write, always draw.
-    fn entry(&mut self, record: &proto::Activity, loaded: &HashSet<i64>) -> Option<Entry> {
+    /// thread does not already show it as mail. A `text` record gives way to
+    /// the automatic reply it was delivered as while that is loaded, and
+    /// draws once per delivered-as id otherwise; a receipt or turn echoing
+    /// mail gives way once all of it is loaded, a turn keeping its
+    /// separator. Records without these ids, as older runners write, draw.
+    fn entry(&mut self, kept: &Kept, loaded: &Loaded) -> Option<Entry> {
+        let record = &kept.activity;
         let mut value: serde_json::Value = serde_json::from_str(&record.record).unwrap_or_default();
         let event = value["event"].as_str().unwrap_or_default().to_string();
         if !self.kinds.shows(&event) {
             return None;
         }
-        let refs = mail_refs(&value);
-        let shown = !refs.is_empty() && refs.iter().all(|id| loaded.contains(id));
-        let lines = match event.as_str() {
-            "text" | "mail" | "steer" if shown => return None,
-            "prompt" if shown => {
+        let echoed =
+            !kept.mail_ids.is_empty() && kept.mail_ids.iter().all(|id| loaded.contains_key(id));
+        let lines = match (event.as_str(), kept.mail_id) {
+            ("text", Some(id)) if loaded.get(&id) == Some(&true) || !self.drawn.insert(id) => {
+                return None;
+            }
+            ("mail" | "steer", _) if echoed => return None,
+            ("prompt", _) if echoed => {
                 value["text"] = serde_json::Value::Null;
                 self.renderer.render(&value.to_string())
             }
@@ -318,9 +345,10 @@ impl Stream {
     }
 
     /// Every record kept, drawn afresh, as after changing the kinds or
-    /// loading mail that records name.
-    pub fn entries(&mut self, loaded: &HashSet<i64>) -> Vec<Entry> {
+    /// loading or evicting mail that records name.
+    pub fn entries(&mut self, loaded: &Loaded) -> Vec<Entry> {
         self.renderer = Activity::new(true).local_time();
+        self.drawn.clear();
         let records = std::mem::take(&mut self.records);
         let entries = records
             .iter()
@@ -332,7 +360,7 @@ impl Stream {
 
     /// Take a batch of this stream's data at `now`, given the thread's
     /// loaded message ids; returns the new entries.
-    pub fn on_data(&mut self, data: &Data, now: Instant, loaded: &HashSet<i64>) -> Vec<Entry> {
+    pub fn on_data(&mut self, data: &Data, now: Instant, loaded: &Loaded) -> Vec<Entry> {
         if let Data::ActivityBaseline {
             id,
             through_id,
@@ -352,18 +380,15 @@ impl Stream {
             Ok(events) => {
                 for event in events {
                     self.progress.observe(event.id, &event.record, now);
-                    if let Ok(value) = serde_json::from_str(&event.record) {
-                        self.referenced.extend(mail_refs(&value));
-                    }
                 }
                 self.loaded = true;
                 self.error = None;
-                let entries = events
-                    .iter()
-                    .filter_map(|e| self.entry(e, loaded))
-                    .collect();
-                self.records.extend(events.iter().cloned());
+                let kept: Vec<_> = events.iter().map(Kept::new).collect();
+                let entries = kept.iter().filter_map(|k| self.entry(k, loaded)).collect();
+                self.records.extend(kept);
                 let over = self.records.len().saturating_sub(MAX_RECORDS);
+                // An evicted copy's row stays in the larger view, so no
+                // redraw is needed for a retried copy to draw once.
                 self.records.drain(..over);
                 entries
             }
@@ -415,29 +440,29 @@ mod tests {
                 record: None,
             },
             now,
-            &HashSet::new(),
+            &Loaded::new(),
         );
-        stream.on_data(&batch(id, 500, "text"), now, &HashSet::new());
+        stream.on_data(&batch(id, 500, "text"), now, &Loaded::new());
         assert_eq!(stream.progress(now), Progress::Unknown);
         stream.kinds = Kinds::Problems;
         assert!(
             stream
-                .on_data(&batch(id, 501, "text"), now, &HashSet::new())
+                .on_data(&batch(id, 501, "text"), now, &Loaded::new())
                 .is_empty()
         );
         assert_eq!(stream.progress(now), Progress::Progressing(0));
-        stream.entries(&HashSet::new());
+        stream.entries(&Loaded::new());
         stream.on_data(
             &batch(id, 501, "text"),
             now + Duration::from_secs(59),
-            &HashSet::new(),
+            &Loaded::new(),
         );
         assert_eq!(
             stream.progress(now + Duration::from_secs(60)),
             Progress::Unknown
         );
         // Recorded completion persists instead of expiring.
-        stream.on_data(&batch(id, 502, "turn_end"), now, &HashSet::new());
+        stream.on_data(&batch(id, 502, "turn_end"), now, &Loaded::new());
         assert_eq!(stream.progress(now), Progress::Done);
         assert_eq!(
             stream.progress(now + Duration::from_secs(60)),
@@ -452,9 +477,9 @@ mod tests {
                 record: None,
             },
             now,
-            &HashSet::new(),
+            &Loaded::new(),
         );
-        stream.on_data(&batch(id, 503, "text"), now, &HashSet::new());
+        stream.on_data(&batch(id, 503, "text"), now, &Loaded::new());
         assert_eq!(stream.progress(now), Progress::Unknown);
         let id = stream.id;
         stream.on_data(
@@ -464,9 +489,9 @@ mod tests {
                 record: None,
             },
             now,
-            &HashSet::new(),
+            &Loaded::new(),
         );
-        stream.on_data(&batch(id, 504, "text"), now, &HashSet::new());
+        stream.on_data(&batch(id, 504, "text"), now, &Loaded::new());
         assert_eq!(stream.progress(now), Progress::Progressing(0));
         stream.on_data(
             &Data::Activity {
@@ -474,7 +499,7 @@ mod tests {
                 result: Err("disconnected".into()),
             },
             now,
-            &HashSet::new(),
+            &Loaded::new(),
         );
         assert_eq!(stream.progress(now), Progress::Unknown);
     }

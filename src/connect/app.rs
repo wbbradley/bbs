@@ -4385,7 +4385,10 @@ mod tests {
                     from_kind: proto::Kind::Human.into(),
                     ..at(10, "01", "ada", "Mateo", "please build")
                 },
-                at(11, "05", "Mateo", "ada", "built it"),
+                proto::Message {
+                    auto_reply: Some(true),
+                    ..at(11, "05", "Mateo", "ada", "built it")
+                },
             ]
         };
         let records = || {
@@ -4492,6 +4495,119 @@ mod tests {
             !out.contains("steered echo") && !out.contains("steered into"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn delivered_text_hides_only_for_its_agents_auto_reply_and_draws_once() {
+        let text = |id: i64, body: &str, mail_id: i64| {
+            activity(
+                id,
+                "05",
+                &format!(
+                    r#"{{"ts":"2026-10-16T18:00:05Z","event":"text","text":"{body}","mail_id":{mail_id}}}"#
+                ),
+            )
+        };
+        let (mut app, mut rx) = app();
+        let (feed, act) = mateo_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![
+                proto::Message {
+                    auto_reply: Some(true),
+                    ..at(11, "04", "Mateo", "ada", "the reply")
+                },
+                // Mail by hand, and another agent's automatic reply.
+                at(12, "04", "Mateo", "ada", "by hand"),
+                proto::Message {
+                    auto_reply: Some(true),
+                    ..at(13, "04", "Zed", "ada", "zed reply")
+                },
+            ]),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![
+                // Newer than the filler below, so it outlives the reply in
+                // the bounded view.
+                activity(
+                    1,
+                    "07",
+                    r#"{"ts":"2026-10-16T18:00:07Z","event":"text","text":"the reply","mail_id":11}"#,
+                ),
+                text(2, "manual words", 12),
+                text(3, "foreign words", 13),
+                // A retried post repeats an undelivered-looking copy; equal
+                // prose under another id is a different reply.
+                text(4, "retried words", 50),
+                text(5, "retried words", 50),
+                text(6, "retried words", 51),
+            ]),
+        }));
+        let out = screen(&mut app, 100, 40);
+        assert_eq!(out.matches("the reply").count(), 1, "{out}");
+        for shown in ["manual words", "foreign words", "by hand", "zed reply"] {
+            assert!(out.contains(shown), "{shown}: {out}");
+        }
+        assert_eq!(out.matches("retried words").count(), 2, "{out}");
+        // With messages filtered out, the text stands in for its reply;
+        // with activity filtered out, the reply shows.
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, 'A');
+        assert!(bottom(&mut app).contains("A: messages"));
+        assert_eq!(screen(&mut app, 100, 40).matches("the reply").count(), 1);
+        key(&mut app, 'A');
+        assert!(bottom(&mut app).contains("A: activity"));
+        assert_eq!(screen(&mut app, 100, 40).matches("the reply").count(), 1);
+        key(&mut app, 'A');
+        assert_eq!(screen(&mut app, 100, 40).matches("the reply").count(), 1);
+
+        // Evicting the reply from the bounded message history brings the
+        // text back, once.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok((100..100 + crate::ui::thread::MAX_ROWS as i64)
+                .map(|id| at(id, "06", "Mateo", "Ben", "filler"))
+                .collect()),
+        }));
+        let matches = |app: &mut App, query: &str| {
+            key(app, '/');
+            typed(app, query);
+            enter(app);
+            bottom(app)
+        };
+        assert!(
+            matches(&mut app, "by hand").contains(": 0 matches"),
+            "evicted"
+        );
+        let row = matches(&mut app, "the reply");
+        assert!(row.contains(": 1 matches"), "{row}");
+
+        // Evicting the first copy from the bounded activity keeps one.
+        let (mut app, mut rx) = self::app();
+        let (_, act) = mateo_streams(&mut app, &mut rx);
+        let mut records = vec![text(1, "kept once", 60)];
+        records.extend(
+            (2..=crate::connect::timeline::MAX_RECORDS as i64 + 1).map(|id| {
+                activity(
+                    id,
+                    "05",
+                    r#"{"ts":"2026-10-16T18:00:05Z","event":"turn_end","stop_reason":"end_turn"}"#,
+                )
+            }),
+        );
+        records.push(text(
+            crate::connect::timeline::MAX_RECORDS as i64 + 2,
+            "kept once",
+            60,
+        ));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(records),
+        }));
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        let row = matches(&mut app, "kept once");
+        assert!(row.contains(": 1 matches"), "{row}");
     }
 
     #[test]
