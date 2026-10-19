@@ -108,6 +108,9 @@ pub struct ThreadView<R: Row = Message> {
     pub(crate) started: bool,
     /// Line layout that keys scroll against.
     pub(crate) frame: Geometry,
+    /// Something drawn just below continues the last row (a pane of calls
+    /// still running), so the last row keeps no closing blank of its own.
+    continued: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -146,6 +149,7 @@ impl<R: Row> ThreadView<R> {
             gaps: HashSet::new(),
             started: false,
             frame: Geometry::default(),
+            continued: false,
         };
         view.ingest(rows);
         view
@@ -214,6 +218,17 @@ impl<R: Row> ThreadView<R> {
         self.layout(self.frame.width, self.frame.height);
     }
 
+    /// Whether something drawn just below continues the last row; changing
+    /// it re-measures that row.
+    pub fn set_continued(&mut self, continued: bool) {
+        if self.continued != continued {
+            self.continued = continued;
+            if let Some(last) = self.rows.len().checked_sub(1) {
+                self.remeasure(last);
+            }
+        }
+    }
+
     /// Forget row `i`'s measured height, if there is such a row.
     fn remeasure(&mut self, i: usize) {
         if let Some(height) = self.heights.get_mut(i) {
@@ -229,7 +244,7 @@ impl<R: Row> ThreadView<R> {
         if row.spaced_after(i.checked_sub(1).map(|j| &self.rows[j])) {
             lines.insert(0, Line::default());
         }
-        if i + 1 == self.rows.len() && row.spaced_last() {
+        if i + 1 == self.rows.len() && !self.continued && row.spaced_last() {
             lines.push(Line::default());
         }
         lines

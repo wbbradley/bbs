@@ -4915,6 +4915,73 @@ mod tests {
     }
 
     #[test]
+    fn running_calls_continue_the_finished_run_with_one_blank_below() {
+        let rec = |id: i64, body: String| {
+            activity(
+                id,
+                "05",
+                &format!(r#"{{"ts":"2026-10-16T18:00:05Z",{body}}}"#),
+            )
+        };
+        let tool = |id: i64, call: &str, status: &str| {
+            rec(
+                id,
+                format!(
+                    r#""event":"tool","id":"{call}","title":"Read {call}.rs","status":"{status}""#
+                ),
+            )
+        };
+        let (mut app, mut rx) = app();
+        let (_, act) = mateo_streams(&mut app, &mut rx);
+        // Enough text to fill the timeline, so its last row meets the pane.
+        let mut records: Vec<_> = (1..=40)
+            .map(|id| rec(id, format!(r#""event":"text","text":"line {id}""#)))
+            .collect();
+        records.extend([tool(41, "a", "in_progress"), tool(42, "a", "completed")]);
+        records.extend((0..12).map(|n| tool(43 + n, &format!("r{n}"), "in_progress")));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(records),
+        }));
+        let out = screen(&mut app, 80, 30);
+        let lines: Vec<&str> = out.lines().map(str::trim_end).collect();
+        let done = lines
+            .iter()
+            .position(|l| l.contains("✓ Read a.rs"))
+            .expect("done");
+        // One blank opens the run; the running calls follow with none between.
+        assert!(
+            lines[done - 1].is_empty() && lines[done - 2].contains("line 40"),
+            "{out}"
+        );
+        assert!(lines[done + 1].contains("… Read r0.rs running"), "{out}");
+        // More calls than the pane holds: it keeps its closing blank anyway.
+        let last = lines.iter().rposition(|l| l.contains(" running")).unwrap();
+        assert!(lines[last + 1].is_empty(), "{out}");
+        assert!(
+            !out.contains("Read r11.rs"),
+            "the pane holds only a third: {out}"
+        );
+        // When the calls finish, the run closes after the last finished one.
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok((0..12)
+                .map(|n| tool(55 + n, &format!("r{n}"), "completed"))
+                .collect()),
+        }));
+        let out = screen(&mut app, 80, 30);
+        let lines: Vec<&str> = out.lines().map(str::trim_end).collect();
+        let last = lines
+            .iter()
+            .rposition(|l| l.contains("✓ Read r11.rs"))
+            .unwrap();
+        assert!(
+            lines[last + 1].is_empty() && !out.contains(" running"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn raw_feed_gaps_show_one_warning_and_overlaps_none() {
         {
             let (mut app, mut rx) = app();

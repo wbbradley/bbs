@@ -1038,20 +1038,26 @@ impl Thread {
         // Calls still running sit below the newest activity while following,
         // as one more tool run would. The renderer only tracks calls the
         // kinds shown let through, so `E` hides them too.
-        let mut running = match &self.stream {
+        let calls = match &self.stream {
             Some(stream) if self.show.stream() && self.view.following() => {
                 stream.running(body.width)
             }
             _ => Vec::new(),
         };
-        // Calls still running are a run too: a blank line above unless the
-        // timeline already ends a run or with a blank, and one below.
-        if !running.is_empty() {
-            if crate::connect::timeline::opens_run(self.view.rows.last()) {
-                running.insert(0, Line::default());
+        // Calls still running continue a run the timeline ends with, or open
+        // one with a blank line above; either way one blank line closes the
+        // run below them, kept within the pane's share of the height.
+        let mut running = Vec::new();
+        if !calls.is_empty() {
+            let open = crate::connect::timeline::opens_run(self.view.rows.last());
+            let room = usize::from(body.height / 3).saturating_sub(usize::from(open) + 1);
+            if open {
+                running.push(Line::default());
             }
+            running.extend(calls.into_iter().take(room.max(1)));
             running.push(Line::default());
         }
+        self.view.set_continued(!running.is_empty());
         let height = (running.len() as u16).min(body.height / 3);
         let [body, below] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(body);
