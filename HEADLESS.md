@@ -138,8 +138,8 @@ setting reports that actual value with a failure explaining the mismatch. Metada
 updates alone do not acknowledge controls, and an older completion cannot clear a
 newer pending request.
 
-The bottom bar separates last reported current/report age, pending next-turn
-intent and errors. Delayed requests remain visibly unconfirmed. A definite refusal
+The bottom bar separates the last reported current value, pending next-turn
+intent and errors. Slow outcomes stay pending without an alarm. A definite refusal
 clears the matching request; a timeout/disconnect reports uncertainty instead of
 claiming success. When a setter or turn-start has ambiguous acceptance, the driver
 stops, records unsent mail as `unprocessed` or possibly delivered mail as

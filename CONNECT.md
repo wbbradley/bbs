@@ -34,9 +34,9 @@ several separate `bbs group` commands.
   outgoing/input surface.
 - Screens have no outer border; list/menu headings sit above their content
   and dialogs keep their own boundaries. Block shading (`░▒▓█`) for title bars
-  and menus. A status bar fills the whole bottom line with the server, the
-  human and time online when space permits. Agent conversations use the bottom
-  bar for timeline state and feedback.
+  and menus. A status bar fills the whole bottom line with the signed-in human.
+  Agent conversations have no title bar: their bottom bar starts with
+  `BBS · <agent>` and carries timeline state and feedback.
 - Structured agent names use Agent blue, human names Human purple, groups Group
   yellow, timestamps Timestamp muted gray, and tool labels Tool technical text in
   Gruvbox. Terminal and No color keep the same semantic roles. Qualified names
@@ -52,8 +52,9 @@ several separate `bbs group` commands.
 
 ## Screens
 
-The top level is a main menu. Every other screen sits under a shared title bar
-and above the full-width status bar.
+The top level is a main menu. Every other screen except an agent conversation
+sits under a shared title bar, and every screen sits above the full-width status
+bar.
 
 | Screen | What it shows | Data |
 | --- | --- | --- |
@@ -68,17 +69,17 @@ and above the full-width status bar.
 
 ### Agent effort
 
-The agent bottom bar shows last reported effort and report age before timeline
-state. A separate next-turn value stays pending until the exact control outcome
-arrives; metadata changes alone never acknowledge it. Explicit newer driver-pending
-requests may supersede older local requests without implying success. Delayed
-requests remain visible as unconfirmed after 60 seconds, including across closing
-and reopening a conversation within the session. Applied means provider ACK;
-failed and unknown outcomes are separate feedback. A definite capability,
-authentication or validation refusal clears only the matching local request;
-a transport failure retains it as unconfirmed. A fresh authoritative agent list
-can clear an old driver's current/choices without discarding unresolved intent.
-Report age is not connectivity.
+The agent bottom bar shows the last reported effort ("effort low", or "effort
+unknown" without a report) before timeline state, and a pending next-turn value
+as "effort low → medium next turn". It shows no report age and no alarm while an
+outcome is slow. The next-turn value stays pending until the exact control
+outcome arrives; metadata changes alone never acknowledge it. Explicit newer
+driver-pending requests may supersede older local requests without implying
+success. Applied means provider ACK; failed and unknown outcomes are separate
+feedback. A definite capability, authentication or validation refusal clears only
+the matching local request and is shown; a transport failure quietly keeps it
+pending. A fresh authoritative agent list can clear an old driver's
+current/choices without discarding unresolved intent.
 
 Tab increases effort and Shift-Tab decreases it in both agent typing and timeline
 navigation, before composer input. Shift-Tab accepts terminal BackTab and enhanced
@@ -129,7 +130,8 @@ the current scheme; saved drafts keep their text/cursor and resolve styles as dr
 Split vertically. The top pane is the agent's timeline, scrollable, newest
 at the bottom, and following until you scroll up (as `bbs view` does). The
 bottom pane is the composer. Sending goes to the agent by direct message.
-The conversation title appears once in the app title bar. There is no separate
+The conversation title appears once, as `BBS · <agent>` at the left of the
+bottom bar; the timeline takes the title bar's row. There is no separate
 entry-count row. The bottom bar shows following or paused, with new arrivals
 while paused, plus filter/view and search feedback. Prompts keep their visible
 tail and Enter/Esc hints; errors take priority over normal filter and connection

@@ -342,27 +342,38 @@ impl Thread {
                 .and_then(|a| ctx.efforts.error(a))
                 .map(|e| ("effort error", e.to_string()))
         });
-        let delayed = self
-            .agent
-            .as_ref()
-            .and_then(|a| ctx.efforts.delayed(a, (self.now)()));
-        let issue = issue.or_else(|| delayed.map(|e| ("effort unconfirmed", e)));
-        if !searching {
-            let budget = if issue.is_some()
-                || self.effort_notice.is_some()
-                || ctx.navigation_notice.is_some()
-            {
-                12
-            } else {
-                width.saturating_sub(mode.width() + 37).min(48)
-            };
+        let hints = |short: bool| {
+            let mut parts = Vec::new();
+            if !self.compact {
+                parts.push(if short {
+                    format!("A:{}", self.show.label())
+                } else {
+                    format!("A: {}", self.show.label())
+                });
+                if self.show.stream()
+                    && let Some(stream) = &self.stream
+                {
+                    let label = stream.kinds.label();
+                    parts.push(if short {
+                        format!("E:{}", label.strip_suffix(" kinds").unwrap_or(label))
+                    } else {
+                        format!("E: {label}")
+                    });
+                }
+            }
+            parts.join(if short { " " } else { " · " })
+        };
+        // Feedback and the search prompt take the effort summary's room.
+        let feedback =
+            issue.is_some() || self.effort_notice.is_some() || ctx.navigation_notice.is_some();
+        if !searching && !feedback {
+            // Room left by the mode, the short filters and the human.
+            let rest = mode.width() + hints(true).width() + ctx.me.width() + 9;
+            let budget = width.saturating_sub(rest).min(48);
             let effort = self
                 .agent
                 .as_ref()
-                .map(|a| {
-                    ctx.efforts
-                        .summary(a, (self.now)(), chrono::Local::now(), budget)
-                })
+                .map(|a| ctx.efforts.summary(a, budget))
                 .unwrap_or_default();
             mode = format!("{} · {mode}", fit_status(&effort, budget, false));
         }
@@ -396,41 +407,10 @@ impl Thread {
                 fit_status(notice.text(), available, false)
             ));
         }
-        let hints = |short: bool| {
-            let mut parts = Vec::new();
-            if !self.compact {
-                parts.push(if short {
-                    format!("A:{}", self.show.label())
-                } else {
-                    format!("A: {}", self.show.label())
-                });
-                if self.show.stream()
-                    && let Some(stream) = &self.stream
-                {
-                    let label = stream.kinds.label();
-                    parts.push(if short {
-                        format!("E:{}", label.strip_suffix(" kinds").unwrap_or(label))
-                    } else {
-                        format!("E: {label}")
-                    });
-                }
-            }
-            parts.push(if short {
-                format!(
-                    "Ctrl-T:{}",
-                    if self.compact { "verbose" } else { "compact" }
-                )
-            } else {
-                format!(
-                    "Ctrl-T: {}",
-                    if self.compact { "verbose" } else { "compact" }
-                )
-            });
-            parts.join(if short { " " } else { " · " })
-        };
         let mut filters = hints(false);
         let mut text = mode;
-        if text.width() + filters.width() + 3 > width {
+        // Short labels before dropping the human's name.
+        if text.width() + filters.width() + ctx.me.width() + 6 > width {
             filters = hints(true);
         }
         if self.composer.as_ref().is_some_and(Composer::sending) {
@@ -448,29 +428,19 @@ impl Thread {
                 fit_status(query, available, true)
             ));
         }
-        text.push_str(&format!(" · {filters}"));
-        let secs = ctx.started.elapsed().as_secs();
+        if !filters.is_empty() {
+            text.push_str(&format!(" · {filters}"));
+        }
         let mut line = Line::raw(text);
-        for (detail, role) in [
-            (ctx.server.clone(), theme::Role::Text),
-            (ctx.me.clone(), theme::Role::Human),
-            (
-                format!(
-                    "online {:02}:{:02}:{:02}",
-                    secs / 3600,
-                    secs / 60 % 60,
-                    secs % 60
+        if line.width() + ctx.me.width() + 3 <= width {
+            line.spans.push(Span::raw(" · "));
+            line.spans.push(Span::styled(
+                ctx.me.clone(),
+                theme::on_surface(
+                    theme::style(theme::Role::StatusBar),
+                    theme::style(theme::Role::Human),
                 ),
-                theme::Role::Timestamp,
-            ),
-        ] {
-            if line.width() + detail.width() + 3 <= width {
-                line.spans.push(Span::raw(" · "));
-                line.spans.push(Span::styled(
-                    detail,
-                    theme::on_surface(theme::style(theme::Role::StatusBar), theme::style(role)),
-                ));
-            }
+            ));
         }
         theme::clip_line(line, width)
     }
@@ -654,7 +624,32 @@ impl Screen for Thread {
             0
         };
         let text_width = width.saturating_sub(reserved);
-        let mut line = self.conversation_status(text_width, ctx, draft_error);
+        // The conversation's title, at the left: agent threads have no title
+        // row. A long name keeps at most a third of the bar.
+        let bar = theme::style(theme::Role::StatusBar);
+        let name = fit_status(
+            self.agent.as_deref().unwrap_or_default(),
+            usize::from(text_width) / 3,
+            false,
+        );
+        let title = vec![
+            Span::styled("BBS · ", bar),
+            Span::styled(
+                name.clone(),
+                theme::on_surface(bar, theme::style(theme::Role::Agent)),
+            ),
+            Span::styled(" · ", bar),
+        ];
+        let title_width = name.width() + "BBS ·  · ".width();
+        let mut line = self.conversation_status(
+            text_width.saturating_sub(title_width as u16),
+            ctx,
+            draft_error,
+        );
+        // The title's own colours override an error line's style.
+        let mut spans = title;
+        spans.append(&mut line.spans);
+        line.spans = spans;
         if let Some(mut indicator) = indicator
             && width > 0
         {
@@ -908,11 +903,7 @@ impl Screen for Thread {
                             Span::raw("Effort · "),
                             Span::styled(agent.clone(), theme::style(theme::Role::Agent)),
                         ]),
-                        format!(
-                            "{}; next ordinary turn.",
-                            ctx.efforts
-                                .status(agent, (self.now)(), chrono::Local::now())
-                        ),
+                        format!("{}; next ordinary turn.", ctx.efforts.status(agent)),
                         ctx.efforts.choices(agent),
                     ));
                     Transition::Stay

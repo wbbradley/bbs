@@ -34,7 +34,6 @@ pub struct Ctx {
     /// The connected human.
     pub me: String,
     pub server: String,
-    pub started: Instant,
     /// `[connect] composer_max_height_percent`.
     pub composer_max_height_percent: u8,
     pub preferences: Preferences,
@@ -371,7 +370,7 @@ impl App {
                             known.extend(rows.iter().map(|s| s.agent.to_ascii_lowercase()));
                         }
                         if let Ok(rows) = result {
-                            self.ctx.efforts.summarized(rows, (self.ctx.now)());
+                            self.ctx.efforts.summarized(rows);
                         }
                         self.ctx.inbox.snapshot(*id, result);
                         if matches!(self.ctx.navigation_notice, Some(Feedback::Summary(_))) {
@@ -379,12 +378,10 @@ impl App {
                         }
                     }
                     Data::EffortSent { id, agent, result } => {
-                        self.ctx.efforts.sent(agent, *id, result, (self.ctx.now)());
+                        self.ctx.efforts.sent(agent, *id, result);
                     }
                     Data::Agents(Ok(list)) => {
-                        self.ctx
-                            .efforts
-                            .listed(&list.agents, list_revision, (self.ctx.now)());
+                        self.ctx.efforts.listed(&list.agents, list_revision);
                         self.known_agents = Some(
                             list.agents
                                 .iter()
@@ -493,13 +490,11 @@ impl App {
         match transition {
             Transition::Stay => {}
             Transition::Effort { agent, value } => {
-                if let Some(request) = self.ctx.efforts.request(
-                    &agent,
-                    &self.ctx.me,
-                    value,
-                    next_id(),
-                    (self.ctx.now)(),
-                ) {
+                if let Some(request) =
+                    self.ctx
+                        .efforts
+                        .request(&agent, &self.ctx.me, value, next_id())
+                {
                     self.send(vec![request]);
                 }
             }
@@ -525,12 +520,17 @@ impl App {
             theme::render_too_small(frame);
             return;
         }
-        let [title, body, status] = theme::frame_areas(frame.area());
+        let [title, mut body, status] = theme::frame_areas(frame.area());
         let screen = self.stack.last_mut().expect("the menu is never popped");
-        frame.render_widget(Paragraph::new(theme::title_bar(screen.title_line())), title);
+        // An agent conversation's title is at the left of its bottom bar, so
+        // its timeline takes the title row.
+        if matches!(screen.conversation(), Some(Conversation::Agent(_))) {
+            body = title.union(body);
+        } else {
+            frame.render_widget(Paragraph::new(theme::title_bar(screen.title_line())), title);
+        }
         screen.render(frame, body, &self.ctx);
-        let online = self.ctx.started.elapsed();
-        let bar = theme::status_bar(&self.ctx.server, &self.ctx.me, online);
+        let bar = theme::status_bar(&self.ctx.me);
         if let Some(line) = screen.bottom_status(status.width, &self.ctx, self.draft_store.error())
         {
             let style = theme::style(theme::Role::StatusBar).patch(line.style);
@@ -1134,12 +1134,10 @@ mod tests {
                     theme::Role::Human,
                     theme::Role::StatusBar,
                 );
-                check(
-                    buffer,
-                    23,
-                    "00:00:",
-                    theme::Role::Timestamp,
-                    theme::Role::StatusBar,
+                let status: String = (0..80).map(|x| buffer[(x, 23)].symbol()).collect();
+                assert!(
+                    !status.contains("online") && !status.contains("bbs:7777"),
+                    "{status}"
                 );
             }
             open_agents(&mut app, &mut rx);
@@ -1187,10 +1185,10 @@ mod tests {
                 let buffer = terminal.backend().buffer();
                 check(
                     buffer,
-                    0,
+                    23,
                     "Mateo",
                     theme::Role::Agent,
-                    theme::Role::TitleBar,
+                    theme::Role::StatusBar,
                 );
                 check(
                     buffer,
@@ -1273,19 +1271,20 @@ mod tests {
         });
     }
 
+    /// Whether the bottom row shows verbose mode's A:/E: filter labels.
+    fn verbose_filters(out: &str) -> bool {
+        out.lines().last().is_some_and(|row| row.contains(" A:"))
+    }
+
     fn assert_status_foreground(cell: &ratatui::buffer::Cell, bar: ratatui::style::Style) {
         assert!(
-            [
-                theme::Role::Text,
-                theme::Role::Human,
-                theme::Role::Timestamp
-            ]
-            .into_iter()
-            .map(|role| theme::on_surface(bar, theme::style(role))
-                .fg
-                .unwrap_or(cell.fg))
-            .chain(bar.fg)
-            .any(|fg| cell.fg == fg),
+            [theme::Role::Text, theme::Role::Human, theme::Role::Agent]
+                .into_iter()
+                .map(|role| theme::on_surface(bar, theme::style(role))
+                    .fg
+                    .unwrap_or(cell.fg))
+                .chain(bar.fg)
+                .any(|fg| cell.fg == fg),
             "unexpected status foreground: {cell:?}"
         );
     }
@@ -1429,7 +1428,6 @@ mod tests {
         let mut ctx = Ctx {
             me: "ada".into(),
             server: "bbs:7777".into(),
-            started: Instant::now(),
             composer_max_height_percent: 20,
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
@@ -1490,7 +1488,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_title_is_single_and_mode_uses_the_full_width_bottom_bar() {
+    fn agent_title_moves_to_the_bottom_bar_and_the_timeline_takes_its_row() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {
             with_scheme(scheme, || {
@@ -1501,9 +1499,17 @@ mod tests {
                     result: Ok(vec![message(1, "Mateo", "ada", "body-start")]),
                 }));
                 let out = screen(&mut app, 80, 24);
-                assert_eq!(out.matches("Mateo conversation").count(), 1);
-                assert!(out.lines().nth(3).unwrap().contains("body-start"), "{out}");
-                assert!(out.lines().last().unwrap().contains("following · A:all"));
+                assert!(!out.contains("conversation") && !out.contains('░'), "{out}");
+                assert!(out.lines().nth(2).unwrap().contains("body-start"), "{out}");
+                let last = out.lines().last().unwrap();
+                assert!(
+                    last.starts_with("BBS · Mateo · effort unknown · following"),
+                    "{last}"
+                );
+                assert!(
+                    !last.contains("bbs:7777") && !last.contains("online"),
+                    "{last}"
+                );
                 assert!(
                     !out.contains("1 entries")
                         && !out.contains("1 messages")
@@ -1513,12 +1519,91 @@ mod tests {
                 terminal.draw(|frame| app.draw(frame)).unwrap();
                 let buffer = terminal.backend().buffer();
                 let expected = theme::base().patch(theme::style(theme::Role::StatusBar));
+                let agent = theme::on_surface(expected, theme::style(theme::Role::Agent));
                 for x in 0..80 {
-                    assert_status_foreground(&buffer[(x, 23)], expected);
+                    // "BBS · " then the agent's name in its category colour.
+                    if (6..11).contains(&x) {
+                        assert_eq!(buffer[(x, 23)].fg, agent.fg.unwrap(), "x={x}");
+                    } else {
+                        assert_status_foreground(&buffer[(x, 23)], expected);
+                    }
                     assert_eq!(buffer[(x, 23)].bg, expected.bg.unwrap());
                 }
             });
         }
+    }
+
+    #[test]
+    fn agent_conversations_trade_the_title_row_for_a_quiet_bottom_bar() {
+        let (mut app, mut rx) = app();
+        let (clock, now) = test_clock();
+        app.ctx.now = now;
+        // Other screens keep their title row; no screen shows the server or
+        // a clock.
+        let menu = screen(&mut app, 80, 24);
+        assert!(
+            menu.lines()
+                .next()
+                .unwrap()
+                .contains("░▒▓█ BBS · Main menu █▓▒░")
+        );
+        assert_eq!(menu.lines().last().unwrap().trim(), "ada");
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok((1..=40)
+                .map(|id| message(id, "Mateo", "ada", &format!("line {id}")))
+                .collect()),
+        }));
+        report_effort(&mut app, effort_report(Some("low")));
+        let first_row = |out: &str| out.lines().next().unwrap().to_string();
+        // Every agent mode: the timeline reaches the top row and the bottom
+        // bar starts with the title.
+        let mut seen = Vec::new();
+        for (compact, insert) in [(false, true), (false, false), (true, false), (true, true)] {
+            if verbose_filters(&screen(&mut app, 80, 24)) == compact {
+                press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+            }
+            if editor_focused(&mut app) != insert {
+                let code = if insert {
+                    KeyCode::Esc
+                } else {
+                    KeyCode::PageUp
+                };
+                press(&mut app, code, KeyModifiers::NONE);
+            }
+            let out = screen(&mut app, 80, 24);
+            assert_eq!(verbose_filters(&out), !compact, "{out}");
+            assert_eq!(editor_focused(&mut app), insert, "{out}");
+            assert!(
+                !first_row(&out).contains("BBS") && !out.contains('░'),
+                "{out}"
+            );
+            let last = out.lines().last().unwrap();
+            assert!(last.starts_with("BBS · Mateo · effort low · "), "{last}");
+            for gone in ["conversation", "reported", "Ctrl-T", "bbs:7777", "online"] {
+                assert!(!last.contains(gone), "{gone}: {last}");
+            }
+            seen.push((compact, insert));
+        }
+        assert_eq!(seen.len(), 4);
+        // A pending change reads as one quiet next-turn value, however long
+        // its outcome takes.
+        app.on_action(Action::EffortUp);
+        while rx.try_recv().is_ok() {}
+        assert!(bottom(&mut app).contains("effort low → medium next turn"));
+        clock.advance(Duration::from_secs(600));
+        let row = bottom(&mut app);
+        assert!(
+            row.contains("effort low → medium next turn") && !row.contains("unconf"),
+            "{row}"
+        );
+        // Ctrl-T is still a key, and Help still lists it.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        key(&mut app, '?');
+        let help = screen(&mut app, 80, 60);
+        assert!(help.contains("Ctrl-T"), "{help}");
     }
 
     #[test]
@@ -1542,7 +1627,8 @@ mod tests {
         key(&mut app, 'G');
         assert!(bottom(&mut app).contains(" · following"));
         key(&mut app, 'E');
-        assert!(bottom(&mut app).contains("E:no text"));
+        let row = bottom(&mut app);
+        assert!(row.contains("E: no text"), "{row}");
         key(&mut app, '/');
         typed(&mut app, &"👍🏽🇺🇸👩‍💻é".repeat(20));
         let prompt = bottom(&mut app);
@@ -1552,7 +1638,7 @@ mod tests {
         let committed = bottom(&mut app);
         assert!(committed.contains("0 matches · n/N"), "{committed}");
         assert!(
-            committed.contains("A:all E:no text Ctrl-T:compact"),
+            committed.contains("A:all E:no text") && !committed.contains("Ctrl-T"),
             "{committed}"
         );
         assert!(unicode_width::UnicodeWidthStr::width(committed.as_str()) <= 80);
@@ -1731,7 +1817,7 @@ mod tests {
         assert_eq!(app.top().draft().unwrap().1.text, "keep");
         let status = bottom(&mut app);
         assert!(
-            status.contains("low→high next") && status.contains("following"),
+            status.contains("effort low → high next turn") && status.contains("following"),
             "{status}"
         );
         let mut r = effort_report(Some("low"));
@@ -1796,12 +1882,7 @@ mod tests {
             effort_revision: old,
             result: Ok(cleared()),
         }));
-        assert!(
-            app.ctx
-                .efforts
-                .status("Mateo", (app.ctx.now)(), chrono::Local::now())
-                .contains("effort high")
-        );
+        assert!(app.ctx.efforts.status("Mateo").contains("effort high"));
         app.send(vec![Request::Agents]);
         let Request::AgentsAt { effort_revision } = rx.try_recv().unwrap() else {
             panic!("fresh list")
@@ -1815,14 +1896,8 @@ mod tests {
             true,
         );
         while rx.try_recv().is_ok() {}
-        let status = app
-            .ctx
-            .efforts
-            .status("Mateo", (app.ctx.now)(), chrono::Local::now());
-        assert!(
-            status.contains("effort unknown (not reported)") && status.contains("medium next turn"),
-            "{status}"
-        );
+        let status = app.ctx.efforts.status("Mateo");
+        assert!(status == "effort unknown → medium next turn", "{status}");
         app.on_action(Action::EffortUp);
         assert!(
             !app.top().navigation_blocked(),
@@ -1997,7 +2072,8 @@ mod tests {
         r.state.as_mut().unwrap().reason = "No effort configuration".into();
         report_effort(&mut app, r);
         app.on_action(Action::EffortUp);
-        assert!(bottom(&mut app).contains("No effort configuration"));
+        let row = bottom(&mut app);
+        assert!(row.contains("No effort configuration"), "{row}");
         assert!(rx.try_recv().is_err());
         assert_eq!(app.top().draft().unwrap().1.text, ",.");
         app.open(Box::new(Thread::group("crew")), true);
@@ -2044,7 +2120,7 @@ mod tests {
                     while rx.try_recv().is_ok() {}
                     let row = bottom(&mut app);
                     assert!(
-                        row.starts_with("effort")
+                        row.starts_with("BBS · Mateo · effort")
                             && row.contains("following")
                             && row.contains("next"),
                         "{row}"
@@ -2053,10 +2129,11 @@ mod tests {
                     assert!(app.next_animation_frame().is_some());
                     press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
                 }
+                // A slow outcome raises no alarm: the next-turn value stays.
                 clock.advance(Duration::from_secs(61));
                 let delayed = bottom(&mut app);
                 assert!(
-                    delayed.contains("unconfirmed") || delayed.contains("unconf…"),
+                    !delayed.contains("unconf") && delayed.contains("next"),
                     "{delayed}"
                 );
                 app.ctx.preferences.error = Some("local preference failure".into());
@@ -2157,7 +2234,6 @@ mod tests {
         let ctx = Ctx {
             me: "ada".into(),
             server: "bbs:7777".into(),
-            started: Instant::now(),
             composer_max_height_percent: 20,
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
@@ -2183,7 +2259,6 @@ mod tests {
         let ctx = Ctx {
             me: "ada".into(),
             server: "local".into(),
-            started: Instant::now(),
             composer_max_height_percent: 20,
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
@@ -2203,8 +2278,11 @@ mod tests {
         assert!(out.contains("BBS · Main menu"), "{out}");
         assert!(out.contains("[A]gents"), "{out}");
         assert!(out.contains("[G]roups"), "{out}");
-        assert!(out.contains("bbs:7777"), "{out}");
-        assert!(out.contains("ada"), "{out}");
+        assert!(
+            !out.contains("bbs:7777") && !out.contains("online"),
+            "{out}"
+        );
+        assert!(out.lines().last().unwrap().trim() == "ada", "{out}");
         assert!(!out.contains("baud"), "{out}");
     }
 
@@ -2393,13 +2471,13 @@ mod tests {
             result: Ok(vec![message(9, "Zed", "Lu", "elsewhere")]),
         }));
         let out = screen(&mut app, 80, 24);
-        assert!(out.contains("Mateo conversation"), "{out}");
+        assert!(out.contains("BBS · Mateo · "), "{out}");
         assert!(
             out.contains("first needle") && out.contains("second"),
             "{out}"
         );
         assert!(!out.contains("elsewhere"), "{out}");
-        assert!(out.contains("following · A:all E:all"), "{out}");
+        assert!(out.contains("following · A:"), "{out}");
         // The search prompt takes every key, q included, until Enter.
         key(&mut app, '/');
         for c in "q needle".chars() {
@@ -3296,7 +3374,12 @@ mod tests {
                 let expected = theme::base()
                     .patch(theme::style(theme::Role::StatusBar))
                     .patch(theme::error());
-                for x in area.left()..area.right() {
+                // "BBS · Mateo · " keeps its colours; the error follows it.
+                let bar = theme::base().patch(theme::style(theme::Role::StatusBar));
+                for x in 0..14 {
+                    assert_status_foreground(&buffer[(x, area.bottom() - 1)], bar);
+                }
+                for x in 14..area.right() {
                     let cell = &buffer[(x, area.bottom() - 1)];
                     assert_eq!(
                         cell.fg,
@@ -4090,7 +4173,7 @@ mod tests {
         }));
         let verbose = screen(&mut app, 120, 40);
         assert!(
-            verbose.contains("Ctrl-T: compact")
+            verbose_filters(&verbose)
                 && verbose.contains("broadcast-body")
                 && verbose.contains("activity-body"),
             "{verbose}"
@@ -4098,7 +4181,7 @@ mod tests {
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let compact = screen(&mut app, 120, 40);
         assert!(
-            !compact.contains("3 messages") && compact.contains("Ctrl-T: verbose"),
+            !compact.contains("3 messages") && !verbose_filters(&compact),
             "{compact}"
         );
         for shown in ["direct-one", "outbound-body", "direct-two"] {
@@ -4263,7 +4346,7 @@ mod tests {
             agents: vec![agent("Mateo", "ada", &[]), agent("Zed", "ada", &[])],
         }))));
         reopen(&mut first_app, &mut rx);
-        assert!(screen(&mut first_app, 120, 24).contains("Ctrl-T: verbose"));
+        assert!(!verbose_filters(&screen(&mut first_app, 120, 24)));
         typed(&mut first_app, "draft");
         press(&mut first_app, KeyCode::Left, KeyModifiers::NONE);
         press(&mut first_app, KeyCode::Char('t'), KeyModifiers::CONTROL);
@@ -4271,7 +4354,7 @@ mod tests {
         close_conversation(&mut first_app, &mut rx);
         key(&mut first_app, 'j');
         reopen(&mut first_app, &mut rx);
-        assert!(screen(&mut first_app, 120, 24).contains("Ctrl-T: compact"));
+        assert!(verbose_filters(&screen(&mut first_app, 120, 24)));
         press(&mut first_app, KeyCode::PageUp, KeyModifiers::NONE);
         press(&mut first_app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert!(!editor_focused(&mut first_app));
@@ -4280,7 +4363,7 @@ mod tests {
         close_conversation(&mut first_app, &mut rx);
         key(&mut first_app, 'k');
         reopen(&mut first_app, &mut rx);
-        assert!(screen(&mut first_app, 120, 24).contains("Ctrl-T: verbose"));
+        assert!(!verbose_filters(&screen(&mut first_app, 120, 24)));
         typed(&mut first_app, "X");
         enter(&mut first_app);
         let Request::Send { req, .. } = rx.try_recv().unwrap() else {
@@ -4296,11 +4379,7 @@ mod tests {
             next_app.ctx.preferences = Preferences::load(path.clone()).unwrap();
             mateo(&mut next_app, &mut next_rx);
             let out = screen(&mut next_app, 120, 24);
-            assert!(out.contains(if compact {
-                "Ctrl-T: verbose"
-            } else {
-                "Ctrl-T: compact"
-            }));
+            assert_eq!(verbose_filters(&out), !compact, "{out}");
         }
     }
 
@@ -4392,10 +4471,7 @@ mod tests {
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let out = screen(&mut app, 120, 24);
-        assert!(
-            !editor_focused(&mut app) && out.contains("Ctrl-T: verbose"),
-            "{out}"
-        );
+        assert!(!editor_focused(&mut app) && !verbose_filters(&out), "{out}");
         key(&mut app, 'i');
         typed(&mut app, "hello");
         press(&mut app, KeyCode::Left, KeyModifiers::NONE);

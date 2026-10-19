@@ -93,7 +93,6 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
             .server
             .clone()
             .unwrap_or_else(|| "local".into()),
-        started: Instant::now(),
         composer_max_height_percent: opener.config.composer_max_height_percent(),
         preferences,
         now: std::sync::Arc::new(Instant::now),

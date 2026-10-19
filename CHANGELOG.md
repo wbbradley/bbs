@@ -20,6 +20,12 @@ binaries cannot open schema 16, so downgrading requires the pre-upgrade backup.
   unseen activity, then the server's order. Agents and agent summaries carry the
   time as `last_human_conversation_at`; controls, timer messages and broadcasts
   don't count.
+- `bbs connect` agent conversations drop their title bar: the timeline takes
+  its row and the bottom bar starts with `BBS · <agent>`. Status bars no longer
+  show the server or a time-online clock, and the agent bar drops the Ctrl-T
+  hint (still listed in Help). Effort reads `effort low` or
+  `effort low → medium next turn`, without report age or an "unconfirmed"
+  alarm; definite refusals and other errors are still shown.
 
 ### Fixed
 

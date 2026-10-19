@@ -1,10 +1,8 @@
 //! Shared-theme layout helpers for the connect screens.
 
-use std::time::Duration;
-
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
@@ -97,19 +95,13 @@ pub fn clip_line(mut line: Line<'static>, width: usize) -> Line<'static> {
     line
 }
 
-/// The bar across the bottom: server, human and time online.
-pub fn status_bar(server: &str, human: &str, online: Duration) -> Line<'static> {
-    let secs = online.as_secs();
-    let clock = format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
+/// The bar across the bottom: the signed-in human.
+pub fn status_bar(human: &str) -> Line<'static> {
     let bar = style(Role::StatusBar);
-    Line::from(vec![
-        Span::styled(format!(" {server} "), bar.add_modifier(Modifier::BOLD)),
-        Span::styled("│", bar),
-        Span::styled(format!(" {human} "), on_surface(bar, style(Role::Human))),
-        Span::styled("│", bar),
-        Span::raw(" online "),
-        Span::styled(format!("{clock} "), on_surface(bar, style(Role::Timestamp))),
-    ])
+    Line::from(Span::styled(
+        format!(" {human} "),
+        on_surface(bar, style(Role::Human)),
+    ))
     .style(bar)
 }
 
