@@ -204,7 +204,7 @@ impl Kinds {
         }
     }
 
-    pub fn shows(self, event: &str) -> bool {
+    fn shows(self, event: &str) -> bool {
         match self {
             Kinds::All => true,
             Kinds::NoText => !matches!(event, "text" | "thought"),

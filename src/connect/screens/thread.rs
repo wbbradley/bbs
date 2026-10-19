@@ -1036,13 +1036,10 @@ impl Thread {
             return;
         }
         // Calls still running sit below the newest activity while following,
-        // when tool calls are shown, as one more tool run would.
+        // as one more tool run would. The renderer only tracks calls the
+        // kinds shown let through, so `E` hides them too.
         let mut running = match &self.stream {
-            Some(stream)
-                if self.show.stream() && stream.kinds.shows("tool") && self.view.following() =>
-            {
-                stream.running()
-            }
+            Some(stream) if self.show.stream() && self.view.following() => stream.running(),
             _ => Vec::new(),
         };
         if !running.is_empty() && crate::connect::timeline::starts_tool_run(self.view.rows.last()) {
