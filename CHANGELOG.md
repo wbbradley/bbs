@@ -17,7 +17,7 @@ runner restart is needed.
 
 - Opening an agent conversation holds partial history out of view until mail
   and activity have caught up, avoiding replay flicker. The composer stays
-  usable, and available content appears after at most two seconds if loading stalls.
+  usable, and a two-second grace period releases available content if loading stalls.
 
 ### Changed
 
