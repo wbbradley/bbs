@@ -1039,7 +1039,9 @@ impl Thread {
         // as one more tool run would. The renderer only tracks calls the
         // kinds shown let through, so `E` hides them too.
         let mut running = match &self.stream {
-            Some(stream) if self.show.stream() && self.view.following() => stream.running(),
+            Some(stream) if self.show.stream() && self.view.following() => {
+                stream.running(body.width)
+            }
             _ => Vec::new(),
         };
         if !running.is_empty() && crate::connect::timeline::starts_tool_run(self.view.rows.last()) {

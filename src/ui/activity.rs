@@ -16,6 +16,93 @@ struct Call {
     shown: bool,
 }
 
+/// One tool call's line, keeping the call's full name so a view can fit it to
+/// any width: the mark, then the name, then the status and duration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolLine {
+    mark: Span<'static>,
+    name: String,
+    status: Span<'static>,
+    took: Span<'static>,
+}
+
+impl ToolLine {
+    pub(crate) fn running(name: &str) -> ToolLine {
+        ToolLine {
+            mark: Span::styled("  … ", dim()),
+            name: name.to_string(),
+            status: Span::styled(" running", dim()),
+            took: Span::raw(""),
+        }
+    }
+
+    /// The call as lines. Without a width, as the log prints it, the name's
+    /// own line breaks kept. With one, a single line of at most `width`
+    /// columns: the name's line breaks become spaces and a name that does
+    /// not fit beside the mark, status and duration ends in an ellipsis.
+    pub fn lines(&self, width: Option<usize>) -> Vec<Line<'static>> {
+        let name = |text: String| Span::styled(text, style(Role::Tool));
+        let Some(width) = width else {
+            return styled_parts(vec![
+                self.mark.clone(),
+                name(self.name.clone()),
+                self.status.clone(),
+                self.took.clone(),
+            ]);
+        };
+        let flat: String = self
+            .name
+            .chars()
+            .map(|c| {
+                if matches!(c, '\n' | '\r' | '\t') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let fixed = self.mark.width() + self.status.width() + self.took.width();
+        let spans = if fixed < width {
+            vec![
+                self.mark.clone(),
+                name(fit(&flat, width - fixed)),
+                self.status.clone(),
+                self.took.clone(),
+            ]
+        } else {
+            // Too narrow even for the mark and status: fit the whole call.
+            let text = format!(
+                "{}{flat}{}{}",
+                self.mark.content, self.status.content, self.took.content
+            );
+            vec![Span::styled(fit(&text, width), style(Role::Tool))]
+        };
+        vec![Line::from(spans)]
+    }
+}
+
+/// `text` in at most `width` columns, cut at a grapheme with an ellipsis.
+fn fit(text: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for part in text.graphemes(true) {
+        if used + part.width() + 1 > width {
+            break;
+        }
+        used += part.width();
+        out.push_str(part);
+    }
+    if width > 0 {
+        out.push('…');
+    }
+    out
+}
+
 /// Renders records one at a time, pairing each tool call's records by id.
 pub struct Activity {
     /// Render `text` records' markdown, rather than showing their source.
@@ -27,6 +114,8 @@ pub struct Activity {
     calls: HashMap<String, Call>,
     /// Ids in start order, so running calls are reported in order.
     order: Vec<String>,
+    /// The call the last record finished, for a view that fits it itself.
+    finished: Option<ToolLine>,
 }
 
 impl Activity {
@@ -37,6 +126,7 @@ impl Activity {
             turns: true,
             calls: HashMap::new(),
             order: Vec::new(),
+            finished: None,
         }
     }
 
@@ -55,6 +145,7 @@ impl Activity {
 
     /// One log line as styled lines; none for hidden records.
     pub fn render(&mut self, line: &str) -> Vec<Line<'static>> {
+        self.finished = None;
         let Ok(Value::Object(r)) = serde_json::from_str::<Value>(line) else {
             return styled(line.trim_end_matches('\n'), style(Role::Text));
         };
@@ -180,12 +271,26 @@ impl Activity {
     /// more of a followed log, so a long call shows before it finishes.
     /// Every tool call still running, one line each, in start order, without
     /// marking them shown: for a view redrawn as calls finish.
+    #[cfg(test)]
     pub fn in_progress(&self) -> Vec<Line<'static>> {
+        self.running_calls()
+            .iter()
+            .flat_map(|call| call.lines(None))
+            .collect()
+    }
+
+    /// Every tool call still running, in start order, for a view to fit.
+    pub fn running_calls(&self) -> Vec<ToolLine> {
         self.order
             .iter()
             .filter_map(|id| self.calls.get(id))
-            .flat_map(|call| running_line(&call.name))
+            .map(|call| ToolLine::running(&call.name))
             .collect()
+    }
+
+    /// The call the last rendered record finished, if it finished one.
+    pub fn take_tool(&mut self) -> Option<ToolLine> {
+        self.finished.take()
     }
 
     pub fn running(&mut self) -> Vec<Line<'static>> {
@@ -245,12 +350,14 @@ impl Activity {
             "failed" => ("✗", style(Role::Error)),
             _ => ("•", style(Role::Text)),
         };
-        out.extend(styled_parts(vec![
-            Span::styled(format!("  {mark} "), status_style),
-            Span::styled(name, style(Role::Tool)),
-            Span::styled(format!(" {status}"), status_style),
-            Span::styled(took, style(Role::Timestamp)),
-        ]));
+        let call = ToolLine {
+            mark: Span::styled(format!("  {mark} "), status_style),
+            name,
+            status: Span::styled(format!(" {status}"), status_style),
+            took: Span::styled(took, style(Role::Timestamp)),
+        };
+        out.extend(call.lines(None));
+        self.finished = Some(call);
     }
 
     fn timed(&self, out: &mut Vec<Line<'static>>, time: &str, text: &str, status: Style) {
@@ -287,11 +394,7 @@ impl Activity {
 }
 
 fn running_line(name: &str) -> Vec<Line<'static>> {
-    styled_parts(vec![
-        Span::styled("  … ", dim()),
-        Span::styled(name.to_string(), style(Role::Tool)),
-        Span::styled(" running", dim()),
-    ])
+    ToolLine::running(name).lines(None)
 }
 
 /// Structured values keep their categories, even when a field contains newlines.
@@ -450,6 +553,57 @@ mod tests {
         // Errors and stops are not turn markers.
         let error = r#"{"ts":"2026-10-16T05:43:11Z","event":"turn_error","message":"boom"}"#;
         assert!(to_ansi(&quiet.render(error), false).contains("turn_error: boom"));
+    }
+
+    #[test]
+    fn a_fitted_tool_call_is_one_line_within_the_width() {
+        use unicode_width::UnicodeWidthStr;
+        let finish = |title: &str| {
+            let mut pretty = Activity::new(false);
+            let start = serde_json::json!({"ts":"2026-10-16T05:00:00Z","event":"tool","id":"a","title":title,"status":"in_progress"});
+            pretty.render(&start.to_string());
+            let end =
+                r#"{"ts":"2026-10-16T05:00:01Z","event":"tool","id":"a","status":"completed"}"#;
+            let full = to_ansi(&pretty.render(end), false);
+            (full, pretty.take_tool().expect("a finished call"))
+        };
+        let text = |lines: Vec<Line<'static>>| -> String {
+            assert_eq!(lines.len(), 1, "one line");
+            lines[0].to_string()
+        };
+        // A multi-line Python invocation: the log keeps it whole; the fitted
+        // line flattens it, ends the name with an ellipsis and keeps the rest.
+        let script = "python3 - <<'EOF'\nimport json\nfor i in range(100):\n    print(json.dumps({'i': i}))\nEOF";
+        let (full, call) = finish(script);
+        assert_eq!(
+            full,
+            format!("  ✓ {script} completed (1.0s)\n"),
+            "pretty logs keep the call's own lines"
+        );
+        for width in [80, 40, 24] {
+            let line = text(call.lines(Some(width)));
+            assert!(line.width() <= width, "{width}: {line}");
+            assert!(line.ends_with("… completed (1.0s)"), "{width}: {line}");
+            assert!(!line.contains('\n'));
+        }
+        let wide = text(call.lines(Some(200)));
+        assert!(wide.contains("import json for i in range(100):"), "{wide}");
+        assert!(!wide.contains('…'), "fits whole: {wide}");
+        // Wide graphemes and combining marks are never split or overrun.
+        let (_, call) = finish(&"漢字👩‍💻é\u{301}".repeat(20));
+        for width in [80, 33, 25] {
+            let line = text(call.lines(Some(width)));
+            assert!(line.width() <= width, "{width}: {line}");
+            assert!(line.ends_with("… completed (1.0s)"), "{width}: {line}");
+        }
+        // Too narrow even for the mark and status: still within the width.
+        for width in [0, 5, 12] {
+            assert!(text(call.lines(Some(width))).width() <= width);
+        }
+        // A running call fits the same way.
+        let running = ToolLine::running(script);
+        let line = text(running.lines(Some(30)));
+        assert!(line.width() <= 30 && line.ends_with("… running"), "{line}");
     }
 
     #[test]

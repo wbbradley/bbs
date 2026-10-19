@@ -4829,6 +4829,87 @@ mod tests {
     }
 
     #[test]
+    fn long_tool_calls_take_one_line_that_fits_and_widens_on_resize() {
+        use unicode_width::UnicodeWidthStr;
+        let script = "python3 - <<'EOF'\\nimport json\\nfor i in range(100):\\n    print(json.dumps({'i': i, 'square': i * i, 'cube': i * i * i, 'label': f'item-{i}'}))\\nEOF";
+        let call = |id: i64, s: &str, call: &str, status: &str| {
+            let title = if status == "in_progress" {
+                format!(r#","title":"{script} #{call}""#)
+            } else {
+                String::new()
+            };
+            activity(
+                id,
+                s,
+                &format!(
+                    r#"{{"ts":"2026-10-16T18:00:{s}Z","event":"tool","id":"{call}","status":"{status}"{title}}}"#
+                ),
+            )
+        };
+        let (mut app, mut rx) = app();
+        let (_, act) = mateo_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![
+                activity(
+                    1,
+                    "01",
+                    r#"{"ts":"2026-10-16T18:00:01Z","event":"text","text":"Running it."}"#,
+                ),
+                call(2, "02", "a", "in_progress"),
+                call(3, "03", "a", "completed"),
+                call(4, "04", "b", "in_progress"),
+                call(5, "05", "b", "completed"),
+                call(6, "06", "c", "in_progress"),
+            ]),
+        }));
+        let rows =
+            |out: &str| -> Vec<String> { out.lines().map(|l| l.trim_end().to_string()).collect() };
+        for width in [80u16, 120] {
+            let out = screen(&mut app, width, 30);
+            let lines = rows(&out);
+            let text = lines
+                .iter()
+                .position(|l| l.contains("Running it."))
+                .unwrap();
+            // One blank line, then each call on exactly one line, tight.
+            assert_eq!(lines[text + 1], "", "{out}");
+            for (offset, line) in lines[text + 2..text + 4].iter().enumerate() {
+                assert!(
+                    line.starts_with("  ✓ python3 - <<'EOF' import json"),
+                    "{out}"
+                );
+                assert!(line.ends_with("… completed (1.0s)"), "{offset}: {out}");
+                assert!(line.width() <= usize::from(width), "{out}");
+            }
+            assert!(
+                !lines[text + 4].contains("import"),
+                "no wrapped tail: {out}"
+            );
+            let running = lines
+                .iter()
+                .find(|l| l.contains(" running"))
+                .expect("running");
+            assert!(
+                running.contains('…') && running.width() <= usize::from(width),
+                "{out}"
+            );
+        }
+        // The wider screen shows more of each call than the narrow one.
+        let at = |out: &str| rows(out).iter().find(|l| l.contains("✓")).unwrap().width();
+        let narrow = at(&screen(&mut app, 80, 30));
+        let wide = at(&screen(&mut app, 120, 30));
+        assert!(wide > narrow, "{narrow} {wide}");
+        // Search still reaches the part of a call the line leaves out.
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, '/');
+        typed(&mut app, "json.dumps");
+        enter(&mut app);
+        let row = bottom(&mut app);
+        assert!(row.contains(": 2 matches"), "{row}");
+    }
+
+    #[test]
     fn raw_feed_gaps_show_one_warning_and_overlaps_none() {
         {
             let (mut app, mut rx) = app();

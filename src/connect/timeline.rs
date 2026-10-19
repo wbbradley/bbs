@@ -14,7 +14,7 @@ use super::progress::{Progress, ProgressState};
 use super::theme;
 use crate::backend::AGENT_ACTIVITY;
 use crate::proto::{self, Message};
-use crate::ui::activity::Activity;
+use crate::ui::activity::{Activity, ToolLine};
 use crate::ui::message::{compact_message_lines, find_matches, message_lines_with_recipient};
 use crate::ui::thread::Row;
 
@@ -41,14 +41,15 @@ pub enum Entry {
         id: i64,
         created_at: String,
         lines: Vec<Line<'static>>,
-        /// A finished tool call: runs of these sit together after one blank.
-        tool: bool,
+        /// A finished tool call, kept whole and drawn as one line fitted to
+        /// the width; runs of these sit together after one blank.
+        call: Option<ToolLine>,
     },
 }
 
 impl Entry {
     fn is_tool(&self) -> bool {
-        matches!(self, Entry::Stream { tool: true, .. })
+        matches!(self, Entry::Stream { call: Some(_), .. })
     }
 }
 
@@ -127,6 +128,16 @@ impl Row for Entry {
             }
         )
         .then(|| theme::style(theme::Role::Screen))
+    }
+
+    /// A tool call fits on one line of the width; search still sees all of it.
+    fn lines_at(&self, gap: bool, query: Option<&str>, width: u16) -> Vec<Line<'_>> {
+        match self {
+            Entry::Stream {
+                call: Some(call), ..
+            } => call.lines(Some(usize::from(width))),
+            _ => self.lines(gap, query),
+        }
     }
 
     /// A blank line before each run of tool calls, the first included,
@@ -323,9 +334,14 @@ impl Stream {
         self.records.back().map(|r| r.activity.id)
     }
 
-    /// Tool calls still running, to show below the newest activity.
-    pub fn running(&self) -> Vec<Line<'static>> {
-        self.renderer.in_progress()
+    /// Tool calls still running, to show below the newest activity, each
+    /// on one line of `width`.
+    pub fn running(&self, width: u16) -> Vec<Line<'static>> {
+        self.renderer
+            .running_calls()
+            .iter()
+            .flat_map(|call| call.lines(Some(usize::from(width))))
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -376,7 +392,7 @@ impl Stream {
             id: record.id,
             created_at: record.created_at.clone(),
             lines,
-            tool: event == "tool",
+            call: self.renderer.take_tool(),
         })
     }
 
@@ -464,7 +480,7 @@ mod tests {
             id: 1,
             created_at: "2026-10-16T18:00:00Z".into(),
             lines,
-            tool,
+            call: tool.then(|| ToolLine::running("a")),
         };
         assert!(starts_tool_run(None), "the first run takes a blank too");
         assert!(!starts_tool_run(Some(&stream(

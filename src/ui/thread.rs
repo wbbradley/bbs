@@ -38,6 +38,11 @@ pub trait Row: PartialEq {
     }
     /// Whether the row matches a case-folded search.
     fn matches(&self, query: &str) -> bool;
+    /// The row's lines at `width` columns, for a row that fits itself to
+    /// the width rather than wrapping; others wrap their `lines`.
+    fn lines_at(&self, gap: bool, query: Option<&str>, _width: u16) -> Vec<Line<'_>> {
+        self.lines(gap, query)
+    }
     /// Whether a blank line goes before this row, given the row before it
     /// (none at the top). Its height depends on that neighbour, so changing
     /// a row also re-measures the one after it.
@@ -209,9 +214,9 @@ impl<R: Row> ThreadView<R> {
 
     /// Row `i`'s lines, with any blank line it asks for before it: shared by
     /// measuring and drawing so the two agree.
-    fn row_lines(&self, i: usize, query: Option<&str>) -> Vec<Line<'_>> {
+    fn row_lines(&self, i: usize, query: Option<&str>, width: u16) -> Vec<Line<'_>> {
         let row = &self.rows[i];
-        let mut lines = row.lines(self.gaps.contains(&row.key()), query);
+        let mut lines = row.lines_at(self.gaps.contains(&row.key()), query, width);
         if row.spaced_after(i.checked_sub(1).map(|j| &self.rows[j])) {
             lines.insert(0, Line::default());
         }
@@ -231,7 +236,7 @@ impl<R: Row> ThreadView<R> {
             total += match self.heights[i] {
                 Some((w, h)) if w == width => h,
                 _ => {
-                    let h = Paragraph::new(Text::from(self.row_lines(i, None)))
+                    let h = Paragraph::new(Text::from(self.row_lines(i, None, width)))
                         .wrap(Wrap { trim: false })
                         .line_count(width);
                     self.heights[i] = Some((width, h));
@@ -399,7 +404,7 @@ impl<R: Row> ThreadView<R> {
                 area.width,
                 (visible_end - visible_start) as u16,
             );
-            let paragraph = Paragraph::new(self.row_lines(i, self.query.as_deref()))
+            let paragraph = Paragraph::new(self.row_lines(i, self.query.as_deref(), area.width))
                 .style(row.style())
                 .wrap(Wrap { trim: false })
                 .scroll(((visible_start - start).min(u16::MAX as usize) as u16, 0));

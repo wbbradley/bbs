@@ -19,7 +19,8 @@ under the new package version and its publication date.
   logs --pretty` is unchanged.
 - Each run of tool calls in a `bbs connect` agent conversation follows one
   blank line, with the calls on consecutive lines, including calls still
-  running.
+  running. Each call takes one line: a long or multi-line command is cut with an
+  ellipsis, keeping its status and duration; logs keep the whole call.
 
 ## 0.10.0 - 2026-10-19
 

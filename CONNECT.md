@@ -147,7 +147,10 @@ progress mark in the bottom bar shows turn state; a turn's prompt still shows
 any mail not otherwise in the thread. Each run of tool calls, the first
 included, follows one blank line (shared with a blank the row before already
 ends with), and calls within a run sit on consecutive lines; so do calls still
-running. `A`
+running. Each call takes one line of the width: a long or multi-line command is
+flattened and cut with an ellipsis before its status and duration, a wider
+window shows more of it, and search still finds all of it. Logs keep the whole
+call. `A`
 cycles between everything, messages only and activity only; `E` cycles which
 kinds of activity show. This works for any headless agent on the board that
 shares its activity, wherever it runs: `bbs headless run` sends it to the
