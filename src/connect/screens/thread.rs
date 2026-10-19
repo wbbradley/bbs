@@ -467,6 +467,27 @@ impl Thread {
     }
 }
 
+/// The pane of calls still running, in at most `share` rows: a blank line
+/// above when it `open`s a run, as many calls as fit, and one closing blank.
+/// Nothing where the share cannot hold one call and those blank lines.
+pub(crate) fn running_pane(
+    calls: Vec<Line<'static>>,
+    open: bool,
+    share: u16,
+) -> Vec<Line<'static>> {
+    let room = usize::from(share).saturating_sub(usize::from(open) + 1);
+    if calls.is_empty() || room == 0 {
+        return Vec::new();
+    }
+    let mut pane = Vec::new();
+    if open {
+        pane.push(Line::default());
+    }
+    pane.extend(calls.into_iter().take(room));
+    pane.push(Line::default());
+    pane
+}
+
 /// Clip feedback by display columns without splitting emoji or combining marks.
 fn fit_status(text: &str, width: usize, tail: bool) -> String {
     if text.width() <= width {
@@ -1047,17 +1068,8 @@ impl Thread {
         // Calls still running continue a run the timeline ends with, or open
         // one with a blank line above; either way one blank line closes the
         // run below them, kept within the pane's share of the height.
-        // No pane at all where its share cannot hold one call and its blanks.
-        let mut running = Vec::new();
         let open = crate::connect::timeline::opens_run(self.view.rows.last());
-        let room = usize::from(body.height / 3).saturating_sub(usize::from(open) + 1);
-        if !calls.is_empty() && room > 0 {
-            if open {
-                running.push(Line::default());
-            }
-            running.extend(calls.into_iter().take(room));
-            running.push(Line::default());
-        }
+        let running = running_pane(calls, open, body.height / 3);
         self.view.set_continued(!running.is_empty());
         let height = (running.len() as u16).min(body.height / 3);
         let [body, below] =

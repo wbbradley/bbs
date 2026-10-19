@@ -5008,8 +5008,28 @@ mod tests {
         }
         let out = screen(&mut app, 80, 24);
         assert!(!out.contains("running"), "{out}");
-        // The timeline then ends as it would with no pane: no bare blank pane.
         assert!(out.contains("draft 29"), "{out}");
+        // Every share: a pane is a call or more and all its blank lines, or
+        // nothing at all.
+        use crate::connect::screens::thread::running_pane;
+        let calls = || vec![Line::raw("… a running"), Line::raw("… b running")];
+        let shape = |pane: Vec<Line<'static>>| -> Vec<String> {
+            pane.iter().map(|l| l.to_string()).collect()
+        };
+        for share in 0..=5u16 {
+            for open in [false, true] {
+                let pane = shape(running_pane(calls(), open, share));
+                let fits = usize::from(share) >= usize::from(open) + 2;
+                assert_eq!(!pane.is_empty(), fits, "{share} {open}: {pane:?}");
+                if fits {
+                    assert!(pane.len() <= usize::from(share), "{share}: {pane:?}");
+                    assert_eq!(pane[0].is_empty(), open, "{pane:?}");
+                    assert!(pane[usize::from(open)].contains("running"), "{pane:?}");
+                    assert_eq!(pane.last().unwrap(), "", "closing blank: {pane:?}");
+                }
+            }
+        }
+        assert!(running_pane(Vec::new(), true, 5).is_empty());
     }
 
     #[test]
