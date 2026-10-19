@@ -3244,6 +3244,24 @@ mod tests {
         assert!(!screen(&mut app, 80, 24).contains("Loading…"));
     }
 
+    #[test]
+    fn loading_deadline_cannot_spin_redraws_in_a_too_small_terminal() {
+        let (mut app, mut rx) = app();
+        let (clock, now) = test_clock();
+        app.ctx.now = now;
+        let (feed, _) = mateo_loading_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(1, "Mateo", "ada", "available mail")]),
+        }));
+        assert!(app.next_animation_frame().is_some());
+        clock.advance(Duration::from_secs(2));
+        assert!(screen(&mut app, 79, 24).contains("terminal too small"));
+        assert!(app.next_animation_frame().is_none());
+        let restored = screen(&mut app, 80, 24);
+        assert!(restored.contains("available mail") && !restored.contains("Loading…"));
+    }
+
     fn mateo(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> u64 {
         mateo_streams(app, rx).0
     }

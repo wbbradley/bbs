@@ -768,11 +768,14 @@ impl Screen for Thread {
     }
 
     fn next_animation_frame(&self) -> Option<Instant> {
-        let animation = self
-            .stream
-            .as_ref()
-            .and_then(|s| s.next_frame_at((self.now)()));
-        animation.into_iter().chain(self.opening_until).min()
+        let now = (self.now)();
+        let animation = self.stream.as_ref().and_then(|s| s.next_frame_at(now));
+        // A too-small terminal skips this screen's draw, so an expired hold
+        // must stop scheduling frames even before draw clears it.
+        animation
+            .into_iter()
+            .chain(self.opening_until.filter(|deadline| *deadline > now))
+            .min()
     }
 
     fn save_draft(&mut self, drafts: &mut HashMap<String, Composer>) {
