@@ -703,6 +703,7 @@ async fn agent_summaries_stream_what_a_human_has_yet_to_read_or_see() {
     let s = next().await;
     assert_eq!(s.len(), 1, "{s:?}");
     assert_eq!((s[0].unread_messages, s[0].unseen_stream), (0, 0), "{s:?}");
+    assert_eq!(s[0].last_human_conversation_at, None, "{s:?}");
 
     let dm = proto::SendRequest {
         to: "will".into(),
@@ -712,6 +713,10 @@ async fn agent_summaries_stream_what_a_human_has_yet_to_read_or_see() {
     client.send(as_agent(&a.token, dm)).await.unwrap();
     let s = next().await;
     assert_eq!((s[0].unread_messages, s[0].unseen_stream), (1, 0), "{s:?}");
+    let asked = s[0]
+        .last_human_conversation_at
+        .clone()
+        .expect("a conversation");
 
     // A change that leaves the summary as it was sends nothing, so the next
     // summary is the activity's.
@@ -737,6 +742,20 @@ async fn agent_summaries_stream_what_a_human_has_yet_to_read_or_see() {
     assert!(moved.into_inner().moved);
     let s = next().await;
     assert_eq!((s[0].unread_messages, s[0].unseen_stream), (1, 0), "{s:?}");
+
+    // A human's reply is a newer conversation, and the summary says so live.
+    let reply = proto::SendRequest {
+        to: a.name.clone(),
+        body: "an answer".into(),
+        control: None,
+    };
+    client.send(as_human("will", reply)).await.unwrap();
+    let s = next().await;
+    let answered = s[0]
+        .last_human_conversation_at
+        .clone()
+        .expect("a conversation");
+    assert!(answered > asked, "{s:?}");
 }
 
 #[tokio::test]

@@ -165,8 +165,10 @@ in both compact and verbose views and regardless of display filters. This also
 applies to live arrivals while the conversation is active. Covering it with
 help defers marking until you return; closed conversations do not mark arrivals.
 The Agents list uses the app's shared `WatchAgentSummary` snapshot, which lists every live agent, and
-puts first the agents with messages to you unread, then those with activity
-unseen, each oldest first, then the rest; separate INBOX (✉) and ACTIVITY (•)
+puts first the agents any human most recently exchanged a direct message with
+(either way; controls, timer messages and broadcasts don't count), newest first.
+Ties and agents no human has talked with put the agents with messages to you
+unread first, then those with activity unseen, each oldest first, then the rest; separate INBOX (✉) and ACTIVITY (•)
 columns count unread mail and unseen activity, each capped at 99 and blank at
 zero. ACTIVE shows how long ago the agent last sent a message or posted an
 activity event, as at most two day/hour/minute units plus "ago" ("14m ago",

@@ -951,6 +951,15 @@ pub fn send(
         }
         let msg = db::insert_message(ctx.conn, &me, None, body, &ctx.now_s)?;
         db::insert_delivery(ctx.conn, msg, target.kind, target.id)?;
+        match (me.kind, target.kind) {
+            (db::Kind::Human, db::Kind::Agent) => {
+                db::record_human_conversation(ctx.conn, target.id, me.id, &ctx.now_s)?;
+            }
+            (db::Kind::Agent, db::Kind::Human) => {
+                db::record_human_conversation(ctx.conn, me.id, target.id, &ctx.now_s)?;
+            }
+            _ => {}
+        }
         tracing::info!(
             from = me.name,
             to = target.name,
@@ -1058,6 +1067,7 @@ pub fn list_agents(
                 last_sent_at: a.last_sent_at,
                 effort: a.effort.as_deref().and_then(effort_from_json),
                 effort_reported_at: a.effort_reported_at,
+                last_human_conversation_at: a.last_human_conversation_at,
             })
             .collect();
         Ok(proto::ListAgentsResponse { humans, agents })
@@ -1522,6 +1532,7 @@ pub fn agent_summary(
                 last_sent_at: s.last_sent_at,
                 effort: s.effort.as_deref().and_then(effort_from_json),
                 effort_reported_at: s.effort_reported_at,
+                last_human_conversation_at: s.last_human_conversation_at,
             })
             .collect();
         Ok(proto::AgentSummarySnapshot { agents })
@@ -2253,6 +2264,116 @@ mod tests {
         let zed_at = at(&rows, "Zed").unwrap();
         assert!(zed_at >= zed_join);
         assert_eq!(at(&rows, "Mateo").as_deref(), Some(mateo_at.as_str()));
+    }
+
+    #[test]
+    fn human_conversations_count_direct_mail_either_way_and_nothing_else() {
+        let (mut conn, will, [mateo, zed, _lu]) = board();
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        let dm = |conn: &mut Connection, from: &Caller, to: &str| {
+            let req = proto::SendRequest {
+                to: to.into(),
+                body: "hi".into(),
+                ..Default::default()
+            };
+            send(conn, from, req).unwrap().id.unwrap()
+        };
+        let talked = |conn: &mut Connection| {
+            let mut rows: Vec<_> = list_agents(conn, &will, proto::ListAgentsRequest { all: true })
+                .unwrap()
+                .agents
+                .into_iter()
+                .map(|a| (a.name, a.last_human_conversation_at))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let none = |names: &[&str]| -> Vec<(String, Option<String>)> {
+            names.iter().map(|n| (n.to_string(), None)).collect()
+        };
+        // Group joins and broadcasts, agent-to-agent mail, a control and a
+        // timer message from a human are not conversations with a human.
+        let req = proto::SendRequest {
+            to: "@crew".into(),
+            body: "all hands".into(),
+            ..Default::default()
+        };
+        send(&mut conn, &will, req).unwrap();
+        dm(&mut conn, &mateo, "Zed");
+        let req = proto::SendRequest {
+            to: "Lu".into(),
+            body: "stop".into(),
+            control: Some(proto::Control::Cancel.into()),
+        };
+        send(&mut conn, &will, req).unwrap();
+        let t = add(&mut conn, &will, "Lu", "in 1m").unwrap();
+        assert_eq!(fire_timers(&mut conn, time(&t.next_run)).unwrap().0, 1);
+        assert_eq!(talked(&mut conn), none(&["Lu", "Mateo", "Zed"]));
+        // A human to an agent, and an agent to a human, each count once, at
+        // the message's server time, for that pair only.
+        let to_mateo = dm(&mut conn, &will, "Mateo");
+        let to_ada = dm(&mut conn, &zed, "ada");
+        let created = |conn: &mut Connection, id: i64| -> String {
+            conn.query_row("SELECT created_at FROM messages WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let (mateo_at, zed_at) = (created(&mut conn, to_mateo), created(&mut conn, to_ada));
+        assert_eq!(
+            talked(&mut conn),
+            [
+                ("Lu".to_string(), None),
+                ("Mateo".to_string(), Some(mateo_at.clone())),
+                ("Zed".to_string(), Some(zed_at.clone())),
+            ]
+        );
+        let pairs: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT a.name, h.name FROM agent_human_conversations p
+                 JOIN agents a ON a.id = p.agent_id JOIN humans h ON h.id = p.human_id
+                 ORDER BY a.name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            pairs,
+            [
+                ("Mateo".into(), "will".into()),
+                ("Zed".into(), "ada".into())
+            ]
+        );
+        // Any human's conversation counts, so every human's summary agrees.
+        for human in [&will, &ada] {
+            let mut rows: Vec<_> = agent_summary(&mut conn, human, proto::AgentSummaryRequest {})
+                .unwrap()
+                .agents
+                .into_iter()
+                .map(|s| (s.agent, s.last_human_conversation_at))
+                .collect();
+            rows.sort();
+            assert_eq!(rows, talked(&mut conn));
+        }
+        // A failed send records nothing.
+        let req = proto::SendRequest {
+            to: "Nobody".into(),
+            body: "hi".into(),
+            ..Default::default()
+        };
+        assert!(send(&mut conn, &will, req).is_err());
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM agent_human_conversations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

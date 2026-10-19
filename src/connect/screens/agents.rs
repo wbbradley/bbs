@@ -1,6 +1,6 @@
 //! Agents: yours by default, everyone's on request, each with its owner.
-//! Those with mail to the viewer unread come first, then those with activity
-//! unseen, each oldest first.
+//! Those a human talked with most recently come first; ties and the rest put
+//! mail to the viewer unread first, then activity unseen, each oldest first.
 
 use chrono::{DateTime, Local};
 use ratatui::Frame;
@@ -52,8 +52,9 @@ impl Agents {
         self.now = Some(now);
     }
 
-    /// Unread mail first, then unseen activity, each oldest first; the rest
-    /// keep the server's order.
+    /// The most recent direct message with any human first, newest first.
+    /// Ties and agents without one: unread mail, then unseen activity, each
+    /// oldest first; the rest keep the server's order.
     fn shown<'a>(&'a self, ctx: &Ctx) -> Vec<&'a proto::Agent> {
         let Some(Ok(agents)) = &self.agents else {
             return Vec::new();
@@ -62,13 +63,21 @@ impl Agents {
             .iter()
             .filter(|a| self.all || a.owner.as_deref() == Some(ctx.me.as_str()))
             .collect();
-        shown.sort_by_key(
-            |a| match ctx.inbox.summaries.get(&a.name.to_ascii_lowercase()) {
+        let key = |a: &proto::Agent| {
+            let summary = ctx.inbox.summaries.get(&a.name.to_ascii_lowercase());
+            // Live from the summary stream when it says, otherwise the list's.
+            // Timestamps are fixed-width UTC, so they compare as text.
+            let talked = summary
+                .and_then(|s| s.last_human_conversation_at.clone())
+                .or_else(|| a.last_human_conversation_at.clone());
+            let pending = match summary {
                 Some(s) if s.unread_messages > 0 => (0, s.oldest_unread_message.clone()),
                 Some(s) if s.unseen_stream > 0 => (1, s.oldest_unseen_stream.clone()),
                 _ => (2, None),
-            },
-        );
+            };
+            (talked.is_none(), std::cmp::Reverse(talked), pending)
+        };
+        shown.sort_by_cached_key(|a| key(a));
         shown
     }
 

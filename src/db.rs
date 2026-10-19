@@ -27,6 +27,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0013_human_dms.sql"),
     include_str!("../migrations/0014_activity_seen.sql"),
     include_str!("../migrations/0015_agent_effort.sql"),
+    include_str!("../migrations/0016_agent_human_conversations.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +67,8 @@ pub struct AgentRow {
     /// The newest validated effort report (JSON) and when the server got it.
     pub effort: Option<String>,
     pub effort_reported_at: Option<String>,
+    /// The newest direct message between the agent and any human; None when never.
+    pub last_human_conversation_at: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -523,7 +526,8 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                    SELECT created_at FROM (
                      SELECT created_at FROM activity
                      WHERE agent_id = a.id
-                     ORDER BY id DESC LIMIT 1)))
+                     ORDER BY id DESC LIMIT 1))),
+                (SELECT max(last_at) FROM agent_human_conversations p WHERE p.agent_id = a.id)
          FROM agents a
          LEFT JOIN agent_owners o ON o.agent_id = a.id
          LEFT JOIN humans h ON h.id = o.human_id
@@ -544,6 +548,7 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                 effort: r.get(8)?,
                 effort_reported_at: r.get(9)?,
                 last_sent_at: r.get(10)?,
+                last_human_conversation_at: r.get(11)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -814,6 +819,24 @@ pub fn insert_delivery(conn: &Connection, message_id: i64, kind: Kind, id: i64) 
     Ok(())
 }
 
+/// Record a direct message between `agent` and `human`, in either direction,
+/// at `at`. Monotonic: an older time never replaces a newer one.
+pub fn record_human_conversation(
+    conn: &Connection,
+    agent: i64,
+    human: i64,
+    at: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO agent_human_conversations (agent_id, human_id, last_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT (agent_id, human_id) DO UPDATE SET last_at = excluded.last_at
+         WHERE excluded.last_at > agent_human_conversations.last_at",
+        params![agent, human, at],
+    )?;
+    Ok(())
+}
+
 const INBOX_SELECT: &str = "
     SELECT m.id, m.created_at, m.from_kind,
            CASE m.from_kind WHEN 'agent' THEN a.name ELSE h.name END,
@@ -880,6 +903,8 @@ pub struct AgentSummary {
     /// The newest validated effort report (JSON) and when the server got it.
     pub effort: Option<String>,
     pub effort_reported_at: Option<String>,
+    /// The newest direct message between the agent and any human; None when never.
+    pub last_human_conversation_at: Option<String>,
 }
 
 /// Unread mail through the human's inbox index; unseen activity per live
@@ -911,13 +936,15 @@ const AGENT_SUMMARIES: &str = "
                    SELECT created_at FROM (
                      SELECT created_at FROM activity
                      WHERE agent_id = g.id
-                     ORDER BY id DESC LIMIT 1))) AS last_sent
+                     ORDER BY id DESC LIMIT 1))) AS last_sent,
+               (SELECT max(p.last_at) FROM agent_human_conversations p
+                WHERE p.agent_id = g.id) AS human_conversation
         FROM agents g
         LEFT JOIN activity_seen s ON s.human_id = ?1 AND s.agent_id = g.id
         LEFT JOIN unread u ON u.agent_id = g.id
         WHERE g.retired_at IS NULL)
     SELECT name, unread, unread_oldest, unseen, unseen_oldest, last_sent, effort,
-           effort_reported_at FROM summaries
+           effort_reported_at, human_conversation FROM summaries
     ORDER BY lower(name)";
 
 /// For each live agent, the direct messages it sent `human` that are unread,
@@ -936,6 +963,7 @@ pub fn agent_summaries(conn: &Connection, human: i64) -> Result<Vec<AgentSummary
                 last_sent_at: r.get(5)?,
                 effort: r.get(6)?,
                 effort_reported_at: r.get(7)?,
+                last_human_conversation_at: r.get(8)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -2096,6 +2124,152 @@ mod tests {
                 .any(|l| l.starts_with("SEARCH activity USING INDEX activity_agent (agent_id=?)")),
             "{plan:#?}"
         );
+    }
+
+    #[test]
+    fn human_conversations_backfill_like_incremental_recording() {
+        let pairs = |conn: &Connection| -> Vec<(i64, i64, String)> {
+            conn.prepare("SELECT agent_id, human_id, last_at FROM agent_human_conversations")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let t = |s: u32| format!("2026-10-19T00:00:{s:02}.000000Z");
+        // Humans 1-2; agents 1-2 live, 3 a retired "Mateo" and 4 the live
+        // "Mateo" registered after it; group 1. Each message: (id, from kind,
+        // from id, group, recipient kind, recipient id, control, timer, second).
+        type Row = (
+            i64,
+            &'static str,
+            i64,
+            Option<i64>,
+            &'static str,
+            i64,
+            Option<&'static str>,
+            Option<i64>,
+            u32,
+        );
+        let history: [Row; 11] = [
+            (1, "human", 1, None, "agent", 1, None, None, 1), // will -> 1
+            (2, "agent", 1, None, "human", 1, None, None, 5), // 1 -> will, newer
+            (3, "human", 1, None, "agent", 1, None, None, 3), // older again
+            (4, "agent", 2, None, "human", 2, None, None, 2), // 2 -> ada
+            (5, "human", 2, None, "agent", 3, None, None, 4), // ada -> retired 3
+            (6, "human", 1, None, "agent", 2, Some("cancel"), None, 9),
+            (7, "human", 1, None, "agent", 2, None, Some(1), 10), // timer
+            (8, "human", 1, Some(1), "agent", 2, None, None, 11), // broadcast
+            (9, "agent", 1, Some(1), "human", 2, None, None, 12), // broadcast
+            (10, "agent", 1, None, "agent", 2, None, None, 13),   // agent to agent
+            (
+                11,
+                "agent",
+                2,
+                None,
+                "human",
+                1,
+                Some("set-effort"),
+                None,
+                14,
+            ),
+        ];
+        let qualifies = |r: &Row| r.3.is_none() && r.6.is_none() && r.7.is_none() && r.1 != r.4;
+        let setup = |conn: &Connection| {
+            conn.execute_batch(
+                "INSERT INTO humans (id, name, created_at, active_at) VALUES
+                     (1, 'will', 'x', 'x'), (2, 'ada', 'x', 'x');
+                 INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at, retired_at)
+                 VALUES (1, 'Bram', 't1', '/', 'h', 'x', 'x', NULL),
+                        (2, 'Zed', 't2', '/', 'h', 'x', 'x', NULL),
+                        (3, 'Mateo', 't3', '/', 'h', 'x', 'x', 'x'),
+                        (4, 'Mateo', 't4', '/', 'h', 'x', 'x', NULL);
+                 INSERT INTO bbs_groups (id, name, created_at) VALUES (1, 'crew', 'x');",
+            )
+            .unwrap();
+        };
+        let insert = |conn: &Connection, r: &Row| {
+            conn.execute(
+                "INSERT INTO messages (id, from_kind, from_id, to_group_id, body, created_at, control, timer_id)
+                 VALUES (?1, ?2, ?3, ?4, 'x', ?5, ?6, ?7)",
+                params![r.0, r.1, r.2, r.3, t(r.8), r.6, r.7],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO deliveries (message_id, recipient_kind, recipient_id, direct)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![r.0, r.4, r.5, r.3.is_none()],
+            )
+            .unwrap();
+        };
+
+        // Backfill: the history exists at schema 15, then the board migrates.
+        let mut old = Connection::open_in_memory().unwrap();
+        old.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for sql in &MIGRATIONS[..15] {
+            old.execute_batch(sql).unwrap();
+        }
+        old.pragma_update(None, "user_version", 15).unwrap();
+        setup(&old);
+        history.iter().for_each(|r| insert(&old, r));
+        migrate(&mut old).unwrap();
+
+        // Incremental: the same history recorded as it is sent.
+        let mut new = Connection::open_in_memory().unwrap();
+        migrate(&mut new).unwrap();
+        setup(&new);
+        for r in &history {
+            insert(&new, r);
+            if qualifies(r) {
+                let (agent, human) = if r.1 == "agent" {
+                    (r.2, r.5)
+                } else {
+                    (r.5, r.2)
+                };
+                record_human_conversation(&new, agent, human, &t(r.8)).unwrap();
+            }
+        }
+        let mut backfilled = pairs(&old);
+        backfilled.sort();
+        let mut recorded = pairs(&new);
+        recorded.sort();
+        assert_eq!(backfilled, recorded);
+        // Newest per pair, never moved back by older mail; nothing else counts.
+        assert_eq!(backfilled, [(1, 1, t(5)), (2, 2, t(2)), (3, 2, t(4))]);
+
+        // The agent's value is its newest pair; a new agent reusing a retired
+        // one's name does not inherit its pairs.
+        record_human_conversation(&old, 1, 2, &t(7)).unwrap();
+        record_human_conversation(&old, 1, 2, &t(6)).unwrap();
+        let talked: Vec<_> = list_agents(&old, true)
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.id, a.last_human_conversation_at))
+            .collect();
+        assert!(talked.contains(&(1, Some(t(7)))));
+        assert!(talked.contains(&(2, Some(t(2)))));
+        assert!(talked.contains(&(3, Some(t(4)))));
+        assert!(talked.contains(&(4, None)));
+        let human = insert_human(&old, "lee", &t(0)).unwrap();
+        let summaries: Vec<_> = agent_summaries(&old, human)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.agent, s.last_human_conversation_at))
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                ("Bram".into(), Some(t(7))),
+                ("Mateo".into(), None),
+                ("Zed".into(), Some(t(2)))
+            ]
+        );
+
+        // A rolled-back send leaves no record.
+        let tx = old.transaction().unwrap();
+        record_human_conversation(&tx, 2, 1, &t(30)).unwrap();
+        drop(tx);
+        assert!(!pairs(&old).iter().any(|p| p.0 == 2 && p.1 == 1));
     }
 
     #[test]

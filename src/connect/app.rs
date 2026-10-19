@@ -2532,6 +2532,7 @@ mod tests {
                 last_sent_at: None,
                 effort: None,
                 effort_reported_at: None,
+                last_human_conversation_at: None,
             };
         // Selecting Bo, who then moves; the selection moves with it.
         key(&mut app, 'j');
@@ -2565,6 +2566,105 @@ mod tests {
             ["Ana", "Bo", "Cy", "Di", "Ed"]
         );
         assert!(!out.contains('✉'), "{out}");
+    }
+
+    #[test]
+    fn agents_a_human_talked_with_most_recently_come_first() {
+        let (mut app, mut rx) = app();
+        key(&mut app, 'a');
+        assert!(matches!(rx.try_recv().unwrap(), Request::AgentsAt { .. }));
+        let id = app.ctx.inbox.id;
+        let at = |s: &str| Some(format!("2026-10-19T00:00:{s}.000000Z"));
+        // The list says when Ana last talked with a human; the rest never did.
+        let mut agents: Vec<_> = ["Ana", "Bo", "Cy", "Di", "Ed"]
+            .iter()
+            .map(|n| agent(n, "ada", &["crew"]))
+            .collect();
+        agents[0].last_human_conversation_at = at("01");
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents,
+        }))));
+        let names = ["Ana", "Bo", "Cy", "Di", "Ed"];
+        let out = screen(&mut app, 100, 24);
+        assert_eq!(
+            order(&out, &names),
+            ["Ana", "Bo", "Cy", "Di", "Ed"],
+            "{out}"
+        );
+        let summary = |agent: &str, mail: u32, talked: Option<String>| proto::AgentSummary {
+            agent: agent.into(),
+            unread_messages: mail,
+            oldest_unread_message: (mail > 0).then(|| "2026-10-19T00:00:00.000000Z".into()),
+            last_human_conversation_at: talked,
+            ..Default::default()
+        };
+        // Select Ed, then the live summary reorders: Cy and Di tie on the
+        // newest conversation, so Di's unread mail puts it first; Ana keeps
+        // the list's time; Bo's unread mail cannot beat any conversation, and
+        // Ed, who never talked with a human, keeps the server's order.
+        for _ in 0..4 {
+            key(&mut app, 'j');
+        }
+        app.on_event(Event::Data(Data::Summary {
+            id,
+            result: Ok(vec![
+                summary("Bo", 3, None),
+                summary("Cy", 0, at("05")),
+                summary("Di", 1, at("05")),
+            ]),
+        }));
+        let out = screen(&mut app, 100, 24);
+        assert_eq!(
+            order(&out, &names),
+            ["Di", "Cy", "Ana", "Bo", "Ed"],
+            "{out}"
+        );
+        // A new conversation moves Ed to the top; the selection follows it.
+        app.on_event(Event::Data(Data::Summary {
+            id,
+            result: Ok(vec![
+                summary("Bo", 3, None),
+                summary("Cy", 0, at("05")),
+                summary("Di", 1, at("05")),
+                summary("Ed", 0, at("09")),
+            ]),
+        }));
+        let out = screen(&mut app, 100, 24);
+        assert_eq!(
+            order(&out, &names),
+            ["Ed", "Di", "Cy", "Ana", "Bo"],
+            "{out}"
+        );
+        enter(&mut app);
+        assert_eq!(watched(&mut rx).1.with.as_deref(), Some("Ed"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        // Without summaries, the list's times still order; an older server
+        // with neither keeps the server's order.
+        app.on_event(Event::Data(Data::Summary {
+            id,
+            result: Err("required capability agent-summary.v1 is unavailable".into()),
+        }));
+        let out = screen(&mut app, 100, 24);
+        assert_eq!(
+            order(&out, &names),
+            ["Ana", "Bo", "Cy", "Di", "Ed"],
+            "{out}"
+        );
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: names
+                .iter()
+                .rev()
+                .map(|n| agent(n, "ada", &["crew"]))
+                .collect(),
+        }))));
+        let out = screen(&mut app, 100, 24);
+        assert_eq!(
+            order(&out, &names),
+            ["Ed", "Di", "Cy", "Bo", "Ana"],
+            "{out}"
+        );
     }
 
     #[test]

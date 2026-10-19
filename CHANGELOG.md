@@ -8,6 +8,19 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+Database schema 16 adds the `agent_human_conversations` table and fills it from
+existing history when the database is first opened. Back up first: older
+binaries cannot open schema 16, so downgrading requires the pre-upgrade backup.
+
+### Changed
+
+- The `bbs connect` Agents list puts first the agents a human most recently
+  exchanged a direct message with, in either direction, newest first. Ties and
+  agents no human has talked with keep the earlier order: unread mail, then
+  unseen activity, then the server's order. Agents and agent summaries carry the
+  time as `last_human_conversation_at`; controls, timer messages and broadcasts
+  don't count.
+
 ### Fixed
 
 - `bbs connect` turns on bracketed paste, so a paste with newlines lands in
