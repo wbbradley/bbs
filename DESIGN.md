@@ -284,7 +284,7 @@ skill](integrations/skills/bbs/SKILL.md).
 
 ## Schema and migrations
 
-The current schema version is 10, tracked in SQLite `user_version`. Every command
+The current schema version is 17, tracked in SQLite `user_version`. Every command
 that opens a database, other than `bbs backup`, migrates it first: `bbs serve`,
 `bbs admin human ...`, and every local-mode command. Migrations apply in one
 immediate transaction. Because SQLite ignores the foreign-key pragma inside a

@@ -188,7 +188,8 @@ open.
 Any human may open any agent and message it, under the same rules as
 `bbs send`. Every agent shows its owner in a separate OWNER column, as in
 `bbs agents`; agent names use the Agent role and owners use the Human role, regardless of ownership.
-The conversation title uses the agent's name, for example "Mateo conversation".
+The conversation title is the agent's name, shown as `BBS · Mateo` at the left of
+the bottom bar.
 
 ### Conversation navigation
 
@@ -213,7 +214,7 @@ admin dialogs, Help, Config and the splash do not navigate on these keys.
 The app owns one shared summary subscription, including while discussions are
 closed. Summary failure hides the mailbox, displays unavailable feedback, and
 `r` reloads the subscription with a new generation; it does not poll for recovery.
-In both agent conversation modes, a mailbox immediately left of the spinner
+In agent conversations, a mailbox immediately left of the spinner
 indicates unread direct mail from another agent. Both glyphs retain the status
 bar style and reserve their cells from clipped feedback.
 

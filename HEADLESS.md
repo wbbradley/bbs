@@ -96,7 +96,13 @@ own command-line flags, environment, or configuration files; the
 
 Updated runners require `auto-reply.v1` before starting a harness. The server
 resolves the registered owner; a runner without an owner or compatible server
-fails clearly. `share_activity = false` does not disable owner chat.
+fails clearly, so upgrade the server before restarting runners. Older runners keep
+working against an upgraded server without automatic replies.
+`share_activity = false` does not disable owner chat. Pending replies wait in a
+private `owner-outbox/` in the agent's state directory; do not delete it while
+delivery is pending, since a downgraded runner leaves it undelivered until an
+updated runner starts again. Resumed sessions keep their earlier instructions;
+start with `--new-session` to give an agent the new ones.
 
 Parent-session assistant text is collected at message boundaries, tool/thought
 boundaries, and prompt completion. ACP adapters without message IDs use contiguous
