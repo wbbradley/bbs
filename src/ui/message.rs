@@ -26,6 +26,39 @@ pub fn message_lines_with_recipient<'a>(
     with_header(row, gap, query, Some(header(row, query, recipient)))
 }
 
+/// A side conversation identifies its participants without delivery metadata
+/// or owner suffixes. The stored message and ordinary feed header stay intact.
+pub fn side_message_lines<'a>(
+    row: &'a Message,
+    gap: bool,
+    query: Option<&str>,
+    recipient: Option<Kind>,
+) -> Vec<Line<'a>> {
+    let mut spans = highlight_names(name_spans(&row.from_name, None, row.from_kind()), query);
+    spans.push(Span::styled(" → ", style(Role::Muted)));
+    match (&row.to_group, row.to_name.as_deref()) {
+        (Some(group), _) => spans.extend(highlight_names(
+            vec![Span::styled(format!("@{group}"), style(Role::Group).bold())],
+            query,
+        )),
+        (None, Some(to)) => spans.extend(highlight_names(
+            name_spans(
+                to,
+                None,
+                recipient.unwrap_or(if row.to_owner.is_some() {
+                    Kind::Agent
+                } else {
+                    Kind::Unspecified
+                }),
+            ),
+            query,
+        )),
+        (None, None) => spans.push(Span::raw("?")),
+    }
+    let header = Line::from(spans).style(style(Role::OtherConversationHeader));
+    with_header(row, gap, query, Some(header))
+}
+
 /// The same body and search rendering, without a header.
 pub fn compact_message_lines<'a>(
     row: &'a Message,

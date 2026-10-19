@@ -4371,18 +4371,45 @@ mod tests {
                         "{text}"
                     );
                 }
-                // Header and every wrapped body line share the surface; the
-                // leading separator remains the ordinary screen background.
+                // The header has its own tint; wrapped body lines keep the
+                // quieter surface and the separator keeps the screen background.
                 let first = row("other-body");
                 let last = row("tail-end");
                 assert!(last > first);
-                for y in first - 1..=last {
+                for y in first..=last {
                     assert!((0..80).all(|x| buffer[(x, y)].bg
                         == if conversation {
                             other.bg.unwrap()
                         } else {
                             base.bg.unwrap()
                         }));
+                }
+                let header = (0..80)
+                    .map(|x| buffer[(x, first - 1)].symbol())
+                    .collect::<String>();
+                if conversation {
+                    assert_eq!(header.trim(), "Zed → Mateo");
+                } else {
+                    assert!(header.contains("Zed@ada → Mateo@ada"), "{header}");
+                    assert!(header.contains("2026-10-16"), "{header}");
+                }
+                let header_style = if conversation {
+                    base.patch(theme::style(theme::Role::OtherConversationHeader))
+                } else {
+                    base
+                };
+                // The attribution text has the stronger tint; unused cells
+                // keep the quiet message surface rather than a bright bar.
+                let end = unicode_width::UnicodeWidthStr::width(header.trim_end()) as u16;
+                assert!((0..end).all(|x| buffer[(x, first - 1)].bg == header_style.bg.unwrap()));
+                assert!((end..80).all(|x| buffer[(x, first - 1)].bg
+                    == if conversation {
+                        other.bg.unwrap()
+                    } else {
+                        base.bg.unwrap()
+                    }));
+                if conversation && crate::ui::theme::current() != Scheme::NoColor {
+                    assert_ne!(header_style.bg, other.bg);
                 }
                 assert!((0..80).all(|x| buffer[(x, first - 2)].bg == base.bg.unwrap()));
             };

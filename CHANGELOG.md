@@ -10,6 +10,9 @@ under the new package version and its publication date.
 
 ### Changed
 
+- Side-message headers show just sender and recipient, without owner suffixes
+  or timestamps, on a slightly stronger themed tint. Reasoning traces in
+  connect omit leading whitespace while retaining internal paragraph breaks.
 - Agent conversations give mail not from or to the viewing human a subtle
   themed background across its header and body, retaining attribution.
 - The `bbs connect` Agents list puts agents a human has talked with in order

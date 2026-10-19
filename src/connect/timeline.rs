@@ -15,7 +15,9 @@ use super::theme;
 use crate::backend::AGENT_ACTIVITY;
 use crate::proto::{self, Message};
 use crate::ui::activity::{Activity, ToolLine};
-use crate::ui::message::{compact_message_lines, find_matches, message_lines_with_recipient};
+use crate::ui::message::{
+    compact_message_lines, find_matches, message_lines_with_recipient, side_message_lines,
+};
 use crate::ui::thread::Row;
 
 /// Events each batch holds; the stream catches up from the start in batches.
@@ -108,11 +110,13 @@ impl Row for Entry {
                 headerless,
                 recipient,
                 outgoing,
+                other_participants,
                 gap: raw_gap,
-                ..
             } => {
                 let mut lines = if *headerless {
                     compact_message_lines(message, gap || *raw_gap, query)
+                } else if *other_participants {
+                    side_message_lines(message, gap || *raw_gap, query, *recipient)
                 } else {
                     message_lines_with_recipient(message, gap || *raw_gap, query, *recipient)
                 };
@@ -413,6 +417,12 @@ impl Stream {
                 return None;
             }
             ("mail" | "steer", _) if echoed => return None,
+            ("thought", _) => {
+                if let Some(text) = value["text"].as_str() {
+                    value["text"] = text.trim_start().to_owned().into();
+                }
+                self.renderer.render(&value.to_string())
+            }
             ("prompt", _) if echoed => {
                 value["text"] = serde_json::Value::Null;
                 self.renderer.render(&value.to_string())
@@ -504,6 +514,37 @@ mod tests {
         style::Modifier,
         widgets::{Block, Paragraph, Wrap},
     };
+
+    #[test]
+    fn reasoning_drops_leading_whitespace_but_keeps_paragraphs_and_raw_logs() {
+        let mut stream = Stream::new("Mateo");
+        let source = serde_json::json!({"event":"thought", "text":"\n \n\t**Pushing changes upstream**\n\n**Clarifying GitHub installation**"}).to_string();
+        let record = proto::Activity {
+            id: 1,
+            record: source.clone(),
+            ..Default::default()
+        };
+        let kept = Kept::new(&record);
+        let entry = stream.entry(&kept, &Loaded::new()).unwrap();
+        let lines = entry.lines(false, None);
+        assert_eq!(
+            lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            [
+                "│ **Pushing changes upstream**",
+                "│",
+                "│ **Clarifying GitHub installation**"
+            ]
+        );
+        assert_eq!(kept.activity.record, source);
+        let pretty = Activity::new(false).render(&source);
+        assert_eq!(pretty[0].to_string(), "│", "CLI logs are unchanged");
+        let blank = Kept::new(&proto::Activity {
+            id: 2,
+            record: serde_json::json!({"event":"thought", "text":" \n\t"}).to_string(),
+            ..Default::default()
+        });
+        assert!(stream.entry(&blank, &Loaded::new()).is_none());
+    }
 
     #[test]
     fn one_gap_on_each_side_of_a_tool_run_unless_a_blank_is_already_there() {
