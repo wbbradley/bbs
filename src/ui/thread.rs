@@ -49,6 +49,11 @@ pub trait Row: PartialEq {
     fn spaced_after(&self, _prev: Option<&Self>) -> bool {
         false
     }
+    /// Whether a blank line goes after this row when it is the last one. The
+    /// row before the newest is re-measured as rows arrive.
+    fn spaced_last(&self) -> bool {
+        false
+    }
 }
 
 impl Row for Message {
@@ -176,6 +181,10 @@ impl<R: Row> ThreadView<R> {
                     self.matched.push(self.matches(&m));
                     self.rows.push(m);
                     self.heights.push(None);
+                    // The old last row may have drawn a closing blank.
+                    if let Some(before) = i.checked_sub(1) {
+                        self.remeasure(before);
+                    }
                     if self.paused.is_some() {
                         self.new_count += 1;
                     }
@@ -219,6 +228,9 @@ impl<R: Row> ThreadView<R> {
         let mut lines = row.lines_at(self.gaps.contains(&row.key()), query, width);
         if row.spaced_after(i.checked_sub(1).map(|j| &self.rows[j])) {
             lines.insert(0, Line::default());
+        }
+        if i + 1 == self.rows.len() && row.spaced_last() {
+            lines.push(Line::default());
         }
         lines
     }
@@ -429,7 +441,8 @@ impl<R: Row> ThreadView<R> {
 mod tests {
     use super::*;
 
-    /// A row spaced before each run of tool rows, as connect's timeline is.
+    /// A row spaced on both sides of each run of tool rows, as connect's
+    /// timeline is.
     #[derive(Clone, Debug, PartialEq)]
     struct R {
         id: i64,
@@ -450,7 +463,10 @@ mod tests {
             false
         }
         fn spaced_after(&self, prev: Option<&Self>) -> bool {
-            self.tool && prev.is_none_or(|p| !p.tool)
+            prev.is_some_and(|p| p.tool) != self.tool
+        }
+        fn spaced_last(&self) -> bool {
+            self.tool
         }
     }
 
@@ -473,13 +489,16 @@ mod tests {
     #[test]
     fn neighbour_spacing_is_remeasured_on_insert_replace_and_eviction() {
         let mut view = ThreadView::new(vec![r(1, true), r(3, true)], 100);
-        assert_eq!(totals(&mut view), (3, 3), "a run: one blank, then tight");
-        // A row landing inside the run splits it: the next row gains a blank.
+        assert_eq!(totals(&mut view), (4, 4), "a run: a blank each side, tight");
+        // A row landing inside the run splits it: blanks around each part.
         view.ingest(vec![r(2, false)]);
-        assert_eq!(totals(&mut view), (5, 5));
+        assert_eq!(totals(&mut view), (7, 7));
         // Replacing that row with a tool row rejoins the run.
         view.ingest(vec![r(2, true)]);
-        assert_eq!(totals(&mut view), (4, 4));
+        assert_eq!(totals(&mut view), (5, 5));
+        // A row after the run moves its closing blank off the old last row.
+        view.ingest(vec![r(4, false)]);
+        assert_eq!(totals(&mut view), (6, 6));
         // Evicting the oldest row leaves a new first row with nothing before.
         let mut rows = vec![r(0, true), r(1, true)];
         rows.extend((2..MAX_ROWS as i64).map(|id| r(id, false)));

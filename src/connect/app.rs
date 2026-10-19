@@ -4704,17 +4704,20 @@ mod tests {
             let lines: Vec<&str> = out.lines().map(str::trim_end).collect();
             let a = lines.iter().position(|l| l.contains(first)).expect(first);
             let b = lines.iter().position(|l| l.contains(last)).expect(last);
-            lines[a..=b].iter().map(|l| l.to_string()).collect()
+            // Through the line after `last`, for the run's closing blank.
+            lines[a..=b + 1].iter().map(|l| l.to_string()).collect()
         };
         let expected = [
             "Looking.",
             "",
             "  ✓ Read a.rs completed (1.0s)",
             "  ✓ Read b.rs completed (1.0s)",
+            "",
             "Done.",
             "group note",
             "",
             "  ✓ Read c.rs completed (1.0s)",
+            "",
         ];
         let start = |app: &mut App, rx: &mut UnboundedReceiver<Request>| {
             let (feed, act) = mateo_streams(app, rx);
@@ -4767,8 +4770,8 @@ mod tests {
             "{rebuilt}"
         );
 
-        // Mail landing inside a run splits it: the later calls start a new
-        // run, with one blank line, not two.
+        // Mail landing inside a run splits it: each part gets one blank line
+        // above and below, never two.
         let (mut app, mut rx) = self::app();
         let (feed, act) = start(&mut app, &mut rx);
         app.on_event(Event::Data(Data::Activity {
@@ -4784,10 +4787,11 @@ mod tests {
         let b = lines.iter().position(|l| l.contains("Read b.rs")).unwrap();
         assert!(lines[b - 1].is_empty() && !lines[b - 2].is_empty(), "{out}");
         let a = lines.iter().position(|l| l.contains("Read a.rs")).unwrap();
-        assert!(lines[a - 1].is_empty(), "{out}");
+        assert!(lines[a - 1].is_empty() && !lines[a - 2].is_empty(), "{out}");
+        assert!(lines[a + 1].is_empty() && !lines[a + 2].is_empty(), "{out}");
 
         // A run at the top still gets its blank line; a call still running
-        // shows in the pane below (its own leading blank is starts_tool_run's
+        // shows in the pane below (its blank lines follow opens_run's
         // rule), and E: problems hides it.
         let (mut app, mut rx) = self::app();
         let (_, act) = mateo_streams(&mut app, &mut rx);
@@ -4814,6 +4818,7 @@ mod tests {
             lines[0].is_empty() && lines[1].contains("Read a.rs"),
             "{out}"
         );
+        assert!(lines[2].is_empty() && lines[3].contains("Next."), "{out}");
         assert!(out.contains("Read d.rs running"), "{out}");
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         key(&mut app, 'E');

@@ -144,10 +144,10 @@ activity: thoughts, tool calls and errors, rendered by the same code as
 `bbs headless logs -f --pretty`, with calls still running shown below. Turn
 markers (the separator before a turn and `turn end`) are left out, since the
 progress mark in the bottom bar shows turn state; a turn's prompt still shows
-any mail not otherwise in the thread. Each run of tool calls, the first
-included, follows one blank line (shared with a blank the row before already
-ends with), and calls within a run sit on consecutive lines; so do calls still
-running. Each call takes one line of the width: a long or multi-line command is
+any mail not otherwise in the thread. Each run of tool calls has one blank
+line above and one below, at the top and bottom of the timeline too, sharing a
+blank line already there; calls within a run sit on consecutive lines, and so
+do calls still running. Each call takes one line of the width: a long or multi-line command is
 flattened and cut with an ellipsis before its status and duration, a wider
 window shows more of it, and search still finds all of it. Logs keep the whole
 call. `A`

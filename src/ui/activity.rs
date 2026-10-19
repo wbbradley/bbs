@@ -36,20 +36,20 @@ impl ToolLine {
         }
     }
 
-    /// The call as lines. Without a width, as the log prints it, the name's
-    /// own line breaks kept. With one, a single line of at most `width`
-    /// columns: the name's line breaks become spaces and a name that does
-    /// not fit beside the mark, status and duration ends in an ellipsis.
-    pub fn lines(&self, width: Option<usize>) -> Vec<Line<'static>> {
-        let name = |text: String| Span::styled(text, style(Role::Tool));
-        let Some(width) = width else {
-            return styled_parts(vec![
-                self.mark.clone(),
-                name(self.name.clone()),
-                self.status.clone(),
-                self.took.clone(),
-            ]);
-        };
+    /// The call as the log prints it, the name's own line breaks kept.
+    pub fn full_lines(&self) -> Vec<Line<'static>> {
+        styled_parts(vec![
+            self.mark.clone(),
+            Span::styled(self.name.clone(), style(Role::Tool)),
+            self.status.clone(),
+            self.took.clone(),
+        ])
+    }
+
+    /// The call as one line of at most `width` columns: the name's line
+    /// breaks become spaces, and a name that does not fit beside the mark,
+    /// status and duration ends in an ellipsis.
+    pub fn one_line(&self, width: usize) -> Line<'static> {
         let flat: String = self
             .name
             .chars()
@@ -62,22 +62,20 @@ impl ToolLine {
             })
             .collect();
         let fixed = self.mark.width() + self.status.width() + self.took.width();
-        let spans = if fixed < width {
-            vec![
+        if fixed < width {
+            return Line::from(vec![
                 self.mark.clone(),
-                name(fit(&flat, width - fixed)),
+                Span::styled(fit(&flat, width - fixed), style(Role::Tool)),
                 self.status.clone(),
                 self.took.clone(),
-            ]
-        } else {
-            // Too narrow even for the mark and status: fit the whole call.
-            let text = format!(
-                "{}{flat}{}{}",
-                self.mark.content, self.status.content, self.took.content
-            );
-            vec![Span::styled(fit(&text, width), style(Role::Tool))]
-        };
-        vec![Line::from(spans)]
+            ]);
+        }
+        // Too narrow even for the mark and status: fit the whole call.
+        let text = format!(
+            "{}{flat}{}{}",
+            self.mark.content, self.status.content, self.took.content
+        );
+        Line::from(Span::styled(fit(&text, width), style(Role::Tool)))
     }
 }
 
@@ -275,7 +273,7 @@ impl Activity {
     pub fn in_progress(&self) -> Vec<Line<'static>> {
         self.running_calls()
             .iter()
-            .flat_map(|call| call.lines(None))
+            .flat_map(|call| call.full_lines())
             .collect()
     }
 
@@ -356,7 +354,7 @@ impl Activity {
             status: Span::styled(format!(" {status}"), status_style),
             took: Span::styled(took, style(Role::Timestamp)),
         };
-        out.extend(call.lines(None));
+        out.extend(call.full_lines());
         self.finished = Some(call);
     }
 
@@ -394,7 +392,7 @@ impl Activity {
 }
 
 fn running_line(name: &str) -> Vec<Line<'static>> {
-    ToolLine::running(name).lines(None)
+    ToolLine::running(name).full_lines()
 }
 
 /// Structured values keep their categories, even when a field contains newlines.
@@ -567,10 +565,7 @@ mod tests {
             let full = to_ansi(&pretty.render(end), false);
             (full, pretty.take_tool().expect("a finished call"))
         };
-        let text = |lines: Vec<Line<'static>>| -> String {
-            assert_eq!(lines.len(), 1, "one line");
-            lines[0].to_string()
-        };
+        let text = |line: Line<'static>| line.to_string();
         // A multi-line Python invocation: the log keeps it whole; the fitted
         // line flattens it, ends the name with an ellipsis and keeps the rest.
         let script = "python3 - <<'EOF'\nimport json\nfor i in range(100):\n    print(json.dumps({'i': i}))\nEOF";
@@ -581,29 +576,52 @@ mod tests {
             "pretty logs keep the call's own lines"
         );
         for width in [80, 40, 24] {
-            let line = text(call.lines(Some(width)));
+            let line = text(call.one_line(width));
             assert!(line.width() <= width, "{width}: {line}");
             assert!(line.ends_with("… completed (1.0s)"), "{width}: {line}");
             assert!(!line.contains('\n'));
         }
-        let wide = text(call.lines(Some(200)));
+        let wide = text(call.one_line(200));
         assert!(wide.contains("import json for i in range(100):"), "{wide}");
         assert!(!wide.contains('…'), "fits whole: {wide}");
         // Wide graphemes and combining marks are never split or overrun.
         let (_, call) = finish(&"漢字👩‍💻é\u{301}".repeat(20));
         for width in [80, 33, 25] {
-            let line = text(call.lines(Some(width)));
+            let line = text(call.one_line(width));
             assert!(line.width() <= width, "{width}: {line}");
             assert!(line.ends_with("… completed (1.0s)"), "{width}: {line}");
         }
         // Too narrow even for the mark and status: still within the width.
         for width in [0, 5, 12] {
-            assert!(text(call.lines(Some(width))).width() <= width);
+            assert!(text(call.one_line(width)).width() <= width);
         }
         // A running call fits the same way.
         let running = ToolLine::running(script);
-        let line = text(running.lines(Some(30)));
+        let line = text(running.one_line(30));
         assert!(line.width() <= 30 && line.ends_with("… running"), "{line}");
+    }
+
+    #[test]
+    fn only_the_record_that_finishes_a_call_carries_it() {
+        let mut pretty = Activity::new(false);
+        pretty.render(r#"{"ts":"2026-10-16T05:00:00Z","event":"tool","id":"a","title":"ls","status":"in_progress"}"#);
+        assert!(pretty.take_tool().is_none(), "a start finishes nothing");
+        pretty.render(
+            r#"{"ts":"2026-10-16T05:00:01Z","event":"tool","id":"a","status":"completed"}"#,
+        );
+        assert!(pretty.take_tool().is_some());
+        pretty.render(
+            r#"{"ts":"2026-10-16T05:00:01Z","event":"tool","id":"a","status":"completed"}"#,
+        );
+        // Records after it never inherit the call, taken or not.
+        for later in [
+            r#"{"ts":"2026-10-16T05:00:02Z","event":"text","text":"after"}"#,
+            r#"{"ts":"2026-10-16T05:00:03Z","event":"tool","id":"b","title":"partial"}"#,
+            "not json",
+        ] {
+            pretty.render(later);
+            assert!(pretty.take_tool().is_none(), "{later}");
+        }
     }
 
     #[test]

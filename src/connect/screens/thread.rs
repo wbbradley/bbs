@@ -1044,8 +1044,13 @@ impl Thread {
             }
             _ => Vec::new(),
         };
-        if !running.is_empty() && crate::connect::timeline::starts_tool_run(self.view.rows.last()) {
-            running.insert(0, Line::default());
+        // Calls still running are a run too: a blank line above unless the
+        // timeline already ends a run or with a blank, and one below.
+        if !running.is_empty() {
+            if crate::connect::timeline::opens_run(self.view.rows.last()) {
+                running.insert(0, Line::default());
+            }
+            running.push(Line::default());
         }
         let height = (running.len() as u16).min(body.height / 3);
         let [body, below] =

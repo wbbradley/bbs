@@ -17,9 +17,9 @@ under the new package version and its publication date.
   before each turn and `turn end`), which the bottom-right progress mark shows;
   a turn's prompt still shows mail not otherwise in the thread. `bbs headless
   logs --pretty` is unchanged.
-- Each run of tool calls in a `bbs connect` agent conversation follows one
-  blank line, with the calls on consecutive lines, including calls still
-  running. Each call takes one line: a long or multi-line command is cut with an
+- Each run of tool calls in a `bbs connect` agent conversation has one blank
+  line above and one below, with the calls on consecutive lines, including
+  calls still running. Each call takes one line: a long or multi-line command is cut with an
   ellipsis, keeping its status and duration; logs keep the whole call.
 - Bare `bbs` opens `bbs connect`; explicit subcommands are unchanged, and
   outside a terminal a bare invocation still prints usage and exits 2.

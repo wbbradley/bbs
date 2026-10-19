@@ -53,16 +53,33 @@ impl Entry {
     }
 }
 
-/// Whether tool calls after `prev` (none: the top) start a new run, and so
-/// take one blank line first: `prev` is no tool call and does not already
-/// end with a blank line.
-pub fn starts_tool_run(prev: Option<&Entry>) -> bool {
-    let blank = |line: &Line| {
-        line.spans
-            .iter()
-            .all(|s| s.content.chars().all(char::is_whitespace))
-    };
-    prev.is_none_or(|p| !p.is_tool() && p.lines(false, None).last().is_none_or(|l| !blank(l)))
+/// Whether a line shows nothing: no text, or only whitespace.
+fn blank(line: &Line) -> bool {
+    line.spans
+        .iter()
+        .all(|s| s.content.chars().all(char::is_whitespace))
+}
+
+fn ends_blank(e: &Entry) -> bool {
+    e.lines(false, None).last().is_some_and(blank)
+}
+
+fn starts_blank(e: &Entry) -> bool {
+    e.lines(false, None).first().is_some_and(blank)
+}
+
+/// Whether one blank line goes between `prev` and `next` (none: the top or
+/// the bottom): a run of tool calls starts or ends there, and neither side
+/// already shows a blank line at that boundary. Calls within a run are tight.
+pub fn needs_gap(prev: Option<&Entry>, next: Option<&Entry>) -> bool {
+    let tool = |e: Option<&Entry>| e.is_some_and(Entry::is_tool);
+    tool(prev) != tool(next) && !prev.is_some_and(ends_blank) && !next.is_some_and(starts_blank)
+}
+
+/// Whether tool calls drawn after `prev` (none: the top) open a run, and so
+/// need a blank line above them.
+pub fn opens_run(prev: Option<&Entry>) -> bool {
+    !prev.is_some_and(|p| p.is_tool() || ends_blank(p))
 }
 
 /// Microseconds since the epoch, so rows from the two sources interleave.
@@ -135,15 +152,19 @@ impl Row for Entry {
         match self {
             Entry::Stream {
                 call: Some(call), ..
-            } => call.lines(Some(usize::from(width))),
+            } => vec![call.one_line(usize::from(width))],
             _ => self.lines(gap, query),
         }
     }
 
-    /// A blank line before each run of tool calls, the first included,
-    /// unless the row before already ends with one; none within a run.
+    /// One blank line above and below each run of tool calls, edges
+    /// included, unless one is already there; none within a run.
     fn spaced_after(&self, prev: Option<&Self>) -> bool {
-        self.is_tool() && starts_tool_run(prev)
+        needs_gap(prev, Some(self))
+    }
+
+    fn spaced_last(&self) -> bool {
+        needs_gap(Some(self), None)
     }
 
     fn matches(&self, query: &str) -> bool {
@@ -340,7 +361,7 @@ impl Stream {
         self.renderer
             .running_calls()
             .iter()
-            .flat_map(|call| call.lines(Some(usize::from(width))))
+            .map(|call| call.one_line(usize::from(width)))
             .collect()
     }
 
@@ -475,31 +496,35 @@ mod tests {
     };
 
     #[test]
-    fn tool_runs_start_after_the_top_or_a_non_tool_row_without_a_trailing_blank() {
-        let stream = |tool: bool, lines: Vec<Line<'static>>| Entry::Stream {
+    fn one_gap_on_each_side_of_a_tool_run_unless_a_blank_is_already_there() {
+        let row = |tool: bool, lines: Vec<Line<'static>>| Entry::Stream {
             id: 1,
             created_at: "2026-10-16T18:00:00Z".into(),
             lines,
             call: tool.then(|| ToolLine::running("a")),
         };
-        assert!(starts_tool_run(None), "the first run takes a blank too");
-        assert!(!starts_tool_run(Some(&stream(
-            true,
-            vec![Line::raw("✓ a")]
-        ))));
-        assert!(starts_tool_run(Some(&stream(
-            false,
-            vec![Line::raw("text")]
-        ))));
-        // A row already ending with a blank line lends it to the run.
-        let blank_after = stream(false, vec![Line::raw("text"), Line::default()]);
-        assert!(!starts_tool_run(Some(&blank_after)));
-        // Whitespace-only is visibly blank too, though it has width.
-        let spaces = stream(false, vec![Line::raw("text"), Line::raw("   ")]);
-        assert!(!starts_tool_run(Some(&spaces)));
-        let tool = stream(true, vec![Line::raw("✓ b")]);
-        assert!(tool.spaced_after(None) && !tool.spaced_after(Some(&tool.clone())));
-        assert!(!stream(false, vec![Line::raw("text")]).spaced_after(None));
+        let call = row(true, vec![Line::raw("✓ a")]);
+        let text = row(false, vec![Line::raw("text")]);
+        // Runs open and close against text and against the edges.
+        assert!(needs_gap(None, Some(&call)), "a leading run");
+        assert!(needs_gap(Some(&text), Some(&call)));
+        assert!(needs_gap(Some(&call), Some(&text)));
+        assert!(needs_gap(Some(&call), None), "a trailing run");
+        // Never within a run, between non-tool rows, or at a non-tool edge.
+        assert!(!needs_gap(Some(&call), Some(&call)));
+        assert!(!needs_gap(Some(&text), Some(&text)));
+        assert!(!needs_gap(None, Some(&text)) && !needs_gap(Some(&text), None));
+        // A blank already at the boundary, empty or whitespace-only, serves.
+        for blank in [Line::default(), Line::raw("   ")] {
+            let ends = row(false, vec![Line::raw("text"), blank.clone()]);
+            let starts = row(false, vec![blank, Line::raw("text")]);
+            assert!(!needs_gap(Some(&ends), Some(&call)));
+            assert!(!needs_gap(Some(&call), Some(&starts)));
+            assert!(!opens_run(Some(&ends)));
+        }
+        assert!(opens_run(None) && opens_run(Some(&text)) && !opens_run(Some(&call)));
+        assert!(call.spaced_after(None) && call.spaced_last());
+        assert!(!call.spaced_after(Some(&call)) && text.spaced_after(Some(&call)));
     }
 
     #[test]
