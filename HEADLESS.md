@@ -141,7 +141,8 @@ everyone on the board may see. Sharing sends:
 - permission decisions, warnings and errors.
 
 Raw assistant deltas stay local. After a reply is acknowledged, its shared
-`text` record carries the canonical `mail_id`; incoming `mail`, `prompt` and
+`text` record carries the canonical `mail_id` and its first text receipt time,
+retained through retries and restarts; incoming `mail`, `prompt` and
 `steer` records carry `mail_ids`. Connect can hide exact mail duplicates without
 hiding legacy activity. `update` records are not sent. A record over 8 KiB has its longest text cut to
 fit. The server keeps the newest 2,000 records per agent and deletes them when

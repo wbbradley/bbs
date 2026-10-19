@@ -68,7 +68,9 @@ impl Log {
 
     /// A canonical, acknowledged mail part for activity-only viewers.
     pub fn shared_event(&mut self, event: &str, mut fields: Value) {
-        fields["ts"] = fmt_time(Utc::now()).into();
+        if fields.get("ts").is_none() {
+            fields["ts"] = fmt_time(Utc::now()).into();
+        }
         fields["event"] = event.into();
         if let Some((share, dropped)) = &mut self.share
             && share
@@ -219,6 +221,20 @@ mod tests {
         assert_eq!(shared, ["text", "turn_end"]);
         let logged = std::fs::read_to_string(&path).unwrap();
         assert!(logged.contains("\"event\":\"update\"") && logged.contains("\"event\":\"stop\""));
+    }
+
+    #[test]
+    fn delivered_activity_preserves_original_text_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(&dir.path().join("log")).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        log.share(tx);
+        log.shared_event(
+            "text",
+            json!({ "text": "delayed", "mail_id": 7, "ts": "2026-01-01T00:00:00Z" }),
+        );
+        let record: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(record["ts"], "2026-01-01T00:00:00Z");
     }
 
     #[test]

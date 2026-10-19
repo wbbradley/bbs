@@ -564,7 +564,7 @@ fn delivered(outbox: &mut Outbox, log: &mut Log, key: &str, id: i64) -> Result<(
     );
     log.shared_event(
         "text",
-        json!({ "text": part.body, "mail_id": id, "source": part.source }),
+        json!({ "text": part.body, "mail_id": id, "source": part.source, "ts": part.emitted_at }),
     );
     Ok(())
 }
@@ -831,11 +831,13 @@ mod tests {
         assert!(rx.try_recv().is_err());
         record(&mut log, &mut outbox, Event::TextEnd(source, None)).unwrap();
         let key = outbox.ready().unwrap().key.clone();
+        let emitted_at = outbox.ready().unwrap().emitted_at.clone();
         assert_eq!(outbox.ready().unwrap().body, "first last\n");
         delivered(&mut outbox, &mut log, &key, 42).unwrap();
         log.event("turn_end", json!({}));
         let text: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(text["mail_id"], 42);
+        assert_eq!(text["ts"], emitted_at);
         assert_eq!(text["text"], "first last\n");
         let end: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(end["event"], "turn_end");

@@ -25,6 +25,8 @@ pub struct Source {
 pub struct Part {
     pub key: String,
     pub source: Source,
+    /// First text receipt time, retained across retries and process restarts.
+    pub emitted_at: String,
     pub body: String,
     pub sealed: bool,
     sequence: u64,
@@ -169,6 +171,7 @@ impl Outbox {
                 self.parts.push_back(Part {
                     key: crate::auth::new_token(),
                     source: source.clone(),
+                    emitted_at: crate::service::fmt_time(chrono::Utc::now()),
                     body: String::new(),
                     sealed: false,
                     sequence,
@@ -485,14 +488,18 @@ mod tests {
         let mut out = Outbox::open(dir.path(), "board".into(), 3).unwrap();
         out.append(source.clone(), " a\n\n**é**\n").unwrap();
         assert!(out.ready().is_none());
+        let emitted_at = out.parts.back().unwrap().emitted_at.clone();
+        chrono::DateTime::parse_from_rfc3339(&emitted_at).unwrap();
         drop(out);
         let mut out = Outbox::open(dir.path(), "board".into(), 3).unwrap();
         let part = out.ready().unwrap().clone();
         assert_eq!(part.source, source);
+        assert_eq!(part.emitted_at, emitted_at);
         assert_eq!(part.body, " a\n\n**é**\n");
         drop(out); // Server may already have accepted this key.
         out = Outbox::open(dir.path(), "board".into(), 3).unwrap();
         assert_eq!(out.ready().unwrap().key, part.key);
+        assert_eq!(out.ready().unwrap().emitted_at, emitted_at);
         assert!(out.acknowledge("wrong").is_err());
         out.acknowledge(&part.key).unwrap();
         drop(out);
