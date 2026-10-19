@@ -191,8 +191,9 @@ summaries, even with `share_activity = false`; they are independent of the 2,000
 activity window and never prove that the runner is currently connected. The server
 migrates to schema 17 automatically, so back up first; older local/server binaries
 need the pre-upgrade database to downgrade. Protocol v2 and config format 3 remain
-unchanged. Against older servers, a new runner warns and disables effort reporting
-while ordinary mail handling continues. Keep one runner per agent; no new config
+unchanged. If an otherwise compatible server omits `agent-effort.v1`, the runner
+warns and disables effort reporting. The `auto-reply.v1` capability remains
+required to start the runner. Keep one runner per agent; no new config
 keys, credentials or identity changes are required.
 
 ## Turns
