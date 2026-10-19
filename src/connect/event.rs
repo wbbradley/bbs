@@ -3,6 +3,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, KeyEvent, KeyEventKind};
@@ -220,10 +224,36 @@ fn input(event: event::Event) -> Option<Event> {
     }
 }
 
-/// Read terminal input on a thread of its own: crossterm's reads block.
-pub fn spawn_input(tx: UnboundedSender<Event>) {
-    std::thread::spawn(move || {
-        loop {
+/// Own the terminal reader until it has stopped. It must be dropped before
+/// restoring the terminal, so it cannot consume the shell's next input.
+pub struct Input {
+    stopped: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Input {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Poll on the reader's own thread so shutdown can join it even with no input.
+pub fn spawn_input(tx: UnboundedSender<Event>) -> Input {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let stopping = stopped.clone();
+    let thread = std::thread::spawn(move || {
+        while !stopping.load(Ordering::Acquire) {
+            match event::poll(Duration::from_millis(50)) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(_) => return,
+            }
+            if stopping.load(Ordering::Acquire) {
+                return;
+            }
             let event = match event::read() {
                 Ok(event) => match input(event) {
                     Some(event) => event,
@@ -236,6 +266,10 @@ pub fn spawn_input(tx: UnboundedSender<Event>) {
             }
         }
     });
+    Input {
+        stopped,
+        thread: Some(thread),
+    }
 }
 
 /// A tick each second, for the status bar's clock.

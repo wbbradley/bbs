@@ -113,7 +113,7 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
             return Err(anyhow::Error::new(e).context("could not enable bracketed paste"));
         }
     };
-    event::spawn_input(events.clone());
+    let input = event::spawn_input(events.clone());
     event::spawn_ticks(events);
     let result = async {
         loop {
@@ -131,6 +131,7 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
         }
     }
     .await;
+    drop(input);
     let drafts_result = app.finish();
     ratatui::restore();
     result.and(drafts_result)

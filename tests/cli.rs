@@ -3478,6 +3478,29 @@ fn connect_is_for_humans_at_a_terminal(mode: Mode) {
     assert!(err.contains("Usage:"), "{err}");
 }
 
+#[cfg(unix)]
+#[test]
+fn connect_stops_reading_before_returning_the_terminal_to_the_shell() {
+    let bbs = Bbs::new("connect-exit");
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/connect_exit.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_bbs"))
+        .env("HOME", &bbs.home)
+        .env("USER", "will")
+        .env("TERM", "xterm-256color")
+        .env_remove("BBS_SERVER")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn control_messages_are_for_owned_agents_only(mode: Mode) {
     let bbs = Bbs::with_mode("control", mode);
     bbs.ok(&["human", "add", "alice"]);
