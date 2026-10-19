@@ -75,6 +75,26 @@ bar.
 | Config | Live local color scheme selection | local preferences |
 | Help | Key bindings | none |
 
+### Group mail in agent conversations
+
+Group messages sent or received by the agent render like side conversations,
+with a warm red/orange surface and a stronger full-width header. Headers read
+`• Zoe → @nw-api`, without timestamps or owner suffixes. Wrapped bodies keep
+the two-space inset, Markdown and search highlighting. Group/feed screens are
+unchanged.
+
+The agent feed opts into `FeedRequest.include_group_deliveries`; the server
+uses recorded deliveries rather than current group membership. Existing
+message-ID matching hides duplicate receipt/prompt echoes once the feed loads.
+An older server ignores the optional field, retaining today's activity fallback.
+No runner update or database migration is required.
+
+Gruvbox group shades blend its orange accent into its background (10% for the
+body, 18% for the header). This is RGB tinting, not an HSV transformation.
+Terminal mode uses dark red indexed colors because its ANSI palette RGB values
+are defined by the terminal; no-color mode adds no color. Existing side-card
+colors remain their per-scheme palette choices.
+
 ### Agent effort
 
 The agent bottom bar shows the last reported effort ("effort low", or "effort

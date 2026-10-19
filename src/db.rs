@@ -1152,6 +1152,8 @@ pub struct FeedFilter<'a> {
     pub from_human: Option<i64>,
     /// Sent by any of these principals, or sent directly to one of them.
     pub with: Option<Vec<(Kind, i64)>>,
+    /// Include broadcasts delivered to agents in `with`, at send time.
+    pub include_group_deliveries: bool,
     /// `created_at >= since`.
     pub since: Option<&'a str>,
     /// `created_at < until`.
@@ -1416,6 +1418,7 @@ fn page_ids(conn: &Connection, limit: u32, filter: &FeedFilter) -> Result<Vec<i6
             terms.push(Term::Sent(kind, id));
             terms.push(match kind {
                 Kind::Human => Term::DirectTo(id),
+                Kind::Agent if filter.include_group_deliveries => Term::DeliveredTo(id),
                 Kind::Agent => Term::DirectToAgent(id),
             });
         }
@@ -2132,6 +2135,10 @@ mod tests {
                 "deliveries_recipient",
             ),
             (
+                term_sql(Term::DeliveredTo(2), 200, &mine, Expanded::With),
+                "deliveries_recipient",
+            ),
+            (
                 term_sql(Term::ToGroup(1), 200, &mine, Expanded::Groups),
                 "messages_group",
             ),
@@ -2481,6 +2488,11 @@ mod tests {
             },
             FeedFilter {
                 with: Some(vec![(Kind::Agent, bram.id)]),
+                ..Default::default()
+            },
+            FeedFilter {
+                with: Some(vec![(Kind::Agent, bram.id)]),
+                include_group_deliveries: true,
                 ..Default::default()
             },
         ] {

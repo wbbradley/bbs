@@ -321,6 +321,10 @@ message FeedRequest {
   // Sent by this agent or human name, or sent directly to it (case-insensitive;
   // retired agents included).
   optional string with = 9;
+  // Connect agent conversations also include broadcasts delivered to the named agents.
+  // Optional
+  // presentation enrichment: old servers ignore it and retain the direct-only feed.
+  bool include_group_deliveries = 10;
 }
 message FeedSnapshot { repeated Message messages = 1; }
 

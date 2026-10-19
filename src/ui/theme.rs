@@ -19,6 +19,8 @@ pub enum Role {
     /// Conversation mail between participants other than the viewing human.
     OtherConversation,
     OtherConversationHeader,
+    GroupConversation,
+    GroupConversationHeader,
     Agent,
     Human,
     Group,
@@ -190,6 +192,21 @@ impl Scheme {
                 Self::Terminal => Color::Indexed(237),
                 Self::NoColor => unreachable!(),
             }),
+            GroupConversation | GroupConversationHeader => {
+                let header = role == GroupConversationHeader;
+                Style::new().fg(text).bg(match self {
+                    // Gruvbox orange (base09), blended into the scheme's background.
+                    // More of the same accent makes the header stronger without
+                    // changing the body/header hue or their text contrast abruptly.
+                    Self::Gruvbox => {
+                        tint(bg, Color::Rgb(254, 128, 25), if header { 18 } else { 10 })
+                    }
+                    // ANSI colors have terminal-defined RGB values. Keep palette
+                    // references rather than pretending we can transform those RGBs.
+                    Self::Terminal => Color::Indexed(if header { 88 } else { 52 }),
+                    Self::NoColor => unreachable!(),
+                })
+            }
             Muted | Timestamp => Style::new().fg(muted),
             Technical | Tool => Style::new().fg(technical),
             Heading => Style::new().fg(accent).bold(),
@@ -210,9 +227,56 @@ impl Scheme {
     }
 }
 
+/// Mix a palette accent into its RGB background by a percentage.
+fn tint(background: Color, accent: Color, percent: u16) -> Color {
+    let (Color::Rgb(r, g, b), Color::Rgb(ar, ag, ab)) = (background, accent) else {
+        return background;
+    };
+    let mix = |base: u8, ink: u8| {
+        ((u16::from(base) * (100 - percent) + u16::from(ink) * percent) / 100) as u8
+    };
+    Color::Rgb(mix(r, ar), mix(g, ag), mix(b, ab))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_surfaces_are_warm_and_the_header_has_more_accent() {
+        let body = Scheme::Gruvbox.style(Role::GroupConversation).bg.unwrap();
+        let header = Scheme::Gruvbox
+            .style(Role::GroupConversationHeader)
+            .bg
+            .unwrap();
+        let Color::Rgb(r, g, b) = body else {
+            panic!("RGB scheme")
+        };
+        let Color::Rgb(hr, hg, hb) = header else {
+            panic!("RGB scheme")
+        };
+        assert!(r > g && g > b);
+        assert!(hr > hg && hg > hb && hr - hb > r - b);
+        assert_eq!(
+            body,
+            tint(
+                Scheme::Gruvbox.style(Role::Screen).bg.unwrap(),
+                Color::Rgb(254, 128, 25),
+                10
+            )
+        );
+        assert_ne!(
+            body,
+            Scheme::Gruvbox.style(Role::OtherConversation).bg.unwrap()
+        );
+        for role in [Role::GroupConversation, Role::GroupConversationHeader] {
+            assert_eq!(Scheme::NoColor.style(role), Style::default());
+            assert!(matches!(
+                Scheme::Terminal.style(role).bg,
+                Some(Color::Indexed(_))
+            ));
+        }
+    }
 
     #[test]
     fn categorical_roles_inherit_surfaces_and_bar_collisions_stay_visible() {
@@ -232,6 +296,8 @@ mod tests {
                         Role::HumanSurface,
                         Role::OtherConversation,
                         Role::OtherConversationHeader,
+                        Role::GroupConversation,
+                        Role::GroupConversationHeader,
                         Role::Selection,
                         Role::TitleBar,
                         Role::StatusBar,
@@ -362,6 +428,8 @@ pub(crate) mod testing {
             HumanSurface,
             OtherConversation,
             OtherConversationHeader,
+            GroupConversation,
+            GroupConversationHeader,
             Agent,
             Human,
             Group,

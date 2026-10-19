@@ -848,6 +848,115 @@ async fn auto_replies_are_advertised_deduped_and_owned() {
 }
 
 #[tokio::test]
+async fn group_deliveries_opt_in_over_the_wire_and_follow_live() {
+    let server = Server::start("conversation-group-feed");
+    let mut client = server.client().await;
+    let agent = register_as(&mut client, "will", Some("Mateo")).await;
+    client
+        .group_register(as_human(
+            "will",
+            proto::GroupRegisterRequest {
+                group: "crew".into(),
+                description: None,
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .group_join(as_agent(
+            &agent.token,
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    let req = proto::FeedRequest {
+        backlog: 100,
+        with: Some(agent.name.clone()),
+        ..Default::default()
+    };
+    let mut old = client
+        .watch_feed(as_human("will", req.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut enriched = client
+        .watch_feed(as_human(
+            "will",
+            proto::FeedRequest {
+                include_group_deliveries: true,
+                ..req.clone()
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    // A membership notice sent by the watched agent occurs in both branches
+    // of the expanded union but still appears exactly once.
+    let initial = enriched.message().await.unwrap().unwrap();
+    assert_eq!(initial.messages.len(), 1);
+    assert_eq!(old.message().await.unwrap().unwrap().messages.len(), 1);
+    client
+        .send(as_human(
+            "will",
+            proto::SendRequest {
+                to: "@crew".into(),
+                body: "received group text".into(),
+                control: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let live = tokio::time::timeout(Duration::from_secs(5), enriched.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let message = live
+        .messages
+        .iter()
+        .find(|m| m.body == "received group text")
+        .unwrap();
+    assert_eq!(message.to_group.as_deref(), Some("crew"));
+    let old_snapshot = client
+        .watch_feed(as_human("will", req.clone()))
+        .await
+        .unwrap()
+        .into_inner()
+        .message()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!old_snapshot.messages.iter().any(|m| m.id == message.id));
+    let cursor = client
+        .watch_feed(as_human(
+            "will",
+            proto::FeedRequest {
+                backlog: 1,
+                after_id: Some(message.id - 1),
+                include_group_deliveries: true,
+                ..req
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .message()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.messages[0].id, message.id);
+    // Reading the feed doesn't consume the runner's mail.
+    let unread = client
+        .read(as_agent(&agent.token, proto::ReadRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(unread.messages.iter().any(|m| m.id == message.id));
+}
+
+#[tokio::test]
 async fn feed_filters_are_advertised_and_applied_server_side() {
     let server = Server::start("feed-filter");
     let mut client = server.client().await;

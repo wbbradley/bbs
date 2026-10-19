@@ -17,8 +17,8 @@ use crate::backend::AGENT_ACTIVITY;
 use crate::proto::{self, Message};
 use crate::ui::activity::{Activity, ToolLine};
 use crate::ui::message::{
-    compact_message_lines, find_matches, message_lines_with_recipient, message_prefix, side_header,
-    side_message_lines,
+    compact_message_lines, conversation_roles, find_matches, message_lines_with_recipient,
+    message_prefix, side_header, side_message_lines,
 };
 use crate::ui::thread::Row;
 
@@ -37,7 +37,7 @@ pub enum Entry {
         headerless: bool,
         recipient: Option<proto::Kind>,
         outgoing: bool,
-        /// Mail not from or to the viewer, only in an agent conversation.
+        /// Side conversations and group mail, only in an agent conversation.
         other_participants: bool,
         /// A possible gap in the raw feed before this visible message.
         gap: bool,
@@ -153,8 +153,9 @@ impl Row for Entry {
             Entry::Message { outgoing: true, .. } => theme::style(theme::Role::HumanSurface),
             Entry::Message {
                 other_participants: true,
+                message,
                 ..
-            } => theme::style(theme::Role::OtherConversation),
+            } => theme::style(conversation_roles(message).0),
             _ => Style::default(),
         }
     }
@@ -191,13 +192,17 @@ impl Row for Entry {
         };
         let prefix_height = measure(message_prefix(gap || *raw_gap));
         let header_height = measure(vec![side_header(message, query, *recipient)]);
-        let surface = theme::style(theme::Role::OtherConversationHeader);
+        let surface = theme::style(conversation_roles(message).1);
         let mut gutter = vec![Line::default(); prefix_height];
         for index in 0..header_height {
             gutter.push(
                 Line::from(Span::styled(
                     if index == 0 { "• " } else { "  " },
-                    surface.patch(theme::style(theme::Role::Accent)),
+                    surface.patch(theme::style(if message.to_group.is_some() {
+                        theme::Role::Group
+                    } else {
+                        theme::Role::Accent
+                    })),
                 ))
                 .style(surface),
             );
@@ -845,84 +850,85 @@ mod tests {
                 assert_eq!(text.inset(), 2);
                 // A wrapped side header keeps one bullet in column zero, names
                 // at column two, and its tint through the gutter and scrolling.
-                let side = Entry::Message {
-                    message: Message {
-                        from_name: "Theo長い名前".repeat(4),
-                        ..message
-                    },
-                    headerless: false,
-                    recipient: Some(proto::Kind::Agent),
-                    outgoing: false,
-                    other_participants: true,
-                    gap: true,
-                };
-                let mut view = ThreadView::new(vec![side], 100);
-                let width = 32;
-                let mut terminal = Terminal::new(TestBackend::new(width, 80)).unwrap();
-                terminal
-                    .draw(|f| {
-                        f.render_widget(Block::new().style(theme::base()), f.area());
-                        view.render(f, f.area());
-                    })
-                    .unwrap();
-                let buf = terminal.backend().buffer();
-                let header = (0..view.frame.total as u16)
-                    .find(|&y| buf[(0, y)].symbol() == "•")
-                    .unwrap();
-                assert!(header > 2, "wrapped gap warning comes before header");
-                assert_eq!(buf[(2, header)].symbol(), "T");
-                assert_eq!(
-                    buf[(0, header)].fg,
-                    theme::base()
-                        .patch(theme::style(theme::Role::Accent))
-                        .fg
-                        .unwrap()
-                );
-                assert_eq!(buf[(0, header + 1)].symbol(), " ");
-                let header_bg = theme::base()
-                    .patch(theme::style(theme::Role::OtherConversationHeader))
-                    .bg
-                    .unwrap();
-                let header_rows = view.rows[0].gutter(true, None, width - 2).len();
-                for y in header..header_rows as u16 {
+                for group in [false, true] {
+                    let header_role = if group {
+                        theme::Role::GroupConversationHeader
+                    } else {
+                        theme::Role::OtherConversationHeader
+                    };
+                    let bullet_role = if group {
+                        theme::Role::Group
+                    } else {
+                        theme::Role::Accent
+                    };
+                    let side = Entry::Message {
+                        message: Message {
+                            from_name: "Theo長い名前".repeat(4),
+                            to_group: group.then(|| "long-group-name".repeat(3)),
+                            ..message.clone()
+                        },
+                        headerless: false,
+                        recipient: Some(proto::Kind::Agent),
+                        outgoing: false,
+                        other_participants: true,
+                        gap: true,
+                    };
+                    let mut view = ThreadView::new(vec![side], 100);
+                    let width = 32;
+                    let mut terminal = Terminal::new(TestBackend::new(width, 80)).unwrap();
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(Block::new().style(theme::base()), f.area());
+                            view.render(f, f.area());
+                        })
+                        .unwrap();
+                    let buf = terminal.backend().buffer();
+                    let header = (0..view.frame.total as u16)
+                        .find(|&y| buf[(0, y)].symbol() == "•")
+                        .unwrap();
+                    assert!(header > 2, "wrapped gap warning comes before header");
+                    assert_eq!(buf[(2, header)].symbol(), "T");
+                    assert_eq!(
+                        buf[(0, header)].fg,
+                        theme::base().patch(theme::style(bullet_role)).fg.unwrap()
+                    );
+                    assert_eq!(buf[(0, header + 1)].symbol(), " ");
+                    let header_bg = theme::base().patch(theme::style(header_role)).bg.unwrap();
+                    let header_rows = view.rows[0].gutter(true, None, width - 2).len();
+                    for y in header..header_rows as u16 {
+                        let mut x = 0;
+                        while x < width {
+                            assert_eq!(buf[(x, y)].bg, header_bg, "wrapped header at {x},{y}");
+                            // TestBackend clears the hidden continuation cells of
+                            // wide glyphs; the displayed glyph supplies their style.
+                            x += unicode_width::UnicodeWidthStr::width(buf[(x, y)].symbol()).max(1)
+                                as u16;
+                        }
+                    }
+                    assert_eq!(
+                        buf[(0, header + 1)].bg,
+                        theme::base().patch(theme::style(header_role)).bg.unwrap()
+                    );
+                    assert_eq!(buf.content.iter().filter(|c| c.symbol() == "•").count(), 1);
+                    view.layout(width, 3);
+                    view.scroll_to(header as usize + 1);
+                    terminal.backend_mut().resize(width, 3);
+                    terminal
+                        .resize(ratatui::layout::Rect::new(0, 0, width, 3))
+                        .unwrap();
+                    terminal.draw(|f| view.render(f, f.area())).unwrap();
+                    assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
                     let mut x = 0;
                     while x < width {
-                        assert_eq!(buf[(x, y)].bg, header_bg, "wrapped header at {x},{y}");
-                        // TestBackend clears the hidden continuation cells of
-                        // wide glyphs; the displayed glyph supplies their style.
-                        x += unicode_width::UnicodeWidthStr::width(buf[(x, y)].symbol()).max(1)
-                            as u16;
+                        let cell = &terminal.backend().buffer()[(x, 0)];
+                        assert_eq!(cell.bg, header_bg);
+                        x += unicode_width::UnicodeWidthStr::width(cell.symbol()).max(1) as u16;
                     }
+                    assert_eq!(
+                        terminal.backend().buffer()[(0, 0)].bg,
+                        theme::base().patch(theme::style(header_role)).bg.unwrap()
+                    );
                 }
-                assert_eq!(
-                    buf[(0, header + 1)].bg,
-                    theme::base()
-                        .patch(theme::style(theme::Role::OtherConversationHeader))
-                        .bg
-                        .unwrap()
-                );
-                assert_eq!(buf.content.iter().filter(|c| c.symbol() == "•").count(), 1);
-                view.layout(width, 3);
-                view.scroll_to(header as usize + 1);
-                terminal.backend_mut().resize(width, 3);
-                terminal
-                    .resize(ratatui::layout::Rect::new(0, 0, width, 3))
-                    .unwrap();
-                terminal.draw(|f| view.render(f, f.area())).unwrap();
-                assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
-                let mut x = 0;
-                while x < width {
-                    let cell = &terminal.backend().buffer()[(x, 0)];
-                    assert_eq!(cell.bg, header_bg);
-                    x += unicode_width::UnicodeWidthStr::width(cell.symbol()).max(1) as u16;
-                }
-                assert_eq!(
-                    terminal.backend().buffer()[(0, 0)].bg,
-                    theme::base()
-                        .patch(theme::style(theme::Role::OtherConversationHeader))
-                        .bg
-                        .unwrap()
-                );
             });
         }
     }

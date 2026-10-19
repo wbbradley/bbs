@@ -101,7 +101,7 @@ impl Thread {
         }
     }
 
-    /// What `agent` sent and what was sent to it directly.
+    /// What `agent` sent and what was delivered to it, including group mail.
     pub fn agent(
         agent: &str,
         human: &str,
@@ -110,6 +110,7 @@ impl Thread {
         let title = format!("{agent} conversation");
         let req = FeedRequest {
             with: Some(agent.to_string()),
+            include_group_deliveries: true,
             ..Default::default()
         };
         let mut thread = Thread::new(title, req, Some(agent));
@@ -215,7 +216,7 @@ impl Thread {
                         .to_name
                         .as_ref()
                         .is_some_and(|to| to.eq_ignore_ascii_case(human));
-                !from_viewer && !to_viewer
+                message.to_group.is_some() || (!from_viewer && !to_viewer)
             })
     }
 

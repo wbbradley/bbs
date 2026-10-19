@@ -1181,6 +1181,9 @@ pub fn feed(
                 req.backlog
             );
         }
+        if req.include_group_deliveries && req.with.is_none() {
+            bail!("include_group_deliveries requires a with filter");
+        }
         let group_ids = req
             .group
             .as_deref()
@@ -1244,6 +1247,7 @@ pub fn feed(
             senders,
             from_human,
             with,
+            include_group_deliveries: req.include_group_deliveries,
             since: since.as_deref(),
             until: until.as_deref(),
             scope: req.mine.then_some(me.id),
@@ -2836,6 +2840,152 @@ mod tests {
         };
         assert_eq!(timer_list(&mut conn, &lu, req).unwrap().timers.len(), 1);
         timer_remove(&mut conn, &lu, proto::TimerRemoveRequest { id: t.id }).unwrap();
+    }
+
+    #[test]
+    fn conversation_group_feed_uses_deliveries_at_send_time_without_changing_default() {
+        let (mut conn, will, [mateo, _, lu]) = board();
+        let post = |conn: &mut Connection, to: &str, body: &str| {
+            send(
+                conn,
+                &will,
+                proto::SendRequest {
+                    to: to.into(),
+                    body: body.into(),
+                    control: None,
+                },
+            )
+            .unwrap();
+        };
+        post(&mut conn, "@crew", "before join");
+        group_join(
+            &mut conn,
+            &lu,
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        post(&mut conn, "@crew", "while joined");
+        post(&mut conn, "Lu", "direct");
+        group_leave(
+            &mut conn,
+            &lu,
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        post(&mut conn, "@crew", "after leave");
+        let req = proto::FeedRequest {
+            backlog: 100,
+            with: Some("lu".into()),
+            include_group_deliveries: true,
+            ..Default::default()
+        };
+        let enriched = feed(&mut conn, &will, req.clone()).unwrap().messages;
+        let bodies: Vec<_> = enriched.iter().map(|m| m.body.as_str()).collect();
+        assert!(
+            bodies.contains(&"while joined") && bodies.contains(&"direct"),
+            "{bodies:?}"
+        );
+        assert!(
+            !bodies.contains(&"before join") && !bodies.contains(&"after leave"),
+            "{bodies:?}"
+        );
+        let ids: std::collections::HashSet<_> = enriched.iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids.len(),
+            enriched.len(),
+            "sent and delivered union must not duplicate notices"
+        );
+        let old = feed(
+            &mut conn,
+            &will,
+            proto::FeedRequest {
+                include_group_deliveries: false,
+                ..req.clone()
+            },
+        )
+        .unwrap()
+        .messages;
+        assert!(old.iter().any(|m| m.body == "direct"));
+        assert!(!old.iter().any(|m| m.body == "while joined"));
+        // One-row cursor pages and recent windows must not drop/duplicate broadcasts.
+        let mut cursor = 0;
+        let mut paged = Vec::new();
+        loop {
+            let page = feed(
+                &mut conn,
+                &will,
+                proto::FeedRequest {
+                    backlog: 1,
+                    after_id: Some(cursor),
+                    ..req.clone()
+                },
+            )
+            .unwrap()
+            .messages;
+            let Some(message) = page.first() else { break };
+            cursor = message.id;
+            paged.push(cursor);
+        }
+        assert_eq!(paged, enriched.iter().map(|m| m.id).collect::<Vec<_>>());
+        let recent = feed(
+            &mut conn,
+            &will,
+            proto::FeedRequest {
+                backlog: 1,
+                ..req.clone()
+            },
+        )
+        .unwrap()
+        .messages;
+        assert_eq!(recent[0].id, *paged.last().unwrap());
+        let grouped = feed(
+            &mut conn,
+            &will,
+            proto::FeedRequest {
+                group: Some("crew".into()),
+                ..req.clone()
+            },
+        )
+        .unwrap()
+        .messages;
+        assert!(
+            grouped
+                .iter()
+                .all(|m| m.to_group.as_deref() == Some("crew"))
+        );
+        assert!(!grouped.iter().any(|m| m.body == "direct"));
+        // A human named by `with` still means direct mail, not their broadcast inbox.
+        let human = feed(
+            &mut conn,
+            &will,
+            proto::FeedRequest {
+                with: Some("will".into()),
+                ..req.clone()
+            },
+        )
+        .unwrap()
+        .messages;
+        let human_old = feed(
+            &mut conn,
+            &will,
+            proto::FeedRequest {
+                with: Some("will".into()),
+                include_group_deliveries: false,
+                ..req.clone()
+            },
+        )
+        .unwrap()
+        .messages;
+        assert_eq!(human, human_old);
+        assert!(
+            feed(&mut conn, &mateo, req.clone()).is_err(),
+            "feed stays human-only"
+        );
+        assert!(feed(&mut conn, &will, proto::FeedRequest { with: None, ..req }).is_err());
     }
 
     #[test]

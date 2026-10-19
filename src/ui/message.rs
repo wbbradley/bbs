@@ -72,7 +72,16 @@ pub fn side_header(row: &Message, query: Option<&str>, recipient: Option<Kind>) 
         )),
         (None, None) => spans.push(Span::raw("?")),
     }
-    Line::from(spans).style(style(Role::OtherConversationHeader))
+    Line::from(spans).style(style(conversation_roles(row).1))
+}
+
+/// Semantic surfaces for a conversation card, independent of its author.
+pub fn conversation_roles(row: &Message) -> (Role, Role) {
+    if row.to_group.is_some() {
+        (Role::GroupConversation, Role::GroupConversationHeader)
+    } else {
+        (Role::OtherConversation, Role::OtherConversationHeader)
+    }
 }
 
 /// The body and search rendering without a header or literal inset; the

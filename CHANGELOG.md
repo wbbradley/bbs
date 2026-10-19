@@ -6,6 +6,17 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Changed
+
+- Agent conversations include group broadcasts delivered to that agent, using
+  warm cards with a stronger full-width `sender → @group` header, bullet and
+  two-space margin. Matching activity echoes disappear once messages load.
+  Requires an updated client and server; no database migration or runner
+  restart. Older servers keep the existing activity display; ordinary feed
+  filters and group screens are unchanged.
+
 ## 0.10.2 - 2026-10-19
 
 Client reliability and conversation presentation improvements. Protocol v2,

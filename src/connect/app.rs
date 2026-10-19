@@ -3063,7 +3063,8 @@ mod tests {
             agents: vec![agent("Mateo", "ada", &["crew"])],
         }))));
         enter(app);
-        let feed = watched(rx).0;
+        let (feed, req) = watched(rx);
+        assert!(req.include_group_deliveries);
         match rx.try_recv().unwrap() {
             Request::WatchActivity { id, req } => {
                 assert_eq!(req.agent.as_deref(), Some("Mateo"));
@@ -4565,8 +4566,8 @@ mod tests {
                     ("incoming-body", theme::Role::Screen),
                     ("outgoing-body", theme::Role::HumanSurface),
                     ("agent-named-viewer", theme::Role::OtherConversation),
-                    ("viewer-group-post", theme::Role::Screen),
-                    ("agent-group-post", theme::Role::OtherConversation),
+                    ("viewer-group-post", theme::Role::GroupConversation),
+                    ("agent-group-post", theme::Role::GroupConversation),
                 ] {
                     let y = row(text);
                     let expected = base.patch(theme::style(if conversation {
@@ -4723,6 +4724,108 @@ mod tests {
             result: Ok(vec![outgoing]),
         }));
         assert_background(&mut app, false, false);
+    }
+
+    #[test]
+    fn group_cards_replace_log_envelopes_in_either_arrival_order_and_keep_theme_geometry() {
+        use crate::ui::theme::{Scheme, testing::with_scheme};
+        for scheme in Scheme::ALL {
+            with_scheme(scheme, || {
+                for activity_first in [true, false] {
+                    let (mut app, mut rx) = app();
+                    let (feed, act) = mateo_streams(&mut app, &mut rx);
+                    let body = format!(
+                        "**Joined** @nw-api. {} final-tail",
+                        "wrapped words ".repeat(20)
+                    );
+                    let mail = proto::Message {
+                        from_owner: Some("thmtz".into()),
+                        to_name: None,
+                        to_group: Some("nw-api".into()),
+                        ..at(10, "01", "Zoe", "", &body)
+                    };
+                    let envelope = format!(
+                        "New BBS mail (1 message):\n\n[2026-10-16T18:00:01Z] from Zoe@thmtz to @nw-api:\n{body}\n"
+                    );
+                    let feed_event = Event::Data(Data::Feed {
+                        id: feed,
+                        result: Ok(vec![mail]),
+                    });
+                    let activity_event = Event::Data(Data::Activity {
+                        id: act,
+                        result: Ok(vec![
+                            activity(1, "02", r#"{"event":"mail","from":["Zoe@thmtz"],"mail_ids":[10]}"#),
+                            activity(2, "03", &serde_json::json!({"event":"prompt", "text":envelope, "mail_ids":[10]}).to_string()),
+                        ]),
+                    });
+                    if activity_first {
+                        app.on_event(activity_event);
+                        let old = screen(&mut app, 80, 40);
+                        assert!(
+                            old.contains("mail from Zoe@thmtz"),
+                            "old-server fallback: {old}"
+                        );
+                        app.on_event(feed_event);
+                    } else {
+                        app.on_event(feed_event);
+                        app.on_event(activity_event);
+                    }
+                    let out = screen(&mut app, 80, 40);
+                    assert_eq!(out.matches("• Zoe → @nw-api").count(), 1, "{out}");
+                    assert_eq!(out.matches("Joined").count(), 1, "{out}");
+                    assert!(
+                        !out.contains("mail from")
+                            && !out.contains("thmtz")
+                            && !out.contains("[2026-"),
+                        "{out}"
+                    );
+                    for width in [80, 120] {
+                        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                        terminal.draw(|f| app.draw(f)).unwrap();
+                        let buf = terminal.backend().buffer();
+                        crate::ui::theme::testing::assert_buffer(buf);
+                        let row = |needle: &str| {
+                            (0..40)
+                                .find(|&y| {
+                                    (0..width)
+                                        .map(|x| buf[(x, y)].symbol())
+                                        .collect::<String>()
+                                        .contains(needle)
+                                })
+                                .unwrap()
+                        };
+                        let header = row("Zoe → @nw-api");
+                        let end = row("final-tail");
+                        assert_eq!(buf[(0, header)].symbol(), "•");
+                        assert_eq!(buf[(2, header)].symbol(), "Z");
+                        let bg = |role| theme::base().patch(theme::style(role)).bg.unwrap();
+                        assert!((0..width).all(
+                            |x| buf[(x, header)].bg == bg(theme::Role::GroupConversationHeader)
+                        ));
+                        assert!(
+                            (0..width).all(|x| buf[(x, header - 1)].bg == bg(theme::Role::Screen))
+                        );
+                        for y in header + 1..=end {
+                            assert!(
+                                (0..width)
+                                    .all(|x| buf[(x, y)].bg == bg(theme::Role::GroupConversation))
+                            );
+                            assert_eq!(buf[(0, y)].symbol(), " ");
+                            assert_eq!(buf[(1, y)].symbol(), " ");
+                        }
+                        assert!(buf.content.iter().any(|c| c.symbol() == "J"
+                            && c.modifier.contains(ratatui::style::Modifier::BOLD)));
+                    }
+                    // Activity-only filtering restores the raw echo, not an empty view.
+                    press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+                    key(&mut app, 'A');
+                    key(&mut app, 'A');
+                    assert!(screen(&mut app, 80, 40).contains("mail from Zoe@thmtz"));
+                    key(&mut app, 'A');
+                    assert_eq!(screen(&mut app, 80, 40).matches("Joined").count(), 1);
+                }
+            });
+        }
     }
 
     #[test]
