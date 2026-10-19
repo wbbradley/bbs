@@ -4817,9 +4817,15 @@ mod tests {
         assert!(out.contains("Read d.rs running"), "{out}");
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         key(&mut app, 'E');
+        // Following again, so only the filter can hide the pane.
+        key(&mut app, 'G');
+        assert!(screen(&mut app, 80, 30).contains("Read d.rs running"));
         key(&mut app, 'E');
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(!screen(&mut app, 80, 30).contains("Read d.rs running"));
+        let out = screen(&mut app, 80, 30);
+        assert!(
+            out.contains("following") && !out.contains("Read d.rs running"),
+            "{out}"
+        );
     }
 
     #[test]
