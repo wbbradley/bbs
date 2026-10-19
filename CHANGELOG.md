@@ -27,6 +27,13 @@ cannot open schema 17, so downgrading requires the pre-upgrade backup.
   hint (still listed in Help). Effort reads `effort low` or
   `effort low → medium next turn`, without report age or an "unconfirmed"
   alarm; definite refusals and other errors are still shown.
+- `bbs connect` agent conversations are one view: compact/verbose and Ctrl-T
+  are gone. Mail between you and the agent has no header, everyone else's mail
+  keeps its sender, and activity shows inline with `A`/`E` labels only while
+  narrowed. Assistant text delivered as owner mail, and turn echoes of your mail,
+  show once as the mail when their activity records name it (`mail_id`,
+  `mail_ids`); older runners' activity always shows. The saved `compact` choice
+  is ignored and dropped on the next save.
 
 ### Fixed
 

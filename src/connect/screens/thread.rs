@@ -23,7 +23,7 @@ use crate::connect::effort::Decision;
 use crate::connect::event::{Data, Request};
 use crate::connect::keys::{Action, GroupOp};
 use crate::connect::theme;
-use crate::connect::timeline::{Entry, Show, Stream};
+use crate::connect::timeline::{Entry, Kinds, Show, Stream};
 use crate::proto::{self, FeedRequest, Message, SendRequest};
 use crate::ui::thread::{MAX_ROWS, ThreadView};
 
@@ -37,12 +37,9 @@ pub struct Thread {
     view: ThreadView<Entry>,
     /// Every message received, so another `show` can rebuild the view.
     messages: Vec<Message>,
-    /// Raw feed boundaries that may have skipped messages, before compact filtering.
+    /// Raw feed boundaries that may have skipped messages.
     message_gaps: BTreeSet<i64>,
     show: Show,
-    /// Compact mode shows only direct mail
-    /// between that agent and this human, retaining the verbose filter choices.
-    compact: bool,
     human: Option<String>,
     /// The stream's last error; it has ended until a reload.
     error: Option<String>,
@@ -80,7 +77,6 @@ impl Thread {
             messages: Vec::new(),
             message_gaps: BTreeSet::new(),
             show: Show::All,
-            compact: false,
             human: None,
             error: None,
             prompt: None,
@@ -101,7 +97,6 @@ impl Thread {
     pub fn agent(
         agent: &str,
         human: &str,
-        compact: bool,
         now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
     ) -> Thread {
         let title = format!("{agent} conversation");
@@ -114,7 +109,6 @@ impl Thread {
         thread.draft_key = Some(format!("agent:{}", agent.to_ascii_lowercase()));
         thread.composing = true;
         thread.human = Some(human.to_string());
-        thread.compact = compact;
         thread.stream = Some(Stream::new(agent));
         thread.now = now;
         thread
@@ -124,14 +118,14 @@ impl Thread {
     /// activity kinds, keeping the search.
     fn rebuild(&mut self) {
         let mut entries = Vec::new();
-        if self.compact || self.show.messages() {
+        if self.show.messages() {
             entries.extend(self.message_entries(&self.messages));
         }
-        if !self.compact
-            && self.show.stream()
+        let loaded = self.loaded();
+        if self.show.stream()
             && let Some(stream) = &mut self.stream
         {
-            entries.extend(stream.entries());
+            entries.extend(stream.entries(&loaded));
         }
         let query = self.view.query.clone();
         self.view = ThreadView::new(entries, BACKLOG as usize);
@@ -140,25 +134,27 @@ impl Thread {
         }
     }
 
+    /// The ids of every message held, which activity records may name.
+    fn loaded(&self) -> HashSet<i64> {
+        self.messages.iter().map(|m| m.id).collect()
+    }
+
+    /// Redraw after loading mail that kept activity records name, keeping
+    /// the reader's place, so a delivered text or an echo gives way to the
+    /// mail in the same frame.
+    fn reconcile(&mut self) {
+        let (paused, new_count) = (self.view.paused, self.view.new_count);
+        self.rebuild();
+        self.view.paused = paused;
+        self.view.new_count = new_count;
+    }
+
     fn message_entries(&self, messages: &[Message]) -> Vec<Entry> {
-        let visible_gaps: HashSet<_> = self
-            .message_gaps
-            .iter()
-            .filter_map(|gap| {
-                self.messages
-                    .iter()
-                    .find(|m| {
-                        m.id >= *gap && (self.direct_to_human(m) || self.direct_from_human(m))
-                    })
-                    .map(|m| m.id)
-            })
-            .collect();
         messages
             .iter()
-            .filter(|m| !self.compact || self.direct_to_human(m) || self.direct_from_human(m))
             .cloned()
             .map(|m| Entry::Message {
-                compact: self.compact,
+                headerless: self.direct_to_human(&m) || self.direct_from_human(&m),
                 recipient: if m.to_owner.is_some()
                     || self.agent.as_ref().is_some_and(|a| {
                         m.to_name
@@ -176,7 +172,7 @@ impl Thread {
                     None
                 },
                 outgoing: self.direct_from_human(&m),
-                gap: visible_gaps.contains(&m.id),
+                gap: self.message_gaps.contains(&m.id),
                 message: m,
             })
             .collect()
@@ -342,24 +338,26 @@ impl Thread {
                 .and_then(|a| ctx.efforts.error(a))
                 .map(|e| ("effort error", e.to_string()))
         });
+        // Filter labels only when a filter is narrowed from showing all.
         let hints = |short: bool| {
             let mut parts = Vec::new();
-            if !self.compact {
+            if self.show != Show::All {
                 parts.push(if short {
                     format!("A:{}", self.show.label())
                 } else {
                     format!("A: {}", self.show.label())
                 });
-                if self.show.stream()
-                    && let Some(stream) = &self.stream
-                {
-                    let label = stream.kinds.label();
-                    parts.push(if short {
-                        format!("E:{}", label.strip_suffix(" kinds").unwrap_or(label))
-                    } else {
-                        format!("E: {label}")
-                    });
-                }
+            }
+            if self.show.stream()
+                && let Some(stream) = &self.stream
+                && stream.kinds != Kinds::All
+            {
+                let label = stream.kinds.label();
+                parts.push(if short {
+                    format!("E:{}", label.strip_suffix(" kinds").unwrap_or(label))
+                } else {
+                    format!("E: {label}")
+                });
             }
             parts.join(if short { " " } else { " · " })
         };
@@ -733,9 +731,10 @@ impl Screen for Thread {
     }
 
     fn on_data(&mut self, data: &Data) {
+        let loaded = self.loaded();
         if let Some(stream) = &mut self.stream {
-            let entries = stream.on_data(data, (self.now)());
-            if !self.compact && self.show.stream() && !entries.is_empty() {
+            let entries = stream.on_data(data, (self.now)(), &loaded);
+            if self.show.stream() && !entries.is_empty() {
                 self.view.ingest(entries);
             }
         }
@@ -743,8 +742,20 @@ impl Screen for Thread {
             Data::Feed { id, result } if *id == self.id => match result {
                 Ok(messages) => {
                     self.error = None;
+                    let arrived: Vec<i64> = messages
+                        .iter()
+                        .map(|m| m.id)
+                        .filter(|id| !loaded.contains(id))
+                        .collect();
                     self.keep(messages);
-                    if self.compact || self.show.messages() {
+                    if self
+                        .stream
+                        .as_ref()
+                        .is_some_and(|s| self.show.stream() && s.references(arrived))
+                    {
+                        // Records drawn before this mail arrived give way to it.
+                        self.reconcile();
+                    } else if self.show.messages() {
                         let entries = self.message_entries(messages);
                         self.view.ingest(entries);
                     }
@@ -822,14 +833,6 @@ impl Screen for Thread {
             });
         }
         self.effort_notice = None;
-        if self.agent.is_some()
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.code == KeyCode::Char('t')
-        {
-            self.compact = !self.compact;
-            self.rebuild();
-            return Some(Transition::Compact(self.compact));
-        }
         if self.composing {
             return self.compose(key);
         }
@@ -928,11 +931,11 @@ impl Screen for Thread {
             Action::Search => self.prompt = Some(String::new()),
             Action::Compose => self.composing = self.composer.is_some(),
             // Only an agent's thread has activity.
-            Action::Show if self.stream.is_some() && !self.compact => {
+            Action::Show if self.stream.is_some() => {
                 self.show = self.show.next();
                 self.rebuild();
             }
-            Action::ActivityKinds if !self.compact => {
+            Action::ActivityKinds => {
                 if let Some(stream) = &mut self.stream {
                     stream.kinds = stream.kinds.next();
                     self.rebuild();
@@ -1010,9 +1013,7 @@ impl Thread {
         }
         // Calls still running sit below the newest activity while following.
         let running = match &self.stream {
-            Some(stream) if !self.compact && self.show.stream() && self.view.following() => {
-                stream.running()
-            }
+            Some(stream) if self.show.stream() && self.view.following() => stream.running(),
             _ => Vec::new(),
         };
         let height = (running.len() as u16).min(body.height / 3);
@@ -1024,9 +1025,6 @@ impl Thread {
 
     /// Why an activity-only timeline is empty.
     fn empty_activity(&self) -> Option<Line<'static>> {
-        if self.compact {
-            return None;
-        }
         let stream = self.stream.as_ref()?;
         if self.show != Show::Stream || !self.view.rows.is_empty() {
             return None;

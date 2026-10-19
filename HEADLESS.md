@@ -117,7 +117,7 @@ warning and stops sending. On a local board the records go into its database.
 ## Effort control
 
 In an agent conversation, `Tab` increases effort and `Shift-Tab` decreases it in
-both compact/verbose and typing/navigation modes. Only the agent's owner may
+both typing and navigation modes. Only the agent's owner may
 request a change. These keys do not insert indentation there; group conversations,
 search prompts and dialogs keep their existing input behavior.
 

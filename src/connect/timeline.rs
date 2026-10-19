@@ -1,7 +1,7 @@
 //! A thread's timeline: messages and, in an agent's thread, the activity it
 //! shares, drawn as `bbs headless logs --pretty` draws it, in time order.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 use chrono::DateTime;
@@ -28,8 +28,9 @@ const MAX_RECORDS: usize = 5000;
 pub enum Entry {
     Message {
         message: Message,
-        /// Omit message headers in compact conversations.
-        compact: bool,
+        /// Mail between the viewer and the agent omits its header; everyone
+        /// else's keeps it, so the sender stays identified.
+        headerless: bool,
         recipient: Option<proto::Kind>,
         outgoing: bool,
         /// A possible gap in the raw feed before this visible message.
@@ -64,18 +65,18 @@ impl Row for Entry {
         match self {
             Entry::Message {
                 message,
-                compact,
+                headerless,
                 recipient,
                 outgoing,
                 gap: raw_gap,
             } => {
-                let mut lines = if *compact {
+                let mut lines = if *headerless {
                     compact_message_lines(message, gap || *raw_gap, query)
                 } else {
-                    message_lines_with_recipient(message, gap, query, *recipient)
+                    message_lines_with_recipient(message, gap || *raw_gap, query, *recipient)
                 };
                 if *outgoing {
-                    if *compact {
+                    if *headerless {
                         lines.insert(1 + usize::from(gap || *raw_gap), Line::default());
                     }
                     for line in &mut lines {
@@ -100,7 +101,7 @@ impl Row for Entry {
         matches!(
             self,
             Entry::Message {
-                compact: true,
+                headerless: true,
                 outgoing: true,
                 ..
             }
@@ -182,17 +183,11 @@ impl Kinds {
         }
     }
 
-    fn shows(self, record: &str) -> bool {
-        let event = serde_json::from_str::<serde_json::Value>(record)
-            .ok()
-            .and_then(|r| r["event"].as_str().map(str::to_string))
-            .unwrap_or_default();
+    fn shows(self, event: &str) -> bool {
         match self {
             Kinds::All => true,
-            Kinds::NoText => !matches!(event.as_str(), "text" | "thought"),
-            Kinds::Problems => {
-                matches!(event.as_str(), "warning" | "error" | "turn_error" | "stop")
-            }
+            Kinds::NoText => !matches!(event, "text" | "thought"),
+            Kinds::Problems => matches!(event, "warning" | "error" | "turn_error" | "stop"),
         }
     }
 }
@@ -210,6 +205,21 @@ pub struct Stream {
     /// The stream's last error; it has ended until a reload.
     pub error: Option<String>,
     progress: ProgressState,
+    /// Messages that kept records say they delivered or echo, so their
+    /// arrival can redraw those records.
+    referenced: HashSet<i64>,
+}
+
+/// The messages a record names: the owner mail an agent's text was
+/// delivered as (`mail_id`), or the mail a receipt or turn echoes
+/// (`mail_ids`).
+fn mail_refs(record: &serde_json::Value) -> Vec<i64> {
+    let ids = record["mail_ids"].as_array().into_iter().flatten();
+    record["mail_id"]
+        .as_i64()
+        .into_iter()
+        .chain(ids.filter_map(serde_json::Value::as_i64))
+        .collect()
 }
 
 impl Stream {
@@ -223,6 +233,7 @@ impl Stream {
             loaded: false,
             error: None,
             progress: ProgressState::default(),
+            referenced: HashSet::new(),
         }
     }
 
@@ -273,12 +284,32 @@ impl Stream {
         self.records.is_empty()
     }
 
-    /// Draw `record` as an entry, if the kinds shown include it.
-    fn entry(&mut self, record: &proto::Activity) -> Option<Entry> {
-        if !self.kinds.shows(&record.record) {
+    /// Whether a record names any of `ids`, so their arrival redraws it.
+    pub fn references(&self, ids: impl IntoIterator<Item = i64>) -> bool {
+        ids.into_iter().any(|id| self.referenced.contains(&id))
+    }
+
+    /// Draw `record` as an entry, if the kinds shown include it and the
+    /// thread does not already show it as mail (`loaded` message ids). Text
+    /// delivered as owner mail and receipts echoing mail drop out; a turn
+    /// keeps its separator without the echoed mail. Records without these
+    /// ids, as older runners write, always draw.
+    fn entry(&mut self, record: &proto::Activity, loaded: &HashSet<i64>) -> Option<Entry> {
+        let mut value: serde_json::Value = serde_json::from_str(&record.record).unwrap_or_default();
+        let event = value["event"].as_str().unwrap_or_default().to_string();
+        if !self.kinds.shows(&event) {
             return None;
         }
-        let lines = self.renderer.render(&record.record);
+        let refs = mail_refs(&value);
+        let shown = !refs.is_empty() && refs.iter().all(|id| loaded.contains(id));
+        let lines = match event.as_str() {
+            "text" | "mail" | "steer" if shown => return None,
+            "prompt" if shown => {
+                value["text"] = serde_json::Value::Null;
+                self.renderer.render(&value.to_string())
+            }
+            _ => self.renderer.render(&record.record),
+        };
         (!lines.is_empty()).then(|| Entry::Stream {
             id: record.id,
             created_at: record.created_at.clone(),
@@ -286,17 +317,22 @@ impl Stream {
         })
     }
 
-    /// Every record kept, drawn afresh, as after changing the kinds.
-    pub fn entries(&mut self) -> Vec<Entry> {
+    /// Every record kept, drawn afresh, as after changing the kinds or
+    /// loading mail that records name.
+    pub fn entries(&mut self, loaded: &HashSet<i64>) -> Vec<Entry> {
         self.renderer = Activity::new(true).local_time();
         let records = std::mem::take(&mut self.records);
-        let entries = records.iter().filter_map(|r| self.entry(r)).collect();
+        let entries = records
+            .iter()
+            .filter_map(|r| self.entry(r, loaded))
+            .collect();
         self.records = records;
         entries
     }
 
-    /// Take a batch of this stream's data at `now`; returns the new entries.
-    pub fn on_data(&mut self, data: &Data, now: Instant) -> Vec<Entry> {
+    /// Take a batch of this stream's data at `now`, given the thread's
+    /// loaded message ids; returns the new entries.
+    pub fn on_data(&mut self, data: &Data, now: Instant, loaded: &HashSet<i64>) -> Vec<Entry> {
         if let Data::ActivityBaseline {
             id,
             through_id,
@@ -316,10 +352,16 @@ impl Stream {
             Ok(events) => {
                 for event in events {
                     self.progress.observe(event.id, &event.record, now);
+                    if let Ok(value) = serde_json::from_str(&event.record) {
+                        self.referenced.extend(mail_refs(&value));
+                    }
                 }
                 self.loaded = true;
                 self.error = None;
-                let entries = events.iter().filter_map(|e| self.entry(e)).collect();
+                let entries = events
+                    .iter()
+                    .filter_map(|e| self.entry(e, loaded))
+                    .collect();
                 self.records.extend(events.iter().cloned());
                 let over = self.records.len().saturating_sub(MAX_RECORDS);
                 self.records.drain(..over);
@@ -373,20 +415,29 @@ mod tests {
                 record: None,
             },
             now,
+            &HashSet::new(),
         );
-        stream.on_data(&batch(id, 500, "text"), now);
+        stream.on_data(&batch(id, 500, "text"), now, &HashSet::new());
         assert_eq!(stream.progress(now), Progress::Unknown);
         stream.kinds = Kinds::Problems;
-        assert!(stream.on_data(&batch(id, 501, "text"), now).is_empty());
+        assert!(
+            stream
+                .on_data(&batch(id, 501, "text"), now, &HashSet::new())
+                .is_empty()
+        );
         assert_eq!(stream.progress(now), Progress::Progressing(0));
-        stream.entries();
-        stream.on_data(&batch(id, 501, "text"), now + Duration::from_secs(59));
+        stream.entries(&HashSet::new());
+        stream.on_data(
+            &batch(id, 501, "text"),
+            now + Duration::from_secs(59),
+            &HashSet::new(),
+        );
         assert_eq!(
             stream.progress(now + Duration::from_secs(60)),
             Progress::Unknown
         );
         // Recorded completion persists instead of expiring.
-        stream.on_data(&batch(id, 502, "turn_end"), now);
+        stream.on_data(&batch(id, 502, "turn_end"), now, &HashSet::new());
         assert_eq!(stream.progress(now), Progress::Done);
         assert_eq!(
             stream.progress(now + Duration::from_secs(60)),
@@ -401,8 +452,9 @@ mod tests {
                 record: None,
             },
             now,
+            &HashSet::new(),
         );
-        stream.on_data(&batch(id, 503, "text"), now);
+        stream.on_data(&batch(id, 503, "text"), now, &HashSet::new());
         assert_eq!(stream.progress(now), Progress::Unknown);
         let id = stream.id;
         stream.on_data(
@@ -412,8 +464,9 @@ mod tests {
                 record: None,
             },
             now,
+            &HashSet::new(),
         );
-        stream.on_data(&batch(id, 504, "text"), now);
+        stream.on_data(&batch(id, 504, "text"), now, &HashSet::new());
         assert_eq!(stream.progress(now), Progress::Progressing(0));
         stream.on_data(
             &Data::Activity {
@@ -421,6 +474,7 @@ mod tests {
                 result: Err("disconnected".into()),
             },
             now,
+            &HashSet::new(),
         );
         assert_eq!(stream.progress(now), Progress::Unknown);
     }
@@ -452,7 +506,7 @@ mod tests {
                         ..Default::default()
                     },
                     outgoing,
-                    compact,
+                    headerless: compact,
                     gap: false,
                 };
                 let body = "**needle** followed by enough words to wrap across several full rendered rows.\n\n`code` and [link](https://example.com)";

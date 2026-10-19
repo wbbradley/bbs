@@ -20,7 +20,6 @@ const AGENT_KEYS: &[(&str, &str)] = &[
     ("Ctrl-U", "insert: delete to line start; join at column 0"),
     ("Esc", "agent navigation: return to insert mode"),
     ("↑ / ↓", "agent insert: move within the draft"),
-    ("Ctrl-T", "agents: compact/verbose (remembered locally)"),
     (
         "Tab / Shift-Tab",
         "agents: increase / decrease effort; default opens picker",

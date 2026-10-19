@@ -51,8 +51,6 @@ pub enum Transition {
     Quit,
     /// Ask the server for something on the screen's behalf.
     Request(Request),
-    /// Remember the agent conversation view locally for this and future sessions.
-    Compact(bool),
     Effort {
         agent: String,
         value: String,
@@ -288,12 +286,7 @@ impl App {
             return;
         }
         let screen = match &target {
-            Conversation::Agent(agent) => Thread::agent(
-                agent,
-                &self.ctx.me,
-                self.ctx.preferences.compact(),
-                self.ctx.now.clone(),
-            ),
+            Conversation::Agent(agent) => Thread::agent(agent, &self.ctx.me, self.ctx.now.clone()),
             Conversation::Group(group) => Thread::group(group),
         };
         self.open(Box::new(screen), oldest);
@@ -502,7 +495,6 @@ impl App {
                 crate::ui::theme::select(scheme);
                 self.ctx.preferences.set_theme(scheme);
             }
-            Transition::Compact(compact) => self.ctx.preferences.set_compact(compact),
             Transition::Push(screen) => self.push(screen),
             Transition::Pop if self.stack.len() > 1 => self.pop(),
             Transition::Request(request) => self.send(vec![request]),
@@ -1008,7 +1000,7 @@ mod tests {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {
             with_scheme(scheme, || {
-                for compact in [false, true] {
+                {
                     let (mut app, mut rx) = app();
                     let (_, now) = test_clock();
                     app.ctx.now = now;
@@ -1020,9 +1012,6 @@ mod tests {
                             ("Zed", 1, "2026-10-18T12:00:01Z"),
                         ],
                     );
-                    if compact {
-                        ctrl(&mut app, 't');
-                    }
                     for (event, glyph) in
                         [(None, "·"), (Some("text"), "⠋"), (Some("turn_end"), "✓")]
                     {
@@ -1271,11 +1260,6 @@ mod tests {
         });
     }
 
-    /// Whether the bottom row shows verbose mode's A:/E: filter labels.
-    fn verbose_filters(out: &str) -> bool {
-        out.lines().last().is_some_and(|row| row.contains(" A:"))
-    }
-
     fn assert_status_foreground(cell: &ratatui::buffer::Cell, bar: ratatui::style::Style) {
         assert!(
             [theme::Role::Text, theme::Role::Human, theme::Role::Agent]
@@ -1425,7 +1409,7 @@ mod tests {
 
     fn app() -> (App, UnboundedReceiver<Request>) {
         let (tx, mut rx) = unbounded_channel();
-        let mut ctx = Ctx {
+        let ctx = Ctx {
             me: "ada".into(),
             server: "bbs:7777".into(),
             composer_max_height_percent: 20,
@@ -1435,8 +1419,6 @@ mod tests {
             efforts: Default::default(),
             navigation_notice: None,
         };
-        // Most interaction tests exercise an explicitly chosen verbose view.
-        ctx.preferences.set_compact(false);
         let mut app = App::new(ctx, tx);
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -1500,7 +1482,8 @@ mod tests {
                 }));
                 let out = screen(&mut app, 80, 24);
                 assert!(!out.contains("conversation") && !out.contains('░'), "{out}");
-                assert!(out.lines().nth(2).unwrap().contains("body-start"), "{out}");
+                // Mail between the viewer and the agent is headerless.
+                assert!(out.lines().nth(1).unwrap().contains("body-start"), "{out}");
                 let last = out.lines().last().unwrap();
                 assert!(
                     last.starts_with("BBS · Mateo · effort unknown · following"),
@@ -1557,13 +1540,9 @@ mod tests {
         }));
         report_effort(&mut app, effort_report(Some("low")));
         let first_row = |out: &str| out.lines().next().unwrap().to_string();
-        // Every agent mode: the timeline reaches the top row and the bottom
-        // bar starts with the title.
-        let mut seen = Vec::new();
-        for (compact, insert) in [(false, true), (false, false), (true, false), (true, true)] {
-            if verbose_filters(&screen(&mut app, 80, 24)) == compact {
-                press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-            }
+        // Typing and navigation: the timeline reaches the top row and the
+        // bottom bar starts with the title, with no filter labels at defaults.
+        for insert in [true, false, true] {
             if editor_focused(&mut app) != insert {
                 let code = if insert {
                     KeyCode::Esc
@@ -1573,7 +1552,6 @@ mod tests {
                 press(&mut app, code, KeyModifiers::NONE);
             }
             let out = screen(&mut app, 80, 24);
-            assert_eq!(verbose_filters(&out), !compact, "{out}");
             assert_eq!(editor_focused(&mut app), insert, "{out}");
             assert!(
                 !first_row(&out).contains("BBS") && !out.contains('░'),
@@ -1581,12 +1559,18 @@ mod tests {
             );
             let last = out.lines().last().unwrap();
             assert!(last.starts_with("BBS · Mateo · effort low · "), "{last}");
-            for gone in ["conversation", "reported", "Ctrl-T", "bbs:7777", "online"] {
+            for gone in [
+                "conversation",
+                "reported",
+                "Ctrl-T",
+                "A:",
+                "E:",
+                "bbs:7777",
+                "online",
+            ] {
                 assert!(!last.contains(gone), "{gone}: {last}");
             }
-            seen.push((compact, insert));
         }
-        assert_eq!(seen.len(), 4);
         // A pending change reads as one quiet next-turn value, however long
         // its outcome takes.
         app.on_action(Action::EffortUp);
@@ -1598,12 +1582,18 @@ mod tests {
             row.contains("effort low → medium next turn") && !row.contains("unconf"),
             "{row}"
         );
-        // Ctrl-T is still a key, and Help still lists it.
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        // One view: Ctrl-T changes nothing, and Help no longer lists it.
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        let before = screen(&mut app, 80, 24);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(screen(&mut app, 80, 24), before);
+        assert!(rx.try_recv().is_err());
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        }
         key(&mut app, '?');
         let help = screen(&mut app, 80, 60);
-        assert!(help.contains("Ctrl-T"), "{help}");
+        assert!(help.contains("Help") && !help.contains("Ctrl-T"), "{help}");
     }
 
     #[test]
@@ -1704,7 +1694,7 @@ mod tests {
         let committed = bottom(&mut app);
         assert!(committed.contains("0 matches · n/N"), "{committed}");
         assert!(
-            committed.contains("A:all E:no text") && !committed.contains("Ctrl-T"),
+            committed.contains("E:no text") && !committed.contains("A:"),
             "{committed}"
         );
         assert!(unicode_width::UnicodeWidthStr::width(committed.as_str()) <= 80);
@@ -1875,7 +1865,7 @@ mod tests {
             result: Ok(Some(102)),
         }));
         app.open(
-            Box::new(Thread::agent("Mateo", "ada", false, app.ctx.now.clone())),
+            Box::new(Thread::agent("Mateo", "ada", app.ctx.now.clone())),
             true,
         );
         rx.try_recv().unwrap();
@@ -1958,7 +1948,7 @@ mod tests {
             result: Ok(cleared()),
         }));
         app.open(
-            Box::new(Thread::agent("Mateo", "ada", true, app.ctx.now.clone())),
+            Box::new(Thread::agent("Mateo", "ada", app.ctx.now.clone())),
             true,
         );
         while rx.try_recv().is_ok() {}
@@ -1974,12 +1964,9 @@ mod tests {
 
     #[test]
     fn effort_tabs_step_in_both_agent_modes_without_indenting_or_moving_the_draft() {
-        for compact in [false, true] {
+        {
             let (mut app, mut rx) = app();
             mateo_streams(&mut app, &mut rx);
-            if compact {
-                press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-            }
             report_effort(&mut app, effort_report(Some("low")));
             typed(&mut app, "é ab,.");
             press(&mut app, KeyCode::Left, KeyModifiers::NONE);
@@ -2543,7 +2530,8 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("elsewhere"), "{out}");
-        assert!(out.contains("following · A:"), "{out}");
+        // Filter labels stay hidden at their defaults.
+        assert!(out.contains("following") && !out.contains("A:"), "{out}");
         // The search prompt takes every key, q included, until Enter.
         key(&mut app, '/');
         for c in "q needle".chars() {
@@ -3918,7 +3906,10 @@ mod tests {
             ["working on the build", "a request", "reply sent"]
         );
         assert!(out.contains("cargo test running"), "{out}");
-        assert!(out.contains("following · A: all · E: all kinds"), "{out}");
+        assert!(
+            out.contains("following") && !out.contains("A:") && !out.contains("E:"),
+            "{out}"
+        );
         assert!(!editor_focused(&mut app), "{out}");
 
         // A cycles messages only, activity only, then everything again.
@@ -3932,13 +3923,16 @@ mod tests {
         assert!(!out.contains("cargo test running"), "{out}");
         key(&mut app, 'A');
         let out = screen(&mut app, 100, 24);
-        assert!(out.contains("A: activity · E: all kinds"), "{out}");
+        assert!(
+            out.contains("A: activity ·") && !out.contains("E:"),
+            "{out}"
+        );
         assert!(
             !out.contains("a request") && out.contains("reply sent"),
             "{out}"
         );
         key(&mut app, 'A');
-        assert!(screen(&mut app, 100, 24).contains("A: all"));
+        assert!(!screen(&mut app, 100, 24).contains("A:"));
 
         // A reload starts both streams over without the activity it had.
         while rx.try_recv().is_ok() {}
@@ -4179,7 +4173,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_conversations_filter_direct_mail_and_live_arrivals() {
+    fn one_view_shows_every_message_once_headerless_only_between_viewer_and_agent() {
         let (mut app, mut rx) = app();
         let (feed, act) = mateo_streams(&mut app, &mut rx);
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
@@ -4237,44 +4231,37 @@ mod tests {
                 r#"{"event":"warning","message":"activity-body"}"#,
             )]),
         }));
-        let verbose = screen(&mut app, 120, 40);
-        assert!(
-            verbose_filters(&verbose)
-                && verbose.contains("broadcast-body")
-                && verbose.contains("activity-body"),
-            "{verbose}"
-        );
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        let compact = screen(&mut app, 120, 40);
-        assert!(
-            !compact.contains("3 messages") && !verbose_filters(&compact),
-            "{compact}"
-        );
-        for shown in ["direct-one", "outbound-body", "direct-two"] {
-            assert!(compact.contains(shown), "{compact}");
+        // The line above a body: a header names the sender, else none.
+        let above = |out: &str, body: &str| -> String {
+            let lines: Vec<&str> = out.lines().collect();
+            let i = lines
+                .iter()
+                .position(|l| l.contains(body))
+                .unwrap_or_else(|| panic!("{body}: {out}"));
+            i.checked_sub(1)
+                .map_or(String::new(), |j| lines[j].to_string())
+        };
+        let out = screen(&mut app, 120, 40);
+        for body in ["direct-one", "outbound-body", "direct-two"] {
+            assert_eq!(out.matches(body).count(), 1, "{body}: {out}");
+            assert!(!above(&out, body).contains('→'), "{body}: {out}");
         }
-        for hidden in [
-            "to-agent-body",
-            "other-human-body",
-            "broadcast-body",
-            "other-human-outbound",
-            "agent-named-human",
-            "outbound-other-agent",
-            "other-agent-body",
-            "human-sender-body",
-            "owned-recipient-body",
-            "activity-body",
-            "→",
-            "unread",
-            "**",
+        for (body, header) in [
+            ("to-agent-body", "Mateo → Zed"),
+            ("other-human-body", "Mateo → Ben"),
+            ("broadcast-body", "Mateo → @crew"),
+            ("other-human-outbound", "Ben → Mateo"),
+            ("agent-named-human", "ada → Mateo"),
+            ("outbound-other-agent", "ada → Zed"),
+            ("other-agent-body", "Zed → ada"),
+            ("human-sender-body", "Mateo → ada"),
+            ("owned-recipient-body", "Mateo → ada"),
         ] {
-            assert!(!compact.contains(hidden), "{hidden}: {compact}");
+            assert_eq!(out.matches(body).count(), 1, "{body}: {out}");
+            assert!(above(&out, body).contains(header), "{body}: {out}");
         }
-        assert_eq!(
-            order(&compact, &["direct-one", "outbound-body", "direct-two"]),
-            ["direct-one", "outbound-body", "direct-two"]
-        );
-        assert!(!compact.contains("2026-10-16"), "{compact}");
+        assert!(out.contains("activity-body"), "{out}");
+        assert!(!out.contains("**"), "{out}");
         app.on_event(Event::Data(Data::Feed {
             id: feed,
             result: Ok(vec![
@@ -4282,7 +4269,7 @@ mod tests {
                     created_at: "2026-10-16T18:00:04Z".into(),
                     ..message(13, "Mateo", "ada", "live-direct")
                 },
-                message(14, "Mateo", "Ben", "live-hidden"),
+                message(14, "Mateo", "Ben", "live-other"),
                 proto::Message {
                     from_kind: proto::Kind::Human.into(),
                     created_at: "2026-10-16T18:00:03Z".into(),
@@ -4290,24 +4277,12 @@ mod tests {
                 },
             ]),
         }));
-        let compact = screen(&mut app, 120, 40);
-        assert!(
-            !compact.contains("5 messages")
-                && compact.contains("live-direct")
-                && !compact.contains("live-hidden"),
-            "{compact}"
-        );
+        let out = screen(&mut app, 120, 40);
+        assert!(!above(&out, "live-direct").contains('→'), "{out}");
+        assert!(above(&out, "live-other").contains("Mateo → Ben"), "{out}");
         assert_eq!(
-            order(&compact, &["direct-two", "live-outbound", "live-direct"]),
+            order(&out, &["direct-two", "live-outbound", "live-direct"]),
             ["direct-two", "live-outbound", "live-direct"]
-        );
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        let verbose = screen(&mut app, 120, 40);
-        assert!(
-            verbose.contains("live-hidden")
-                && verbose.contains("activity-body")
-                && verbose.contains("→"),
-            "{verbose}"
         );
     }
 
@@ -4327,7 +4302,7 @@ mod tests {
             rx.try_recv().is_err(),
             "outgoing mail must not mark mail read or activity seen"
         );
-        let assert_background = |app: &mut App, shaded: bool, compact: bool| {
+        let assert_background = |app: &mut App, shaded: bool, headerless: bool| {
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
             terminal.draw(|f| app.draw(f)).unwrap();
             let buffer = terminal.backend().buffer();
@@ -4360,7 +4335,7 @@ mod tests {
                 for padding in [y - 2, y + 1] {
                     assert!((area.left()..area.right()).all(|x| {
                         buffer[(x, padding)].bg
-                            == theme::style(if compact && padding < y {
+                            == theme::style(if headerless && padding < y {
                                 theme::Role::Screen
                             } else {
                                 theme::Role::HumanSurface
@@ -4370,7 +4345,7 @@ mod tests {
                             && buffer[(x, padding)].symbol() == " "
                     }));
                 }
-                if compact {
+                if headerless {
                     assert!((area.left()..area.right()).all(|x| {
                         buffer[(x, y - 1)].bg
                             == theme::base()
@@ -4382,8 +4357,8 @@ mod tests {
                 }
             }
         };
-        assert_background(&mut app, true, false);
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        // Mail between the viewer and the agent is headerless, with the
+        // separator and padding rows around it.
         assert_background(&mut app, true, true);
         assert!(rx.try_recv().is_err());
         // Leave Insert mode, then close the conversation and open the board feed.
@@ -4401,163 +4376,127 @@ mod tests {
     }
 
     #[test]
-    fn conversation_preference_defaults_to_compact_and_is_shared_and_reloaded() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("connect.json");
-        let (mut first_app, mut rx) = app();
-        first_app.ctx.preferences = Preferences::load(path.clone()).unwrap();
-        open_agents(&mut first_app, &mut rx);
-        first_app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
-            humans: Vec::new(),
-            agents: vec![agent("Mateo", "ada", &[]), agent("Zed", "ada", &[])],
-        }))));
-        reopen(&mut first_app, &mut rx);
-        assert!(!verbose_filters(&screen(&mut first_app, 120, 24)));
-        typed(&mut first_app, "draft");
-        press(&mut first_app, KeyCode::Left, KeyModifiers::NONE);
-        press(&mut first_app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(!Preferences::load(path.clone()).unwrap().compact());
-        close_conversation(&mut first_app, &mut rx);
-        key(&mut first_app, 'j');
-        reopen(&mut first_app, &mut rx);
-        assert!(verbose_filters(&screen(&mut first_app, 120, 24)));
-        press(&mut first_app, KeyCode::PageUp, KeyModifiers::NONE);
-        press(&mut first_app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(!editor_focused(&mut first_app));
-        assert!(Preferences::load(path.clone()).unwrap().compact());
-        press(&mut first_app, KeyCode::Esc, KeyModifiers::NONE);
-        close_conversation(&mut first_app, &mut rx);
-        key(&mut first_app, 'k');
-        reopen(&mut first_app, &mut rx);
-        assert!(!verbose_filters(&screen(&mut first_app, 120, 24)));
-        typed(&mut first_app, "X");
-        enter(&mut first_app);
-        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
-            panic!("expected send");
+    fn delivered_text_and_owner_mail_echoes_show_once_in_either_arrival_order() {
+        // ada asks (mail 10); the turn echoes it; Mateo's answer is delivered
+        // as owner mail 11 and its text record names it.
+        let mail = || {
+            vec![
+                proto::Message {
+                    from_kind: proto::Kind::Human.into(),
+                    ..at(10, "01", "ada", "Mateo", "please build")
+                },
+                at(11, "05", "Mateo", "ada", "built it"),
+            ]
         };
-        assert_eq!(req.body, "drafXt");
-
-        // A new app invocation inherits the saved global preference.
-        for compact in [true, false] {
-            let mut preferences = Preferences::load(path.clone()).unwrap();
-            preferences.set_compact(compact);
-            let (mut next_app, mut next_rx) = app();
-            next_app.ctx.preferences = Preferences::load(path.clone()).unwrap();
-            mateo(&mut next_app, &mut next_rx);
-            let out = screen(&mut next_app, 120, 24);
-            assert_eq!(verbose_filters(&out), !compact, "{out}");
+        let records = || {
+            vec![
+                activity(
+                    1,
+                    "02",
+                    r#"{"ts":"2026-10-16T18:00:02Z","event":"mail","from":["ada"],"mail_ids":[10]}"#,
+                ),
+                activity(
+                    2,
+                    "03",
+                    r#"{"ts":"2026-10-16T18:00:03Z","event":"prompt","text":"You are Mateo.\n\nNew BBS mail (1 message):\n\n[2026-10-16T18:00:01Z] from ada (human) to Mateo:\nplease build\n","mail_ids":[10]}"#,
+                ),
+                activity(
+                    3,
+                    "04",
+                    r#"{"ts":"2026-10-16T18:00:04Z","event":"tool","id":"t","title":"cargo build","status":"completed"}"#,
+                ),
+                activity(
+                    4,
+                    "05",
+                    r#"{"ts":"2026-10-16T18:00:05Z","event":"text","text":"built it","mail_id":11}"#,
+                ),
+            ]
+        };
+        let once = |out: &str| {
+            for body in ["please build", "built it"] {
+                assert_eq!(out.matches(body).count(), 1, "{body}: {out}");
+            }
+            assert!(out.contains("turn") && out.contains("cargo build"), "{out}");
+            assert!(!out.contains("mail from ada"), "{out}");
+        };
+        for mail_first in [true, false] {
+            let (mut app, mut rx) = app();
+            let (feed, act) = mateo_streams(&mut app, &mut rx);
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+            let feed = Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(mail()),
+            });
+            let activity = Event::Data(Data::Activity {
+                id: act,
+                result: Ok(records()),
+            });
+            if mail_first {
+                app.on_event(feed);
+                app.on_event(activity);
+            } else {
+                // Before the mail loads, the activity stands in for it.
+                app.on_event(activity);
+                let out = screen(&mut app, 100, 40);
+                assert!(
+                    out.contains("please build")
+                        && out.contains("built it")
+                        && out.contains("mail from ada"),
+                    "{out}"
+                );
+                // One feed event settles it, and a paused reader stays paused.
+                press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+                assert!(bottom(&mut app).contains("paused"));
+                app.on_event(feed);
+                assert!(bottom(&mut app).contains("paused"));
+            }
+            once(&screen(&mut app, 100, 40));
         }
-    }
 
-    #[test]
-    fn preference_save_errors_are_visible_without_losing_the_view_or_draft() {
-        let dir = tempfile::tempdir().unwrap();
-        let parent = dir.path().join("state");
-        let (mut app, mut rx) = app();
-        app.ctx.preferences = Preferences::load(parent.join("connect.json")).unwrap();
-        std::fs::write(&parent, "blocked").unwrap();
-        mateo(&mut app, &mut rx);
-        typed(&mut app, "draft");
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        let out = screen(&mut app, 80, 24);
-        assert!(
-            out.contains("Cannot save view preference")
-                && out.contains("draft")
-                && editor_focused(&mut app),
-            "{out}"
-        );
-        assert!(!app.ctx.preferences.compact());
-        std::fs::remove_file(&parent).unwrap();
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(!screen(&mut app, 80, 24).contains("Cannot save view preference"));
-    }
-
-    #[test]
-    fn compact_keeps_verbose_filters_while_marking_hidden_activity_seen() {
+        // Older runners' records, a partly loaded echo, undelivered text and
+        // another human's mail all stay visible.
         let (mut app, mut rx) = app();
         let (feed, act) = mateo_streams(&mut app, &mut rx);
-        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
-        key(&mut app, 'A');
-        key(&mut app, 'A');
-        key(&mut app, 'E');
         app.on_event(Event::Data(Data::Feed {
             id: feed,
-            result: Ok(vec![message(1, "Mateo", "ada", "visible-direct")]),
+            result: Ok(vec![
+                proto::Message {
+                    from_kind: proto::Kind::Human.into(),
+                    ..at(10, "01", "ada", "Mateo", "please build")
+                },
+                proto::Message {
+                    from_kind: proto::Kind::Human.into(),
+                    ..at(20, "06", "Ben", "Mateo", "from ben")
+                },
+            ]),
         }));
-        assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("Mateo".into()));
-        app.on_event(Event::Data(Data::Feed {
-            id: feed,
-            result: Ok(vec![proto::Message {
-                read_at: Some("2026-10-16T18:00:01Z".into()),
-                ..message(1, "Mateo", "ada", "visible-direct")
-            }]),
-        }));
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         app.on_event(Event::Data(Data::Activity {
             id: act,
             result: Ok(vec![
-                activity(7, "01", r#"{"event":"text","text":"filtered-text"}"#),
-                activity(8, "02", r#"{"event":"warning","message":"hidden-warning"}"#),
+                activity(1, "02", r#"{"ts":"2026-10-16T18:00:02Z","event":"text","text":"legacy words"}"#),
+                activity(2, "03", r#"{"ts":"2026-10-16T18:00:03Z","event":"prompt","text":"New BBS mail (2 messages):\n\npartial echo\n","mail_ids":[10,99]}"#),
+                activity(3, "04", r#"{"ts":"2026-10-16T18:00:04Z","event":"steer","text":"New BBS mail (1 message):\n\nsteered echo\n","mail_ids":[10]}"#),
+                activity(4, "05", r#"{"ts":"2026-10-16T18:00:05Z","event":"text","text":"undelivered words","mail_id":12}"#),
             ]),
         }));
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            Request::MarkSeen {
-                agent: "Mateo".into(),
-                through_id: 8
-            }
-        );
-        key(&mut app, 'A');
-        key(&mut app, 'E');
-        let out = screen(&mut app, 120, 24);
+        let out = screen(&mut app, 100, 40);
+        for shown in [
+            "legacy words",
+            "partial echo",
+            "undelivered words",
+            "Ben → Mateo",
+        ] {
+            assert!(out.contains(shown), "{shown}: {out}");
+        }
         assert!(
-            out.contains("visible-direct")
-                && !out.contains("hidden-warning")
-                && !out.contains("filtered-text"),
+            !out.contains("steered echo") && !out.contains("steered into"),
             "{out}"
         );
-        assert!(rx.try_recv().is_err());
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        let out = screen(&mut app, 120, 24);
-        assert!(
-            out.contains("A: activity · E: no text") && out.contains("hidden-warning"),
-            "{out}"
-        );
-        assert!(
-            !out.contains("visible-direct") && !out.contains("filtered-text"),
-            "{out}"
-        );
-        assert!(rx.try_recv().is_err(), "toggling does not re-mark activity");
     }
 
     #[test]
-    fn compact_toggle_preserves_navigation_focus_and_composer_cursor() {
-        let (mut app, mut rx) = app();
-        mateo(&mut app, &mut rx);
-        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        let out = screen(&mut app, 120, 24);
-        assert!(!editor_focused(&mut app) && !verbose_filters(&out), "{out}");
-        key(&mut app, 'i');
-        typed(&mut app, "hello");
-        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
-        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(editor_focused(&mut app));
-        typed(&mut app, "X");
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(editor_focused(&mut app));
-        typed(&mut app, "Y");
-        enter(&mut app);
-        let Request::Send { req, .. } = rx.try_recv().unwrap() else {
-            panic!("expected send");
-        };
-        assert_eq!(req.body, "helXYlo");
-    }
-
-    #[test]
-    fn compact_feed_keeps_raw_gap_warnings_through_filtering_and_toggles() {
-        for all_hidden in [true, false] {
+    fn raw_feed_gaps_show_one_warning_and_overlaps_none() {
+        {
             let (mut app, mut rx) = app();
             let (feed, _) = mateo_streams(&mut app, &mut rx);
             press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
@@ -4565,38 +4504,20 @@ mod tests {
                 id: feed,
                 result: Ok(vec![message(1, "Mateo", "ada", "before-gap")]),
             }));
-            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-            // A burst pushed a visible DM out of the raw 200-message window.
+            // A burst pushed messages out of the raw 200-message window.
             let snapshot = (201..=400)
                 .map(|id| {
-                    message(
-                        id,
-                        "Mateo",
-                        if !all_hidden && id == 400 {
-                            "ada"
-                        } else {
-                            "Ben"
-                        },
-                        if id == 400 { "after-gap" } else { "hidden" },
-                    )
+                    let body = if id == 201 { "after-gap" } else { "burst" };
+                    message(id, "Mateo", if id == 400 { "ada" } else { "Ben" }, body)
                 })
                 .collect();
             app.on_event(Event::Data(Data::Feed {
                 id: feed,
                 result: Ok(snapshot),
             }));
-            if all_hidden {
-                assert!(!screen(&mut app, 120, 30).contains("messages may be missing"));
-                // A later visible arrival still carries the raw gap boundary.
-                app.on_event(Event::Data(Data::Feed {
-                    id: feed,
-                    result: Ok(vec![proto::Message {
-                        from_kind: proto::Kind::Human.into(),
-                        ..message(401, "ada", "Mateo", "after-gap")
-                    }]),
-                }));
-            }
-            let out = screen(&mut app, 120, 30);
+            // Tall enough for the whole history: the warning sits between
+            // the two sides of the gap.
+            let out = screen(&mut app, 120, 700);
             assert_eq!(
                 order(
                     &out,
@@ -4605,9 +4526,6 @@ mod tests {
                 ["before-gap", "messages may be missing", "after-gap"],
                 "{out}"
             );
-            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-            let out = screen(&mut app, 120, 30);
             assert_eq!(out.matches("messages may be missing").count(), 1, "{out}");
         }
         let (mut app, mut rx) = app();
@@ -4616,77 +4534,19 @@ mod tests {
         app.on_event(Event::Data(Data::Feed {
             id: feed,
             result: Ok((1..200)
-                .map(|id| {
-                    message(
-                        id,
-                        "Mateo",
-                        if id == 1 { "ada" } else { "Ben" },
-                        "already received",
-                    )
-                })
+                .map(|id| message(id, "Mateo", "Ben", "already received"))
                 .collect()),
         }));
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        // This full raw window overlaps previously held hidden messages.
+        // This full raw window overlaps previously held messages.
         app.on_event(Event::Data(Data::Feed {
             id: feed,
             result: Ok((2..=201)
-                .map(|id| {
-                    message(
-                        id,
-                        "Mateo",
-                        if id == 201 { "ada" } else { "Ben" },
-                        "new arrival",
-                    )
-                })
+                .map(|id| message(id, "Mateo", "Ben", "new arrival"))
                 .collect()),
         }));
         let out = screen(&mut app, 120, 30);
         assert!(
             out.contains("new arrival") && !out.contains("messages may be missing"),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn compact_toggle_is_only_for_agent_conversations() {
-        let (mut app, mut rx) = app();
-        crew_list(&mut app, &mut rx);
-        enter(&mut app);
-        let (group, _) = watched(&mut rx);
-        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
-        let broadcast = proto::Message {
-            to_name: None,
-            to_group: Some("crew".into()),
-            ..message(1, "Mateo", "", "broadcast remains")
-        };
-        app.on_event(Event::Data(Data::Feed {
-            id: group,
-            result: Ok(vec![broadcast.clone()]),
-        }));
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        let out = screen(&mut app, 100, 24);
-        assert!(
-            out.contains("broadcast remains")
-                && out.contains("→ @crew")
-                && !out.contains("Ctrl-T:"),
-            "{out}"
-        );
-        key(&mut app, 'q');
-        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(group));
-        key(&mut app, 'q');
-        key(&mut app, 'f');
-        let (feed, _) = watched(&mut rx);
-        app.on_event(Event::Data(Data::Feed {
-            id: feed,
-            result: Ok(vec![broadcast]),
-        }));
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        let out = screen(&mut app, 100, 24);
-        assert!(
-            out.contains("broadcast remains")
-                && out.contains("→ @crew")
-                && !out.contains("Ctrl-T:"),
             "{out}"
         );
     }
@@ -4750,7 +4610,7 @@ mod tests {
             ]),
         }));
         let out = screen(&mut app, 100, 24);
-        assert!(out.contains("E: all kinds"), "{out}");
+        assert!(!out.contains("E:"), "{out}");
         assert!(
             out.contains("pondering") && out.contains("mail from Zed"),
             "{out}"
@@ -4805,11 +4665,8 @@ mod tests {
 
     #[test]
     fn active_conversations_mark_mail_and_activity_in_every_view_and_filter() {
-        for (compact, show_steps, kind_steps) in
-            [(true, 0, 0), (false, 1, 0), (false, 2, 1), (false, 0, 2)]
-        {
+        for (show_steps, kind_steps) in [(0, 0), (1, 0), (2, 1), (0, 2)] {
             let (mut app, mut rx) = app();
-            app.ctx.preferences.set_compact(compact);
             let (feed, act) = mateo_streams(&mut app, &mut rx);
             press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
             for _ in 0..show_steps {

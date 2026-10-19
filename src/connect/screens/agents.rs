@@ -160,12 +160,9 @@ impl Screen for Agents {
             Action::Open => {
                 let shown = self.shown(ctx);
                 match self.state.selected().and_then(|i| shown.get(i)) {
-                    Some(a) => Transition::Push(Box::new(Thread::agent(
-                        &a.name,
-                        &ctx.me,
-                        ctx.preferences.compact(),
-                        ctx.now.clone(),
-                    ))),
+                    Some(a) => {
+                        Transition::Push(Box::new(Thread::agent(&a.name, &ctx.me, ctx.now.clone())))
+                    }
                     None => Transition::Stay,
                 }
             }
