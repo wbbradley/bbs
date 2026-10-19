@@ -56,7 +56,12 @@ impl Entry {
 /// take one blank line first: `prev` is no tool call and does not already
 /// end with a blank line.
 pub fn starts_tool_run(prev: Option<&Entry>) -> bool {
-    prev.is_none_or(|p| !p.is_tool() && p.lines(false, None).last().is_none_or(|l| l.width() > 0))
+    let blank = |line: &Line| {
+        line.spans
+            .iter()
+            .all(|s| s.content.chars().all(char::is_whitespace))
+    };
+    prev.is_none_or(|p| !p.is_tool() && p.lines(false, None).last().is_none_or(|l| !blank(l)))
 }
 
 /// Microseconds since the epoch, so rows from the two sources interleave.
@@ -473,6 +478,9 @@ mod tests {
         // A row already ending with a blank line lends it to the run.
         let blank_after = stream(false, vec![Line::raw("text"), Line::default()]);
         assert!(!starts_tool_run(Some(&blank_after)));
+        // Whitespace-only is visibly blank too, though it has width.
+        let spaces = stream(false, vec![Line::raw("text"), Line::raw("   ")]);
+        assert!(!starts_tool_run(Some(&spaces)));
         let tool = stream(true, vec![Line::raw("✓ b")]);
         assert!(tool.spaced_after(None) && !tool.spaced_after(Some(&tool.clone())));
         assert!(!stream(false, vec![Line::raw("text")]).spaced_after(None));
