@@ -4288,6 +4288,127 @@ mod tests {
     }
 
     #[test]
+    fn other_participants_have_a_distinct_surface_only_in_agent_conversations() {
+        use crate::ui::theme::{Scheme, select, testing::with_scheme};
+        with_scheme(Scheme::Gruvbox, || {
+            let (mut app, mut rx) = app();
+            let (feed, _) = mateo_streams(&mut app, &mut rx);
+            let other = proto::Message {
+                from_owner: Some("ada".into()),
+                to_owner: Some("ada".into()),
+                ..message(
+                    1,
+                    "Zed",
+                    "Mateo",
+                    &format!("other-body {} tail-end", "wrapped text ".repeat(14)),
+                )
+            };
+            let messages = vec![
+                other,
+                message(2, "Mateo", "ADA", "incoming-body"),
+                proto::Message {
+                    from_kind: proto::Kind::Human.into(),
+                    ..message(3, "ADA", "Mateo", "outgoing-body")
+                },
+                proto::Message {
+                    to_owner: Some("someone".into()),
+                    ..message(4, "Mateo", "ada", "agent-named-viewer")
+                },
+                proto::Message {
+                    from_kind: proto::Kind::Human.into(),
+                    to_group: Some("crew".into()),
+                    to_name: None,
+                    ..message(5, "ada", "", "viewer-group-post")
+                },
+                proto::Message {
+                    to_group: Some("crew".into()),
+                    to_name: None,
+                    ..message(6, "Mateo", "", "agent-group-post")
+                },
+            ];
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(messages.clone()),
+            }));
+            let check = |app: &mut App, conversation: bool| {
+                let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let buffer = terminal.backend().buffer();
+                crate::ui::theme::testing::assert_buffer(buffer);
+                let row = |text: &str| {
+                    (0..40)
+                        .find(|&y| {
+                            (0..80)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                                .contains(text)
+                        })
+                        .unwrap_or_else(|| panic!("missing {text}"))
+                };
+                let base = theme::base();
+                let other = base.patch(theme::style(theme::Role::OtherConversation));
+                if crate::ui::theme::current() != Scheme::NoColor {
+                    assert_ne!(other.bg, base.bg);
+                    assert_ne!(other.bg, theme::style(theme::Role::HumanSurface).bg);
+                }
+                for (text, role) in [
+                    ("other-body", theme::Role::OtherConversation),
+                    ("tail-end", theme::Role::OtherConversation),
+                    ("incoming-body", theme::Role::Screen),
+                    ("outgoing-body", theme::Role::HumanSurface),
+                    ("agent-named-viewer", theme::Role::OtherConversation),
+                    ("viewer-group-post", theme::Role::Screen),
+                    ("agent-group-post", theme::Role::OtherConversation),
+                ] {
+                    let y = row(text);
+                    let expected = base.patch(theme::style(if conversation {
+                        role
+                    } else {
+                        theme::Role::Screen
+                    }));
+                    assert!(
+                        (0..80).all(|x| buffer[(x, y)].bg == expected.bg.unwrap()),
+                        "{text}"
+                    );
+                }
+                // Header and every wrapped body line share the surface; the
+                // leading separator remains the ordinary screen background.
+                let first = row("other-body");
+                let last = row("tail-end");
+                assert!(last > first);
+                for y in first - 1..=last {
+                    assert!((0..80).all(|x| buffer[(x, y)].bg
+                        == if conversation {
+                            other.bg.unwrap()
+                        } else {
+                            base.bg.unwrap()
+                        }));
+                }
+                assert!((0..80).all(|x| buffer[(x, first - 2)].bg == base.bg.unwrap()));
+            };
+            // Restyle the same loaded messages, without changing their data.
+            for scheme in Scheme::ALL {
+                select(scheme);
+                check(&mut app, true);
+            }
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            while rx.try_recv().is_ok() {}
+            key(&mut app, 'q');
+            while rx.try_recv().is_ok() {}
+            key(&mut app, 'f');
+            let (feed, _) = watched(&mut rx);
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(messages),
+            }));
+            for scheme in Scheme::ALL {
+                select(scheme);
+                check(&mut app, false);
+            }
+        });
+    }
+
+    #[test]
     fn outgoing_mail_is_shaded_only_in_agent_conversations_and_stays_unread() {
         let (mut app, mut rx) = app();
         let (feed, _) = mateo_streams(&mut app, &mut rx);

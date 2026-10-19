@@ -33,6 +33,8 @@ pub enum Entry {
         headerless: bool,
         recipient: Option<proto::Kind>,
         outgoing: bool,
+        /// Mail not from or to the viewer, only in an agent conversation.
+        other_participants: bool,
         /// A possible gap in the raw feed before this visible message.
         gap: bool,
     },
@@ -107,6 +109,7 @@ impl Row for Entry {
                 recipient,
                 outgoing,
                 gap: raw_gap,
+                ..
             } => {
                 let mut lines = if *headerless {
                     compact_message_lines(message, gap || *raw_gap, query)
@@ -131,6 +134,10 @@ impl Row for Entry {
     fn style(&self) -> Style {
         match self {
             Entry::Message { outgoing: true, .. } => theme::style(theme::Role::HumanSurface),
+            Entry::Message {
+                other_participants: true,
+                ..
+            } => theme::style(theme::Role::OtherConversation),
             _ => Style::default(),
         }
     }
@@ -139,6 +146,9 @@ impl Row for Entry {
         matches!(
             self,
             Entry::Message {
+                other_participants: true,
+                ..
+            } | Entry::Message {
                 headerless: true,
                 outgoing: true,
                 ..
@@ -694,6 +704,7 @@ mod tests {
                         ..Default::default()
                     },
                     outgoing,
+                    other_participants: false,
                     headerless: compact,
                     gap: false,
                 };

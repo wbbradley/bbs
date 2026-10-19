@@ -188,10 +188,26 @@ impl Thread {
                     None
                 },
                 outgoing: self.direct_from_human(&m),
+                other_participants: self.other_participants(&m),
                 gap: self.message_gaps.contains(&m.id),
                 message: m,
             })
             .collect()
+    }
+
+    fn other_participants(&self, message: &Message) -> bool {
+        self.agent.is_some()
+            && self.human.as_ref().is_some_and(|human| {
+                let from_viewer = message.from_kind() == proto::Kind::Human
+                    && message.from_name.eq_ignore_ascii_case(human);
+                let to_viewer = message.to_group.is_none()
+                    && message.to_owner.is_none()
+                    && message
+                        .to_name
+                        .as_ref()
+                        .is_some_and(|to| to.eq_ignore_ascii_case(human));
+                !from_viewer && !to_viewer
+            })
     }
 
     fn direct_to_human(&self, message: &Message) -> bool {

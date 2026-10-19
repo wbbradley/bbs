@@ -10,6 +10,8 @@ under the new package version and its publication date.
 
 ### Changed
 
+- Agent conversations give mail not from or to the viewing human a subtle
+  themed background across its header and body, retaining attribution.
 - The `bbs connect` Agents list puts agents a human has talked with in order
   of their latest direct message with a human, oldest first, instead of newest
   first. Ties and agents no human has talked with keep the earlier order.

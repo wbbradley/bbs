@@ -16,6 +16,8 @@ pub enum Role {
     Heading,
     Accent,
     HumanSurface,
+    /// Conversation mail between participants other than the viewing human.
+    OtherConversation,
     Agent,
     Human,
     Group,
@@ -177,6 +179,11 @@ impl Scheme {
             Screen => Style::new().fg(text).bg(bg),
             Text => Style::new().fg(text),
             HumanSurface => Style::new().fg(text).bg(surface),
+            OtherConversation => Style::new().fg(text).bg(match self {
+                Self::Gruvbox => Color::Rgb(44, 54, 52),
+                Self::Terminal => Color::Indexed(235),
+                Self::NoColor => unreachable!(),
+            }),
             Muted | Timestamp => Style::new().fg(muted),
             Technical | Tool => Style::new().fg(technical),
             Heading => Style::new().fg(accent).bold(),
@@ -217,6 +224,7 @@ mod tests {
                     for surface in [
                         Role::Screen,
                         Role::HumanSurface,
+                        Role::OtherConversation,
                         Role::Selection,
                         Role::TitleBar,
                         Role::StatusBar,
@@ -345,6 +353,7 @@ pub(crate) mod testing {
             Heading,
             Accent,
             HumanSurface,
+            OtherConversation,
             Agent,
             Human,
             Group,
