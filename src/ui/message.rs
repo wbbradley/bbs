@@ -34,7 +34,12 @@ pub fn side_message_lines<'a>(
     query: Option<&str>,
     recipient: Option<Kind>,
 ) -> Vec<Line<'a>> {
-    let mut spans = highlight_names(name_spans(&row.from_name, None, row.from_kind()), query);
+    let sender = if row.from_kind() == Kind::Unspecified && row.from_owner.is_some() {
+        Kind::Agent
+    } else {
+        row.from_kind()
+    };
+    let mut spans = highlight_names(name_spans(&row.from_name, None, sender), query);
     spans.push(Span::styled(" → ", style(Role::Muted)));
     match (&row.to_group, row.to_name.as_deref()) {
         (Some(group), _) => spans.extend(highlight_names(
@@ -336,6 +341,42 @@ pub fn age(stored: &str, now: DateTime<Local>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn side_headers_hide_owner_labels_without_losing_identity_styles() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let mut row = Message {
+                    from_name: "Tim".into(),
+                    from_owner: Some("ada".into()),
+                    to_name: Some("Theo".into()),
+                    to_owner: Some("ada".into()),
+                    body: "2026-10-19 Tim@ada remains in the body".into(),
+                    ..Default::default()
+                };
+                let lines = side_message_lines(&row, false, Some("tim"), None);
+                assert_eq!(lines[1].to_string(), "Tim → Theo");
+                assert_eq!(lines[1].spans[0].style.fg, style(Role::Agent).fg);
+                assert!(
+                    lines[1].spans[0]
+                        .style
+                        .add_modifier
+                        .contains(Modifier::REVERSED)
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.to_string().contains("2026-10-19 Tim@ada"))
+                );
+                row.to_group = Some("crew".into());
+                assert_eq!(
+                    side_message_lines(&row, false, None, None)[1].to_string(),
+                    "Tim → @crew"
+                );
+            });
+        }
+    }
 
     #[test]
     fn typed_names_and_qualified_search_keep_their_categories() {
