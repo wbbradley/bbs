@@ -48,12 +48,18 @@ pub enum Entry {
         /// A finished tool call, kept whole and drawn as one line fitted to
         /// the width; runs of these sit together after one blank.
         call: Option<ToolLine>,
+        /// Reasoning rows form tight groups with a blank line above.
+        thought: bool,
     },
 }
 
 impl Entry {
     fn is_tool(&self) -> bool {
         matches!(self, Entry::Stream { call: Some(_), .. })
+    }
+
+    fn is_thought(&self) -> bool {
+        matches!(self, Entry::Stream { thought: true, .. })
     }
 }
 
@@ -73,11 +79,14 @@ fn starts_blank(e: &Entry) -> bool {
 }
 
 /// Whether one blank line goes between `prev` and `next` (none: the top or
-/// the bottom): a run of tool calls starts or ends there, and neither side
-/// already shows a blank line at that boundary. Calls within a run are tight.
+/// the bottom): tool runs get both boundaries, reasoning groups only the
+/// opening boundary. Reuse existing blanks and keep each group's rows tight.
 pub fn needs_gap(prev: Option<&Entry>, next: Option<&Entry>) -> bool {
     let tool = |e: Option<&Entry>| e.is_some_and(Entry::is_tool);
-    tool(prev) != tool(next) && !prev.is_some_and(ends_blank) && !next.is_some_and(starts_blank)
+    let opens_thought = next.is_some_and(Entry::is_thought) && !prev.is_some_and(Entry::is_thought);
+    (tool(prev) != tool(next) || opens_thought)
+        && !prev.is_some_and(ends_blank)
+        && !next.is_some_and(starts_blank)
 }
 
 /// Whether tool calls drawn after `prev` (none: the top) open a run, and so
@@ -171,8 +180,8 @@ impl Row for Entry {
         }
     }
 
-    /// One blank line above and below each run of tool calls, edges
-    /// included, unless one is already there; none within a run.
+    /// One blank above reasoning groups, and above and below tool runs;
+    /// reuse existing blanks and keep consecutive rows in each group tight.
     fn spaced_after(&self, prev: Option<&Self>) -> bool {
         needs_gap(prev, Some(self))
     }
@@ -440,6 +449,7 @@ impl Stream {
             created_at: record.created_at.clone(),
             lines,
             call: self.renderer.take_tool(),
+            thought: event == "thought",
         })
     }
 
@@ -673,6 +683,7 @@ mod tests {
             created_at: "2026-10-16T18:00:00Z".into(),
             lines,
             call: tool.then(|| ToolLine::running("a")),
+            thought: false,
         };
         let call = row(true, vec![Line::raw("✓ a")]);
         let text = row(false, vec![Line::raw("text")]);
@@ -696,6 +707,103 @@ mod tests {
         assert!(opens_run(None) && opens_run(Some(&text)) && !opens_run(Some(&call)));
         assert!(call.spaced_after(None) && call.spaced_last());
         assert!(!call.spaced_after(Some(&call)) && text.spaced_after(Some(&call)));
+    }
+
+    #[test]
+    fn reasoning_groups_get_one_blank_above_in_visible_time_order() {
+        let mut stream = Stream::new("Mateo");
+        let make = |stream: &mut Stream, id, event: &str, text: &str| {
+            stream
+                .entry(
+                    &Kept::new(&proto::Activity {
+                        id,
+                        created_at: "2026-10-19T18:00:00Z".into(),
+                        record: serde_json::json!({"event":event,"text":text}).to_string(),
+                        ..Default::default()
+                    }),
+                    &Loaded::new(),
+                )
+                .unwrap()
+        };
+        let before = make(&mut stream, 10, "text", "Before.");
+        let first = make(
+            &mut stream,
+            20,
+            "thought",
+            "**Checking output**\n\n**Checking bold**",
+        );
+        let second = make(&mut stream, 40, "thought", "Checking spacing");
+        let after = make(&mut stream, 50, "text", "After.");
+        let render = |view: &mut ThreadView<Entry>| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    view.render(frame, frame.area());
+                })
+                .unwrap();
+            (0..view.frame.total as u16)
+                .map(|y| {
+                    (0..80)
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut view = ThreadView::new(vec![before.clone(), first.clone()], 100);
+        view.ingest(vec![second.clone(), after.clone()]);
+        assert_eq!(
+            render(&mut view),
+            [
+                "Before.",
+                "",
+                "│ Checking output",
+                "│ Checking bold",
+                "│ Checking spacing",
+                "After."
+            ]
+        );
+        // A late row splits the visible group, regardless of arrival order.
+        let middle = make(&mut stream, 30, "text", "Interruption.");
+        view.ingest(vec![middle.clone()]);
+        let expected = [
+            "Before.",
+            "",
+            "│ Checking output",
+            "│ Checking bold",
+            "Interruption.",
+            "",
+            "│ Checking spacing",
+            "After.",
+        ];
+        assert_eq!(render(&mut view), expected);
+        let mut rebuilt = ThreadView::new(vec![before, first.clone(), middle, second, after], 100);
+        assert_eq!(render(&mut rebuilt), expected);
+        assert!(first.spaced_after(None), "a leading reasoning group");
+        assert!(!first.spaced_last(), "no new trailing blank for reasoning");
+        let padded = Entry::Stream {
+            id: 1,
+            created_at: String::new(),
+            lines: vec![Line::raw(" \t")],
+            call: None,
+            thought: false,
+        };
+        assert!(
+            !first.spaced_after(Some(&padded)),
+            "reuse whitespace-only padding"
+        );
+        let tool = Entry::Stream {
+            id: 2,
+            created_at: String::new(),
+            lines: vec![Line::raw("tool")],
+            call: Some(ToolLine::running("read")),
+            thought: false,
+        };
+        assert!(
+            first.spaced_after(Some(&tool)),
+            "tool closing and reasoning opening share one gap"
+        );
     }
 
     #[test]

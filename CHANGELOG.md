@@ -17,7 +17,8 @@ under the new package version and its publication date.
 ### Changed
 
 - Reasoning in `bbs connect` renders Markdown instead of literal formatting
-  marks and omits blank display lines. Raw activity and pretty logs are unchanged.
+  marks and omits blank display lines. Consecutive reasoning rows stay together,
+  with one blank line above each group. Raw activity and pretty logs are unchanged.
 
 ## 0.10.1 - 2026-10-19
 
