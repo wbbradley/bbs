@@ -752,7 +752,11 @@ impl Screen for Thread {
         let loaded = self.loaded();
         if let Some(stream) = &mut self.stream {
             let entries = stream.on_data(data, (self.now)(), &loaded);
-            if self.show.stream() && !entries.is_empty() {
+            if stream.take_redraw() {
+                // Evicted records named delivered mail: redraw from what is
+                // kept, so no evicted row outlives the dedup history.
+                self.reconcile();
+            } else if self.show.stream() && !entries.is_empty() {
                 self.view.ingest(entries);
             }
         }

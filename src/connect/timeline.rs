@@ -205,9 +205,12 @@ pub struct Stream {
     /// The stream's last error; it has ended until a reload.
     pub error: Option<String>,
     progress: ProgressState,
-    /// Delivered-as ids already drawn, so a retried copy of the same text
-    /// draws once; only ids that retained records carry, so it stays bounded.
+    /// Delivered-as ids drawn since the last full redraw, so a retried copy
+    /// of the same text draws once.
     drawn: HashSet<i64>,
+    /// Evicted records named delivered mail: the timeline must redraw from
+    /// what is kept, so its rows and `drawn` agree and stay bounded.
+    redraw: bool,
 }
 
 /// The messages a thread holds, by id: true for an automatic reply from the
@@ -252,6 +255,7 @@ impl Stream {
             error: None,
             progress: ProgressState::default(),
             drawn: HashSet::new(),
+            redraw: false,
         }
     }
 
@@ -309,6 +313,11 @@ impl Stream {
             r.mail_id.is_some_and(|id| ids.contains(&id))
                 || r.mail_ids.iter().any(|id| ids.contains(id))
         })
+    }
+
+    /// Whether evicted records need the timeline redrawn from what is kept.
+    pub fn take_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.redraw)
     }
 
     /// Draw `record` as an entry, if the kinds shown include it and the
@@ -387,13 +396,11 @@ impl Stream {
                 let entries = kept.iter().filter_map(|k| self.entry(k, loaded)).collect();
                 self.records.extend(kept);
                 let over = self.records.len().saturating_sub(MAX_RECORDS);
-                // An evicted copy's row stays in the larger view, so a
-                // retained copy of it still must not draw; ids no retained
-                // record carries are forgotten.
+                // An evicted copy's row would outlive it in the larger view;
+                // redraw from what is kept instead.
                 if self.records.drain(..over).any(|r| r.mail_id.is_some()) {
-                    let kept: HashSet<i64> =
-                        self.records.iter().filter_map(|r| r.mail_id).collect();
-                    self.drawn.retain(|id| kept.contains(id));
+                    self.drawn.clear();
+                    self.redraw = true;
                 }
                 entries
             }
@@ -425,7 +432,7 @@ mod tests {
     };
 
     #[test]
-    fn retried_copies_draw_once_and_forget_ids_only_retained_records_lack() {
+    fn retried_copies_draw_once_and_eviction_redraws_from_what_is_kept() {
         let now = Instant::now();
         let mut stream = Stream::new("Mateo");
         let id = stream.id;
@@ -459,19 +466,24 @@ mod tests {
         assert_eq!(texts(&push(&mut stream, vec![record(1, Some(1))])), 1);
         assert_eq!(texts(&push(&mut stream, vec![record(2, Some(1))])), 0);
         assert_eq!(texts(&push(&mut stream, vec![record(3, Some(2))])), 1);
-        // Evict the first copy: the retained copy still keeps mail 1 drawn.
+        // Evicting the first copy asks for a redraw from what is kept,
+        // which draws the retained copy once.
         let filler: Vec<_> = (4..=MAX_RECORDS as i64 + 1)
             .map(|n| record(n, None))
             .collect();
         push(&mut stream, filler);
+        assert!(stream.take_redraw() && stream.drawn.is_empty());
+        assert_eq!(texts(&stream.entries(&Loaded::new())), 2);
         assert_eq!(stream.drawn, HashSet::from([1, 2]));
-        // Evict every record naming mail: nothing is remembered.
-        let filler: Vec<_> = (MAX_RECORDS as i64 + 2..MAX_RECORDS as i64 + 5)
-            .map(|n| record(n, None))
-            .collect();
-        push(&mut stream, filler);
-        assert!(stream.drawn.is_empty(), "{:?}", stream.drawn);
+        // Evicting the other records naming mail redraws to none; evicting
+        // records that name no mail needs no redraw.
+        let n = MAX_RECORDS as i64;
+        push(&mut stream, vec![record(n + 2, None), record(n + 3, None)]);
+        assert!(stream.take_redraw());
         assert_eq!(texts(&stream.entries(&Loaded::new())), 0);
+        assert!(stream.drawn.is_empty());
+        push(&mut stream, vec![record(n + 4, None)]);
+        assert!(!stream.take_redraw());
     }
 
     #[test]

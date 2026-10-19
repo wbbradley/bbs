@@ -4611,6 +4611,47 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_after_every_copy_is_evicted_still_shows_once() {
+        let (mut app, mut rx) = app();
+        let (_, act) = mateo_streams(&mut app, &mut rx);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        let copy = |id: i64| {
+            activity(
+                id,
+                "05",
+                r#"{"ts":"2026-10-16T18:00:05Z","event":"text","text":"retry words","mail_id":70}"#,
+            )
+        };
+        let count = |app: &mut App| {
+            key(app, '/');
+            typed(app, "retry words");
+            enter(app);
+            bottom(app)
+        };
+        // The original is visible.
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![copy(1)]),
+        }));
+        assert!(count(&mut app).contains(": 1 matches"));
+        // Every record naming mail 70 is evicted from the bounded history.
+        let n = crate::connect::timeline::MAX_RECORDS as i64;
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok((2..=n + 1)
+                .map(|id| activity(id, "06", r#"{"event":"turn_end","stop_reason":"end_turn"}"#))
+                .collect()),
+        }));
+        // A retried post naming mail 70 arrives: still one copy.
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![copy(n + 2)]),
+        }));
+        let row = count(&mut app);
+        assert!(row.contains(": 1 matches"), "{row}");
+    }
+
+    #[test]
     fn raw_feed_gaps_show_one_warning_and_overlaps_none() {
         {
             let (mut app, mut rx) = app();
