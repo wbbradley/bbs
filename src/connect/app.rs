@@ -4958,10 +4958,10 @@ mod tests {
         // More calls than the pane holds: it keeps its closing blank anyway.
         let last = lines.iter().rposition(|l| l.contains(" running")).unwrap();
         let prompt = lines.iter().rposition(|l| l.starts_with('›')).unwrap();
-        // The pane's closing blank, then the composer's own padding row.
-        assert_eq!(prompt, last + 3, "{out}");
+        // The pane's closing blank, then the composer's two padding rows.
+        assert_eq!(prompt, last + 4, "{out}");
         assert!(
-            lines[last + 1].is_empty() && lines[last + 2].is_empty(),
+            lines[last + 1..prompt].iter().all(|l| l.is_empty()),
             "{out}"
         );
         assert!(
