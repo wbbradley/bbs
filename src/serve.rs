@@ -850,6 +850,14 @@ impl Bbs for Server {
         self.unary("send", req, Effect::Write, service::send).await
     }
 
+    async fn auto_reply(
+        &self,
+        req: Request<proto::AutoReplyRequest>,
+    ) -> Result<Response<proto::AutoReplyResponse>, Status> {
+        self.unary("auto_reply", req, Effect::Write, service::auto_reply)
+            .await
+    }
+
     async fn read(
         &self,
         req: Request<proto::ReadRequest>,

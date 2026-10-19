@@ -8,9 +8,10 @@ under the new package version and its publication date.
 
 ## Unreleased
 
-Database schema 16 adds the `agent_human_conversations` table and fills it from
-existing history when the database is first opened. Back up first: older
-binaries cannot open schema 16, so downgrading requires the pre-upgrade backup.
+Database schema 17 adds the `agent_human_conversations` table, filled from
+existing history when the database is first opened, plus the `auto_replies`
+table and the `messages.auto_reply` column. Back up first: older binaries
+cannot open schema 17, so downgrading requires the pre-upgrade backup.
 
 ### Changed
 
@@ -48,6 +49,13 @@ No config migration or new credentials are required.
 
 ### Added
 
+- An agent can send its owning human an automatic reply with the `AutoReply`
+  call (capability `auto-reply.v1`): the destination is the registered owner,
+  resolved by the server, and a stable per-registration delivery key makes
+  retries safe — a retried send returns the same message without delivering
+  again, and reusing a key with a different body is rejected. Messages carry
+  `auto_reply` so clients can mark them, and `Whoami` reports the agent's
+  owner so runners and tool guards need not guess it locally.
 - Ctrl-G opens the agent conversation with the oldest unread direct message to
   you, across owners. Ctrl-O cycles backward through unique visited agent/group
   conversations, preserving drafts, cursors and pending sends. A mailbox beside

@@ -28,6 +28,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0014_activity_seen.sql"),
     include_str!("../migrations/0015_agent_effort.sql"),
     include_str!("../migrations/0016_agent_human_conversations.sql"),
+    include_str!("../migrations/0017_auto_replies.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +107,8 @@ pub struct MessageView {
     pub control: Option<String>,
     /// Inbox only: the timer that sent it.
     pub timer_id: Option<i64>,
+    /// Sent via AutoReply.
+    pub auto_reply: bool,
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -819,6 +822,59 @@ pub fn insert_delivery(conn: &Connection, message_id: i64, kind: Kind, id: i64) 
     Ok(())
 }
 
+/// Mark message `id` as an automatic owner reply.
+pub fn set_message_auto_reply(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("UPDATE messages SET auto_reply = 1 WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+/// An accepted auto-reply for this (registration, key), if any: its message
+/// id, the body as stored, and the human it was delivered to.
+pub fn find_auto_reply(
+    conn: &Connection,
+    agent_id: i64,
+    key: &str,
+) -> Result<Option<(i64, String, i64)>> {
+    Ok(conn
+        .query_row(
+            "SELECT ar.message_id, m.body, d.recipient_id
+             FROM auto_replies ar
+             JOIN messages m ON m.id = ar.message_id
+             JOIN deliveries d ON d.message_id = ar.message_id AND d.recipient_kind = 'human'
+             WHERE ar.agent_id = ?1 AND ar.key = ?2",
+            params![agent_id, key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?)
+}
+
+/// Record an accepted auto-reply. The primary key rejects a conflicting
+/// duplicate; callers treat that as a replay after re-reading.
+pub fn insert_auto_reply(
+    conn: &Connection,
+    agent_id: i64,
+    key: &str,
+    message_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO auto_replies (agent_id, key, message_id) VALUES (?1, ?2, ?3)",
+        params![agent_id, key, message_id],
+    )?;
+    Ok(())
+}
+
+/// The owning human's name, when the agent has a registered owner.
+pub fn agent_owner_name(conn: &Connection, agent_id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT h.name FROM agent_owners o JOIN humans h ON h.id = o.human_id
+             WHERE o.agent_id = ?1",
+            [agent_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// Record a direct message between `agent` and `human`, in either direction,
 /// at `at`. Monotonic: an older time never replaces a newer one.
 pub fn record_human_conversation(
@@ -840,7 +896,7 @@ pub fn record_human_conversation(
 const INBOX_SELECT: &str = "
     SELECT m.id, m.created_at, m.from_kind,
            CASE m.from_kind WHEN 'agent' THEN a.name ELSE h.name END,
-           g.name, m.body, owner.name, reader_owner.name, m.control, m.timer_id
+           g.name, m.body, owner.name, reader_owner.name, m.control, m.timer_id, m.auto_reply
     FROM deliveries d
     JOIN messages m ON m.id = d.message_id
     LEFT JOIN agents a ON m.from_kind = 'agent' AND a.id = m.from_id
@@ -872,6 +928,7 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         body: r.get(5)?,
         control: r.get(8)?,
         timer_id: r.get(9)?,
+        auto_reply: r.get::<_, Option<i64>>(10)?.is_some_and(|v| v != 0),
     })
 }
 
@@ -1420,7 +1477,8 @@ pub fn feed_messages(
     }
     let sql = format!(
         "SELECT m.id, m.created_at, m.from_kind, COALESCE(fa.name, fh.name), g.name,
-                COALESCE(ta.name, th.name), d.archived_at, m.body, owner.name, to_owner.name
+                COALESCE(ta.name, th.name), d.archived_at, m.body, owner.name, to_owner.name,
+                m.auto_reply
          FROM messages m
          LEFT JOIN agents fa ON m.from_kind = 'agent' AND fa.id = m.from_id
          LEFT JOIN humans fh ON m.from_kind = 'human' AND fh.id = m.from_id
@@ -1458,6 +1516,7 @@ pub fn feed_messages(
                 body: r.get(7)?,
                 control: None,
                 timer_id: None,
+                auto_reply: r.get::<_, Option<i64>>(10)?.is_some_and(|v| v != 0),
             })
         })?
         .collect::<Result<_, _>>()?;

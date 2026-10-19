@@ -46,6 +46,11 @@ service Bbs {
   rpc GroupList(Empty) returns (GroupListResponse);
 
   rpc Send(SendRequest) returns (SendResponse);
+
+  // An agent sends its owning human an automatic reply, deduplicated by a
+  // delivery key so a retry after a lost reply returns the same message.
+  // Agent token, self only; requires auto-reply.v1.
+  rpc AutoReply(AutoReplyRequest) returns (AutoReplyResponse);
   // Unread mail oldest first, archived as returned; or archived history.
   rpc Read(ReadRequest) returns (ReadResponse);
   // Mark read the caller's unread mail from one sender; requires
@@ -113,6 +118,9 @@ message Principal {
   Kind kind = 1;
   int64 id = 2;
   string name = 3;
+  // Agents only: the owning human, resolved by the server; absent when
+  // unknown, for humans, or on servers without auto-reply.v1.
+  optional string owner = 4;
 }
 
 message EnsureHumanRequest { string name = 1; }
@@ -188,6 +196,19 @@ message SendResponse {
   optional int64 id = 3;           // the message's id, for control correlation
 }
 
+// Auto-replies to the owning human (auto-reply.v1). The destination is the
+// sender's registered owner, resolved by the server; there is no `to` field.
+message AutoReplyRequest {
+  // The sender's stable delivery key: 1 to 128 bytes of [A-Za-z0-9._:-],
+  // scoped to this registration. A retry after a lost reply must reuse it.
+  string key = 1;
+  string body = 2;
+}
+message AutoReplyResponse {
+  int64 id = 1;        // the message's id; the same on every retry of one send
+  bool replayed = 2;   // true: an earlier accepted send was returned, not re-sent
+}
+
 // Effort reporting (agent-effort.v1). A driver reports only
 // provider-confirmed state, never inferred or synthesized values.
 message EffortChoice {
@@ -248,6 +269,8 @@ message Message {
   optional string to_owner = 11;     // feed only: direct recipient agent's human; absent otherwise
   optional Control control = 12;     // inbox only: set on control messages
   optional int64 timer_id = 13;      // inbox only: the timer that sent it
+  // Set when the message was sent via AutoReply; absent on older servers.
+  optional bool auto_reply = 14;
 }
 
 message WaitRequest { optional uint32 limit = 1; }

@@ -775,3 +775,13 @@ starts with none. Servers return the newest per agent as
 `last_human_conversation_at` on agents and agent summaries; connect falls back
 to its earlier order when a server omits it. Older binaries cannot open a schema
 16 database, so back up before upgrading and restore that backup to downgrade.
+
+Automatic owner replies (schema 17) add an `auto_replies` table and a nullable
+`messages.auto_reply` column. An agent's `AutoReply` call sends its registered
+owner a direct message, deduplicated by a stable delivery key scoped to the
+agent's registration: a retry after a lost reply returns the original message
+without delivering again, and reusing a key with a different body, or after the
+owner changed, is rejected. Messages carry `auto_reply` so clients can mark
+them, and `Whoami` reports the agent's owner. `AutoReply` requires a server
+advertising `auto-reply.v1`. Older binaries cannot open a schema 17 database,
+so back up before upgrading.

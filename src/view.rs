@@ -380,6 +380,7 @@ mod tests {
             from_name: "Juliana".into(),
             from_owner: None,
             reader_owner: None,
+            auto_reply: None,
             to_group: group.map(Into::into),
             to_name: to.map(Into::into),
             to_owner: None,

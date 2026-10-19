@@ -759,6 +759,95 @@ async fn agent_summaries_stream_what_a_human_has_yet_to_read_or_see() {
 }
 
 #[tokio::test]
+async fn auto_replies_are_advertised_deduped_and_owned() {
+    let server = Server::start("auto-reply");
+    let mut client = server.client().await;
+    let info = client
+        .server_info(proto::Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(info.capabilities.iter().any(|c| c == "auto-reply.v1"));
+    let agent = register(&mut client).await;
+    let req = proto::AutoReplyRequest {
+        key: "run-7".into(),
+        body: "turn finished".into(),
+    };
+    let first = client
+        .auto_reply(as_agent(&agent.token, req.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!first.replayed);
+    // The agent's own identity carries the server-resolved owner.
+    let me = client
+        .whoami(as_agent(&agent.token, proto::Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(me.owner.as_deref(), Some("will"));
+    // A retry after a lost reply returns the same message, unmarked as new.
+    let again = client
+        .auto_reply(as_agent(&agent.token, req))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(again.replayed && again.id == first.id);
+    // A conflicting body under the same key is rejected.
+    let conflict = client
+        .auto_reply(as_agent(
+            &agent.token,
+            proto::AutoReplyRequest {
+                key: "run-7".into(),
+                body: "different".into(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::FailedPrecondition);
+    // The owner got exactly one copy, marked as an auto-reply.
+    let mail = client
+        .read(as_human("will", proto::ReadRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let auto: Vec<_> = mail
+        .messages
+        .iter()
+        .filter(|m| m.auto_reply == Some(true))
+        .collect();
+    assert_eq!(auto.len(), 1);
+    assert_eq!(auto[0].id, first.id);
+
+    // Two callers racing one delivery key: both get the same message, and it
+    // was delivered once.
+    let req = proto::AutoReplyRequest {
+        key: "race-1".into(),
+        body: "raced".into(),
+    };
+    let mut second = client.clone();
+    let (a, b) = tokio::join!(
+        client.auto_reply(as_agent(&agent.token, req.clone())),
+        second.auto_reply(as_agent(&agent.token, req)),
+    );
+    let (a, b) = (a.unwrap().into_inner(), b.unwrap().into_inner());
+    assert_eq!(a.id, b.id);
+    assert_ne!(a.replayed, b.replayed);
+    let mail = client
+        .read(as_human("will", proto::ReadRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        mail.messages
+            .iter()
+            .filter(|m| m.body == "raced")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn feed_filters_are_advertised_and_applied_server_side() {
     let server = Server::start("feed-filter");
     let mut client = server.client().await;

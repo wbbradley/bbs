@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rand::seq::IndexedRandom;
 use rusqlite::{Connection, TransactionBehavior};
@@ -158,6 +158,7 @@ fn principal(p: db::Principal) -> proto::Principal {
         kind: proto_kind(p.kind).into(),
         id: p.id,
         name: p.name,
+        owner: None,
     }
 }
 
@@ -185,6 +186,7 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
             _ => None,
         },
         timer_id: m.timer_id,
+        auto_reply: if m.auto_reply { Some(true) } else { None },
     }
 }
 
@@ -428,7 +430,17 @@ pub fn rotate_agent_token(
 }
 
 pub fn whoami(conn: &mut Connection, caller: &Caller) -> Result<proto::Principal> {
-    with_ctx(conn, caller, |ctx| Ok(principal(ctx.actor()?)))
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        let owner = match me.kind {
+            db::Kind::Agent => db::agent_owner_name(ctx.conn, me.id)?,
+            db::Kind::Human => None,
+        };
+        Ok(proto::Principal {
+            owner,
+            ..principal(me)
+        })
+    })
 }
 
 pub fn set_status(
@@ -880,6 +892,66 @@ fn send_control(
         to: target.name,
         recipients: None,
         id: Some(msg),
+    })
+}
+
+/// Delivery keys are bounded ASCII identifiers, scoped to the sender's
+/// registration.
+fn validate_delivery_key(key: &str) -> Result<()> {
+    let ok = !key.is_empty()
+        && key.len() <= 128
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b));
+    if !ok {
+        bail!("delivery key must be 1 to 128 bytes of [A-Za-z0-9._:-]");
+    }
+    Ok(())
+}
+
+/// An agent's automatic reply to its owning human (auto-reply.v1). The
+/// destination is the registered owner, never a request field. The delivery
+/// key makes retries safe: a replayed send returns the original message
+/// without delivering again.
+pub fn auto_reply(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::AutoReplyRequest,
+) -> Result<proto::AutoReplyResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        if me.kind != db::Kind::Agent {
+            bail!("only agents send automatic owner replies");
+        }
+        validate_delivery_key(&req.key)?;
+        validate_body(&req.body)?;
+        let owner = db::agent_owner_id(ctx.conn, me.id)?
+            .ok_or_else(|| anyhow!("{} has no registered owner", me.name))?;
+        if let Some((message_id, body, recipient)) =
+            db::find_auto_reply(ctx.conn, me.id, &req.key)?
+        {
+            if body != req.body {
+                bail!("delivery key reused with a different body");
+            }
+            if recipient != owner {
+                bail!("delivery key's owner no longer matches the registered owner");
+            }
+            // A retry after a lost reply: the same mail, sent exactly once.
+            return Ok(proto::AutoReplyResponse {
+                id: message_id,
+                replayed: true,
+            });
+        }
+        let msg = db::insert_message(ctx.conn, &me, None, &req.body, &ctx.now_s)?;
+        db::set_message_auto_reply(ctx.conn, msg)?;
+        db::insert_delivery(ctx.conn, msg, db::Kind::Human, owner)?;
+        db::record_human_conversation(ctx.conn, me.id, owner, &ctx.now_s)?;
+        db::insert_auto_reply(ctx.conn, me.id, &req.key, msg)?;
+        tracing::info!(from = me.name, bytes = req.body.len(), "sent auto reply");
+        Ok(proto::AutoReplyResponse {
+            id: msg,
+            replayed: false,
+        })
     })
 }
 
@@ -2374,6 +2446,221 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn auto_replies_reach_the_owner_once_and_replay_safely() {
+        let (mut conn, will, [mateo, zed, _lu]) = board();
+        let reply = |conn: &mut Connection, key: &str, body: &str| {
+            auto_reply(
+                conn,
+                &mateo,
+                proto::AutoReplyRequest {
+                    key: key.into(),
+                    body: body.into(),
+                },
+            )
+        };
+        // Humans cannot send automatic replies; the request has no `to`.
+        let human = auto_reply(
+            &mut conn,
+            &will,
+            proto::AutoReplyRequest {
+                key: "k".into(),
+                body: "hi".into(),
+            },
+        );
+        assert!(human.unwrap_err().to_string().contains("only agents"));
+        // An agent without a registered owner has nowhere to reply.
+        conn.execute("DELETE FROM agent_owners WHERE agent_id = 3", [])
+            .unwrap();
+        let unowned = auto_reply(
+            &mut conn,
+            &_lu,
+            proto::AutoReplyRequest {
+                key: "k".into(),
+                body: "hi".into(),
+            },
+        );
+        assert!(
+            unowned
+                .unwrap_err()
+                .to_string()
+                .contains("no registered owner")
+        );
+        // Key and body bounds.
+        for key in ["", "no spaces", "snowman-\u{2603}", &"k".repeat(129)] {
+            let err = reply(&mut conn, key, "hi").unwrap_err().to_string();
+            assert!(err.contains("delivery key"), "{key:?}: {err}");
+        }
+        let err = reply(&mut conn, "k", "").unwrap_err().to_string();
+        assert!(err.contains("empty"), "{err}");
+        let err = reply(&mut conn, "k", &"x".repeat(64 * 1024 + 1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds"), "{err}");
+
+        // The destination is the registered owner, resolved server-side.
+        let first = reply(&mut conn, "turn-1", "done").unwrap();
+        assert!(!first.replayed);
+        let mail = inbox(&mut conn, &will);
+        let auto: Vec<_> = mail.iter().filter(|m| m.auto_reply == Some(true)).collect();
+        assert_eq!(auto.len(), 1);
+        assert_eq!(
+            (auto[0].id, auto[0].from_name.as_str(), auto[0].body.as_str()),
+            (first.id, "Mateo", "done")
+        );
+        assert_eq!(auto[0].to_name.as_deref(), Some("will"));
+        // Manual mail is not marked.
+        let manual = send(
+            &mut conn,
+            &zed,
+            proto::SendRequest {
+                to: "will".into(),
+                body: "by hand".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(inbox(&mut conn, &will)
+            .iter()
+            .any(|m| m.id == manual.id.unwrap() && m.auto_reply.is_none()));
+        // The feed carries the provenance too.
+        let feed = feed(
+            &mut conn,
+            &will,
+            proto::FeedRequest {
+                backlog: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(feed
+            .messages
+            .iter()
+            .any(|m| m.id == first.id && m.auto_reply == Some(true)));
+
+        // The normal send effects happened exactly once.
+        let recency = |conn: &mut Connection| -> String {
+            conn.query_row(
+                "SELECT last_at FROM agent_human_conversations WHERE agent_id = 1 AND human_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let first_recency = recency(&mut conn);
+
+        // A retry after a lost reply returns the same mail and changes
+        // nothing: no second delivery, unread, or recency update.
+        let again = reply(&mut conn, "turn-1", "done").unwrap();
+        assert!(again.replayed && again.id == first.id);
+        let deliveries: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM deliveries d JOIN messages m ON m.id = d.message_id
+                 WHERE m.auto_reply = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(deliveries, 1);
+        assert_eq!(recency(&mut conn), first_recency);
+
+        // The same key with a different body is rejected; nothing is sent.
+        let err = reply(&mut conn, "turn-1", "changed")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different body"), "{err}");
+
+        // A different key is a new send.
+        let second = reply(&mut conn, "turn-2", "also done").unwrap();
+        assert!(!second.replayed && second.id != first.id);
+
+        // whoami exposes the owner to agents, never to humans.
+        let me = whoami(&mut conn, &mateo).unwrap();
+        assert_eq!(me.owner.as_deref(), Some("will"));
+        assert!(whoami(&mut conn, &will).unwrap().owner.is_none());
+
+        // Registration isolation: a retired name's keys do not follow its
+        // re-registration.
+        retire_agent(
+            &mut conn,
+            &will,
+            proto::RetireRequest {
+                agent: "Mateo".into(),
+            },
+        )
+        .unwrap();
+        let token = register(
+            &mut conn,
+            &will,
+            proto::RegisterRequest {
+                name: Some("Mateo".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .token;
+        let mateo2 = Caller {
+            token: Some(token),
+            ..Default::default()
+        };
+        let fresh = auto_reply(
+            &mut conn,
+            &mateo2,
+            proto::AutoReplyRequest {
+                key: "turn-1".into(),
+                body: "done".into(),
+            },
+        )
+        .unwrap();
+        assert!(!fresh.replayed && fresh.id != first.id);
+
+        // Owner reassignment between retries: a replay whose stored recipient
+        // is no longer the owner is rejected, with no new mail.
+        let third = auto_reply(
+            &mut conn,
+            &mateo2,
+            proto::AutoReplyRequest {
+                key: "turn-2".into(),
+                body: "same".into(),
+            },
+        )
+        .unwrap();
+        assert!(!third.replayed);
+        ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: "ada".into(),
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE agent_owners SET human_id = (SELECT id FROM humans WHERE name = 'ada')
+             WHERE agent_id = (SELECT id FROM agents WHERE name = 'Mateo' AND retired_at IS NULL)",
+            [],
+        )
+        .unwrap();
+        let err = auto_reply(
+            &mut conn,
+            &mateo2,
+            proto::AutoReplyRequest {
+                key: "turn-2".into(),
+                body: "same".into(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("owner no longer matches"), "{err}");
+        // Nothing new reached either human from that key.
+        let will_mail = inbox(&mut conn, &will);
+        assert_eq!(
+            will_mail
+                .iter()
+                .filter(|m| m.body == "same" && m.auto_reply == Some(true))
+                .count(),
+            1
+        );
     }
 
     #[test]
