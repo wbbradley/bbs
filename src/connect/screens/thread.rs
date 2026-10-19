@@ -1035,11 +1035,19 @@ impl Thread {
             frame.render_widget(Paragraph::new(notice).wrap(Wrap { trim: false }), body);
             return;
         }
-        // Calls still running sit below the newest activity while following.
-        let running = match &self.stream {
-            Some(stream) if self.show.stream() && self.view.following() => stream.running(),
+        // Calls still running sit below the newest activity while following,
+        // when tool calls are shown, as one more tool run would.
+        let mut running = match &self.stream {
+            Some(stream)
+                if self.show.stream() && stream.kinds.shows("tool") && self.view.following() =>
+            {
+                stream.running()
+            }
             _ => Vec::new(),
         };
+        if !running.is_empty() && crate::connect::timeline::starts_tool_run(self.view.rows.last()) {
+            running.insert(0, Line::default());
+        }
         let height = (running.len() as u16).min(body.height / 3);
         let [body, below] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(body);

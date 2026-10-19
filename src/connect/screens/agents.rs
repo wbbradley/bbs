@@ -1,6 +1,7 @@
 //! Agents: yours by default, everyone's on request, each with its owner.
-//! Those a human talked with most recently come first; ties and the rest put
-//! mail to the viewer unread first, then activity unseen, each oldest first.
+//! Those a human talked with come first, the longest since that talk first;
+//! ties and the rest put mail to the viewer unread first, then activity
+//! unseen, each oldest first.
 
 use chrono::{DateTime, Local};
 use ratatui::Frame;
@@ -52,7 +53,8 @@ impl Agents {
         self.now = Some(now);
     }
 
-    /// The most recent direct message with any human first, newest first.
+    /// Agents a human has talked with first, the longest since their latest
+    /// direct message with any human first.
     /// Ties and agents without one: unread mail, then unseen activity, each
     /// oldest first; the rest keep the server's order.
     fn shown<'a>(&'a self, ctx: &Ctx) -> Vec<&'a proto::Agent> {
@@ -75,7 +77,7 @@ impl Agents {
                 Some(s) if s.unseen_stream > 0 => (1, s.oldest_unseen_stream.clone()),
                 _ => (2, None),
             };
-            (talked.is_none(), std::cmp::Reverse(talked), pending)
+            (talked.is_none(), talked, pending)
         };
         shown.sort_by_cached_key(|a| key(a));
         shown

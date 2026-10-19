@@ -41,7 +41,22 @@ pub enum Entry {
         id: i64,
         created_at: String,
         lines: Vec<Line<'static>>,
+        /// A finished tool call: runs of these sit together after one blank.
+        tool: bool,
     },
+}
+
+impl Entry {
+    fn is_tool(&self) -> bool {
+        matches!(self, Entry::Stream { tool: true, .. })
+    }
+}
+
+/// Whether tool calls after `prev` (none: the top) start a new run, and so
+/// take one blank line first: `prev` is no tool call and does not already
+/// end with a blank line.
+pub fn starts_tool_run(prev: Option<&Entry>) -> bool {
+    prev.is_none_or(|p| !p.is_tool() && p.lines(false, None).last().is_none_or(|l| l.width() > 0))
 }
 
 /// Microseconds since the epoch, so rows from the two sources interleave.
@@ -107,6 +122,12 @@ impl Row for Entry {
             }
         )
         .then(|| theme::style(theme::Role::Screen))
+    }
+
+    /// A blank line before each run of tool calls, the first included,
+    /// unless the row before already ends with one; none within a run.
+    fn spaced_after(&self, prev: Option<&Self>) -> bool {
+        self.is_tool() && starts_tool_run(prev)
     }
 
     fn matches(&self, query: &str) -> bool {
@@ -183,7 +204,7 @@ impl Kinds {
         }
     }
 
-    fn shows(self, event: &str) -> bool {
+    pub fn shows(self, event: &str) -> bool {
         match self {
             Kinds::All => true,
             Kinds::NoText => !matches!(event, "text" | "thought"),
@@ -250,7 +271,7 @@ impl Stream {
             agent: agent.to_string(),
             kinds: Kinds::All,
             records: VecDeque::new(),
-            renderer: Activity::new(true).local_time(),
+            renderer: Activity::new(true).local_time().without_turns(),
             loaded: false,
             error: None,
             progress: ProgressState::default(),
@@ -350,13 +371,14 @@ impl Stream {
             id: record.id,
             created_at: record.created_at.clone(),
             lines,
+            tool: event == "tool",
         })
     }
 
     /// Every record kept, drawn afresh, as after changing the kinds or
     /// loading or evicting mail that records name.
     pub fn entries(&mut self, loaded: &Loaded) -> Vec<Entry> {
-        self.renderer = Activity::new(true).local_time();
+        self.renderer = Activity::new(true).local_time().without_turns();
         self.drawn.clear();
         let records = std::mem::take(&mut self.records);
         let entries = records
@@ -430,6 +452,31 @@ mod tests {
         style::Modifier,
         widgets::{Block, Paragraph, Wrap},
     };
+
+    #[test]
+    fn tool_runs_start_after_the_top_or_a_non_tool_row_without_a_trailing_blank() {
+        let stream = |tool: bool, lines: Vec<Line<'static>>| Entry::Stream {
+            id: 1,
+            created_at: "2026-10-16T18:00:00Z".into(),
+            lines,
+            tool,
+        };
+        assert!(starts_tool_run(None), "the first run takes a blank too");
+        assert!(!starts_tool_run(Some(&stream(
+            true,
+            vec![Line::raw("✓ a")]
+        ))));
+        assert!(starts_tool_run(Some(&stream(
+            false,
+            vec![Line::raw("text")]
+        ))));
+        // A row already ending with a blank line lends it to the run.
+        let blank_after = stream(false, vec![Line::raw("text"), Line::default()]);
+        assert!(!starts_tool_run(Some(&blank_after)));
+        let tool = stream(true, vec![Line::raw("✓ b")]);
+        assert!(tool.spaced_after(None) && !tool.spaced_after(Some(&tool.clone())));
+        assert!(!stream(false, vec![Line::raw("text")]).spaced_after(None));
+    }
 
     #[test]
     fn retried_copies_draw_once_and_eviction_redraws_from_what_is_kept() {

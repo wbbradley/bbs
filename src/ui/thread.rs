@@ -38,6 +38,12 @@ pub trait Row: PartialEq {
     }
     /// Whether the row matches a case-folded search.
     fn matches(&self, query: &str) -> bool;
+    /// Whether a blank line goes before this row, given the row before it
+    /// (none at the top). Its height depends on that neighbour, so changing
+    /// a row also re-measures the one after it.
+    fn spaced_after(&self, _prev: Option<&Self>) -> bool {
+        false
+    }
 }
 
 impl Row for Message {
@@ -158,6 +164,7 @@ impl<R: Row> ThreadView<R> {
                     self.matched[i] = self.matches(&m);
                     self.rows[i] = m;
                     self.heights[i] = None;
+                    self.remeasure(i + 1);
                 }
                 Ok(_) => {}
                 Err(i) if i == self.rows.len() => {
@@ -172,6 +179,7 @@ impl<R: Row> ThreadView<R> {
                     self.matched.insert(i, self.matches(&m));
                     self.rows.insert(i, m);
                     self.heights.insert(i, None);
+                    self.remeasure(i + 1);
                 }
                 // Older than everything kept: it was dropped, or never loaded.
                 Err(_) => {}
@@ -181,6 +189,10 @@ impl<R: Row> ThreadView<R> {
         self.rows.drain(..excess);
         self.heights.drain(..excess);
         self.matched.drain(..excess);
+        if excess > 0 {
+            // The new first row has no row before it now.
+            self.remeasure(0);
+        }
         if let Some(oldest) = self.rows.first() {
             let oldest = oldest.key();
             self.gaps.retain(|&id| id >= oldest);
@@ -188,24 +200,41 @@ impl<R: Row> ThreadView<R> {
         self.layout(self.frame.width, self.frame.height);
     }
 
+    /// Forget row `i`'s measured height, if there is such a row.
+    fn remeasure(&mut self, i: usize) {
+        if let Some(height) = self.heights.get_mut(i) {
+            *height = None;
+        }
+    }
+
+    /// Row `i`'s lines, with any blank line it asks for before it: shared by
+    /// measuring and drawing so the two agree.
+    fn row_lines(&self, i: usize, query: Option<&str>) -> Vec<Line<'_>> {
+        let row = &self.rows[i];
+        let mut lines = row.lines(self.gaps.contains(&row.key()), query);
+        if row.spaced_after(i.checked_sub(1).map(|j| &self.rows[j])) {
+            lines.insert(0, Line::default());
+        }
+        lines
+    }
+
     /// Recompute line starts for a feed area, measuring only uncached rows.
     pub fn layout(&mut self, width: u16, height: usize) {
         let mut starts = Vec::with_capacity(self.rows.len());
         let mut total = 0;
-        for (row, cached) in self.rows.iter().zip(&mut self.heights) {
+        for i in 0..self.rows.len() {
             starts.push(total);
             // Nothing is drawn before the first frame sizes the feed area.
             if width == 0 {
                 continue;
             }
-            total += match *cached {
+            total += match self.heights[i] {
                 Some((w, h)) if w == width => h,
                 _ => {
-                    let gap = self.gaps.contains(&row.key());
-                    let h = Paragraph::new(Text::from(row.lines(gap, None)))
+                    let h = Paragraph::new(Text::from(self.row_lines(i, None)))
                         .wrap(Wrap { trim: false })
                         .line_count(width);
-                    *cached = Some((width, h));
+                    self.heights[i] = Some((width, h));
                     h
                 }
             };
@@ -360,7 +389,6 @@ impl<R: Row> ThreadView<R> {
             .partition_point(|&s| s <= top)
             .saturating_sub(1);
         for (i, row) in self.rows.iter().enumerate().skip(first) {
-            let gap = self.gaps.contains(&row.key());
             let start = self.frame.starts[i];
             let end = *self.frame.starts.get(i + 1).unwrap_or(&self.frame.total);
             let visible_start = start.max(top);
@@ -371,7 +399,7 @@ impl<R: Row> ThreadView<R> {
                 area.width,
                 (visible_end - visible_start) as u16,
             );
-            let paragraph = Paragraph::new(row.lines(gap, self.query.as_deref()))
+            let paragraph = Paragraph::new(self.row_lines(i, self.query.as_deref()))
                 .style(row.style())
                 .wrap(Wrap { trim: false })
                 .scroll(((visible_start - start).min(u16::MAX as usize) as u16, 0));
@@ -389,5 +417,74 @@ impl<R: Row> ThreadView<R> {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row spaced before each run of tool rows, as connect's timeline is.
+    #[derive(Clone, Debug, PartialEq)]
+    struct R {
+        id: i64,
+        tool: bool,
+        text: &'static str,
+    }
+
+    impl Row for R {
+        type Key = i64;
+        const MERGES: bool = true;
+        fn key(&self) -> i64 {
+            self.id
+        }
+        fn lines(&self, _gap: bool, _query: Option<&str>) -> Vec<Line<'_>> {
+            vec![Line::raw(self.text)]
+        }
+        fn matches(&self, _query: &str) -> bool {
+            false
+        }
+        fn spaced_after(&self, prev: Option<&Self>) -> bool {
+            self.tool && prev.is_none_or(|p| !p.tool)
+        }
+    }
+
+    fn r(id: i64, tool: bool) -> R {
+        R {
+            id,
+            tool,
+            text: "row",
+        }
+    }
+
+    /// Lines laid out incrementally, and from scratch for the same rows.
+    fn totals(view: &mut ThreadView<R>) -> (usize, usize) {
+        view.layout(80, 50);
+        let mut fresh = ThreadView::new(view.rows.clone(), view.window);
+        fresh.layout(80, 50);
+        (view.frame.total, fresh.frame.total)
+    }
+
+    #[test]
+    fn neighbour_spacing_is_remeasured_on_insert_replace_and_eviction() {
+        let mut view = ThreadView::new(vec![r(1, true), r(3, true)], 100);
+        assert_eq!(totals(&mut view), (3, 3), "a run: one blank, then tight");
+        // A row landing inside the run splits it: the next row gains a blank.
+        view.ingest(vec![r(2, false)]);
+        assert_eq!(totals(&mut view), (5, 5));
+        // Replacing that row with a tool row rejoins the run.
+        view.ingest(vec![r(2, true)]);
+        assert_eq!(totals(&mut view), (4, 4));
+        // Evicting the oldest row leaves a new first row with nothing before.
+        let mut rows = vec![r(0, true), r(1, true)];
+        rows.extend((2..MAX_ROWS as i64).map(|id| r(id, false)));
+        let mut view = ThreadView::new(rows, 100);
+        let before = totals(&mut view);
+        assert_eq!(before.0, before.1);
+        view.ingest(vec![r(MAX_ROWS as i64, false)]);
+        let after = totals(&mut view);
+        assert_eq!(after.0, after.1);
+        // Row 0's blank went with it; row 1 now starts the run and takes one.
+        assert_eq!(after.0, before.0);
     }
 }

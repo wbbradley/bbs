@@ -2701,7 +2701,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_a_human_talked_with_most_recently_come_first() {
+    fn agents_a_human_talked_with_longest_ago_come_first() {
         let (mut app, mut rx) = app();
         key(&mut app, 'a');
         assert!(matches!(rx.try_recv().unwrap(), Request::AgentsAt { .. }));
@@ -2731,10 +2731,10 @@ mod tests {
             last_human_conversation_at: talked,
             ..Default::default()
         };
-        // Select Ed, then the live summary reorders: Cy and Di tie on the
-        // newest conversation, so Di's unread mail puts it first; Ana keeps
-        // the list's time; Bo's unread mail cannot beat any conversation, and
-        // Ed, who never talked with a human, keeps the server's order.
+        // Select Ed, then the live summary reorders: Ana's list time is the
+        // oldest; Cy and Di tie, so Di's unread mail puts it first; Bo's
+        // unread mail cannot beat any conversation, and Ed, who never talked
+        // with a human, keeps the server's order.
         for _ in 0..4 {
             key(&mut app, 'j');
         }
@@ -2749,10 +2749,11 @@ mod tests {
         let out = screen(&mut app, 100, 24);
         assert_eq!(
             order(&out, &names),
-            ["Di", "Cy", "Ana", "Bo", "Ed"],
+            ["Ana", "Di", "Cy", "Bo", "Ed"],
             "{out}"
         );
-        // A new conversation moves Ed to the top; the selection follows it.
+        // A new conversation puts Ed after the older ones; the selection
+        // follows it.
         app.on_event(Event::Data(Data::Summary {
             id,
             result: Ok(vec![
@@ -2765,7 +2766,7 @@ mod tests {
         let out = screen(&mut app, 100, 24);
         assert_eq!(
             order(&out, &names),
-            ["Ed", "Di", "Cy", "Ana", "Bo"],
+            ["Ana", "Di", "Cy", "Ed", "Bo"],
             "{out}"
         );
         enter(&mut app);
@@ -4419,7 +4420,8 @@ mod tests {
             for body in ["please build", "built it"] {
                 assert_eq!(out.matches(body).count(), 1, "{body}: {out}");
             }
-            assert!(out.contains("turn") && out.contains("cargo build"), "{out}");
+            // The turn marker is left to the progress mark.
+            assert!(!out.contains("━━") && out.contains("cargo build"), "{out}");
             assert!(!out.contains("mail from ada"), "{out}");
         };
         for mail_first in [true, false] {
@@ -4649,6 +4651,175 @@ mod tests {
         }));
         let row = count(&mut app);
         assert!(row.contains(": 1 matches"), "{row}");
+    }
+
+    #[test]
+    fn turn_markers_give_way_to_the_progress_mark_and_tool_runs_get_one_blank() {
+        let rec = |id: i64, s: &str, body: &str| {
+            activity(
+                id,
+                s,
+                &format!(r#"{{"ts":"2026-10-16T18:00:{s}Z",{body}}}"#),
+            )
+        };
+        let records = || {
+            vec![
+                // ada's mail is loaded, so this turn's echo goes entirely.
+                rec(
+                    1,
+                    "02",
+                    r#""event":"prompt","text":"New BBS mail (1 message):\n\nplease build\n","mail_ids":[10]"#,
+                ),
+                rec(2, "03", r#""event":"text","text":"Looking.""#),
+                rec(
+                    3,
+                    "04",
+                    r#""event":"tool","id":"a","title":"Read a.rs","status":"pending""#,
+                ),
+                rec(4, "05", r#""event":"tool","id":"a","status":"completed""#),
+                rec(
+                    5,
+                    "06",
+                    r#""event":"tool","id":"b","title":"Read b.rs","status":"pending""#,
+                ),
+                rec(6, "07", r#""event":"tool","id":"b","status":"completed""#),
+                rec(7, "08", r#""event":"text","text":"Done.""#),
+                // Mail not in this thread keeps its body, without a marker.
+                rec(
+                    8,
+                    "09",
+                    r#""event":"prompt","text":"New BBS mail (1 message):\n\ngroup note\n","mail_ids":[99]"#,
+                ),
+                rec(
+                    9,
+                    "10",
+                    r#""event":"tool","id":"c","title":"Read c.rs","status":"pending""#,
+                ),
+                rec(10, "11", r#""event":"tool","id":"c","status":"completed""#),
+                rec(11, "12", r#""event":"turn_end","stop_reason":"end_turn""#),
+            ]
+        };
+        // The lines from the one holding `first` through the one holding `last`.
+        let span = |out: &str, first: &str, last: &str| -> Vec<String> {
+            let lines: Vec<&str> = out.lines().map(str::trim_end).collect();
+            let a = lines.iter().position(|l| l.contains(first)).expect(first);
+            let b = lines.iter().position(|l| l.contains(last)).expect(last);
+            lines[a..=b].iter().map(|l| l.to_string()).collect()
+        };
+        let expected = [
+            "Looking.",
+            "",
+            "  ✓ Read a.rs completed (1.0s)",
+            "  ✓ Read b.rs completed (1.0s)",
+            "Done.",
+            "group note",
+            "",
+            "  ✓ Read c.rs completed (1.0s)",
+        ];
+        let start = |app: &mut App, rx: &mut UnboundedReceiver<Request>| {
+            let (feed, act) = mateo_streams(app, rx);
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(vec![proto::Message {
+                    from_kind: proto::Kind::Human.into(),
+                    ..at(10, "01", "ada", "Mateo", "please build")
+                }]),
+            }));
+            app.on_event(Event::Data(Data::ActivityBaseline {
+                id: act,
+                through_id: 0,
+                record: None,
+            }));
+            (feed, act)
+        };
+
+        // Streamed one record at a time, then redrawn by a filter round trip:
+        // the same lines, no turn marker, and the progress mark at Done.
+        let (mut app, mut rx) = app();
+        let (_, act) = start(&mut app, &mut rx);
+        for record in records() {
+            app.on_event(Event::Data(Data::Activity {
+                id: act,
+                result: Ok(vec![record]),
+            }));
+        }
+        let streamed = screen(&mut app, 80, 30);
+        assert_eq!(
+            span(&streamed, "Looking.", "Read c.rs"),
+            expected,
+            "{streamed}"
+        );
+        assert!(
+            !streamed.contains("━━") && !streamed.contains("turn end"),
+            "{streamed}"
+        );
+        let row = bottom(&mut app);
+        assert!(row.ends_with('✓'), "{row}");
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        for _ in 0..3 {
+            key(&mut app, 'A');
+        }
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let rebuilt = screen(&mut app, 80, 30);
+        assert_eq!(
+            span(&rebuilt, "Looking.", "Read c.rs"),
+            expected,
+            "{rebuilt}"
+        );
+
+        // Mail landing inside a run splits it: the later calls start a new
+        // run, with one blank line, not two.
+        let (mut app, mut rx) = self::app();
+        let (feed, act) = start(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(records()),
+        }));
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![at(20, "06", "Zed", "Mateo", "zed note")]),
+        }));
+        let out = screen(&mut app, 80, 40);
+        let lines: Vec<&str> = out.lines().map(str::trim_end).collect();
+        let b = lines.iter().position(|l| l.contains("Read b.rs")).unwrap();
+        assert!(lines[b - 1].is_empty() && !lines[b - 2].is_empty(), "{out}");
+        let a = lines.iter().position(|l| l.contains("Read a.rs")).unwrap();
+        assert!(lines[a - 1].is_empty(), "{out}");
+
+        // A run at the top still gets its blank line; a call still running
+        // shows in the pane below (its own leading blank is starts_tool_run's
+        // rule), and E: problems hides it.
+        let (mut app, mut rx) = self::app();
+        let (_, act) = mateo_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![
+                rec(
+                    1,
+                    "01",
+                    r#""event":"tool","id":"a","title":"Read a.rs","status":"pending""#,
+                ),
+                rec(2, "02", r#""event":"tool","id":"a","status":"completed""#),
+                rec(3, "03", r#""event":"text","text":"Next.""#),
+                rec(
+                    4,
+                    "04",
+                    r#""event":"tool","id":"d","title":"Read d.rs","status":"pending""#,
+                ),
+            ]),
+        }));
+        let out = screen(&mut app, 80, 30);
+        let lines: Vec<&str> = out.lines().map(str::trim_end).collect();
+        assert!(
+            lines[0].is_empty() && lines[1].contains("Read a.rs"),
+            "{out}"
+        );
+        assert!(out.contains("Read d.rs running"), "{out}");
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, 'E');
+        key(&mut app, 'E');
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!screen(&mut app, 80, 30).contains("Read d.rs running"));
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub struct Activity {
     markdown: bool,
     /// Show times in local time rather than the log's UTC.
     local: bool,
+    /// Mark turns: a separator before each prompt and a `turn end` line.
+    turns: bool,
     calls: HashMap<String, Call>,
     /// Ids in start order, so running calls are reported in order.
     order: Vec<String>,
@@ -32,6 +34,7 @@ impl Activity {
         Activity {
             markdown,
             local: false,
+            turns: true,
             calls: HashMap::new(),
             order: Vec::new(),
         }
@@ -40,6 +43,13 @@ impl Activity {
     /// Show times in local time, as `bbs connect` does elsewhere.
     pub fn local_time(mut self) -> Activity {
         self.local = true;
+        self
+    }
+
+    /// Leave out turn markers, the prompt separator and `turn end`, where
+    /// something else shows turn state, as `bbs connect`'s progress mark does.
+    pub fn without_turns(mut self) -> Activity {
+        self.turns = false;
         self
     }
 
@@ -97,12 +107,14 @@ impl Activity {
                 ]));
             }
             "prompt" => {
-                out.push(Line::default());
-                out.extend(styled_parts(vec![
-                    Span::styled("━━ ", style(Role::Accent).bold()),
-                    Span::styled(time.clone(), style(Role::Timestamp)),
-                    Span::styled(" turn ━━", style(Role::Accent).bold()),
-                ]));
+                if self.turns {
+                    out.push(Line::default());
+                    out.extend(styled_parts(vec![
+                        Span::styled("━━ ", style(Role::Accent).bold()),
+                        Span::styled(time.clone(), style(Role::Timestamp)),
+                        Span::styled(" turn ━━", style(Role::Accent).bold()),
+                    ]));
+                }
                 self.block(&mut out, mail_part(text), style(Role::Text));
             }
             "steer" => {
@@ -130,6 +142,7 @@ impl Activity {
                 let line = format!("permission {}", rest(&r));
                 self.timed(&mut out, &time, &line, style(Role::Warning).bold());
             }
+            "turn_end" if !self.turns => {}
             "turn_end" => {
                 let line = format!("turn end ({})", str_field(&r, "stop_reason"));
                 self.timed(&mut out, &time, &line, style(Role::Success).bold());
@@ -422,6 +435,21 @@ mod tests {
              **Done.**\n\
              05:43:10 turn end (end_turn)\n"
         );
+    }
+
+    #[test]
+    fn without_turns_keeps_the_mail_and_drops_only_the_markers() {
+        let prompt = r#"{"ts":"2026-10-16T05:43:05.9Z","event":"prompt","text":"You are Tim.\n\nNew BBS mail (1 message):\n\n[2026-10-16T05:43:05Z] from wbbradley (human) to @g:\nhello\n"}"#;
+        let end = r#"{"ts":"2026-10-16T05:43:10Z","event":"turn_end","stop_reason":"end_turn"}"#;
+        let mut quiet = Activity::new(false).without_turns();
+        assert_eq!(
+            to_ansi(&quiet.render(prompt), false),
+            "[2026-10-16T05:43:05Z] from wbbradley (human) to @g:\nhello\n"
+        );
+        assert!(quiet.render(end).is_empty());
+        // Errors and stops are not turn markers.
+        let error = r#"{"ts":"2026-10-16T05:43:11Z","event":"turn_error","message":"boom"}"#;
+        assert!(to_ansi(&quiet.render(error), false).contains("turn_error: boom"));
     }
 
     #[test]

@@ -6,6 +6,21 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Changed
+
+- The `bbs connect` Agents list puts agents a human has talked with in order
+  of their latest direct message with a human, oldest first, instead of newest
+  first. Ties and agents no human has talked with keep the earlier order.
+- `bbs connect` agent conversations leave out turn markers (the separator
+  before each turn and `turn end`), which the bottom-right progress mark shows;
+  a turn's prompt still shows mail not otherwise in the thread. `bbs headless
+  logs --pretty` is unchanged.
+- Each run of tool calls in a `bbs connect` agent conversation follows one
+  blank line, with the calls on consecutive lines, including calls still
+  running.
+
 ## 0.10.0 - 2026-10-19
 
 Protocol v2, config format 3 and Rust 1.89 remain unchanged. Database schema 17

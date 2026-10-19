@@ -140,8 +140,14 @@ error returns after searching. Draft errors take precedence over preference,
 send, feed and activity errors. Connection details use any remaining space.
 
 The timeline merges, in time order, the agent's messages with its live
-activity: turns, thoughts, tool calls and errors, rendered by the same code as
-`bbs headless logs -f --pretty`, with calls still running shown below. `A`
+activity: thoughts, tool calls and errors, rendered by the same code as
+`bbs headless logs -f --pretty`, with calls still running shown below. Turn
+markers (the separator before a turn and `turn end`) are left out, since the
+progress mark in the bottom bar shows turn state; a turn's prompt still shows
+any mail not otherwise in the thread. Each run of tool calls, the first
+included, follows one blank line (shared with a blank the row before already
+ends with), and calls within a run sit on consecutive lines; so do calls still
+running. `A`
 cycles between everything, messages only and activity only; `E` cycles which
 kinds of activity show. This works for any headless agent on the board that
 shares its activity, wherever it runs: `bbs headless run` sends it to the
@@ -161,8 +167,7 @@ dropped on the next save. Group threads and the Feed keep their usual display.
 Each thing is shown once. An activity `text` record naming the owner mail it
 was delivered as (`mail_id`) gives way to that message while it is loaded in the
 thread, and a `mail` receipt or `steer` naming the mail it echoes (`mail_ids`)
-does too once all of it is loaded; a turn keeps its separator without the
-echoed mail. Whichever stream arrives first, the next update settles it without
+does too once all of it is loaded, as does a turn's echoed mail. Whichever stream arrives first, the next update settles it without
 moving a paused reader. Records without these ids, as older runners write, and
 text whose mail is not loaded always show. This is display only: delivery,
 history and logs are unchanged.
@@ -173,8 +178,9 @@ regardless of display filters. This also
 applies to live arrivals while the conversation is active. Covering it with
 help defers marking until you return; closed conversations do not mark arrivals.
 The Agents list uses the app's shared `WatchAgentSummary` snapshot, which lists every live agent, and
-puts first the agents any human most recently exchanged a direct message with
-(either way; controls, timer messages and broadcasts don't count), newest first.
+puts first the agents any human has exchanged a direct message with (either way;
+controls, timer messages and broadcasts don't count), the longest since their
+latest such message first.
 Ties and agents no human has talked with put the agents with messages to you
 unread first, then those with activity unseen, each oldest first, then the rest; separate INBOX (✉) and ACTIVITY (•)
 columns count unread mail and unseen activity, each capped at 99 and blank at
