@@ -4988,6 +4988,31 @@ mod tests {
     }
 
     #[test]
+    fn a_running_pane_too_small_for_a_call_and_its_blanks_is_not_shown() {
+        let (mut app, mut rx) = app();
+        let (_, act) = mateo_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![
+                activity(1, "01", r#"{"ts":"2026-10-16T18:00:01Z","event":"text","text":"Working."}"#),
+                activity(2, "02", r#"{"ts":"2026-10-16T18:00:02Z","event":"tool","id":"d","title":"Read d.rs","status":"in_progress"}"#),
+            ]),
+        }));
+        assert!(screen(&mut app, 80, 24).contains("Read d.rs running"));
+        // A composer allowed the whole height, grown by a long draft, leaves
+        // the timeline too little for the pane's share to hold a call.
+        app.ctx.composer_max_height_percent = 100;
+        for n in 0..30 {
+            typed(&mut app, &format!("draft {n}"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+        }
+        let out = screen(&mut app, 80, 24);
+        assert!(!out.contains("running"), "{out}");
+        // The timeline then ends as it would with no pane: no bare blank pane.
+        assert!(out.contains("draft 29"), "{out}");
+    }
+
+    #[test]
     fn raw_feed_gaps_show_one_warning_and_overlaps_none() {
         {
             let (mut app, mut rx) = app();

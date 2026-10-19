@@ -1047,14 +1047,15 @@ impl Thread {
         // Calls still running continue a run the timeline ends with, or open
         // one with a blank line above; either way one blank line closes the
         // run below them, kept within the pane's share of the height.
+        // No pane at all where its share cannot hold one call and its blanks.
         let mut running = Vec::new();
-        if !calls.is_empty() {
-            let open = crate::connect::timeline::opens_run(self.view.rows.last());
-            let room = usize::from(body.height / 3).saturating_sub(usize::from(open) + 1);
+        let open = crate::connect::timeline::opens_run(self.view.rows.last());
+        let room = usize::from(body.height / 3).saturating_sub(usize::from(open) + 1);
+        if !calls.is_empty() && room > 0 {
             if open {
                 running.push(Line::default());
             }
-            running.extend(calls.into_iter().take(room.max(1)));
+            running.extend(calls.into_iter().take(room));
             running.push(Line::default());
         }
         self.view.set_continued(!running.is_empty());
