@@ -184,6 +184,28 @@ impl Drop for Bbs {
 }
 
 #[test]
+fn bare_bbs_outside_a_terminal_prints_usage_without_side_effects() {
+    let home = std::env::temp_dir().join(format!("bbs-test-{}-bare", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_bbs"))
+        .env("HOME", &home)
+        .env("BBS_SERVER", "127.0.0.1:1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Usage:"), "{err}");
+    assert!(
+        !home.join("bbs.log").exists(),
+        "no log file: {}",
+        home.display()
+    );
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
 fn requires_init() {
     let home = std::env::temp_dir().join(format!("bbs-test-{}-noinit", std::process::id()));
     std::fs::create_dir_all(&home).unwrap();
@@ -3449,12 +3471,11 @@ fn connect_is_for_humans_at_a_terminal(mode: Mode) {
     let (_, token) = bbs.register();
     let err = bbs.err(&["--token", &token, "connect"]);
     assert!(err.contains("bbs connect is for humans"), "{err}");
-    // Bare `bbs` dispatches to the same connect path as the explicit command:
-    // both terminate without a terminal, with the same diagnostic.
-    for args in [&["connect"][..], &[][..]] {
-        let err = bbs.err(args);
-        assert!(err.contains("bbs connect needs a terminal"), "{err}");
-    }
+    let err = bbs.err(&["connect"]);
+    assert!(err.contains("bbs connect needs a terminal"), "{err}");
+    // Bare `bbs` outside a terminal never reaches connect: usage, exit 2.
+    let err = bbs.err(&[]);
+    assert!(err.contains("Usage:"), "{err}");
 }
 
 fn control_messages_are_for_owned_agents_only(mode: Mode) {

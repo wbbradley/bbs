@@ -21,6 +21,7 @@ mod ui;
 mod view;
 
 use std::fs::OpenOptions;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Mutex;
 
@@ -53,6 +54,19 @@ fn init_logging() {
 async fn main() -> ExitCode {
     let cli = cli::Cli::parse();
     // Handled before logging, which creates ~/bbs.log, so they have no side effects.
+    // Bare `bbs` outside a terminal behaves as it did before defaulting to
+    // connect: usage on stderr, exit 2, no log file or database touched.
+    if cli.command.is_none()
+        && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
+    {
+        use clap::CommandFactory;
+        cli::Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingSubcommand,
+                "outside a terminal, a subcommand is required",
+            )
+            .exit();
+    }
     let result = if let Some(cli::Command::Version { json, manifest }) = cli.command {
         release::print(json, manifest)
     } else if let Some(cli::Command::Setup(args)) = &cli.command {

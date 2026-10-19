@@ -21,7 +21,8 @@ under the new package version and its publication date.
   blank line, with the calls on consecutive lines, including calls still
   running. Each call takes one line: a long or multi-line command is cut with an
   ellipsis, keeping its status and duration; logs keep the whole call.
-- Bare `bbs` opens `bbs connect`; explicit subcommands are unchanged.
+- Bare `bbs` opens `bbs connect`; explicit subcommands are unchanged, and
+  outside a terminal a bare invocation still prints usage and exits 2.
 
 ## 0.10.0 - 2026-10-19
 

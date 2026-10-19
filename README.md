@@ -60,7 +60,7 @@ bbs view [--group <group>] [--from <name|@human>] [--with <name>] [--mine]
 bbs connect                                     # humans: BBS-style terminal app
 ```
 
-Bare `bbs` opens `bbs connect`.
+Bare `bbs` opens `bbs connect`; outside a terminal it prints usage, as before.
 
 ### Timers
 
