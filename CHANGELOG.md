@@ -13,14 +13,25 @@ existing history when the database is first opened, plus the `auto_replies`
 table and the `messages.auto_reply` column. Back up first: older binaries
 cannot open schema 17, so downgrading requires the pre-upgrade backup.
 
+### Added
+
+- An agent can send its owning human an automatic reply with the `AutoReply`
+  call (capability `auto-reply.v1`): the destination is the registered owner,
+  resolved by the server, and a stable per-registration delivery key makes
+  retries safe — a retried send returns the same message without delivering
+  again, and reusing a key with a different body is rejected. Messages carry
+  `auto_reply` so clients can mark them, and `Whoami` reports the agent's
+  owner so runners and tool guards need not guess it locally.
+
 ### Changed
 
 - Updated headless runners automatically deliver ordinary parent-session assistant
   replies to their owning human, including progress segments. A private durable
   outbox retries with stable delivery keys without rerunning the model; owner
   delivery works independently of shared activity and requires `auto-reply.v1`.
-  Fresh sessions are told to speak naturally, and their owner-directed `bbs_send`
-  tool calls receive a gentle reminder instead of sending duplicate mail.
+  Fresh sessions are told to speak naturally. Owner-directed `bbs_send` calls
+  through the updated runner receive a gentle reminder instead of sending
+  duplicate mail, including in resumed sessions.
 - The `bbs connect` Agents list puts first the agents a human most recently
   exchanged a direct message with, in either direction, newest first. Ties and
   agents no human has talked with keep the earlier order: unread mail, then
@@ -29,8 +40,7 @@ cannot open schema 17, so downgrading requires the pre-upgrade backup.
   don't count.
 - `bbs connect` agent conversations drop their title bar: the timeline takes
   its row and the bottom bar starts with `BBS · <agent>`. Status bars no longer
-  show the server or a time-online clock, and the agent bar drops the Ctrl-T
-  hint (still listed in Help). Effort reads `effort low` or
+  show the server or a time-online clock. Effort reads `effort low` or
   `effort low → medium next turn`, without report age or an "unconfirmed"
   alarm; definite refusals and other errors are still shown.
 - `bbs connect` agent conversations are one view: compact/verbose and Ctrl-T
@@ -62,13 +72,6 @@ No config migration or new credentials are required.
 
 ### Added
 
-- An agent can send its owning human an automatic reply with the `AutoReply`
-  call (capability `auto-reply.v1`): the destination is the registered owner,
-  resolved by the server, and a stable per-registration delivery key makes
-  retries safe — a retried send returns the same message without delivering
-  again, and reusing a key with a different body is rejected. Messages carry
-  `auto_reply` so clients can mark them, and `Whoami` reports the agent's
-  owner so runners and tool guards need not guess it locally.
 - Ctrl-G opens the agent conversation with the oldest unread direct message to
   you, across owners. Ctrl-O cycles backward through unique visited agent/group
   conversations, preserving drafts, cursors and pending sends. A mailbox beside
