@@ -41,6 +41,7 @@ pub trait Row: PartialEq {
         0
     }
     /// Content of that margin, in display-line order at the inner width.
+    /// A line's background also fills the corresponding full-width row.
     fn gutter(&self, _gap: bool, _query: Option<&str>, _width: u16) -> Vec<Line<'_>> {
         Vec::new()
     }
@@ -448,21 +449,36 @@ impl<R: Row> ThreadView<R> {
                 row_area.height,
             );
             let scroll = (visible_start - start).min(u16::MAX as usize) as u16;
+            let mut gutter = row.gutter(
+                self.gaps.contains(&row.key()),
+                self.query.as_deref(),
+                content_area.width,
+            );
+            if row.spaced_after(i.checked_sub(1).map(|j| &self.rows[j])) {
+                gutter.insert(0, Line::default());
+            }
             let paragraph =
                 Paragraph::new(self.row_lines(i, self.query.as_deref(), content_area.width))
                     .style(row.style())
                     .wrap(Wrap { trim: false })
                     .scroll((scroll, 0));
             frame.render_widget(paragraph, content_area);
-            if inset > 0 {
-                let mut gutter = row.gutter(
-                    self.gaps.contains(&row.key()),
-                    self.query.as_deref(),
-                    content_area.width,
-                );
-                if row.spaced_after(i.checked_sub(1).map(|j| &self.rows[j])) {
-                    gutter.insert(0, Line::default());
+            // Extend the gutter's background across the row without changing
+            // participant colors or the text's search modifiers.
+            for (y, line) in gutter
+                .iter()
+                .skip(scroll as usize)
+                .take(row_area.height as usize)
+                .enumerate()
+            {
+                if let Some(bg) = line.style.bg {
+                    frame.render_widget(
+                        Block::new().style(Style::default().bg(bg)),
+                        Rect::new(row_area.x, row_area.y + y as u16, row_area.width, 1),
+                    );
                 }
+            }
+            if inset > 0 {
                 frame.render_widget(
                     Paragraph::new(gutter)
                         .style(row.style())

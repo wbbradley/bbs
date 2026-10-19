@@ -879,6 +879,21 @@ mod tests {
                         .unwrap()
                 );
                 assert_eq!(buf[(0, header + 1)].symbol(), " ");
+                let header_bg = theme::base()
+                    .patch(theme::style(theme::Role::OtherConversationHeader))
+                    .bg
+                    .unwrap();
+                let header_rows = view.rows[0].gutter(true, None, width - 2).len();
+                for y in header..header_rows as u16 {
+                    let mut x = 0;
+                    while x < width {
+                        assert_eq!(buf[(x, y)].bg, header_bg, "wrapped header at {x},{y}");
+                        // TestBackend clears the hidden continuation cells of
+                        // wide glyphs; the displayed glyph supplies their style.
+                        x += unicode_width::UnicodeWidthStr::width(buf[(x, y)].symbol()).max(1)
+                            as u16;
+                    }
+                }
                 assert_eq!(
                     buf[(0, header + 1)].bg,
                     theme::base()
@@ -895,6 +910,12 @@ mod tests {
                     .unwrap();
                 terminal.draw(|f| view.render(f, f.area())).unwrap();
                 assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+                let mut x = 0;
+                while x < width {
+                    let cell = &terminal.backend().buffer()[(x, 0)];
+                    assert_eq!(cell.bg, header_bg);
+                    x += unicode_width::UnicodeWidthStr::width(cell.symbol()).max(1) as u16;
+                }
                 assert_eq!(
                     terminal.backend().buffer()[(0, 0)].bg,
                     theme::base()
@@ -902,6 +923,67 @@ mod tests {
                         .bg
                         .unwrap()
                 );
+            });
+        }
+    }
+
+    #[test]
+    fn side_header_background_fills_the_row_without_recoloring_body_or_search() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        use ratatui::style::Modifier;
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let side = Entry::Message {
+                    message: Message {
+                        id: 1,
+                        from_name: "Jefe".into(),
+                        from_kind: proto::Kind::Agent.into(),
+                        to_name: Some("John".into()),
+                        body: "side body".into(),
+                        ..Default::default()
+                    },
+                    headerless: false,
+                    recipient: Some(proto::Kind::Agent),
+                    outgoing: false,
+                    other_participants: true,
+                    gap: false,
+                };
+                let mut view = ThreadView::new(vec![side], 100);
+                view.set_query("jefe");
+                for width in [80, 120] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(Block::new().style(theme::base()), f.area());
+                            view.render(f, f.area());
+                        })
+                        .unwrap();
+                    let buf = terminal.backend().buffer();
+                    for (y, role) in [
+                        theme::Role::Screen,
+                        theme::Role::OtherConversationHeader,
+                        theme::Role::OtherConversation,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let bg = theme::base().patch(theme::style(role)).bg.unwrap();
+                        for x in 0..width {
+                            assert_eq!(buf[(x, y as u16)].bg, bg, "{x},{y}");
+                        }
+                    }
+                    assert_eq!(buf[(0, 1)].symbol(), "•");
+                    assert_eq!(buf[(2, 1)].symbol(), "J");
+                    assert!(buf[(2, 1)].modifier.contains(Modifier::REVERSED));
+                    assert_eq!(
+                        buf[(2, 1)].fg,
+                        theme::base()
+                            .patch(theme::style(theme::Role::Agent))
+                            .fg
+                            .unwrap()
+                    );
+                    assert_eq!(buf[(2, 2)].symbol(), "s");
+                }
             });
         }
     }

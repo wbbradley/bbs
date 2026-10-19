@@ -13,6 +13,9 @@ under the new package version and its publication date.
 - `bbs connect` reads terminal input only while its UI is active, so it cannot
   swallow the shell's next keystroke during cleanup.
 
+- Side-conversation headers fill the full row with their stronger background,
+  including wrapped headers and the space after the participant names.
+
 - `bbs connect` reconnects its message, activity and agent-summary streams
   after a temporary connection failure, including laptop sleep. Activity resumes
   after the last received record. Failed sends are not automatically retried.

@@ -4606,16 +4606,9 @@ mod tests {
                 } else {
                     base
                 };
-                // The attribution text has the stronger tint; unused cells
-                // keep the quiet message surface rather than a bright bar.
-                let end = unicode_width::UnicodeWidthStr::width(header.trim_end()) as u16;
-                assert!((0..end).all(|x| buffer[(x, first - 1)].bg == header_style.bg.unwrap()));
-                assert!((end..80).all(|x| buffer[(x, first - 1)].bg
-                    == if conversation {
-                        other.bg.unwrap()
-                    } else {
-                        base.bg.unwrap()
-                    }));
+                // The stronger tint fills the attribution row, including the
+                // unused columns; ordinary feed headers keep their background.
+                assert!((0..80).all(|x| buffer[(x, first - 1)].bg == header_style.bg.unwrap()));
                 if conversation && crate::ui::theme::current() != Scheme::NoColor {
                     assert_ne!(header_style.bg, other.bg);
                 }
