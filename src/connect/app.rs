@@ -4957,7 +4957,13 @@ mod tests {
         assert!(lines[done + 1].contains("… Read r0.rs running"), "{out}");
         // More calls than the pane holds: it keeps its closing blank anyway.
         let last = lines.iter().rposition(|l| l.contains(" running")).unwrap();
-        assert!(lines[last + 1].is_empty(), "{out}");
+        let prompt = lines.iter().rposition(|l| l.starts_with('›')).unwrap();
+        // The pane's closing blank, then the composer's own padding row.
+        assert_eq!(prompt, last + 3, "{out}");
+        assert!(
+            lines[last + 1].is_empty() && lines[last + 2].is_empty(),
+            "{out}"
+        );
         assert!(
             !out.contains("Read r11.rs"),
             "the pane holds only a third: {out}"
