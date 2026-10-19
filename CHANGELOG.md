@@ -8,6 +8,12 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Fixed
+
+- Opening an agent conversation holds partial history out of view until mail
+  and activity have caught up, avoiding replay flicker. The composer stays
+  usable, and available content appears after at most two seconds if loading stalls.
+
 ### Changed
 
 - Side-message headers show just sender and recipient, without owner suffixes

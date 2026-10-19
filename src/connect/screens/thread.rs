@@ -4,7 +4,7 @@
 //! group threads the admin dialogs.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -30,6 +30,9 @@ use crate::ui::thread::{MAX_ROWS, ThreadView};
 /// Messages each feed snapshot holds, as for `bbs view`.
 const BACKLOG: u32 = 200;
 
+/// Bound the initial display hold without timing out either subscription.
+const INITIAL_LOAD_GRACE: Duration = Duration::from_secs(2);
+
 pub struct Thread {
     title: String,
     id: u64,
@@ -37,6 +40,9 @@ pub struct Thread {
     view: ThreadView<Entry>,
     /// Every message received, so another `show` can rebuild the view.
     messages: Vec<Message>,
+    feed_loaded: bool,
+    /// Hold only the initial presentation; all incoming data is still processed.
+    opening_until: Option<Instant>,
     /// Raw feed boundaries that may have skipped messages.
     message_gaps: BTreeSet<i64>,
     show: Show,
@@ -75,6 +81,8 @@ impl Thread {
             },
             view: ThreadView::new(Vec::new(), BACKLOG as usize),
             messages: Vec::new(),
+            feed_loaded: false,
+            opening_until: None,
             message_gaps: BTreeSet::new(),
             show: Show::All,
             human: None,
@@ -110,6 +118,7 @@ impl Thread {
         thread.composing = true;
         thread.human = Some(human.to_string());
         thread.stream = Some(Stream::new(agent));
+        thread.opening_until = Some(now() + INITIAL_LOAD_GRACE);
         thread.now = now;
         thread
     }
@@ -744,6 +753,8 @@ impl Screen for Thread {
             let cancel = stream.unwatch();
             stream.reset();
             self.seen = 0;
+            self.feed_loaded = false;
+            self.opening_until = Some((self.now)() + INITIAL_LOAD_GRACE);
             self.rebuild();
             return vec![cancel];
         }
@@ -757,8 +768,11 @@ impl Screen for Thread {
     }
 
     fn next_animation_frame(&self) -> Option<Instant> {
-        let stream = self.stream.as_ref()?;
-        stream.next_frame_at((self.now)())
+        let animation = self
+            .stream
+            .as_ref()
+            .and_then(|s| s.next_frame_at((self.now)()));
+        animation.into_iter().chain(self.opening_until).min()
     }
 
     fn save_draft(&mut self, drafts: &mut HashMap<String, Composer>) {
@@ -800,6 +814,7 @@ impl Screen for Thread {
         match data {
             Data::Feed { id, result } if *id == self.id => match result {
                 Ok(messages) => {
+                    self.feed_loaded = true;
                     self.error = None;
                     let held: HashSet<i64> = self.messages.iter().map(|m| m.id).collect();
                     let mut changed: Vec<i64> = messages
@@ -849,6 +864,11 @@ impl Screen for Thread {
                 }
             }
             _ => {}
+        }
+        if self.error.is_some()
+            || (self.feed_loaded && self.stream.as_ref().is_some_and(Stream::history_ready))
+        {
+            self.opening_until = None;
         }
     }
 
@@ -1062,6 +1082,15 @@ impl Thread {
             ];
             frame.render_widget(Paragraph::new(text), body);
             return;
+        }
+        if let Some(deadline) = self.opening_until {
+            if (self.now)() < deadline {
+                frame.render_widget(Paragraph::new(Line::styled("Loading…", theme::dim())), body);
+                return;
+            }
+            // A slow stream must not keep usable messages or the editor hidden.
+            // Once released, later batches update normally without another hold.
+            self.opening_until = None;
         }
         // Lay out first, so the status line reflects this frame.
         self.view.layout(body.width, body.height as usize);

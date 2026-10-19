@@ -274,6 +274,9 @@ pub struct Stream {
     renderer: Activity,
     /// A batch has arrived, so no records means nothing is shared.
     pub loaded: bool,
+    /// Startup replay ends at the newest id sampled before subscribing.
+    history_end: Option<i64>,
+    history_ready: bool,
     /// The stream's last error; it has ended until a reload.
     pub error: Option<String>,
     progress: ProgressState,
@@ -324,6 +327,8 @@ impl Stream {
             records: VecDeque::new(),
             renderer: Activity::new(true).local_time().without_turns(),
             loaded: false,
+            history_end: None,
+            history_ready: false,
             error: None,
             progress: ProgressState::default(),
             drawn: HashSet::new(),
@@ -353,6 +358,10 @@ impl Stream {
             kinds: self.kinds,
             ..Stream::new(&self.agent)
         };
+    }
+
+    pub fn history_ready(&self) -> bool {
+        self.history_ready || self.error.is_some()
     }
 
     pub fn progress(&self, now: Instant) -> Progress {
@@ -461,6 +470,7 @@ impl Stream {
         } = data
             && *id == self.id
         {
+            self.history_end = Some(*through_id);
             self.progress.baseline(*through_id, record.as_deref());
         }
         let Data::Activity { id, result } = data else {
@@ -475,6 +485,10 @@ impl Stream {
                     self.progress.observe(event.id, &event.record, now);
                 }
                 self.loaded = true;
+                self.history_ready |= events.len() < BACKLOG as usize
+                    || events
+                        .last()
+                        .is_some_and(|row| row.id >= self.history_end.unwrap_or(0));
                 self.error = None;
                 let kept: Vec<_> = events.iter().map(Kept::new).collect();
                 let entries = kept.iter().filter_map(|k| self.entry(k, loaded)).collect();
@@ -514,6 +528,56 @@ mod tests {
         style::Modifier,
         widgets::{Block, Paragraph, Wrap},
     };
+
+    #[test]
+    fn initial_history_handles_empty_short_and_crossed_boundary_batches() {
+        for (through, count, end, ready) in [
+            (0, 0, 0, true),
+            (500, 199, 499, true),
+            (500, 200, 400, false),
+            (500, 200, 501, true),
+        ] {
+            let mut stream = Stream::new("Mateo");
+            let now = Instant::now();
+            stream.on_data(
+                &Data::ActivityBaseline {
+                    id: stream.id,
+                    through_id: through,
+                    record: None,
+                },
+                now,
+                &Loaded::new(),
+            );
+            // Another subscription must not release this one's history gate.
+            stream.on_data(
+                &Data::Activity {
+                    id: stream.id + 1,
+                    result: Ok(vec![]),
+                },
+                now,
+                &Loaded::new(),
+            );
+            assert!(!stream.history_ready());
+            let rows = (0..count)
+                .map(|i| proto::Activity {
+                    id: end - count + i + 1,
+                    record: r#"{"event":"thought","text":"history"}"#.into(),
+                    ..Default::default()
+                })
+                .collect();
+            stream.on_data(
+                &Data::Activity {
+                    id: stream.id,
+                    result: Ok(rows),
+                },
+                now,
+                &Loaded::new(),
+            );
+            assert_eq!(stream.history_ready(), ready);
+            stream.reset();
+            assert!(!stream.history_ready());
+        }
+    }
 
     #[test]
     fn reasoning_drops_leading_whitespace_but_keeps_paragraphs_and_raw_logs() {

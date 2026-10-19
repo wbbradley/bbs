@@ -2510,7 +2510,11 @@ mod tests {
         };
         assert_eq!(req.backlog, 200);
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
-        assert!(screen(&mut app, 80, 24).contains("No messages yet"));
+        assert!(screen(&mut app, 80, 24).contains("Loading…"));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![]),
+        }));
         app.on_event(Event::Data(Data::Feed {
             id,
             result: Ok(vec![
@@ -3038,6 +3042,21 @@ mod tests {
     /// The agent thread for Mateo, with its feed stream's id.
     /// Open Mateo's thread; returns its feed stream and its activity stream.
     fn mateo_streams(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> (u64, u64) {
+        let (feed, activity) = mateo_loading_streams(app, rx);
+        // Most fixtures exercise a loaded conversation. Startup has its own
+        // multi-batch tests through mateo_loading_streams.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![]),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: activity,
+            result: Ok(vec![]),
+        }));
+        (feed, activity)
+    }
+
+    fn mateo_loading_streams(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> (u64, u64) {
         open_agents(app, rx);
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
             humans: Vec::new(),
@@ -3052,6 +3071,177 @@ mod tests {
             }
             other => panic!("expected an activity watch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn opening_conversation_waits_for_both_sources_and_the_history_boundary() {
+        for feed_first in [false, true] {
+            let (mut app, mut rx) = app();
+            let (_, now) = test_clock();
+            app.ctx.now = now;
+            let (feed, act) = mateo_loading_streams(&mut app, &mut rx);
+            typed(&mut app, "draft stays usable");
+            let initial = screen(&mut app, 80, 24);
+            assert!(initial.contains("Loading…") && initial.contains("draft stays usable"));
+            app.on_event(Event::Data(Data::ActivityBaseline {
+                id: act,
+                through_id: 400,
+                record: Some(r#"{"event":"turn_end"}"#.into()),
+            }));
+            let mail = || Data::Feed {
+                id: feed,
+                result: Ok(vec![message(7, "Mateo", "ada", "canonical reply")]),
+            };
+            if feed_first {
+                app.on_event(Event::Data(mail()));
+            }
+            let mut first: Vec<_> = (1..=200)
+                .map(|id| {
+                    activity(
+                        id,
+                        "2026-10-19T12:00:00Z",
+                        r#"{"event":"thought","text":"old history"}"#,
+                    )
+                })
+                .collect();
+            first[199] = activity(
+                200,
+                "2026-10-19T12:00:00Z",
+                r#"{"event":"tool","id":"read","title":"historical read","status":"in_progress"}"#,
+            );
+            app.on_event(Event::Data(Data::Activity {
+                id: act,
+                result: Ok(first),
+            }));
+            let middle = screen(&mut app, 80, 24);
+            assert!(middle.contains("Loading…"), "{middle}");
+            assert!(
+                !middle.contains("old history")
+                    && !middle.contains("historical read")
+                    && !middle.contains("canonical reply")
+            );
+            let mut last: Vec<_> = (201..=400).map(|id| activity(id, "2026-10-19T12:00:01Z", r#"{"event":"tool","id":"read","title":"historical read","status":"completed"}"#)).collect();
+            last[199] = activity(400, "2026-10-19T12:00:02Z", r#"{"event":"turn_end"}"#);
+            app.on_event(Event::Data(Data::Activity {
+                id: act,
+                result: Ok(last),
+            }));
+            if !feed_first {
+                assert!(screen(&mut app, 80, 24).contains("Loading…"));
+                app.on_event(Event::Data(mail()));
+            }
+            let loaded = screen(&mut app, 80, 24);
+            assert!(
+                !loaded.contains("Loading…") && !loaded.contains("running"),
+                "{loaded}"
+            );
+            assert!(loaded.contains("draft stays usable"));
+            app.on_event(Event::Data(Data::Activity {
+                id: act,
+                result: Ok(vec![activity(
+                    401,
+                    "2026-10-19T12:00:03Z",
+                    r#"{"event":"thought","text":"live update"}"#,
+                )]),
+            }));
+            let live = screen(&mut app, 80, 24);
+            assert!(
+                live.contains("live update") && !live.contains("Loading…"),
+                "{live}"
+            );
+        }
+    }
+
+    #[test]
+    fn opening_conversation_releases_empty_failed_or_stalled_history() {
+        for outcome in ["empty", "error", "stall"] {
+            let (mut app, mut rx) = app();
+            let (clock, now) = test_clock();
+            app.ctx.now = now;
+            let (feed, act) = mateo_loading_streams(&mut app, &mut rx);
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(vec![message(1, "Mateo", "ada", "usable mail")]),
+            }));
+            match outcome {
+                "empty" => {
+                    app.on_event(Event::Data(Data::ActivityBaseline {
+                        id: act,
+                        through_id: 0,
+                        record: None,
+                    }));
+                    app.on_event(Event::Data(Data::Activity {
+                        id: act,
+                        result: Ok(vec![]),
+                    }));
+                }
+                "error" => {
+                    app.on_event(Event::Data(Data::Activity {
+                        id: act,
+                        result: Err("activity unavailable".into()),
+                    }));
+                }
+                _ => {
+                    assert!(screen(&mut app, 80, 24).contains("Loading…"));
+                    assert!(app.next_animation_frame().is_some());
+                    clock.advance(Duration::from_secs(2));
+                }
+            }
+            let out = screen(&mut app, 80, 24);
+            assert!(
+                out.contains("usable mail") && !out.contains("Loading…"),
+                "{out}"
+            );
+            assert!(app.next_animation_frame().is_none());
+        }
+    }
+
+    #[test]
+    fn initial_display_hold_expires_even_when_the_feed_stalls_and_resets_on_reload() {
+        let (mut app, mut rx) = app();
+        let (clock, now) = test_clock();
+        app.ctx.now = now;
+        let (feed, act) = mateo_loading_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![activity(
+                1,
+                "01",
+                r#"{"event":"thought","text":"available activity"}"#,
+            )]),
+        }));
+        assert!(screen(&mut app, 80, 24).contains("Loading…"));
+        clock.advance(Duration::from_secs(2));
+        assert!(screen(&mut app, 80, 24).contains("available activity"));
+        // Later events do not re-enter the hold.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![]),
+        }));
+        assert!(!screen(&mut app, 80, 24).contains("Loading…"));
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        while rx.try_recv().is_ok() {}
+        key(&mut app, 'r');
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(act));
+        assert_eq!(watched(&mut rx).0, feed);
+        let Request::WatchActivity { id: fresh, .. } = rx.try_recv().unwrap() else {
+            panic!("activity watch")
+        };
+        assert!(screen(&mut app, 80, 24).contains("Loading…"));
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![]),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![]),
+        }));
+        assert!(screen(&mut app, 80, 24).contains("Loading…"));
+        app.on_event(Event::Data(Data::Activity {
+            id: fresh,
+            result: Ok(vec![]),
+        }));
+        assert!(!screen(&mut app, 80, 24).contains("Loading…"));
     }
 
     fn mateo(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> u64 {
@@ -3946,7 +4136,7 @@ mod tests {
         assert_ne!(new_act, act);
         let out = screen(&mut app, 100, 24);
         assert!(
-            !out.contains("reply sent") && out.contains("a request"),
+            !out.contains("reply sent") && out.contains("Loading…"),
             "{out}"
         );
         // Closing the thread stops both.
@@ -5240,7 +5430,11 @@ mod tests {
     #[test]
     fn activity_alone_says_when_nothing_is_shared_or_the_server_is_old() {
         let (mut app, mut rx) = app();
-        let (_, act) = mateo_streams(&mut app, &mut rx);
+        let (feed, act) = mateo_loading_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![]),
+        }));
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         key(&mut app, 'A');
         key(&mut app, 'A');
@@ -5328,7 +5522,11 @@ mod tests {
         while rx.try_recv().is_ok() {}
         key(&mut app, 'r');
         assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(act));
-        watched(&mut rx);
+        let (feed, _) = watched(&mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![]),
+        }));
         let Request::WatchActivity { id: act, .. } = rx.try_recv().unwrap() else {
             panic!("expected replacement activity watch");
         };

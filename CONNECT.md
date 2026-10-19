@@ -37,6 +37,9 @@ several separate `bbs group` commands.
   and menus. A status bar fills the whole bottom line with the signed-in human.
   Agent conversations have no title bar: their bottom bar starts with
   `BBS · <agent>` and carries timeline state and feedback.
+  Initial mail and activity history assemble behind a single loading notice;
+  the composer remains usable. After two seconds, partial content is shown
+  even if a subscription is slow, and later updates appear normally.
 - Structured agent names use Agent blue, human names Human purple, groups Group
   yellow, timestamps Timestamp muted gray, and tool labels Tool technical text in
   Gruvbox. Terminal and No color keep the same semantic roles. Qualified names
