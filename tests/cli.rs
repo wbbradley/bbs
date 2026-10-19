@@ -3449,8 +3449,12 @@ fn connect_is_for_humans_at_a_terminal(mode: Mode) {
     let (_, token) = bbs.register();
     let err = bbs.err(&["--token", &token, "connect"]);
     assert!(err.contains("bbs connect is for humans"), "{err}");
-    let err = bbs.err(&["connect"]);
-    assert!(err.contains("bbs connect needs a terminal"), "{err}");
+    // Bare `bbs` dispatches to the same connect path as the explicit command:
+    // both terminate without a terminal, with the same diagnostic.
+    for args in [&["connect"][..], &[][..]] {
+        let err = bbs.err(args);
+        assert!(err.contains("bbs connect needs a terminal"), "{err}");
+    }
 }
 
 fn control_messages_are_for_owned_agents_only(mode: Mode) {
