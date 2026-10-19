@@ -60,6 +60,8 @@ bbs view [--group <group>] [--from <name|@human>] [--with <name>] [--mine]
 bbs connect                                     # humans: BBS-style terminal app
 ```
 
+Bare `bbs` opens `bbs connect`.
+
 ### Timers
 
 `bbs timer add` sets a timer: when it comes due, the server sends its text to the agent as a direct message from whoever set it, marked `(timer N)` in `bbs read` (and `"timer": N` with `--json`). `<when>` is one of:

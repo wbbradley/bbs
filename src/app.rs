@@ -29,8 +29,17 @@ pub(crate) fn display_time(stored: &str) -> String {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    let theme_explicit = crate::ui::theme::init(cli.theme.as_deref())?;
-    let dir = match &cli.command {
+    let notice = wants_update_notice(&cli);
+    let Cli {
+        theme,
+        token,
+        as_human,
+        command,
+    } = cli;
+    // Bare `bbs` opens connect; explicit subcommands behave exactly as before.
+    let command = command.unwrap_or(Command::Connect);
+    let theme_explicit = crate::ui::theme::init(theme.as_deref())?;
+    let dir = match &command {
         Command::Serve {
             state_dir: Some(dir),
             ..
@@ -45,7 +54,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         } => dir.clone(),
         _ => state_dir()?,
     };
-    match &cli.command {
+    match &command {
         Command::Init {
             server,
             human,
@@ -56,16 +65,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                 server,
                 human,
                 *human_token_stdin,
-                cli.as_human.as_deref(),
+                as_human.as_deref(),
             )
             .await;
         }
         Command::Hook { harness } => return crate::hook::run(*harness, &dir).await,
         Command::Headless { .. } => {
-            let Command::Headless { command } = cli.command else {
+            let Command::Headless { command } = command else {
                 unreachable!()
             };
-            return crate::headless::run(command, &dir, cli.as_human.as_deref()).await;
+            return crate::headless::run(command, &dir, as_human.as_deref()).await;
         }
         Command::Serve {
             listen,
@@ -100,22 +109,22 @@ pub async fn run(cli: Cli) -> Result<()> {
         _ => {}
     }
     let config = Config::load()?;
-    let notice = wants_update_notice(&cli) && std::io::stderr().is_terminal();
+    let notice = notice && std::io::stderr().is_terminal();
     let caller = Caller {
-        token: cli.token.clone(),
-        human: config.human(cli.as_human.as_deref()),
+        token: token.clone(),
+        human: config.human(as_human.as_deref()),
         ..Default::default()
     };
     let mut backend = Backend::open(&config, &dir, caller).await?;
-    match cli.command {
+    match command {
         Command::View(args) => crate::view::run(&mut backend, args).await,
         Command::Connect => {
             let opener = crate::connect::Opener {
                 config: config.clone(),
                 dir: dir.clone(),
                 caller: Caller {
-                    token: cli.token.clone(),
-                    human: config.human(cli.as_human.as_deref()),
+                    token: token.clone(),
+                    human: config.human(as_human.as_deref()),
                     ..Default::default()
                 },
             };
@@ -146,7 +155,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 /// Only humans see the update notice. Agents pass `--token`, except when they
 /// `register`, which runs before they have one.
 fn wants_update_notice(cli: &Cli) -> bool {
-    cli.token.is_none() && !matches!(cli.command, Command::Register { .. })
+    cli.token.is_none() && !matches!(cli.command, Some(Command::Register { .. }))
 }
 
 async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
@@ -702,5 +711,24 @@ mod tests {
         assert!(wants(&["bbs", "group", "register", "g"]));
         assert!(!wants(&["bbs", "--token", "t", "agents"]));
         assert!(!wants(&["bbs", "register"]));
+    }
+
+    #[test]
+    fn bare_invocation_defaults_to_connect_and_flags_keep_semantics() {
+        let cli = Cli::parse_from(["bbs"]);
+        assert!(cli.command.is_none());
+        let cli = Cli::parse_from(["bbs", "--as", "ada", "--theme", "mono"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.as_human.as_deref(), Some("ada"));
+        assert_eq!(cli.theme.as_deref(), Some("mono"));
+        // Explicit subcommands, help and version are unchanged.
+        assert!(matches!(
+            Cli::parse_from(["bbs", "agents"]).command,
+            Some(Command::Agents { .. })
+        ));
+        let help = Cli::try_parse_from(["bbs", "--help"]).unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let version = Cli::try_parse_from(["bbs", "--version"]).unwrap_err();
+        assert_eq!(version.kind(), clap::error::ErrorKind::DisplayVersion);
     }
 }

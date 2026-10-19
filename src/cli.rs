@@ -19,8 +19,9 @@ pub struct Cli {
     #[arg(long = "as", global = true, value_name = "HUMAN")]
     pub as_human: Option<String>,
 
+    /// With no subcommand, open `connect`.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]

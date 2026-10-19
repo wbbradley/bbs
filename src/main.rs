@@ -53,9 +53,9 @@ fn init_logging() {
 async fn main() -> ExitCode {
     let cli = cli::Cli::parse();
     // Handled before logging, which creates ~/bbs.log, so they have no side effects.
-    let result = if let cli::Command::Version { json, manifest } = cli.command {
+    let result = if let Some(cli::Command::Version { json, manifest }) = cli.command {
         release::print(json, manifest)
-    } else if let cli::Command::Setup(args) = &cli.command {
+    } else if let Some(cli::Command::Setup(args)) = &cli.command {
         setup::run(args)
     } else {
         init_logging();
