@@ -924,14 +924,9 @@ pub fn auto_reply(
             bail!("only agents send automatic owner replies");
         }
         validate_delivery_key(&req.key)?;
-        // Unlike an ordinary send, whitespace-only bodies are kept: runners
-        // stream parts whose bytes must survive byte-for-byte.
-        if req.body.is_empty() {
-            bail!("message body is empty");
-        }
-        if req.body.len() > MAX_BODY_BYTES {
-            bail!("message body exceeds {} KiB", MAX_BODY_BYTES / 1024);
-        }
+        // Same validation as an ordinary send: whitespace-only parts carry no
+        // content; the outbox skips them rather than sending blank mail.
+        validate_body(&req.body)?;
         let owner = db::agent_owner_id(ctx.conn, me.id)?
             .ok_or_else(|| anyhow!("{} has no registered owner", me.name))?;
         if let Some((message_id, body, recipient)) =
@@ -2506,12 +2501,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("exceeds"), "{err}");
-        // Whitespace-only bodies are valid streamed parts, kept byte-for-byte.
-        let spaces = reply(&mut conn, "part-1", "  \n ").unwrap();
+        // Whitespace-only bodies are rejected, exactly as an ordinary send;
+        // bodies with content keep their whitespace byte-for-byte.
+        let err = reply(&mut conn, "k", "  \n ").unwrap_err().to_string();
+        assert!(err.contains("empty"), "{err}");
+        let kept = reply(&mut conn, "part-1", "  done \n").unwrap();
         let mail = inbox(&mut conn, &will);
         assert!(mail
             .iter()
-            .any(|m| m.id == spaces.id && m.body == "  \n "));
+            .any(|m| m.id == kept.id && m.body == "  done \n"));
 
         // The destination is the registered owner, resolved server-side.
         let first = reply(&mut conn, "turn-1", "done").unwrap();
