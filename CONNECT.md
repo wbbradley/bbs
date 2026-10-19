@@ -40,6 +40,11 @@ several separate `bbs group` commands.
   Initial mail and activity history assemble behind a single loading notice;
   the composer remains usable. After two seconds, partial content is shown
   even if a subscription is slow, and later updates appear normally.
+  Remote subscriptions reconnect after temporary connection failures, retaining
+  drafts and timeline data. Activity resumes from its last received record;
+  message and summary snapshots refresh. Retries back off from one to thirty
+  seconds; authentication and compatibility errors require attention instead.
+  Failed message sends and administrative actions are never automatically retried.
 - Structured agent names use Agent blue, human names Human purple, groups Group
   yellow, timestamps Timestamp muted gray, and tool labels Tool technical text in
   Gruvbox. Terminal and No color keep the same semantic roles. Qualified names

@@ -158,12 +158,12 @@ pub enum Data {
         result: Result<proto::ListAgentsResponse, String>,
     },
     Groups(Result<proto::GroupListResponse, String>),
-    /// A snapshot of the feed stream `id`. A stream ends after an error.
+    /// A snapshot of the feed stream `id`. Transient remote failures reconnect automatically.
     Feed {
         id: u64,
         result: Result<Vec<proto::Message>, String>,
     },
-    /// A batch of the activity stream `id`. A stream ends after an error.
+    /// A batch of the activity stream `id`. Transient remote failures reconnect automatically.
     Activity {
         id: u64,
         result: Result<Vec<proto::Activity>, String>,
@@ -175,7 +175,7 @@ pub enum Data {
         through_id: i64,
         record: Option<String>,
     },
-    /// Summaries from the stream `id`. A stream ends after an error.
+    /// Summaries from the stream `id`. Transient remote failures reconnect automatically.
     Summary {
         id: u64,
         result: Result<Vec<proto::AgentSummary>, String>,
@@ -431,41 +431,135 @@ async fn admin(backend: &mut Backend, op: Admin) -> anyhow::Result<Notice> {
     })
 }
 
-/// Stream feed `id` until it fails or the app goes away.
-async fn watch(opener: Opener, id: u64, req: proto::FeedRequest, tx: UnboundedSender<Event>) {
-    let result: anyhow::Result<()> = async {
-        let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller).await?;
-        let mut feed = backend.watch_feed(req, false).await?;
-        loop {
-            let result = Ok(feed.next().await?);
-            if tx.send(Event::Data(Data::Feed { id, result })).is_err() {
-                return Ok(());
-            }
+/// Retry only remote read subscriptions. Writes remain single attempts in serve().
+struct Reconnect {
+    remote: bool,
+    delay: Duration,
+}
+
+fn transient_connection(error: &anyhow::Error) -> bool {
+    use tonic::Code;
+    if let Some(status) = error.downcast_ref::<tonic::Status>() {
+        return matches!(
+            status.code(),
+            Code::Unavailable
+                | Code::DeadlineExceeded
+                | Code::Unknown
+                | Code::Internal
+                | Code::Cancelled
+        );
+    }
+    error.downcast_ref::<tonic::transport::Error>().is_some()
+        && !error
+            .chain()
+            .any(|cause| cause.is::<tonic::codegen::http::uri::InvalidUri>())
+}
+
+impl Reconnect {
+    fn new(opener: &Opener) -> Self {
+        Self {
+            remote: opener.config.server.is_some(),
+            delay: Duration::from_secs(1),
         }
     }
-    .await;
-    if let Err(e) = result {
-        let result = Err(format!("{e:#}"));
-        let _ = tx.send(Event::Data(Data::Feed { id, result }));
+
+    fn received(&mut self) {
+        self.delay = Duration::from_secs(1);
+    }
+
+    async fn after_error(
+        &mut self,
+        error: anyhow::Error,
+        tx: &UnboundedSender<Event>,
+        data: impl FnOnce(String) -> Data,
+    ) -> bool {
+        let retry = self.remote && transient_connection(&error);
+        let text = if retry {
+            format!("Connection interrupted; reconnecting… {error:#}")
+        } else {
+            format!("{error:#}")
+        };
+        if tx.send(Event::Data(data(text))).is_err() || !retry {
+            return false;
+        }
+        let delay = self.delay;
+        self.delay = (self.delay * 2).min(Duration::from_secs(30));
+        tokio::select! {
+            () = tx.closed() => false,
+            () = tokio::time::sleep(delay) => true,
+        }
     }
 }
 
-/// Stream summaries `id` until it fails or the app goes away.
-async fn watch_summary(opener: Opener, id: u64, tx: UnboundedSender<Event>) {
-    let result: anyhow::Result<()> = async {
-        let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller).await?;
-        let mut summaries = backend.watch_agent_summary().await?;
-        loop {
-            let result = Ok(summaries.next().await?);
-            if tx.send(Event::Data(Data::Summary { id, result })).is_err() {
-                return Ok(());
+/// Refresh feed snapshots after a remote interruption, until closed or refused.
+async fn watch(opener: Opener, id: u64, mut req: proto::FeedRequest, tx: UnboundedSender<Event>) {
+    let mut reconnect = Reconnect::new(&opener);
+    loop {
+        let result: anyhow::Result<()> = async {
+            let mut backend =
+                Backend::open(&opener.config, &opener.dir, opener.caller.clone()).await?;
+            let mut feed = backend.watch_feed(req.clone(), false).await?;
+            loop {
+                let messages = feed.next().await?;
+                let newest = messages.iter().map(|m| m.id).max();
+                if tx
+                    .send(Event::Data(Data::Feed {
+                        id,
+                        result: Ok(messages),
+                    }))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                if req.after_id.is_some()
+                    && let Some(newest) = newest
+                {
+                    req.after_id = Some(newest);
+                }
+                reconnect.received();
             }
         }
+        .await;
+        let Err(error) = result else { return };
+        if !reconnect
+            .after_error(error, &tx, |text| Data::Feed {
+                id,
+                result: Err(text),
+            })
+            .await
+        {
+            return;
+        }
     }
-    .await;
-    if let Err(e) = result {
-        let result = Err(format!("{e:#}"));
-        let _ = tx.send(Event::Data(Data::Summary { id, result }));
+}
+
+/// Reopen summaries after a remote interruption; each reply replaces the snapshot.
+async fn watch_summary(opener: Opener, id: u64, tx: UnboundedSender<Event>) {
+    let mut reconnect = Reconnect::new(&opener);
+    loop {
+        let result: anyhow::Result<()> = async {
+            let mut backend =
+                Backend::open(&opener.config, &opener.dir, opener.caller.clone()).await?;
+            let mut summaries = backend.watch_agent_summary().await?;
+            loop {
+                let result = Ok(summaries.next().await?);
+                if tx.send(Event::Data(Data::Summary { id, result })).is_err() {
+                    return Ok(());
+                }
+                reconnect.received();
+            }
+        }
+        .await;
+        let Err(error) = result else { return };
+        if !reconnect
+            .after_error(error, &tx, |text| Data::Summary {
+                id,
+                result: Err(text),
+            })
+            .await
+        {
+            return;
+        }
     }
 }
 
@@ -484,44 +578,439 @@ async fn activity_baseline(
     Ok(latest.next().await?.into_iter().next())
 }
 
-/// Stream activity `id` until it fails or the app goes away.
+/// Resume activity after the last delivered id, with a fresh history watermark.
 async fn watch_activity(
     opener: Opener,
     id: u64,
-    req: proto::ActivityRequest,
+    mut req: proto::ActivityRequest,
     tx: UnboundedSender<Event>,
 ) {
-    let result: anyhow::Result<()> = async {
-        let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller).await?;
-        let baseline = activity_baseline(&mut backend, &req).await?;
-        if tx
-            .send(Event::Data(Data::ActivityBaseline {
-                id,
-                through_id: baseline.as_ref().map_or(0, |row| row.id),
-                record: baseline.map(|row| row.record),
-            }))
-            .is_err()
-        {
-            return Ok(());
-        }
-        let mut activity = backend.watch_activity(req).await?;
-        loop {
-            let result = Ok(activity.next().await?);
-            if tx.send(Event::Data(Data::Activity { id, result })).is_err() {
+    let mut reconnect = Reconnect::new(&opener);
+    loop {
+        let result: anyhow::Result<()> = async {
+            let mut backend =
+                Backend::open(&opener.config, &opener.dir, opener.caller.clone()).await?;
+            let baseline = activity_baseline(&mut backend, &req).await?;
+            if tx
+                .send(Event::Data(Data::ActivityBaseline {
+                    id,
+                    through_id: baseline.as_ref().map_or(0, |row| row.id),
+                    record: baseline.map(|row| row.record),
+                }))
+                .is_err()
+            {
                 return Ok(());
             }
+            let mut activity = backend.watch_activity(req.clone()).await?;
+            loop {
+                let events = activity.next().await?;
+                let newest = events.last().map(|row| row.id);
+                if tx
+                    .send(Event::Data(Data::Activity {
+                        id,
+                        result: Ok(events),
+                    }))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                if let Some(newest) = newest {
+                    req.after_id = Some(newest);
+                }
+                reconnect.received();
+            }
         }
-    }
-    .await;
-    if let Err(e) = result {
-        let result = Err(format!("{e:#}"));
-        let _ = tx.send(Event::Data(Data::Activity { id, result }));
+        .await;
+        let Err(error) = result else { return };
+        if !reconnect
+            .after_error(error, &tx, |text| Data::Activity {
+                id,
+                result: Err(text),
+            })
+            .await
+        {
+            return;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn reconnect_classifies_codes_without_matching_error_text() {
+        use tonic::Code;
+        for code in [
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+            Code::Unknown,
+            Code::Internal,
+            Code::Cancelled,
+        ] {
+            assert!(transient_connection(&anyhow::Error::new(
+                tonic::Status::new(code, "permission denied")
+            )));
+        }
+        for code in [
+            Code::Unauthenticated,
+            Code::PermissionDenied,
+            Code::FailedPrecondition,
+            Code::Unimplemented,
+            Code::NotFound,
+            Code::InvalidArgument,
+            Code::ResourceExhausted,
+            Code::DataLoss,
+        ] {
+            assert!(!transient_connection(&anyhow::Error::new(
+                tonic::Status::new(code, "h2 connection lost")
+            )));
+        }
+        assert!(!transient_connection(&anyhow::anyhow!(
+            "h2 connection lost"
+        )));
+        let invalid =
+            tonic::transport::Endpoint::from_shared("http://bad host".to_string()).unwrap_err();
+        assert!(!transient_connection(&anyhow::Error::new(invalid)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_backoff_is_capped_resettable_and_cancelled_when_closed() {
+        let (_dir, _conn, mut opener, _) = board();
+        opener.config.server = Some("localhost:1".into());
+        let mut reconnect = Reconnect::new(&opener);
+        let (tx, mut rx) = unbounded_channel();
+        for seconds in [1, 2, 4, 8, 16, 30, 30] {
+            let before = tokio::time::Instant::now();
+            assert!(
+                reconnect
+                    .after_error(tonic::Status::unavailable("offline").into(), &tx, |e| {
+                        Data::Summary {
+                            id: 1,
+                            result: Err(e),
+                        }
+                    })
+                    .await
+            );
+            assert_eq!(before.elapsed(), Duration::from_secs(seconds));
+            assert!(matches!(
+                rx.recv().await,
+                Some(Event::Data(Data::Summary { result: Err(_), .. }))
+            ));
+        }
+        reconnect.received();
+        assert_eq!(reconnect.delay, Duration::from_secs(1));
+        // An Unwatch aborts the task; receiver shutdown also ends a pending wait.
+        let task = tokio::spawn(async move {
+            reconnect
+                .after_error(tonic::Status::unavailable("offline").into(), &tx, |e| {
+                    Data::Summary {
+                        id: 1,
+                        result: Err(e),
+                    }
+                })
+                .await
+        });
+        rx.recv().await.unwrap();
+        drop(rx);
+        assert!(!task.await.unwrap());
+        opener.config.server = None;
+        let mut local = Reconnect::new(&opener);
+        let (tx, _rx) = unbounded_channel();
+        assert!(
+            !local
+                .after_error(tonic::Status::unavailable("offline").into(), &tx, |e| {
+                    Data::Summary {
+                        id: 1,
+                        result: Err(e),
+                    }
+                })
+                .await
+        );
+    }
+
+    mod reconnect_wire {
+        use super::*;
+        use std::{
+            convert::Infallible,
+            pin::Pin,
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::{Context, Poll},
+        };
+        use tokio_stream::{Stream, StreamExt};
+        use tonic::{
+            Response, Status,
+            body::Body,
+            codegen::{BoxFuture, Service, http},
+        };
+
+        type Replies<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+        type Reply<T> = BoxFuture<Response<Replies<T>>, Status>;
+
+        #[derive(Default)]
+        struct State {
+            feeds: AtomicUsize,
+            summaries: AtomicUsize,
+            cursors: Mutex<Vec<Option<i64>>>,
+            refusal: Option<tonic::Code>,
+        }
+        #[derive(Clone, Default)]
+        struct Server(Arc<State>);
+
+        fn reply<T: Send + 'static>(value: T, interrupt: bool) -> Reply<T> {
+            Box::pin(async move {
+                let replies: Replies<T> = if interrupt {
+                    // Clean EOF must reconnect too, not just an explicit status.
+                    Box::pin(tokio_stream::iter([Ok(value)]))
+                } else {
+                    Box::pin(tokio_stream::iter([Ok(value)]).chain(tokio_stream::pending()))
+                };
+                Ok(Response::new(replies))
+            })
+        }
+        impl tonic::server::ServerStreamingService<proto::FeedRequest> for Server {
+            type Response = proto::FeedSnapshot;
+            type ResponseStream = Replies<Self::Response>;
+            type Future = Reply<Self::Response>;
+            fn call(&mut self, _: tonic::Request<proto::FeedRequest>) -> Self::Future {
+                let n = self.0.feeds.fetch_add(1, Ordering::SeqCst);
+                if let Some(code) = self.0.refusal {
+                    return Box::pin(async move { Err(Status::new(code, "refused")) });
+                }
+                reply(
+                    proto::FeedSnapshot {
+                        messages: vec![proto::Message {
+                            id: n as i64 + 1,
+                            body: format!("mail {n}"),
+                            ..Default::default()
+                        }],
+                    },
+                    n == 0,
+                )
+            }
+        }
+        impl tonic::server::ServerStreamingService<proto::AgentSummaryRequest> for Server {
+            type Response = proto::AgentSummarySnapshot;
+            type ResponseStream = Replies<Self::Response>;
+            type Future = Reply<Self::Response>;
+            fn call(&mut self, _: tonic::Request<proto::AgentSummaryRequest>) -> Self::Future {
+                let n = self.0.summaries.fetch_add(1, Ordering::SeqCst);
+                reply(
+                    proto::AgentSummarySnapshot {
+                        agents: vec![proto::AgentSummary {
+                            agent: "Mateo".into(),
+                            unread_messages: n as u32,
+                            ..Default::default()
+                        }],
+                    },
+                    n == 0,
+                )
+            }
+        }
+        impl tonic::server::ServerStreamingService<proto::ActivityRequest> for Server {
+            type Response = proto::ActivitySnapshot;
+            type ResponseStream = Replies<Self::Response>;
+            type Future = Reply<Self::Response>;
+            fn call(&mut self, request: tonic::Request<proto::ActivityRequest>) -> Self::Future {
+                let cursor = request.into_inner().after_id;
+                let mut cursors = self.0.cursors.lock().unwrap();
+                let n = cursors.iter().filter(|c| c.is_some()).count();
+                cursors.push(cursor);
+                let id = if n == 0 { 10 } else { 11 };
+                reply(
+                    proto::ActivitySnapshot {
+                        events: vec![proto::Activity {
+                            id,
+                            record: r#"{"event":"turn_end"}"#.into(),
+                            ..Default::default()
+                        }],
+                    },
+                    cursor.is_some() && n == 0,
+                )
+            }
+        }
+        impl tonic::server::NamedService for Server {
+            const NAME: &'static str = "bbs.v2.Bbs";
+        }
+        impl Service<http::Request<Body>> for Server {
+            type Response = http::Response<Body>;
+            type Error = Infallible;
+            type Future = BoxFuture<Self::Response, Self::Error>;
+            fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, req: http::Request<Body>) -> Self::Future {
+                let server = self.clone();
+                Box::pin(async move {
+                    let response = match req.uri().path() {
+                        "/bbs.v2.Bbs/WatchFeed" => {
+                            tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+                                proto::FeedSnapshot,
+                                proto::FeedRequest,
+                            >::default())
+                            .server_streaming(server, req)
+                            .await
+                        }
+                        "/bbs.v2.Bbs/WatchActivity" => {
+                            tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+                                proto::ActivitySnapshot,
+                                proto::ActivityRequest,
+                            >::default())
+                            .server_streaming(server, req)
+                            .await
+                        }
+                        "/bbs.v2.Bbs/WatchAgentSummary" => {
+                            tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+                                proto::AgentSummarySnapshot,
+                                proto::AgentSummaryRequest,
+                            >::default())
+                            .server_streaming(server, req)
+                            .await
+                        }
+                        _ => Status::unimplemented("unexpected RPC").into_http(),
+                    };
+                    Ok(response)
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn remote_subscriptions_resume_without_duplicate_activity_or_app_restart() {
+            let (_dir, _conn, mut opener, req) = board();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            opener.config.server = Some(listener.local_addr().unwrap().to_string());
+            let server = Server::default();
+            let state = server.0.clone();
+            let serving = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(server)
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            );
+            let (tx, mut rx) = unbounded_channel();
+            let workers = [
+                tokio::spawn(watch(
+                    opener.clone(),
+                    1,
+                    proto::FeedRequest::default(),
+                    tx.clone(),
+                )),
+                tokio::spawn(watch_summary(opener.clone(), 2, tx.clone())),
+                tokio::spawn(watch_activity(opener, 3, req, tx)),
+            ];
+            let mut mail = vec![];
+            let mut summaries = 0;
+            let mut activity = vec![];
+            let mut baselines = vec![];
+            let mut errors = 0;
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while mail.len() < 2 || summaries < 2 || activity.len() < 2 {
+                    match rx.recv().await.unwrap() {
+                        Event::Data(Data::Feed {
+                            result: Ok(rows), ..
+                        }) => mail.extend(rows.into_iter().map(|m| m.id)),
+                        Event::Data(Data::Summary { result: Ok(_), .. }) => summaries += 1,
+                        Event::Data(Data::Activity {
+                            result: Ok(rows), ..
+                        }) => activity.extend(rows.into_iter().map(|m| m.id)),
+                        Event::Data(Data::ActivityBaseline { through_id, .. }) => {
+                            baselines.push(through_id)
+                        }
+                        Event::Data(
+                            Data::Feed { result: Err(_), .. }
+                            | Data::Summary { result: Err(_), .. }
+                            | Data::Activity { result: Err(_), .. },
+                        ) => errors += 1,
+                        _ => panic!("unexpected event"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(mail, [1, 2]);
+            assert_eq!(activity, [10, 11]);
+            assert_eq!(baselines, [10, 11]);
+            assert_eq!(errors, 3);
+            assert_eq!(
+                *state.cursors.lock().unwrap(),
+                [None, Some(0), None, Some(10)]
+            );
+            for worker in workers {
+                worker.abort();
+            }
+            serving.abort();
+        }
+
+        #[tokio::test]
+        async fn remote_subscription_recovers_after_connection_refused() {
+            let (_dir, _conn, mut opener, _) = board();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            opener.config.server = Some(address.to_string());
+            drop(listener);
+            let (tx, mut rx) = unbounded_channel();
+            let worker = tokio::spawn(watch_summary(opener, 2, tx));
+            let event = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(event, Event::Data(Data::Summary { result: Err(ref e), .. }) if e.contains("reconnecting"))
+            );
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            let server = Server::default();
+            server.0.summaries.store(1, Ordering::SeqCst);
+            let serving = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(server)
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            );
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                event,
+                Event::Data(Data::Summary { result: Ok(_), .. })
+            ));
+            worker.abort();
+            serving.abort();
+        }
+
+        #[tokio::test]
+        async fn remote_auth_refusal_stops_instead_of_retrying() {
+            let (_dir, _conn, mut opener, _) = board();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            opener.config.server = Some(listener.local_addr().unwrap().to_string());
+            let server = Server(Arc::new(State {
+                refusal: Some(tonic::Code::Unauthenticated),
+                ..Default::default()
+            }));
+            let state = server.0.clone();
+            let serving = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(server)
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            );
+            let (tx, mut rx) = unbounded_channel();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                watch(opener, 1, proto::FeedRequest::default(), tx),
+            )
+            .await
+            .unwrap();
+            assert_eq!(state.feeds.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                rx.recv().await,
+                Some(Event::Data(Data::Feed { result: Err(_), .. }))
+            ));
+            assert!(rx.recv().await.is_none());
+            serving.abort();
+        }
+    }
 
     #[test]
     fn terminal_pastes_become_one_paste_event_not_keys() {

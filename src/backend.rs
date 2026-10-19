@@ -678,7 +678,9 @@ impl<'a, R: Watched> Watch<'a, R> {
             },
             Watch::Remote(stream) => match stream.message().await.map_err(status_error)? {
                 Some(snapshot) => Ok(snapshot),
-                None => bail!("the server closed the stream"),
+                None => Err(status_error(tonic::Status::unavailable(
+                    "the server closed the stream",
+                ))),
             },
         }
     }

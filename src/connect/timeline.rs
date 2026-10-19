@@ -277,7 +277,7 @@ pub struct Stream {
     /// Startup replay ends at the newest id sampled before subscribing.
     history_end: Option<i64>,
     history_ready: bool,
-    /// The stream's last error; it has ended until a reload.
+    /// The stream's last error, cleared by the next successful batch.
     pub error: Option<String>,
     progress: ProgressState,
     /// Delivered-as ids drawn since the last full redraw, so a retried copy
@@ -471,6 +471,7 @@ impl Stream {
             && *id == self.id
         {
             self.history_end = Some(*through_id);
+            self.progress = ProgressState::default();
             self.progress.baseline(*through_id, record.as_deref());
         }
         let Data::Activity { id, result } = data else {
@@ -528,6 +529,54 @@ mod tests {
         style::Modifier,
         widgets::{Block, Paragraph, Wrap},
     };
+
+    #[test]
+    fn reconnected_activity_refreshes_progress_without_replaying_old_rows() {
+        let mut stream = Stream::new("Mateo");
+        let id = stream.id;
+        let now = Instant::now();
+        let baseline = |through_id| Data::ActivityBaseline {
+            id,
+            through_id,
+            record: Some(r#"{"event":"turn_end"}"#.into()),
+        };
+        let data = |n| Data::Activity {
+            id,
+            result: Ok(vec![proto::Activity {
+                id: n,
+                record: r#"{"event":"thought","text":"working"}"#.into(),
+                ..Default::default()
+            }]),
+        };
+        stream.on_data(&baseline(1), now, &Loaded::new());
+        stream.on_data(&data(2), now, &Loaded::new());
+        assert!(matches!(stream.progress(now), Progress::Progressing(_)));
+        stream.on_data(
+            &Data::Activity {
+                id,
+                result: Err("reconnecting".into()),
+            },
+            now,
+            &Loaded::new(),
+        );
+        assert_eq!(stream.progress(now), Progress::Unknown);
+        stream.on_data(&baseline(3), now, &Loaded::new());
+        assert_eq!(stream.progress(now), Progress::Done);
+        // Catch-up is history; only events beyond the reconnect watermark animate.
+        stream.on_data(&data(3), now, &Loaded::new());
+        assert_eq!(stream.progress(now), Progress::Done);
+        stream.on_data(&data(4), now, &Loaded::new());
+        assert!(matches!(stream.progress(now), Progress::Progressing(_)));
+        assert!(stream.error.is_none());
+        assert_eq!(
+            stream
+                .records
+                .iter()
+                .map(|r| r.activity.id)
+                .collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+    }
 
     #[test]
     fn initial_history_handles_empty_short_and_crossed_boundary_batches() {
