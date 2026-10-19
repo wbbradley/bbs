@@ -1607,6 +1607,72 @@ mod tests {
     }
 
     #[test]
+    fn a_long_unicode_agent_title_leaves_room_for_feedback_mailbox_and_spinner() {
+        use unicode_width::UnicodeWidthStr;
+        let (mut app, mut rx) = app();
+        let (_, now) = test_clock();
+        app.ctx.now = now;
+        let name = "Ünïcødé👩‍💻Agent-".repeat(4);
+        open_agents(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![agent(&name, "ada", &["crew"])],
+        }))));
+        enter(&mut app);
+        watched(&mut rx);
+        let Request::WatchActivity { id: act, .. } = rx.try_recv().unwrap() else {
+            panic!("expected an activity watch");
+        };
+        // Another agent's unread mail lights the mailbox; fresh activity spins.
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "Other".into(),
+                unread_messages: 1,
+                ..Default::default()
+            }]),
+        }));
+        app.on_event(Event::Data(Data::ActivityBaseline {
+            id: act,
+            through_id: 0,
+            record: None,
+        }));
+        let mut record = activity(1, "01", r#"{"event":"text"}"#);
+        record.agent = name.clone();
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![record]),
+        }));
+        app.ctx.preferences.error = Some("local preference failure".into());
+        let check = |app: &mut App, needles: &[&str]| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buffer = terminal.backend().buffer();
+            crate::ui::theme::testing::assert_buffer(buffer);
+            let row = bottom(app);
+            // The name keeps at most a third of the bar, clipped, so the
+            // feedback still shows and the mailbox and spinner keep their cells.
+            assert!(
+                row.starts_with("BBS · Ünïcødé👩‍💻") && row.contains("… · "),
+                "{row}"
+            );
+            assert!(row.width() <= 80, "{row}");
+            assert!(row.ends_with("✉ ⠋"), "{row}");
+            assert_eq!(buffer[(79, 23)].symbol(), "⠋");
+            assert_eq!(buffer[(77, 23)].symbol(), "✉");
+            for needle in needles {
+                assert!(row.contains(needle), "{needle}: {row}");
+            }
+        };
+        check(&mut app, &["local preference"]);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, '/');
+        typed(&mut app, &"🔍é".repeat(30));
+        // Typed text keeps its room ahead of the key hint.
+        check(&mut app, &["pref error", "🔍é🔍é█"]);
+    }
+
+    #[test]
     fn bottom_bar_keeps_pause_new_arrivals_filters_and_unicode_search_at_minimum_width() {
         let (mut app, mut rx) = app();
         let (feed, _) = mateo_streams(&mut app, &mut rx);

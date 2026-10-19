@@ -382,8 +382,13 @@ impl Thread {
             if let Some((badge, _)) = &issue {
                 mode.push_str(&format!(" · {badge}"));
             }
-            let suffix = "█ · Enter search · Esc cancel";
-            let available = width.saturating_sub(mode.width() + 3 + 1 + suffix.width());
+            // What is typed comes before the key hint when space is short.
+            let mut suffix = "█ · Enter search · Esc cancel";
+            let mut available = width.saturating_sub(mode.width() + 3 + 1 + suffix.width());
+            if available < 6 {
+                suffix = "█";
+                available = width.saturating_sub(mode.width() + 3 + 1 + suffix.width());
+            }
             return Line::styled(
                 format!("{mode} · /{}{suffix}", fit_status(prompt, available, true)),
                 error_style,
