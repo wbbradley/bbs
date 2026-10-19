@@ -12,7 +12,7 @@ import termios
 import time
 
 
-def check_exit(binary, key):
+def check_exit(binary, key, trailing_fragment=False):
     ready, start = os.pipe()
     pid, master = pty.fork()
     if pid == 0:
@@ -54,12 +54,19 @@ def check_exit(binary, key):
         os.write(master, b" ")
         read_until(b"Main menu")
         os.write(master, key)
+        if trailing_fragment:
+            # Give a read-ahead thread a chance to start parsing an incomplete
+            # sequence. Joining that reader used to hang despite poll's timeout.
+            time.sleep(0.0001)
+            os.write(master, b"\x1b[")
         # Type as soon as the shell screen returns, while BBS may still be
         # exiting. Its reader must already be stopped, not racing Bash for input.
         read_until(b"\x1b[?1049l")
         assert termios.tcgetattr(master) == original, "terminal modes not restored"
         os.write(master, b"first-character\n")
-        read_until(b"SHELL_RECEIVED=<first-character>")
+        # The deliberately late fragment may belong to Bash already. It must
+        # not prevent exit or consume the line typed after terminal restoration.
+        read_until(b"first-character>" if trailing_fragment else b"SHELL_RECEIVED=<first-character>")
         assert b"\x1b[?2004l" in transcript, "bracketed paste not disabled"
     finally:
         # Also cleans up a stuck BBS child on a failed regression.
@@ -74,3 +81,4 @@ def check_exit(binary, key):
 
 for exit_key in (b"\x1b", b"q"):
     check_exit(sys.argv[1], exit_key)
+check_exit(sys.argv[1], b"q", trailing_fragment=True)

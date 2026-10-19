@@ -10,8 +10,8 @@ under the new package version and its publication date.
 
 ### Fixed
 
-- `bbs connect` stops its input reader before restoring the terminal on exit,
-  so it cannot swallow the shell's next keystroke during cleanup.
+- `bbs connect` reads terminal input only while its UI is active, so it cannot
+  swallow the shell's next keystroke during cleanup.
 
 - `bbs connect` reconnects its message, activity and agent-summary streams
   after a temporary connection failure, including laptop sleep. Activity resumes

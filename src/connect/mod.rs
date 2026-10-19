@@ -17,7 +17,7 @@ mod theme;
 mod timeline;
 
 use std::io::IsTerminal;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
@@ -31,22 +31,36 @@ use crate::proto::Kind;
 pub use event::Opener;
 
 /// What the run loop waits on: an event to handle, or a redraw when the next
-/// animation frame is due. With no deadline it waits for events only.
+/// animation frame is due. Empty input polls never request a redraw.
 enum Wait {
     Event(Event),
     Redraw,
 }
 
-async fn wait(rx: &mut UnboundedReceiver<Event>, next_frame: Option<Instant>) -> Option<Wait> {
+async fn wait(
+    rx: &mut UnboundedReceiver<Event>,
+    next_frame: Option<Instant>,
+    mut poll_input: impl FnMut() -> std::io::Result<Option<Event>>,
+) -> Result<Option<Wait>> {
     let frame = async {
         match next_frame {
             Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
             None => std::future::pending().await,
         }
     };
-    tokio::select! {
-        event = rx.recv() => event.map(Wait::Event),
-        () = frame => Some(Wait::Redraw),
+    tokio::pin!(frame);
+    let mut input = tokio::time::interval(Duration::from_millis(20));
+    input.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            event = rx.recv() => return Ok(event.map(Wait::Event)),
+            () = &mut frame => return Ok(Some(Wait::Redraw)),
+            _ = input.tick() => {
+                if let Some(event) = poll_input()? {
+                    return Ok(Some(Wait::Event(event)));
+                }
+            }
+        }
     }
 }
 
@@ -113,12 +127,11 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
             return Err(anyhow::Error::new(e).context("could not enable bracketed paste"));
         }
     };
-    let input = event::spawn_input(events.clone());
     event::spawn_ticks(events);
     let result = async {
         loop {
             terminal.draw(|frame| app.draw(frame))?;
-            match wait(&mut rx, app.next_animation_frame()).await {
+            match wait(&mut rx, app.next_animation_frame(), event::poll_input).await? {
                 None => return Ok(()),
                 // A frame is due: only redraw, never housekeeping.
                 Some(Wait::Redraw) => {}
@@ -131,7 +144,6 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
         }
     }
     .await;
-    drop(input);
     let drafts_result = app.finish();
     ratatui::restore();
     result.and(drafts_result)
@@ -150,22 +162,39 @@ mod tests {
         // An event wins over a far-future frame.
         tx.send(Event::Tick).unwrap();
         assert!(matches!(
-            wait(&mut rx, Some(now + Duration::from_secs(3600))).await,
+            wait(&mut rx, Some(now + Duration::from_secs(3600)), || Ok(None))
+                .await
+                .unwrap(),
             Some(Wait::Event(Event::Tick))
         ));
         // A due frame redraws without consuming or producing events.
-        assert!(matches!(wait(&mut rx, Some(now)).await, Some(Wait::Redraw)));
+        assert!(matches!(
+            wait(&mut rx, Some(now), || Ok(None)).await.unwrap(),
+            Some(Wait::Redraw)
+        ));
         assert!(rx.try_recv().is_err());
-        // No frame armed: only events can wake the loop.
-        let pending = tokio::time::timeout(Duration::from_secs(10), wait(&mut rx, None)).await;
+        // Empty terminal polls do not redraw or run housekeeping.
+        let pending =
+            tokio::time::timeout(Duration::from_secs(10), wait(&mut rx, None, || Ok(None))).await;
         assert!(pending.is_err(), "no deadline, no wake");
+        assert!(matches!(
+            wait(&mut rx, None, || Ok(Some(Event::Resize)))
+                .await
+                .unwrap(),
+            Some(Wait::Event(Event::Resize))
+        ));
+        assert!(
+            wait(&mut rx, None, || Err(std::io::Error::other("input failed")))
+                .await
+                .is_err()
+        );
         tx.send(Event::Resize).unwrap();
         assert!(matches!(
-            wait(&mut rx, None).await,
+            wait(&mut rx, None, || Ok(None)).await.unwrap(),
             Some(Wait::Event(Event::Resize))
         ));
         // The channel closing ends the loop.
         drop(tx);
-        assert!(wait(&mut rx, None).await.is_none());
+        assert!(wait(&mut rx, None, || Ok(None)).await.unwrap().is_none());
     }
 }
