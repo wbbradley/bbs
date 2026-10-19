@@ -27,7 +27,7 @@ const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// ...from this far back, when it gives no start.
 const DEFAULT_HISTORY_SINCE: &str = "7d";
 
-pub async fn run(dir: &Path, local: bool) -> Result<()> {
+pub async fn run(dir: &Path, local: bool, auto_owner_reply: bool) -> Result<()> {
     if local && !dir.is_absolute() {
         bail!("--local-state-dir must be an absolute path");
     }
@@ -37,6 +37,7 @@ pub async fn run(dir: &Path, local: bool) -> Result<()> {
         .with_context(|| format!("{TOKEN_ENV} is not set"))?;
     let mut tools = Tools::new(dir, token);
     tools.local = local;
+    tools.auto_owner_reply = auto_owner_reply;
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
     let mut line = String::new();
@@ -72,6 +73,7 @@ pub struct Tools {
     token: String,
     backend: Option<Backend>,
     local: bool,
+    auto_owner_reply: bool,
 }
 
 impl Tools {
@@ -81,7 +83,13 @@ impl Tools {
             token,
             backend: None,
             local: false,
+            auto_owner_reply: false,
         }
+    }
+
+    pub fn auto_owner_reply(mut self) -> Self {
+        self.auto_owner_reply = true;
+        self
     }
 
     async fn handle(&mut self, msg: &Value) -> Result<Value> {
@@ -143,7 +151,20 @@ impl Tools {
                 .map(str::to_string)
                 .with_context(|| format!("missing string argument {key:?}"))
         };
+        let guard = self.auto_owner_reply;
         let b = self.backend().await?;
+        if name == "bbs_send" && guard {
+            let to = arg("to")?;
+            let me = b.whoami().await?;
+            let owner = me
+                .owner
+                .context("automatic owner delivery has no registered owner")?;
+            if to.trim().eq_ignore_ascii_case(&owner) {
+                bail!(
+                    "Nothing was sent. Your ordinary replies are delivered to {owner} automatically. Write your next ordinary reply instead of calling bbs_send to your owner."
+                );
+            }
+        }
         Ok(match name {
             "bbs_send" => {
                 let r = b

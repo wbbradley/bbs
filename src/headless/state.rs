@@ -104,7 +104,7 @@ impl AgentDir {
 }
 
 /// Atomically replace `path` with a 0600 file.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().expect("state path has a parent");
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     #[cfg(unix)]
@@ -117,6 +117,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     file.as_file().sync_all()?;
     file.persist(path)
         .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 

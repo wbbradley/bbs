@@ -15,6 +15,12 @@ cannot open schema 17, so downgrading requires the pre-upgrade backup.
 
 ### Changed
 
+- Updated headless runners automatically deliver ordinary parent-session assistant
+  replies to their owning human, including progress segments. A private durable
+  outbox retries with stable delivery keys without rerunning the model; owner
+  delivery works independently of shared activity and requires `auto-reply.v1`.
+  Fresh sessions are told to speak naturally, and their owner-directed `bbs_send`
+  tool calls receive a gentle reminder instead of sending duplicate mail.
 - The `bbs connect` Agents list puts first the agents a human most recently
   exchanged a direct message with, in either direction, newest first. Ties and
   agents no human has talked with keep the earlier order: unread mail, then

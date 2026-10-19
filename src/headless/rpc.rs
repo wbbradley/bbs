@@ -23,6 +23,7 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 pub struct Process {
     child: Child,
     pgid: libc::pid_t,
+    reader: tokio::task::JoinHandle<()>,
 }
 
 impl Process {
@@ -33,25 +34,36 @@ impl Process {
 
     /// SIGTERM the group, give it `STOP_GRACE` to exit, then SIGKILL whatever
     /// remains.
-    pub async fn stop(&mut self) {
+    pub async fn stop(&mut self) -> bool {
         signal_group(self.pgid, libc::SIGTERM);
         let deadline = tokio::time::Instant::now() + STOP_GRACE;
         while tokio::time::Instant::now() < deadline {
             // Reap the harness, so it does not keep the group alive as a zombie.
             let _ = self.child.try_wait();
             if !group_alive(self.pgid) {
-                return;
+                break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         signal_group(self.pgid, libc::SIGKILL);
         let _ = self.child.wait().await;
+        // EOF follows the final protocol bytes. Join their reader before the
+        // caller seals/drains owner output, including a cancellation tail.
+        let drained = matches!(
+            tokio::time::timeout(Duration::from_secs(1), &mut self.reader).await,
+            Ok(Ok(()))
+        );
+        if !drained {
+            self.reader.abort();
+        }
+        drained
     }
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
         signal_group(self.pgid, libc::SIGKILL);
+        self.reader.abort();
     }
 }
 
@@ -145,8 +157,15 @@ impl Rpc {
                 next_id: AtomicU64::new(1),
             }),
         };
-        tokio::spawn(read_loop(rpc.clone(), BufReader::new(stdout), handler));
-        Ok((rpc, Process { child, pgid }))
+        let reader = tokio::spawn(read_loop(rpc.clone(), BufReader::new(stdout), handler));
+        Ok((
+            rpc,
+            Process {
+                child,
+                pgid,
+                reader,
+            },
+        ))
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {

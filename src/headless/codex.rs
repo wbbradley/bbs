@@ -31,6 +31,7 @@ const TURN_ID_WAIT: Duration = Duration::from_secs(10);
 #[derive(Default)]
 struct TurnState {
     turn: Mutex<Turn>,
+    dispatch: Mutex<()>,
     changed: Notify,
 }
 
@@ -66,6 +67,10 @@ struct Turn {
     id: Option<String>,
     /// Resolved by `turn/completed`.
     done: Option<oneshot::Sender<Result<String>>>,
+    text_seen: std::collections::HashSet<String>,
+    text_done: std::collections::HashSet<String>,
+    before_ack: Vec<(String, Value)>,
+    exited: bool,
 }
 
 struct CodexEffort {
@@ -286,7 +291,12 @@ impl Codex {
     /// Run one turn; returns its status (`completed` or `interrupted`).
     pub async fn prompt(&self, text: &str, effort: Option<EffortRequest>) -> Result<String> {
         let (tx, rx) = oneshot::channel();
-        self.turn.set(|turn| turn.done = Some(tx));
+        self.turn.set(|turn| {
+            *turn = Turn {
+                done: Some(tx),
+                ..Turn::default()
+            }
+        });
         let mut params = json!({ "threadId": self.thread_id, "input": input(text) });
         let effort =
             effort.filter(
@@ -366,11 +376,27 @@ impl Codex {
                 return Err(anyhow!(message));
             }
         };
-        self.turn.set(|turn| {
-            if turn.done.is_some() && turn.id.is_none() {
-                turn.id = result["turn"]["id"].as_str().map(str::to_string);
+        {
+            let _ordered = self.turn.dispatch.lock().unwrap();
+            let id = result["turn"]["id"]
+                .as_str()
+                .context("turn/start returned no turn id")?;
+            let mut queued = Vec::new();
+            self.turn.set(|turn| {
+                turn.id = Some(id.to_string());
+                queued = std::mem::take(&mut turn.before_ack);
+            });
+            for (method, params) in queued {
+                dispatch_notification(&method, &params, &self.turn, &self.events);
             }
-        });
+            self.turn.set(|turn| {
+                if turn.exited
+                    && let Some(done) = turn.done.take()
+                {
+                    let _ = done.send(Err(anyhow!("the harness exited")));
+                }
+            });
+        }
         rx.await.map_err(|_| anyhow!("the harness exited"))?
     }
 
@@ -452,15 +478,67 @@ fn handle(
             if method == "thread/settings/updated" && effort.lock().unwrap().notification(&params) {
                 let _ = events.send(Event::EffortChanged);
             }
-            if let Some(event) = notification_event(&method, &params, turn) {
-                let _ = events.send(event);
+            // Only the opened parent's live turn can produce owner chat.
+            // History replay and child notifications never enter the text stream.
+            if effort
+                .lock()
+                .unwrap()
+                .parent
+                .as_deref()
+                .is_none_or(|id| params["threadId"].as_str() != Some(id))
+            {
+                return;
             }
+            let _ordered = turn.dispatch.lock().unwrap();
+            dispatch_notification(&method, &params, turn, events);
         }
         Incoming::Exited => {
-            // Dropping the sender fails the running prompt.
-            turn.set(|turn| *turn = Turn::default());
+            let _ordered = turn.dispatch.lock().unwrap();
+            turn.set(|turn| {
+                turn.exited = true;
+                // A received start ACK may still be awaiting its task. Keep
+                // pre-ACK text until that task binds and drains it.
+                if (turn.id.is_some() || turn.before_ack.is_empty())
+                    && let Some(done) = turn.done.take()
+                {
+                    let _ = done.send(Err(anyhow!("the harness exited")));
+                }
+            });
             let _ = events.send(Event::Exited);
         }
+    }
+}
+
+/// Called under `dispatch`, including buffered notifications that preceded the
+/// turn/start ACK. A previous turn cannot finish or speak for the current one.
+fn dispatch_notification(
+    method: &str,
+    params: &Value,
+    turn: &TurnState,
+    events: &mpsc::UnboundedSender<Event>,
+) {
+    if method.starts_with("item/") || method.starts_with("turn/") {
+        let incoming = params["turnId"]
+            .as_str()
+            .or_else(|| params["turn"]["id"].as_str());
+        let mut current = turn.turn.lock().unwrap();
+        if current.done.is_none() || incoming.is_none() {
+            return;
+        }
+        let Some(expected) = current.id.as_deref() else {
+            // Bind only to the response for our own turn/start, not an arbitrary
+            // turn/started notification from the parent thread.
+            current
+                .before_ack
+                .push((method.to_string(), params.clone()));
+            return;
+        };
+        if incoming != Some(expected) {
+            return;
+        }
+    }
+    if let Some(event) = notification_event(method, params, turn) {
+        let _ = events.send(event);
     }
 }
 
@@ -486,8 +564,38 @@ fn answer(
 /// The event a notification reports, tracking the running turn as it goes.
 fn notification_event(method: &str, params: &Value, turn: &TurnState) -> Option<Event> {
     let delta = || params["delta"].as_str().map(str::to_string);
+    let source = |message: Option<&str>| super::outbox::Source {
+        session: params["threadId"].as_str().unwrap_or_default().to_string(),
+        turn: params["turnId"].as_str().map(str::to_string),
+        message: message.map(str::to_string),
+    };
     Some(match method {
-        "item/agentMessage/delta" => Event::Text(delta()?),
+        "item/agentMessage/delta" => {
+            let id = params["itemId"].as_str()?;
+            let text = delta()?;
+            if text.is_empty() {
+                return None;
+            }
+            let mut state = turn.turn.lock().unwrap();
+            if state.text_done.contains(id) {
+                return None;
+            }
+            state.text_seen.insert(id.into());
+            Event::Text(source(Some(id)), text)
+        }
+        "item/completed" if params["item"]["type"] == "agentMessage" => {
+            let id = params["item"]["id"].as_str()?;
+            let mut state = turn.turn.lock().unwrap();
+            if !state.text_done.insert(id.into()) {
+                return None;
+            }
+            let fallback = if state.text_seen.contains(id) {
+                None
+            } else {
+                params["item"]["text"].as_str().map(str::to_string)
+            };
+            Event::TextEnd(source(Some(id)), fallback)
+        }
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => Event::Thought(delta()?),
         "item/started" | "item/completed" => item_event(method, &params["item"])?,
         "turn/started" => {
@@ -618,6 +726,61 @@ mod tests {
     }
 
     #[test]
+    fn stale_turns_cannot_speak_or_complete_the_current_turn() {
+        let turn = TurnState::default();
+        let (done, mut result) = oneshot::channel();
+        turn.set(|s| {
+            s.id = Some("current".into());
+            s.done = Some(done);
+        });
+        let (events, mut rx) = mpsc::unbounded_channel();
+        dispatch_notification(
+            "item/agentMessage/delta",
+            &json!({ "threadId": "parent", "turnId": "old", "itemId": "m", "delta": "stale" }),
+            &turn,
+            &events,
+        );
+        dispatch_notification(
+            "turn/completed",
+            &json!({ "threadId": "parent", "turn": { "id": "old", "status": "completed" } }),
+            &turn,
+            &events,
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        // A malformed delta must not suppress the completed-item fallback.
+        dispatch_notification(
+            "item/agentMessage/delta",
+            &json!({ "turnId": "current", "itemId": "m" }),
+            &turn,
+            &events,
+        );
+        dispatch_notification(
+            "item/agentMessage/delta",
+            &json!({ "turnId": "current", "itemId": "m", "delta": "" }),
+            &turn,
+            &events,
+        );
+        dispatch_notification(
+            "item/completed",
+            &json!({ "turnId": "current", "item": { "type": "agentMessage", "id": "m", "text": "actual" } }),
+            &turn,
+            &events,
+        );
+        assert!(matches!(rx.try_recv(), Ok(Event::TextEnd(_, Some(t))) if t == "actual"));
+        dispatch_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "current", "status": "completed" } }),
+            &turn,
+            &events,
+        );
+        assert_eq!(result.try_recv().unwrap().unwrap(), "completed");
+    }
+
+    #[test]
     fn maps_notifications() {
         let turn = TurnState::default();
         let e = notification_event(
@@ -625,7 +788,7 @@ mod tests {
             &json!({ "delta": "hi", "itemId": "i" }),
             &turn,
         );
-        assert!(matches!(e, Some(Event::Text(t)) if t == "hi"));
+        assert!(matches!(e, Some(Event::Text(_, t)) if t == "hi"));
         let e = notification_event(
             "item/reasoning/summaryTextDelta",
             &json!({ "delta": "hmm" }),
@@ -659,7 +822,7 @@ mod tests {
             &json!({ "item": { "type": "agentMessage", "id": "m", "text": "hi" } }),
             &turn,
         );
-        assert!(e.is_none());
+        assert!(matches!(e, Some(Event::TextEnd(_, Some(t))) if t == "hi"));
         let e = notification_event(
             "error",
             &json!({ "error": { "message": "stream lost" }, "willRetry": true }),

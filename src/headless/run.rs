@@ -15,6 +15,7 @@ use super::effort;
 use super::harness::{BbsTools, EffortUnconfirmed, Event, Harness, PromptNotStarted};
 use super::log::Log;
 use super::mcp::{TOKEN_ENV, Tools};
+use super::outbox::{self, Outbox};
 use super::settings::{DEFAULT_MAX_TURN_ERRORS, McpEnv, MidTurn, Settings};
 use super::share;
 use super::state::{AgentDir, State};
@@ -70,6 +71,10 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     };
 
     let config = Config::load()?;
+    anyhow::ensure!(
+        server_has(&config, dir, crate::backend::AUTO_REPLY).await,
+        "this headless runner requires server capability auto-reply.v1; upgrade the server before starting it"
+    );
     let agent_dir = AgentDir::new(&args.agent)?;
     agent_dir.create()?;
     // One driver per agent on this machine; the OS releases the lock on exit.
@@ -86,6 +91,24 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     )
     .await?;
     agent_dir.save(&state)?;
+    let mut identity_backend = Backend::open(
+        &config,
+        dir,
+        Caller {
+            token: Some(token.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let identity = identity_backend.whoami().await?;
+    let owner = identity
+        .owner
+        .context("headless automatic replies require a registered owning human")?;
+    let board = match &config.server {
+        Some(server) => format!("remote:{server}"),
+        None => format!("local:{}", std::fs::canonicalize(dir)?.display()),
+    };
+    let mut outbox = Outbox::open(&agent_dir.dir.join("owner-outbox"), board, identity.id)?;
 
     let mut log = Log::open(&agent_dir.log_path())?;
     let (share_warn, mut share_warnings) = mpsc::unbounded_channel();
@@ -104,7 +127,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         json!({ "agent": agent, "harness": harness, "cwd": cwd, "pid": std::process::id() }),
     );
 
-    let mut mcp_args = vec!["headless".into(), "mcp".into()];
+    let mut mcp_args = vec!["headless".into(), "mcp".into(), "--auto-owner-reply".into()];
     if harness_config.mcp_env == McpEnv::Process && config.server.is_none() {
         mcp_args.extend([
             "--local-state-dir".into(),
@@ -138,7 +161,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             &harness_config,
             &cwd,
             &stderr,
-            BbsTools { mcp, tools: Tools::new(dir, token.clone()) },
+            BbsTools { mcp, tools: Tools::new(dir, token.clone()).auto_owner_reply() },
             resume.as_deref(),
         ) => started,
         _ = signals.recv() => Err(anyhow::anyhow!("stopped during harness setup")),
@@ -178,12 +201,20 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         None
     } else {
         let timers = server_has(&config, dir, crate::backend::TIMERS).await;
-        Some(preamble(&agent, instructions.as_deref(), timers))
+        Some(preamble(&agent, &owner, instructions.as_deref(), timers))
     };
-    let (effort_reports, reporting) =
-        effort::reporter(config.clone(), dir.to_path_buf(), token.clone(), share_warn);
+    let (effort_reports, reporting) = effort::reporter(
+        config.clone(),
+        dir.to_path_buf(),
+        token.clone(),
+        share_warn.clone(),
+    );
     let mut effort_control = effort::Control::default();
     let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
+    let mut delivery =
+        outbox::Sender::start(config.clone(), dir.to_path_buf(), token.clone(), share_warn);
+    let mut delivering = false;
+    let mut completed_turn = None;
     let (mail_tx, mut mail_rx) = mpsc::unbounded_channel();
     let mail_task = tokio::spawn(wait_for_mail(
         config.clone(),
@@ -201,16 +232,37 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     let mut turn_errors = 0;
     // A resumed session that never completes a turn may be what fails.
     let mut session_proven = !agent_harness.session_resumed();
-    let result = loop {
+    let mut result = loop {
+        if !delivering && let Some(part) = outbox.ready() {
+            if delivery.queue.send(part.clone()).await.is_err() {
+                break Err(anyhow::anyhow!(
+                    "owner reply sender stopped; outbox retained"
+                ));
+            }
+            delivering = true;
+        }
+        if outbox.is_empty()
+            && let Some(stop) = completed_turn.take()
+        {
+            log.event("turn_end", json!({ "stop_reason": stop }));
+        }
+        if outbox.bytes() >= outbox::HIGH_WATER {
+            break Err(anyhow::anyhow!(
+                "owner reply outbox reached 16 MiB; stopping generation, retaining text for delivery on restart"
+            ));
+        }
         let ready_at = last_start
             .map(|t| t + interval)
             .unwrap_or_else(Instant::now);
-        if turn.is_none() && !queue.is_empty() && Instant::now() >= ready_at {
+        if turn.is_none() && outbox.is_empty() && !queue.is_empty() && Instant::now() >= ready_at {
             active_preamble = preamble.take();
             let mut prompt = active_preamble.clone().unwrap_or_default();
             prompt.push_str(&mail_prompt(&queue)?);
             active_mail = std::mem::take(&mut queue);
-            log.event("prompt", json!({ "text": prompt }));
+            log.event(
+                "prompt",
+                json!({ "text": prompt, "mail_ids": mail_ids(&active_mail) }),
+            );
             let agent_harness = agent_harness.clone();
             let requested_effort = effort_control.dispatch();
             active_effort = requested_effort.is_some();
@@ -220,7 +272,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             last_start = Some(Instant::now());
             continue;
         }
-        let throttled = turn.is_none() && !queue.is_empty();
+        let throttled = turn.is_none() && outbox.is_empty() && !queue.is_empty();
         tokio::select! {
             mail = mail_rx.recv() => match mail {
                 Some(Ok(mut batch)) => {
@@ -253,8 +305,8 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                         let text = mail_prompt(&batch)?;
                         match agent_harness.steer(&text).await {
                             Ok(()) => {
-                                log.event("mail", json!({ "count": batch.len(), "from": from, "queued": false }));
-                                log.event("steer", json!({ "text": text }));
+                                log.event("mail", json!({ "count": batch.len(), "from": from, "queued": false, "mail_ids": mail_ids(&batch) }));
+                                log.event("steer", json!({ "text": text, "mail_ids": mail_ids(&batch) }));
                                 continue;
                             }
                             Err(err) => log.event("warning", json!({
@@ -263,7 +315,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                         }
                     }
                     let waiting = turn.is_some() || Instant::now() < ready_at;
-                    log.event("mail", json!({ "count": batch.len(), "from": from, "queued": waiting }));
+                    log.event("mail", json!({ "count": batch.len(), "from": from, "queued": waiting, "mail_ids": mail_ids(&batch) }));
                     queue.extend(batch);
                 }
                 Some(Err(err)) => break Err(err),
@@ -271,11 +323,24 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             },
             done = async { turn.as_mut().unwrap().await }, if turn.is_some() => {
                 turn = None;
+                // The wire reader queues notifications before resolving the
+                // response. Persist those final deltas before clearing the turn.
+                let mut drain_error = None;
+                while let Ok(event) = events.try_recv() {
+                    match event {
+                        Event::EffortOutcome(outcome) => effort_control.complete(outcome),
+                        Event::EffortChanged => {},
+                        other => if let Err(err) = record(&mut log, &mut outbox, other) { drain_error = Some(err); break; },
+                    }
+                }
+                let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
+                if let Some(err) = drain_error { break Err(err); }
+                if let Err(err) = outbox.seal() { break Err(err); }
                 let message = match done {
                     Ok(Ok(stop)) => {
                         active_mail.clear();
                         active_preamble = None;
-                        log.event("turn_end", json!({ "stop_reason": stop }));
+                        completed_turn = Some(stop);
                         turn_errors = 0;
                         session_proven = true;
                         continue;
@@ -328,8 +393,18 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     effort_control.complete(outcome);
                     let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
                 }
-                Some(event) => record(&mut log, event),
+                Some(event) => if let Err(err) = record(&mut log, &mut outbox, event) { break Err(err); },
             },
+            reply = delivery.replies.recv(), if delivering => {
+                match reply {
+                    Some(Ok((key, id))) => {
+                        if let Err(err) = delivered(&mut outbox, &mut log, &key, id) { break Err(err); }
+                        delivering = false;
+                    }
+                    Some(Err(err)) => break Err(err),
+                    None => break Err(anyhow::anyhow!("owner reply sender stopped; outbox retained")),
+                }
+            }
             _ = tokio::time::sleep_until(ready_at), if throttled => {}
             status = process.wait() => break Err(match status {
                 Ok(status) => anyhow::anyhow!("the harness exited ({status})"),
@@ -350,6 +425,22 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     if turn.is_some() {
         let _ = agent_harness.cancel().await;
     }
+    // Stop the producer before draining, so late cancellation text is retained.
+    if !process.stop().await {
+        result = Err(anyhow::anyhow!(
+            "harness output reader did not finish during shutdown; persisted owner text retained, unread output may be incomplete"
+        ));
+    }
+    if let Some(mut task) = turn.take() {
+        // Allow a received start ACK to bind/drain buffered Codex text after
+        // process exit. This does not submit or retry any prompt.
+        if tokio::time::timeout(Duration::from_secs(1), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
     log.flush();
     if !queue.is_empty() {
         // Already marked read on the server; keep them where the owner can find them.
@@ -358,17 +449,52 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             json!({ "text": format_messages(&queue, false)? }),
         );
     }
-    match &result {
-        Ok(()) => log.event("stop", json!({})),
-        Err(err) => log.event("stop", json!({ "error": format!("{err:#}") })),
-    }
     // Drain effort ACKs already emitted before harness exit/turn completion.
     while let Ok(event) = events.try_recv() {
         match event {
             Event::EffortOutcome(outcome) => effort_control.complete(outcome),
             Event::EffortChanged => {}
-            other => record(&mut log, other),
+            other => {
+                if let Err(err) = record(&mut log, &mut outbox, other) {
+                    result = Err(err);
+                }
+            }
         }
+    }
+    if let Err(err) = outbox.seal() {
+        result = Err(err);
+    }
+    let flush = async {
+        while !outbox.is_empty() {
+            if !delivering && let Some(part) = outbox.ready() {
+                delivery
+                    .queue
+                    .send(part.clone())
+                    .await
+                    .context("owner sender stopped")?;
+                delivering = true;
+            }
+            let (key, id) = delivery
+                .replies
+                .recv()
+                .await
+                .context("owner sender stopped")??;
+            delivered(&mut outbox, &mut log, &key, id)?;
+            delivering = false;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    match tokio::time::timeout(Duration::from_secs(5), flush).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => result = Err(err),
+        Err(_) => {
+            eprintln!("bbs: owner reply delivery pending; private outbox retained for the next run")
+        }
+    }
+    if outbox.is_empty()
+        && let Some(stop) = completed_turn.take()
+    {
+        log.event("turn_end", json!({ "stop_reason": stop }));
     }
     let mut final_effort = agent_harness.effort_state();
     if effort_control.interrupted() {
@@ -383,8 +509,12 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     }
     let _ = effort_reports.send(effort_control.report(final_effort));
     drop(effort_reports);
+    match &result {
+        Ok(()) => log.event("stop", json!({})),
+        Err(err) => log.event("stop", json!({ "error": format!("{err:#}") })),
+    }
+
     log.unshare();
-    process.stop().await;
     if let Some(task) = sharing {
         // Let the last records, "stop" among them, reach the server.
         let _ = tokio::time::timeout(SHARE_FLUSH, task).await;
@@ -393,19 +523,54 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     result
 }
 
-fn record(log: &mut Log, event: Event) {
+fn record(log: &mut Log, outbox: &mut Outbox, event: Event) -> Result<()> {
     match event {
-        Event::Text(t) => log.chunk("text", &t),
-        Event::Thought(t) => log.chunk("thought", &t),
+        Event::Text(source, text) => {
+            outbox.append(source.clone(), &text)?;
+            log.local_event("text", json!({ "text": text, "source": source }));
+        }
+        Event::TextEnd(source, fallback) => {
+            if let Some(text) = fallback {
+                outbox.append(source.clone(), &text)?;
+                log.local_event("text", json!({ "text": text, "source": source }));
+            }
+            outbox.seal()?;
+        }
+        Event::Thought(t) => {
+            outbox.seal()?;
+            log.chunk("thought", &t);
+        }
         Event::Tool(id, mut fields) => {
+            outbox.seal()?;
             fields["id"] = id.into();
             log.event("tool", fields);
         }
-        Event::Permission(fields) => log.event("permission", fields),
+        Event::Permission(fields) => {
+            outbox.seal()?;
+            log.event("permission", fields);
+        }
         Event::Warning(message) => log.event("warning", json!({ "message": message })),
         Event::Other(kind) => log.event("update", json!({ "kind": kind })),
         Event::Exited | Event::EffortChanged | Event::EffortOutcome(_) => {}
     }
+    Ok(())
+}
+
+fn delivered(outbox: &mut Outbox, log: &mut Log, key: &str, id: i64) -> Result<()> {
+    let part = outbox.acknowledge(key)?;
+    log.local_event(
+        "owner_delivery",
+        json!({ "key": key, "mail_id": id, "source": part.source }),
+    );
+    log.shared_event(
+        "text",
+        json!({ "text": part.body, "mail_id": id, "source": part.source }),
+    );
+    Ok(())
+}
+
+fn mail_ids(mail: &[proto::Message]) -> Vec<i64> {
+    mail.iter().map(|m| m.id).collect()
 }
 
 /// A prompt listing `mail`, oldest first.
@@ -550,12 +715,14 @@ fn wake_sentence(timers: bool) -> &'static str {
     }
 }
 
-fn preamble(agent: &str, instructions: Option<&str>, timers: bool) -> String {
+fn preamble(agent: &str, owner: &str, instructions: Option<&str>, timers: bool) -> String {
     let mut text = format!(
         "You are {agent}, an agent on BBS, a message board shared by coding agents and \
-         the humans who run them. You are running headless: nothing you write as plain \
-         text reaches anyone. It goes only to a local log.\n\n\
-         To communicate, use the bbs_* tools: bbs_send messages an agent, a human, or a @group \
+         the humans who run them. Your owning human is {owner}. Speak naturally: your ordinary \
+         commentary and final replies are delivered automatically to {owner}. Do not use \
+         bbs_send to message {owner}; write your ordinary reply instead. Thoughts, tool calls, \
+         and permission events are not sent as chat.\n\n\
+         To contact other recipients, use the bbs_* tools: bbs_send messages an agent, another human, or a @group \
          (broadcasting needs write access, which only a human can grant; without it, \
          message one of the group's writers), bbs_agents and bbs_group_list show who is around, bbs_status sets what you are \
          working on, and bbs_history rereads past messages. You can also join and leave \
@@ -629,12 +796,50 @@ mod tests {
 
     #[test]
     fn the_preamble_offers_timers_only_where_the_server_has_them() {
-        let with = preamble("Ade", None, true);
+        let with = preamble("Ade", "Will", None, true);
         assert!(with.contains("bbs_timer_add"), "{with}");
         assert!(!with.contains("sleep 600"), "{with}");
-        let without = preamble("Ade", None, false);
+        let without = preamble("Ade", "Will", None, false);
         assert!(without.contains("sleep 600"), "{without}");
         assert!(!without.contains("bbs_timer"), "{without}");
+    }
+
+    #[test]
+    fn final_text_persists_before_completion_and_only_acknowledged_text_is_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outbox = Outbox::open(&dir.path().join("outbox"), "board".into(), 1).unwrap();
+        let mut log = Log::open(&dir.path().join("log")).unwrap();
+        let (tx, mut rx) = mpsc::channel(20);
+        log.share(tx);
+        let source = outbox::Source {
+            session: "parent".into(),
+            message: Some("m".into()),
+            ..Default::default()
+        };
+        record(
+            &mut log,
+            &mut outbox,
+            Event::Text(source.clone(), "first ".into()),
+        )
+        .unwrap();
+        record(
+            &mut log,
+            &mut outbox,
+            Event::Text(source.clone(), "last\n".into()),
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        record(&mut log, &mut outbox, Event::TextEnd(source, None)).unwrap();
+        let key = outbox.ready().unwrap().key.clone();
+        assert_eq!(outbox.ready().unwrap().body, "first last\n");
+        delivered(&mut outbox, &mut log, &key, 42).unwrap();
+        log.event("turn_end", json!({}));
+        let text: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(text["mail_id"], 42);
+        assert_eq!(text["text"], "first last\n");
+        let end: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(end["event"], "turn_end");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

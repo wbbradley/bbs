@@ -58,6 +58,30 @@ impl Log {
         self.write(event, fields);
     }
 
+    /// Raw owner text is retained locally before delivery, never shared twice.
+    pub fn local_event(&mut self, event: &str, fields: Value) {
+        self.flush();
+        let share = self.share.take();
+        self.write(event, fields);
+        self.share = share;
+    }
+
+    /// A canonical, acknowledged mail part for activity-only viewers.
+    pub fn shared_event(&mut self, event: &str, mut fields: Value) {
+        fields["ts"] = fmt_time(Utc::now()).into();
+        fields["event"] = event.into();
+        if let Some((share, dropped)) = &mut self.share
+            && share
+                .try_send(crate::headless::share::capped(&fields))
+                .is_err()
+        {
+            *dropped += 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!("activity sharing is behind; {dropped} records dropped");
+            }
+        }
+    }
+
     /// Text the harness streams in chunks (`text` or `thought`).
     pub fn chunk(&mut self, kind: &'static str, text: &str) {
         match &mut self.pending {

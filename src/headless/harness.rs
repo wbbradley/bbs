@@ -21,7 +21,8 @@ pub const MAX_INPUT_CHARS: usize = 2000;
 /// What the harness reported during a session.
 #[derive(Debug)]
 pub enum Event {
-    Text(String),
+    Text(super::outbox::Source, String),
+    TextEnd(super::outbox::Source, Option<String>),
     /// Provider metadata changed; read the latest snapshot. Never an ACK.
     EffortChanged,
     EffortOutcome(crate::proto::EffortOutcome),

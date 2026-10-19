@@ -351,6 +351,9 @@ pub enum HeadlessCommand {
         /// Pin a local board independently of inherited environment and config.
         #[arg(long)]
         local_state_dir: Option<std::path::PathBuf>,
+        /// Runner has automatic owner delivery enabled.
+        #[arg(long, hide = true)]
+        auto_owner_reply: bool,
     },
 }
 

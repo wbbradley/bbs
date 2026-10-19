@@ -52,6 +52,7 @@ pub struct Acp {
     events: mpsc::UnboundedSender<Event>,
     /// While a loaded session replays its history, updates are not events.
     replaying: Arc<AtomicBool>,
+    active_prompt: Arc<Mutex<Option<String>>>,
     session_id: String,
     pub session_resumed: bool,
 }
@@ -150,11 +151,15 @@ impl Acp {
         let (events, rx) = mpsc::unbounded_channel();
         let effort = Arc::new(Mutex::new(AcpEffort::default()));
         let replaying = Arc::new(AtomicBool::new(false));
+        let active_prompt = Arc::new(Mutex::new(None));
         let handler = {
+            let active_prompt = active_prompt.clone();
             let replaying = replaying.clone();
             let effort = effort.clone();
             let events = events.clone();
-            move |rpc: &Rpc, msg: Incoming| handle(rpc, msg, &replaying, &effort, &events)
+            move |rpc: &Rpc, msg: Incoming| {
+                handle(rpc, msg, &replaying, &active_prompt, &effort, &events)
+            }
         };
         let (rpc, mut process) = Rpc::spawn(&config.command, &env, cwd, stderr, handler)?;
         let mut acp = Acp {
@@ -162,6 +167,7 @@ impl Acp {
             effort,
             events,
             replaying,
+            active_prompt,
             session_id: String::new(),
             session_resumed: false,
         };
@@ -408,6 +414,7 @@ impl Acp {
         if let Some(request) = effort {
             self.apply_effort(request).await?;
         }
+        *self.active_prompt.lock().unwrap() = Some(crate::auth::new_token());
         let result = self
             .rpc
             .request(
@@ -417,7 +424,9 @@ impl Acp {
                     "prompt": [{ "type": "text", "text": text }],
                 }),
             )
-            .await?;
+            .await;
+        *self.active_prompt.lock().unwrap() = None;
+        let result = result?;
         Ok(result["stopReason"]
             .as_str()
             .unwrap_or("unknown")
@@ -436,6 +445,7 @@ fn handle(
     rpc: &Rpc,
     msg: Incoming,
     replaying: &AtomicBool,
+    active_prompt: &Mutex<Option<String>>,
     effort: &Mutex<AcpEffort>,
     events: &mpsc::UnboundedSender<Event>,
 ) {
@@ -449,8 +459,21 @@ fn handle(
                     let _ = events.send(Event::EffortChanged);
                 }
             } else if !replaying.load(Ordering::SeqCst)
-                && let Some(event) = update_event(&params["update"])
+                && effort
+                    .lock()
+                    .unwrap()
+                    .parent
+                    .as_deref()
+                    .is_some_and(|id| params["sessionId"].as_str() == Some(id))
+                && let Some(mut event) = update_event(&params["update"])
             {
+                if let Event::Text(source, _) = &mut event {
+                    let Some(prompt) = active_prompt.lock().unwrap().clone() else {
+                        return;
+                    };
+                    source.turn = Some(prompt);
+                    source.session = params["sessionId"].as_str().unwrap().to_string();
+                }
                 let _ = events.send(event);
             }
         }
@@ -501,7 +524,13 @@ fn update_event(update: &Value) -> Option<Event> {
     let kind = update["sessionUpdate"].as_str()?;
     let text = || update["content"]["text"].as_str().map(str::to_string);
     Some(match kind {
-        "agent_message_chunk" => Event::Text(text()?),
+        "agent_message_chunk" => Event::Text(
+            super::outbox::Source {
+                message: update["messageId"].as_str().map(str::to_string),
+                ..Default::default()
+            },
+            text()?,
+        ),
         "agent_thought_chunk" => Event::Thought(text()?),
         "user_message_chunk" => return None,
         "tool_call" | "tool_call_update" => {
@@ -581,7 +610,7 @@ mod tests {
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "text", "text": "hi" },
         }));
-        assert!(matches!(e, Some(Event::Text(t)) if t == "hi"));
+        assert!(matches!(e, Some(Event::Text(_, t)) if t == "hi"));
         let e = update_event(&json!({
             "sessionUpdate": "tool_call",
             "toolCallId": "t1",

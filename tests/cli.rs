@@ -3225,7 +3225,7 @@ fn headless_shares_activity_by_default(mode: Mode) {
     ] {
         assert!(events.contains(&event.to_string()), "{event}: {events:?}");
     }
-    // Shared records are the local log's, in its order.
+    // Raw deltas stay local; shared text appears only at its delivery ACK.
     let logged: Vec<String> = std::fs::read_to_string(&log)
         .unwrap()
         .lines()
@@ -3235,7 +3235,14 @@ fn headless_shares_activity_by_default(mode: Mode) {
                 .unwrap()
                 .to_string()
         })
-        .filter(|e| e != "update")
+        .filter(|e| !matches!(e.as_str(), "update" | "text"))
+        .map(|e| {
+            if e == "owner_delivery" {
+                "text".into()
+            } else {
+                e
+            }
+        })
         .collect();
     assert_eq!(events, logged);
 
@@ -3588,6 +3595,8 @@ both_modes!(
     view_json_follow_emits_each_message_once,
     view_json_follow_survives_full_windows_and_bursts,
     headless_replies_through_tools_and_cancels,
+    headless_owner_delivery_acp,
+    headless_owner_delivery_codex,
     headless_process_mcp_env_routes_without_serializing_credentials,
     headless_shares_activity_by_default,
     headless_codex_replies_steers_and_interrupts,
@@ -3642,4 +3651,210 @@ fn themes_are_local_and_redirected_pretty_logs_stay_plain() {
         .unwrap();
     assert!(env.status.success());
     assert!(!env.stdout.contains(&0x1b));
+}
+
+fn headless_owner_delivery_acp(mode: Mode) {
+    owner_delivery(mode, "acp");
+}
+fn headless_owner_delivery_codex(mode: Mode) {
+    owner_delivery(mode, "codex-app-server");
+}
+
+fn owner_delivery(mode: Mode, kind: &str) {
+    let bbs = Bbs::with_mode(&format!("owner-delivery-{kind}"), mode);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_owner_delivery.py");
+    headless_config(
+        &bbs,
+        &["python3", fake, if kind == "acp" { "acp" } else { "codex" }],
+    );
+    let config = bbs.home.join(".config/bbs/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("type = {kind:?}\nshare_activity = false\n"));
+    std::fs::write(config, text).unwrap();
+    bbs.ok(&["human", "add", "alice"]);
+    let prompt_file = bbs.home.join("instructions.txt");
+    std::fs::write(&prompt_file, "CUSTOM INSTRUCTIONS").unwrap();
+    let run = RunGuard::start_with(
+        &bbs,
+        "Zed",
+        &["--prompt-file", prompt_file.to_str().unwrap()],
+    );
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    eventually("owner-delivery session", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|s| s.contains("\"event\":\"session\""))
+    });
+    bbs.ok(&["send", "--to", "Zed", "FIRST"]);
+    eventually("final owner mail before turn completion", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|s| s.contains("\"event\":\"turn_end\""))
+    });
+    let conn = rusqlite::Connection::open(match &bbs.server {
+        Some(s) => s.state.join("bbs.db"),
+        None => bbs.home.join(".local/state/bbs/bbs.db"),
+    })
+    .unwrap();
+    let bodies = || -> Vec<String> {
+        conn.prepare("SELECT body FROM messages WHERE auto_reply = 1 ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let first = bodies();
+    assert_eq!(
+        first.concat(),
+        format!(
+            " hello\n**world**\n \n\t```text\n{}\n```\nFINAL\n",
+            "é".repeat(33000)
+        )
+    );
+    assert!(first.iter().all(|s| s.len() <= 65536));
+    assert!(first.iter().any(|s| s == " \n\t"));
+    assert!(!first.concat().contains("FOREIGN"));
+    assert!(!first.concat().contains("OLD REPLAY"));
+    assert!(shared_activity(&bbs, "Zed").is_empty());
+    assert!(
+        bbs.ok(&["--as", "alice", "read"])
+            .contains("other-recipient-still-works")
+    );
+    let prompts = std::fs::read_to_string(bbs.home.join("owner-prompts.jsonl")).unwrap();
+    assert!(
+        prompts.find("owning human is will").unwrap()
+            < prompts.find("CUSTOM INSTRUCTIONS").unwrap()
+    );
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        logged.rfind("\"event\":\"owner_delivery\"").unwrap()
+            < logged.rfind("\"event\":\"turn_end\"").unwrap()
+    );
+    assert!(logged.contains("\"mail_ids\":["));
+    assert!(run.stop().status.success());
+    let run = RunGuard::start(&bbs, "Zed");
+    eventually("resumed session", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|s| s.contains("\"resumed\":true"))
+    });
+    bbs.ok(&["send", "--to", "Zed", "INTERRUPT"]);
+    eventually("partial owner message", || {
+        bodies().concat().ends_with(" partial\n").then_some(())
+    });
+    bbs.ok(&["headless", "cancel", "Zed"]);
+    eventually("interrupted tail", || {
+        bodies()
+            .concat()
+            .ends_with(" partial\ntail\n")
+            .then_some(())
+    });
+    assert!(run.stop().status.success());
+    let prompts: Vec<String> = std::fs::read_to_string(bbs.home.join("owner-prompts.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(prompts.len(), 2);
+    assert!(!prompts[1].contains("Speak naturally"));
+    assert!(!bodies().concat().contains("OLD REPLAY"));
+    assert!(!bodies().concat().contains("STALE"));
+}
+
+#[test]
+fn headless_owner_outage_survives_restart_without_model_rerun() {
+    let mut bbs = Bbs::with_mode("owner-outage", Mode::Remote);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_owner_delivery.py");
+    headless_config(&bbs, &["python3", fake, "acp"]);
+    let run = RunGuard::start_with(&bbs, "Zed", &["--mid-turn", "queue"]);
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    eventually("outage session", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|s| s.contains("\"event\":\"session\""))
+    });
+    bbs.ok(&["send", "--to", "Zed", "OUTAGE"]);
+    eventually("accepted prompt", || {
+        bbs.home.join("owner-prompts.jsonl").exists().then_some(())
+    });
+    bbs.ok(&["send", "--to", "Zed", "NEVER SUBMITTED"]);
+    eventually("queued ordinary mail", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|s| s.contains("\"queued\":true"))
+    });
+    let mut server = bbs.server.take().unwrap();
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    std::fs::write(bbs.home.join("release-output"), "").unwrap();
+    eventually("durable text while offline", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .filter(|s| s.contains("owner delivery delayed"))
+    });
+    let stopped = run.stop();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let prompts = std::fs::read_to_string(bbs.home.join("owner-prompts.jsonl")).unwrap();
+    assert_eq!(
+        prompts.lines().count(),
+        1,
+        "pending delivery must block another model turn"
+    );
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .any(|s| s.contains("unprocessed") && s.contains("NEVER SUBMITTED"))
+    );
+    let parts = bbs.home.join(".local/state/bbs/headless/zed/owner-outbox");
+    assert!(std::fs::read_dir(&parts).unwrap().any(|p| {
+        p.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("part-")
+    }));
+    // Restart only the synthetic loopback server, on the same board and port.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bbs"))
+        .args(["serve", "--listen", &server.addr, "--state-dir"])
+        .arg(&server.state)
+        .env("HOME", &bbs.home)
+        .env_remove("BBS_SERVER")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.contains("listening"), "{line}");
+    bbs.server = Some(Server {
+        child,
+        addr: server.addr.clone(),
+        state: server.state.clone(),
+    });
+    let run = RunGuard::start(&bbs, "Zed");
+    let conn = rusqlite::Connection::open(server.state.join("bbs.db")).unwrap();
+    eventually("retained owner reply", || {
+        let count: i64 = conn.query_row("SELECT count(*) FROM messages WHERE auto_reply=1 AND body='durable outage reply' || char(10)", [], |r| r.get(0)).unwrap();
+        (count == 1).then_some(())
+    });
+    assert!(run.stop().status.success());
+    assert_eq!(
+        std::fs::read_to_string(bbs.home.join("owner-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(!std::fs::read_dir(&parts).unwrap().any(|p| {
+        p.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("part-")
+    }));
 }
