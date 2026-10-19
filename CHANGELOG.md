@@ -6,7 +6,12 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
-## Unreleased
+## 0.10.1 - 2026-10-19
+
+Client display and navigation improvements. Protocol v2, database schema 17,
+config format 3 and Rust 1.89 are unchanged from 0.10.0. Upgrade the client and
+reopen `bbs connect` to use these changes; no server deployment or headless
+runner restart is needed.
 
 ### Fixed
 
