@@ -41,6 +41,9 @@ several separate `bbs group` commands.
   timeline in one step when complete, above the view, so neither a following
   nor a paused reader's view moves. After two seconds, partial content is
   shown even if a subscription is slow, and later updates appear normally.
+  Older-history reads stop after thirty seconds or a connection failure,
+  keeping recent and live activity usable; a history error remains visible
+  until `r` reloads the conversation and retries.
   Remote subscriptions reconnect after temporary connection failures, retaining
   drafts and timeline data. Activity resumes from its last received record;
   message and summary snapshots refresh. Retries back off from one to thirty

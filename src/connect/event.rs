@@ -1,7 +1,7 @@
 //! Everything the app reacts to, merged into one channel: key presses and
 //! resizes, a clock tick, and replies from the server.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -620,7 +620,7 @@ impl Reconnect {
         tx: &UnboundedSender<Event>,
         data: impl FnOnce(String) -> Data,
     ) -> bool {
-        let retry = self.retries(&error);
+        let retry = self.remote && transient_connection(&error);
         let text = if retry {
             format!("Connection interrupted; reconnecting… {error:#}")
         } else {
@@ -629,15 +629,6 @@ impl Reconnect {
         if tx.send(Event::Data(data(text))).is_err() || !retry {
             return false;
         }
-        self.wait(tx).await
-    }
-
-    fn retries(&self, error: &anyhow::Error) -> bool {
-        self.remote && transient_connection(error)
-    }
-
-    /// Back off before the next attempt; false once the app has gone.
-    async fn wait(&mut self, tx: &UnboundedSender<Event>) -> bool {
         let delay = self.delay;
         self.delay = (self.delay * 2).min(Duration::from_secs(30));
         tokio::select! {
@@ -849,9 +840,8 @@ async fn follow_activity(
     }
 }
 
-/// Fetch the agent's retained activity older than `cutoff`, the opening
-/// window's oldest id, and deliver it once, whole. Interruptions retry from
-/// the start without disturbing the live stream; a refusal is reported.
+/// Fetch older activity once, without delaying or interrupting live activity.
+/// A failure leaves the recent window usable; reloading retries the history.
 async fn backfill_activity(
     opener: Opener,
     id: u64,
@@ -860,45 +850,52 @@ async fn backfill_activity(
     cutoff: tokio::sync::oneshot::Receiver<i64>,
 ) {
     let Ok(cutoff) = cutoff.await else { return };
-    let mut reconnect = Reconnect::new(&opener);
-    loop {
-        let result: anyhow::Result<Vec<proto::Activity>> = async {
-            let mut backend =
-                Backend::open(&opener.config, &opener.dir, opener.caller.clone()).await?;
-            let mut pages = backend
-                .watch_activity(proto::ActivityRequest {
-                    backlog: BACKFILL_PAGE,
-                    after_id: Some(0),
-                    agent: agent.clone(),
-                })
-                .await?;
-            let mut older = Vec::new();
-            loop {
-                let page = pages.next().await?;
-                // A cursor never sends an empty batch: stop at the window.
-                let done = page.len() < BACKFILL_PAGE as usize
-                    || page.last().is_some_and(|row| row.id >= cutoff);
-                older.extend(page.into_iter().take_while(|row| row.id < cutoff));
-                if done {
-                    return Ok(older);
-                }
+    let result = tokio::select! {
+        () = tx.closed() => return,
+        result = tokio::time::timeout(HISTORY_LOAD_TIMEOUT, older_activity(opener, agent, cutoff)) => {
+            match result {
+                Ok(result) => result.map_err(|e| format!("{e:#}")),
+                Err(_) => Err("did not finish within 30 seconds".to_string()),
             }
         }
-        .await;
-        let result = match result {
-            Ok(older) => Ok(older),
-            Err(error) if reconnect.retries(&error) => {
-                if reconnect.wait(&tx).await {
-                    continue;
-                }
-                return;
+    };
+    let result = result.map_err(|e| format!("Older activity unavailable; r retries: {e}"));
+    let _ = tx.send(Event::Data(Data::ActivityBackfill { id, result }));
+}
+
+async fn older_activity(
+    opener: Opener,
+    agent: Option<String>,
+    cutoff: i64,
+) -> anyhow::Result<Vec<proto::Activity>> {
+    let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller).await?;
+    let mut pages = backend
+        .watch_activity(proto::ActivityRequest {
+            backlog: BACKFILL_PAGE,
+            after_id: Some(0),
+            agent,
+        })
+        .await?;
+    let mut older = VecDeque::new();
+    loop {
+        let page = pages.next().await?;
+        // The first batch can be empty. Later empty cursor batches are
+        // suppressed, so also stop on reaching the sampled opening window.
+        let done =
+            page.len() < BACKFILL_PAGE as usize || page.last().is_some_and(|row| row.id >= cutoff);
+        for row in page.into_iter().take_while(|row| row.id < cutoff) {
+            if older.len() == super::timeline::MAX_RECORDS {
+                older.pop_front();
             }
-            Err(error) => Err(format!("{error:#}")),
-        };
-        let _ = tx.send(Event::Data(Data::ActivityBackfill { id, result }));
-        return;
+            older.push_back(row);
+        }
+        if done {
+            return Ok(older.into_iter().collect());
+        }
     }
 }
+
+const HISTORY_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Records per backfill page, as the server's cursor pages them.
 const BACKFILL_PAGE: u32 = 200;
@@ -1074,9 +1071,46 @@ mod tests {
             summaries: AtomicUsize,
             cursors: Mutex<Vec<Option<i64>>>,
             refusal: Option<tonic::Code>,
+            history: Option<Arc<History>>,
         }
         #[derive(Clone, Default)]
         struct Server(Arc<State>);
+
+        #[derive(Default)]
+        struct History {
+            prefix: Mutex<Option<UnboundedSender<Result<proto::ActivitySnapshot, Status>>>>,
+            live: Mutex<Option<UnboundedSender<Result<proto::ActivitySnapshot, Status>>>>,
+            started: tokio::sync::Notify,
+            prefix_closed: Arc<tokio::sync::Notify>,
+            live_closed: Arc<tokio::sync::Notify>,
+        }
+
+        struct HeldActivity {
+            rx: UnboundedReceiver<Result<proto::ActivitySnapshot, Status>>,
+            closed: Arc<tokio::sync::Notify>,
+        }
+
+        impl Stream for HeldActivity {
+            type Item = Result<proto::ActivitySnapshot, Status>;
+
+            fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                self.get_mut().rx.poll_recv(cx)
+            }
+        }
+
+        impl Drop for HeldActivity {
+            fn drop(&mut self) {
+                self.closed.notify_one();
+            }
+        }
+
+        fn activity_row(id: i64) -> proto::Activity {
+            proto::Activity {
+                id,
+                record: r#"{"event":"turn_end"}"#.into(),
+                ..Default::default()
+            }
+        }
 
         fn reply<T: Send + 'static>(value: T, interrupt: bool) -> Reply<T> {
             Box::pin(async move {
@@ -1133,10 +1167,43 @@ mod tests {
             type ResponseStream = Replies<Self::Response>;
             type Future = Reply<Self::Response>;
             fn call(&mut self, request: tonic::Request<proto::ActivityRequest>) -> Self::Future {
-                let cursor = request.into_inner().after_id;
+                let request = request.into_inner();
+                let cursor = request.after_id;
                 let mut cursors = self.0.cursors.lock().unwrap();
                 let n = cursors.iter().filter(|c| c.is_some()).count();
                 cursors.push(cursor);
+                if let Some(history) = &self.0.history {
+                    if cursor.is_none() {
+                        return reply(
+                            proto::ActivitySnapshot {
+                                events: if request.backlog == 1 {
+                                    vec![activity_row(1598)]
+                                } else {
+                                    (0..200).map(|i| activity_row(1000 + i * 3)).collect()
+                                },
+                            },
+                            false,
+                        );
+                    }
+                    let (tx, rx) = unbounded_channel();
+                    let closed = if cursor == Some(0) {
+                        *history.prefix.lock().unwrap() = Some(tx);
+                        history.started.notify_one();
+                        history.prefix_closed.clone()
+                    } else {
+                        tx.send(Ok(proto::ActivitySnapshot {
+                            events: vec![activity_row(cursor.unwrap() + 1)],
+                        }))
+                        .unwrap();
+                        *history.live.lock().unwrap() = Some(tx);
+                        history.live_closed.clone()
+                    };
+                    return Box::pin(async move {
+                        let rows: Replies<proto::ActivitySnapshot> =
+                            Box::pin(HeldActivity { rx, closed });
+                        Ok(Response::new(rows))
+                    });
+                }
                 let id = if n == 0 { 10 } else { 11 };
                 reply(
                     proto::ActivitySnapshot {
@@ -1210,6 +1277,145 @@ mod tests {
                     };
                     Ok(response)
                 })
+            }
+        }
+
+        #[tokio::test]
+        async fn live_activity_survives_stalled_or_failed_history_and_cancels_with_it() {
+            for outcome in ["timeout", "unavailable", "cancel"] {
+                let (_dir, _conn, mut opener, mut req) = board();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                opener.config.server = Some(listener.local_addr().unwrap().to_string());
+                req.after_id = None;
+                let history = Arc::new(History::default());
+                let state = Arc::new(State {
+                    history: Some(history.clone()),
+                    ..Default::default()
+                });
+                let serving = tokio::spawn(
+                    tonic::transport::Server::builder()
+                        .add_service(Server(state.clone()))
+                        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                            listener,
+                        )),
+                );
+                let (tx, mut rx) = unbounded_channel();
+                let worker = tokio::spawn(watch_activity(opener, 9, req, tx));
+                // A live event arrives with the older read still held open.
+                let mut window = false;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match rx.recv().await.unwrap() {
+                            Event::Data(Data::Activity {
+                                result: Ok(rows), ..
+                            }) => {
+                                if rows.len() == 200 {
+                                    assert_eq!(rows.first().unwrap().id, 1000);
+                                    assert_eq!(rows.last().unwrap().id, 1597);
+                                    window = true;
+                                } else if rows.last().is_some_and(|r| r.id == 1598) {
+                                    break;
+                                }
+                            }
+                            Event::Data(Data::ActivityBaseline {
+                                through_id: 1597, ..
+                            }) => {}
+                            _ => panic!("unexpected event before history completes"),
+                        }
+                    }
+                    history.started.notified().await;
+                })
+                .await
+                .unwrap();
+                assert!(window);
+                assert_eq!(
+                    state
+                        .cursors
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|c| **c == Some(0))
+                        .count(),
+                    1
+                );
+
+                if outcome == "cancel" {
+                    worker.abort();
+                    assert!(worker.await.unwrap_err().is_cancelled());
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        history.prefix_closed.notified().await;
+                        history.live_closed.notified().await;
+                    })
+                    .await
+                    .unwrap();
+                    assert!(rx.try_recv().is_err(), "cancel sends no history result");
+                } else {
+                    if outcome == "timeout" {
+                        tokio::time::pause();
+                        tokio::time::advance(HISTORY_LOAD_TIMEOUT).await;
+                    } else {
+                        history
+                            .prefix
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .send(Err(Status::unavailable("interrupted")))
+                            .unwrap();
+                    }
+                    let Event::Data(Data::ActivityBackfill {
+                        id: 9,
+                        result: Err(error),
+                    }) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                    else {
+                        panic!("history fails once, without a partial result")
+                    };
+                    if outcome == "timeout" {
+                        assert!(error.contains("30 seconds"));
+                        tokio::time::resume();
+                    } else {
+                        assert!(error.contains("interrupted"));
+                    }
+                    assert!(error.contains("r retries"));
+                    tokio::time::timeout(Duration::from_secs(5), history.prefix_closed.notified())
+                        .await
+                        .unwrap();
+                    // A live interruption still resumes its own cursor; it
+                    // neither retries the failed prefix nor duplicates it.
+                    history.live.lock().unwrap().take();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            match rx.recv().await.unwrap() {
+                                Event::Data(Data::ActivityBackfill { .. }) => {
+                                    panic!("history retried")
+                                }
+                                Event::Data(Data::Activity {
+                                    result: Ok(rows), ..
+                                }) if rows.last().is_some_and(|r| r.id == 1599) => break,
+                                _ => {}
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        state
+                            .cursors
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|c| **c == Some(0))
+                            .count(),
+                        1
+                    );
+                    worker.abort();
+                    assert!(worker.await.unwrap_err().is_cancelled());
+                }
+                serving.abort();
+                let _ = serving.await;
             }
         }
 
@@ -1777,6 +1983,39 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn older_activity_keeps_a_bounded_recent_prefix_and_handles_an_empty_board() {
+        let (_dir, conn, opener, req) = board();
+        conn.execute_batch(
+            r#"WITH RECURSIVE ids(id) AS (
+                VALUES(501) UNION ALL SELECT id + 1 FROM ids WHERE id < 6500
+            ) INSERT INTO activity (id, agent_id, created_at, event, record)
+              SELECT id, 1, 't', 'text', '{"event":"text"}' FROM ids;
+              UPDATE activity SET id = -id;
+              UPDATE activity SET id = -id * 3;"#,
+        )
+        .unwrap();
+        let rows = older_activity(opener.clone(), req.agent.clone(), 6201 * 3)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), super::super::timeline::MAX_RECORDS);
+        assert_eq!(rows.first().unwrap().id, 1201 * 3);
+        assert_eq!(rows.last().unwrap().id, 6200 * 3);
+        assert!(rows.windows(2).all(|pair| pair[0].id < pair[1].id));
+        conn.execute("DELETE FROM activity", []).unwrap();
+        assert!(
+            older_activity(opener.clone(), req.agent, 6201 * 3)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            older_activity(opener, Some("retired".into()), 6201 * 3)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn activity_opens_on_the_newest_window_then_older_history_once_then_live() {
         async fn next(rx: &mut UnboundedReceiver<Event>) -> Event {
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -1786,7 +2025,7 @@ mod tests {
         }
         // (records kept, older history expected): more than a page before
         // the window, exactly a page, and none.
-        for (kept, older) in [(500, 300), (400, 200), (150, 0)] {
+        for (kept, older) in [(500, 300), (400, 200), (200, 0), (150, 0), (0, 0)] {
             let (_dir, conn, opener, mut req) = board();
             conn.execute("DELETE FROM activity WHERE id > ?1", [kept])
                 .unwrap();
@@ -1796,12 +2035,13 @@ mod tests {
             let Event::Data(Data::ActivityBaseline {
                 id: 9,
                 through_id,
-                record: Some(_),
+                record,
             }) = next(&mut rx).await
             else {
                 panic!("expected the window's watermark");
             };
             assert_eq!(through_id, kept);
+            assert_eq!(record.is_some(), kept > 0);
             let Event::Data(Data::Activity {
                 id: 9,
                 result: Ok(window),
@@ -1822,7 +2062,7 @@ mod tests {
             )
             .unwrap();
             let (mut live, mut history) = (Vec::new(), None);
-            while live.is_empty() || (older > 0 && history.is_none()) {
+            while live.is_empty() || (kept >= 200 && history.is_none()) {
                 match next(&mut rx).await {
                     Event::Data(Data::Activity {
                         id: 9,
@@ -1839,7 +2079,7 @@ mod tests {
                 }
             }
             assert_eq!(live, [kept + 1]);
-            if older > 0 {
+            if kept >= 200 {
                 assert_eq!(history.unwrap(), (1..=older).collect::<Vec<_>>(), "{kept}");
             } else {
                 assert!(
@@ -1847,14 +2087,14 @@ mod tests {
                     "a short window has nothing older to fetch"
                 );
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            worker.abort();
+            assert!(worker.await.unwrap_err().is_cancelled());
             while let Ok(event) = rx.try_recv() {
                 assert!(
                     matches!(event, Event::Data(Data::Activity { result: Ok(rows), .. }) if rows.is_empty()),
                     "nothing more, nothing twice"
                 );
             }
-            worker.abort();
         }
     }
 

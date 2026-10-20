@@ -4345,9 +4345,16 @@ mod tests {
             result: Ok((201..=400).map(row).collect()),
         }));
         screen(&mut app, 80, 24);
+        typed(&mut app, "draft during history loading");
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![row(401)]),
+        }));
         let paused = screen(&mut app, 80, 24);
         assert!(paused.contains("paused"), "{paused}");
+        assert!(paused.contains("1 new"), "{paused}");
+        assert!(paused.contains("draft during history loading"), "{paused}");
         app.on_event(Event::Data(Data::ActivityBackfill {
             id: act,
             result: Ok((1..=200).map(row).collect()),

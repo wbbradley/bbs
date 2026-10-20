@@ -398,6 +398,12 @@ impl Thread {
                     .as_ref()
                     .and_then(|s| s.error.as_ref())
                     .map(|e| ("activity error", format!("activity: {e}")))
+            })
+            .or_else(|| {
+                self.stream
+                    .as_ref()
+                    .and_then(|s| s.history_error.as_ref())
+                    .map(|e| ("history error", e.clone()))
             });
         let issue = issue.or_else(|| {
             ctx.inbox

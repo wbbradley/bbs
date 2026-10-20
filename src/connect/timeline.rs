@@ -367,6 +367,8 @@ pub struct Stream {
     history_ready: bool,
     /// The stream's last error, cleared by the next successful batch.
     pub error: Option<String>,
+    /// Older-history failure, retained until the conversation is reloaded.
+    pub history_error: Option<String>,
     progress: ProgressState,
     /// Delivered-as ids drawn since the last full redraw, so a retried copy
     /// of the same text draws once.
@@ -421,6 +423,7 @@ impl Stream {
             history_end: None,
             history_ready: false,
             error: None,
+            history_error: None,
             progress: ProgressState::default(),
             drawn: HashSet::new(),
             redraw: false,
@@ -594,7 +597,7 @@ impl Stream {
         {
             match result {
                 Ok(older) => self.backfill(older),
-                Err(e) => self.error = Some(e.clone()),
+                Err(e) => self.history_error = Some(e.clone()),
             }
             return Vec::new();
         }
@@ -773,7 +776,17 @@ mod tests {
             now,
             &Loaded::new(),
         );
-        assert_eq!(full.error.as_deref(), Some("refused"));
+        assert_eq!(full.history_error.as_deref(), Some("refused"));
+        full.on_data(
+            &Data::Activity {
+                id: full.id,
+                result: Ok(vec![row(MAX_RECORDS as i64 + 2, r#"{"event":"turn_end"}"#)]),
+            },
+            now,
+            &Loaded::new(),
+        );
+        assert!(full.error.is_none());
+        assert_eq!(full.history_error.as_deref(), Some("refused"));
     }
 
     #[test]
