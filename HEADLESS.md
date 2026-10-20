@@ -276,6 +276,8 @@ two-minute lifetime. Cancellation targets the child. A runner restart interrupts
 pending work rather than submitting the question again. An uncertain start is
 reported without an automatic retry. Closing and reopening the conversation
 keeps the request available; use its explicit cancellation action to stop it.
+If provider cleanup cannot be confirmed, side questions are disabled until the
+runner restarts after the provider problem is resolved.
 
 ## Turns
 
