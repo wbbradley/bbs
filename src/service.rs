@@ -1297,6 +1297,11 @@ pub fn close_owner_input(
     with_ctx(conn, caller, |ctx| {
         let me = ctx.agent()?;
         validate_generation(ctx, &me, &req.generation)?;
+        if let Some(seq) = req.request_seq
+            && seq < 1
+        {
+            bail!("close sequence must be positive");
+        }
         let mut barrier = None;
         if let Some(id) = req.request_id {
             let Some(row) = db::owner_input(ctx.conn, id)? else {
@@ -3540,7 +3545,22 @@ mod tests {
         let _ = lu;
 
         // The closed-sequence barrier retires requests that never arrived.
+        // Nonpositive sequences reject, like publish.
         begin(&mut conn, &mateo, "run-3").unwrap();
+        for seq in [0, -1] {
+            let err = close_owner_input(
+                &mut conn,
+                &mateo,
+                proto::CloseOwnerInputRequest {
+                    generation: "run-3".into(),
+                    request_id: None,
+                    request_seq: Some(seq),
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("must be positive"), "{seq}: {err}");
+        }
         close_owner_input(
             &mut conn,
             &mateo,
