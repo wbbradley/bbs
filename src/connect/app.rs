@@ -57,6 +57,8 @@ pub enum Transition {
     },
     /// Apply and remember a local color scheme immediately.
     Theme(crate::ui::theme::Scheme),
+    /// Remember compact (true) or verbose view for every agent conversation.
+    Compact(bool),
 }
 
 pub trait Screen {
@@ -502,6 +504,7 @@ impl App {
                 crate::ui::theme::select(scheme);
                 self.ctx.preferences.set_theme(scheme);
             }
+            Transition::Compact(compact) => self.ctx.preferences.set_compact(compact),
             Transition::Push(screen) => self.push(screen),
             Transition::Pop if self.stack.len() > 1 => self.pop(),
             Transition::Request(request) => self.send(vec![request]),
@@ -5656,13 +5659,75 @@ mod tests {
             bottom(&mut app).contains("compact"),
             "after the prompt closes"
         );
-        // The choice lasts while the conversation is open: reopened, it is
-        // verbose again.
+        // The choice outlives the conversation: reopened, it is compact.
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         while rx.try_recv().is_ok() {}
         reopen(&mut app, &mut rx);
+        assert!(bottom(&mut app).contains("compact"));
+    }
+
+    #[test]
+    fn compact_is_one_saved_choice_across_agents_and_restarts() {
+        let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connect.json");
+        let saved = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+        let (mut app, mut rx) = app();
+        app.ctx.preferences = Preferences::load(path.clone()).unwrap();
+        mateo_streams(&mut app, &mut rx);
+        assert!(!bottom(&mut app).contains("compact"), "verbose by default");
+        assert!(!path.exists(), "no choice, no state");
+        ctrl_t(&mut app);
+        assert!(app.ctx.preferences.error.is_none());
+        assert_eq!(saved(), serde_json::json!({"compact": true}));
+        // Another agent's conversation, opened over this one, is compact too;
+        // verbose there is verbose here once this one shows again.
+        app.stack
+            .push(Box::new(Thread::agent("Zed", "ada", app.ctx.now.clone())));
+        assert!(bottom(&mut app).contains("BBS · Zed") && bottom(&mut app).contains("compact"));
+        ctrl_t(&mut app);
         assert!(!bottom(&mut app).contains("compact"));
+        assert_eq!(saved(), serde_json::json!({}), "verbose is the default");
+        app.stack.pop();
+        assert!(bottom(&mut app).contains("BBS · Mateo"));
+        assert!(!bottom(&mut app).contains("compact"));
+        ctrl_t(&mut app);
+        // A new process starts compact.
+        let (mut restarted, mut rx) = self::app();
+        restarted.ctx.preferences = Preferences::load(path.clone()).unwrap();
+        mateo_streams(&mut restarted, &mut rx);
+        assert!(bottom(&mut restarted).contains("compact"));
+    }
+
+    #[test]
+    fn a_failed_compact_save_keeps_the_view_says_why_and_retries() {
+        let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state");
+        let path = parent.join("connect.json");
+        let (mut app, mut rx) = app();
+        app.ctx.preferences = Preferences::load(path.clone()).unwrap();
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![at(11, "01", "Zed", "Mateo", "side chatter")]),
+        }));
+        while rx.try_recv().is_ok() {}
+        std::fs::write(&parent, "blocked").unwrap();
+        ctrl_t(&mut app);
+        let out = screen(&mut app, 120, 24);
+        // The view still changes; the bottom bar says why it was not saved.
+        assert!(!out.contains("side chatter"), "{out}");
+        assert!(out.contains("Cannot save view preference"), "{out}");
+        assert!(rx.try_recv().is_err(), "nothing sent");
+        std::fs::remove_file(&parent).unwrap();
+        ctrl_t(&mut app);
+        ctrl_t(&mut app);
+        assert!(app.ctx.preferences.error.is_none());
+        assert!(Preferences::load(path).unwrap().compact());
     }
 
     #[test]

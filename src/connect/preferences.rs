@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::ui::theme::{self, Scheme};
 
-/// Unknown fields are ignored and dropped on the next save, as the retired
-/// `compact` view choice is.
+/// Unknown fields are ignored and dropped on the next save.
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 struct Values {
+    /// Agent conversations show compact view; absent means verbose.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    compact: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     theme: Option<Scheme>,
 }
@@ -58,6 +60,20 @@ impl Preferences {
             .map(|e| format!("Cannot save color scheme: {e:#}"));
     }
 
+    /// Whether agent conversations show compact view.
+    pub fn compact(&self) -> bool {
+        self.values.compact
+    }
+
+    pub fn set_compact(&mut self, compact: bool) {
+        self.values.compact = compact;
+        // Keep the live choice if persistence fails, and let the screen explain it.
+        self.error = self
+            .save()
+            .err()
+            .map(|e| format!("Cannot save view preference: {e:#}"));
+    }
+
     fn save(&self) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -82,7 +98,7 @@ mod tests {
         use crate::ui::theme::testing::with_scheme;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connect.json");
-        // A file with the retired view choice loads; the next save drops it.
+        // A verbose choice is the default, so the next save leaves it out.
         std::fs::write(&path, r#"{"compact":false}"#).unwrap();
         let mut prefs = Preferences::load(path.clone()).unwrap();
         with_scheme(Scheme::Terminal, || {
@@ -139,6 +155,28 @@ mod tests {
                 Some(Scheme::Terminal)
             );
         });
+    }
+
+    #[test]
+    fn compact_round_trips_beside_the_theme_and_verbose_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connect.json");
+        std::fs::write(&path, r#"{"compact":true,"theme":"terminal"}"#).unwrap();
+        let mut prefs = Preferences::load(path.clone()).unwrap();
+        assert!(prefs.compact());
+        prefs.set_compact(false);
+        assert!(prefs.error.is_none());
+        let saved = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        assert_eq!(saved(&path), serde_json::json!({"theme": "terminal"}));
+        assert!(!Preferences::load(path.clone()).unwrap().compact());
+        prefs.set_compact(true);
+        assert_eq!(
+            saved(&path),
+            serde_json::json!({"compact": true, "theme": "terminal"})
+        );
+        assert!(!Preferences::default().compact(), "verbose by default");
     }
 
     #[test]

@@ -46,8 +46,9 @@ pub struct Thread {
     /// Raw feed boundaries that may have skipped messages.
     message_gaps: BTreeSet<i64>,
     show: Show,
-    /// Ctrl-T: hide tool calls and mail among other participants while this
-    /// conversation is open; `show` and the activity kinds still apply.
+    /// Ctrl-T: hide tool calls and mail among other participants, following
+    /// the saved choice shared by agent conversations; `show` and the
+    /// activity kinds still apply.
     compact: bool,
     human: Option<String>,
     /// The stream's last error; it has ended until a reload.
@@ -211,6 +212,15 @@ impl Thread {
                 message: m,
             })
             .collect()
+    }
+
+    /// Show compact or verbose view, redrawing only on a change. A paused
+    /// reader keeps their place, or the next entry shown.
+    fn set_compact(&mut self, compact: bool) {
+        if self.compact != compact {
+            self.compact = compact;
+            self.reconcile();
+        }
     }
 
     /// While compact, the ids of held mail among other participants.
@@ -1099,10 +1109,8 @@ impl Screen for Thread {
             if self.prompt.is_some() {
                 return Some(Transition::Stay);
             }
-            self.compact = !self.compact;
-            // A paused reader keeps their place, or the next entry shown.
-            self.reconcile();
-            return Some(Transition::Stay);
+            self.set_compact(!self.compact);
+            return Some(Transition::Compact(self.compact));
         }
         if self.composing {
             return self.compose(key);
@@ -1231,6 +1239,10 @@ impl Screen for Thread {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
+        // The choice is global: follow one made in another conversation.
+        if self.agent.is_some() {
+            self.set_compact(ctx.preferences.compact());
+        }
         self.draw(frame, area, ctx);
         if let Some((_, admin)) = &self.group {
             admin.render(frame, area);

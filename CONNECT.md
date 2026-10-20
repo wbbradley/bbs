@@ -257,7 +257,11 @@ timeline, and mail among other participants (the side messages above), along
 with their echoes in activity even when `A` shows activity only. Your mail with
 the agent, its replies, reasoning and other activity stay, and `A` and `E`
 still apply on top. The bottom bar says `compact` while it is on. The
-choice lasts while the conversation is open and is not saved. An open `/answer` form keeps
+choice applies to every agent conversation, including ones already open, and is
+saved with the color scheme in `~/.local/state/bbs/connect.json`, so later
+sessions start in it; without a saved choice, conversations are verbose. If the
+choice cannot be saved, the bottom bar says why and the view still changes for
+this session. An open `/answer` form keeps
 every key, so `Ctrl-T` does nothing there. The question card, `/context` and
 the `/btw` panel are unaffected, and toggling never cancels anything. Marking
 read and seen, progress, and notices work the same in both views.
