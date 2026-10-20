@@ -4128,16 +4128,14 @@ mod tests {
             },
         )
         .unwrap();
-        let stamp = side_report(
-            &mut conn,
-            &mateo,
-            proto::SideReportRequest {
-                agent: String::new(),
-                generation: Some("run-2".into()),
-            },
+        // Pin the report time to a fixed old instant, so preservation can
+        // never pass by the clock merely standing still.
+        conn.execute(
+            "UPDATE side_state SET reported_at = '2020-01-01T00:00:00.000000Z' WHERE agent_id = 1",
+            [],
         )
-        .unwrap()
-        .reported_at;
+        .unwrap();
+        let stamp = "2020-01-01T00:00:00.000000Z";
         let err = report_context(
             &mut conn,
             &mateo,
@@ -4178,7 +4176,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.usage.unwrap().used_tokens, Some(42));
-        assert_eq!(view.reported_at, stamp);
+        assert_eq!(view.reported_at, stamp.to_string());
         assert_eq!(view.side_supported, Some(false));
         assert_eq!(view.side_reason.as_deref(), Some("child setup failed"));
 
