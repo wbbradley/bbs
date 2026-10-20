@@ -957,6 +957,78 @@ async fn group_deliveries_opt_in_over_the_wire_and_follow_live() {
 }
 
 #[tokio::test]
+async fn side_questions_are_advertised_and_answered_over_the_wire() {
+    let server = Server::start("side-questions");
+    let mut client = server.client().await;
+    let info = client
+        .server_info(proto::Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(info.capabilities.iter().any(|c| c == "side-questions.v1"));
+    let agent = register(&mut client).await;
+    client
+        .begin_side_session(as_agent(
+            &agent.token,
+            proto::BeginSideSessionRequest {
+                generation: "proc-1".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    let request = client
+        .request_owner_input(as_agent(
+            &agent.token,
+            proto::RequestOwnerInputRequest {
+                generation: "proc-1".into(),
+                questions: vec![proto::InputQuestion {
+                    id: "q".into(),
+                    header: "Deploy?".into(),
+                    text: "Ship it?".into(),
+                    options: vec![proto::InputOption {
+                        value: "yes".into(),
+                        label: None,
+                        description: None,
+                    }],
+                    allow_free_text: true,
+                    required: true,
+                }],
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    client
+        .answer_owner_input(as_human(
+            "will",
+            proto::AnswerOwnerInputRequest {
+                request_id: request.request_id,
+                action: proto::AnswerAction::Submit.into(),
+                answers: vec![proto::InputAnswer {
+                    question_id: "q".into(),
+                    value: "yes".into(),
+                }],
+            },
+        ))
+        .await
+        .unwrap();
+    let report = client
+        .side_report(as_agent(
+            &agent.token,
+            proto::SideReportRequest {
+                agent: String::new(),
+                generation: Some("proc-1".into()),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let input = report.pending_input.unwrap();
+    assert_eq!(input.status(), proto::InputStatus::Answered);
+    assert_eq!(input.answers[0].value, "yes");
+}
+
+#[tokio::test]
 async fn feed_filters_are_advertised_and_applied_server_side() {
     let server = Server::start("feed-filter");
     let mut client = server.client().await;

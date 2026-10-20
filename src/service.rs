@@ -3089,6 +3089,319 @@ mod tests {
     }
 
     #[test]
+    fn side_channels_lifecycle_generation_bounds_and_exclusion() {
+        let (mut conn, will, [mateo, zed, lu]) = board();
+        let begin = |conn: &mut Connection, agent: &Caller, g: &str| {
+            begin_side_session(
+                conn,
+                agent,
+                proto::BeginSideSessionRequest {
+                    generation: g.into(),
+                },
+            )
+        };
+        let question = |id: &str, required: bool| proto::InputQuestion {
+            id: id.into(),
+            header: format!("H{id}"),
+            text: format!("Pick {id}"),
+            options: vec![
+                proto::InputOption {
+                    value: "a".into(),
+                    label: Some("A".into()),
+                    description: None,
+                },
+                proto::InputOption {
+                    value: "b".into(),
+                    label: None,
+                    description: Some("the b".into()),
+                },
+            ],
+            allow_free_text: false,
+            required,
+        };
+        let ask = |conn: &mut Connection, g: &str, qs| {
+            request_owner_input(
+                conn,
+                &mateo,
+                proto::RequestOwnerInputRequest {
+                    generation: g.into(),
+                    questions: qs,
+                },
+            )
+        };
+        let mail_counts = |conn: &mut Connection| -> (i64, i64, i64) {
+            (
+                conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+                    .unwrap(),
+                conn.query_row("SELECT count(*) FROM deliveries", [], |r| r.get(0))
+                    .unwrap(),
+                conn.query_row("SELECT count(*) FROM agent_human_conversations", [], |r| {
+                    r.get(0)
+                })
+                .unwrap(),
+            )
+        };
+        let before = mail_counts(&mut conn);
+
+        // Generation validation and idempotent begin.
+        assert!(begin(&mut conn, &mateo, "").is_err());
+        assert!(begin(&mut conn, &mateo, &"g".repeat(129)).is_err());
+        let first = begin(&mut conn, &mateo, "run-1").unwrap();
+        assert_eq!(first.generation, "run-1");
+        // Reporting with a generation never begun is stale.
+        let err = report_context(
+            &mut conn,
+            &mateo,
+            proto::ReportContextRequest {
+                generation: "never".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("stale side generation"), "{err}");
+        // Usage validation: source required, limit positive.
+        for usage in [
+            proto::ContextUsage {
+                used_tokens: Some(10),
+                limit_tokens: Some(100),
+                source: 0,
+            },
+            proto::ContextUsage {
+                used_tokens: Some(10),
+                limit_tokens: Some(0),
+                source: 1,
+            },
+        ] {
+            assert!(report_context(
+                &mut conn,
+                &mateo,
+                proto::ReportContextRequest {
+                    generation: "run-1".into(),
+                    usage: Some(usage),
+                    ..Default::default()
+                },
+            )
+            .is_err());
+        }
+        report_context(
+            &mut conn,
+            &mateo,
+            proto::ReportContextRequest {
+                generation: "run-1".into(),
+                usage: Some(proto::ContextUsage {
+                    used_tokens: Some(120),
+                    limit_tokens: Some(100),
+                    source: proto::context_usage::Source::CurrentContext.into(),
+                }),
+                side_supported: Some(true),
+                side_reason: None,
+            },
+        )
+        .unwrap();
+        // An idempotent re-begin keeps state: lost ACK never resets.
+        begin(&mut conn, &mateo, "run-1").unwrap();
+        let report = side_report(
+            &mut conn,
+            &mateo,
+            proto::SideReportRequest {
+                agent: String::new(),
+                generation: Some("run-1".into()),
+            },
+        )
+        .unwrap();
+        let usage = report.usage.unwrap();
+        assert_eq!(
+            (usage.used_tokens, usage.limit_tokens, usage.source()),
+            (
+                Some(120),
+                Some(100),
+                proto::context_usage::Source::CurrentContext
+            )
+        );
+        assert_eq!(report.side_supported, Some(true));
+
+        // Bounds.
+        assert!(ask(&mut conn, "run-1", vec![]).is_err());
+        assert!(ask(
+            &mut conn,
+            "run-1",
+            vec![question("a", true); 4].to_vec()
+        )
+        .is_err());
+        let mut many = question("a", true);
+        many.options = (0..17)
+            .map(|n| proto::InputOption {
+                value: format!("v{n}"),
+                label: None,
+                description: None,
+            })
+            .collect();
+        assert!(ask(&mut conn, "run-1", vec![many]).is_err());
+        let mut big = question("a", true);
+        big.text = "x".repeat(4 * 1024 + 1);
+        assert!(ask(&mut conn, "run-1", vec![big]).is_err());
+        let dup = vec![question("a", true), question("a", false)];
+        assert!(ask(&mut conn, "run-1", dup).is_err());
+
+        // Ask, and one pending only.
+        let request = ask(
+            &mut conn,
+            "run-1",
+            vec![question("a", true), question("b", false)],
+        )
+        .unwrap();
+        let err = ask(&mut conn, "run-1", vec![question("c", true)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already pending"), "{err}");
+
+        // Owner scoping: another human cannot answer or read.
+        ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: "ada".into(),
+            },
+        )
+        .unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        let err = answer_owner_input(
+            &mut conn,
+            &ada,
+            proto::AnswerOwnerInputRequest {
+                request_id: request.request_id,
+                action: proto::AnswerAction::Cancel.into(),
+                answers: vec![],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not your agent"), "{err}");
+        let err = side_report(
+            &mut conn,
+            &ada,
+            proto::SideReportRequest {
+                agent: "Mateo".into(),
+                generation: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not your agent"), "{err}");
+
+        // Answer validation: unknown question, non-option value, required miss.
+        let mut bad = |answers: Vec<proto::InputAnswer>| {
+            answer_owner_input(
+                &mut conn,
+                &will,
+                proto::AnswerOwnerInputRequest {
+                    request_id: request.request_id,
+                    action: proto::AnswerAction::Submit.into(),
+                    answers,
+                },
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(bad(vec![proto::InputAnswer {
+            question_id: "zzz".into(),
+            value: "a".into(),
+        }])
+        .contains("unknown question"));
+        assert!(bad(vec![proto::InputAnswer {
+            question_id: "a".into(),
+            value: "off-script".into(),
+        }])
+        .contains("not an offered option"));
+        assert!(bad(vec![]).contains("required question unanswered"));
+
+        // Owner submits; an optional question may be skipped.
+        answer_owner_input(
+            &mut conn,
+            &will,
+            proto::AnswerOwnerInputRequest {
+                request_id: request.request_id,
+                action: proto::AnswerAction::Submit.into(),
+                answers: vec![proto::InputAnswer {
+                    question_id: "a".into(),
+                    value: "b".into(),
+                }],
+            },
+        )
+        .unwrap();
+        let report = side_report(
+            &mut conn,
+            &will,
+            proto::SideReportRequest {
+                agent: "Mateo".into(),
+                generation: None,
+            },
+        )
+        .unwrap();
+        let input = report.pending_input.unwrap();
+        assert_eq!(input.status(), proto::InputStatus::Answered);
+        assert_eq!(input.answers.len(), 1);
+        assert_eq!(input.answers[0].value, "b");
+
+        // The driver closes its own next request; a fresh generation resets.
+        let second = ask(&mut conn, "run-1", vec![question("c", true)]).unwrap();
+        close_owner_input(
+            &mut conn,
+            &mateo,
+            proto::CloseOwnerInputRequest {
+                generation: "run-1".into(),
+                request_id: second.request_id,
+            },
+        )
+        .unwrap();
+        let third = ask(&mut conn, "run-1", vec![question("d", true)]).unwrap();
+        assert!(third.request_id > second.request_id);
+        begin(&mut conn, &mateo, "run-2").unwrap();
+        // The reset staled the pending request and cleared usage.
+        let report = side_report(
+            &mut conn,
+            &mateo,
+            proto::SideReportRequest {
+                agent: String::new(),
+                generation: Some("run-2".into()),
+            },
+        )
+        .unwrap();
+        assert!(report.usage.is_none());
+        assert_eq!(
+            report.pending_input.unwrap().status(),
+            proto::InputStatus::Stale
+        );
+        // The old generation is now rejected everywhere.
+        for err in [
+            report_context(
+                &mut conn,
+                &mateo,
+                proto::ReportContextRequest {
+                    generation: "run-1".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string(),
+            ask(&mut conn, "run-1", vec![question("e", true)])
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(err.contains("stale side generation"), "{err}");
+        }
+        // Another agent's generation is independent.
+        assert!(begin(&mut conn, &zed, "zed-1").is_ok());
+        let _ = lu;
+
+        // Nothing side-channel ever becomes mail, a delivery, or a conversation.
+        assert_eq!(mail_counts(&mut conn), before);
+    }
+
+    #[test]
     fn a_one_time_timer_sends_once_from_its_creator() {
         let (mut conn, _, [mateo, zed, _]) = board();
         let t = add(&mut conn, &mateo, "zed", "in 30m").unwrap();
