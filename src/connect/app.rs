@@ -3499,14 +3499,16 @@ mod tests {
             request_id: 7,
             result: Err(SideError::Transient("timed out".into())),
         }));
+        // The open form's footer says so, beside the kept answer.
         let out = screen(&mut app, 80, 24);
         assert!(
-            app.top().navigation_blocked() && out.contains("keep me"),
+            app.top().navigation_blocked()
+                && out.contains("keep me")
+                && out.contains("Could not confirm response: timed out")
+                && out.contains("[Submit]"),
             "{out}"
         );
         assert!(rx.try_recv().is_err(), "no automatic retry");
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(screen(&mut app, 80, 24).contains("Could not confirm response"));
         // A refusal stops polling and says why.
         let (mut app, mut rx) = self::app();
         mateo_streams(&mut app, &mut rx);
@@ -3594,6 +3596,138 @@ mod tests {
         );
         command(&mut app, "/answer");
         assert!(app.top().navigation_blocked());
+    }
+
+    /// A tall form: a long message above one optional free-text question.
+    fn tall_form(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> u64 {
+        mateo_streams(app, rx);
+        let id = poll(app, rx);
+        let mut report = side_report(
+            1,
+            7,
+            vec![proto::InputQuestion {
+                id: "note".into(),
+                header: "Note".into(),
+                text: "Say anything.".into(),
+                options: Vec::new(),
+                allow_free_text: true,
+                required: false,
+            }],
+        );
+        report.pending_input.as_mut().unwrap().message = Some(
+            (1..=30)
+                .map(|n| format!("background {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(report)),
+        }));
+        command(app, "/answer");
+        press(app, KeyCode::Down, KeyModifiers::NONE);
+        press(app, KeyCode::Up, KeyModifiers::NONE);
+        id
+    }
+
+    #[test]
+    fn a_free_text_answer_taller_than_the_form_keeps_its_end_and_caret_in_view() {
+        let (mut app, mut rx) = app();
+        tall_form(&mut app, &mut rx);
+        app.on_event(Event::Paste(format!("{}END", "x".repeat(4090))));
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("END█") && out.contains("[Submit]"), "{out}");
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("EN█") && !out.contains("END"), "{out}");
+        // 4092 bytes: four more reach the 4096-byte limit, and no further.
+        typed(&mut app, "D!?#");
+        assert!(screen(&mut app, 80, 24).contains("END!?#█"));
+        typed(&mut app, "z");
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("END!?#█") && out.contains("4 KiB"), "{out}");
+    }
+
+    #[test]
+    fn reply_failures_show_in_the_open_forms_footer_on_one_line() {
+        use crate::connect::event::SideError;
+        for (error, shown) in [
+            (
+                SideError::Refused(format!("question 'note' {}", "is invalid ".repeat(30))),
+                "Not sent: question 'note'",
+            ),
+            (
+                SideError::Transient("no reply within 3 seconds".into()),
+                "Could not confirm response: no reply within 3 seconds",
+            ),
+        ] {
+            let (mut app, mut rx) = app();
+            let id = tall_form(&mut app, &mut rx);
+            typed(&mut app, "my answer");
+            // Submit from the actions.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                Request::AnswerOwnerInput { .. }
+            ));
+            app.on_event(Event::Data(Data::OwnerAnswered {
+                id,
+                request_id: 7,
+                result: Err(error),
+            }));
+            let out = screen(&mut app, 80, 24);
+            assert!(out.contains(shown), "{out}");
+            assert!(
+                out.contains("[Submit]") && out.contains("PgUp/PgDn scroll"),
+                "{out}"
+            );
+            assert!(
+                out.lines()
+                    .filter(|l| l.contains("Not sent") || l.contains("Could not confirm"))
+                    .count()
+                    == 1,
+                "{out}"
+            );
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert!(
+                screen(&mut app, 80, 24).contains("my answer"),
+                "typing kept"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_or_unsupported_read_clears_the_cached_card() {
+        use crate::connect::event::SideError;
+        for (error, reason) in [
+            (
+                SideError::Refused("Mateo has retired".into()),
+                "Mateo has retired",
+            ),
+            (
+                SideError::Unsupported("x".into()),
+                "not available on this server",
+            ),
+        ] {
+            let (mut app, mut rx) = app();
+            mateo_streams(&mut app, &mut rx);
+            let id = poll(&mut app, &mut rx);
+            app.on_event(Event::Data(Data::SideReport {
+                id,
+                result: Ok(Box::new(side_report(1, 7, deploy_questions()))),
+            }));
+            assert!(screen(&mut app, 80, 24).contains("asks 2"));
+            poll(&mut app, &mut rx);
+            app.on_event(Event::Data(Data::SideReport {
+                id,
+                result: Err(error),
+            }));
+            let out = screen(&mut app, 80, 24);
+            assert!(!out.contains("asks 2") && out.contains(reason), "{out}");
+            app.on_event(Event::Tick);
+            assert!(without_sends(&mut rx).is_none(), "no more asking");
+        }
     }
 
     /// The requests waiting, but the owner's once-a-second side polls.

@@ -168,6 +168,18 @@ async fn bounded<T>(
 fn side_error(local: bool, error: anyhow::Error) -> SideError {
     use tonic::Code;
     let text = format!("{error:#}");
+    // A local board's momentary writer is not a refusal.
+    let busy = error.chain().any(|cause| {
+        cause.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
+            matches!(
+                e.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            )
+        })
+    });
+    if busy {
+        return SideError::Transient(text);
+    }
     match error
         .downcast_ref::<tonic::Status>()
         .map(tonic::Status::code)
@@ -757,6 +769,18 @@ mod tests {
             side_error(true, anyhow::anyhow!("not the owner")),
             SideError::Refused(_)
         ));
+        // A local board's busy or locked database is momentary.
+        for code in [5, 6] {
+            let busy = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+            .context("reading side state");
+            assert!(
+                matches!(side_error(true, busy), SideError::Transient(_)),
+                "{code}"
+            );
+        }
     }
     use tokio::sync::mpsc::unbounded_channel;
 

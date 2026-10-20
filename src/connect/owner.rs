@@ -217,13 +217,19 @@ impl Session {
                         self.report = Some(report.as_ref().clone());
                         self.supersede();
                     }
+                    // Stop asking, and stop showing what was cached: the agent
+                    // may have retired, or this owner lost it.
                     Err(SideError::Unsupported(_)) => {
                         self.unsupported = true;
                         self.form = None;
+                        self.report = None;
+                        self.notice =
+                            Some("Agent questions are not available on this server.".into());
                     }
                     Err(SideError::Refused(why)) => {
                         self.unsupported = true;
                         self.form = None;
+                        self.report = None;
                         self.notice = Some(why.clone());
                     }
                     // A transient failure is retried on the next tick.
@@ -243,13 +249,22 @@ impl Session {
                         self.form = None;
                         self.notice = None;
                     }
-                    // The form and what was typed stay; nothing is retried.
-                    Err(SideError::Unsupported(why) | SideError::Refused(why)) => {
-                        self.notice = Some(format!("Not sent: {why}"));
-                    }
-                    // The server may have taken it: the next poll settles it.
-                    Err(SideError::Transient(why)) => {
-                        self.notice = Some(format!("Could not confirm response: {why}"));
+                    // The form and what was typed stay, showing why in its
+                    // footer; nothing is retried.
+                    Err(error) => {
+                        let why = match error {
+                            SideError::Unsupported(why) | SideError::Refused(why) => {
+                                format!("Not sent: {why}")
+                            }
+                            // The server may have taken it: the next poll settles it.
+                            SideError::Transient(why) => {
+                                format!("Could not confirm response: {why}")
+                            }
+                        };
+                        match &mut self.form {
+                            Some(form) => form.notice = Some(why),
+                            None => self.notice = Some(why),
+                        }
                     }
                 }
                 true
@@ -685,8 +700,12 @@ impl Form {
         })
         .collect();
         let mut footer = vec![Line::from(actions)];
+        // One line at most, so a long error never hides the body or actions.
         if let Some(notice) = &self.notice {
-            footer.push(Line::styled(notice.clone(), theme::error()));
+            footer.push(theme::clip_line(
+                Line::styled(one_line(notice), theme::error()),
+                usize::from(inner),
+            ));
         }
         footer.push(Line::styled(
             "↑/↓ move · Enter or Space choose · PgUp/PgDn scroll · Esc closes, questions stay open",
@@ -710,11 +729,18 @@ impl Form {
         {
             let start: usize = heights[..line].iter().sum();
             let end = start + heights[line];
-            if end > scroll + body_room {
+            if end - start > body_room && matches!(focused, Some(Item::Text(_))) {
+                // Typing goes on at the end of a long answer: keep it, and
+                // the caret, in view.
                 scroll = end - body_room;
-            }
-            if start < scroll {
-                scroll = start;
+            } else {
+                if end > scroll + body_room {
+                    scroll = end - body_room;
+                }
+                // A long choice begins at its label; PgDn reads the rest.
+                if start < scroll {
+                    scroll = start;
+                }
             }
         }
         let scroll = scroll.min(total.saturating_sub(body_room));
