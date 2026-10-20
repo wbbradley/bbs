@@ -186,12 +186,19 @@ impl Row for Entry {
                 other_participants: true,
                 ..
             }
-            | Entry::Stream { reply: true, .. } => 2,
+            | Entry::Stream { reply: true, .. }
+            | Entry::Stream { thought: true, .. } => 2,
             _ => 0,
         }
     }
 
     fn gutter(&self, gap: bool, query: Option<&str>, width: u16) -> Vec<Line<'_>> {
+        if self.is_thought() {
+            let height = Paragraph::new(self.lines(gap, query))
+                .wrap(Wrap { trim: false })
+                .line_count(width);
+            return vec![Line::styled("│ ", theme::dim().italic()); height];
+        }
         let Entry::Message {
             other_participants: true,
             message,
@@ -775,10 +782,7 @@ mod tests {
         let lines = entry.lines(false, None);
         assert_eq!(
             lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            [
-                "│ Pushing changes upstream",
-                "│ Clarifying GitHub installation"
-            ]
+            ["Pushing changes upstream", "Clarifying GitHub installation"]
         );
         assert!(lines.iter().all(|line| line.spans.iter().any(|span| {
             span.style
@@ -797,6 +801,85 @@ mod tests {
             ..Default::default()
         });
         assert!(stream.entry(&blank, &Loaded::new()).is_none());
+    }
+
+    #[test]
+    fn reasoning_gutter_repeats_on_wrapped_lines_after_resize_and_scroll() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        let text = format!(
+            "**Heading** {}\n\n- first item\n  - nested item\n\n```python\nif ready:\n    run()\n```\n\n[docs](https://example.com) and `code`",
+            "Unicode 界 café words ".repeat(16)
+        );
+        let source = serde_json::json!({"event":"thought", "text":text}).to_string();
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let mut stream = Stream::new("Mateo");
+                let record = Kept::new(&proto::Activity {
+                    id: 1,
+                    record: source.clone(),
+                    ..Default::default()
+                });
+                let entry = stream.entry(&record, &Loaded::new()).unwrap();
+                assert!(!entry.compact_hides(&HashSet::new()));
+                let mut view = ThreadView::new(vec![entry.clone()], 100);
+                view.set_query("heading");
+                assert_eq!(view.search_status(), Some(("heading", 1)));
+                for width in [28, 48, 80, 32] {
+                    view.follow();
+                    let mut terminal = Terminal::new(TestBackend::new(width, 200)).unwrap();
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(Block::new().style(theme::base()), f.area());
+                            view.render(f, f.area());
+                        })
+                        .unwrap();
+                    let buf = terminal.backend().buffer();
+                    let lines: Vec<_> = (0..view.frame.total as u16)
+                        .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                        .collect();
+                    assert!(lines[0].trim().is_empty(), "group separator has no gutter");
+                    assert!(lines[1].starts_with("│ Heading"), "{lines:?}");
+                    assert!(
+                        lines[1..].iter().all(|line| line.starts_with("│ ")),
+                        "{lines:?}"
+                    );
+                    assert!(
+                        lines.iter().any(|line| line.trim_end() == "│     run()"),
+                        "{lines:?}"
+                    );
+                    assert!(buf[(2, 1)].modifier.contains(Modifier::BOLD));
+                    assert!(buf[(0, 1)].modifier.contains(Modifier::ITALIC));
+                    crate::ui::theme::testing::assert_buffer(buf);
+                    let expected = Paragraph::new(entry.lines(false, None))
+                        .wrap(Wrap { trim: false })
+                        .line_count(width - 2)
+                        + 1;
+                    assert_eq!(view.frame.total, expected);
+                    assert!(expected > entry.lines(false, None).len() + 1);
+                    terminal.backend_mut().resize(width, 5);
+                    terminal
+                        .resize(ratatui::layout::Rect::new(0, 0, width, 5))
+                        .unwrap();
+                    view.layout(width, 5);
+                    view.scroll_to(3);
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(Block::new().style(theme::base()), f.area());
+                            view.render(f, f.area());
+                        })
+                        .unwrap();
+                    for y in 0..5 {
+                        let shown = (0..width)
+                            .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                            .collect::<String>();
+                        assert_eq!(shown, lines[view.top() + y as usize]);
+                        assert!(shown.starts_with("│ "));
+                    }
+                    assert_eq!(view.search_status(), Some(("heading", 1)));
+                }
+                assert_eq!(record.activity.record, source);
+            });
+        }
     }
 
     #[test]

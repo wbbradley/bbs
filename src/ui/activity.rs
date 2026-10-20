@@ -144,7 +144,8 @@ impl Activity {
         self
     }
 
-    /// Use compact Markdown reasoning in the conversation, leaving logs unchanged.
+    /// Use compact Markdown reasoning; the conversation supplies its display gutter.
+    /// Logs keep their existing formatting.
     pub fn compact_thoughts(mut self) -> Activity {
         self.compact_thoughts = true;
         self
@@ -402,14 +403,17 @@ impl Activity {
             if line.spans.iter().all(|span| span.content.trim().is_empty()) {
                 continue;
             }
-            let mut spans = vec![Span::styled("│ ", dim().italic())];
-            spans.extend(line.spans.iter().map(|span| {
-                let mut rendered = line.style.patch(span.style);
-                if rendered.fg == style(Role::Text).fg {
-                    rendered.fg = dim().fg;
-                }
-                Span::styled(span.content.to_string(), dim().italic().patch(rendered))
-            }));
+            let spans = line
+                .spans
+                .iter()
+                .map(|span| {
+                    let mut rendered = line.style.patch(span.style);
+                    if rendered.fg == style(Role::Text).fg {
+                        rendered.fg = dim().fg;
+                    }
+                    Span::styled(span.content.to_string(), dim().italic().patch(rendered))
+                })
+                .collect::<Vec<_>>();
             out.push(Line::from(spans));
         }
     }
@@ -567,15 +571,15 @@ mod tests {
                 let text = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
                 assert!(
                     text.iter()
-                        .all(|line| line.starts_with("│ ") && !line[4..].trim().is_empty()),
+                        .all(|line| !line.trim().is_empty() && !line.starts_with("│ ")),
                     "{text:?}"
                 );
                 assert!(
-                    text.contains(&"│ Planning and checking config".into()),
+                    text.contains(&"Planning and checking config".into()),
                     "{text:?}"
                 );
-                assert!(text.contains(&"│     run()".into()), "{text:?}");
-                assert!(text.contains(&"│     finish()".into()), "{text:?}");
+                assert!(text.contains(&"    run()".into()), "{text:?}");
+                assert!(text.contains(&"    finish()".into()), "{text:?}");
                 let span = |name: &str| {
                     lines
                         .iter()
