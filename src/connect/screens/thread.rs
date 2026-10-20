@@ -153,14 +153,14 @@ impl Thread {
     }
 
     /// The messages shown, which activity records may stand for, marking
-    /// automatic replies from this agent. None while messages are filtered
-    /// out, so activity is never hidden along with the mail it stands for.
+    /// automatic replies from this agent. While messages are filtered out,
+    /// none, so activity is never hidden along with the mail it stands for;
+    /// but compact view still counts mail among other participants, so their
+    /// echoes stay hidden with them.
     fn loaded(&self) -> Loaded {
-        if !self.show.messages() {
-            return Loaded::new();
-        }
         self.messages
             .iter()
+            .filter(|m| self.show.messages() || (self.compact && self.other_participants(m)))
             .map(|m| {
                 let reply = m.auto_reply == Some(true)
                     && m.from_kind() == proto::Kind::Agent
@@ -1083,6 +1083,10 @@ impl Screen for Thread {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('t')
         {
+            // An open search prompt keeps its input and the view.
+            if self.prompt.is_some() {
+                return Some(Transition::Stay);
+            }
             self.compact = !self.compact;
             // A paused reader keeps their place, or the next entry shown.
             self.reconcile();
@@ -1365,7 +1369,7 @@ impl Thread {
             )
         } else if self.compact {
             Line::styled(
-                "Compact view hides tool calls. Ctrl-T shows everything.",
+                "Compact view hides tool calls. Ctrl-T returns to verbose view.",
                 theme::dim(),
             )
         } else {

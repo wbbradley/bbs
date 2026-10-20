@@ -5387,6 +5387,127 @@ mod tests {
     }
 
     #[test]
+    fn compact_keeps_side_echoes_hidden_under_any_filter_and_direct_fallback_drawn() {
+        let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        // Zed's mail to Mateo (a side message) and the receipt echoing it;
+        // Mateo's automatic reply to ada and the text it was delivered as.
+        let mail = vec![
+            at(11, "01", "Zed", "Mateo", "side chatter"),
+            proto::Message {
+                auto_reply: Some(true),
+                ..at(13, "03", "Mateo", "ada", "auto text")
+            },
+        ];
+        let records = vec![
+            activity(
+                20,
+                "02",
+                r#"{"event":"mail","from":["Zed"],"mail_ids":[11]}"#,
+            ),
+            activity(
+                21,
+                "04",
+                r#"{"event":"text","text":"auto text","mail_id":13}"#,
+            ),
+        ];
+        for mail_first in [true, false] {
+            let (mut app, mut rx) = app();
+            let (feed, act) = mateo_streams(&mut app, &mut rx);
+            let feed = Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(mail.clone()),
+            });
+            let activity = Event::Data(Data::Activity {
+                id: act,
+                result: Ok(records.clone()),
+            });
+            if mail_first {
+                app.on_event(feed);
+                app.on_event(activity);
+            } else {
+                app.on_event(activity);
+                app.on_event(feed);
+            }
+            // (compact, A presses from everything, side card, receipt, auto
+            // text drawn): every message once, as mail or as activity.
+            for (compact, a, card, receipt, auto) in [
+                (false, 0, true, false, 1),
+                (true, 0, false, false, 1),
+                // Activity only: verbose lets the receipt stand in for the
+                // mail; compact keeps the side echo hidden, and the direct
+                // reply's text still stands in for its mail.
+                (false, 2, false, true, 1),
+                (true, 2, false, false, 1),
+                // Messages only: no activity either way.
+                (true, 1, false, false, 1),
+            ] {
+                let app = &mut app;
+                press(app, KeyCode::PageUp, KeyModifiers::NONE);
+                for _ in 0..a {
+                    key(app, 'A');
+                }
+                if compact {
+                    ctrl_t(app);
+                }
+                let out = screen(app, 80, 24);
+                let case = format!("mail first {mail_first}, compact {compact}, A×{a}");
+                assert_eq!(out.contains("side chatter"), card, "{case}: {out}");
+                assert_eq!(out.contains("mail from"), receipt, "{case}: {out}");
+                assert_eq!(out.matches("auto text").count(), auto, "{case}: {out}");
+                // Back to verbose, everything shown, for the next case.
+                if compact {
+                    ctrl_t(app);
+                }
+                for _ in 0..(3 - a) % 3 {
+                    key(app, 'A');
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tool_finishing_while_hidden_restores_finished_and_search_keeps_ctrl_t() {
+        let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let (mut app, mut rx) = app();
+        let (_, act) = mateo_streams(&mut app, &mut rx);
+        ctrl_t(&mut app);
+        for (id, status) in [(30, "pending"), (31, "completed")] {
+            app.on_event(Event::Data(Data::Activity {
+                id: act,
+                result: Ok(vec![activity(
+                    id,
+                    "05",
+                    &format!(
+                        r#"{{"event":"tool","id":"t1","status":"{status}","title":"cargo test"}}"#
+                    ),
+                )]),
+            }));
+            assert!(!screen(&mut app, 80, 24).contains("cargo test"));
+        }
+        ctrl_t(&mut app);
+        let out = screen(&mut app, 80, 24);
+        assert_eq!(out.matches("cargo test").count(), 1, "{out}");
+        assert!(
+            out.contains("✓ cargo test completed"),
+            "never stuck running: {out}"
+        );
+        // Under an open search prompt, Ctrl-T neither toggles nor types.
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, '/');
+        typed(&mut app, "car");
+        ctrl_t(&mut app);
+        let out = screen(&mut app, 80, 24);
+        assert!(!bottom(&mut app).contains("compact"), "{out}");
+        assert!(out.contains("/car") && !out.contains("/cart"), "{out}");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        ctrl_t(&mut app);
+        assert!(
+            bottom(&mut app).contains("compact"),
+            "after the prompt closes"
+        );
+    }
+
+    #[test]
     fn ctrl_t_leaves_owner_forms_their_keys_and_never_cancels_a_side_question() {
         use proto::SideStatus;
         let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
