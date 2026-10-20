@@ -87,6 +87,17 @@ impl Tools {
         }
     }
 
+    /// A separate connection with the same identity and tool policy.
+    pub fn independent(&self) -> Self {
+        Self {
+            dir: self.dir.clone(),
+            token: self.token.clone(),
+            backend: None,
+            local: self.local,
+            auto_owner_reply: self.auto_owner_reply,
+        }
+    }
+
     pub fn auto_owner_reply(mut self) -> Self {
         self.auto_owner_reply = true;
         self

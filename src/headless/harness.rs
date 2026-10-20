@@ -113,6 +113,31 @@ impl Harness {
         }
     }
 
+    pub fn side_supported(&self) -> bool {
+        matches!(self, Self::Codex(_))
+    }
+    pub fn side_text(&self) -> String {
+        match self {
+            Self::Codex(c) => c.side_text(),
+            Self::Acp(_) => String::new(),
+        }
+    }
+    pub async fn side_question(
+        &self,
+        question: &str,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> super::codex_btw::Outcome {
+        match self {
+            Self::Codex(c) => c.side_question(question, cancel).await,
+            Self::Acp(_) => super::codex_btw::Outcome {
+                status: super::codex_btw::Status::Unsupported,
+                answer: String::new(),
+                detail: "ACP side-fork isolation has not been verified".into(),
+                disable: true,
+            },
+        }
+    }
+
     pub fn input_pending(&self, key: &str) -> bool {
         match self {
             Self::Acp(a) => a.inputs.pending(key),

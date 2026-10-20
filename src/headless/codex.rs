@@ -21,7 +21,7 @@ use super::harness::{
 use super::mcp::{Tools, tool_list};
 use super::rpc::{Incoming, Process, Rpc};
 use super::settings::HarnessConfig;
-use super::{context, input};
+use super::{codex_btw, context, input};
 use crate::proto::effort_outcome::Result as Outcome;
 use crate::proto::{EffortRequest, EffortState};
 
@@ -159,6 +159,8 @@ pub struct Codex {
     thread_id: String,
     pub resumed: bool,
     turn: Arc<TurnState>,
+    side: Arc<codex_btw::SideChannel>,
+    side_tools: Arc<tokio::sync::Mutex<Tools>>,
 }
 
 impl Codex {
@@ -176,12 +178,23 @@ impl Codex {
         let turn = Arc::new(TurnState::default());
         turn.inputs.enable(input_enabled);
         let effort = Arc::new(Mutex::new(CodexEffort::default()));
+        let side = Arc::new(codex_btw::SideChannel::default());
+        let side_tools = Arc::new(tokio::sync::Mutex::new(tools.independent()));
         let handler = {
             let turn = turn.clone();
+            let side = side.clone();
+            let side_tools = side_tools.clone();
             let tools = Arc::new(tokio::sync::Mutex::new(tools));
             let effort = effort.clone();
             let events = events.clone();
-            move |rpc: &Rpc, msg: Incoming| handle(rpc, msg, &turn, &tools, &effort, &events)
+            move |rpc: &Rpc, msg: Incoming| {
+                if matches!(msg, Incoming::Exited) {
+                    side.exited();
+                }
+                if let Some(msg) = side.handle(rpc, msg, &side_tools) {
+                    handle(rpc, msg, &turn, &tools, &effort, &events)
+                }
+            }
         };
         let (rpc, mut process) = Rpc::spawn(&config.command, &config.env, cwd, stderr, handler)?;
         let mut codex = Codex {
@@ -191,6 +204,8 @@ impl Codex {
             thread_id: String::new(),
             resumed: false,
             turn,
+            side,
+            side_tools,
         };
         match timeout(SETUP_TIMEOUT, codex.open_thread(config, cwd, resume)).await {
             Ok(Ok(())) => Ok((codex, process, rx)),
@@ -258,6 +273,25 @@ impl Codex {
         self.effort.lock().unwrap().parent = Some(self.thread_id.clone());
         self.discover_effort(&result).await;
         Ok(())
+    }
+
+    pub async fn side_question(
+        &self,
+        question: &str,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> codex_btw::Outcome {
+        self.side
+            .run(
+                &self.rpc,
+                &self.thread_id,
+                question,
+                cancel,
+                &self.side_tools,
+            )
+            .await
+    }
+    pub fn side_text(&self) -> String {
+        self.side.text()
     }
 
     pub fn thread_id(&self) -> &str {
@@ -516,9 +550,36 @@ fn handle(
             dispatch_input(rpc, id, params, turn, events);
         }
         Incoming::Request { id, method, params } if method == "item/tool/call" => {
+            if effort
+                .lock()
+                .unwrap()
+                .parent
+                .as_deref()
+                .is_none_or(|p| params["threadId"].as_str() != Some(p))
+            {
+                rpc.respond_later(
+                    id,
+                    Err("tool call is not in the opened parent or active side thread".into()),
+                );
+                return;
+            }
+            let turn = turn.clone();
             let rpc = rpc.clone();
             let tools = tools.clone();
             tokio::spawn(async move {
+                let running = turn.running_id(TURN_ID_WAIT).await;
+                let valid = {
+                    let current = turn.turn.lock().unwrap();
+                    current.done.is_some()
+                        && running.is_some()
+                        && running.as_deref() == params["turnId"].as_str()
+                        && current.id == running
+                        && !current.cancel_requested
+                };
+                if !valid {
+                    rpc.respond_later(id, Err("tool call is not in the active parent turn".into()));
+                    return;
+                }
                 let name = params["tool"].as_str().unwrap_or_default();
                 // Tool failures are results the agent can read.
                 let (text, success) =
@@ -534,7 +595,21 @@ fn handle(
             });
         }
         Incoming::Request { id, method, params } => {
-            rpc.respond_later(id, answer(&method, &params, events));
+            if params.get("threadId").is_some()
+                && effort
+                    .lock()
+                    .unwrap()
+                    .parent
+                    .as_deref()
+                    .is_none_or(|p| params["threadId"].as_str() != Some(p))
+            {
+                rpc.respond_later(
+                    id,
+                    Err("callback is not in the opened parent or active side thread".into()),
+                );
+            } else {
+                rpc.respond_later(id, answer(&method, &params, events));
+            }
         }
         Incoming::Notification { method, params } => {
             if method == "thread/settings/updated" {
