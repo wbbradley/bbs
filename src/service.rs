@@ -895,7 +895,7 @@ fn send_control(
     })
 }
 
-// ---- side channels (side-questions.v1) -------------------------------------
+// ---- side channels (agent-interactions.v1) -------------------------------------
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct InputOptionJson {
@@ -937,8 +937,6 @@ struct UsageJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     limit_tokens: Option<u64>,
     source: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    received_at: Option<String>,
 }
 
 fn question_json(q: &proto::InputQuestion) -> InputQuestionJson {
@@ -1005,7 +1003,6 @@ fn usage_proto(usage: Option<String>) -> Result<Option<proto::ContextUsage>> {
         used_tokens: parsed.used_tokens,
         limit_tokens: parsed.limit_tokens,
         source: source.into(),
-        received_at: parsed.received_at,
     }))
 }
 
@@ -1064,7 +1061,6 @@ pub fn report_context(
                     used_tokens: usage.used_tokens,
                     limit_tokens: usage.limit_tokens,
                     source: source.into(),
-                    received_at: usage.received_at.clone(),
                 })?)
             }
         };
@@ -3268,13 +3264,11 @@ mod tests {
                 used_tokens: Some(10),
                 limit_tokens: Some(100),
                 source: 0,
-                received_at: None,
             },
             proto::ContextUsage {
                 used_tokens: Some(10),
                 limit_tokens: Some(0),
                 source: 1,
-                received_at: None,
             },
         ] {
             assert!(report_context(
@@ -3297,7 +3291,6 @@ mod tests {
                     used_tokens: Some(120),
                     limit_tokens: Some(100),
                     source: proto::context_usage::Source::CurrentContext.into(),
-                    received_at: None,
                 }),
             },
         )
@@ -3635,7 +3628,7 @@ mod tests {
         .to_string();
         assert!(err.contains("only accompany a submit"), "{err}");
 
-        // received_at and is_blocking round-trip verbatim.
+        // is_blocking round-trips verbatim.
         begin(&mut conn, &mateo, "run-4").unwrap();
         report_context(
             &mut conn,
@@ -3646,7 +3639,6 @@ mod tests {
                     used_tokens: Some(9),
                     limit_tokens: None,
                     source: proto::context_usage::Source::LastModelRequest.into(),
-                    received_at: Some("2026-10-20T01:00:00Z".into()),
                 }),
             },
         )
@@ -3660,8 +3652,7 @@ mod tests {
             },
         )
         .unwrap();
-        let usage = report.usage.unwrap();
-        assert_eq!(usage.received_at.as_deref(), Some("2026-10-20T01:00:00Z"));
+        assert!(report.usage.is_some());
         let blocking = request_owner_input(
             &mut conn,
             &mateo,

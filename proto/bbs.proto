@@ -91,7 +91,7 @@ service Bbs {
   // Agent token, self only; requires agent-effort.v1.
   rpc ReportEffort(ReportEffortRequest) returns (ReportEffortResponse);
 
-  // Side channels (side-questions.v1): structured owner input and context
+  // Side channels (agent-interactions.v1): structured owner input and context
   // usage, outside mail, history and the harness's model input.
   // A runner begins one interaction session per process; a fresh generation
   // resets the agent's side state. Agent token, self only.
@@ -262,7 +262,7 @@ message EffortReport {
 message ReportEffortRequest { EffortReport report = 1; }
 message ReportEffortResponse {}
 
-// Side channels (side-questions.v1). Nothing here is mail: no message,
+// Side channels (agent-interactions.v1). Nothing here is mail: no message,
 // delivery, inbox, history or recency row is ever created.
 
 // A fresh opaque generation per runner process. Idempotent for the same
@@ -280,9 +280,6 @@ message ContextUsage {
     LAST_MODEL_REQUEST = 2;
   }
   Source source = 3;  // required when the usage is present
-  // When the driver received this provider snapshot (RFC3339 UTC); preserved
-  // verbatim across coalescing and retries, never the server's write time.
-  optional string received_at = 4;
 }
 
 message ReportContextRequest {

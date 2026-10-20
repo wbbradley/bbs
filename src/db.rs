@@ -881,7 +881,7 @@ pub fn agent_owner_name(conn: &Connection, agent_id: i64) -> Result<Option<Strin
         .optional()?)
 }
 
-// ---- side channels (side-questions.v1) -------------------------------------
+// ---- side channels (agent-interactions.v1) -------------------------------------
 
 /// One agent's side state: its current generation, latest reported usage
 /// (JSON), capability, and the side-state revision counter.

@@ -1,4 +1,4 @@
--- Side channels (side-questions.v1): structured owner input requests and
+-- Side channels (agent-interactions.v1): structured owner input requests and
 -- per-agent side state. Never mail: nothing here touches messages,
 -- deliveries, inboxes, history or conversation recency.
 CREATE TABLE side_state (

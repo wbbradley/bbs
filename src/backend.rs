@@ -386,7 +386,7 @@ impl Backend {
     }
 
     /// Begin the calling agent's side interaction session. A server needs
-    /// `side-questions.v1`.
+    /// `agent-interactions.v1`.
     pub async fn begin_side_session(
         &mut self,
         req: proto::BeginSideSessionRequest,
@@ -399,7 +399,7 @@ impl Backend {
     }
 
     /// Report context usage and side capability. A server needs
-    /// `side-questions.v1`.
+    /// `agent-interactions.v1`.
     pub async fn report_context(&mut self, req: proto::ReportContextRequest) -> Result<proto::Empty> {
         match self {
             Backend::Local(l) => service::report_context(&mut l.conn, &l.caller, req),
@@ -409,7 +409,7 @@ impl Backend {
     }
 
     /// Ask the owning human structured questions. A server needs
-    /// `side-questions.v1`.
+    /// `agent-interactions.v1`.
     pub async fn request_owner_input(
         &mut self,
         req: proto::RequestOwnerInputRequest,
@@ -422,7 +422,7 @@ impl Backend {
     }
 
     /// Answer, decline or cancel an input request as its agent's owner. A
-    /// server needs `side-questions.v1`.
+    /// server needs `agent-interactions.v1`.
     pub async fn answer_owner_input(
         &mut self,
         req: proto::AnswerOwnerInputRequest,
@@ -435,7 +435,7 @@ impl Backend {
     }
 
     /// Close the calling agent's own pending input request. A server needs
-    /// `side-questions.v1`.
+    /// `agent-interactions.v1`.
     pub async fn close_owner_input(
         &mut self,
         req: proto::CloseOwnerInputRequest,
@@ -448,7 +448,7 @@ impl Backend {
     }
 
     /// One agent's side state: its owner, or the driver with its generation.
-    /// A server needs `side-questions.v1`.
+    /// A server needs `agent-interactions.v1`.
     pub async fn side_report(
         &mut self,
         req: proto::SideReportRequest,

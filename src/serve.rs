@@ -858,11 +858,13 @@ impl Bbs for Server {
             .await
     }
 
+    // Side-channel writes mutate no mail/feed/summary/timer view, so they do
+    // not wake those watchers; the side UI and drivers poll independently.
     async fn begin_side_session(
         &self,
         req: Request<proto::BeginSideSessionRequest>,
     ) -> Result<Response<proto::BeginSideSessionResponse>, Status> {
-        self.unary("begin_side_session", req, Effect::Write, service::begin_side_session)
+        self.unary("begin_side_session", req, Effect::Query, service::begin_side_session)
             .await
     }
 
@@ -870,7 +872,7 @@ impl Bbs for Server {
         &self,
         req: Request<proto::ReportContextRequest>,
     ) -> Result<Response<proto::Empty>, Status> {
-        self.unary("report_context", req, Effect::Write, service::report_context)
+        self.unary("report_context", req, Effect::Query, service::report_context)
             .await
     }
 
