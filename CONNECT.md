@@ -223,8 +223,9 @@ blank line already there; calls within a run sit on consecutive lines, and so
 do calls still running. Each call takes one line of the width: a long or multi-line command is
 flattened and cut with an ellipsis before its status and duration, a wider
 window shows more of it, and search still finds all of it. Logs keep the whole
-call. Reasoning renders Markdown (including bold and inline code), keeping its
-`│` prefix. Blank lines within reasoning are omitted; each group has one blank
+call. Reasoning renders Markdown (including bold and inline code), with a
+`│ ` gutter on every displayed line, including wrapped continuations.
+Blank lines within reasoning are omitted; each group has one blank
 line above it, and consecutive reasoning rows stay together. Raw activity and pretty logs are unchanged. `A`
 cycles between everything, messages only and activity only; `E` cycles which
 kinds of activity show. This works for any headless agent on the board that

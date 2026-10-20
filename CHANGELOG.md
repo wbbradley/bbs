@@ -8,14 +8,20 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.11.1 - 2026-10-20
+
 ### Added
 
 - `bbs connect` agent conversations toggle compact view with `Ctrl-T`, while
   writing or navigating. Compact view hides tool calls (finished and still
   running) and mail among other participants; verbose view, the default, is
   unchanged. The choice applies to every agent conversation and is saved for
-  later sessions. Question cards, `/answer`,
-  `/context` and `/btw` are unaffected.
+  later sessions. Question cards, `/answer`, `/context` and `/btw` are unaffected.
+
+### Fixed
+
+- Wrapped reasoning lines repeat the `│ ` gutter, preserving Markdown styling
+  and code indentation through resizing and scrolling.
 
 ## 0.11.0 - 2026-10-20
 
