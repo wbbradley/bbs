@@ -308,3 +308,55 @@ async fn cancel_and_shutdown_close_published_input_without_panicking() {
         );
     }
 }
+
+#[tokio::test]
+async fn text_before_native_question_is_delivered_before_any_human_answer() {
+    const BEFORE: &str = "  Before the question.\n\n```text\n  exact bytes\n```\n";
+    for kind in ["codex", "acp"] {
+        let r = Rig::new(kind, "text-before-question").await;
+        r.send("ASK", None).await;
+        let form = r
+            .wait_report(|r| {
+                r.pending_input
+                    .as_ref()
+                    .is_some_and(|i| i.status() == proto::InputStatus::Pending)
+            })
+            .await
+            .pending_input
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mail = r
+                    .client()
+                    .await
+                    .read(req(proto::ReadRequest::default()))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .messages;
+                if let Some(m) = mail.into_iter().find(|m| m.body == BEFORE) {
+                    return m;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("text preceding the native question must not wait for the answer");
+        assert_eq!(delivered.body, BEFORE);
+        assert_eq!(delivered.auto_reply, Some(true));
+        assert_eq!(
+            r.report().await.pending_input.unwrap().status(),
+            proto::InputStatus::Pending
+        );
+        assert!(
+            !r.wire().iter().any(|v| v["id"] == "question"),
+            "no provider answer yet"
+        );
+        r.answer(form.request_id, proto::AnswerAction::Decline, vec![])
+            .await
+            .unwrap();
+        r.wait_wire(|w| w.iter().any(|v| v["kind"] == "finished"))
+            .await;
+        assert_eq!(r.wire().iter().filter(|v| v["kind"] == "prompt").count(), 1);
+    }
+}

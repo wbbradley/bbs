@@ -542,6 +542,11 @@ fn record_side(
     event: Event,
     side: Option<&side::Side>,
 ) -> Result<()> {
+    // A native question can block the provider without a separate Tool event.
+    // Commit preceding assistant text for delivery before exposing the form.
+    if matches!(&event, Event::OwnerInput(_)) {
+        outbox.seal()?;
+    }
     if let Some(side) = side {
         side.event(&event);
     }

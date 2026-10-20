@@ -62,6 +62,12 @@ for line in sys.stdin:
         record('prompt', text=text)
         if kind=='codex' and scenario!='resolved': reply(mid,dict(turn=dict(id=tid,status='inProgress')))
         usage('parent',tid,40)
+        if scenario == 'text-before-question':
+            before = '  Before the question.\n\n```text\n  exact bytes\n```\n'
+            if kind == 'acp':
+                note('session/update',dict(sessionId='parent',update=dict(sessionUpdate='agent_message_chunk',content=dict(type='text',text=before))))
+            else:
+                note('item/agentMessage/delta',dict(threadId='parent',turnId=tid,itemId='preface',delta=before))
         ask('foreign','child',tid)
         ask('question','parent',tid)
         if kind=='codex' and scenario=='resolved':
