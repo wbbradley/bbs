@@ -17,8 +17,8 @@ use super::log::Log;
 use super::mcp::{TOKEN_ENV, Tools};
 use super::outbox::{self, Outbox};
 use super::settings::{DEFAULT_MAX_TURN_ERRORS, McpEnv, MidTurn, Settings};
-use super::share;
 use super::state::{AgentDir, State};
+use super::{share, side};
 use crate::app::format_messages;
 use crate::backend::Backend;
 use crate::cli::HeadlessRunArgs;
@@ -156,12 +156,21 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     // start, which kills the harness's process group.
     let mut signals = Signals::new()?;
     let stderr = agent_dir.stderr_path();
+    let side_session = match side::Session::begin(&config, dir, &token).await {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = share_warn.send(format!(
+                "optional human input/context unavailable at startup: {error:#}"
+            ));
+            None
+        }
+    };
     let started = tokio::select! {
         started = Harness::start(
             &harness_config,
             &cwd,
             &stderr,
-            BbsTools { mcp, tools: Tools::new(dir, token.clone()).auto_owner_reply() },
+            BbsTools { mcp, tools: Tools::new(dir, token.clone()).auto_owner_reply(), input_enabled: side_session.is_some() },
             resume.as_deref(),
         ) => started,
         _ = signals.recv() => Err(anyhow::anyhow!("stopped during harness setup")),
@@ -173,6 +182,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             return Err(err);
         }
     };
+    let interactions = side_session.map(|s| s.start(agent_harness.clone(), share_warn.clone()));
     state.harness = Some(harness.clone());
     state.session_id = Some(agent_harness.session_id().to_string());
     agent_dir.save(&state)?;
@@ -330,7 +340,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     match event {
                         Event::EffortOutcome(outcome) => effort_control.complete(outcome),
                         Event::EffortChanged => {},
-                        other => if let Err(err) = record(&mut log, &mut outbox, other) { drain_error = Some(err); break; },
+                        other => if let Err(err) = record_side(&mut log, &mut outbox, other, interactions.as_ref()) { drain_error = Some(err); break; },
                     }
                 }
                 let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
@@ -393,7 +403,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     effort_control.complete(outcome);
                     let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
                 }
-                Some(event) => if let Err(err) = record(&mut log, &mut outbox, event) { break Err(err); },
+                Some(event) => if let Err(err) = record_side(&mut log, &mut outbox, event, interactions.as_ref()) { break Err(err); },
             },
             reply = delivery.replies.recv(), if delivering => {
                 match reply {
@@ -455,11 +465,14 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             Event::EffortOutcome(outcome) => effort_control.complete(outcome),
             Event::EffortChanged => {}
             other => {
-                if let Err(err) = record(&mut log, &mut outbox, other) {
+                if let Err(err) = record_side(&mut log, &mut outbox, other, interactions.as_ref()) {
                     result = Err(err);
                 }
             }
         }
+    }
+    if let Some(interactions) = interactions {
+        interactions.finish().await;
     }
     if let Err(err) = outbox.seal() {
         result = Err(err);
@@ -523,6 +536,18 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     result
 }
 
+fn record_side(
+    log: &mut Log,
+    outbox: &mut Outbox,
+    event: Event,
+    side: Option<&side::Side>,
+) -> Result<()> {
+    if let Some(side) = side {
+        side.event(&event);
+    }
+    record(log, outbox, event)
+}
+
 fn record(log: &mut Log, outbox: &mut Outbox, event: Event) -> Result<()> {
     match event {
         Event::Text(source, text) => {
@@ -551,7 +576,12 @@ fn record(log: &mut Log, outbox: &mut Outbox, event: Event) -> Result<()> {
         }
         Event::Warning(message) => log.event("warning", json!({ "message": message })),
         Event::Other(kind) => log.event("update", json!({ "kind": kind })),
-        Event::Exited | Event::EffortChanged | Event::EffortOutcome(_) => {}
+        Event::Exited
+        | Event::EffortChanged
+        | Event::EffortOutcome(_)
+        | Event::OwnerInput(_)
+        | Event::InputClosed(_)
+        | Event::ContextChanged(_) => {}
     }
     Ok(())
 }

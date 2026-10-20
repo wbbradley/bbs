@@ -18,6 +18,7 @@ use super::effort;
 use super::harness::{EffortUnconfirmed, Event, MAX_INPUT_CHARS, SETUP_TIMEOUT, truncate};
 use super::rpc::{Incoming, Process, Rpc};
 use super::settings::{HarnessConfig, McpEnv};
+use super::{context, input};
 use crate::proto::effort_outcome::Result as Outcome;
 use crate::proto::{EffortRequest, EffortState};
 
@@ -47,14 +48,22 @@ impl McpServer {
 /// One running ACP agent and the session it serves.
 #[derive(Clone)]
 pub struct Acp {
+    pub inputs: Arc<input::Requests>,
+    input_enabled: bool,
     rpc: Rpc,
     effort: Arc<Mutex<AcpEffort>>,
     events: mpsc::UnboundedSender<Event>,
     /// While a loaded session replays its history, updates are not events.
     replaying: Arc<AtomicBool>,
-    active_prompt: Arc<Mutex<Option<String>>>,
+    active_prompt: Arc<Mutex<ActivePrompt>>,
     session_id: String,
     pub session_resumed: bool,
+}
+
+#[derive(Default)]
+struct ActivePrompt {
+    id: Option<String>,
+    input_cancelled: bool,
 }
 
 struct AcpEffort {
@@ -62,6 +71,8 @@ struct AcpEffort {
     state: EffortState,
     id: Option<String>,
     claude: bool,
+    model: Option<String>,
+    usage_valid: bool,
 }
 
 impl Default for AcpEffort {
@@ -71,6 +82,8 @@ impl Default for AcpEffort {
             state: effort::unavailable("no thought-level option advertised"),
             id: None,
             claude: false,
+            model: None,
+            usage_valid: false,
         }
     }
 }
@@ -89,6 +102,11 @@ impl AcpEffort {
     }
 
     fn update(&mut self, options: &Value) {
+        self.model = options
+            .as_array()
+            .and_then(|o| o.iter().find(|o| o["category"] == "model"))
+            .and_then(|o| o["currentValue"].as_str())
+            .map(str::to_string);
         self.state = effort::unavailable("no thought-level option advertised");
         self.id = None;
         let Some(option) = options.as_array().and_then(|options| {
@@ -142,6 +160,7 @@ impl Acp {
         stderr: &Path,
         mcp: &McpServer,
         resume: Option<&str>,
+        input_enabled: bool,
     ) -> Result<(Acp, Process, mpsc::UnboundedReceiver<Event>, Vec<String>)> {
         let mut env = config.env.clone();
         let mut mcp = mcp.clone();
@@ -149,20 +168,33 @@ impl Acp {
             env.extend(std::mem::take(&mut mcp.env));
         }
         let (events, rx) = mpsc::unbounded_channel();
+        let inputs = Arc::new(input::Requests::default());
+        inputs.enable(input_enabled);
         let effort = Arc::new(Mutex::new(AcpEffort::default()));
         let replaying = Arc::new(AtomicBool::new(false));
-        let active_prompt = Arc::new(Mutex::new(None));
+        let active_prompt = Arc::new(Mutex::new(ActivePrompt::default()));
         let handler = {
+            let inputs = inputs.clone();
             let active_prompt = active_prompt.clone();
             let replaying = replaying.clone();
             let effort = effort.clone();
             let events = events.clone();
             move |rpc: &Rpc, msg: Incoming| {
-                handle(rpc, msg, &replaying, &active_prompt, &effort, &events)
+                handle(
+                    rpc,
+                    msg,
+                    &replaying,
+                    &active_prompt,
+                    &effort,
+                    &events,
+                    &inputs,
+                )
             }
         };
         let (rpc, mut process) = Rpc::spawn(&config.command, &env, cwd, stderr, handler)?;
         let mut acp = Acp {
+            inputs,
+            input_enabled,
             rpc,
             effort,
             events,
@@ -254,16 +286,18 @@ impl Acp {
     }
 
     async fn initialize(&self) -> Result<AgentCaps> {
+        let mut caps =
+            json!({"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false});
+        if self.input_enabled {
+            caps["elicitation"] = json!({"form": {}});
+        }
         let result = self
             .rpc
             .request(
                 "initialize",
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
-                    "clientCapabilities": {
-                        "fs": { "readTextFile": false, "writeTextFile": false },
-                        "terminal": false,
-                    },
+                    "clientCapabilities": caps,
                     "clientInfo": { "name": "bbs", "version": env!("CARGO_PKG_VERSION") },
                 }),
             )
@@ -409,12 +443,32 @@ impl Acp {
         Ok(())
     }
 
+    pub fn cancel_input(&self) {
+        self.inputs.cancel(&self.events);
+    }
+    pub async fn answer_input(
+        &self,
+        key: &str,
+        action: crate::proto::AnswerAction,
+        answers: &[crate::proto::InputAnswer],
+    ) -> Result<()> {
+        self.inputs.answer(key, action, answers, &self.events).await
+    }
+
     /// Run one turn; a rejected effort change never consumes its prompt mail.
     pub async fn prompt(&self, text: &str, effort: Option<EffortRequest>) -> Result<String> {
         if let Some(request) = effort {
             self.apply_effort(request).await?;
         }
-        *self.active_prompt.lock().unwrap() = Some(crate::auth::new_token());
+        self.effort.lock().unwrap().usage_valid = true;
+        let _ = self.events.send(Event::ContextChanged(None));
+        {
+            let mut active = self.active_prompt.lock().unwrap();
+            *active = ActivePrompt {
+                id: Some(crate::auth::new_token()),
+                input_cancelled: false,
+            };
+        }
         let result = self
             .rpc
             .request(
@@ -425,7 +479,8 @@ impl Acp {
                 }),
             )
             .await;
-        *self.active_prompt.lock().unwrap() = None;
+        self.active_prompt.lock().unwrap().id = None;
+        self.cancel_input();
         let result = result?;
         Ok(result["stopReason"]
             .as_str()
@@ -435,6 +490,11 @@ impl Acp {
 
     /// Ask the agent to stop the running turn; the prompt then returns `cancelled`.
     pub async fn cancel(&self) -> Result<()> {
+        {
+            let mut active = self.active_prompt.lock().unwrap();
+            active.input_cancelled = true;
+            self.cancel_input();
+        }
         self.rpc
             .notify("session/cancel", json!({ "sessionId": self.session_id }))
             .await
@@ -445,30 +505,68 @@ fn handle(
     rpc: &Rpc,
     msg: Incoming,
     replaying: &AtomicBool,
-    active_prompt: &Mutex<Option<String>>,
+    active_prompt: &Mutex<ActivePrompt>,
     effort: &Mutex<AcpEffort>,
     events: &mpsc::UnboundedSender<Event>,
+    inputs: &input::Requests,
 ) {
     match msg {
-        Incoming::Request { id, method, params } => {
-            rpc.respond_later(id, answer(&method, &params, events));
-        }
-        Incoming::Notification { method, params } if method == "session/update" => {
-            if params["update"]["sessionUpdate"] == "config_option_update" {
-                if effort.lock().unwrap().notification(&params) {
-                    let _ = events.send(Event::EffortChanged);
-                }
-            } else if !replaying.load(Ordering::SeqCst)
+        Incoming::Request { id, method, params } if method == "elicitation/create" => {
+            let active = active_prompt.lock().unwrap();
+            let valid = !active.input_cancelled
+                && !replaying.load(Ordering::SeqCst)
+                && active.id.is_some()
                 && effort
                     .lock()
                     .unwrap()
                     .parent
                     .as_deref()
+                    .is_some_and(|p| params["sessionId"].as_str() == Some(p));
+            let result = if valid {
+                input::acp(&params).and_then(|form| inputs.open(rpc, id.clone(), form, events))
+            } else {
+                Err(anyhow!(
+                    "human input must belong to the active parent session"
+                ))
+            };
+            if let Err(error) = result {
+                rpc.respond_later(id, Err(error.to_string()));
+            }
+        }
+        Incoming::Request { id, method, params } => {
+            rpc.respond_later(id, answer(&method, &params, events));
+        }
+        Incoming::Notification { method, params } if method == "session/update" => {
+            let parent = effort.lock().unwrap().parent.clone();
+            if params["update"]["sessionUpdate"] == "config_option_update" {
+                let mut state = effort.lock().unwrap();
+                let old_model = state.model.clone();
+                if state.notification(&params) {
+                    let _ = events.send(Event::EffortChanged);
+                    if old_model != state.model {
+                        state.usage_valid = false;
+                        let _ = events.send(Event::ContextChanged(None));
+                    }
+                }
+            } else if !replaying.load(Ordering::SeqCst)
+                && parent
+                    .as_deref()
                     .is_some_and(|id| params["sessionId"].as_str() == Some(id))
                 && let Some(mut event) = update_event(&params["update"])
             {
+                if matches!(event, Event::ContextChanged(_)) {
+                    let mut state = effort.lock().unwrap();
+                    if matches!(
+                        params["update"]["sessionUpdate"].as_str(),
+                        Some("current_model_update" | "compaction_update")
+                    ) {
+                        state.usage_valid = false;
+                    } else if !state.usage_valid {
+                        return;
+                    }
+                }
                 if let Event::Text(source, _) = &mut event {
-                    let Some(prompt) = active_prompt.lock().unwrap().clone() else {
+                    let Some(prompt) = active_prompt.lock().unwrap().id.clone() else {
                         return;
                     };
                     source.turn = Some(prompt);
@@ -481,6 +579,7 @@ fn handle(
             let _ = events.send(Event::Other(method));
         }
         Incoming::Exited => {
+            inputs.cancel(events);
             let _ = events.send(Event::Exited);
         }
     }
@@ -522,6 +621,12 @@ fn answer(
 
 fn update_event(update: &Value) -> Option<Event> {
     let kind = update["sessionUpdate"].as_str()?;
+    if kind == "usage_update" {
+        return Some(Event::ContextChanged(context::acp(update)));
+    }
+    if matches!(kind, "current_model_update" | "compaction_update") {
+        return Some(Event::ContextChanged(None));
+    }
     let text = || update["content"]["text"].as_str().map(str::to_string);
     Some(match kind {
         "agent_message_chunk" => Event::Text(

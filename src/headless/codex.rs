@@ -21,6 +21,7 @@ use super::harness::{
 use super::mcp::{Tools, tool_list};
 use super::rpc::{Incoming, Process, Rpc};
 use super::settings::HarnessConfig;
+use super::{context, input};
 use crate::proto::effort_outcome::Result as Outcome;
 use crate::proto::{EffortRequest, EffortState};
 
@@ -30,6 +31,7 @@ const TURN_ID_WAIT: Duration = Duration::from_secs(10);
 /// The running turn, and a signal for each change to it.
 #[derive(Default)]
 struct TurnState {
+    inputs: input::Requests,
     turn: Mutex<Turn>,
     dispatch: Mutex<()>,
     changed: Notify,
@@ -63,14 +65,22 @@ impl TurnState {
 /// The running turn, if any.
 #[derive(Default)]
 struct Turn {
+    cancel_requested: bool,
     /// Known once `turn/started` or the `turn/start` response arrives.
     id: Option<String>,
     /// Resolved by `turn/completed`.
     done: Option<oneshot::Sender<Result<String>>>,
     text_seen: std::collections::HashSet<String>,
     text_done: std::collections::HashSet<String>,
-    before_ack: Vec<(String, Value)>,
+    before_ack: Vec<Queued>,
+    latest_id: Option<String>,
+    usage_invalid: bool,
     exited: bool,
+}
+
+enum Queued {
+    Notification(String, Value),
+    Input(Rpc, Value, Value),
 }
 
 struct CodexEffort {
@@ -160,9 +170,11 @@ impl Codex {
         stderr: &Path,
         tools: Tools,
         resume: Option<&str>,
+        input_enabled: bool,
     ) -> Result<(Codex, Process, mpsc::UnboundedReceiver<Event>)> {
         let (events, rx) = mpsc::unbounded_channel();
         let turn = Arc::new(TurnState::default());
+        turn.inputs.enable(input_enabled);
         let effort = Arc::new(Mutex::new(CodexEffort::default()));
         let handler = {
             let turn = turn.clone();
@@ -288,9 +300,28 @@ impl Codex {
         e.refresh();
     }
 
+    pub fn inputs(&self) -> &input::Requests {
+        &self.turn.inputs
+    }
+    pub fn cancel_input(&self) {
+        self.turn.inputs.cancel(&self.events);
+    }
+    pub async fn answer_input(
+        &self,
+        key: &str,
+        action: crate::proto::AnswerAction,
+        answers: &[crate::proto::InputAnswer],
+    ) -> Result<()> {
+        self.turn
+            .inputs
+            .answer(key, action, answers, &self.events)
+            .await
+    }
+
     /// Run one turn; returns its status (`completed` or `interrupted`).
     pub async fn prompt(&self, text: &str, effort: Option<EffortRequest>) -> Result<String> {
         let (tx, rx) = oneshot::channel();
+        let _ = self.events.send(Event::ContextChanged(None));
         self.turn.set(|turn| {
             *turn = Turn {
                 done: Some(tx),
@@ -362,7 +393,14 @@ impl Codex {
                         message.clone(),
                     )));
                 }
-                self.turn.set(|turn| *turn = Turn::default());
+                self.turn.set(|turn| {
+                    for q in std::mem::take(&mut turn.before_ack) {
+                        if let Queued::Input(rpc, id, _) = q {
+                            rpc.respond_later(id, Err("turn did not start".into()));
+                        }
+                    }
+                    *turn = Turn::default();
+                });
                 if definite && changing_effort {
                     return Err(PromptNotStarted(message).into());
                 }
@@ -386,8 +424,15 @@ impl Codex {
                 turn.id = Some(id.to_string());
                 queued = std::mem::take(&mut turn.before_ack);
             });
-            for (method, params) in queued {
-                dispatch_notification(&method, &params, &self.turn, &self.events);
+            for event in queued {
+                match event {
+                    Queued::Notification(method, params) => {
+                        dispatch_notification(&method, &params, &self.turn, &self.events)
+                    }
+                    Queued::Input(rpc, id, params) => {
+                        dispatch_input(&rpc, id, params, &self.turn, &self.events)
+                    }
+                }
             }
             self.turn.set(|turn| {
                 if turn.exited
@@ -419,6 +464,11 @@ impl Codex {
 
     /// Interrupt the running turn; its prompt then returns `interrupted`.
     pub async fn cancel(&self) -> Result<()> {
+        {
+            let _ordered = self.turn.dispatch.lock().unwrap();
+            self.turn.set(|turn| turn.cancel_requested = true);
+            self.cancel_input();
+        }
         if let Some(id) = self.turn.running_id(TURN_ID_WAIT).await {
             self.rpc
                 .request(
@@ -447,12 +497,24 @@ fn dynamic_tools() -> Value {
 fn handle(
     rpc: &Rpc,
     msg: Incoming,
-    turn: &TurnState,
+    turn: &Arc<TurnState>,
     tools: &Arc<tokio::sync::Mutex<Tools>>,
     effort: &Mutex<CodexEffort>,
     events: &mpsc::UnboundedSender<Event>,
 ) {
     match msg {
+        Incoming::Request { id, method, params } if method == "item/tool/requestUserInput" => {
+            let parent = effort.lock().unwrap().parent.clone();
+            if parent.as_deref() != params["threadId"].as_str() || parent.is_none() {
+                rpc.respond_later(
+                    id,
+                    Err("human input must belong to the active parent".into()),
+                );
+                return;
+            }
+            let _ordered = turn.dispatch.lock().unwrap();
+            dispatch_input(rpc, id, params, turn, events);
+        }
         Incoming::Request { id, method, params } if method == "item/tool/call" => {
             let rpc = rpc.clone();
             let tools = tools.clone();
@@ -475,8 +537,19 @@ fn handle(
             rpc.respond_later(id, answer(&method, &params, events));
         }
         Incoming::Notification { method, params } => {
-            if method == "thread/settings/updated" && effort.lock().unwrap().notification(&params) {
-                let _ = events.send(Event::EffortChanged);
+            if method == "thread/settings/updated" {
+                let mut e = effort.lock().unwrap();
+                let model = e.model.clone();
+                if e.notification(&params) {
+                    let _ = events.send(Event::EffortChanged);
+                    if model != e.model {
+                        turn.set(|t| {
+                            t.usage_invalid = true;
+                            t.latest_id = None;
+                        });
+                        let _ = events.send(Event::ContextChanged(None));
+                    }
+                }
             }
             // Only the opened parent's live turn can produce owner chat.
             // History replay and child notifications never enter the text stream.
@@ -494,6 +567,7 @@ fn handle(
         }
         Incoming::Exited => {
             let _ordered = turn.dispatch.lock().unwrap();
+            turn.inputs.cancel(events);
             turn.set(|turn| {
                 turn.exited = true;
                 // A received start ACK may still be awaiting its task. Keep
@@ -509,6 +583,52 @@ fn handle(
     }
 }
 
+/// Defer pre-ACK callbacks in wire order without blocking the JSON-RPC reader.
+fn dispatch_input(
+    rpc: &Rpc,
+    id: Value,
+    params: Value,
+    turn: &TurnState,
+    events: &mpsc::UnboundedSender<Event>,
+) {
+    let mut current = turn.turn.lock().unwrap();
+    if current.done.is_some()
+        && !current.exited
+        && !current.cancel_requested
+        && current.id.is_none()
+    {
+        if current
+            .before_ack
+            .iter()
+            .any(|q| matches!(q, Queued::Input(..)))
+        {
+            rpc.respond_later(id, Err("another human-input request is pending".into()));
+        } else {
+            current
+                .before_ack
+                .push(Queued::Input(rpc.clone(), id, params));
+        }
+        return;
+    }
+    let valid = current.done.is_some()
+        && !current.exited
+        && !current.cancel_requested
+        && current.id.as_deref() == params["turnId"].as_str()
+        && current.id.is_some()
+        && params["itemId"].as_str().is_some_and(|s| !s.is_empty());
+    drop(current);
+    let result = if valid {
+        input::codex(&params).and_then(|form| turn.inputs.open(rpc, id.clone(), form, events))
+    } else {
+        Err(anyhow!(
+            "human input is no longer in the active parent turn"
+        ))
+    };
+    if let Err(error) = result {
+        rpc.respond_later(id, Err(error.to_string()));
+    }
+}
+
 /// Called under `dispatch`, including buffered notifications that preceded the
 /// turn/start ACK. A previous turn cannot finish or speak for the current one.
 fn dispatch_notification(
@@ -517,12 +637,50 @@ fn dispatch_notification(
     turn: &TurnState,
     events: &mpsc::UnboundedSender<Event>,
 ) {
-    if method.starts_with("item/") || method.starts_with("turn/") {
+    if method == "serverRequest/resolved" {
+        let mut current = turn.turn.lock().unwrap();
+        if current.done.is_some() && current.id.is_none() {
+            // Remove the deferred callback as well as an already opened form.
+            current
+                .before_ack
+                .retain(|q| !matches!(q, Queued::Input(_, id, _) if id == &params["requestId"]));
+        }
+        drop(current);
+        turn.inputs.withdraw(&params["requestId"], events);
+        return;
+    }
+    if method.starts_with("item/")
+        || method.starts_with("turn/")
+        || matches!(
+            method,
+            "thread/tokenUsage/updated" | "thread/compacted" | "model/rerouted"
+        )
+    {
         let incoming = params["turnId"]
             .as_str()
             .or_else(|| params["turn"]["id"].as_str());
         let mut current = turn.turn.lock().unwrap();
-        if current.done.is_none() || incoming.is_none() {
+        if incoming.is_none() {
+            return;
+        }
+        if matches!(
+            method,
+            "thread/tokenUsage/updated" | "thread/compacted" | "model/rerouted"
+        ) {
+            if method == "thread/tokenUsage/updated" && current.usage_invalid {
+                return;
+            }
+            if current.done.is_none() {
+                if incoming != current.latest_id.as_deref() {
+                    return;
+                }
+                drop(current);
+                if let Some(event) = notification_event(method, params, turn) {
+                    let _ = events.send(event);
+                }
+                return;
+            }
+        } else if current.done.is_none() {
             return;
         }
         let Some(expected) = current.id.as_deref() else {
@@ -530,12 +688,22 @@ fn dispatch_notification(
             // turn/started notification from the parent thread.
             current
                 .before_ack
-                .push((method.to_string(), params.clone()));
+                .push(Queued::Notification(method.to_string(), params.clone()));
             return;
         };
         if incoming != Some(expected) {
             return;
         }
+    }
+    if method == "turn/completed" {
+        turn.inputs.cancel(events);
+    }
+    if method == "item/completed" && params["item"]["type"] == "contextCompaction" {
+        turn.set(|t| {
+            t.usage_invalid = true;
+            t.latest_id = None;
+        });
+        let _ = events.send(Event::ContextChanged(None));
     }
     if let Some(event) = notification_event(method, params, turn) {
         let _ = events.send(event);
@@ -606,9 +774,22 @@ fn notification_event(method: &str, params: &Value, turn: &TurnState) -> Option<
             });
             return None;
         }
+        "thread/tokenUsage/updated" => Event::ContextChanged(context::codex(params)),
+        "thread/compacted" | "model/rerouted" => {
+            turn.set(|t| {
+                t.usage_invalid = true;
+                t.latest_id = None;
+            });
+            Event::ContextChanged(None)
+        }
         "turn/completed" => {
             let mut done = None;
-            turn.set(|turn| done = std::mem::take(turn).done);
+            turn.set(|turn| {
+                let old = std::mem::take(turn);
+                turn.latest_id = old.id;
+                turn.usage_invalid = old.usage_invalid;
+                done = old.done;
+            });
             if let Some(done) = done {
                 let _ = done.send(turn_outcome(&params["turn"]));
             }
@@ -624,7 +805,6 @@ fn notification_event(method: &str, params: &Value, turn: &TurnState) -> Option<
                 .unwrap_or_else(|| params.to_string());
             Event::Warning(truncate(format!("{method}: {message}"), MAX_INPUT_CHARS))
         }
-        "thread/compacted" | "model/rerouted" => Event::Other(method.to_string()),
         // Output deltas, account and status updates, and the like.
         _ => return None,
     })
@@ -680,6 +860,81 @@ fn item_event(method: &str, item: &Value) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_accepts_latest_completed_then_rejects_older_or_invalidated_usage() {
+        let state = TurnState::default();
+        let (done, _result) = oneshot::channel();
+        state.set(|s| {
+            s.id = Some("t1".into());
+            s.done = Some(done);
+        });
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let usage = |id| json!({"turnId":id,"tokenUsage":{"last":{"totalTokens":42},"modelContextWindow":100}});
+        dispatch_notification(
+            "turn/completed",
+            &json!({"turn":{"id":"t1","status":"completed"}}),
+            &state,
+            &events,
+        );
+        dispatch_notification("thread/tokenUsage/updated", &usage("t1"), &state, &events);
+        assert!(matches!(rx.try_recv(), Ok(Event::ContextChanged(Some(_)))));
+        dispatch_notification(
+            "thread/tokenUsage/updated",
+            &usage("older"),
+            &state,
+            &events,
+        );
+        assert!(rx.try_recv().is_err());
+        dispatch_notification("thread/compacted", &json!({"turnId":"t1"}), &state, &events);
+        assert!(matches!(rx.try_recv(), Ok(Event::ContextChanged(None))));
+        dispatch_notification("thread/tokenUsage/updated", &usage("t1"), &state, &events);
+        assert!(rx.try_recv().is_err());
+        let (done, _result) = oneshot::channel();
+        state.set(|s| {
+            *s = Turn {
+                id: Some("t2".into()),
+                done: Some(done),
+                ..Default::default()
+            }
+        });
+        dispatch_notification("thread/tokenUsage/updated", &usage("t1"), &state, &events);
+        assert!(rx.try_recv().is_err());
+        dispatch_notification("thread/tokenUsage/updated", &usage("t2"), &state, &events);
+        assert!(matches!(rx.try_recv(), Ok(Event::ContextChanged(Some(_)))));
+        dispatch_notification("model/rerouted", &json!({"turnId":"t2"}), &state, &events);
+        assert!(matches!(rx.try_recv(), Ok(Event::ContextChanged(None))));
+        dispatch_notification("thread/tokenUsage/updated", &usage("t2"), &state, &events);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn current_compaction_item_clears_usage_but_stale_invalidations_do_not() {
+        let state = TurnState::default();
+        let (done, _) = oneshot::channel();
+        state.set(|s| {
+            s.id = Some("live".into());
+            s.done = Some(done);
+        });
+        let (events, mut rx) = mpsc::unbounded_channel();
+        for method in ["thread/compacted", "model/rerouted"] {
+            dispatch_notification(method, &json!({"turnId":"old"}), &state, &events);
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(!state.turn.lock().unwrap().usage_invalid);
+        dispatch_notification(
+            "item/completed",
+            &json!({"turnId":"live","item":{"id":"compaction","type":"contextCompaction"}}),
+            &state,
+            &events,
+        );
+        assert!(matches!(rx.try_recv(), Ok(Event::ContextChanged(None))));
+        assert!(state.turn.lock().unwrap().usage_invalid);
+        assert!(
+            matches!(rx.try_recv(), Ok(Event::Tool(_, _))),
+            "retain existing activity semantics"
+        );
+    }
 
     #[test]
     fn effort_metadata_ignores_foreign_and_missing_thread_ids() {

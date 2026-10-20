@@ -3,8 +3,10 @@
 
 mod acp;
 mod codex;
+mod context;
 mod effort;
 mod harness;
+mod input;
 mod log;
 mod mcp;
 mod outbox;
@@ -12,6 +14,7 @@ mod rpc;
 mod run;
 mod settings;
 mod share;
+mod side;
 mod state;
 
 use std::path::Path;

@@ -195,12 +195,60 @@ before deciding whether to send those messages again.
 Effort reports are durable state visible to humans through agent lists and shared
 summaries, even with `share_activity = false`; they are independent of the 2,000-row
 activity window and never prove that the runner is currently connected. The server
-migrates to schema 17 automatically, so back up first; older local/server binaries
+migrates to schema 18 automatically, so back up first; older local/server binaries
 need the pre-upgrade database to downgrade. Protocol v2 and config format 3 remain
 unchanged. If an otherwise compatible server omits `agent-effort.v1`, the runner
 warns and disables effort reporting. The `auto-reply.v1` capability remains
 required to start the runner. Keep one runner per agent; no new config
 keys, credentials or identity changes are required.
+
+## Native questions and context usage
+
+On a server advertising `agent-interactions.v1`, an updated runner can forward
+native provider questions to its owning human. These are separate forms, not
+chat messages: questions and answers do not enter mail, history, recency, or
+another model prompt. Answers return only to the original live provider callback.
+This works with `share_activity = false`. Missing capability or failed startup
+negotiation disables these optional features while ordinary turns continue.
+
+Codex app-server uses `item/tool/requestUserInput`, fenced to the parent thread,
+turn and item. Its `isBlocking` value is retained; a nonblocking question does not
+mean the model is waiting. `serverRequest/resolved` withdraws its exact question.
+ACP advertises form elicitation only when the board transport is available and
+supports `elicitation/create` for the live parent session. The initial ACP subset
+is flat string fields and string enum/single-select fields; form messages, titles,
+descriptions, optional fields and custom-text fields retain their meanings. Array,
+number, URL, secret, and richer constrained forms return an explicit unsupported
+response. Codex secret questions are also refused before publication.
+
+Each form has 1–3 fields and at most eight options per field, with a 16 KiB total
+bound; answers are at most 4 KiB per field. No default choice is submitted.
+Optional fields may be skipped. Submit, decline and cancel remain distinct for
+ACP; Codex cancellation returns an empty answer map. Only one native question can
+be pending. Cancellation, completion and shutdown retire it, and late answers
+cannot attach to a later request. A fresh runner generation retires old forms;
+requests are never replayed into a model after restart.
+
+The runner serializes form publication and cleanup. On a form transport failure it
+cancels the native callback, rejects new forms until cleanup succeeds, and retains
+a sequence-based close even when the publication acknowledgment was lost. It does
+not retry the model turn. Authentication, stale-generation or unsupported-service
+errors disable the optional path. Shutdown makes a bounded cleanup attempt; if the
+board is unavailable, the next runner generation retires the stale card.
+
+Context usage is provider-reported occupancy, not cumulative token spending.
+Codex uses `tokenUsage.last.totalTokens` and `modelContextWindow`; ACP uses
+`usage_update.used` and `size`. Unknown counts and windows remain absent, and
+counts above the reported window are not clamped. Parent-session updates only are
+accepted; Codex additionally fences usage to the current or latest completed turn.
+New turns and known model/compaction changes clear the prior snapshot. After an
+invalidating model/compaction event, usage stays unknown until the next turn.
+Reports are coalesced and sent only for new snapshots, without a periodic retry
+loop. Their timestamp means server report receipt, not observation time or proof
+that the runner is connected. Input activity and polling do not refresh that age.
+
+These interfaces do not provide an isolated `/btw` side conversation. That needs
+separately verified provider isolation and tool restrictions.
 
 ## Turns
 

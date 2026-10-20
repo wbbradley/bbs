@@ -25,6 +25,9 @@ pub enum Event {
     TextEnd(super::outbox::Source, Option<String>),
     /// Provider metadata changed; read the latest snapshot. Never an ACK.
     EffortChanged,
+    OwnerInput(super::input::Form),
+    InputClosed(String),
+    ContextChanged(Option<crate::proto::ContextUsage>),
     EffortOutcome(crate::proto::EffortOutcome),
     Thought(String),
     /// A tool call started or changed: id, and the fields worth logging.
@@ -45,6 +48,7 @@ pub struct BbsTools {
     pub mcp: McpServer,
     /// For Codex: tools answered in this process.
     pub tools: Tools,
+    pub input_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -72,12 +76,12 @@ impl Harness {
         Ok(match config.kind {
             HarnessType::Acp => {
                 let (acp, process, events, warnings) =
-                    Acp::start(config, cwd, stderr, &bbs.mcp, resume).await?;
+                    Acp::start(config, cwd, stderr, &bbs.mcp, resume, bbs.input_enabled).await?;
                 (Harness::Acp(acp), process, events, warnings)
             }
             HarnessType::CodexAppServer => {
                 let (codex, process, events) =
-                    Codex::start(config, cwd, stderr, bbs.tools, resume).await?;
+                    Codex::start(config, cwd, stderr, bbs.tools, resume, bbs.input_enabled).await?;
                 (Harness::Codex(codex), process, events, Vec::new())
             }
         })
@@ -106,6 +110,39 @@ impl Harness {
         match self {
             Self::Acp(a) => a.effort_state(),
             Self::Codex(c) => c.effort_state(),
+        }
+    }
+
+    pub fn input_pending(&self, key: &str) -> bool {
+        match self {
+            Self::Acp(a) => a.inputs.pending(key),
+            Self::Codex(c) => c.inputs().pending(key),
+        }
+    }
+
+    pub fn enable_input(&self, enabled: bool) {
+        match self {
+            Self::Acp(a) => a.inputs.enable(enabled),
+            Self::Codex(c) => c.inputs().enable(enabled),
+        }
+    }
+
+    pub fn cancel_input(&self) {
+        match self {
+            Self::Acp(a) => a.cancel_input(),
+            Self::Codex(c) => c.cancel_input(),
+        }
+    }
+
+    pub async fn answer_input(
+        &self,
+        key: &str,
+        action: crate::proto::AnswerAction,
+        answers: &[crate::proto::InputAnswer],
+    ) -> Result<()> {
+        match self {
+            Self::Acp(a) => a.answer_input(key, action, answers).await,
+            Self::Codex(c) => c.answer_input(key, action, answers).await,
         }
     }
 
