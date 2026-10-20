@@ -208,11 +208,12 @@ On a server advertising `agent-interactions.v1`, an updated runner can forward
 native provider questions to its owning human. These are separate forms, not
 chat messages: questions and answers do not enter mail, history, recency, or
 another model prompt. Answers return only to the original live provider callback.
+They remain part of that provider conversation as native tool results.
 This works with `share_activity = false`. Missing capability or failed startup
 negotiation disables these optional features while ordinary turns continue.
 
-Codex app-server uses `item/tool/requestUserInput`, fenced to the parent thread,
-turn and item. Its `isBlocking` value is retained; a nonblocking question does not
+Codex app-server uses `item/tool/requestUserInput`, checked against the parent
+thread and turn and bound to the exact callback. Its `isBlocking` value is retained; a nonblocking question does not
 mean the model is waiting. `serverRequest/resolved` withdraws its exact question.
 ACP advertises form elicitation only when the board transport is available and
 supports `elicitation/create` for the live parent session. The initial ACP subset
