@@ -46,8 +46,8 @@ pub struct Thread {
     /// Raw feed boundaries that may have skipped messages.
     message_gaps: BTreeSet<i64>,
     show: Show,
-    /// Ctrl-T: hide tool calls and mail among other participants, for this
-    /// session; `show` and the activity kinds still apply.
+    /// Ctrl-T: hide tool calls and mail among other participants while this
+    /// conversation is open; `show` and the activity kinds still apply.
     compact: bool,
     human: Option<String>,
     /// The stream's last error; it has ended until a reload.

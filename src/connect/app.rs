@@ -5505,6 +5505,13 @@ mod tests {
             bottom(&mut app).contains("compact"),
             "after the prompt closes"
         );
+        // The choice lasts while the conversation is open: reopened, it is
+        // verbose again.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        while rx.try_recv().is_ok() {}
+        reopen(&mut app, &mut rx);
+        assert!(!bottom(&mut app).contains("compact"));
     }
 
     #[test]
