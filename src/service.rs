@@ -1413,14 +1413,15 @@ pub fn cancel_side(
         let Some(row) = db::side_request(ctx.conn, req.id)? else {
             bail!("no such side question");
         };
+        if db::agent_owner_id(ctx.conn, row.agent_id)? != Some(me.id) {
+            bail!("not your agent's question");
+        }
+        // Idempotent after a lost reply: already cancelled is a no-op.
         if row.status == "cancelled" {
             return Ok(proto::Empty {});
         }
         if row.status != "open" {
             bail!("side question is not open");
-        }
-        if db::agent_owner_id(ctx.conn, row.agent_id)? != Some(me.id) {
-            bail!("not your agent's question");
         }
         db::cancel_side_request(ctx.conn, req.id, &ctx.now_s)?;
         Ok(proto::Empty {})
@@ -1476,7 +1477,9 @@ pub fn report_side(
         let Some(row) = db::side_request(ctx.conn, req.id)? else {
             bail!("no such side question");
         };
-        if row.generation.as_deref() != Some(req.generation.as_str()) {
+        if row.agent_id != me.id
+            || row.generation.as_deref() != Some(req.generation.as_str())
+        {
             bail!("not your claimed side question");
         }
         if row.status != "open" {
@@ -4016,6 +4019,51 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("closed"), "{err}");
+
+        // A report names its registration: another agent holding the same
+        // generation string cannot touch it.
+        begin_side_session(
+            &mut conn,
+            &_zed,
+            proto::BeginSideSessionRequest {
+                generation: "run-1".into(),
+            },
+        )
+        .unwrap();
+        let err = report_side(
+            &mut conn,
+            &_zed,
+            proto::ReportSideRequest {
+                generation: "run-1".into(),
+                id: first.id,
+                status: proto::SideStatus::SideCompleted.into(),
+                answer: Some("not mine".into()),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not your claimed"), "{err}");
+        // Ownership precedes cancel idempotence: a cancelled id from another
+        // human's agent still rejects.
+        ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: "ada".into(),
+            },
+        )
+        .unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        let err = cancel_side(
+            &mut conn,
+            &ada,
+            proto::CancelSideRequest { id: first.id },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not your agent"), "{err}");
 
         // A fresh generation interrupts everything open and clears capability.
         let second = ask(&mut conn, "unclaimed").unwrap();
