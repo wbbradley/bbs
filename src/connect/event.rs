@@ -60,6 +60,17 @@ pub enum Request {
         id: u64,
         agent: String,
     },
+    /// The owner's side question (`/btw`) to an agent, for the screen `id`.
+    AskSide {
+        id: u64,
+        agent: String,
+        question: String,
+    },
+    /// Cancel the owner's open side question `side`, for the screen `id`.
+    CancelSide {
+        id: u64,
+        side: i64,
+    },
     /// The owner's reply to an agent's questions, for the screen `id`.
     AnswerOwnerInput {
         id: u64,
@@ -272,6 +283,16 @@ pub enum Data {
         request_id: i64,
         result: Result<(), SideError>,
     },
+    /// The new side question's id.
+    SideAsked {
+        id: u64,
+        result: Result<i64, SideError>,
+    },
+    SideCancelled {
+        id: u64,
+        side: i64,
+        result: Result<(), SideError>,
+    },
     /// Completion of an actual read request, for the local summary fence.
     MarkedRead {
         agent: String,
@@ -392,6 +413,27 @@ pub async fn serve(
                     result: bounded(backend.answer_owner_input(req), local)
                         .await
                         .map(|_| ()),
+                }
+            }
+            Request::AskSide {
+                id,
+                agent,
+                question,
+            } => {
+                let local = matches!(backend, Backend::Local(_));
+                let call = backend.ask_side(proto::AskSideRequest { agent, question });
+                Data::SideAsked {
+                    id,
+                    result: bounded(call, local).await.map(|r| r.id),
+                }
+            }
+            Request::CancelSide { id, side } => {
+                let local = matches!(backend, Backend::Local(_));
+                let call = backend.cancel_side(proto::CancelSideRequest { id: side });
+                Data::SideCancelled {
+                    id,
+                    side,
+                    result: bounded(call, local).await.map(|_| ()),
                 }
             }
             Request::Admin { id, op } => {
@@ -1351,6 +1393,85 @@ mod tests {
             conn.query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn side_asks_and_cancels_report_ids_and_typed_refusals() {
+        let (_dir, conn, opener, _) = board();
+        conn.execute_batch(
+            "INSERT INTO agent_owners (agent_id, human_id) VALUES (1, 1);
+             INSERT INTO side_state (agent_id, generation, reported_at, revision, closed_seq, supported)
+             VALUES (1, 'run-1', '2026-10-20T02:30:00Z', 1, 0, 1);",
+        )
+        .unwrap();
+        let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
+        let ask = |id| Request::AskSide {
+            id,
+            agent: "Mateo".into(),
+            question: "which branch?".into(),
+        };
+        tx.send(ask(50)).unwrap();
+        // One open question at a time: the second ask is refused.
+        tx.send(ask(51)).unwrap();
+        drop(tx);
+        serve(backend, opener.clone(), rx, events).await;
+        let Some(Event::Data(Data::SideAsked {
+            id: 50,
+            result: Ok(side),
+        })) = replies.recv().await
+        else {
+            panic!("the new side question's id")
+        };
+        assert!(matches!(
+            replies.recv().await,
+            Some(Event::Data(Data::SideAsked {
+                id: 51,
+                result: Err(SideError::Refused(_)),
+            }))
+        ));
+        let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Request::CancelSide { id: 52, side }).unwrap();
+        tx.send(Request::CancelSide {
+            id: 53,
+            side: side + 1,
+        })
+        .unwrap();
+        drop(tx);
+        serve(backend, opener, rx, events).await;
+        assert!(matches!(
+            replies.recv().await,
+            Some(Event::Data(Data::SideCancelled { id: 52, side: s, result: Ok(()) })) if s == side
+        ));
+        assert!(matches!(
+            replies.recv().await,
+            Some(Event::Data(Data::SideCancelled {
+                id: 53,
+                result: Err(SideError::Refused(_)),
+                ..
+            }))
+        ));
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM side_requests WHERE id = ?1",
+                [side],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "never mail"
         );
     }
 

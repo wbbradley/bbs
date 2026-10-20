@@ -100,6 +100,71 @@ pub struct Session {
     /// shows it waiting, and must not bring it back.
     answered: Option<i64>,
     pub notice: Option<String>,
+    /// The `/btw` panel, from this session's ask or the first report's side
+    /// question.
+    pub side: Option<Side>,
+    /// A first report has arrived: later side questions appear only when
+    /// asked here.
+    seen_report: bool,
+    /// A draft the server took as a side question: the composer clears it if
+    /// nothing was typed since.
+    pub asked_draft: Option<String>,
+}
+
+/// The longest side question the server takes.
+pub const SIDE_QUESTION_LIMIT: usize = 4 * 1024;
+
+/// The owner's `/btw` question and where it stands.
+#[derive(Debug, PartialEq)]
+pub struct Side {
+    /// The draft as submitted.
+    draft: String,
+    pub question: String,
+    /// The latest side id known before asking: an ask whose outcome is
+    /// unknown adopts only a newer one with the same question.
+    baseline: i64,
+    pub state: SideState,
+    /// A cancel on its way.
+    cancelling: bool,
+    pub notice: Option<String>,
+    /// Lines scrolled up from the answer's end.
+    pub scroll: Cell<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SideState {
+    /// The ask is on its way.
+    Asking,
+    /// The server took it under this id; reports carry the rest.
+    Tracking(i64),
+    /// The ask's outcome is unknown, for this reason.
+    Unconfirmed(String),
+    /// Not asked, for this reason.
+    NotAsked(String),
+}
+
+/// What a side question shows: its server status and answer so far.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SideView {
+    Asking,
+    Unconfirmed(String),
+    NotAsked(String),
+    /// Taken, before a report shows it.
+    Asked,
+    Open(String),
+    Completed(String),
+    Failed(String),
+    Cancelled(String),
+    Interrupted(String),
+    /// A newer side question took its place in the reports.
+    Replaced,
+}
+
+impl SideView {
+    /// Whether the question may still be answered.
+    pub fn running(&self) -> bool {
+        matches!(self, SideView::Asking | SideView::Asked | SideView::Open(_))
+    }
 }
 
 impl Session {
@@ -114,6 +179,155 @@ impl Session {
             sending: None,
             answered: None,
             notice: None,
+            side: None,
+            seen_report: false,
+            asked_draft: None,
+        }
+    }
+
+    /// Ask `question` aside, from `draft`; the reason it cannot be asked
+    /// otherwise. Never sent as mail either way.
+    pub fn ask_side(
+        &mut self,
+        agent: &str,
+        draft: &str,
+        question: &str,
+    ) -> Result<Request, String> {
+        if self.side_view().is_some_and(|v| v.running()) {
+            return Err("A side question is already running (Esc cancels it).".into());
+        }
+        if self.unsupported {
+            return Err("Side questions are not available on this server.".into());
+        }
+        let report = self
+            .report
+            .as_ref()
+            .ok_or("Waiting for the agent's report; try again in a moment.")?;
+        if report.side_supported != Some(true) {
+            return Err(report
+                .side_reason
+                .clone()
+                .filter(|r| !r.trim().is_empty())
+                .unwrap_or_else(|| format!("{agent}'s runner does not answer side questions.")));
+        }
+        if question.is_empty() {
+            return Err("Usage: /btw <question>".into());
+        }
+        if question.len() > SIDE_QUESTION_LIMIT {
+            return Err(format!(
+                "A side question is at most 4 KiB; this one is {} bytes.",
+                question.len()
+            ));
+        }
+        if report
+            .side
+            .as_ref()
+            .is_some_and(|s| s.status() == proto::SideStatus::SideOpen)
+        {
+            return Err("A side question is already open for this agent.".into());
+        }
+        self.side = Some(Side {
+            draft: draft.to_string(),
+            question: question.to_string(),
+            baseline: report.side.as_ref().map_or(0, |s| s.id),
+            state: SideState::Asking,
+            cancelling: false,
+            notice: None,
+            scroll: Cell::new(0),
+        });
+        Ok(Request::AskSide {
+            id: self.id,
+            agent: agent.to_string(),
+            question: question.to_string(),
+        })
+    }
+
+    /// The panel's question and where it stands, if a panel is up.
+    pub fn side_view(&self) -> Option<SideView> {
+        let side = self.side.as_ref()?;
+        Some(match &side.state {
+            SideState::Asking => SideView::Asking,
+            SideState::Unconfirmed(why) => SideView::Unconfirmed(why.clone()),
+            SideState::NotAsked(why) => SideView::NotAsked(why.clone()),
+            SideState::Tracking(id) => {
+                match self.report.as_ref().and_then(|r| r.side.as_ref()) {
+                    Some(s) if s.id == *id => {
+                        let answer = s.answer.clone().unwrap_or_default();
+                        match s.status() {
+                            proto::SideStatus::SideOpen => SideView::Open(answer),
+                            proto::SideStatus::SideCompleted => SideView::Completed(answer),
+                            proto::SideStatus::SideFailed => SideView::Failed(answer),
+                            proto::SideStatus::SideCancelled => SideView::Cancelled(answer),
+                            proto::SideStatus::SideInterrupted => SideView::Interrupted(answer),
+                            proto::SideStatus::Unspecified => SideView::Asked,
+                        }
+                    }
+                    Some(s) if s.id > *id => SideView::Replaced,
+                    // A report from before the ask: not this question.
+                    _ => SideView::Asked,
+                }
+            }
+        })
+    }
+
+    /// Esc on the panel: cancel a question still running, or close one that
+    /// has finished. `None` when there is nothing to send.
+    pub fn side_escape(&mut self) -> Option<Request> {
+        let view = self.side_view()?;
+        let side = self.side.as_mut()?;
+        match (&side.state, view) {
+            // The id is not known yet: nothing to cancel by.
+            (SideState::Asking, _) => {
+                side.notice = Some("Waiting for the server to take the question.".into());
+                None
+            }
+            (SideState::Tracking(id), view) if view.running() => {
+                if side.cancelling {
+                    return None;
+                }
+                side.cancelling = true;
+                side.notice = Some("Cancelling…".into());
+                Some(Request::CancelSide {
+                    id: self.id,
+                    side: *id,
+                })
+            }
+            _ => {
+                self.side = None;
+                None
+            }
+        }
+    }
+
+    /// Fit the panel to a report: adopt an unconfirmed ask's question, or on
+    /// a session's first report, the side question it shows.
+    fn track_side(&mut self) {
+        let first = !std::mem::replace(&mut self.seen_report, true);
+        let Some(latest) = self.report.as_ref().and_then(|r| r.side.as_ref()) else {
+            return;
+        };
+        match &mut self.side {
+            Some(side)
+                if matches!(side.state, SideState::Unconfirmed(_))
+                    && latest.id > side.baseline
+                    && latest.question == side.question =>
+            {
+                side.state = SideState::Tracking(latest.id);
+                side.notice = None;
+                self.asked_draft = Some(side.draft.clone());
+            }
+            None if first => {
+                self.side = Some(Side {
+                    draft: String::new(),
+                    question: latest.question.clone(),
+                    baseline: latest.id,
+                    state: SideState::Tracking(latest.id),
+                    cancelling: false,
+                    notice: None,
+                    scroll: Cell::new(0),
+                });
+            }
+            _ => {}
         }
     }
 
@@ -216,12 +430,14 @@ impl Session {
                         }
                         self.report = Some(report.as_ref().clone());
                         self.supersede();
+                        self.track_side();
                     }
                     // Stop asking, and stop showing what was cached: the agent
                     // may have retired, or this owner lost it.
                     Err(SideError::Unsupported(_)) => {
                         self.unsupported = true;
                         self.form = None;
+                        self.side = None;
                         self.report = None;
                         self.notice =
                             Some("Agent questions are not available on this server.".into());
@@ -229,6 +445,7 @@ impl Session {
                     Err(SideError::Refused(why)) => {
                         self.unsupported = true;
                         self.form = None;
+                        self.side = None;
                         self.report = None;
                         self.notice = Some(why.clone());
                     }
@@ -269,7 +486,56 @@ impl Session {
                 }
                 true
             }
+            Data::SideAsked { id, result } if *id == self.id => {
+                let Some(side) = self.side.as_mut() else {
+                    return false;
+                };
+                if side.state != SideState::Asking {
+                    return false;
+                }
+                side.state = match result {
+                    Ok(side_id) => {
+                        self.asked_draft = Some(side.draft.clone());
+                        SideState::Tracking(*side_id)
+                    }
+                    // The server may have taken it: a newer report with the
+                    // same question settles it; nothing is retried.
+                    Err(SideError::Transient(why)) => SideState::Unconfirmed(why.clone()),
+                    Err(SideError::Unsupported(why) | SideError::Refused(why)) => {
+                        SideState::NotAsked(why.clone())
+                    }
+                };
+                self.track_side_unconfirmed();
+                true
+            }
+            Data::SideCancelled { id, side, result } if *id == self.id => {
+                let Some(panel) = self.side.as_mut() else {
+                    return false;
+                };
+                if panel.state != SideState::Tracking(*side) {
+                    return false;
+                }
+                panel.cancelling = false;
+                // A cancel taken shows once a report does.
+                panel.notice = result.as_ref().err().map(|e| match e {
+                    SideError::Unsupported(why)
+                    | SideError::Refused(why)
+                    | SideError::Transient(why) => format!("Could not cancel: {why}"),
+                });
+                true
+            }
             _ => false,
+        }
+    }
+
+    /// An ask whose outcome is unknown may already show in the report.
+    fn track_side_unconfirmed(&mut self) {
+        if self
+            .side
+            .as_ref()
+            .is_some_and(|s| matches!(s.state, SideState::Unconfirmed(_)))
+        {
+            self.track_side();
         }
     }
 
@@ -315,6 +581,33 @@ fn question_set(input: &proto::OwnerInput) -> QuestionSet {
                 required: q.required,
             })
             .collect(),
+    }
+}
+
+/// What a draft means for `/btw`.
+#[derive(Debug, PartialEq)]
+pub enum SideDraft<'a> {
+    /// `/btw <question>`: a side question, never sent as mail.
+    Ask(&'a str),
+    /// `//btw …`: mail that starts with a literal `/btw`.
+    Literal(String),
+    /// Anything else: ordinary mail.
+    Mail,
+}
+
+/// Read a draft for `/btw`: its first word, after leading space, decides.
+pub fn side_draft(draft: &str) -> SideDraft<'_> {
+    let text = draft.trim_start();
+    let word = |prefix: &str| {
+        text.strip_prefix(prefix)
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    };
+    if word("//btw").is_some() {
+        return SideDraft::Literal(text[1..].to_string());
+    }
+    match word("/btw") {
+        Some(question) => SideDraft::Ask(question.trim()),
+        None => SideDraft::Mail,
     }
 }
 
@@ -391,6 +684,126 @@ pub fn context_lines(agent: &str, usage: Option<&ContextUsage>) -> Vec<Line<'sta
         }
     };
     vec![title, body, Line::styled("Esc closes", theme::dim())]
+}
+
+/// The `/btw` panel's rows: a header, the question, the answer and a
+/// footer, at most `rows`.
+pub fn side_height(agent: &str, view: &SideView, width: u16, rows: u16) -> u16 {
+    let answer = Paragraph::new(side_body(agent, view))
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    u16::try_from(answer.saturating_add(3))
+        .unwrap_or(u16::MAX)
+        .min(rows)
+}
+
+/// Draw the `/btw` panel: the answer shows its end, less what was scrolled
+/// up.
+pub fn render_side(frame: &mut Frame, area: Rect, agent: &str, side: &Side, view: &SideView) {
+    let width = usize::from(area.width);
+    let (label, role) = match view {
+        SideView::Asking => ("asking…", theme::Role::Muted),
+        SideView::Asked => ("asked", theme::Role::Muted),
+        SideView::Open(_) => ("answering…", theme::Role::Accent),
+        SideView::Completed(_) => ("answered", theme::Role::Success),
+        SideView::Failed(_) => ("failed", theme::Role::Error),
+        SideView::Cancelled(_) => ("cancelled", theme::Role::Warning),
+        SideView::Interrupted(_) => ("interrupted", theme::Role::Warning),
+        SideView::Unconfirmed(_) => ("not confirmed", theme::Role::Warning),
+        SideView::NotAsked(_) => ("not asked", theme::Role::Error),
+        SideView::Replaced => ("replaced", theme::Role::Muted),
+    };
+    let header = theme::clip_line(
+        Line::from(vec![
+            Span::styled("btw · ", theme::heading()),
+            Span::styled(agent.to_string(), theme::style(theme::Role::Agent)),
+            Span::styled(" · ", theme::heading()),
+            Span::styled(label, theme::style(role)),
+        ]),
+        width,
+    );
+    let question = theme::clip_line(
+        Line::styled(
+            format!("  {}", one_line(&side.question)),
+            theme::style(theme::Role::Text),
+        ),
+        width,
+    );
+    let footer = theme::clip_line(
+        match &side.notice {
+            Some(notice) => Line::styled(notice.clone(), theme::dim()),
+            None => Line::styled(
+                if view.running() {
+                    "Esc cancels · Alt-↑/↓ scrolls"
+                } else {
+                    "Esc closes · Alt-↑/↓ scrolls"
+                },
+                theme::dim(),
+            ),
+        },
+        width,
+    );
+    let [top, middle, answer_area, bottom] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    frame.render_widget(Paragraph::new(header), top);
+    frame.render_widget(Paragraph::new(question), middle);
+    frame.render_widget(Paragraph::new(footer), bottom);
+    let answer = Paragraph::new(side_body(agent, view)).wrap(Wrap { trim: false });
+    let total = answer.line_count(area.width);
+    let shown = usize::from(answer_area.height);
+    let scroll = side.scroll.get().min(total.saturating_sub(shown));
+    side.scroll.set(scroll);
+    let top_row = total.saturating_sub(shown).saturating_sub(scroll);
+    frame.render_widget(
+        answer.scroll((u16::try_from(top_row).unwrap_or(u16::MAX), 0)),
+        answer_area,
+    );
+}
+
+/// What the panel says below the question.
+fn side_body<'a>(agent: &str, view: &'a SideView) -> ratatui::text::Text<'a> {
+    use ratatui::text::Text;
+    let note = |text: String, style| Text::from(Line::styled(text, style));
+    let answer = |text: &'a str, empty: String| {
+        if text.trim().is_empty() {
+            note(empty, theme::dim())
+        } else {
+            crate::ui::markdown::render(text)
+        }
+    };
+    match view {
+        SideView::Asking => note("Asking…".into(), theme::dim()),
+        SideView::Asked => note(format!("Waiting for {agent}'s runner…"), theme::dim()),
+        SideView::Open(text) => answer(text, format!("Waiting for {agent}'s runner…")),
+        SideView::Completed(text) => answer(text, "No answer text.".into()),
+        SideView::Cancelled(text) => answer(text, "Cancelled before an answer.".into()),
+        SideView::Interrupted(text) => answer(text, "Interrupted before an answer.".into()),
+        SideView::Failed(why) => note(
+            if why.trim().is_empty() {
+                "The runner could not answer.".into()
+            } else {
+                format!("Failed: {why}")
+            },
+            theme::error(),
+        ),
+        SideView::Unconfirmed(why) => note(
+            format!(
+                "Could not confirm the question was asked: {why}. \
+                 Nothing was retried; the next report shows it if it was."
+            ),
+            theme::style(theme::Role::Warning),
+        ),
+        SideView::NotAsked(why) => note(format!("Not asked: {why}"), theme::error()),
+        SideView::Replaced => note(
+            "A newer side question took this one's place.".into(),
+            theme::dim(),
+        ),
+    }
 }
 
 /// A token count in a few columns: 950, 84k, 1.2M.
@@ -996,6 +1409,23 @@ mod tests {
         press(&mut form, KeyCode::Char('c'));
         press(&mut form, KeyCode::Char('d'));
         assert_eq!(form.text[1].len(), 4096);
+    }
+
+    #[test]
+    fn btw_is_a_first_word_and_a_doubled_slash_sends_it_literally() {
+        assert_eq!(side_draft("/btw what is X?"), SideDraft::Ask("what is X?"));
+        assert_eq!(
+            side_draft("  /btw\nline one\nline two "),
+            SideDraft::Ask("line one\nline two")
+        );
+        assert_eq!(side_draft("/btw"), SideDraft::Ask(""));
+        assert_eq!(
+            side_draft("//btw is a command"),
+            SideDraft::Literal("/btw is a command".into())
+        );
+        for mail in ["/btwx no", "btw /btw", "say /btw", "/b tw", "///btw", ""] {
+            assert_eq!(side_draft(mail), SideDraft::Mail, "{mail:?}");
+        }
     }
 
     #[test]

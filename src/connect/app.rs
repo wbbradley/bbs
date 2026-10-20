@@ -3218,6 +3218,413 @@ mod tests {
         assert!(rx.try_recv().is_err(), "one reply in flight");
     }
 
+    /// A side report for Mateo whose runner answers side questions, showing
+    /// `side` as (id, question, status, answer).
+    fn btw_report(revision: i64, side: Option<(i64, &str, proto::SideStatus, &str)>) -> Data {
+        Data::SideReport {
+            id: 0,
+            result: Ok(Box::new(proto::SideReportResponse {
+                side_supported: Some(true),
+                side: side.map(|(id, question, status, answer)| proto::SideRequest {
+                    id,
+                    question: question.into(),
+                    status: status.into(),
+                    answer: (!answer.is_empty()).then(|| answer.into()),
+                    updated_at: "2026-10-20T02:31:00Z".into(),
+                }),
+                ..side_report(revision, 0, Vec::new())
+            })),
+        }
+    }
+
+    /// Deliver `data` as the reply to the session's poll `id`.
+    fn reply_to(app: &mut App, id: u64, data: Data) {
+        let Data::SideReport { result, .. } = data else {
+            panic!("a side report");
+        };
+        app.on_event(Event::Data(Data::SideReport { id, result }));
+    }
+
+    fn draft_text(app: &mut App) -> String {
+        app.top().draft().unwrap().1.text
+    }
+
+    #[test]
+    fn btw_asks_aside_clears_only_an_unchanged_draft_and_esc_cancels_then_closes() {
+        use proto::SideStatus;
+        let (mut app, mut rx) = app();
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        reply_to(&mut app, id, btw_report(1, None));
+        command(&mut app, "/btw which branch?");
+        assert_eq!(
+            without_polls(&mut rx),
+            [Request::AskSide {
+                id,
+                agent: "Mateo".into(),
+                question: "which branch?".into()
+            }],
+            "asked aside, never sent as mail"
+        );
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("btw · Mateo · asking…"), "{out}");
+        // Typing while the ask is on its way keeps the draft past the ACK.
+        typed(&mut app, " also");
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(5) }));
+        assert_eq!(draft_text(&mut app), "/btw which branch? also");
+        assert!(screen(&mut app, 80, 24).contains("btw · Mateo · asked"));
+        // The answer streams in; mail to the parent conversation still lands.
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            btw_report(
+                2,
+                Some((5, "which branch?", SideStatus::SideOpen, "On `main`")),
+            ),
+        );
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(40, "Mateo", "ada", "parent mail meanwhile")]),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("answering…")
+                && out.contains("On main")
+                && out.contains("Esc cancels")
+                && out.contains("parent mail meanwhile"),
+            "{out}"
+        );
+        // A second question waits for this one.
+        while rx.try_recv().is_ok() {}
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        command(&mut app, "/btw another");
+        assert!(without_polls(&mut rx).is_empty());
+        assert!(screen(&mut app, 80, 24).contains("already running (Esc cancels it)"));
+        assert_eq!(draft_text(&mut app), "/btw another");
+        // Esc cancels by exact id, once.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            without_polls(&mut rx),
+            [Request::CancelSide { id, side: 5 }]
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(without_polls(&mut rx).is_empty(), "one cancel in flight");
+        assert!(screen(&mut app, 80, 24).contains("Cancelling…"));
+        app.on_event(Event::Data(Data::SideCancelled {
+            id,
+            side: 5,
+            result: Ok(()),
+        }));
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            btw_report(
+                3,
+                Some((5, "which branch?", SideStatus::SideCancelled, "On `main`")),
+            ),
+        );
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("btw · Mateo · cancelled") && out.contains("Esc closes"),
+            "{out}"
+        );
+        // Esc closes the finished panel; only then does Esc leave.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(without_polls(&mut rx).is_empty());
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            !out.contains("btw ·") && out.contains("BBS · Mateo"),
+            "{out}"
+        );
+        // An unchanged draft clears once the server takes it.
+        command(&mut app, "");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::AskSide { question, .. }] if question == "another"
+        ));
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(6) }));
+        assert_eq!(draft_text(&mut app), "");
+        // The question and answer never reach the conversation or its draft.
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            btw_report(4, Some((6, "another", SideStatus::SideCompleted, "Done."))),
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            !out.contains("Done.") && !out.contains("which branch"),
+            "{out}"
+        );
+        close_conversation(&mut app, &mut rx);
+    }
+
+    #[test]
+    fn btw_never_sends_mail_when_it_cannot_ask_and_a_doubled_slash_is_mail() {
+        use crate::connect::event::SideError;
+        use proto::SideStatus;
+        let refused =
+            |app: &mut App, rx: &mut UnboundedReceiver<Request>, text: &str, why: &str| {
+                command(app, text);
+                assert!(without_polls(rx).is_empty(), "{text}: nothing sent");
+                let out = screen(app, 120, 24);
+                assert!(out.contains(why), "{text}: {out}");
+                assert_eq!(draft_text(app), text, "the draft stays");
+                press(app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+            };
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        refused(
+            &mut app,
+            &mut rx,
+            "/btw early",
+            "Waiting for the agent's report",
+        );
+        let Data::SideReport {
+            result: Ok(mut old),
+            ..
+        } = btw_report(1, None)
+        else {
+            unreachable!()
+        };
+        old.side_supported = None;
+        old.side_reason = Some("Mateo's runner predates side questions.".into());
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(old),
+        }));
+        refused(
+            &mut app,
+            &mut rx,
+            "/btw old runner",
+            "Mateo's runner predates side questions.",
+        );
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            btw_report(2, Some((3, "elsewhere", SideStatus::SideOpen, ""))),
+        );
+        // An open question asked elsewhere never shows here, but blocks.
+        assert!(!screen(&mut app, 120, 24).contains("btw ·"));
+        refused(
+            &mut app,
+            &mut rx,
+            "/btw again",
+            "already open for this agent",
+        );
+        poll(&mut app, &mut rx);
+        reply_to(&mut app, id, btw_report(3, None));
+        refused(&mut app, &mut rx, "/btw", "Usage: /btw <question>");
+        refused(&mut app, &mut rx, "  /btw   ", "Usage: /btw <question>");
+        let long = format!("/btw {}", "é".repeat(2049));
+        app.on_event(Event::Paste(long.clone()));
+        enter(&mut app);
+        assert!(without_polls(&mut rx).is_empty());
+        assert!(screen(&mut app, 120, 24).contains("at most 4 KiB; this one is 4098 bytes"));
+        assert_eq!(draft_text(&mut app), long);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        // Exactly 4 KiB is asked.
+        command(&mut app, &format!("/btw {}", "x".repeat(4096)));
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::AskSide { question, .. }] if question.len() == 4096
+        ));
+        app.on_event(Event::Data(Data::SideAsked {
+            id,
+            result: Err(SideError::Refused("a side question is already open".into())),
+        }));
+        let out = screen(&mut app, 120, 24);
+        assert!(
+            out.contains("not asked") && out.contains("Not asked: a side question is already open"),
+            "{out}"
+        );
+        assert!(
+            !draft_text(&mut app).is_empty(),
+            "a refused ask keeps the draft"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        // `//btw` is mail starting `/btw`; `/btwx` is plain mail.
+        for (text, body) in [("//btw hi", "/btw hi"), ("/btwx hi", "/btwx hi")] {
+            command(&mut app, text);
+            match without_polls(&mut rx).as_slice() {
+                [Request::Send { id, req }] => {
+                    assert_eq!(req.body, body);
+                    app.on_event(Event::Data(Data::Sent {
+                        id: *id,
+                        result: Ok(()),
+                    }));
+                }
+                other => panic!("expected mail, got {other:?}"),
+            }
+            assert_eq!(draft_text(&mut app), "");
+        }
+        // A server without the capability never asks.
+        let (mut app, mut rx) = self::app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Err(SideError::Unsupported("no agent-interactions.v1".into())),
+        }));
+        refused(
+            &mut app,
+            &mut rx,
+            "/btw hello",
+            "not available on this server",
+        );
+        // Someone else's agent: never asked, never mailed.
+        let (mut app, mut rx) = self::app();
+        mateo_streams(&mut app, &mut rx);
+        app.ctx.me = "bob".into();
+        app.on_event(Event::Tick);
+        assert!(without_polls(&mut rx).is_empty());
+        refused(&mut app, &mut rx, "/btw hello", "Only Mateo's owner");
+    }
+
+    #[test]
+    fn an_unconfirmed_ask_adopts_only_a_newer_matching_question_and_never_retries() {
+        use crate::connect::event::SideError;
+        use proto::SideStatus;
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        // An old answer to the same text shows on opening; Esc closes it.
+        reply_to(
+            &mut app,
+            id,
+            btw_report(
+                1,
+                Some((4, "same?", SideStatus::SideCompleted, "old answer")),
+            ),
+        );
+        assert!(screen(&mut app, 80, 24).contains("old answer"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        command(&mut app, "/btw same?");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::AskSide { .. }]
+        ));
+        app.on_event(Event::Data(Data::SideAsked {
+            id,
+            result: Err(SideError::Transient("timed out".into())),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("not confirmed")
+                && out.contains("Could not confirm the question was asked: timed out"),
+            "{out}"
+        );
+        assert_eq!(draft_text(&mut app), "/btw same?");
+        // The old same-text answer, or a newer foreign question, is not it.
+        for (revision, side) in [
+            (2, (4, "same?", SideStatus::SideCompleted, "old answer")),
+            (3, (5, "other", SideStatus::SideOpen, "foreign")),
+        ] {
+            poll(&mut app, &mut rx);
+            reply_to(&mut app, id, btw_report(revision, Some(side)));
+            let out = screen(&mut app, 80, 24);
+            assert!(
+                out.contains("not confirmed")
+                    && !out.contains("old answer")
+                    && !out.contains("foreign"),
+                "{out}"
+            );
+            assert_eq!(draft_text(&mut app), "/btw same?");
+        }
+        assert!(without_polls(&mut rx).is_empty(), "never retried");
+        // A newer question with the same text was this ask.
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            btw_report(4, Some((6, "same?", SideStatus::SideOpen, "fresh"))),
+        );
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("answering…") && out.contains("fresh"), "{out}");
+        assert_eq!(
+            draft_text(&mut app),
+            "",
+            "adopted: the unchanged draft clears"
+        );
+        // A later report of a newer question replaces it; a stale ACK or
+        // cancel result changes nothing.
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            btw_report(5, Some((7, "same?", SideStatus::SideOpen, "not ours"))),
+        );
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(9) }));
+        app.on_event(Event::Data(Data::SideCancelled {
+            id,
+            side: 4,
+            result: Err(SideError::Refused("stale".into())),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("replaced") && !out.contains("not ours") && !out.contains("stale"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn closing_keeps_the_question_open_and_reopening_shows_the_latest_report() {
+        use proto::SideStatus;
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        reply_to(&mut app, id, btw_report(1, None));
+        command(&mut app, "/btw long job?");
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(5) }));
+        // Leaving by navigation (PgUp, q) cancels nothing.
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(
+            !without_polls(&mut rx)
+                .iter()
+                .any(|r| matches!(r, Request::CancelSide { .. }))
+        );
+        reopen(&mut app, &mut rx);
+        while rx.try_recv().is_ok() {}
+        let new = poll(&mut app, &mut rx);
+        let answer = (1..=40)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        reply_to(
+            &mut app,
+            new,
+            btw_report(
+                9,
+                Some((5, "long job?", SideStatus::SideCompleted, &answer)),
+            ),
+        );
+        // At 80×24 the panel keeps to its third, ends on the answer's end,
+        // and scrolls up with Alt-↑.
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("btw · Mateo · answered")
+                && out.contains("line 40")
+                && !out.contains("line 30"),
+            "{out}"
+        );
+        let rows = out.lines().filter(|l| l.contains("line ")).count();
+        assert!(rows <= 5, "{out}");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        }
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("line 37") && !out.contains("line 40"), "{out}");
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        assert!(screen(&mut app, 80, 24).contains("line 38"));
+    }
+
     #[test]
     fn replaced_or_withdrawn_questions_close_the_form_and_a_stale_reply_is_ignored() {
         let (mut app, mut rx) = app();

@@ -576,6 +576,8 @@ impl Thread {
             self.view.scroll_up(page);
             return Some(Transition::Stay);
         }
+        // `//btw …` goes as mail starting `/btw …`.
+        let mut literal = None;
         if key.code == KeyCode::Enter
             && let Some(agent) = self.agent.clone()
             && let Some(composer) = &mut self.composer
@@ -586,6 +588,14 @@ impl Thread {
                     self.side_command(command, &agent);
                     return Some(Transition::Stay);
                 }
+            }
+            let draft = composer.draft().text;
+            match crate::connect::owner::side_draft(&draft) {
+                crate::connect::owner::SideDraft::Ask(question) => {
+                    return Some(self.ask_side(&agent, &draft, question));
+                }
+                crate::connect::owner::SideDraft::Literal(body) => literal = Some(body),
+                crate::connect::owner::SideDraft::Mail => {}
             }
         }
         let send_id = if key.code == KeyCode::Enter {
@@ -599,7 +609,7 @@ impl Thread {
                 id: send_id,
                 req: SendRequest {
                     to: composer.to().to_string(),
-                    body,
+                    body: literal.unwrap_or(body),
                     control: None,
                 },
             }),
@@ -629,6 +639,22 @@ impl Thread {
             ));
         }
         lines
+    }
+
+    /// `/btw <question>` asks the agent aside; the draft stays until the
+    /// server takes it. Never mail, even when it cannot be asked.
+    fn ask_side(&mut self, agent: &str, draft: &str, question: &str) -> Transition {
+        let Some(owner) = &mut self.owner else {
+            self.effort_notice = Some(format!("Only {agent}'s owner can ask it side questions."));
+            return Transition::Stay;
+        };
+        match owner.ask_side(agent, draft, question) {
+            Ok(request) => Transition::Request(request),
+            Err(why) => {
+                self.effort_notice = Some(why);
+                Transition::Stay
+            }
+        }
     }
 
     /// `/answer` opens the form on the agent's waiting questions; `/context`
@@ -867,6 +893,12 @@ impl Screen for Thread {
     fn on_data(&mut self, data: &Data) {
         if let Some(owner) = &mut self.owner {
             owner.on_data(data);
+            // The server took the question: clear the draft unless it changed.
+            if let Some(draft) = owner.asked_draft.take()
+                && let Some(composer) = &mut self.composer
+            {
+                composer.clear_if(&draft);
+            }
         }
         let loaded = self.loaded();
         if let Some(stream) = &mut self.stream {
@@ -986,6 +1018,31 @@ impl Screen for Thread {
         {
             owner.context_open = false;
             return Some(Transition::Stay);
+        }
+        if self.effort_picker.is_none()
+            && self.prompt.is_none()
+            && let Some(owner) = &mut self.owner
+            && let Some(side) = &owner.side
+        {
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            match key.code {
+                KeyCode::Esc => {
+                    return Some(
+                        owner
+                            .side_escape()
+                            .map_or(Transition::Stay, Transition::Request),
+                    );
+                }
+                KeyCode::Up if alt => {
+                    side.scroll.set(side.scroll.get().saturating_add(1));
+                    return Some(Transition::Stay);
+                }
+                KeyCode::Down if alt => {
+                    side.scroll.set(side.scroll.get().saturating_sub(1));
+                    return Some(Transition::Stay);
+                }
+                _ => {}
+            }
         }
         if let Some(picker) = &mut self.effort_picker {
             return Some(match picker.key(key) {
@@ -1176,17 +1233,33 @@ impl Thread {
             .composer
             .as_ref()
             .map_or(0, |c| c.height(inner.width, max_lines));
-        // The owner's questions card or context panel sits above the composer.
+        // The owner's questions card or context panel, then the `/btw` panel,
+        // sit above the composer, together in a third of the height.
         let side = self.side_lines(inner.width);
-        let side_height = (side.len() as u16).min(inner.height / 3);
-        let [status, body, side_area, composer] = Layout::vertical([
+        let room = inner.height / 3;
+        let btw = self
+            .owner
+            .as_ref()
+            .and_then(|o| Some((o.side.as_ref()?, o.side_view()?)));
+        let side_height = (side.len() as u16).min(if btw.is_some() { room / 2 } else { room });
+        let btw_height = match (&btw, &self.agent) {
+            (Some((_, view)), Some(agent)) => {
+                crate::connect::owner::side_height(agent, view, inner.width, room - side_height)
+            }
+            _ => 0,
+        };
+        let [status, body, side_area, btw_area, composer] = Layout::vertical([
             Constraint::Length(u16::from(self.agent.is_none())),
             Constraint::Min(0),
             Constraint::Length(side_height),
+            Constraint::Length(btw_height),
             Constraint::Length(composer_height),
         ])
         .areas(inner);
         frame.render_widget(Paragraph::new(side), side_area);
+        if let (Some((side, view)), Some(agent)) = (&btw, &self.agent) {
+            crate::connect::owner::render_side(frame, btw_area, agent, side, view);
+        }
         if let Some(c) = &mut self.composer {
             c.render(frame, composer, self.composing);
         }

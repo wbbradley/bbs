@@ -256,6 +256,16 @@ impl Composer {
         self.sending.is_some()
     }
 
+    /// Clear the draft if it is still exactly `text`: what was submitted,
+    /// with nothing typed since.
+    pub fn clear_if(&mut self, text: &str) -> bool {
+        if self.text.lines().join("\n") != text {
+            return false;
+        }
+        self.text = blank();
+        true
+    }
+
     /// Whether the whole draft is the local command `command`; if so it is
     /// consumed, never sent.
     pub fn take_command(&mut self, command: &str) -> bool {
