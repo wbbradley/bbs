@@ -1032,6 +1032,89 @@ async fn side_questions_are_advertised_and_answered_over_the_wire() {
 }
 
 #[tokio::test]
+async fn side_questions_are_asked_claimed_and_answered_over_the_wire() {
+    let server = Server::start("side-questions");
+    let mut client = server.client().await;
+    let info = client
+        .server_info(proto::Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(info.capabilities.iter().any(|c| c == "side-questions.v1"));
+    let agent = register(&mut client).await;
+    client
+        .begin_side_session(as_agent(
+            &agent.token,
+            proto::BeginSideSessionRequest {
+                generation: "proc-1".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .report_context(as_agent(
+            &agent.token,
+            proto::ReportContextRequest {
+                generation: "proc-1".into(),
+                usage: None,
+                side_supported: Some(true),
+                side_reason: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let asked = client
+        .ask_side(as_human(
+            "will",
+            proto::AskSideRequest {
+                agent: agent.name.clone(),
+                question: "is the deploy green?".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let claim = client
+        .claim_side(as_agent(
+            &agent.token,
+            proto::ClaimSideRequest {
+                generation: "proc-1".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let side = claim.request.unwrap();
+    assert_eq!(side.id, asked.id);
+    client
+        .report_side(as_agent(
+            &agent.token,
+            proto::ReportSideRequest {
+                generation: "proc-1".into(),
+                id: side.id,
+                status: proto::SideStatus::SideCompleted.into(),
+                answer: Some("green across the board".into()),
+            },
+        ))
+        .await
+        .unwrap();
+    let report = client
+        .side_report(as_human(
+            "will",
+            proto::SideReportRequest {
+                agent: agent.name.clone(),
+                generation: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let side = report.side.unwrap();
+    assert_eq!(side.status(), proto::SideStatus::SideCompleted);
+    assert_eq!(side.answer.as_deref(), Some("green across the board"));
+}
+
+#[tokio::test]
 async fn feed_filters_are_advertised_and_applied_server_side() {
     let server = Server::start("feed-filter");
     let mut client = server.client().await;

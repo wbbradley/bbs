@@ -3435,6 +3435,8 @@ mod tests {
                 proto::ReportContextRequest {
                     generation: "run-1".into(),
                     usage: Some(usage),
+                    side_supported: None,
+                    side_reason: None,
                 },
             )
             .is_err());
@@ -3449,6 +3451,8 @@ mod tests {
                     limit_tokens: Some(100),
                     source: proto::context_usage::Source::CurrentContext.into(),
                 }),
+                side_supported: None,
+                side_reason: None,
             },
         )
         .unwrap();
@@ -3812,6 +3816,8 @@ mod tests {
                     limit_tokens: None,
                     source: proto::context_usage::Source::LastModelRequest.into(),
                 }),
+                side_supported: None,
+                side_reason: None,
             },
         )
         .unwrap();
@@ -3875,6 +3881,222 @@ mod tests {
         assert_eq!(mail_counts(&mut conn), before);
     }
 
+
+    #[test]
+    fn side_questions_lifecycle_claim_cancel_reset_and_exclusion() {
+        let (mut conn, will, [mateo, _zed, _lu]) = board();
+        let begin = |conn: &mut Connection, g: &str| {
+            begin_side_session(
+                conn,
+                &mateo,
+                proto::BeginSideSessionRequest {
+                    generation: g.into(),
+                },
+            )
+        };
+        let support = |conn: &mut Connection, g: &str, ok: bool| {
+            report_context(
+                conn,
+                &mateo,
+                proto::ReportContextRequest {
+                    generation: g.into(),
+                    usage: None,
+                    side_supported: Some(ok),
+                    side_reason: None,
+                },
+            )
+        };
+        let ask = |conn: &mut Connection, q: &str| {
+            ask_side(
+                conn,
+                &will,
+                proto::AskSideRequest {
+                    agent: "Mateo".into(),
+                    question: q.into(),
+                },
+            )
+        };
+        let mail_counts = |conn: &mut Connection| -> (i64, i64, i64) {
+            (
+                conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+                    .unwrap(),
+                conn.query_row("SELECT count(*) FROM deliveries", [], |r| r.get(0))
+                    .unwrap(),
+                conn.query_row("SELECT count(*) FROM agent_human_conversations", [], |r| {
+                    r.get(0)
+                })
+                .unwrap(),
+            )
+        };
+        let before = mail_counts(&mut conn);
+
+        // The support gate: nothing reported, ask fails; support reported, it works.
+        begin(&mut conn, "run-1").unwrap();
+        let err = ask(&mut conn, "hi").unwrap_err().to_string();
+        assert!(err.contains("does not answer side questions"), "{err}");
+        support(&mut conn, "run-1", true).unwrap();
+        // Bounds and one-open.
+        assert!(ask(&mut conn, "").is_err());
+        assert!(ask(&mut conn, &"x".repeat(4 * 1024 + 1)).is_err());
+        let first = ask(&mut conn, "what broke?").unwrap();
+        let err = ask(&mut conn, "another").unwrap_err().to_string();
+        assert!(err.contains("already open"), "{err}");
+
+        // Claim: empty for others, once per generation, retry-safe.
+        let nothing = claim_side(
+            &mut conn,
+            &_zed,
+            proto::ClaimSideRequest {
+                generation: "never".into(),
+            },
+        );
+        assert!(nothing.is_err(), "zed never began a session");
+        let claim = |conn: &mut Connection, g: &str| {
+            claim_side(
+                conn,
+                &mateo,
+                proto::ClaimSideRequest {
+                    generation: g.into(),
+                },
+            )
+        };
+        let got = claim(&mut conn, "run-1").unwrap().request.unwrap();
+        assert_eq!(got.id, first.id);
+        // A lost reply's retry returns the same claim, not a fresh invocation.
+        let again = claim(&mut conn, "run-1").unwrap().request.unwrap();
+        assert_eq!(again.id, first.id);
+
+        // Progressive then terminal, only by the claiming generation.
+        let report = |conn: &mut Connection, g: &str, status: proto::SideStatus, answer: &str| {
+            report_side(
+                conn,
+                &mateo,
+                proto::ReportSideRequest {
+                    generation: g.into(),
+                    id: first.id,
+                    status: status.into(),
+                    answer: Some(answer.into()),
+                },
+            )
+        };
+        let err = report(&mut conn, "run-1", proto::SideStatus::Unspecified, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("OPEN, COMPLETED or FAILED"), "{err}");
+        let err = report(&mut conn, "run-1", proto::SideStatus::SideOpen, &"x".repeat(64 * 1024 + 1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("64 KiB"), "{err}");
+        report(&mut conn, "run-1", proto::SideStatus::SideOpen, "looking\n").unwrap();
+        let view = side_report(
+            &mut conn,
+            &will,
+            proto::SideReportRequest {
+                agent: "Mateo".into(),
+                generation: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(view.side.unwrap().answer.as_deref(), Some("looking\n"));
+        // The owner cancels; a late terminal report loses.
+        cancel_side(
+            &mut conn,
+            &will,
+            proto::CancelSideRequest { id: first.id },
+        )
+        .unwrap();
+        // Cancel is idempotent for the exact id.
+        cancel_side(
+            &mut conn,
+            &will,
+            proto::CancelSideRequest { id: first.id },
+        )
+        .unwrap();
+        let err = report(&mut conn, "run-1", proto::SideStatus::SideCompleted, "done")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("closed"), "{err}");
+
+        // A fresh generation interrupts everything open and clears capability.
+        let second = ask(&mut conn, "unclaimed").unwrap();
+        let third = ask(&mut conn, "claimed").unwrap_err(); // still one open
+        assert!(third.to_string().contains("already open"));
+        // Claim it, then also check an unclaimed one after replacement.
+        let got = claim(&mut conn, "run-1").unwrap().request.unwrap();
+        assert_eq!(got.id, second.id);
+        begin(&mut conn, "run-2").unwrap();
+        let view = side_report(
+            &mut conn,
+            &will,
+            proto::SideReportRequest {
+                agent: "Mateo".into(),
+                generation: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(view.side.unwrap().status(), proto::SideStatus::SideInterrupted);
+        assert_eq!(view.side_supported, None);
+        let err = ask(&mut conn, "again").unwrap_err().to_string();
+        assert!(err.contains("does not answer side questions"), "{err}");
+        // Omitted capability fields preserve; an explicit report restores.
+        support(&mut conn, "run-2", true).unwrap();
+        report_context(
+            &mut conn,
+            &mateo,
+            proto::ReportContextRequest {
+                generation: "run-2".into(),
+                usage: None,
+                side_supported: None,
+                side_reason: None,
+            },
+        )
+        .unwrap();
+        assert!(ask(&mut conn, "again").is_ok());
+
+        // Nothing side-channel ever becomes mail, a delivery, or a conversation.
+        assert_eq!(mail_counts(&mut conn), before);
+
+        // Retirement cleans side questions; re-registration starts empty.
+        retire_agent(
+            &mut conn,
+            &will,
+            proto::RetireRequest {
+                agent: "Mateo".into(),
+            },
+        )
+        .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM side_requests WHERE agent_id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+        let token = register(
+            &mut conn,
+            &will,
+            proto::RegisterRequest {
+                name: Some("Mateo".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .token;
+        let mateo2 = Caller {
+            token: Some(token),
+            ..Default::default()
+        };
+        let view = side_report(
+            &mut conn,
+            &will,
+            proto::SideReportRequest {
+                agent: "Mateo".into(),
+                generation: None,
+            },
+        )
+        .unwrap();
+        assert!(view.side.is_none());
+        let _ = mateo2;
+    }
 
     #[test]
     fn side_channels_clear_on_retirement_and_re_registration() {

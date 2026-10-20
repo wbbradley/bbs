@@ -3049,6 +3049,9 @@ mod tests {
         questions: Vec<proto::InputQuestion>,
     ) -> proto::SideReportResponse {
         proto::SideReportResponse {
+            side: None,
+            side_supported: None,
+            side_reason: None,
             agent: "Mateo".into(),
             pending_input: (!questions.is_empty()).then(|| proto::OwnerInput {
                 request_id,
