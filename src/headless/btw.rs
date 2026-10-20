@@ -62,7 +62,7 @@ impl Btw {
             &generation,
             supported,
             if supported {
-                "Codex ephemeral fork and child goal-clear are required; shared tools are allowed"
+                "Codex ephemeral fork is required; shared tools are allowed"
             } else {
                 "ACP side-fork isolation has not been verified"
             },

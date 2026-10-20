@@ -12,6 +12,10 @@ under the new package version and its publication date.
 
 - In agent conversations, paging down to the newest view resumes following
   and returns focus to the composer, keeping the draft and cursor position.
+- `/btw` side questions on Codex app-server fork with options current Codex
+  accepts. The child was forked with `deferGoalContinuation`, which Codex
+  refuses for an ephemeral fork, and then had its goal cleared, which an
+  ephemeral thread does not support, so every side question failed.
 
 ### Changed
 

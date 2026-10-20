@@ -267,7 +267,7 @@ impl SideChannel {
             let fork_reply = observed_call(
                 rpc,
                 "thread/fork",
-                json!({"threadId":parent,"ephemeral":true,"excludeTurns":true,"deferGoalContinuation":true}),
+                json!({"threadId":parent,"ephemeral":true,"excludeTurns":true}),
                 Late::Fork(parent.into()),
             );
             let fork = timeout_at(work_deadline.min(Instant::now() + SETUP), fork_reply).await??;
@@ -306,20 +306,8 @@ impl SideChannel {
                 fork["thread"]["ephemeral"] == true && fork["thread"]["forkedFromId"] == parent,
                 "provider did not confirm an isolated ephemeral fork"
             );
-            if *cancel.borrow() {
-                interrupted = true;
-                bail!("side question cancelled before prompt");
-            }
-            // A fork can inherit a Goal. Prevent an automatic continuation after our turn.
-            timeout_at(
-                work_deadline.min(Instant::now() + SETUP),
-                rpc.call("thread/goal/clear", json!({"threadId":thread})),
-            )
-            .await?
-            .map_err(|e| {
-                unsupported = matches!(e.code, -32601 | -32602);
-                anyhow!("child goal clear: {}", e.message)
-            })?;
+            // An ephemeral thread cannot own a goal, so the child inherits none
+            // and none can continue automatically after our turn.
             if *cancel.borrow() {
                 interrupted = true;
                 bail!("side question cancelled before prompt");
@@ -511,11 +499,6 @@ fn observed_call(
                         .as_str()
                         .filter(|id| *id != parent && value["thread"]["forkedFromId"] == parent)
                     {
-                        let _ = timeout_at(
-                            deadline,
-                            rpc.call("thread/goal/clear", json!({"threadId":thread})),
-                        )
-                        .await;
                         let _ = timeout_at(
                             deadline,
                             rpc.call("thread/unsubscribe", json!({"threadId":thread})),
@@ -738,12 +721,24 @@ mod tests {
                     .filter(|v| v["method"] == "turn/start" && v["params"]["threadId"] == "parent")
                     .all(|v| !v["params"].to_string().contains("SIDE QUESTION"))
             );
+            // Only what an ephemeral fork accepts: no deferred goal, and no
+            // goal methods on a child that cannot own one.
+            let fork = wire.iter().find(|v| v["method"] == "thread/fork").unwrap();
+            assert_eq!(
+                fork["params"],
+                json!({"threadId":"parent","ephemeral":true,"excludeTurns":true})
+            );
+            assert!(!wire.iter().any(|v| {
+                v["method"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("thread/goal/"))
+            }));
             r.finish(parent).await;
         }
     }
     #[tokio::test]
     async fn unsupported_prerequisites_never_submit_child_prompt() {
-        for scenario in ["no-fork", "bad-fork", "no-goal"] {
+        for scenario in ["no-fork", "bad-fork"] {
             let mut r = Rig::new(scenario).await;
             let parent = r.parent().await;
             let (_cancel, rx) = watch::channel(false);
@@ -836,7 +831,7 @@ mod tests {
                 w.iter().any(|v| {
                     v["method"]
                         == if scenario == "late-fork" {
-                            "thread/goal/clear"
+                            "thread/unsubscribe"
                         } else {
                             "turn/interrupt"
                         }

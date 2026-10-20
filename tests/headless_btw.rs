@@ -269,7 +269,7 @@ async fn side_tools_and_parent_tools_run_without_chat_or_context_leakage() {
 }
 #[tokio::test]
 async fn child_prerequisite_failure_preserves_parent_usage_and_disables_side_capability() {
-    let r = Rig::new("no-goal").await;
+    let r = Rig::new("bad-fork").await;
     r.send("HOLD MAIN", None).await;
     let before = r
         .wait_report(|r| r.usage.is_some_and(|u| u.used_tokens == Some(40)))

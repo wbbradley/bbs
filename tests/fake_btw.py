@@ -17,7 +17,7 @@ def record(kind, **fields):
 def out(value):
     with lock: print(json.dumps(value),flush=True)
 def reply(mid,result):out(dict(jsonrpc='2.0',id=mid,result=result))
-def error(mid):out(dict(jsonrpc='2.0',id=mid,error=dict(code=-32601,message='unsupported fixture prerequisite')))
+def error(mid,code=-32601,message='unsupported fixture prerequisite'):out(dict(jsonrpc='2.0',id=mid,error=dict(code=code,message=message)))
 def note(method,p):out(dict(jsonrpc='2.0',method=method,params=p))
 def text(thread,turn,body,item='m'):
     note('item/agentMessage/delta',dict(threadId=thread,turnId=turn,itemId=item,delta=body))
@@ -50,16 +50,18 @@ for line in sys.stdin:
         if method=='thread/start':assert any(t['name']=='bbs_agents' for t in p['dynamicTools'])
         reply(mid,dict(thread=dict(id='parent'),model='fixture',reasoningEffort='low'))
     elif method=='thread/fork':
-        assert p==dict(threadId='parent',ephemeral=True,excludeTurns=True,deferGoalContinuation=True)
+        # As Codex 0.160.1 refuses it.
+        if p.get('ephemeral') and p.get('deferGoalContinuation'):
+            error(mid,-32600,'`deferGoalContinuation` cannot be combined with `ephemeral`');continue
+        assert p==dict(threadId='parent',ephemeral=True,excludeTurns=True)
         if scenario=='no-fork':error(mid);continue
         fork=dict(thread=dict(id='child',forkedFromId='parent',ephemeral=True))
         if scenario=='bad-fork':fork['thread']['ephemeral']=False
         if scenario=='late-fork':record('fork_pending');later('release-fork',mid,fork)
         else:reply(mid,fork)
-    elif method=='thread/goal/clear':
-        assert p['threadId']=='child'
-        if scenario=='no-goal':error(mid)
-        else:reply(mid,{})
+    elif method.startswith('thread/goal/'):
+        # An ephemeral child cannot own a goal.
+        error(mid,-32600,'ephemeral thread does not support goals: '+p.get('threadId',''))
     elif method=='turn/start':
         if p['threadId']=='parent':
             parent_live=True;reply(mid,dict(turn=dict(id='p')));text('parent','p','parent before\n');note('thread/tokenUsage/updated',dict(threadId='parent',turnId='p',tokenUsage=dict(last=dict(totalTokens=40),modelContextWindow=100)));record('parent_active')
