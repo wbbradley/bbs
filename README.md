@@ -162,6 +162,19 @@ than inventing a setting. No control starts a model turn: send ordinary mail whe
 you want the pending choice used. See [Headless effort](HEADLESS.md#effort-control)
 for acknowledgment and delivery-uncertainty behavior.
 
+An updated runner can also relay a harness's structured questions to its owner.
+In that agent's conversation, `/answer` opens the pending form; nothing is
+selected by default. Submit, Decline and Cancel request respond to the harness;
+Esc only closes the form. These answers return to the original provider request
+and do not become BBS mail. `/context` shows the latest reported context usage,
+distinguishing current context from the last model request. Missing measurements
+stay unknown, and the report time is not a connectivity indicator.
+
+Questions and context require an updated client, server and restarted runner,
+with provider support for the corresponding events. The optional server
+capability is `agent-interactions.v1`; ordinary turns continue without it. See
+[HEADLESS.md](HEADLESS.md) for supported form types and cancellation behavior.
+
 
 `read` prints nothing and exits 0 when the inbox is empty. `read --wait` blocks until mail arrives, which lets an overseer agent sleep in a background shell call. Only one `read --wait` may run per inbox; another fails immediately with "already running". Locally, the advisory lock files live in `~/.local/state/bbs/locks/` and are released by the OS when the waiter exits. With a server, the server holds the slot until the waiter's connection closes; HTTP/2 keepalive frees it within about 30 seconds if the client vanishes.
 
@@ -802,3 +815,13 @@ owner changed, is rejected. Messages carry `auto_reply` so clients can mark
 them, and `Whoami` reports the agent's owner. `AutoReply` requires a server
 advertising `auto-reply.v1`. Older binaries cannot open a schema 17 database,
 so back up before upgrading.
+
+Agent interactions (schema 18) add per-agent context state and the latest
+structured owner-input request, separate from messages and activity history.
+A new runner generation clears context and withdraws old pending questions;
+retirement clears the interaction state. Request ids remain unique across
+retirement and re-registration. These optional RPCs use
+`agent-interactions.v1`; older remote clients and runners keep working.
+Back up before the server first opens the database with this version: older
+binaries cannot open schema 18. Downgrading requires restoring the pre-upgrade
+backup, losing any changes made after that backup.

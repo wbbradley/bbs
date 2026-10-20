@@ -92,7 +92,7 @@ service Bbs {
   rpc ReportEffort(ReportEffortRequest) returns (ReportEffortResponse);
 
   // Side channels (agent-interactions.v1): structured owner input and context
-  // usage, outside mail, history and the harness's model input.
+  // usage, separate from ordinary mail delivery and prompt submission.
   // A runner begins one interaction session per process; a fresh generation
   // resets the agent's side state. Agent token, self only.
   rpc BeginSideSession(BeginSideSessionRequest) returns (BeginSideSessionResponse);
