@@ -8,11 +8,14 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.11.0 - 2026-10-20
+
 Native questions, context reports and side questions add database schema 19.
-Upgrade the server, runner and client to use them; older remote clients and runners keep working,
-and updated runners continue ordinary turns when `agent-interactions.v1` is
-absent. Back up before upgrading the server. Older binaries cannot open schema
-19; restoring the pre-upgrade backup loses subsequent changes.
+Upgrade the server, runner and client to use them; older remote clients and
+runners keep working, and updated runners continue ordinary turns when
+`agent-interactions.v1` is absent. Back up before upgrading the server. Older
+binaries cannot open schema 19; restoring the pre-upgrade backup loses subsequent
+changes.
 
 ### Added
 
