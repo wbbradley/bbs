@@ -597,6 +597,55 @@ mod tests {
     };
 
     #[test]
+    fn runner_restart_and_hidden_turn_end_clear_stale_running_tools() {
+        let mut stream = Stream::new("Mateo");
+        let now = Instant::now();
+        let mut sequence = 0;
+        let mut push = |stream: &mut Stream, record: &str| {
+            sequence += 1;
+            stream.on_data(
+                &Data::Activity {
+                    id: stream.id,
+                    result: Ok(vec![proto::Activity {
+                        id: sequence,
+                        record: record.into(),
+                        ..Default::default()
+                    }]),
+                },
+                now,
+                &Loaded::new(),
+            )
+        };
+        push(
+            &mut stream,
+            r#"{"event":"tool","id":"old","status":"pending","title":"git show"}"#,
+        );
+        push(
+            &mut stream,
+            r#"{"event":"tool","id":"old","title":"gh api"}"#,
+        );
+        assert_eq!(stream.running(80).len(), 1);
+        // A runner may disappear without ever sharing a stop or tool result.
+        push(&mut stream, r#"{"event":"start"}"#);
+        push(&mut stream, r#"{"event":"session","resumed":true}"#);
+        assert!(stream.running(80).is_empty());
+        stream.entries(&Loaded::new());
+        assert!(stream.running(80).is_empty(), "history replay must agree");
+        push(
+            &mut stream,
+            r#"{"event":"tool","id":"new","status":"pending","title":"cargo test"}"#,
+        );
+        assert_eq!(stream.running(80).len(), 1);
+        assert!(push(&mut stream, r#"{"event":"turn_end"}"#).is_empty());
+        assert!(
+            stream.running(80).is_empty(),
+            "hidden boundaries still retire tools"
+        );
+        stream.entries(&Loaded::new());
+        assert!(stream.running(80).is_empty());
+    }
+
+    #[test]
     fn reconnected_activity_refreshes_progress_without_replaying_old_rows() {
         let mut stream = Stream::new("Mateo");
         let id = stream.id;

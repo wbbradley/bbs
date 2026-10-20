@@ -159,6 +159,15 @@ impl Activity {
         let time = super::clock(str_field(&r, "ts"), self.local);
         let text = str_field(&r, "text");
         let message = str_field(&r, "message");
+        // A missing tool result cannot keep a call running into another turn
+        // or runner session. Forget its live state without inventing a result.
+        if matches!(
+            str_field(&r, "event"),
+            "start" | "session" | "prompt" | "turn_end" | "turn_error" | "cancel" | "stop"
+        ) {
+            self.calls.clear();
+            self.order.clear();
+        }
         let mut out = Vec::new();
         match str_field(&r, "event") {
             "update" => {}
@@ -750,6 +759,58 @@ mod tests {
             to_ansi(&pretty.render(done), false),
             "  ✓ Read src/main.rs completed (2.0s)\n"
         );
+    }
+
+    #[test]
+    fn lifecycle_boundaries_clear_tools_without_inventing_results() {
+        for turns in [true, false] {
+            for event in [
+                "start",
+                "session",
+                "prompt",
+                "turn_end",
+                "turn_error",
+                "cancel",
+                "stop",
+            ] {
+                let mut pretty = Activity::new(false);
+                pretty.turns = turns;
+                pretty.render(r#"{"event":"tool","status":"pending","id":"a","title":"old call"}"#);
+                pretty.render(
+                    r#"{"event":"tool","status":"in_progress","id":"b","title":"another call"}"#,
+                );
+                assert_eq!(pretty.running_calls().len(), 2);
+                let out = pretty.render(&serde_json::json!({"event": event}).to_string());
+                assert!(pretty.running_calls().is_empty(), "{event}, turns={turns}");
+                assert!(pretty.running().is_empty());
+                assert!(pretty.take_tool().is_none());
+                let text = to_ansi(&out, false);
+                assert!(!text.contains("completed") && !text.contains("old call"));
+                // A later call can reuse a provider id without retaining the
+                // previous runner's title or suppressing its running notice.
+                pretty.render(r#"{"event":"tool","status":"pending","id":"a","title":"new call"}"#);
+                assert_eq!(to_ansi(&pretty.running(), false), "  … new call running\n");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_activity_and_steering_keep_live_tools() {
+        let mut pretty = Activity::new(false);
+        pretty.render(r#"{"event":"tool","status":"pending","id":"a","title":"live call"}"#);
+        for event in [
+            "mail",
+            "steer",
+            "thought",
+            "text",
+            "warning",
+            "permission",
+            "update",
+            "error",
+        ] {
+            pretty.render(&serde_json::json!({"event":event}).to_string());
+            assert_eq!(pretty.running_calls().len(), 1, "{event}");
+        }
     }
 
     #[test]

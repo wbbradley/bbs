@@ -41,6 +41,12 @@ absent. Back up before upgrading the server. Older binaries cannot open schema
   questions waiting. `/context` shows the runner's last context report on
   demand. These commands do not create chat messages.
 
+### Fixed
+
+- Conversation activity and pretty logs clear obsolete running-tool entries
+  when a turn ends or the runner restarts, even if its final tool result was
+  lost. A missing result is never shown as successful.
+
 ### Changed
 
 - Agent conversations include group broadcasts delivered to that agent, using
