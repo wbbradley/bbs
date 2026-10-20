@@ -427,13 +427,14 @@ impl Stream {
         }
     }
 
-    /// Stream everything the agent has shared, from its oldest kept event.
+    /// Stream everything the agent has shared: its newest records first, so
+    /// the conversation's end shows at once, then the older ones it keeps.
     pub fn watch(&self) -> Request {
         Request::WatchActivity {
             id: self.id,
             req: proto::ActivityRequest {
                 backlog: BACKLOG,
-                after_id: Some(0),
+                after_id: None,
                 agent: Some(self.agent.clone()),
             },
         }
@@ -551,6 +552,29 @@ impl Stream {
         entries
     }
 
+    /// Put retained history older than every kept record in front, newest
+    /// kept first under the cap, and have the thread redraw once: drawing
+    /// it all in order rebuilds the renderer's state, so no old call shows
+    /// as running and progress, which history never moves, stays put.
+    fn backfill(&mut self, older: &[proto::Activity]) {
+        let oldest = self.records.front().map(|r| r.activity.id);
+        let older: Vec<Kept> = older
+            .iter()
+            .filter(|row| oldest.is_none_or(|oldest| row.id < oldest))
+            .map(Kept::new)
+            .collect();
+        let room = MAX_RECORDS.saturating_sub(self.records.len());
+        let skip = older.len().saturating_sub(room);
+        if older.len() == skip {
+            return;
+        }
+        for kept in older.into_iter().skip(skip).rev() {
+            self.records.push_front(kept);
+        }
+        self.drawn.clear();
+        self.redraw = true;
+    }
+
     /// Take a batch of this stream's data at `now`, given the thread's
     /// loaded message ids; returns the new entries.
     pub fn on_data(&mut self, data: &Data, now: Instant, loaded: &Loaded) -> Vec<Entry> {
@@ -564,6 +588,15 @@ impl Stream {
             self.history_end = Some(*through_id);
             self.progress = ProgressState::default();
             self.progress.baseline(*through_id, record.as_deref());
+        }
+        if let Data::ActivityBackfill { id, result } = data
+            && *id == self.id
+        {
+            match result {
+                Ok(older) => self.backfill(older),
+                Err(e) => self.error = Some(e.clone()),
+            }
+            return Vec::new();
         }
         let Data::Activity { id, result } = data else {
             return Vec::new();
@@ -620,6 +653,128 @@ mod tests {
         style::Modifier,
         widgets::{Block, Paragraph, Wrap},
     };
+
+    #[test]
+    fn older_history_merges_once_in_order_without_reviving_tools_or_progress() {
+        let now = Instant::now();
+        let row = |id: i64, record: &str| proto::Activity {
+            id,
+            record: record.into(),
+            ..Default::default()
+        };
+        let mut stream = Stream::new("Mateo");
+        let tail_record = r#"{"event":"tool","id":"t2","status":"pending","title":"cargo test"}"#;
+        stream.on_data(
+            &Data::ActivityBaseline {
+                id: stream.id,
+                through_id: 20,
+                record: Some(tail_record.into()),
+            },
+            now,
+            &Loaded::new(),
+        );
+        // The newest window: a turn begins at 11; a call is running at 20.
+        let mut window = vec![row(11, r#"{"event":"prompt","text":"go"}"#)];
+        window.extend((12..20).map(|id| row(id, r#"{"event":"thought","text":"newer"}"#)));
+        window.push(row(20, tail_record));
+        stream.on_data(
+            &Data::Activity {
+                id: stream.id,
+                result: Ok(window),
+            },
+            now,
+            &Loaded::new(),
+        );
+        assert!(stream.history_ready());
+        assert_eq!(stream.running(80).len(), 1);
+        let progress = stream.progress(now);
+        assert!(!stream.take_redraw());
+        // Older history: a call that never finished before that turn began,
+        // and a copy of the window's first record.
+        let older = vec![
+            row(
+                1,
+                r#"{"event":"tool","id":"t1","status":"pending","title":"git log"}"#,
+            ),
+            row(2, r#"{"event":"text","text":"older text"}"#),
+            row(11, r#"{"event":"prompt","text":"go"}"#),
+        ];
+        let entries = stream.on_data(
+            &Data::ActivityBackfill {
+                id: stream.id,
+                result: Ok(older.clone()),
+            },
+            now,
+            &Loaded::new(),
+        );
+        assert!(entries.is_empty(), "never drawn piecemeal");
+        assert!(stream.take_redraw(), "the thread redraws once");
+        let ids: Vec<i64> = stream.records.iter().map(|r| r.activity.id).collect();
+        assert_eq!(ids, [1, 2].into_iter().chain(11..=20).collect::<Vec<_>>());
+        let entries = stream.entries(&Loaded::new());
+        let Entry::Stream { id, .. } = &entries[0] else {
+            panic!("an activity entry");
+        };
+        assert_eq!(*id, 2, "the oldest drawn first");
+        assert_eq!(
+            stream.running(80).len(),
+            1,
+            "the old call ended with its turn; only the live one runs"
+        );
+        assert_eq!(
+            stream.progress(now),
+            progress,
+            "history never moves progress"
+        );
+        // Another copy, or one for another stream, changes nothing.
+        for id in [stream.id, stream.id + 1] {
+            stream.on_data(
+                &Data::ActivityBackfill {
+                    id,
+                    result: Ok(older.clone()),
+                },
+                now,
+                &Loaded::new(),
+            );
+            assert!(!stream.take_redraw());
+        }
+        // The cap keeps the newest: history fills only the room left.
+        let mut full = Stream::new("Mateo");
+        full.on_data(
+            &Data::Activity {
+                id: full.id,
+                result: Ok(vec![row(
+                    MAX_RECORDS as i64 + 1,
+                    r#"{"event":"thought","text":"x"}"#,
+                )]),
+            },
+            now,
+            &Loaded::new(),
+        );
+        let older: Vec<_> = (1..=MAX_RECORDS as i64)
+            .map(|id| row(id, r#"{"event":"thought","text":"x"}"#))
+            .collect();
+        full.on_data(
+            &Data::ActivityBackfill {
+                id: full.id,
+                result: Ok(older),
+            },
+            now,
+            &Loaded::new(),
+        );
+        assert_eq!(full.records.len(), MAX_RECORDS);
+        assert_eq!(full.records.front().unwrap().activity.id, 2);
+        // A refused fetch says so, like a stream error.
+        full.on_data(
+            &Data::ActivityBackfill {
+                id: full.id,
+                result: Err("refused".into()),
+            },
+            now,
+            &Loaded::new(),
+        );
+        assert_eq!(full.error.as_deref(), Some("refused"));
+    }
 
     #[test]
     fn runner_restart_and_hidden_turn_end_clear_stale_running_tools() {

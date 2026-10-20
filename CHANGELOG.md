@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- `bbs connect` agent conversations open on the newest activity: the loading
+  notice clears after one page instead of the agent's whole retained history,
+  which joins the timeline in one step when it arrives, without moving the
+  view.
+
 ## 0.11.1 - 2026-10-20
 
 ### Added

@@ -4274,10 +4274,93 @@ mod tests {
         match rx.try_recv().unwrap() {
             Request::WatchActivity { id, req } => {
                 assert_eq!(req.agent.as_deref(), Some("Mateo"));
+                assert_eq!(req.after_id, None, "the newest window first");
                 (feed, id)
             }
             other => panic!("expected an activity watch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn opening_shows_the_newest_window_and_older_history_lands_out_of_view() {
+        let (mut app, mut rx) = app();
+        let (_, now) = test_clock();
+        app.ctx.now = now;
+        let (feed, act) = mateo_loading_streams(&mut app, &mut rx);
+        assert!(screen(&mut app, 80, 24).contains("Loading…"));
+        let row = |id: i64| {
+            activity(
+                id,
+                "05",
+                &serde_json::json!({"event": "thought", "text": format!("row {id}")}).to_string(),
+            )
+        };
+        app.on_event(Event::Data(Data::ActivityBaseline {
+            id: act,
+            through_id: 400,
+            record: Some(row(400).record),
+        }));
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![at(7, "01", "Mateo", "ada", "canonical reply")]),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok((201..=400).map(row).collect()),
+        }));
+        // The newest window and the mail release the conversation; older
+        // history has not arrived.
+        let following = screen(&mut app, 80, 24);
+        assert!(
+            !following.contains("Loading…") && following.contains("row 400"),
+            "{following}"
+        );
+        let older = || Data::ActivityBackfill {
+            id: act,
+            result: Ok((1..=200).map(row).collect()),
+        };
+        app.on_event(Event::Data(older()));
+        assert_eq!(
+            screen(&mut app, 80, 24),
+            following,
+            "a follower sees nothing move"
+        );
+        while rx.try_recv().is_ok() {}
+        // A paused reader keeps their place when it lands too.
+        let (mut app, mut rx) = self::app();
+        let (_, now) = test_clock();
+        app.ctx.now = now;
+        let (feed, act) = mateo_loading_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::ActivityBaseline {
+            id: act,
+            through_id: 400,
+            record: Some(row(400).record),
+        }));
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![at(7, "01", "Mateo", "ada", "canonical reply")]),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok((201..=400).map(row).collect()),
+        }));
+        screen(&mut app, 80, 24);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        let paused = screen(&mut app, 80, 24);
+        assert!(paused.contains("paused"), "{paused}");
+        app.on_event(Event::Data(Data::ActivityBackfill {
+            id: act,
+            result: Ok((1..=200).map(row).collect()),
+        }));
+        assert_eq!(screen(&mut app, 80, 24), paused);
+        // The whole history is there, oldest first, above.
+        key(&mut app, 'g');
+        key(&mut app, 'g');
+        let top = screen(&mut app, 80, 24);
+        assert!(
+            top.lines().any(|line| line.trim_end().ends_with("row 1")),
+            "{top}"
+        );
     }
 
     #[test]

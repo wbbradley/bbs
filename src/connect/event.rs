@@ -37,7 +37,9 @@ pub enum Request {
         id: u64,
         req: proto::FeedRequest,
     },
-    /// Stream agent activity, replacing any stream with the same id.
+    /// Stream agent activity, replacing any stream with the same id. Without
+    /// `after_id`, open on the newest `backlog` records, follow from there,
+    /// and deliver older retained history once, whole (`ActivityBackfill`).
     WatchActivity {
         id: u64,
         req: proto::ActivityRequest,
@@ -258,6 +260,12 @@ pub enum Data {
         id: u64,
         through_id: i64,
         record: Option<String>,
+    },
+    /// The activity stream `id`'s retained history older than its opening
+    /// window, oldest first, delivered once when complete.
+    ActivityBackfill {
+        id: u64,
+        result: Result<Vec<proto::Activity>, String>,
     },
     /// Summaries from the stream `id`. Transient remote failures reconnect automatically.
     Summary {
@@ -612,7 +620,7 @@ impl Reconnect {
         tx: &UnboundedSender<Event>,
         data: impl FnOnce(String) -> Data,
     ) -> bool {
-        let retry = self.remote && transient_connection(&error);
+        let retry = self.retries(&error);
         let text = if retry {
             format!("Connection interrupted; reconnecting… {error:#}")
         } else {
@@ -621,6 +629,15 @@ impl Reconnect {
         if tx.send(Event::Data(data(text))).is_err() || !retry {
             return false;
         }
+        self.wait(tx).await
+    }
+
+    fn retries(&self, error: &anyhow::Error) -> bool {
+        self.remote && transient_connection(error)
+    }
+
+    /// Back off before the next attempt; false once the app has gone.
+    async fn wait(&mut self, tx: &UnboundedSender<Event>) -> bool {
         let delay = self.delay;
         self.delay = (self.delay * 2).min(Duration::from_secs(30));
         tokio::select! {
@@ -717,28 +734,87 @@ async fn activity_baseline(
     Ok(latest.next().await?.into_iter().next())
 }
 
-/// Resume activity after the last delivered id, with a fresh history watermark.
+/// Follow an agent's activity: opened without `after_id`, from its newest
+/// window, with older retained history fetched alongside on its own
+/// connection. Both end with this task, so closing or reloading the
+/// conversation cancels them together.
 async fn watch_activity(
+    opener: Opener,
+    id: u64,
+    req: proto::ActivityRequest,
+    tx: UnboundedSender<Event>,
+) {
+    let (cutoff_tx, cutoff) = tokio::sync::oneshot::channel();
+    let agent = req.agent.clone();
+    tokio::join!(
+        follow_activity(opener.clone(), id, req, tx.clone(), cutoff_tx),
+        backfill_activity(opener, id, agent, tx, cutoff),
+    );
+}
+
+/// Resume activity after the last delivered id, with a fresh history
+/// watermark; without one yet, start at the newest window and report its
+/// oldest id to the backfill when older history may exist.
+async fn follow_activity(
     opener: Opener,
     id: u64,
     mut req: proto::ActivityRequest,
     tx: UnboundedSender<Event>,
+    cutoff: tokio::sync::oneshot::Sender<i64>,
 ) {
+    let mut cutoff = Some(cutoff);
     let mut reconnect = Reconnect::new(&opener);
     loop {
         let result: anyhow::Result<()> = async {
             let mut backend =
                 Backend::open(&opener.config, &opener.dir, opener.caller.clone()).await?;
-            let baseline = activity_baseline(&mut backend, &req).await?;
-            if tx
-                .send(Event::Data(Data::ActivityBaseline {
-                    id,
-                    through_id: baseline.as_ref().map_or(0, |row| row.id),
-                    record: baseline.map(|row| row.record),
-                }))
-                .is_err()
-            {
-                return Ok(());
+            if req.after_id.is_none() {
+                // The newest window answers once, then the cursor follows
+                // from its last id, so nothing after it is missed.
+                let tail = backend.watch_activity(req.clone()).await?.next().await?;
+                let last = tail.last();
+                if tx
+                    .send(Event::Data(Data::ActivityBaseline {
+                        id,
+                        through_id: last.map_or(0, |row| row.id),
+                        record: last.map(|row| row.record.clone()),
+                    }))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                req.after_id = Some(last.map_or(0, |row| row.id));
+                // A full window may have older history before it, sent after
+                // the window itself.
+                let first = (tail.len() >= req.backlog as usize)
+                    .then(|| tail.first().map(|row| row.id))
+                    .flatten();
+                if tx
+                    .send(Event::Data(Data::Activity {
+                        id,
+                        result: Ok(tail),
+                    }))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                if let (Some(first), Some(cutoff)) = (first, cutoff.take()) {
+                    let _ = cutoff.send(first);
+                }
+                cutoff = None;
+                reconnect.received();
+            } else {
+                let baseline = activity_baseline(&mut backend, &req).await?;
+                if tx
+                    .send(Event::Data(Data::ActivityBaseline {
+                        id,
+                        through_id: baseline.as_ref().map_or(0, |row| row.id),
+                        record: baseline.map(|row| row.record),
+                    }))
+                    .is_err()
+                {
+                    return Ok(());
+                }
             }
             let mut activity = backend.watch_activity(req.clone()).await?;
             loop {
@@ -772,6 +848,60 @@ async fn watch_activity(
         }
     }
 }
+
+/// Fetch the agent's retained activity older than `cutoff`, the opening
+/// window's oldest id, and deliver it once, whole. Interruptions retry from
+/// the start without disturbing the live stream; a refusal is reported.
+async fn backfill_activity(
+    opener: Opener,
+    id: u64,
+    agent: Option<String>,
+    tx: UnboundedSender<Event>,
+    cutoff: tokio::sync::oneshot::Receiver<i64>,
+) {
+    let Ok(cutoff) = cutoff.await else { return };
+    let mut reconnect = Reconnect::new(&opener);
+    loop {
+        let result: anyhow::Result<Vec<proto::Activity>> = async {
+            let mut backend =
+                Backend::open(&opener.config, &opener.dir, opener.caller.clone()).await?;
+            let mut pages = backend
+                .watch_activity(proto::ActivityRequest {
+                    backlog: BACKFILL_PAGE,
+                    after_id: Some(0),
+                    agent: agent.clone(),
+                })
+                .await?;
+            let mut older = Vec::new();
+            loop {
+                let page = pages.next().await?;
+                // A cursor never sends an empty batch: stop at the window.
+                let done = page.len() < BACKFILL_PAGE as usize
+                    || page.last().is_some_and(|row| row.id >= cutoff);
+                older.extend(page.into_iter().take_while(|row| row.id < cutoff));
+                if done {
+                    return Ok(older);
+                }
+            }
+        }
+        .await;
+        let result = match result {
+            Ok(older) => Ok(older),
+            Err(error) if reconnect.retries(&error) => {
+                if reconnect.wait(&tx).await {
+                    continue;
+                }
+                return;
+            }
+            Err(error) => Err(format!("{error:#}")),
+        };
+        let _ = tx.send(Event::Data(Data::ActivityBackfill { id, result }));
+        return;
+    }
+}
+
+/// Records per backfill page, as the server's cursor pages them.
+const BACKFILL_PAGE: u32 = 200;
 
 #[cfg(test)]
 mod tests {
@@ -1644,6 +1774,88 @@ mod tests {
         assert_eq!(line.to_string(), "Mateo cannot change @crew");
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.style, style(Role::Error));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_opens_on_the_newest_window_then_older_history_once_then_live() {
+        async fn next(rx: &mut UnboundedReceiver<Event>) -> Event {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        // (records kept, older history expected): more than a page before
+        // the window, exactly a page, and none.
+        for (kept, older) in [(500, 300), (400, 200), (150, 0)] {
+            let (_dir, conn, opener, mut req) = board();
+            conn.execute("DELETE FROM activity WHERE id > ?1", [kept])
+                .unwrap();
+            req.after_id = None;
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let worker = tokio::spawn(watch_activity(opener, 9, req, tx));
+            let Event::Data(Data::ActivityBaseline {
+                id: 9,
+                through_id,
+                record: Some(_),
+            }) = next(&mut rx).await
+            else {
+                panic!("expected the window's watermark");
+            };
+            assert_eq!(through_id, kept);
+            let Event::Data(Data::Activity {
+                id: 9,
+                result: Ok(window),
+            }) = next(&mut rx).await
+            else {
+                panic!("expected the newest window");
+            };
+            let ids: Vec<i64> = window.iter().map(|row| row.id).collect();
+            assert_eq!(ids, (kept - kept.min(200) + 1..=kept).collect::<Vec<_>>());
+            // Live records follow the window with nothing missed or repeated;
+            // older history arrives alongside, once and whole. The live
+            // cursor's first batch may be empty.
+            crate::db::post_activity(
+                &conn,
+                1,
+                "u",
+                &[("turn_end".into(), r#"{"event":"turn_end"}"#.into())],
+            )
+            .unwrap();
+            let (mut live, mut history) = (Vec::new(), None);
+            while live.is_empty() || (older > 0 && history.is_none()) {
+                match next(&mut rx).await {
+                    Event::Data(Data::Activity {
+                        id: 9,
+                        result: Ok(rows),
+                    }) => live.extend(rows.into_iter().map(|row| row.id)),
+                    Event::Data(Data::ActivityBackfill {
+                        id: 9,
+                        result: Ok(rows),
+                    }) => {
+                        assert!(history.is_none(), "older history arrives once");
+                        history = Some(rows.into_iter().map(|row| row.id).collect::<Vec<_>>());
+                    }
+                    _ => panic!("unexpected event"),
+                }
+            }
+            assert_eq!(live, [kept + 1]);
+            if older > 0 {
+                assert_eq!(history.unwrap(), (1..=older).collect::<Vec<_>>(), "{kept}");
+            } else {
+                assert!(
+                    history.is_none(),
+                    "a short window has nothing older to fetch"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            while let Ok(event) = rx.try_recv() {
+                assert!(
+                    matches!(event, Event::Data(Data::Activity { result: Ok(rows), .. }) if rows.is_empty()),
+                    "nothing more, nothing twice"
+                );
+            }
+            worker.abort();
+        }
     }
 
     #[tokio::test(start_paused = true)]

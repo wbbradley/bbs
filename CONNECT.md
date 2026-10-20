@@ -35,9 +35,12 @@ several separate `bbs group` commands.
   and menus. A status bar fills the whole bottom line with the signed-in human.
   Agent conversations have no title bar: their bottom bar starts with
   `BBS · <agent>` and carries timeline state and feedback.
-  Initial mail and activity history assemble behind a single loading notice;
-  the composer remains usable. After two seconds, partial content is shown
-  even if a subscription is slow, and later updates appear normally.
+  Initial mail and the newest 200 activity records assemble behind a single
+  loading notice; the composer remains usable. The rest of the agent's
+  retained activity arrives alongside on its own connection and joins the
+  timeline in one step when complete, above the view, so neither a following
+  nor a paused reader's view moves. After two seconds, partial content is
+  shown even if a subscription is slow, and later updates appear normally.
   Remote subscriptions reconnect after temporary connection failures, retaining
   drafts and timeline data. Activity resumes from its last received record;
   message and summary snapshots refresh. Retries back off from one to thirty
