@@ -99,10 +99,12 @@ colors remain their per-scheme palette choices.
 
 In the owner's open conversation with an agent, connect asks the server for that
 agent's side state (`SideReport`, `agent-interactions.v1`) once a second, one
-request at a time; a server without it, or a refusal, stops the asking, and a
-transient failure is retried. Nobody else's conversation polls. When the
-agent's runner waits on the owner, a card above the composer says "Mateo asks 2
-questions · /answer to respond". `/answer`, typed as the whole draft, opens a
+request at a time, each side call bounded to 3 seconds so a stalled connection
+never holds up ordinary sends; a server without it, or a refusal, stops the
+asking, and a transient failure or timeout is retried. Nobody else's
+conversation polls. When the agent's runner waits on the owner, a card above the
+composer says "Mateo asks 2 questions · /answer to respond"; questions it is not
+waiting on read "Mateo has 2 questions available". `/answer`, typed as the whole draft, opens a
 form over the conversation: the form's own message, then every question,
 choice and description in full, wrapped. It opens at the top so the message can
 be read first; ↑/↓ move the focus and scroll just enough to show it whole,
@@ -112,8 +114,9 @@ Nothing is chosen until the owner chooses it: Enter or Space chooses a choice
 Enter never submits from a choice or text. `[Submit]` needs every required
 question answered and leaves optional ones out, `[Decline]` and `[Cancel
 request]` send those replies, one at a time, and Esc closes the form with the
-questions still waiting. A refused reply keeps the form and its typing; an
-unconfirmed one says it may have arrived, and nothing is retried. If the
+questions still waiting. A refused reply keeps the form and its typing; one
+that could not be confirmed (a timeout) says so, the next poll settles whether
+it landed, and nothing is retried. If the
 questions are answered elsewhere, withdrawn or replaced (a runner restart), the
 form closes and a reply to them is never sent; a poll begun before an answer
 landed never brings its questions back. `/context` shows the runner's last

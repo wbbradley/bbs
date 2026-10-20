@@ -40,6 +40,9 @@ pub struct Question {
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuestionSet {
     pub request_id: i64,
+    /// The runner waits on the answer; otherwise the questions are only
+    /// available to answer.
+    pub blocking: bool,
     pub message: Option<String>,
     pub questions: Vec<Question>,
 }
@@ -196,7 +199,9 @@ impl Session {
                 self.in_flight = false;
                 match result {
                     Ok(report) => {
-                        if self.report.as_ref().map(|r| r.revision) == Some(report.revision) {
+                        // The whole report, not its revision alone: a new agent
+                        // under a reused name counts revisions afresh.
+                        if self.report.as_ref() == Some(report.as_ref()) {
                             return false;
                         }
                         // The fence lifts once a report no longer shows the
@@ -242,10 +247,9 @@ impl Session {
                     Err(SideError::Unsupported(why) | SideError::Refused(why)) => {
                         self.notice = Some(format!("Not sent: {why}"));
                     }
+                    // The server may have taken it: the next poll settles it.
                     Err(SideError::Transient(why)) => {
-                        self.notice = Some(format!(
-                            "Not confirmed: {why}. It may have arrived; check before replying again."
-                        ));
+                        self.notice = Some(format!("Could not confirm response: {why}"));
                     }
                 }
                 true
@@ -273,6 +277,7 @@ impl Session {
 fn question_set(input: &proto::OwnerInput) -> QuestionSet {
     QuestionSet {
         request_id: input.request_id,
+        blocking: input.is_blocking,
         message: input.message.clone().filter(|m| !m.trim().is_empty()),
         questions: input
             .questions
@@ -306,8 +311,10 @@ pub fn card(agent: &str, set: &QuestionSet, width: u16) -> Vec<Line<'static>> {
             Span::styled(agent.to_string(), theme::style(theme::Role::Agent)),
             Span::styled(
                 format!(
-                    " asks {n} question{} · /answer to respond",
-                    if n == 1 { "" } else { "s" }
+                    "{} {n} question{}{} · /answer to respond",
+                    if set.blocking { " asks" } else { " has" },
+                    if n == 1 { "" } else { "s" },
+                    if set.blocking { "" } else { " available" },
                 ),
                 theme::heading(),
             ),
@@ -763,6 +770,7 @@ mod tests {
         };
         QuestionSet {
             request_id: 7,
+            blocking: true,
             message: None,
             questions: vec![
                 Question {

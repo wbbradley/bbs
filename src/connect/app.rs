@@ -3057,6 +3057,7 @@ mod tests {
                 answers: Vec::new(),
                 updated_at: "2026-10-20T02:30:00Z".into(),
                 message: None,
+                is_blocking: true,
             }),
             usage: Some(proto::ContextUsage {
                 used_tokens: Some(84_321),
@@ -3505,7 +3506,7 @@ mod tests {
         );
         assert!(rx.try_recv().is_err(), "no automatic retry");
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(screen(&mut app, 80, 24).contains("Not confirmed"));
+        assert!(screen(&mut app, 80, 24).contains("Could not confirm response"));
         // A refusal stops polling and says why.
         let (mut app, mut rx) = self::app();
         mateo_streams(&mut app, &mut rx);
@@ -3539,6 +3540,60 @@ mod tests {
             result: Ok(Box::new(side_report(1, 7, deploy_questions()))),
         }));
         assert!(screen(&mut app, 80, 24).contains("asks 2"));
+    }
+
+    #[test]
+    fn a_same_revision_report_with_new_questions_shows_them_and_old_replies_stay_inert() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(side_report(5, 7, deploy_questions()))),
+        }));
+        command(&mut app, "/answer");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Request::AnswerOwnerInput { .. }
+        ));
+        app.on_event(Event::Data(Data::OwnerAnswered {
+            id,
+            request_id: 7,
+            result: Ok(()),
+        }));
+        // Mateo retired and a new Mateo registered: its own revision counter
+        // also reads 5, but the request is new and not blocking its runner.
+        let mut fresh = side_report(5, 99, deploy_questions());
+        fresh.pending_input.as_mut().unwrap().is_blocking = false;
+        poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(fresh)),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("Mateo has 2 questions available · /answer to respond"),
+            "{out}"
+        );
+        // A late reply for the old request changes nothing.
+        app.on_event(Event::Data(Data::OwnerAnswered {
+            id,
+            request_id: 7,
+            result: Err(crate::connect::event::SideError::Transient("late".into())),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("questions available") && !out.contains("Could not confirm"),
+            "{out}"
+        );
+        command(&mut app, "/answer");
+        assert!(app.top().navigation_blocked());
     }
 
     /// The requests waiting, but the owner's once-a-second side polls.

@@ -148,6 +148,23 @@ pub enum SideError {
     Transient(String),
 }
 
+/// How long a side call (agent-interactions.v1) may take.
+const SIDE_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// A side call, bounded by SIDE_CALL_TIMEOUT, with its error typed.
+async fn bounded<T>(
+    call: impl std::future::Future<Output = anyhow::Result<T>>,
+    local: bool,
+) -> Result<T, SideError> {
+    match tokio::time::timeout(SIDE_CALL_TIMEOUT, call).await {
+        Ok(result) => result.map_err(|e| side_error(local, e)),
+        Err(_) => Err(SideError::Transient(format!(
+            "no reply within {} seconds",
+            SIDE_CALL_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 fn side_error(local: bool, error: anyhow::Error) -> SideError {
     use tonic::Code;
     let text = format!("{error:#}");
@@ -340,30 +357,29 @@ pub async fn serve(
                     agent,
                 }
             }
+            // Side calls are bounded, so a stalled connection cannot hold
+            // ordinary sends behind a background poll; a timeout is
+            // transient, and an answer is never retried.
             Request::SideReport { id, agent } => {
                 let local = matches!(backend, Backend::Local(_));
+                let call = backend.side_report(proto::SideReportRequest {
+                    agent,
+                    generation: None,
+                });
                 Data::SideReport {
                     id,
-                    result: backend
-                        .side_report(proto::SideReportRequest {
-                            agent,
-                            generation: None,
-                        })
-                        .await
-                        .map(Box::new)
-                        .map_err(|e| side_error(local, e)),
+                    result: bounded(call, local).await.map(Box::new),
                 }
             }
             Request::AnswerOwnerInput { id, req } => {
                 let local = matches!(backend, Backend::Local(_));
+                let request_id = req.request_id;
                 Data::OwnerAnswered {
                     id,
-                    request_id: req.request_id,
-                    result: backend
-                        .answer_owner_input(req)
+                    request_id,
+                    result: bounded(backend.answer_owner_input(req), local)
                         .await
-                        .map(|_| ())
-                        .map_err(|e| side_error(local, e)),
+                        .map(|_| ()),
                 }
             }
             Request::Admin { id, op } => {
@@ -938,6 +954,13 @@ mod tests {
                 )
             }
         }
+        impl tonic::server::UnaryService<proto::ListAgentsRequest> for Server {
+            type Response = proto::ListAgentsResponse;
+            type Future = BoxFuture<Response<proto::ListAgentsResponse>, Status>;
+            fn call(&mut self, _: tonic::Request<proto::ListAgentsRequest>) -> Self::Future {
+                Box::pin(async { Ok(Response::new(proto::ListAgentsResponse::default())) })
+            }
+        }
         impl tonic::server::NamedService for Server {
             const NAME: &'static str = "bbs.v2.Bbs";
         }
@@ -952,6 +975,17 @@ mod tests {
                 let server = self.clone();
                 Box::pin(async move {
                     let response = match req.uri().path() {
+                        // A side read that never answers, as on a half-open
+                        // connection.
+                        "/bbs.v2.Bbs/SideReport" => std::future::pending().await,
+                        "/bbs.v2.Bbs/ListAgents" => {
+                            tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+                                proto::ListAgentsResponse,
+                                proto::ListAgentsRequest,
+                            >::default())
+                            .unary(server, req)
+                            .await
+                        }
                         "/bbs.v2.Bbs/WatchFeed" => {
                             tonic::server::Grpc::new(tonic_prost::ProstCodec::<
                                 proto::FeedSnapshot,
@@ -1046,6 +1080,50 @@ mod tests {
             for worker in workers {
                 worker.abort();
             }
+            serving.abort();
+        }
+
+        #[tokio::test]
+        async fn a_stalled_side_read_times_out_and_queued_work_proceeds() {
+            let (_dir, _conn, mut opener, _) = board();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            opener.config.server = Some(listener.local_addr().unwrap().to_string());
+            let serving = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(Server::default())
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            );
+            let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
+                .await
+                .unwrap();
+            let (tx, rx) = unbounded_channel();
+            let (events, mut replies) = unbounded_channel();
+            let worker = tokio::spawn(serve(backend, opener, rx, events));
+            tx.send(Request::SideReport {
+                id: 1,
+                agent: "Mateo".into(),
+            })
+            .unwrap();
+            tx.send(Request::Agents).unwrap();
+            let started = std::time::Instant::now();
+            let (side, agents) = tokio::time::timeout(Duration::from_secs(10), async {
+                (replies.recv().await.unwrap(), replies.recv().await.unwrap())
+            })
+            .await
+            .expect("the worker never parks behind the side read");
+            assert!(
+                matches!(
+                    side,
+                    Event::Data(Data::SideReport {
+                        id: 1,
+                        result: Err(SideError::Transient(_))
+                    })
+                ),
+                "a stalled read is transient"
+            );
+            assert!(matches!(agents, Event::Data(Data::Agents(Ok(_)))));
+            assert!(started.elapsed() >= SIDE_CALL_TIMEOUT);
+            worker.abort();
             serving.abort();
         }
 
