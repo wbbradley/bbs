@@ -3056,14 +3056,13 @@ mod tests {
                 questions,
                 answers: Vec::new(),
                 updated_at: "2026-10-20T02:30:00Z".into(),
+                message: None,
             }),
             usage: Some(proto::ContextUsage {
                 used_tokens: Some(84_321),
                 limit_tokens: Some(200_000),
                 source: proto::context_usage::Source::CurrentContext.into(),
             }),
-            side_supported: None,
-            side_reason: None,
             revision,
             reported_at: "2026-10-20T02:30:00Z".into(),
         }
@@ -3180,7 +3179,26 @@ mod tests {
             result: Ok(()),
         }));
         assert!(!app.top().navigation_blocked(), "the form closes once sent");
-        // The explicit Cancel request action sends CANCEL.
+        // The last report still shows request 7 waiting, as does a poll that
+        // began before the answer landed: neither brings it back.
+        assert!(!screen(&mut app, 80, 24).contains("asks 2"));
+        poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(side_report(2, 7, deploy_questions()))),
+        }));
+        assert!(!screen(&mut app, 80, 24).contains("asks 2"), "fenced");
+        command(&mut app, "/answer");
+        assert!(screen(&mut app, 80, 24).contains("No questions are waiting."));
+        // A fresh request after that shows and answers as usual.
+        poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(side_report(3, 8, deploy_questions()))),
+        }));
+        assert!(screen(&mut app, 80, 24).contains("asks 2"));
+        // The explicit Cancel request action sends CANCEL, once: a second
+        // Enter while it is on its way sends nothing more.
         command(&mut app, "/answer");
         for _ in 0..5 {
             press(&mut app, KeyCode::Down, KeyModifiers::NONE);
@@ -3190,7 +3208,10 @@ mod tests {
             panic!("expected a cancel");
         };
         assert_eq!(req.action(), proto::AnswerAction::Cancel);
+        assert_eq!(req.request_id, 8);
         assert!(req.answers.is_empty());
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(rx.try_recv().is_err(), "one reply in flight");
     }
 
     #[test]
@@ -3220,7 +3241,7 @@ mod tests {
         app.on_event(Event::Data(Data::OwnerAnswered {
             id,
             request_id: 7,
-            result: Err("stale".into()),
+            result: Err(crate::connect::event::SideError::Refused("stale".into())),
         }));
         assert!(!screen(&mut app, 80, 24).contains("Not sent"));
         // Withdrawn: no questions left.
@@ -3303,7 +3324,9 @@ mod tests {
         let id = poll(&mut app, &mut rx);
         app.on_event(Event::Data(Data::SideReport {
             id,
-            result: Err("required capability side-questions.v1 is unavailable".into()),
+            result: Err(crate::connect::event::SideError::Unsupported(
+                "required capability agent-interactions.v1 is unavailable".into(),
+            )),
         }));
         app.on_event(Event::Tick);
         assert!(without_sends(&mut rx).is_none());
@@ -3362,6 +3385,160 @@ mod tests {
             "{out}"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_long_form_scrolls_while_its_actions_and_keys_stay_in_view() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        let mut report = side_report(
+            1,
+            7,
+            vec![proto::InputQuestion {
+                id: "pick".into(),
+                header: "Pick".into(),
+                text: "Which one?".into(),
+                options: (1..=6)
+                    .map(|n| proto::InputOption {
+                        value: format!("v{n}"),
+                        label: Some(format!("choice {n} 漢字")),
+                        description: Some(format!("long description {n} that wraps past the edge of an eighty column box, ending tail{n}")),
+                    })
+                    .collect(),
+                allow_free_text: true,
+                required: false,
+            }],
+        );
+        report.pending_input.as_mut().unwrap().message = Some(
+            (1..=14)
+                .map(|n| format!("context line {n} 👩‍💻"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(report)),
+        }));
+        command(&mut app, "/answer");
+        // Every frame keeps the actions and keys visible; the form message
+        // opens at the top.
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("[Submit]") && out.contains("PgUp/PgDn scroll"),
+            "{out}"
+        );
+        assert!(out.contains("context line 1 "), "{out}");
+        // PgDn reads on without moving the focus; PgUp comes back.
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        let read = screen(&mut app, 80, 24);
+        assert!(
+            !read.contains("context line 1 ") && read.contains("[Submit]"),
+            "{read}"
+        );
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        assert!(screen(&mut app, 80, 24).contains("context line 1 "));
+        // Moving through the choices brings each whole, description tail
+        // included, into view, actions still shown.
+        let mut tails = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            let out = screen(&mut app, 80, 24);
+            assert!(out.contains("[Submit]"), "{out}");
+            for n in 1..=6 {
+                if out.contains(&format!("tail{n}")) {
+                    tails.insert(n);
+                }
+            }
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        }
+        assert_eq!(tails.len(), 6, "{tails:?}");
+        // A long typed answer shows its end, where typing goes on.
+        typed(&mut app, &format!("{}END", "word ".repeat(80)));
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("END") && out.contains("[Submit]"), "{out}");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn side_errors_are_typed_and_a_reopened_conversation_ignores_old_replies() {
+        use crate::connect::event::SideError;
+        // A transient poll failure retries on the next tick.
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Err(SideError::Transient("connection reset".into())),
+        }));
+        assert_eq!(poll(&mut app, &mut rx), id);
+        // A transient failure answering keeps the form and what was typed, and
+        // says it may have arrived; nothing is retried.
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(side_report(1, 7, deploy_questions()))),
+        }));
+        command(&mut app, "/answer");
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        }
+        typed(&mut app, "keep me");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Request::AnswerOwnerInput { .. }
+        ));
+        app.on_event(Event::Data(Data::OwnerAnswered {
+            id,
+            request_id: 7,
+            result: Err(SideError::Transient("timed out".into())),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            app.top().navigation_blocked() && out.contains("keep me"),
+            "{out}"
+        );
+        assert!(rx.try_recv().is_err(), "no automatic retry");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(screen(&mut app, 80, 24).contains("Not confirmed"));
+        // A refusal stops polling and says why.
+        let (mut app, mut rx) = self::app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Err(SideError::Refused("you no longer own Mateo".into())),
+        }));
+        app.on_event(Event::Tick);
+        assert!(without_sends(&mut rx).is_none());
+        assert!(screen(&mut app, 80, 24).contains("you no longer own Mateo"));
+        // Reopened, the conversation's new session ignores the old one's replies.
+        let (mut app, mut rx) = self::app();
+        mateo_streams(&mut app, &mut rx);
+        let old = poll(&mut app, &mut rx);
+        close_conversation(&mut app, &mut rx);
+        reopen(&mut app, &mut rx);
+        while rx.try_recv().is_ok() {}
+        let new = poll(&mut app, &mut rx);
+        assert_ne!(old, new);
+        app.on_event(Event::Data(Data::SideReport {
+            id: old,
+            result: Ok(Box::new(side_report(1, 7, deploy_questions()))),
+        }));
+        assert!(
+            !screen(&mut app, 80, 24).contains("asks 2"),
+            "a stale reply"
+        );
+        app.on_event(Event::Data(Data::SideReport {
+            id: new,
+            result: Ok(Box::new(side_report(1, 7, deploy_questions()))),
+        }));
+        assert!(screen(&mut app, 80, 24).contains("asks 2"));
     }
 
     /// The requests waiting, but the owner's once-a-second side polls.

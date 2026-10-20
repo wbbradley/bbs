@@ -136,6 +136,40 @@ pub enum EffortSendError {
     Unknown(String),
 }
 
+/// Why a side call (agent-interactions.v1) failed, by the server's status
+/// code rather than its message text.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SideError {
+    /// The server lacks the RPC or the capability: never ask again.
+    Unsupported(String),
+    /// A definite refusal (not the owner, no such agent, invalid answer).
+    Refused(String),
+    /// Possibly transient; a poll retries, a reply is not known to have landed.
+    Transient(String),
+}
+
+fn side_error(local: bool, error: anyhow::Error) -> SideError {
+    use tonic::Code;
+    let text = format!("{error:#}");
+    match error
+        .downcast_ref::<tonic::Status>()
+        .map(tonic::Status::code)
+    {
+        Some(Code::Unimplemented | Code::FailedPrecondition) => SideError::Unsupported(text),
+        Some(
+            Code::InvalidArgument
+            | Code::NotFound
+            | Code::AlreadyExists
+            | Code::PermissionDenied
+            | Code::Unauthenticated
+            | Code::OutOfRange,
+        ) => SideError::Refused(text),
+        // A local board answers from its own database: no transport to fail.
+        _ if local => SideError::Refused(text),
+        _ => SideError::Transient(text),
+    }
+}
+
 fn effort_send_error(local: bool, error: anyhow::Error) -> EffortSendError {
     use tonic::Code;
     let rejected = local
@@ -202,12 +236,12 @@ pub enum Data {
     },
     SideReport {
         id: u64,
-        result: Result<Box<proto::SideReportResponse>, String>,
+        result: Result<Box<proto::SideReportResponse>, SideError>,
     },
     OwnerAnswered {
         id: u64,
         request_id: i64,
-        result: Result<(), String>,
+        result: Result<(), SideError>,
     },
     /// Completion of an actual read request, for the local summary fence.
     MarkedRead {
@@ -306,26 +340,32 @@ pub async fn serve(
                     agent,
                 }
             }
-            Request::SideReport { id, agent } => Data::SideReport {
-                id,
-                result: backend
-                    .side_report(proto::SideReportRequest {
-                        agent,
-                        generation: None,
-                    })
-                    .await
-                    .map(Box::new)
-                    .map_err(error),
-            },
-            Request::AnswerOwnerInput { id, req } => Data::OwnerAnswered {
-                id,
-                request_id: req.request_id,
-                result: backend
-                    .answer_owner_input(req)
-                    .await
-                    .map(|_| ())
-                    .map_err(error),
-            },
+            Request::SideReport { id, agent } => {
+                let local = matches!(backend, Backend::Local(_));
+                Data::SideReport {
+                    id,
+                    result: backend
+                        .side_report(proto::SideReportRequest {
+                            agent,
+                            generation: None,
+                        })
+                        .await
+                        .map(Box::new)
+                        .map_err(|e| side_error(local, e)),
+                }
+            }
+            Request::AnswerOwnerInput { id, req } => {
+                let local = matches!(backend, Backend::Local(_));
+                Data::OwnerAnswered {
+                    id,
+                    request_id: req.request_id,
+                    result: backend
+                        .answer_owner_input(req)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| side_error(local, e)),
+                }
+            }
             Request::Admin { id, op } => {
                 let result = admin(&mut backend, op).await.map_err(error);
                 let changed = result.is_ok();

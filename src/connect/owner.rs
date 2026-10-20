@@ -2,6 +2,8 @@
 //! context: the question card above the composer, the `/answer` form, and the
 //! `/context` panel, for the owner's open conversation only.
 
+use std::cell::Cell;
+
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -10,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 
 use super::app::next_id;
-use super::event::{Data, Request};
+use super::event::{Data, Request, SideError};
 use super::theme;
 use crate::proto;
 
@@ -33,10 +35,12 @@ pub struct Question {
     pub required: bool,
 }
 
-/// The questions a runner is waiting on, under one request id.
+/// The questions a runner is waiting on, under one request id, with the
+/// form's own message when the harness gives one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuestionSet {
     pub request_id: i64,
+    pub message: Option<String>,
     pub questions: Vec<Question>,
 }
 
@@ -82,12 +86,16 @@ pub struct Session {
     id: u64,
     in_flight: bool,
     report: Option<proto::SideReportResponse>,
-    /// The server lacks side-questions.v1: stop asking.
+    /// The server lacks agent-interactions.v1, or refused this owner: stop
+    /// asking.
     pub unsupported: bool,
     pub form: Option<Form>,
     pub context_open: bool,
-    /// The request id of a reply on its way.
+    /// The request id of a reply on its way: one at a time.
     sending: Option<i64>,
+    /// A request answered and acknowledged: a poll begun before that still
+    /// shows it waiting, and must not bring it back.
+    answered: Option<i64>,
     pub notice: Option<String>,
 }
 
@@ -101,6 +109,7 @@ impl Session {
             form: None,
             context_open: false,
             sending: None,
+            answered: None,
             notice: None,
         }
     }
@@ -121,7 +130,8 @@ impl Session {
     /// The questions waiting on the owner, if any.
     pub fn questions(&self) -> Option<QuestionSet> {
         let input = self.report.as_ref()?.pending_input.as_ref()?;
-        (input.status() == proto::InputStatus::Pending).then(|| question_set(input))
+        (input.status() == proto::InputStatus::Pending && self.answered != Some(input.request_id))
+            .then(|| question_set(input))
     }
 
     pub fn usage(&self) -> Option<ContextUsage> {
@@ -150,6 +160,10 @@ impl Session {
 
     /// The request that sends `reply` to the form's question set.
     pub fn reply(&mut self, reply: Reply) -> Option<Request> {
+        if self.sending.is_some() {
+            // One reply at a time; a second Enter sends nothing more.
+            return None;
+        }
         let request_id = self.form.as_ref()?.request_id();
         let (action, answers) = match reply {
             Reply::Submit(answers) => (proto::AnswerAction::Submit, answers),
@@ -185,15 +199,30 @@ impl Session {
                         if self.report.as_ref().map(|r| r.revision) == Some(report.revision) {
                             return false;
                         }
+                        // The fence lifts once a report no longer shows the
+                        // answered request waiting.
+                        let waiting = report
+                            .pending_input
+                            .as_ref()
+                            .filter(|i| i.status() == proto::InputStatus::Pending)
+                            .map(|i| i.request_id);
+                        if waiting != self.answered {
+                            self.answered = None;
+                        }
                         self.report = Some(report.as_ref().clone());
                         self.supersede();
                     }
-                    Err(e) if e.contains(crate::backend::SIDE_QUESTIONS) => {
+                    Err(SideError::Unsupported(_)) => {
                         self.unsupported = true;
                         self.form = None;
                     }
-                    // A failed poll is retried on the next tick.
-                    Err(_) => return false,
+                    Err(SideError::Refused(why)) => {
+                        self.unsupported = true;
+                        self.form = None;
+                        self.notice = Some(why.clone());
+                    }
+                    // A transient failure is retried on the next tick.
+                    Err(SideError::Transient(_)) => return false,
                 }
                 true
             }
@@ -205,10 +234,19 @@ impl Session {
                 self.sending = None;
                 match result {
                     Ok(()) => {
+                        self.answered = Some(*request_id);
                         self.form = None;
                         self.notice = None;
                     }
-                    Err(e) => self.notice = Some(format!("Not sent: {e}")),
+                    // The form and what was typed stay; nothing is retried.
+                    Err(SideError::Unsupported(why) | SideError::Refused(why)) => {
+                        self.notice = Some(format!("Not sent: {why}"));
+                    }
+                    Err(SideError::Transient(why)) => {
+                        self.notice = Some(format!(
+                            "Not confirmed: {why}. It may have arrived; check before replying again."
+                        ));
+                    }
                 }
                 true
             }
@@ -235,6 +273,7 @@ impl Session {
 fn question_set(input: &proto::OwnerInput) -> QuestionSet {
     QuestionSet {
         request_id: input.request_id,
+        message: input.message.clone().filter(|m| !m.trim().is_empty()),
         questions: input
             .questions
             .iter()
@@ -275,6 +314,15 @@ pub fn card(agent: &str, set: &QuestionSet, width: u16) -> Vec<Line<'static>> {
         ]),
         usize::from(width),
     )];
+    if let Some(message) = &set.message {
+        lines.push(theme::clip_line(
+            Line::styled(
+                format!("  {}", one_line(message)),
+                theme::style(theme::Role::Text),
+            ),
+            usize::from(width),
+        ));
+    }
     for q in &set.questions {
         let text = one_line(&format!("{} {}", q.header, q.text));
         lines.push(theme::clip_line(
@@ -299,11 +347,12 @@ pub fn context_lines(agent: &str, usage: Option<&ContextUsage>) -> Vec<Line<'sta
                 Measure::LastRequest => "Last request",
             };
             let amount = match u.limit.filter(|&limit| limit > 0) {
+                // Wide arithmetic: any u64 report, and over 100% as reported.
                 Some(limit) => format!(
                     "{} of {} tokens ({}%)",
                     tokens(used),
                     tokens(limit),
-                    used * 100 / limit
+                    u128::from(used) * 100 / u128::from(limit)
                 ),
                 None => format!("{} tokens", tokens(used)),
             };
@@ -371,7 +420,18 @@ pub struct Form {
     text: Vec<String>,
     focus: usize,
     notice: Option<String>,
+    /// The first body row shown, as last drawn; moving the focus scrolls it
+    /// just enough, and PageUp/PageDown move it to read freely.
+    scroll: Cell<usize>,
+    /// Body rows shown, as last drawn: a page.
+    page: Cell<usize>,
+    /// Reading rather than following the focus: from the top when the form
+    /// opens, or where PageUp/PageDown left it. The next other key ends it.
+    reading: Cell<bool>,
 }
+
+/// The longest free-text answer the server takes, in bytes.
+const FREE_TEXT_LIMIT: usize = 4096;
 
 impl Form {
     pub fn new(set: QuestionSet) -> Form {
@@ -382,6 +442,9 @@ impl Form {
             text: vec![String::new(); n],
             focus: 0,
             notice: None,
+            scroll: Cell::new(0),
+            page: Cell::new(1),
+            reading: Cell::new(true),
         }
     }
 
@@ -409,8 +472,30 @@ impl Form {
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
         let items = self.items();
         let item = items[self.focus.min(items.len() - 1)];
+        let reading = self.reading.get();
+        if !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            self.reading.set(false);
+        }
+        // While reading, the focus may be out of view: the first Enter or
+        // Space only brings it back, never chooses or replies unseen.
+        if reading
+            && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+            && !matches!(item, Item::Text(_))
+        {
+            return Outcome::Open;
+        }
         match key.code {
             KeyCode::Esc => return Outcome::Close,
+            KeyCode::PageUp | KeyCode::PageDown => {
+                let page = self.page.get().max(1);
+                let scroll = self.scroll.get();
+                self.scroll.set(if key.code == KeyCode::PageUp {
+                    scroll.saturating_sub(page)
+                } else {
+                    scroll + page
+                });
+                self.reading.set(true);
+            }
             KeyCode::Up | KeyCode::BackTab => {
                 self.focus = (self.focus + items.len() - 1) % items.len();
             }
@@ -426,8 +511,7 @@ impl Form {
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Item::Text(q) = item {
-                    self.text[q].push(c);
-                    self.chosen[q] = None;
+                    self.type_text(q, &c.to_string());
                 }
             }
             _ => {}
@@ -438,16 +522,29 @@ impl Form {
     /// Paste into the free-text field in focus, on one line.
     pub fn paste(&mut self, text: &str) {
         let items = self.items();
-        if let Some(Item::Text(q)) = items.get(self.focus) {
-            self.text[*q].push_str(&one_line(text));
-            self.chosen[*q] = None;
+        if let Some(&Item::Text(q)) = items.get(self.focus) {
+            self.type_text(q, &one_line(text));
         }
+    }
+
+    /// Add to question `q`'s free text, whole characters only, up to the
+    /// server's limit; typed text replaces a chosen option.
+    fn type_text(&mut self, q: usize, text: &str) {
+        for c in text.chars() {
+            if self.text[q].len() + c.len_utf8() > FREE_TEXT_LIMIT {
+                self.notice = Some("Free text is limited to 4 KiB.".into());
+                break;
+            }
+            self.text[q].push(c);
+        }
+        self.chosen[q] = None;
     }
 
     fn act(&mut self, item: Item, items: &[Item]) -> Outcome {
         match item {
+            // Choosing the chosen option again clears it back to unanswered.
             Item::Choice(q, c) => {
-                self.chosen[q] = Some(c);
+                self.chosen[q] = (self.chosen[q] != Some(c)).then_some(c);
                 self.text[q].clear();
                 Outcome::Open
             }
@@ -486,27 +583,37 @@ impl Form {
         }
     }
 
-    /// The form in a box over `area`: every question, choice and action in
-    /// full, wrapped, scrolled to keep the focus in view.
+    /// The form in a box over `area`: the form's message and every question,
+    /// choice and description in full, wrapped and scrolled; the actions and
+    /// keys stay in view below them at any size.
     pub fn render(&self, frame: &mut Frame, area: Rect, agent: &str) {
         let width = area.width.saturating_sub(2).min(78);
         let inner = width.saturating_sub(2);
         let items = self.items();
         let focused = items.get(self.focus).copied();
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut focus_line = 0;
+        let mut body: Vec<Line<'static>> = Vec::new();
+        if let Some(message) = &self.set.message {
+            for line in message.lines() {
+                body.push(Line::styled(
+                    line.to_string(),
+                    theme::style(theme::Role::Text),
+                ));
+            }
+            body.push(Line::raw(""));
+        }
+        let mut focus_line = None;
         for (q, question) in self.set.questions.iter().enumerate() {
             let mark = if question.required {
                 " (required)"
             } else {
                 " (optional)"
             };
-            lines.push(Line::from(vec![
+            body.push(Line::from(vec![
                 Span::styled(one_line(&question.header), theme::heading()),
                 Span::styled(mark, theme::dim()),
             ]));
             for text in question.text.lines() {
-                lines.push(Line::styled(
+                body.push(Line::styled(
                     text.to_string(),
                     theme::style(theme::Role::Text),
                 ));
@@ -514,7 +621,7 @@ impl Form {
             for (c, choice) in question.choices.iter().enumerate() {
                 let here = focused == Some(Item::Choice(q, c));
                 if here {
-                    focus_line = lines.len();
+                    focus_line = Some(body.len());
                 }
                 let chosen = self.chosen[q] == Some(c);
                 let mut spans = vec![
@@ -532,12 +639,12 @@ impl Form {
                 if here {
                     line = line.style(theme::style(theme::Role::Selection));
                 }
-                lines.push(line);
+                body.push(line);
             }
             if question.allow_free_text {
                 let here = focused == Some(Item::Text(q));
                 if here {
-                    focus_line = lines.len();
+                    focus_line = Some(body.len());
                 }
                 let mut value = Span::styled(self.text[q].clone(), theme::style(theme::Role::Text));
                 if here {
@@ -551,9 +658,9 @@ impl Form {
                 if here {
                     spans.push(Span::styled("█", theme::dim()));
                 }
-                lines.push(Line::from(spans));
+                body.push(Line::from(spans));
             }
-            lines.push(Line::raw(""));
+            body.push(Line::raw(""));
         }
         let actions: Vec<Span> = [
             (Item::Submit, "Submit"),
@@ -570,30 +677,44 @@ impl Form {
             [Span::styled(format!("[{label}]"), style), Span::raw(" ")]
         })
         .collect();
-        if matches!(focused, Some(Item::Submit | Item::Decline | Item::Cancel)) {
-            focus_line = lines.len();
-        }
-        lines.push(Line::from(actions));
+        let mut footer = vec![Line::from(actions)];
         if let Some(notice) = &self.notice {
-            lines.push(Line::styled(notice.clone(), theme::error()));
+            footer.push(Line::styled(notice.clone(), theme::error()));
         }
-        lines.push(Line::styled(
-            "↑/↓ move · Enter or Space choose · Esc closes, questions stay open",
+        footer.push(Line::styled(
+            "↑/↓ move · Enter or Space choose · PgUp/PgDn scroll · Esc closes, questions stay open",
             theme::dim(),
         ));
-        // Measure wrapped rows, so the focus stays in view in a box no
-        // taller than the area, however long the text.
         let rows = |line: &Line<'static>| {
             Paragraph::new(line.clone())
                 .wrap(Wrap { trim: false })
                 .line_count(inner)
         };
-        let heights: Vec<usize> = lines.iter().map(rows).collect();
+        let heights: Vec<usize> = body.iter().map(rows).collect();
         let total: usize = heights.iter().sum();
+        let footer_rows: usize = footer.iter().map(rows).sum();
         let room = usize::from(area.height.saturating_sub(2)).max(1);
-        let at: usize = heights[..focus_line].iter().sum();
-        let scroll = at.saturating_sub(room / 3).min(total.saturating_sub(room));
-        let height = (total.min(room) as u16 + 2).min(area.height);
+        let body_room = room.saturating_sub(footer_rows).max(1);
+        // Scroll just enough to show the whole focused item, its typed tail
+        // included, unless PageUp/PageDown is reading elsewhere.
+        let mut scroll = self.scroll.get();
+        if !self.reading.get()
+            && let Some(line) = focus_line
+        {
+            let start: usize = heights[..line].iter().sum();
+            let end = start + heights[line];
+            if end > scroll + body_room {
+                scroll = end - body_room;
+            }
+            if start < scroll {
+                scroll = start;
+            }
+        }
+        let scroll = scroll.min(total.saturating_sub(body_room));
+        self.scroll.set(scroll);
+        self.page.set(body_room.saturating_sub(1).max(1));
+        let shown_body = total.min(body_room);
+        let height = ((shown_body + footer_rows) as u16 + 2).min(area.height);
         let [row] = Layout::vertical([Constraint::Length(height)])
             .flex(Flex::Center)
             .areas(area);
@@ -609,13 +730,23 @@ impl Form {
                 Span::styled(" asks ", theme::heading()),
             ]))
             .style(theme::base());
+        let inside = block.inner(rect);
         frame.render_widget(Clear, rect);
+        frame.render_widget(block, rect);
+        let [body_area, footer_area] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(footer_rows.min(usize::from(u16::MAX)) as u16),
+        ])
+        .areas(inside);
         frame.render_widget(
-            Paragraph::new(lines)
-                .block(block)
+            Paragraph::new(body)
                 .wrap(Wrap { trim: false })
                 .scroll((scroll.min(usize::from(u16::MAX)) as u16, 0)),
-            rect,
+            body_area,
+        );
+        frame.render_widget(
+            Paragraph::new(footer).wrap(Wrap { trim: false }),
+            footer_area,
         );
     }
 }
@@ -632,6 +763,7 @@ mod tests {
         };
         QuestionSet {
             request_id: 7,
+            message: None,
             questions: vec![
                 Question {
                     id: "deploy".into(),
@@ -660,6 +792,8 @@ mod tests {
     /// Move the focus to the action labelled `n` steps from the first item.
     fn to(form: &mut Form, steps: usize) {
         form.focus = 0;
+        // A focus move ends the opening read, as any arrow key would.
+        form.reading.set(false);
         for _ in 0..steps {
             press(form, KeyCode::Down);
         }
@@ -713,6 +847,15 @@ mod tests {
     }
 
     #[test]
+    fn a_choice_out_of_view_while_reading_is_brought_back_not_chosen() {
+        let mut form = Form::new(set());
+        assert_eq!(press(&mut form, KeyCode::Enter), Outcome::Open);
+        assert_eq!(form.chosen[0], None, "the first Enter only shows the focus");
+        assert_eq!(press(&mut form, KeyCode::Enter), Outcome::Open);
+        assert_eq!(form.chosen[0], Some(0));
+    }
+
+    #[test]
     fn esc_closes_unchanged_and_decline_and_cancel_are_replies() {
         let mut form = Form::new(set());
         assert_eq!(press(&mut form, KeyCode::Esc), Outcome::Close);
@@ -759,6 +902,66 @@ mod tests {
         for unknown in [None, Some(&usage(Measure::Current, None, Some(200_000)))] {
             assert_eq!(text(unknown), "Context size is not reported.");
         }
+    }
+
+    #[test]
+    fn percentages_use_wide_arithmetic_and_are_never_clamped() {
+        let line = |used, limit| {
+            context_lines(
+                "Mateo",
+                Some(&ContextUsage {
+                    measure: Measure::Current,
+                    used: Some(used),
+                    limit: Some(limit),
+                    reported_at: "2026-10-20T02:30:00Z".into(),
+                }),
+            )[1]
+            .to_string()
+        };
+        assert!(line(u64::MAX, u64::MAX).contains("(100%)"));
+        assert!(line(u64::MAX, 1).contains(&format!("({}%)", u128::from(u64::MAX) * 100)));
+        assert!(
+            line(300, 200).contains("(150%)"),
+            "over the limit as reported"
+        );
+    }
+
+    #[test]
+    fn choosing_the_chosen_option_again_clears_an_optional_answer() {
+        let mut form = Form::new(set());
+        form.set.questions[0].required = false;
+        to(&mut form, 0);
+        press(&mut form, KeyCode::Enter);
+        assert_eq!(form.chosen[0], Some(0));
+        press(&mut form, KeyCode::Char(' '));
+        assert_eq!(form.chosen[0], None, "back to unanswered");
+        to(&mut form, SUBMIT);
+        assert_eq!(
+            press(&mut form, KeyCode::Enter),
+            Outcome::Reply(Reply::Submit(vec![]))
+        );
+    }
+
+    #[test]
+    fn free_text_stops_at_four_kib_on_a_character_boundary() {
+        let mut form = Form::new(set());
+        to(&mut form, 2);
+        form.paste(&"é".repeat(3000));
+        assert!(form.text[1].len() <= FREE_TEXT_LIMIT);
+        assert_eq!(form.text[1].len(), 4096, "2048 two-byte characters fit");
+        assert!(form.notice.is_some());
+        let mut form = Form::new(set());
+        to(&mut form, 2);
+        form.paste(&format!("{}👩‍💻", "a".repeat(4094)));
+        assert_eq!(
+            form.text[1],
+            "a".repeat(4094),
+            "a wide character never splits"
+        );
+        press(&mut form, KeyCode::Char('b'));
+        press(&mut form, KeyCode::Char('c'));
+        press(&mut form, KeyCode::Char('d'));
+        assert_eq!(form.text[1].len(), 4096);
     }
 
     #[test]
