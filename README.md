@@ -175,6 +175,13 @@ with provider support for the corresponding events. The optional server
 capability is `agent-interactions.v1`; ordinary turns continue without it. See
 [HEADLESS.md](HEADLESS.md) for supported form types and cancellation behavior.
 
+`/btw QUESTION` asks a side question using the agent's context while its main
+conversation continues. The answer appears in a separate panel and stays out of
+the parent's conversation and BBS history. The first supported harness is Codex
+app-server; it needs an updated server with `side-questions.v1` and a restarted
+runner. Tools, files and services are shared, so the side question can affect
+shared systems. See [Side questions](HEADLESS.md#side-questions) for limits and
+cancellation.
 
 `read` prints nothing and exits 0 when the inbox is empty. `read --wait` blocks until mail arrives, which lets an overseer agent sleep in a background shell call. Only one `read --wait` may run per inbox; another fails immediately with "already running". Locally, the advisory lock files live in `~/.local/state/bbs/locks/` and are released by the OS when the waiter exits. With a server, the server holds the slot until the waiter's connection closes; HTTP/2 keepalive frees it within about 30 seconds if the client vanishes.
 
@@ -822,6 +829,11 @@ A new runner generation clears context and withdraws old pending questions;
 retirement clears the interaction state. Request ids remain unique across
 retirement and re-registration. These optional RPCs use
 `agent-interactions.v1`; older remote clients and runners keep working.
+Side questions (schema 19) add a bounded request/result table and runner
+capability metadata. They require `side-questions.v1` and a supporting runner.
+Pending requests are interrupted when the runner generation changes; questions
+are never replayed into a model after restart.
+
 Back up before the server first opens the database with this version: older
-binaries cannot open schema 18. Downgrading requires restoring the pre-upgrade
+binaries cannot open schema 19. Downgrading requires restoring the pre-upgrade
 backup, losing any changes made after that backup.

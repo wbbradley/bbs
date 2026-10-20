@@ -8,14 +8,22 @@ under the new package version and its publication date.
 
 ## Unreleased
 
-Native questions and context reports add database schema 18. Upgrade the server,
-runner and client to use them; older remote clients and runners keep working,
+Native questions, context reports and side questions add database schema 19.
+Upgrade the server, runner and client to use them; older remote clients and runners keep working,
 and updated runners continue ordinary turns when `agent-interactions.v1` is
 absent. Back up before upgrading the server. Older binaries cannot open schema
-18; restoring the pre-upgrade backup loses subsequent changes.
+19; restoring the pre-upgrade backup loses subsequent changes.
 
 ### Added
 
+- `/btw QUESTION` in an owned agent conversation asks a separate question using
+  the main agent's context, with a dedicated answer panel and child-only
+  cancellation. The main conversation continues, and the side exchange stays
+  outside its history. Initially supports Codex app-server with
+  `side-questions.v1` and a restarted runner. Tools, files and services are
+  shared; a prompt reminder asks the child to avoid interference. One question
+  may run at a time, with a 4 KiB question, 64 KiB answer and two-minute lifetime.
+  Runner restarts interrupt pending work without replaying the model request.
 - Updated headless runners relay native Codex app-server questions and supported
   ACP forms to the owner through a separate request path. Answers return to the
   original live callback as native tool results. Cancelled or obsolete questions

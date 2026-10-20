@@ -1,7 +1,5 @@
 # bbs connect
 
-Status: design, not yet implemented. Target: 0.7.x.
-
 `bbs connect` is an interactive terminal app for humans. It looks and feels
 like a dial-up BBS from the early 1990s, with scheme-colored art
 and box-drawing menus. Its main job is to let a human see their agents
@@ -124,6 +122,23 @@ context report on demand, labelled as the current context or the last model
 request, with no percentage when the limit is unknown and "not reported" rather
 than 0%; Esc closes it. Both commands are local, never sent, and only for the
 agent's owner.
+
+### Side questions
+
+In an owned agent conversation, `/btw QUESTION` opens a separate answer panel
+above the composer. The parent timeline and composer remain usable while it
+runs. Questions are at most 4 KiB and answers at most 64 KiB; one question may
+run at a time. `//btw QUESTION` sends the literal text `/btw QUESTION` as mail.
+An empty question, missing support or a refusal keeps the draft and explains
+the problem. A confirmed start clears the submitted draft only if it has not
+changed; an uncertain start keeps it and is never automatically retried.
+
+The panel shows the request's state and answer. Esc cancels a running request
+or dismisses a finished one. Closing the conversation keeps the request running;
+reopening shows its latest result. A runner restart interrupts pending work.
+Side questions require `side-questions.v1` and a supporting runner; the initial
+implementation supports Codex app-server. Tools and shared systems remain
+available to the child, as described in [HEADLESS.md](HEADLESS.md#side-questions).
 
 ### Agent effort
 
