@@ -144,7 +144,7 @@ impl Thread {
         {
             entries.extend(stream.entries(&loaded));
         }
-        let entries = compacted(self.compact, entries);
+        let entries = compacted(self.compact_side().as_ref(), entries);
         let query = self.view.query.clone();
         self.view = ThreadView::new(entries, BACKLOG as usize);
         if let Some(query) = query {
@@ -153,14 +153,14 @@ impl Thread {
     }
 
     /// The messages shown, which activity records may stand for, marking
-    /// automatic replies from this agent. While messages are filtered out,
-    /// none, so activity is never hidden along with the mail it stands for;
-    /// but compact view still counts mail among other participants, so their
-    /// echoes stay hidden with them.
+    /// automatic replies from this agent. None while messages are filtered
+    /// out, so activity is never hidden along with the mail it stands for.
     fn loaded(&self) -> Loaded {
+        if !self.show.messages() {
+            return Loaded::new();
+        }
         self.messages
             .iter()
-            .filter(|m| self.show.messages() || (self.compact && self.other_participants(m)))
             .map(|m| {
                 let reply = m.auto_reply == Some(true)
                     && m.from_kind() == proto::Kind::Agent
@@ -211,6 +211,17 @@ impl Thread {
                 message: m,
             })
             .collect()
+    }
+
+    /// While compact, the ids of held mail among other participants.
+    fn compact_side(&self) -> Option<HashSet<i64>> {
+        self.compact.then(|| {
+            self.messages
+                .iter()
+                .filter(|m| self.other_participants(m))
+                .map(|m| m.id)
+                .collect()
+        })
     }
 
     fn other_participants(&self, message: &Message) -> bool {
@@ -687,10 +698,11 @@ impl Thread {
     }
 }
 
-/// `entries` less what compact view hides, when it is on.
-fn compacted(compact: bool, mut entries: Vec<Entry>) -> Vec<Entry> {
-    if compact {
-        entries.retain(|e| !e.compact_hides());
+/// `entries` less what compact view hides, given the ids of mail among
+/// other participants while it is on.
+fn compacted(side: Option<&HashSet<i64>>, mut entries: Vec<Entry>) -> Vec<Entry> {
+    if let Some(side) = side {
+        entries.retain(|e| !e.compact_hides(side));
     }
     entries
 }
@@ -907,7 +919,7 @@ impl Screen for Thread {
     }
 
     fn on_data(&mut self, data: &Data) {
-        let compact = self.compact;
+        let side = self.compact_side();
         if let Some(owner) = &mut self.owner {
             owner.on_data(data);
             // The server took the question: clear the draft unless it changed.
@@ -925,7 +937,7 @@ impl Screen for Thread {
                 // kept, so no evicted row outlives the dedup history.
                 self.reconcile();
             } else if self.show.stream() && !entries.is_empty() {
-                self.view.ingest(compacted(compact, entries));
+                self.view.ingest(compacted(side.as_ref(), entries));
             }
         }
         match data {
@@ -950,7 +962,7 @@ impl Screen for Thread {
                         self.reconcile();
                     } else if self.show.messages() {
                         let entries = self.message_entries(messages);
-                        self.view.ingest(compacted(compact, entries));
+                        self.view.ingest(compacted(side.as_ref(), entries));
                     }
                 }
                 Err(e) => self.error = Some(describe(e)),

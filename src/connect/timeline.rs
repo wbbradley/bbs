@@ -54,21 +54,25 @@ pub enum Entry {
         thought: bool,
         /// Assistant reply text uses the same inset as its delivered mail.
         reply: bool,
+        /// The mail this record stands for: what a text was delivered as
+        /// (`mail_id`) and what a receipt or turn echoes (`mail_ids`).
+        echoes: Vec<i64>,
     },
 }
 
 impl Entry {
-    /// What compact view hides: finished tool calls and mail among other
-    /// participants.
-    pub fn compact_hides(&self) -> bool {
-        self.is_tool()
-            || matches!(
-                self,
-                Entry::Message {
-                    other_participants: true,
-                    ..
-                }
-            )
+    /// What compact view hides: finished tool calls, mail among other
+    /// participants, and any activity standing for such mail (`side`), even
+    /// alongside direct mail.
+    pub fn compact_hides(&self, side: &HashSet<i64>) -> bool {
+        match self {
+            Entry::Message {
+                other_participants, ..
+            } => *other_participants,
+            Entry::Stream { call, echoes, .. } => {
+                call.is_some() || echoes.iter().any(|id| side.contains(id))
+            }
+        }
     }
 
     fn is_tool(&self) -> bool {
@@ -519,6 +523,7 @@ impl Stream {
             call: self.renderer.take_tool(),
             thought: event == "thought",
             reply: event == "text",
+            echoes: kept.mail_ids.iter().copied().chain(kept.mail_id).collect(),
         })
     }
 
@@ -803,6 +808,7 @@ mod tests {
             call: tool.then(|| ToolLine::running("a")),
             thought: false,
             reply: false,
+            echoes: Vec::new(),
         };
         let call = row(true, vec![Line::raw("✓ a")]);
         let text = row(false, vec![Line::raw("text")]);
@@ -1136,6 +1142,7 @@ mod tests {
             call: None,
             thought: false,
             reply: false,
+            echoes: Vec::new(),
         };
         assert!(
             !first.spaced_after(Some(&padded)),
@@ -1148,6 +1155,7 @@ mod tests {
             call: Some(ToolLine::running("read")),
             thought: false,
             reply: false,
+            echoes: Vec::new(),
         };
         assert!(
             first.spaced_after(Some(&tool)),

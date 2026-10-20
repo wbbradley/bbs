@@ -5466,6 +5466,112 @@ mod tests {
     }
 
     #[test]
+    fn compact_hides_an_envelope_echoing_side_mail_alongside_direct_mail() {
+        let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let mail = vec![
+            at(11, "01", "Zed", "Mateo", "private side chatter"),
+            proto::Message {
+                from_kind: proto::Kind::Human.into(),
+                ..at(12, "02", "ada", "Mateo", "direct question")
+            },
+            proto::Message {
+                auto_reply: Some(true),
+                ..at(13, "04", "Mateo", "ada", "auto text")
+            },
+            proto::Message {
+                auto_reply: Some(true),
+                ..at(14, "06", "Mateo", "Zed", "side auto")
+            },
+        ];
+        // How each envelope shows the side message when it draws.
+        for (event, marker) in [
+            ("prompt", "private side chatter"),
+            ("steer", "private side chatter"),
+            ("mail", "mail from Zed"),
+        ] {
+            let records = vec![
+                activity(
+                    20,
+                    "03",
+                    &serde_json::json!({
+                        "event": event,
+                        "from": ["Zed", "ada"],
+                        "mail_ids": [11, 12],
+                        "text": "private side chatter\n\ndirect question",
+                    })
+                    .to_string(),
+                ),
+                activity(
+                    21,
+                    "05",
+                    r#"{"event":"text","text":"auto text","mail_id":13}"#,
+                ),
+                activity(
+                    22,
+                    "07",
+                    r#"{"event":"text","text":"side auto","mail_id":14}"#,
+                ),
+            ];
+            for mail_first in [true, false] {
+                let (mut app, mut rx) = app();
+                let (feed, act) = mateo_streams(&mut app, &mut rx);
+                let feed = Event::Data(Data::Feed {
+                    id: feed,
+                    result: Ok(mail.clone()),
+                });
+                let activity = Event::Data(Data::Activity {
+                    id: act,
+                    result: Ok(records.clone()),
+                });
+                if mail_first {
+                    app.on_event(feed);
+                    app.on_event(activity);
+                } else {
+                    app.on_event(activity);
+                    app.on_event(feed);
+                }
+                press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+                // (compact, A presses, times the side message shows).
+                for (compact, a, side) in [
+                    // Verbose: the card stands for the envelope's side
+                    // message; activity alone draws the envelope.
+                    (false, 0, 1),
+                    (false, 2, 1),
+                    // Compact: neither, under any filter.
+                    (true, 0, 0),
+                    (true, 2, 0),
+                ] {
+                    for _ in 0..a {
+                        key(&mut app, 'A');
+                    }
+                    if compact {
+                        ctrl_t(&mut app);
+                    }
+                    let out = screen(&mut app, 80, 40);
+                    let case =
+                        format!("{event}, mail first {mail_first}, compact {compact}, A×{a}");
+                    let shown = if a == 0 && !compact {
+                        out.matches("private side chatter").count()
+                    } else {
+                        out.matches(marker).count()
+                    };
+                    assert_eq!(shown, side, "{case}: {out}");
+                    // The direct reply shows once, as mail or as its text;
+                    // a side reply, like any side message.
+                    assert_eq!(out.matches("auto text").count(), 1, "{case}: {out}");
+                    assert_eq!(out.matches("side auto").count(), side, "{case}: {out}");
+                    if compact {
+                        ctrl_t(&mut app);
+                    }
+                    for _ in 0..(3 - a) % 3 {
+                        key(&mut app, 'A');
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_tool_finishing_while_hidden_restores_finished_and_search_keeps_ctrl_t() {
         let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let (mut app, mut rx) = app();
