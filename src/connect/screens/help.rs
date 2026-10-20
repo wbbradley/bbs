@@ -17,6 +17,10 @@ const AGENT_KEYS: &[(&str, &str)] = &[
         "Enter sends; Esc back, saving the draft/cursor",
     ),
     ("PgUp", "agent insert: navigate the timeline"),
+    (
+        "PgDn",
+        "agent navigation: follow and focus input at the bottom",
+    ),
     ("Ctrl-U", "insert: delete to line start; join at column 0"),
     ("Esc", "agent navigation: return to insert mode"),
     (

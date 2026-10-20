@@ -1218,7 +1218,13 @@ impl Screen for Thread {
             Action::Up => self.view.scroll_up(1),
             Action::Down => self.view.scroll_down_by(1),
             Action::PageUp => self.view.scroll_up(page),
-            Action::PageDown => self.view.scroll_down_by(page),
+            Action::PageDown => {
+                self.view.scroll_down_by(page);
+                if self.agent.is_some() && self.view.top() == self.view.frame.bottom() {
+                    self.view.follow();
+                    self.composing = true;
+                }
+            }
             Action::HalfPageUp => self.view.scroll_up(page / 2),
             Action::HalfPageDown => self.view.scroll_down_by(page / 2),
             Action::Top => self.view.scroll_to(0),

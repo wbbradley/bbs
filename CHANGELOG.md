@@ -8,6 +8,11 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Fixed
+
+- In agent conversations, paging down to the newest view resumes following
+  and returns focus to the composer, keeping the draft and cursor position.
+
 ### Changed
 
 - `bbs connect` agent conversations open on the newest activity: the loading

@@ -4601,6 +4601,60 @@ mod tests {
     }
 
     #[test]
+    fn paging_down_to_the_live_tail_follows_and_restores_the_draft_cursor() {
+        for (pages_up, messages) in [(1, 60), (4, 60), (100, 60), (1, 1), (3, 0)] {
+            let (mut app, mut rx) = app();
+            let id = mateo(&mut app, &mut rx);
+            let rows = |count| {
+                (1..=count)
+                    .map(|id| message(id, "Mateo", "ada", &format!("message {id}")))
+                    .collect()
+            };
+            app.on_event(Event::Data(Data::Feed {
+                id,
+                result: Ok(rows(messages)),
+            }));
+            typed(&mut app, "draft");
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            for _ in 0..pages_up {
+                press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+                screen(&mut app, 80, 24);
+            }
+            assert!(!editor_focused(&mut app));
+            if messages > 1 {
+                app.on_event(Event::Data(Data::Feed {
+                    id,
+                    result: Ok(rows(messages + 1)),
+                }));
+                assert!(bottom(&mut app).contains("1 new"));
+            }
+            let mut returned = false;
+            for pages_down in 1..=100 {
+                press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+                let out = screen(&mut app, 80, 24);
+                if messages > 1 && pages_up <= 4 && pages_down < pages_up {
+                    assert!(!editor_focused(&mut app), "still above the tail: {out}");
+                }
+                if editor_focused(&mut app) {
+                    assert!(out.contains("following") && !out.contains("1 new"), "{out}");
+                    returned = true;
+                    break;
+                }
+                assert!(out.contains("paused"), "{out}");
+            }
+            assert!(returned, "PgUp count {pages_up}, messages {messages}");
+            typed(&mut app, "|");
+            enter(&mut app);
+            let sent = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|r| match r {
+                Request::Send { req, .. } => Some(req.body),
+                _ => None,
+            });
+            assert_eq!(sent.as_deref(), Some("dra|ft"));
+        }
+    }
+
+    #[test]
     fn agent_insert_and_navigation_modes_use_explicit_switches() {
         let (mut app, mut rx) = app();
         let id = mateo(&mut app, &mut rx);

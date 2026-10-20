@@ -355,6 +355,7 @@ and Home/End work everywhere too.
   straight to a screen.
 - Agent conversations open in Insert mode, with the composer active. `PgUp` switches to navigation and scrolls the timeline. In navigation,
   `Esc` returns to Insert mode; in Insert mode, `Esc` goes back to Agents.
+  Paging down to the newest view resumes following and returns focus to the composer.
   Agent and group drafts and cursor positions are restored when their discussions
   are reopened, including in a later `connect` session. Arrow keys, including `Up`
   on the first line, stay within the editor while in Insert mode.
