@@ -21,6 +21,7 @@ const MAX_PENDING: usize = 32;
 pub struct Session {
     backend: Backend,
     generation: String,
+    btw_backend: Option<Backend>,
     #[cfg(test)]
     publish_ack: Option<(
         tokio::sync::oneshot::Sender<()>,
@@ -39,15 +40,27 @@ impl Session {
                 },
             )
             .await?;
-            if !backend
-                .server_info()
-                .await?
-                .capabilities
-                .iter()
-                .any(|c| c == AGENT_INTERACTIONS)
-            {
+            let capabilities = backend.server_info().await?.capabilities;
+            if !capabilities.iter().any(|c| c == AGENT_INTERACTIONS) {
                 return Ok(None);
             }
+            let btw_backend = if capabilities
+                .iter()
+                .any(|c| c == crate::backend::SIDE_QUESTIONS)
+            {
+                Backend::open(
+                    config,
+                    dir,
+                    Caller {
+                        token: Some(token.into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .ok()
+            } else {
+                None
+            };
             let generation = crate::auth::new_token();
             backend
                 .begin_side_session(proto::BeginSideSessionRequest {
@@ -57,6 +70,7 @@ impl Session {
             Ok(Some(Self {
                 backend,
                 generation,
+                btw_backend,
                 #[cfg(test)]
                 publish_ack: None,
             }))
@@ -64,7 +78,22 @@ impl Session {
         .await?
     }
 
-    pub fn start(self, harness: Harness, warnings: mpsc::UnboundedSender<String>) -> Side {
+    pub async fn start(
+        mut self,
+        harness: Harness,
+        warnings: mpsc::UnboundedSender<String>,
+    ) -> Side {
+        let btw = if let Some(backend) = self.btw_backend.take() {
+            super::btw::Btw::start(
+                backend,
+                self.generation.clone(),
+                harness.clone(),
+                warnings.clone(),
+            )
+            .await
+        } else {
+            None
+        };
         let (commands, rx) = mpsc::channel(MAX_PENDING);
         let (usage, usage_rx) = watch::channel(None);
         let (stop, stop_rx) = watch::channel(false);
@@ -77,6 +106,7 @@ impl Session {
             stop_rx,
         ));
         Side {
+            btw,
             commands,
             usage,
             stop,
@@ -103,6 +133,7 @@ struct Pending {
 }
 
 pub struct Side {
+    btw: Option<super::btw::Btw>,
     commands: mpsc::Sender<Command>,
     usage: watch::Sender<Option<Snapshot>>,
     stop: watch::Sender<bool>,
@@ -133,6 +164,9 @@ impl Side {
         }
     }
     pub async fn finish(mut self) {
+        if let Some(btw) = self.btw.take() {
+            btw.finish().await;
+        }
         self.harness.enable_input(false);
         self.harness.cancel_input();
         let _ = self.stop.send(true);
@@ -367,7 +401,7 @@ fn warn(warnings: &mpsc::UnboundedSender<String>, warned: &mut bool, error: &any
         *warned = true;
     }
 }
-fn permanent(backend: &Backend, error: &anyhow::Error) -> bool {
+pub(super) fn permanent(backend: &Backend, error: &anyhow::Error) -> bool {
     if let Some(status) = error.downcast_ref::<tonic::Status>() {
         return matches!(
             status.code(),
@@ -487,7 +521,7 @@ mod tests {
         let (harness, mut process, mut events) =
             provider(dir.path(), HarnessType::CodexAppServer, true).await;
         let (warnings, _) = mpsc::unbounded_channel();
-        let side = session.start(harness.clone(), warnings);
+        let side = session.start(harness.clone(), warnings).await;
         let h = harness.clone();
         let prompt = tokio::spawn(async move { h.prompt("ASK", None).await });
         side.event(&form(&mut events).await);
@@ -567,7 +601,7 @@ mod tests {
         let (harness, mut process, mut events) =
             provider(dir.path(), HarnessType::CodexAppServer, true).await;
         let (warnings, mut warning_rx) = mpsc::unbounded_channel();
-        let side = session.start(harness.clone(), warnings);
+        let side = session.start(harness.clone(), warnings).await;
         let h = harness.clone();
         let prompt = tokio::spawn(async move { h.prompt("ASK", None).await });
         side.event(&form(&mut events).await);
@@ -627,7 +661,7 @@ mod tests {
         let (harness, mut process, mut events) =
             provider(dir.path(), HarnessType::CodexAppServer, true).await;
         let (warnings, mut warnings_rx) = mpsc::unbounded_channel();
-        let side = session.start(harness.clone(), warnings);
+        let side = session.start(harness.clone(), warnings).await;
         let h = harness.clone();
         let prompt = tokio::spawn(async move { h.prompt("ASK", None).await });
         side.event(&form(&mut events).await);

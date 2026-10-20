@@ -182,7 +182,11 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             return Err(err);
         }
     };
-    let interactions = side_session.map(|s| s.start(agent_harness.clone(), share_warn.clone()));
+    let interactions = if let Some(s) = side_session {
+        Some(s.start(agent_harness.clone(), share_warn.clone()).await)
+    } else {
+        None
+    };
     state.harness = Some(harness.clone());
     state.session_id = Some(agent_harness.session_id().to_string());
     agent_dir.save(&state)?;

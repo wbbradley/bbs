@@ -290,6 +290,11 @@ impl Codex {
             )
             .await
     }
+    #[cfg(test)]
+    pub fn side_tools_for_test(&self) -> Arc<tokio::sync::Mutex<Tools>> {
+        self.side_tools.clone()
+    }
+
     pub fn side_text(&self) -> String {
         self.side.text()
     }
@@ -582,11 +587,24 @@ fn handle(
                 }
                 let name = params["tool"].as_str().unwrap_or_default();
                 // Tool failures are results the agent can read.
-                let (text, success) =
-                    match tools.lock().await.call(name, &params["arguments"]).await {
+                let (text, success) = {
+                    let mut tools = tools.lock().await;
+                    let still_current = {
+                        let current = turn.turn.lock().unwrap();
+                        current.done.is_some() && current.id == running && !current.cancel_requested
+                    };
+                    if !still_current {
+                        rpc.respond_later(
+                            id,
+                            Err("parent turn closed before tool dispatch".into()),
+                        );
+                        return;
+                    }
+                    match tools.call(name, &params["arguments"]).await {
                         Ok(text) => (text, true),
                         Err(err) => (format!("{err:#}"), false),
-                    };
+                    }
+                };
                 let reply = json!({
                     "contentItems": [{ "type": "inputText", "text": text }],
                     "success": success,

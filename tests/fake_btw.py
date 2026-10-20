@@ -1,0 +1,101 @@
+"""Isolated Codex fork fixture; no model calls or real tools."""
+import json
+import os
+import sys
+import threading
+import time
+
+scenario = sys.argv[1]
+lock = threading.Lock()
+parent_live = False
+child_live = False
+waiting = set()
+
+def record(kind, **fields):
+    with open('btw-wire.jsonl','a') as f: f.write(json.dumps(dict(kind=kind,**fields))+'\n')
+def out(value):
+    with lock: print(json.dumps(value),flush=True)
+def reply(mid,result):out(dict(jsonrpc='2.0',id=mid,result=result))
+def error(mid):out(dict(jsonrpc='2.0',id=mid,error=dict(code=-32601,message='unsupported fixture prerequisite')))
+def note(method,p):out(dict(jsonrpc='2.0',method=method,params=p))
+def text(thread,turn,body,item='m'):
+    note('item/agentMessage/delta',dict(threadId=thread,turnId=turn,itemId=item,delta=body))
+def done(thread,turn,status='completed'):
+    global child_live,parent_live
+    note('turn/completed',dict(threadId=thread,turn=dict(id=turn,status=status)))
+    if thread=='child':child_live=False
+    else:parent_live=False
+
+def later(marker,mid,value):
+    def wait():
+        while not os.path.exists(marker): time.sleep(.01)
+        reply(mid,value)
+    threading.Thread(target=wait,daemon=True).start()
+
+for line in sys.stdin:
+    msg=json.loads(line);method=msg.get('method');mid=msg.get('id');p=msg.get('params',{})
+    if method is None:
+        record('callback',id=mid,response=msg)
+        waiting.discard(mid)
+        if not waiting and child_live and scenario in ['normal','early','tools']:
+            text('child','s','side final\n')
+            done('child','s')
+        continue
+    record('rpc',method=method,params=p)
+    if method=='initialize':reply(mid,{})
+    elif method=='model/list':reply(mid,dict(data=[],nextCursor=None))
+    elif method in ['thread/start','thread/resume']:
+        if method=='thread/start':assert any(t['name']=='bbs_agents' for t in p['dynamicTools'])
+        reply(mid,dict(thread=dict(id='parent'),model='fixture',reasoningEffort='low'))
+    elif method=='thread/fork':
+        assert p==dict(threadId='parent',ephemeral=True,excludeTurns=True,deferGoalContinuation=True)
+        if scenario=='no-fork':error(mid);continue
+        fork=dict(thread=dict(id='child',forkedFromId='parent',ephemeral=True))
+        if scenario=='bad-fork':fork['thread']['ephemeral']=False
+        if scenario=='late-fork':record('fork_pending');later('release-fork',mid,fork)
+        else:reply(mid,fork)
+    elif method=='thread/goal/clear':
+        assert p['threadId']=='child'
+        if scenario=='no-goal':error(mid)
+        else:reply(mid,{})
+    elif method=='turn/start':
+        if p['threadId']=='parent':
+            parent_live=True;reply(mid,dict(turn=dict(id='p')));text('parent','p','parent before\n');record('parent_active')
+            continue
+        assert p['threadId']=='child'
+        assert p['input'][0]['text'].startswith('You are answering a side question alongside the main agent.')
+        child_live=True
+        ack=dict(turn=dict(id='s'))
+        if scenario in ['late-start','late-start-tools']:
+            note('turn/started',dict(threadId='child',turn=dict(id='s')))
+            record('start_pending')
+            if scenario=='late-start-tools':
+                out(dict(jsonrpc='2.0',id='tool',method='item/tool/call',params=dict(threadId='child',turnId='s',callId='t',tool='bbs_agents',arguments={})))
+                record('tool_pending')
+            later('release-start',mid,ack);continue
+        if scenario!='early':reply(mid,ack)
+        text('parent','p','parent alongside\n')
+        text('child','old-side','STALE SIDE TEXT')
+        text('child','s','side prefix\n')
+        note('thread/tokenUsage/updated',dict(threadId='child',turnId='s',tokenUsage=dict(last=dict(totalTokens=99999),modelContextWindow=100)))
+        if scenario=='overflow':text('child','s','é'*40000);continue
+        if scenario=='hold':record('side_active');continue
+        waiting={'native','approval','foreign'}
+        out(dict(jsonrpc='2.0',id='native',method='item/tool/requestUserInput',params=dict(threadId='child',turnId='s',itemId='q',isBlocking=True,questions=[])))
+        out(dict(jsonrpc='2.0',id='approval',method='item/commandExecution/requestApproval',params=dict(threadId='child',turnId='s',command='synthetic')))
+        out(dict(jsonrpc='2.0',id='foreign',method='item/tool/call',params=dict(threadId='unrelated',turnId='s',callId='f',tool='bbs_status',arguments=dict(text='must not execute'))))
+        if scenario in ['tools','tools-cancel','tools-complete']:
+            waiting.add('tool')
+            out(dict(jsonrpc='2.0',id='tool',method='item/tool/call',params=dict(threadId='child',turnId='s',callId='t',tool='bbs_agents',arguments={})))
+            record('tool_pending')
+            if scenario=='tools-complete':done('child','s')
+        if scenario=='early':reply(mid,ack)
+    elif method=='turn/interrupt':
+        assert p['threadId'] in ['parent','child']
+        reply(mid,{})
+        done(p['threadId'],p['turnId'],'interrupted')
+    elif method=='thread/unsubscribe':
+        assert p['threadId']=='child';reply(mid,{})
+    elif method=='turn/steer':
+        assert p['threadId']=='parent';reply(mid,dict(turnId='p'));text('parent','p','parent steered\n')
+    elif mid is not None:error(mid)

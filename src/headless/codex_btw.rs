@@ -170,6 +170,11 @@ impl SideChannel {
                             .await
                     };
                     let result = tokio::select! {biased; _=cancelled.changed()=>Err(anyhow!("side turn cancelled")), r=work=>r};
+                    let result = if channel.matches(&thread, turn.as_deref()) {
+                        result
+                    } else {
+                        Err(anyhow!("side turn closed before tool response"))
+                    };
                     let success = result.is_ok();
                     let text = match result {
                         Ok(text) => text,
@@ -186,11 +191,9 @@ impl SideChannel {
     }
 
     fn matches(&self, thread: &str, turn: Option<&str>) -> bool {
-        self.child
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|c| c.active && c.thread == thread && c.turn.as_deref() == turn)
+        self.child.lock().unwrap().as_ref().is_some_and(|c| {
+            c.active && !c.cancelled && c.thread == thread && c.turn.as_deref() == turn
+        })
     }
 
     pub async fn run(
@@ -512,5 +515,292 @@ fn notification(c: &mut Child, method: &str, p: &Value) {
             );
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::headless::{
+        acp::McpServer,
+        harness::{BbsTools, Event, Harness},
+        rpc::Process,
+        settings::{HarnessConfig, HarnessType},
+    };
+    struct Rig {
+        dir: tempfile::TempDir,
+        harness: Harness,
+        process: Process,
+        events: mpsc::UnboundedReceiver<Event>,
+    }
+    use tokio::sync::mpsc;
+    impl Rig {
+        async fn new(scenario: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let config = HarnessConfig {
+                kind: HarnessType::CodexAppServer,
+                command: vec![
+                    "python3".into(),
+                    format!("{}/tests/fake_btw.py", env!("CARGO_MANIFEST_DIR")),
+                    scenario.into(),
+                ],
+                ..Default::default()
+            };
+            let (harness, process, events, _) = Harness::start(
+                &config,
+                dir.path(),
+                &dir.path().join("stderr"),
+                BbsTools {
+                    mcp: McpServer {
+                        name: "bbs".into(),
+                        command: "unused".into(),
+                        args: vec![],
+                        env: vec![],
+                    },
+                    tools: Tools::new(dir.path(), "synthetic-unused".into()),
+                    input_enabled: true,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            Self {
+                dir,
+                harness,
+                process,
+                events,
+            }
+        }
+        fn wire(&self) -> Vec<Value> {
+            std::fs::read_to_string(self.dir.path().join("btw-wire.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect()
+        }
+        async fn wait(&self, p: impl Fn(&[Value]) -> bool) {
+            timeout(Duration::from_secs(5), async {
+                while !p(&self.wire()) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        async fn parent(&mut self) -> tokio::task::JoinHandle<Result<String>> {
+            let h = self.harness.clone();
+            let task = tokio::spawn(async move { h.prompt("MAIN CONTEXT", None).await });
+            self.wait(|w| w.iter().any(|v| v["kind"] == "parent_active"))
+                .await;
+            task
+        }
+        fn side(&self, cancel: watch::Receiver<bool>) -> tokio::task::JoinHandle<Outcome> {
+            let h = self.harness.clone();
+            tokio::spawn(async move { h.side_question("SIDE QUESTION", cancel).await })
+        }
+        async fn finish(&mut self, parent: tokio::task::JoinHandle<Result<String>>) {
+            self.harness.cancel().await.unwrap();
+            timeout(Duration::from_secs(5), parent)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            self.process.stop().await;
+        }
+    }
+    #[tokio::test]
+    async fn parent_continues_and_child_callbacks_never_reach_parent_events() {
+        for scenario in ["normal", "early"] {
+            let mut r = Rig::new(scenario).await;
+            let parent = r.parent().await;
+            let (_cancel, rx) = watch::channel(false);
+            let result = timeout(Duration::from_secs(5), r.side(rx))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.status, Status::Completed);
+            assert_eq!(result.answer, "side prefix\nside final\n");
+            assert!(!result.disable);
+            assert!(!parent.is_finished());
+            r.harness.steer("ordinary parent mail").await.unwrap();
+            r.wait(|w| {
+                w.iter()
+                    .any(|v| v["kind"] == "rpc" && v["method"] == "turn/steer")
+            })
+            .await;
+            while let Ok(e) = r.events.try_recv() {
+                match e {
+                    Event::Text(_, t) => {
+                        assert!(!t.starts_with("side") && !t.contains("STALE SIDE"))
+                    }
+                    Event::Permission(_) | Event::OwnerInput(_) => {
+                        panic!("child callback entered parent events")
+                    }
+                    Event::ContextChanged(Some(u)) => assert_ne!(u.used_tokens, Some(99999)),
+                    _ => {}
+                }
+            }
+            let wire = r.wire();
+            let native = wire.iter().find(|v| v["id"] == "native").unwrap();
+            assert_eq!(native["response"]["result"], json!({"answers":{}}));
+            assert!(
+                wire.iter().find(|v| v["id"] == "foreign").unwrap()["response"]["error"]
+                    .is_object()
+            );
+            assert!(
+                wire.iter()
+                    .filter(|v| v["method"] == "turn/start" && v["params"]["threadId"] == "parent")
+                    .all(|v| !v["params"].to_string().contains("SIDE QUESTION"))
+            );
+            r.finish(parent).await;
+        }
+    }
+    #[tokio::test]
+    async fn unsupported_prerequisites_never_submit_child_prompt() {
+        for scenario in ["no-fork", "bad-fork", "no-goal"] {
+            let mut r = Rig::new(scenario).await;
+            let parent = r.parent().await;
+            let (_cancel, rx) = watch::channel(false);
+            let result = r.side(rx).await.unwrap();
+            assert!(matches!(
+                result.status,
+                Status::Unsupported | Status::Failed
+            ));
+            assert!(result.disable);
+            assert!(!parent.is_finished());
+            assert!(
+                !r.wire()
+                    .iter()
+                    .any(|v| v["method"] == "turn/start" && v["params"]["threadId"] == "child")
+            );
+            r.finish(parent).await;
+        }
+    }
+    #[tokio::test]
+    async fn cancellation_and_output_bound_interrupt_only_the_child() {
+        for scenario in ["hold", "overflow"] {
+            let mut r = Rig::new(scenario).await;
+            let parent = r.parent().await;
+            let (cancel, rx) = watch::channel(false);
+            let task = r.side(rx);
+            if scenario == "hold" {
+                r.wait(|w| w.iter().any(|v| v["kind"] == "side_active"))
+                    .await;
+                cancel.send(true).unwrap();
+            }
+            let result = timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                result.status,
+                Status::Interrupted | Status::Failed
+            ));
+            assert!(result.answer.starts_with("side prefix\n"));
+            assert!(result.answer.len() <= MAX_ANSWER);
+            let interrupts: Vec<_> = r
+                .wire()
+                .into_iter()
+                .filter(|v| v["method"] == "turn/interrupt")
+                .collect();
+            assert_eq!(interrupts.len(), 1);
+            assert_eq!(interrupts[0]["params"]["threadId"], "child");
+            assert!(!parent.is_finished());
+            r.finish(parent).await;
+        }
+    }
+    #[tokio::test]
+    async fn late_fork_and_start_acks_are_owned_by_child_cleanup() {
+        for scenario in ["late-fork", "late-start"] {
+            let mut r = Rig::new(scenario).await;
+            let parent = r.parent().await;
+            let (cancel, rx) = watch::channel(false);
+            let task = r.side(rx);
+            let marker = if scenario == "late-fork" {
+                "fork_pending"
+            } else {
+                "start_pending"
+            };
+            r.wait(|w| w.iter().any(|v| v["kind"] == marker)).await;
+            if scenario == "late-start" {
+                cancel.send(true).unwrap();
+            }
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(20)).await;
+            // Resume real I/O time before checking the bounded caller's outcome.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::resume();
+            let result = timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.disable);
+            std::fs::write(
+                r.dir.path().join(if scenario == "late-fork" {
+                    "release-fork"
+                } else {
+                    "release-start"
+                }),
+                "",
+            )
+            .unwrap();
+            r.wait(|w| {
+                w.iter().any(|v| {
+                    v["method"]
+                        == if scenario == "late-fork" {
+                            "thread/goal/clear"
+                        } else {
+                            "turn/interrupt"
+                        }
+                })
+            })
+            .await;
+            assert!(!parent.is_finished());
+            assert!(!r.wire().iter().any(|v|v["method"]=="turn/interrupt"&&v["params"]["threadId"]=="parent"));
+            r.finish(parent).await;
+        }
+    }
+    #[tokio::test]
+    async fn queued_and_waiting_child_tools_cannot_outlive_cancellation_or_completion() {
+        for scenario in ["tools-cancel", "tools-complete", "late-start-tools"] {
+            let mut r = Rig::new(scenario).await;
+            let parent = r.parent().await;
+            let Harness::Codex(c) = &r.harness else {
+                unreachable!()
+            };
+            let locked = c.side_tools_for_test().lock_owned().await;
+            let (cancel, rx) = watch::channel(false);
+            let task = r.side(rx);
+            r.wait(|w| w.iter().any(|v| v["kind"] == "tool_pending"))
+                .await;
+            if scenario != "tools-complete" {
+                cancel.send(true).unwrap();
+            }
+            if scenario == "late-start-tools" {
+                tokio::task::yield_now().await;
+                std::fs::write(r.dir.path().join("release-start"), "").unwrap();
+            }
+            let result = timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                result.status,
+                Status::Completed | Status::Interrupted
+            ));
+            // While the tool client is still locked, a cancelled/closed call must
+            // settle without acquiring it or touching the board.
+            r.wait(|w| w.iter().any(|v| v["id"] == "tool")).await;
+            let reply = r.wire().into_iter().find(|v| v["id"] == "tool").unwrap();
+            assert!(
+                reply["response"]["error"].is_object()
+                    || reply["response"]["result"]["success"] == false
+            );
+            drop(locked);
+            assert!(!parent.is_finished());
+            r.finish(parent).await;
+        }
     }
 }
