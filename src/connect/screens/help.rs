@@ -19,6 +19,10 @@ const AGENT_KEYS: &[(&str, &str)] = &[
     ("PgUp", "agent insert: navigate the timeline"),
     ("Ctrl-U", "insert: delete to line start; join at column 0"),
     ("Esc", "agent navigation: return to insert mode"),
+    (
+        "Ctrl-T",
+        "agents: compact (no tool calls or others' mail) / verbose",
+    ),
     ("↑ / ↓", "agent insert: move within the draft"),
     (
         "Tab / Shift-Tab",

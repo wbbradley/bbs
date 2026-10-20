@@ -153,6 +153,9 @@ provider default/unknown values
 need an explicit choice. Changes wait for the next ordinary prompt and stay
 pending, without any alarm, until their exact provider outcome arrives. Search,
 errors and notices take the effort detail's place while they are shown.
+`Ctrl-T` toggles compact view for the session, while writing or navigating:
+it hides tool calls and mail among other participants, and the bottom bar says
+`compact`. Verbose view, the default, shows everything.
 
 Effort changes are owner-only. Upgrade the server and restart the headless runner
 on the new version to enable them; the ACP harness must advertise a thought-level

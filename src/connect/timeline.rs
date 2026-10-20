@@ -58,6 +58,19 @@ pub enum Entry {
 }
 
 impl Entry {
+    /// What compact view hides: finished tool calls and mail among other
+    /// participants.
+    pub fn compact_hides(&self) -> bool {
+        self.is_tool()
+            || matches!(
+                self,
+                Entry::Message {
+                    other_participants: true,
+                    ..
+                }
+            )
+    }
+
     fn is_tool(&self) -> bool {
         matches!(self, Entry::Stream { call: Some(_), .. })
     }

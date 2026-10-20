@@ -46,6 +46,9 @@ pub struct Thread {
     /// Raw feed boundaries that may have skipped messages.
     message_gaps: BTreeSet<i64>,
     show: Show,
+    /// Ctrl-T: hide tool calls and mail among other participants, for this
+    /// session; `show` and the activity kinds still apply.
+    compact: bool,
     human: Option<String>,
     /// The stream's last error; it has ended until a reload.
     error: Option<String>,
@@ -87,6 +90,7 @@ impl Thread {
             opening_until: None,
             message_gaps: BTreeSet::new(),
             show: Show::All,
+            compact: false,
             human: None,
             error: None,
             prompt: None,
@@ -140,6 +144,7 @@ impl Thread {
         {
             entries.extend(stream.entries(&loaded));
         }
+        let entries = compacted(self.compact, entries);
         let query = self.view.query.clone();
         self.view = ThreadView::new(entries, BACKLOG as usize);
         if let Some(query) = query {
@@ -388,6 +393,9 @@ impl Thread {
         // Filter labels only when a filter is narrowed from showing all.
         let hints = |short: bool| {
             let mut parts = Vec::new();
+            if self.compact {
+                parts.push("compact".to_string());
+            }
             if self.show != Show::All {
                 parts.push(if short {
                     format!("A:{}", self.show.label())
@@ -679,6 +687,14 @@ impl Thread {
     }
 }
 
+/// `entries` less what compact view hides, when it is on.
+fn compacted(compact: bool, mut entries: Vec<Entry>) -> Vec<Entry> {
+    if compact {
+        entries.retain(|e| !e.compact_hides());
+    }
+    entries
+}
+
 /// A stream error as the window shows it.
 fn describe(error: &str) -> String {
     if error.contains("feed-with.v1") {
@@ -891,6 +907,7 @@ impl Screen for Thread {
     }
 
     fn on_data(&mut self, data: &Data) {
+        let compact = self.compact;
         if let Some(owner) = &mut self.owner {
             owner.on_data(data);
             // The server took the question: clear the draft unless it changed.
@@ -908,7 +925,7 @@ impl Screen for Thread {
                 // kept, so no evicted row outlives the dedup history.
                 self.reconcile();
             } else if self.show.stream() && !entries.is_empty() {
-                self.view.ingest(entries);
+                self.view.ingest(compacted(compact, entries));
             }
         }
         match data {
@@ -933,7 +950,7 @@ impl Screen for Thread {
                         self.reconcile();
                     } else if self.show.messages() {
                         let entries = self.message_entries(messages);
-                        self.view.ingest(entries);
+                        self.view.ingest(compacted(compact, entries));
                     }
                 }
                 Err(e) => self.error = Some(describe(e)),
@@ -1061,6 +1078,16 @@ impl Screen for Thread {
             });
         }
         self.effort_notice = None;
+        // Compact and verbose views, while writing or navigating.
+        if self.agent.is_some()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('t')
+        {
+            self.compact = !self.compact;
+            // A paused reader keeps their place, or the next entry shown.
+            self.reconcile();
+            return Some(Transition::Stay);
+        }
         if self.composing {
             return self.compose(key);
         }
@@ -1300,7 +1327,7 @@ impl Thread {
         // as one more tool run would. The renderer only tracks calls the
         // kinds shown let through, so `E` hides them too.
         let calls = match &self.stream {
-            Some(stream) if self.show.stream() && self.view.following() => {
+            Some(stream) if self.show.stream() && !self.compact && self.view.following() => {
                 stream.running(body.width)
             }
             _ => Vec::new(),
@@ -1334,6 +1361,11 @@ impl Thread {
                 format!(
                     "{agent} shares no activity yet. Headless agents share it unless their harness sets share_activity = false; see HEADLESS.md."
                 ),
+                theme::dim(),
+            )
+        } else if self.compact {
+            Line::styled(
+                "Compact view hides tool calls. Ctrl-T shows everything.",
                 theme::dim(),
             )
         } else {

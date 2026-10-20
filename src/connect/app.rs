@@ -1589,9 +1589,12 @@ mod tests {
             row.contains("effort low → medium next turn") && !row.contains("unconf"),
             "{row}"
         );
-        // One view: Ctrl-T changes nothing, and Help no longer lists it.
+        // Ctrl-T toggles compact view, named in the bottom bar, and back;
+        // it sends nothing, and Help lists it.
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         let before = screen(&mut app, 80, 24);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(bottom(&mut app).contains("· compact ·"));
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert_eq!(screen(&mut app, 80, 24), before);
         assert!(rx.try_recv().is_err());
@@ -1600,7 +1603,7 @@ mod tests {
         }
         key(&mut app, '?');
         let help = screen(&mut app, 80, 60);
-        assert!(help.contains("Help") && !help.contains("Ctrl-T"), "{help}");
+        assert!(help.contains("Help") && help.contains("Ctrl-T"), "{help}");
     }
 
     #[test]
@@ -5267,6 +5270,183 @@ mod tests {
         assert!(screen(&mut app, 80, 24).contains("a menu item's hot key"));
     }
 
+    #[test]
+    fn ctrl_t_compact_hides_tool_calls_and_others_mail_and_keeps_everything_else() {
+        let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let (mut app, mut rx) = app();
+        let (feed, act) = mateo_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![
+                proto::Message {
+                    from_kind: proto::Kind::Human.into(),
+                    ..at(10, "01", "ada", "Mateo", "my question")
+                },
+                at(11, "02", "Zed", "Mateo", "side chatter"),
+            ]),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![
+                activity(20, "03", r#"{"event":"thought","text":"pondering"}"#),
+                activity(
+                    21,
+                    "04",
+                    r#"{"event":"tool","id":"t1","status":"pending","title":"cargo test"}"#,
+                ),
+                activity(
+                    22,
+                    "05",
+                    r#"{"event":"tool","id":"t1","status":"completed","title":"cargo test"}"#,
+                ),
+                activity(23, "06", r#"{"event":"text","text":"agent reply"}"#),
+                activity(
+                    24,
+                    "07",
+                    r#"{"event":"tool","id":"t2","status":"pending","title":"git log"}"#,
+                ),
+            ]),
+        }));
+        while rx.try_recv().is_ok() {}
+        let all = [
+            "my question",
+            "side chatter",
+            "pondering",
+            "cargo test",
+            "agent reply",
+            "git log",
+        ];
+        let verbose = screen(&mut app, 80, 30);
+        for text in all {
+            assert!(verbose.contains(text), "verbose shows {text}: {verbose}");
+        }
+        // While writing: the draft and its cursor stay, and nothing is sent.
+        typed(&mut app, "half typed");
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        ctrl_t(&mut app);
+        assert!(rx.try_recv().is_err());
+        let compact = screen(&mut app, 80, 30);
+        for text in ["cargo test", "git log", "side chatter"] {
+            assert!(!compact.contains(text), "compact hides {text}: {compact}");
+        }
+        for text in ["my question", "pondering", "agent reply", "half typed"] {
+            assert!(compact.contains(text), "compact keeps {text}: {compact}");
+        }
+        assert!(bottom(&mut app).contains("compact"));
+        typed(&mut app, "!");
+        assert_eq!(app.top().draft().unwrap().1.text, "half type!d");
+        // Live arrivals follow the view, and are still marked seen and read.
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![activity(
+                25,
+                "08",
+                r#"{"event":"tool","id":"t3","status":"completed","title":"rg needle"}"#,
+            )]),
+        }));
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![
+                at(12, "09", "Zed", "crew", "more chatter"),
+                at(13, "10", "Mateo", "ada", "direct answer"),
+            ]),
+        }));
+        let sent: Vec<Request> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            sent.iter()
+                .any(|r| matches!(r, Request::MarkSeen { through_id: 25, .. })),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::MarkRead(_))),
+            "{sent:?}"
+        );
+        let compact = screen(&mut app, 80, 30);
+        assert!(
+            compact.contains("direct answer")
+                && !compact.contains("rg needle")
+                && !compact.contains("more chatter"),
+            "{compact}"
+        );
+        // While navigating, Ctrl-T brings everything back; following again
+        // shows the call still running.
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        ctrl_t(&mut app);
+        key(&mut app, 'G');
+        let verbose = screen(&mut app, 80, 40);
+        for text in all
+            .into_iter()
+            .chain(["rg needle", "more chatter", "direct answer"])
+        {
+            assert!(
+                verbose.contains(text),
+                "verbose again shows {text}: {verbose}"
+            );
+        }
+        assert!(!bottom(&mut app).contains("compact"));
+    }
+
+    #[test]
+    fn ctrl_t_leaves_owner_forms_their_keys_and_never_cancels_a_side_question() {
+        use proto::SideStatus;
+        let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        reply_to(&mut app, id, btw_report(1, None));
+        command(&mut app, "/btw quick?");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::AskSide { .. }]
+        ));
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(5) }));
+        poll(&mut app, &mut rx);
+        let Data::SideReport {
+            result: Ok(mut report),
+            ..
+        } = btw_report(2, Some((5, "quick?", SideStatus::SideOpen, "thinking")))
+        else {
+            unreachable!()
+        };
+        report.pending_input = side_report(2, 7, deploy_questions()).pending_input;
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(report),
+        }));
+        while rx.try_recv().is_ok() {}
+        // The open form keeps every key: Ctrl-T changes no view.
+        command(&mut app, "/answer");
+        ctrl_t(&mut app);
+        assert!(app.top().navigation_blocked(), "the form stays open");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!bottom(&mut app).contains("compact"));
+        // With /context and the side panel open, Ctrl-T toggles the view and
+        // leaves both, and the question card, as they are; nothing is sent.
+        command(&mut app, "/context");
+        ctrl_t(&mut app);
+        assert!(without_polls(&mut rx).is_empty(), "never a cancel");
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("compact")
+                && out.contains("Context · Mateo")
+                && out.contains("btw · Mateo · answering…"),
+            "{out}"
+        );
+        // Esc still closes /context first; the card and panel stay.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(without_polls(&mut rx).is_empty());
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("compact")
+                && out.contains("Mateo asks 2 questions")
+                && out.contains("btw · Mateo · answering…"),
+            "{out}"
+        );
+        ctrl_t(&mut app);
+        assert!(without_polls(&mut rx).is_empty());
+        assert!(screen(&mut app, 80, 24).contains("btw · Mateo · answering…"));
+    }
+
     fn activity(id: i64, at: &str, record: &str) -> proto::Activity {
         proto::Activity {
             id,
@@ -5508,9 +5688,9 @@ mod tests {
                 .next()
                 .unwrap()
         };
-        assert_eq!(hint_cell(&mut app), '·', "verbose also shows progress");
+        assert_eq!(hint_cell(&mut app), '·', "verbose shows progress");
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert_eq!(hint_cell(&mut app), '·');
+        assert_eq!(hint_cell(&mut app), '·', "and so does compact");
         app.on_event(Event::Data(Data::ActivityBaseline {
             id: act,
             through_id: 500,

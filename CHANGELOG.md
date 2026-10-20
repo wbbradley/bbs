@@ -8,6 +8,14 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- `bbs connect` agent conversations toggle compact view with `Ctrl-T`, while
+  writing or navigating. Compact view hides tool calls (finished and still
+  running) and mail among other participants; verbose view, the default, is
+  unchanged. The choice lasts for the session. Question cards, `/answer`,
+  `/context` and `/btw` are unaffected.
+
 ## 0.11.0 - 2026-10-20
 
 Native questions, context reports and side questions add database schema 19.
