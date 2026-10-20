@@ -10,6 +10,7 @@ mod effort;
 mod event;
 mod keys;
 mod navigation;
+mod owner;
 mod preferences;
 mod progress;
 mod screens;
