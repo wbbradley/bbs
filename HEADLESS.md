@@ -213,8 +213,9 @@ This works with `share_activity = false`. Missing capability or failed startup
 negotiation disables these optional features while ordinary turns continue.
 
 Codex app-server uses `item/tool/requestUserInput`, checked against the parent
-thread and turn and bound to the exact callback. Its `isBlocking` value is retained; a nonblocking question does not
-mean the model is waiting. `serverRequest/resolved` withdraws its exact question.
+thread and turn and bound to the exact callback. Its `isBlocking` value is
+retained; a nonblocking question does not mean the model is waiting.
+`serverRequest/resolved` withdraws its exact question.
 ACP advertises form elicitation only when the board transport is available and
 supports `elicitation/create` for the live parent session. The initial ACP subset
 is flat string fields and string enum/single-select fields; form messages, titles,

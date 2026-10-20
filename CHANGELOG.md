@@ -8,14 +8,30 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+Native questions and context reports add database schema 18. Upgrade the server,
+runner and client to use them; older remote clients and runners keep working,
+and updated runners continue ordinary turns when `agent-interactions.v1` is
+absent. Back up before upgrading the server. Older binaries cannot open schema
+18; restoring the pre-upgrade backup loses subsequent changes.
+
 ### Added
 
+- Updated headless runners relay native Codex app-server questions and supported
+  ACP forms to the owner through a separate request path. Answers return to the
+  original live callback as native tool results. Cancelled or obsolete questions
+  cannot receive a later answer, and preceding assistant text is delivered while
+  the question waits. Supported ACP forms contain up to three string or
+  single-select fields; richer forms fail explicitly.
+- Provider-reported context usage distinguishes current context from the last
+  model request, rather than treating cumulative token spending as occupancy.
+  Questions and context work independently of activity sharing and create no
+  mail, delivery, history or conversation-recency entries.
 - In `bbs connect`, an agent's owner sees the questions its runner asks
   (`agent-interactions.v1`) as a card in the open conversation and answers them in
   an explicit `/answer` form: no default choices, required questions gate
   Submit, Decline and Cancel request are separate replies, and Esc leaves the
   questions waiting. `/context` shows the runner's last context report on
-  demand. Both are local commands, never sent.
+  demand. These commands do not create chat messages.
 
 ### Changed
 
