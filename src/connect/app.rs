@@ -5690,7 +5690,7 @@ mod tests {
         assert!(bottom(&mut app).contains("BBS · Zed") && bottom(&mut app).contains("compact"));
         ctrl_t(&mut app);
         assert!(!bottom(&mut app).contains("compact"));
-        assert_eq!(saved(), serde_json::json!({}), "verbose is the default");
+        assert_eq!(saved(), serde_json::json!({"compact": false}));
         app.stack.pop();
         assert!(bottom(&mut app).contains("BBS · Mateo"));
         assert!(!bottom(&mut app).contains("compact"));

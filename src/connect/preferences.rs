@@ -12,8 +12,8 @@ use crate::ui::theme::{self, Scheme};
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 struct Values {
-    /// Agent conversations show compact view; absent means verbose.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    /// Agent conversations show compact view; absent means verbose. Saved
+    /// either way, so an older client keeps verbose too.
     compact: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     theme: Option<Scheme>,
@@ -98,7 +98,7 @@ mod tests {
         use crate::ui::theme::testing::with_scheme;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connect.json");
-        // A verbose choice is the default, so the next save leaves it out.
+        // A file with only a view choice loads; theme saves keep it.
         std::fs::write(&path, r#"{"compact":false}"#).unwrap();
         let mut prefs = Preferences::load(path.clone()).unwrap();
         with_scheme(Scheme::Terminal, || {
@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(prefs.values.theme, Some(Scheme::NoColor));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),
-            serde_json::json!({"theme": "no-color"})
+            serde_json::json!({"compact": false, "theme": "no-color"})
         );
     }
 
@@ -158,23 +158,34 @@ mod tests {
     }
 
     #[test]
-    fn compact_round_trips_beside_the_theme_and_verbose_is_left_out() {
+    fn legacy_compact_and_theme_round_trip_and_each_save_keeps_the_other() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connect.json");
-        std::fs::write(&path, r#"{"compact":true,"theme":"terminal"}"#).unwrap();
-        let mut prefs = Preferences::load(path.clone()).unwrap();
-        assert!(prefs.compact());
-        prefs.set_compact(false);
-        assert!(prefs.error.is_none());
         let saved = |path: &std::path::Path| -> serde_json::Value {
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
         };
-        assert_eq!(saved(&path), serde_json::json!({"theme": "terminal"}));
-        assert!(!Preferences::load(path.clone()).unwrap().compact());
+        // As older clients wrote it.
+        std::fs::write(&path, r#"{"compact":true,"theme":"terminal"}"#).unwrap();
+        let mut prefs = Preferences::load(path.clone()).unwrap();
+        assert!(prefs.compact());
+        prefs.set_theme(Scheme::NoColor);
+        assert_eq!(
+            saved(&path),
+            serde_json::json!({"compact": true, "theme": "no-color"})
+        );
+        prefs.set_compact(false);
+        assert!(prefs.error.is_none());
+        assert_eq!(
+            saved(&path),
+            serde_json::json!({"compact": false, "theme": "no-color"})
+        );
+        let mut prefs = Preferences::load(path.clone()).unwrap();
+        assert!(!prefs.compact());
+        assert_eq!(prefs.values.theme, Some(Scheme::NoColor));
         prefs.set_compact(true);
         assert_eq!(
             saved(&path),
-            serde_json::json!({"compact": true, "theme": "terminal"})
+            serde_json::json!({"compact": true, "theme": "no-color"})
         );
         assert!(!Preferences::default().compact(), "verbose by default");
     }
