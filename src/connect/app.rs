@@ -100,6 +100,10 @@ pub trait Screen {
     fn on_view(&mut self, _ctx: &Ctx) -> Vec<Request> {
         Vec::new()
     }
+    /// What to ask for once a second while this screen is on top.
+    fn on_tick(&mut self, _ctx: &Ctx) -> Vec<Request> {
+        Vec::new()
+    }
     /// Reset before re-fetching; return any obsolete subscriptions to cancel.
     fn reload(&mut self) -> Vec<Request> {
         Vec::new()
@@ -421,6 +425,9 @@ impl App {
             }
             Event::Tick => {
                 self.flush_drafts();
+                let screen = self.stack.last_mut().expect("the menu is never popped");
+                let requests = screen.on_tick(&self.ctx);
+                self.send(requests);
                 false
             }
             Event::Resize => false,
@@ -3035,6 +3042,331 @@ mod tests {
         );
     }
 
+    /// A side report for Mateo with `questions` waiting under `request_id`.
+    fn side_report(
+        revision: i64,
+        request_id: i64,
+        questions: Vec<proto::InputQuestion>,
+    ) -> proto::SideReportResponse {
+        proto::SideReportResponse {
+            agent: "Mateo".into(),
+            pending_input: (!questions.is_empty()).then(|| proto::OwnerInput {
+                request_id,
+                status: proto::InputStatus::Pending.into(),
+                questions,
+                answers: Vec::new(),
+                updated_at: "2026-10-20T02:30:00Z".into(),
+            }),
+            usage: Some(proto::ContextUsage {
+                used_tokens: Some(84_321),
+                limit_tokens: Some(200_000),
+                source: proto::context_usage::Source::CurrentContext.into(),
+            }),
+            side_supported: None,
+            side_reason: None,
+            revision,
+            reported_at: "2026-10-20T02:30:00Z".into(),
+        }
+    }
+
+    fn deploy_questions() -> Vec<proto::InputQuestion> {
+        let option = |v: &str| proto::InputOption {
+            value: v.into(),
+            label: Some(v.to_uppercase()),
+            description: None,
+        };
+        vec![
+            proto::InputQuestion {
+                id: "deploy".into(),
+                header: "Deploy".into(),
+                text: "Ship to staging?".into(),
+                options: vec![option("yes"), option("no")],
+                allow_free_text: false,
+                required: true,
+            },
+            proto::InputQuestion {
+                id: "note".into(),
+                header: "Note".into(),
+                text: "Anything else?".into(),
+                options: Vec::new(),
+                allow_free_text: true,
+                required: false,
+            },
+        ]
+    }
+
+    /// The owner's poll this tick, which must be one.
+    fn poll(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> u64 {
+        app.on_event(Event::Tick);
+        match without_sends(rx) {
+            Some(Request::SideReport { id, agent }) => {
+                assert_eq!(agent, "Mateo");
+                id
+            }
+            other => panic!("expected a side poll, got {other:?}"),
+        }
+    }
+
+    fn without_sends(rx: &mut UnboundedReceiver<Request>) -> Option<Request> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|r| !matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. }))
+    }
+
+    fn command(app: &mut App, text: &str) {
+        typed(app, text);
+        enter(app);
+    }
+
+    #[test]
+    fn the_owner_answers_waiting_questions_through_an_explicit_form() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        // One poll at a time: none while the first is unanswered.
+        app.on_event(Event::Tick);
+        assert!(without_sends(&mut rx).is_none());
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(side_report(1, 7, deploy_questions()))),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("Mateo asks 2 questions · /answer to respond"),
+            "{out}"
+        );
+        // /answer opens the form; nothing is sent, nothing is answered yet.
+        command(&mut app, "/answer");
+        assert!(rx.try_recv().is_err(), "a local command, never sent");
+        assert!(app.top().navigation_blocked());
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("( ) YES") && out.contains("( ) NO") && out.contains("[Submit]"),
+            "{out}"
+        );
+        assert!(out.contains("[Cancel request]"), "{out}");
+        // Esc closes the form unchanged: the questions still wait, the
+        // conversation stays open, nothing is sent.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(rx.try_recv().is_err());
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("Mateo asks 2 questions") && out.contains("BBS · Mateo"),
+            "{out}"
+        );
+        // Reopen, choose "no" (↓ then Enter), leave the optional note, Submit.
+        command(&mut app, "/answer");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let Request::AnswerOwnerInput { id: sent, req } = rx.try_recv().unwrap() else {
+            panic!("expected an answer");
+        };
+        assert_eq!(sent, id);
+        assert_eq!(req.request_id, 7);
+        assert_eq!(req.action(), proto::AnswerAction::Submit);
+        assert_eq!(
+            req.answers,
+            [proto::InputAnswer {
+                question_id: "deploy".into(),
+                value: "no".into()
+            }]
+        );
+        app.on_event(Event::Data(Data::OwnerAnswered {
+            id,
+            request_id: 7,
+            result: Ok(()),
+        }));
+        assert!(!app.top().navigation_blocked(), "the form closes once sent");
+        // The explicit Cancel request action sends CANCEL.
+        command(&mut app, "/answer");
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let Request::AnswerOwnerInput { req, .. } = rx.try_recv().unwrap() else {
+            panic!("expected a cancel");
+        };
+        assert_eq!(req.action(), proto::AnswerAction::Cancel);
+        assert!(req.answers.is_empty());
+    }
+
+    #[test]
+    fn replaced_or_withdrawn_questions_close_the_form_and_a_stale_reply_is_ignored() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(side_report(1, 7, deploy_questions()))),
+        }));
+        command(&mut app, "/answer");
+        assert!(app.top().navigation_blocked());
+        // A new runner generation replaced request 7 with request 8.
+        poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(side_report(2, 8, deploy_questions()))),
+        }));
+        assert!(
+            !app.top().navigation_blocked(),
+            "a reply to 7 could not apply"
+        );
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("Those questions were replaced"), "{out}");
+        // A late result for 7 changes nothing.
+        app.on_event(Event::Data(Data::OwnerAnswered {
+            id,
+            request_id: 7,
+            result: Err("stale".into()),
+        }));
+        assert!(!screen(&mut app, 80, 24).contains("Not sent"));
+        // Withdrawn: no questions left.
+        command(&mut app, "/answer");
+        poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(side_report(3, 0, Vec::new()))),
+        }));
+        assert!(!app.top().navigation_blocked());
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("no longer waiting") && !out.contains("asks 2"),
+            "{out}"
+        );
+        command(&mut app, "/answer");
+        assert!(screen(&mut app, 80, 24).contains("No questions are waiting."));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn context_shows_on_demand_and_esc_closes_only_the_panel() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(side_report(1, 0, Vec::new()))),
+        }));
+        assert!(
+            !screen(&mut app, 80, 24).contains("Context"),
+            "nothing until asked"
+        );
+        command(&mut app, "/context");
+        assert!(rx.try_recv().is_err(), "a local command, never sent");
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("Current context: 84k of 200k tokens (42%)"),
+            "{out}"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            !out.contains("Current context") && out.contains("BBS · Mateo"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn only_the_owner_polls_and_a_server_without_it_is_asked_once() {
+        // Someone else's agent: no polls; the commands explain and send nothing.
+        let (mut app, mut rx) = app();
+        open_agents(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![agent("Zed", "other", &["crew"])],
+        }))));
+        key(&mut app, 'a');
+        while rx.try_recv().is_ok() {}
+        app.open(
+            Box::new(Thread::agent("Zed", "ada", app.ctx.now.clone())),
+            true,
+        );
+        while rx.try_recv().is_ok() {}
+        app.on_event(Event::Tick);
+        assert!(
+            without_sends(&mut rx).is_none(),
+            "no polls for someone else's agent"
+        );
+        command(&mut app, "/answer");
+        assert!(rx.try_recv().is_err());
+        assert!(
+            bottom(&mut app).contains("Only Zed's owner"),
+            "{}",
+            bottom(&mut app)
+        );
+        // An owned agent on a server without side-questions.v1: one poll, then none.
+        let (mut app, mut rx) = self::app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Err("required capability side-questions.v1 is unavailable".into()),
+        }));
+        app.on_event(Event::Tick);
+        assert!(without_sends(&mut rx).is_none());
+        command(&mut app, "/context");
+        assert!(rx.try_recv().is_err());
+        assert!(
+            bottom(&mut app).contains("does not support"),
+            "{}",
+            bottom(&mut app)
+        );
+    }
+
+    #[test]
+    fn long_questions_stay_whole_and_scroll_within_eighty_by_twenty_four() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        let mut questions = deploy_questions();
+        questions[0].text = (1..=12)
+            .map(|n| format!("detail line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        questions[0].options = (1..=8)
+            .map(|n| proto::InputOption {
+                value: format!("v{n}"),
+                label: Some(format!("option {n}")),
+                description: Some(
+                    "a description long enough to wrap past the box edge at eighty columns".into(),
+                ),
+            })
+            .collect();
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(Box::new(side_report(1, 7, questions))),
+        }));
+        command(&mut app, "/answer");
+        // Every choice is reachable and shown whole as the focus moves.
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..10 {
+            let out = screen(&mut app, 80, 24);
+            for n in 1..=8 {
+                if out.contains(&format!("option {n} — a description")) {
+                    seen.insert(n);
+                }
+            }
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        }
+        assert_eq!(seen.len(), 8, "{seen:?}");
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("eighty columns") || out.contains("[Submit]"),
+            "{out}"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The requests waiting, but the owner's once-a-second side polls.
+    fn without_polls(rx: &mut UnboundedReceiver<Request>) -> Vec<Request> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|r| !matches!(r, Request::SideReport { .. }))
+            .collect()
+    }
+
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
         app.on_event(Event::Key(KeyEvent::new(code, modifiers)))
     }
@@ -3521,6 +3853,8 @@ mod tests {
                 mateo(&mut first, &mut rx);
                 typed(&mut first, "draft");
                 first.on_event(Event::Tick);
+                // The owner's open conversation polls the agent's side state.
+                assert!(matches!(rx.try_recv().unwrap(), Request::SideReport { .. }));
                 enter(&mut first);
                 let Request::Send { id, .. } = rx.try_recv().unwrap() else {
                     panic!("send")
@@ -5713,7 +6047,7 @@ mod tests {
                 );
                 app.on_event(Event::Tick);
                 assert!(
-                    rx.try_recv().is_err(),
+                    without_polls(&mut rx).is_empty(),
                     "already received activity is not marked twice"
                 );
             }

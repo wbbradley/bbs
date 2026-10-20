@@ -9,7 +9,10 @@ use ratatui::style::{Modifier, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 
+use super::app::next_id;
+use super::event::{Data, Request};
 use super::theme;
+use crate::proto;
 
 /// One choice a question offers.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +73,190 @@ pub enum Reply {
     Submit(Vec<(String, Response)>),
     Decline,
     Cancel,
+}
+
+/// The owner's view of one agent's side state while its conversation is
+/// open: polled once a second, with the `/answer` form and `/context` panel.
+pub struct Session {
+    /// The id for this conversation's side requests and their replies.
+    id: u64,
+    in_flight: bool,
+    report: Option<proto::SideReportResponse>,
+    /// The server lacks side-questions.v1: stop asking.
+    pub unsupported: bool,
+    pub form: Option<Form>,
+    pub context_open: bool,
+    /// The request id of a reply on its way.
+    sending: Option<i64>,
+    pub notice: Option<String>,
+}
+
+impl Session {
+    pub fn new() -> Session {
+        Session {
+            id: next_id(),
+            in_flight: false,
+            report: None,
+            unsupported: false,
+            form: None,
+            context_open: false,
+            sending: None,
+            notice: None,
+        }
+    }
+
+    /// The poll to send now, if one is due: one at a time, never once the
+    /// server has shown it lacks the capability.
+    pub fn poll(&mut self, agent: &str) -> Option<Request> {
+        if self.unsupported || self.in_flight {
+            return None;
+        }
+        self.in_flight = true;
+        Some(Request::SideReport {
+            id: self.id,
+            agent: agent.to_string(),
+        })
+    }
+
+    /// The questions waiting on the owner, if any.
+    pub fn questions(&self) -> Option<QuestionSet> {
+        let input = self.report.as_ref()?.pending_input.as_ref()?;
+        (input.status() == proto::InputStatus::Pending).then(|| question_set(input))
+    }
+
+    pub fn usage(&self) -> Option<ContextUsage> {
+        let report = self.report.as_ref()?;
+        let usage = report.usage.as_ref()?;
+        let measure = match usage.source() {
+            proto::context_usage::Source::CurrentContext => Measure::Current,
+            proto::context_usage::Source::LastModelRequest => Measure::LastRequest,
+            proto::context_usage::Source::Unspecified => return None,
+        };
+        Some(ContextUsage {
+            measure,
+            used: usage.used_tokens,
+            limit: usage.limit_tokens,
+            reported_at: report.reported_at.clone(),
+        })
+    }
+
+    /// Open the form on the questions waiting, if there are any.
+    pub fn open_form(&mut self) -> Result<(), &'static str> {
+        let set = self.questions().ok_or("No questions are waiting.")?;
+        self.notice = None;
+        self.form = Some(Form::new(set));
+        Ok(())
+    }
+
+    /// The request that sends `reply` to the form's question set.
+    pub fn reply(&mut self, reply: Reply) -> Option<Request> {
+        let request_id = self.form.as_ref()?.request_id();
+        let (action, answers) = match reply {
+            Reply::Submit(answers) => (proto::AnswerAction::Submit, answers),
+            Reply::Decline => (proto::AnswerAction::Decline, Vec::new()),
+            Reply::Cancel => (proto::AnswerAction::Cancel, Vec::new()),
+        };
+        self.sending = Some(request_id);
+        Some(Request::AnswerOwnerInput {
+            id: self.id,
+            req: proto::AnswerOwnerInputRequest {
+                request_id,
+                action: action.into(),
+                answers: answers
+                    .into_iter()
+                    .map(|(question_id, response)| proto::InputAnswer {
+                        question_id,
+                        value: match response {
+                            Response::Choice(value) | Response::Text(value) => value,
+                        },
+                    })
+                    .collect(),
+            },
+        })
+    }
+
+    /// Take a reply for this session; whether anything shown changed.
+    pub fn on_data(&mut self, data: &Data) -> bool {
+        match data {
+            Data::SideReport { id, result } if *id == self.id => {
+                self.in_flight = false;
+                match result {
+                    Ok(report) => {
+                        if self.report.as_ref().map(|r| r.revision) == Some(report.revision) {
+                            return false;
+                        }
+                        self.report = Some(report.as_ref().clone());
+                        self.supersede();
+                    }
+                    Err(e) if e.contains(crate::backend::SIDE_QUESTIONS) => {
+                        self.unsupported = true;
+                        self.form = None;
+                    }
+                    // A failed poll is retried on the next tick.
+                    Err(_) => return false,
+                }
+                true
+            }
+            Data::OwnerAnswered {
+                id,
+                request_id,
+                result,
+            } if *id == self.id && self.sending == Some(*request_id) => {
+                self.sending = None;
+                match result {
+                    Ok(()) => {
+                        self.form = None;
+                        self.notice = None;
+                    }
+                    Err(e) => self.notice = Some(format!("Not sent: {e}")),
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A form whose questions were answered elsewhere, withdrawn or replaced
+    /// closes: a reply to them could no longer apply.
+    fn supersede(&mut self) {
+        let Some(form) = &self.form else { return };
+        let current = self.questions().map(|q| q.request_id);
+        if current != Some(form.request_id()) {
+            self.form = None;
+            self.sending = None;
+            self.notice = Some(match current {
+                Some(_) => "Those questions were replaced; /answer shows the new ones.".into(),
+                None => "Those questions are no longer waiting.".into(),
+            });
+        }
+    }
+}
+
+fn question_set(input: &proto::OwnerInput) -> QuestionSet {
+    QuestionSet {
+        request_id: input.request_id,
+        questions: input
+            .questions
+            .iter()
+            .map(|q| Question {
+                id: q.id.clone(),
+                header: q.header.clone(),
+                text: q.text.clone(),
+                choices: q
+                    .options
+                    .iter()
+                    .map(|o| Choice {
+                        label: o.label.clone().unwrap_or_else(|| o.value.clone()),
+                        description: o.description.clone().unwrap_or_default(),
+                        value: o.value.clone(),
+                    })
+                    .collect(),
+                // A question without options is free text only.
+                allow_free_text: q.allow_free_text || q.options.is_empty(),
+                required: q.required,
+            })
+            .collect(),
+    }
 }
 
 /// The card above the composer while a question set is open.
@@ -299,12 +486,14 @@ impl Form {
         }
     }
 
+    /// The form in a box over `area`: every question, choice and action in
+    /// full, wrapped, scrolled to keep the focus in view.
     pub fn render(&self, frame: &mut Frame, area: Rect, agent: &str) {
         let width = area.width.saturating_sub(2).min(78);
-        let inner = usize::from(width.saturating_sub(2));
+        let inner = width.saturating_sub(2);
         let items = self.items();
         let focused = items.get(self.focus).copied();
-        let mut lines = Vec::new();
+        let mut lines: Vec<Line<'static>> = Vec::new();
         let mut focus_line = 0;
         for (q, question) in self.set.questions.iter().enumerate() {
             let mark = if question.required {
@@ -312,17 +501,16 @@ impl Form {
             } else {
                 " (optional)"
             };
-            lines.push(theme::clip_line(
-                Line::from(vec![
-                    Span::styled(one_line(&question.header), theme::heading()),
-                    Span::styled(mark, theme::dim()),
-                ]),
-                inner,
-            ));
-            lines.push(theme::clip_line(
-                Line::styled(one_line(&question.text), theme::style(theme::Role::Text)),
-                inner,
-            ));
+            lines.push(Line::from(vec![
+                Span::styled(one_line(&question.header), theme::heading()),
+                Span::styled(mark, theme::dim()),
+            ]));
+            for text in question.text.lines() {
+                lines.push(Line::styled(
+                    text.to_string(),
+                    theme::style(theme::Role::Text),
+                ));
+            }
             for (c, choice) in question.choices.iter().enumerate() {
                 let here = focused == Some(Item::Choice(q, c));
                 if here {
@@ -344,7 +532,7 @@ impl Form {
                 if here {
                     line = line.style(theme::style(theme::Role::Selection));
                 }
-                lines.push(theme::clip_line(line, inner));
+                lines.push(line);
             }
             if question.allow_free_text {
                 let here = focused == Some(Item::Text(q));
@@ -363,14 +551,14 @@ impl Form {
                 if here {
                     spans.push(Span::styled("█", theme::dim()));
                 }
-                lines.push(theme::clip_line(Line::from(spans), inner));
+                lines.push(Line::from(spans));
             }
             lines.push(Line::raw(""));
         }
         let actions: Vec<Span> = [
             (Item::Submit, "Submit"),
             (Item::Decline, "Decline"),
-            (Item::Cancel, "Cancel"),
+            (Item::Cancel, "Cancel request"),
         ]
         .into_iter()
         .flat_map(|(item, label)| {
@@ -390,16 +578,22 @@ impl Form {
             lines.push(Line::styled(notice.clone(), theme::error()));
         }
         lines.push(Line::styled(
-            "↑/↓ move · Enter or Space choose · Esc closes, still open",
+            "↑/↓ move · Enter or Space choose · Esc closes, questions stay open",
             theme::dim(),
         ));
-        // Keep the focus in view in a box no taller than the area.
+        // Measure wrapped rows, so the focus stays in view in a box no
+        // taller than the area, however long the text.
+        let rows = |line: &Line<'static>| {
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner)
+        };
+        let heights: Vec<usize> = lines.iter().map(rows).collect();
+        let total: usize = heights.iter().sum();
         let room = usize::from(area.height.saturating_sub(2)).max(1);
-        let start = focus_line
-            .saturating_sub(room.saturating_sub(3).max(1) - 1)
-            .min(lines.len().saturating_sub(room));
-        let shown: Vec<Line> = lines.into_iter().skip(start).take(room).collect();
-        let height = (shown.len() as u16 + 2).min(area.height);
+        let at: usize = heights[..focus_line].iter().sum();
+        let scroll = at.saturating_sub(room / 3).min(total.saturating_sub(room));
+        let height = (total.min(room) as u16 + 2).min(area.height);
         let [row] = Layout::vertical([Constraint::Length(height)])
             .flex(Flex::Center)
             .areas(area);
@@ -417,9 +611,10 @@ impl Form {
             .style(theme::base());
         frame.render_widget(Clear, rect);
         frame.render_widget(
-            Paragraph::new(shown)
+            Paragraph::new(lines)
                 .block(block)
-                .wrap(Wrap { trim: false }),
+                .wrap(Wrap { trim: false })
+                .scroll((scroll.min(usize::from(u16::MAX)) as u16, 0)),
             rect,
         );
     }

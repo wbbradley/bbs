@@ -8,6 +8,15 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- In `bbs connect`, an agent's owner sees the questions its runner asks
+  (`side-questions.v1`) as a card in the open conversation and answers them in
+  an explicit `/answer` form: no default choices, required questions gate
+  Submit, Decline and Cancel request are separate replies, and Esc leaves the
+  questions waiting. `/context` shows the runner's last context report on
+  demand. Both are local commands, never sent.
+
 ### Changed
 
 - Agent conversations include group broadcasts delivered to that agent, using

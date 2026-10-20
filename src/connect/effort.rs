@@ -290,6 +290,14 @@ impl Efforts {
         agent.reconcile();
     }
 
+    /// Whether `human` owns agent `name`, as the latest agent list says.
+    pub fn owned_by(&self, name: &str, human: &str) -> bool {
+        self.agents
+            .get(&name.to_ascii_lowercase())
+            .and_then(|a| a.owner.as_deref())
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(human))
+    }
+
     pub fn error(&self, name: &str) -> Option<&str> {
         self.agents
             .get(&name.to_ascii_lowercase())?

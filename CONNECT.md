@@ -95,6 +95,26 @@ Terminal mode uses dark red indexed colors because its ANSI palette RGB values
 are defined by the terminal; no-color mode adds no color. Existing side-card
 colors remain their per-scheme palette choices.
 
+### Agent questions and context
+
+In the owner's open conversation with an agent, connect asks the server for that
+agent's side state (`SideReport`, `side-questions.v1`) once a second, one request
+at a time, and stops on a server without it; nobody else's conversation polls.
+When the agent's runner waits on the owner, a card above the composer says
+"Mateo asks 2 questions · /answer to respond". `/answer`, typed as the whole
+draft, opens a form over the conversation with every question, choice and
+description in full, wrapped and scrolled to the focus. Nothing is chosen until
+the owner chooses it; ↑/↓ move, Enter or Space chooses a choice, typing fills a
+free-text answer, and Enter never submits from a choice or text. `[Submit]`
+needs every required question answered and leaves optional ones out,
+`[Decline]` and `[Cancel request]` send those replies, and Esc closes the form
+with the questions still waiting. If the questions are answered elsewhere,
+withdrawn or replaced (a runner restart), the form closes and a reply to them is
+never sent. `/context` shows the runner's last context report on demand,
+labelled as the current context or the last model request, with no percentage
+when the limit is unknown and "not reported" rather than 0%; Esc closes it. Both
+commands are local, never sent, and only for the agent's owner.
+
 ### Agent effort
 
 The agent bottom bar shows the last reported effort ("effort low", or "effort

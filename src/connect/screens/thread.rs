@@ -65,6 +65,8 @@ pub struct Thread {
     /// The newest activity marked seen.
     seen: i64,
     effort_picker: Option<Dialog>,
+    /// The owner's side view of this agent: its questions and context.
+    owner: Option<crate::connect::owner::Session>,
     effort_notice: Option<String>,
     /// The clock for activity freshness and animation; the app's, or a test's.
     now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
@@ -96,6 +98,7 @@ impl Thread {
             stream: None,
             seen: 0,
             effort_picker: None,
+            owner: None,
             effort_notice: None,
             now: std::sync::Arc::new(Instant::now),
         }
@@ -573,6 +576,18 @@ impl Thread {
             self.view.scroll_up(page);
             return Some(Transition::Stay);
         }
+        if key.code == KeyCode::Enter
+            && let Some(agent) = self.agent.clone()
+            && let Some(composer) = &mut self.composer
+        {
+            // Local commands, consumed and never sent.
+            for command in ["/answer", "/context"] {
+                if composer.take_command(command) {
+                    self.side_command(command, &agent);
+                    return Some(Transition::Stay);
+                }
+            }
+        }
         let send_id = if key.code == KeyCode::Enter {
             next_id()
         } else {
@@ -590,6 +605,51 @@ impl Thread {
             }),
             None => Transition::Stay,
         })
+    }
+}
+
+impl Thread {
+    /// The card or panel above the composer, if the owner has one open.
+    fn side_lines(&self, width: u16) -> Vec<Line<'static>> {
+        use crate::connect::owner;
+        let (Some(o), Some(agent)) = (&self.owner, &self.agent) else {
+            return Vec::new();
+        };
+        let mut lines = if o.context_open {
+            owner::context_lines(agent, o.usage().as_ref())
+        } else if let Some(set) = o.questions() {
+            owner::card(agent, &set, width)
+        } else {
+            Vec::new()
+        };
+        if let Some(notice) = &o.notice {
+            lines.push(theme::clip_line(
+                Line::styled(notice.clone(), theme::dim()),
+                usize::from(width),
+            ));
+        }
+        lines
+    }
+
+    /// `/answer` opens the form on the agent's waiting questions; `/context`
+    /// shows its last context report. Only the agent's owner has either.
+    fn side_command(&mut self, command: &str, agent: &str) {
+        let Some(owner) = &mut self.owner else {
+            self.effort_notice = Some(format!(
+                "Only {agent}'s owner can see its questions and context."
+            ));
+            return;
+        };
+        if owner.unsupported {
+            self.effort_notice =
+                Some("This server does not support agent questions or context reports.".into());
+            return;
+        }
+        if command == "/context" {
+            owner.context_open = true;
+        } else if let Err(why) = owner.open_form() {
+            owner.notice = Some(why.into());
+        }
     }
 }
 
@@ -622,6 +682,7 @@ impl Screen for Thread {
     fn navigation_blocked(&self) -> bool {
         self.prompt.is_some()
             || self.effort_picker.is_some()
+            || self.owner.as_ref().is_some_and(|o| o.form.is_some())
             || self
                 .group
                 .as_ref()
@@ -804,6 +865,9 @@ impl Screen for Thread {
     }
 
     fn on_data(&mut self, data: &Data) {
+        if let Some(owner) = &mut self.owner {
+            owner.on_data(data);
+        }
         let loaded = self.loaded();
         if let Some(stream) = &mut self.stream {
             let entries = stream.on_data(data, (self.now)(), &loaded);
@@ -901,6 +965,28 @@ impl Screen for Thread {
     }
 
     fn raw_key(&mut self, key: KeyEvent) -> Option<Transition> {
+        use crate::connect::owner::Outcome as Form;
+        if let Some(owner) = &mut self.owner
+            && let Some(form) = &mut owner.form
+        {
+            return Some(match form.key(key) {
+                Form::Open => Transition::Stay,
+                Form::Close => {
+                    owner.form = None;
+                    Transition::Stay
+                }
+                Form::Reply(reply) => owner
+                    .reply(reply)
+                    .map_or(Transition::Stay, Transition::Request),
+            });
+        }
+        if key.code == KeyCode::Esc
+            && let Some(owner) = &mut self.owner
+            && owner.context_open
+        {
+            owner.context_open = false;
+            return Some(Transition::Stay);
+        }
         if let Some(picker) = &mut self.effort_picker {
             return Some(match picker.key(key) {
                 Outcome::Open => Transition::Stay,
@@ -950,6 +1036,10 @@ impl Screen for Thread {
     /// The same order as `raw_key`: the effort picker (choices take no
     /// text), the composer, a group dialog, then the search prompt.
     fn paste(&mut self, text: &str) {
+        if let Some(form) = self.owner.as_mut().and_then(|o| o.form.as_mut()) {
+            form.paste(text);
+            return;
+        }
         if self.effort_picker.is_some() {
             return;
         }
@@ -1048,6 +1138,29 @@ impl Screen for Thread {
         if let Some(picker) = &self.effort_picker {
             picker.render(frame, area);
         }
+        if let (Some(form), Some(agent)) = (
+            self.owner.as_ref().and_then(|o| o.form.as_ref()),
+            &self.agent,
+        ) {
+            form.render(frame, area, agent);
+        }
+    }
+
+    /// The owner's open conversation asks once a second for the agent's
+    /// side state; anyone else's, or the server without it, never does.
+    fn on_tick(&mut self, ctx: &Ctx) -> Vec<Request> {
+        let Some(agent) = &self.agent else {
+            return Vec::new();
+        };
+        if !ctx.efforts.owned_by(agent, &ctx.me) {
+            self.owner = None;
+            return Vec::new();
+        }
+        self.owner
+            .get_or_insert_with(crate::connect::owner::Session::new)
+            .poll(agent)
+            .into_iter()
+            .collect()
     }
 }
 
@@ -1063,12 +1176,17 @@ impl Thread {
             .composer
             .as_ref()
             .map_or(0, |c| c.height(inner.width, max_lines));
-        let [status, body, composer] = Layout::vertical([
+        // The owner's questions card or context panel sits above the composer.
+        let side = self.side_lines(inner.width);
+        let side_height = (side.len() as u16).min(inner.height / 3);
+        let [status, body, side_area, composer] = Layout::vertical([
             Constraint::Length(u16::from(self.agent.is_none())),
             Constraint::Min(0),
+            Constraint::Length(side_height),
             Constraint::Length(composer_height),
         ])
         .areas(inner);
+        frame.render_widget(Paragraph::new(side), side_area);
         if let Some(c) = &mut self.composer {
             c.render(frame, composer, self.composing);
         }

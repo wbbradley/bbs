@@ -55,6 +55,16 @@ pub enum Request {
         agent: String,
         value: String,
     },
+    /// One owned agent's side state (side-questions.v1), for the screen `id`.
+    SideReport {
+        id: u64,
+        agent: String,
+    },
+    /// The owner's reply to an agent's questions, for the screen `id`.
+    AnswerOwnerInput {
+        id: u64,
+        req: proto::AnswerOwnerInputRequest,
+    },
     /// Change a group for the screen `id`; the group list follows a success.
     Admin {
         id: u64,
@@ -190,6 +200,15 @@ pub enum Data {
         agent: String,
         result: Result<Option<i64>, EffortSendError>,
     },
+    SideReport {
+        id: u64,
+        result: Result<Box<proto::SideReportResponse>, String>,
+    },
+    OwnerAnswered {
+        id: u64,
+        request_id: i64,
+        result: Result<(), String>,
+    },
     /// Completion of an actual read request, for the local summary fence.
     MarkedRead {
         agent: String,
@@ -287,6 +306,26 @@ pub async fn serve(
                     agent,
                 }
             }
+            Request::SideReport { id, agent } => Data::SideReport {
+                id,
+                result: backend
+                    .side_report(proto::SideReportRequest {
+                        agent,
+                        generation: None,
+                    })
+                    .await
+                    .map(Box::new)
+                    .map_err(error),
+            },
+            Request::AnswerOwnerInput { id, req } => Data::OwnerAnswered {
+                id,
+                request_id: req.request_id,
+                result: backend
+                    .answer_owner_input(req)
+                    .await
+                    .map(|_| ())
+                    .map_err(error),
+            },
             Request::Admin { id, op } => {
                 let result = admin(&mut backend, op).await.map_err(error);
                 let changed = result.is_ok();

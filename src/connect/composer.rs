@@ -256,6 +256,16 @@ impl Composer {
         self.sending.is_some()
     }
 
+    /// Whether the whole draft is the local command `command`; if so it is
+    /// consumed, never sent.
+    pub fn take_command(&mut self, command: &str) -> bool {
+        if self.text.lines().join("\n").trim() != command {
+            return false;
+        }
+        self.text = blank();
+        true
+    }
+
     pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         let surface = theme::style(theme::Role::HumanSurface);
         frame.render_widget(Block::new().style(theme::style(theme::Role::Screen)), area);
