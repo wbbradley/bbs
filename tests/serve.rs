@@ -965,7 +965,7 @@ async fn side_questions_are_advertised_and_answered_over_the_wire() {
         .await
         .unwrap()
         .into_inner();
-    assert!(info.capabilities.iter().any(|c| c == "side-questions.v1"));
+    assert!(info.capabilities.iter().any(|c| c == "agent-interactions.v1"));
     let agent = register(&mut client).await;
     client
         .begin_side_session(as_agent(
@@ -982,6 +982,7 @@ async fn side_questions_are_advertised_and_answered_over_the_wire() {
             proto::RequestOwnerInputRequest {
                 generation: "proc-1".into(),
                 request_seq: 1,
+                message: None,
                 questions: vec![proto::InputQuestion {
                     id: "q".into(),
                     header: "Deploy?".into(),

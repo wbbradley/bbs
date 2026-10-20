@@ -923,6 +923,13 @@ struct InputAnswerJson {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+struct InputFormJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    questions: Vec<InputQuestionJson>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct UsageJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     used_tokens: Option<u64>,
@@ -1036,9 +1043,6 @@ pub fn report_context(
     with_ctx(conn, caller, |ctx| {
         let me = ctx.agent()?;
         validate_generation(ctx, &me, &req.generation)?;
-        if req.side_reason.as_deref().is_some_and(|r| r.len() > 4 * 1024) {
-            bail!("side reason exceeds 4 KiB");
-        }
         let usage_json = match &req.usage {
             None => None,
             Some(usage) => {
@@ -1059,14 +1063,7 @@ pub fn report_context(
                 })?)
             }
         };
-        db::report_context(
-            ctx.conn,
-            me.id,
-            usage_json.as_deref(),
-            req.side_supported,
-            req.side_reason.as_deref(),
-            &ctx.now_s,
-        )?;
+        db::report_context(ctx.conn, me.id, usage_json.as_deref(), &ctx.now_s)?;
         Ok(proto::Empty {})
     })
 }
@@ -1132,8 +1129,13 @@ pub fn request_owner_input(
                 }
             }
         }
-        let form: Vec<_> = req.questions.iter().map(question_json).collect();
-        let form = serde_json::to_string(&form)?;
+        if req.message.as_deref().is_some_and(|m| m.len() > 4 * 1024) {
+            bail!("form message exceeds 4 KiB");
+        }
+        let form = serde_json::to_string(&InputFormJson {
+            message: req.message.clone(),
+            questions: req.questions.iter().map(question_json).collect(),
+        })?;
         if form.len() > MAX_INPUT_TOTAL {
             bail!("question form exceeds {} KiB", MAX_INPUT_TOTAL / 1024);
         }
@@ -1179,7 +1181,7 @@ fn input_status_proto(status: &str) -> proto::InputStatus {
 }
 
 fn owner_input_proto(row: db::OwnerInputRow) -> Result<proto::OwnerInput> {
-    let questions: Vec<InputQuestionJson> =
+    let form: InputFormJson =
         serde_json::from_str(&row.form).context("invalid stored question form")?;
     let answers: Vec<InputAnswerJson> = match &row.answers {
         Some(a) => serde_json::from_str(a).context("invalid stored answers")?,
@@ -1188,9 +1190,10 @@ fn owner_input_proto(row: db::OwnerInputRow) -> Result<proto::OwnerInput> {
     Ok(proto::OwnerInput {
         request_id: row.id,
         status: input_status_proto(&row.status).into(),
-        questions: questions.into_iter().map(question_proto).collect(),
+        questions: form.questions.into_iter().map(question_proto).collect(),
         answers: answers.into_iter().map(answer_proto).collect(),
         updated_at: row.updated_at,
+        message: form.message,
     })
 }
 
@@ -1213,8 +1216,9 @@ pub fn answer_owner_input(
         if row.status != "pending" {
             bail!("input request is not pending");
         }
-        let questions: Vec<InputQuestionJson> =
+        let form: InputFormJson =
             serde_json::from_str(&row.form).context("invalid stored question form")?;
+        let questions = &form.questions;
         let (status, answers) = match req.action() {
             proto::AnswerAction::Submit => {
                 let mut seen = std::collections::HashSet::new();
@@ -1235,7 +1239,7 @@ pub fn answer_owner_input(
                         bail!("answer is not an offered option");
                     }
                 }
-                for q in &questions {
+                for q in questions {
                     let answered = req
                         .answers
                         .iter()
@@ -1331,7 +1335,6 @@ pub fn side_report(
     req: proto::SideReportRequest,
 ) -> Result<proto::SideReportResponse> {
     with_ctx(conn, caller, |ctx| {
-        let me = ctx.actor()?;
         let agent = match &req.generation {
             Some(generation) => {
                 let me = ctx.agent()?;
@@ -1358,8 +1361,6 @@ pub fn side_report(
                 agent: agent.name,
                 pending_input: pending,
                 usage: None,
-                side_supported: None,
-                side_reason: None,
                 revision: 0,
                 reported_at: String::new(),
             });
@@ -1368,8 +1369,6 @@ pub fn side_report(
             agent: agent.name,
             pending_input: pending,
             usage: usage_proto(state.usage)?,
-            side_supported: state.supported,
-            side_reason: state.reason,
             revision: state.revision,
             reported_at: state.reported_at,
         })
@@ -3215,6 +3214,7 @@ mod tests {
                     generation: g.into(),
                     request_seq: seq,
                     questions: qs,
+                    message: None,
                 },
             )
         };
@@ -3283,8 +3283,6 @@ mod tests {
                     limit_tokens: Some(100),
                     source: proto::context_usage::Source::CurrentContext.into(),
                 }),
-                side_supported: Some(true),
-                side_reason: None,
             },
         )
         .unwrap();
@@ -3308,7 +3306,6 @@ mod tests {
                 proto::context_usage::Source::CurrentContext
             )
         );
-        assert_eq!(report.side_supported, Some(true));
 
         // Bounds.
         assert!(ask(&mut conn, "run-1", 1, vec![]).is_err());
@@ -3334,12 +3331,30 @@ mod tests {
         let dup = vec![question("a", true), question("a", false)];
         assert!(ask(&mut conn, "run-1", 1, dup).is_err());
 
-        // Ask, and one pending only.
-        let request = ask(
+        // Ask, and one pending only. The form-level message is preserved
+        // verbatim and capped.
+        let err = request_owner_input(
             &mut conn,
-            "run-1",
-            1,
-            vec![question("a", true), question("b", false)],
+            &mateo,
+            proto::RequestOwnerInputRequest {
+                generation: "run-1".into(),
+                request_seq: 1,
+                questions: vec![question("a", true)],
+                message: Some("x".repeat(4 * 1024 + 1)),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("form message"), "{err}");
+        let request = request_owner_input(
+            &mut conn,
+            &mateo,
+            proto::RequestOwnerInputRequest {
+                generation: "run-1".into(),
+                request_seq: 1,
+                questions: vec![question("a", true), question("b", false)],
+                message: Some("Deploy the release candidate?".into()),
+            },
         )
         .unwrap();
         let err = ask(&mut conn, "run-1", 2, vec![question("c", true)])
@@ -3347,11 +3362,15 @@ mod tests {
             .to_string();
         assert!(err.contains("already pending"), "{err}");
         // A lost publish reply: the same sequence and form returns the same id.
-        let retry = ask(
+        let retry = request_owner_input(
             &mut conn,
-            "run-1",
-            1,
-            vec![question("a", true), question("b", false)],
+            &mateo,
+            proto::RequestOwnerInputRequest {
+                generation: "run-1".into(),
+                request_seq: 1,
+                questions: vec![question("a", true), question("b", false)],
+                message: Some("Deploy the release candidate?".into()),
+            },
         )
         .unwrap();
         assert_eq!(retry.request_id, request.request_id);
@@ -3454,6 +3473,7 @@ mod tests {
         assert_eq!(input.status(), proto::InputStatus::Answered);
         assert_eq!(input.answers.len(), 1);
         assert_eq!(input.answers[0].value, "b");
+        assert_eq!(input.message.as_deref(), Some("Deploy the release candidate?"));
 
         // The driver closes its own next request; a fresh generation resets.
         let second = ask(&mut conn, "run-1", 2, vec![question("c", true)]).unwrap();

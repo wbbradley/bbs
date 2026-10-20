@@ -5,8 +5,6 @@ CREATE TABLE side_state (
     agent_id    INTEGER PRIMARY KEY REFERENCES agents (id),
     generation  TEXT NOT NULL,
     usage       TEXT,
-    supported   INTEGER,
-    reason      TEXT,
     reported_at TEXT NOT NULL,
     revision    INTEGER NOT NULL,
     input_seq   INTEGER NOT NULL,

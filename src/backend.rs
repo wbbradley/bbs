@@ -32,7 +32,7 @@ const HUMAN_MESSAGES: &str = "human-messages.v1";
 pub const AGENT_SUMMARY: &str = "agent-summary.v1";
 pub const AGENT_EFFORT: &str = "agent-effort.v1";
 pub const AUTO_REPLY: &str = "auto-reply.v1";
-pub const SIDE_QUESTIONS: &str = "side-questions.v1";
+pub const AGENT_INTERACTIONS: &str = "agent-interactions.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -393,8 +393,8 @@ impl Backend {
     ) -> Result<proto::BeginSideSessionResponse> {
         match self {
             Backend::Local(l) => service::begin_side_session(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, begin_side_session, req, &[SIDE_QUESTIONS])
-                .map_err(|e| missing_rpc(e, SIDE_QUESTIONS)),
+            Backend::Remote(r) => rpc!(r, begin_side_session, req, &[AGENT_INTERACTIONS])
+                .map_err(|e| missing_rpc(e, AGENT_INTERACTIONS)),
         }
     }
 
@@ -403,8 +403,8 @@ impl Backend {
     pub async fn report_context(&mut self, req: proto::ReportContextRequest) -> Result<proto::Empty> {
         match self {
             Backend::Local(l) => service::report_context(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, report_context, req, &[SIDE_QUESTIONS])
-                .map_err(|e| missing_rpc(e, SIDE_QUESTIONS)),
+            Backend::Remote(r) => rpc!(r, report_context, req, &[AGENT_INTERACTIONS])
+                .map_err(|e| missing_rpc(e, AGENT_INTERACTIONS)),
         }
     }
 
@@ -416,8 +416,8 @@ impl Backend {
     ) -> Result<proto::RequestOwnerInputResponse> {
         match self {
             Backend::Local(l) => service::request_owner_input(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, request_owner_input, req, &[SIDE_QUESTIONS])
-                .map_err(|e| missing_rpc(e, SIDE_QUESTIONS)),
+            Backend::Remote(r) => rpc!(r, request_owner_input, req, &[AGENT_INTERACTIONS])
+                .map_err(|e| missing_rpc(e, AGENT_INTERACTIONS)),
         }
     }
 
@@ -429,8 +429,8 @@ impl Backend {
     ) -> Result<proto::Empty> {
         match self {
             Backend::Local(l) => service::answer_owner_input(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, answer_owner_input, req, &[SIDE_QUESTIONS])
-                .map_err(|e| missing_rpc(e, SIDE_QUESTIONS)),
+            Backend::Remote(r) => rpc!(r, answer_owner_input, req, &[AGENT_INTERACTIONS])
+                .map_err(|e| missing_rpc(e, AGENT_INTERACTIONS)),
         }
     }
 
@@ -442,8 +442,8 @@ impl Backend {
     ) -> Result<proto::Empty> {
         match self {
             Backend::Local(l) => service::close_owner_input(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, close_owner_input, req, &[SIDE_QUESTIONS])
-                .map_err(|e| missing_rpc(e, SIDE_QUESTIONS)),
+            Backend::Remote(r) => rpc!(r, close_owner_input, req, &[AGENT_INTERACTIONS])
+                .map_err(|e| missing_rpc(e, AGENT_INTERACTIONS)),
         }
     }
 
@@ -456,7 +456,7 @@ impl Backend {
         match self {
             Backend::Local(l) => service::side_report(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => {
-                rpc!(r, side_report, req, &[SIDE_QUESTIONS]).map_err(|e| missing_rpc(e, SIDE_QUESTIONS))
+                rpc!(r, side_report, req, &[AGENT_INTERACTIONS]).map_err(|e| missing_rpc(e, AGENT_INTERACTIONS))
             }
         }
     }

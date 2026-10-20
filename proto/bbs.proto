@@ -286,8 +286,6 @@ message ReportContextRequest {
   string generation = 1;
   // Present: replace the stored usage. Absent: clear it.
   optional ContextUsage usage = 2;
-  optional bool side_supported = 3;
-  optional string side_reason = 4;
 }
 
 message InputOption {
@@ -306,7 +304,10 @@ message InputQuestion {
 message RequestOwnerInputRequest {
   string generation = 1;
   int64 request_seq = 2;                 // per-generation monotonic; retry-safe
-  repeated InputQuestion questions = 3;  // 1..=3; whole request <= 16 KiB
+  repeated InputQuestion questions = 3;  // 1..=3
+  // The form's own question (e.g. ACP params.message), preserved verbatim
+  // once; <= 4 KiB, counted in the <= 16 KiB total.
+  optional string message = 4;
 }
 message RequestOwnerInputResponse { int64 request_id = 1; }  // never reused
 
@@ -347,6 +348,7 @@ message OwnerInput {
   repeated InputQuestion questions = 3;
   repeated InputAnswer answers = 4;  // SUBMIT'd answers
   string updated_at = 5;
+  optional string message = 6;  // the form's own question, verbatim
 }
 message SideReportRequest {
   string agent = 1;              // owner: an agent they own
@@ -356,10 +358,10 @@ message SideReportResponse {
   string agent = 1;
   optional OwnerInput pending_input = 2;
   optional ContextUsage usage = 3;
-  optional bool side_supported = 4;
-  optional string side_reason = 5;
   int64 revision = 6;      // per agent; changes on every side-state change
-  string reported_at = 7;  // server receipt of the latest driver report
+  // Server receipt of the latest driver report (begin or context report);
+  // input activity and polls never move it.
+  string reported_at = 7;
 }
 
 message ReadRequest {

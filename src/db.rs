@@ -883,8 +883,6 @@ pub fn agent_owner_name(conn: &Connection, agent_id: i64) -> Result<Option<Strin
 pub struct SideState {
     pub generation: String,
     pub usage: Option<String>,
-    pub supported: Option<bool>,
-    pub reason: Option<String>,
     pub reported_at: String,
     pub revision: i64,
     /// The newest request sequence seen in this generation.
@@ -896,19 +894,17 @@ pub struct SideState {
 pub fn side_state(conn: &Connection, agent_id: i64) -> Result<Option<SideState>> {
     Ok(conn
         .query_row(
-            "SELECT generation, usage, supported, reason, reported_at, revision, input_seq, closed_seq
+            "SELECT generation, usage, reported_at, revision, input_seq, closed_seq
              FROM side_state WHERE agent_id = ?1",
             [agent_id],
             |r| {
                 Ok(SideState {
                     generation: r.get(0)?,
                     usage: r.get(1)?,
-                    supported: r.get::<_, Option<i64>>(2)?.map(|v| v != 0),
-                    reason: r.get(3)?,
-                    reported_at: r.get(4)?,
-                    revision: r.get(5)?,
-                    input_seq: r.get(6)?,
-                    closed_seq: r.get(7)?,
+                    reported_at: r.get(2)?,
+                    revision: r.get(3)?,
+                    input_seq: r.get(4)?,
+                    closed_seq: r.get(5)?,
                 })
             },
         )
@@ -932,11 +928,11 @@ pub fn begin_side_session(
     }
     let revision = current.map_or(1, |s| s.revision + 1);
     conn.execute(
-        "INSERT INTO side_state (agent_id, generation, usage, supported, reason, reported_at, revision, input_seq, closed_seq)
-         VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4, 0, 0)
+        "INSERT INTO side_state (agent_id, generation, usage, reported_at, revision, input_seq, closed_seq)
+         VALUES (?1, ?2, NULL, ?3, ?4, 0, 0)
          ON CONFLICT (agent_id) DO UPDATE SET
-           generation = excluded.generation, usage = NULL, supported = NULL,
-           reason = NULL, reported_at = excluded.reported_at,
+           generation = excluded.generation, usage = NULL,
+           reported_at = excluded.reported_at,
            revision = excluded.revision, input_seq = 0, closed_seq = 0",
         params![agent_id, generation, now, revision],
     )?;
@@ -953,20 +949,17 @@ pub fn check_generation(conn: &Connection, agent_id: i64, generation: &str) -> R
     Ok(side_state(conn, agent_id)?.is_some_and(|s| s.generation == generation))
 }
 
-/// Replace the agent's reported context: usage JSON or clear, capability.
+/// Replace the agent's reported context usage: usage JSON, or clear.
 pub fn report_context(
     conn: &Connection,
     agent_id: i64,
     usage: Option<&str>,
-    supported: Option<bool>,
-    reason: Option<&str>,
     now: &str,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE side_state SET usage = ?2, supported = ?3, reason = ?4,
-           reported_at = ?5, revision = revision + 1
+        "UPDATE side_state SET usage = ?2, reported_at = ?3, revision = revision + 1
          WHERE agent_id = ?1",
-        params![agent_id, usage, supported, reason, now],
+        params![agent_id, usage, now],
     )?;
     Ok(())
 }
