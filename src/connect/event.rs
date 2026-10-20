@@ -706,6 +706,42 @@ async fn watch_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn side_errors_are_classified_by_status_code_not_text() {
+        let status = |s: tonic::Status| side_error(false, anyhow::Error::new(s));
+        assert!(matches!(
+            status(tonic::Status::unimplemented("x")),
+            SideError::Unsupported(_)
+        ));
+        // The server reports a missing required capability this way.
+        assert!(matches!(
+            status(tonic::Status::failed_precondition("anything")),
+            SideError::Unsupported(_)
+        ));
+        for refused in [
+            tonic::Status::permission_denied("x"),
+            tonic::Status::not_found("x"),
+            tonic::Status::invalid_argument("x"),
+        ] {
+            assert!(matches!(status(refused), SideError::Refused(_)));
+        }
+        // Text that merely mentions the capability is not a capability error.
+        assert!(matches!(
+            status(tonic::Status::unavailable(
+                "agent-interactions.v1 is unavailable"
+            )),
+            SideError::Transient(_)
+        ));
+        assert!(matches!(
+            side_error(false, anyhow::anyhow!("reset")),
+            SideError::Transient(_)
+        ));
+        assert!(matches!(
+            side_error(true, anyhow::anyhow!("not the owner")),
+            SideError::Refused(_)
+        ));
+    }
     use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
