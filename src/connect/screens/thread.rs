@@ -1014,6 +1014,11 @@ impl Screen for Thread {
     /// An open conversation marks received mail read and activity seen,
     /// independently of the display filters.
     fn on_view(&mut self, ctx: &Ctx) -> Vec<Request> {
+        // The choice is global: follow one made in another conversation,
+        // before the next key, even while the terminal is too small to draw.
+        if self.agent.is_some() {
+            self.set_compact(ctx.preferences.compact());
+        }
         if let Some(picker) = &mut self.effort_picker
             && let Some(agent) = &self.agent
         {

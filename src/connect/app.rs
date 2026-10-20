@@ -5703,6 +5703,48 @@ mod tests {
     }
 
     #[test]
+    fn compact_follows_the_saved_choice_without_a_drawn_frame() {
+        let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connect.json");
+        std::fs::write(&path, r#"{"compact":true}"#).unwrap();
+        let saved = || Preferences::load(path.clone()).unwrap().compact();
+        let (mut app, mut rx) = app();
+        app.ctx.preferences = Preferences::load(path.clone()).unwrap();
+        // Too small to draw any conversation: only the size notice renders.
+        let tiny = |app: &mut App| {
+            let out = screen(app, 79, 23);
+            assert!(!out.contains("BBS ·"), "{out}");
+        };
+        mateo_streams(&mut app, &mut rx);
+        tiny(&mut app);
+        ctrl_t(&mut app);
+        assert!(!saved(), "toggled from the saved compact");
+        ctrl_t(&mut app);
+        assert!(saved());
+        // Another agent opened in its place, as a key opens one, then back
+        // with Ctrl-O.
+        app.apply(Transition::Push(Box::new(Thread::agent(
+            "Zed",
+            "ada",
+            app.ctx.now.clone(),
+        ))));
+        app.viewed();
+        tiny(&mut app);
+        ctrl_t(&mut app);
+        assert!(!saved(), "Zed toggled from the saved compact");
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.top().conversation(),
+            Some(Conversation::Agent("Mateo".into())),
+            "back on Mateo"
+        );
+        tiny(&mut app);
+        ctrl_t(&mut app);
+        assert!(saved(), "Mateo toggled from Zed's verbose");
+    }
+
+    #[test]
     fn a_failed_compact_save_keeps_the_view_says_why_and_retries() {
         let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let dir = tempfile::tempdir().unwrap();
