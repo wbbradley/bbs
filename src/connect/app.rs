@@ -5572,6 +5572,51 @@ mod tests {
     }
 
     #[test]
+    fn compact_still_draws_an_envelope_of_direct_mail_alone() {
+        for mail_first in [true, false] {
+            let (mut app, mut rx) = app();
+            let (feed, act) = mateo_streams(&mut app, &mut rx);
+            let feed = Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(vec![
+                    at(11, "01", "Zed", "Mateo", "side chatter"),
+                    proto::Message {
+                        from_kind: proto::Kind::Human.into(),
+                        ..at(12, "02", "ada", "Mateo", "direct question")
+                    },
+                ]),
+            });
+            let activity = Event::Data(Data::Activity {
+                id: act,
+                result: Ok(vec![activity(
+                    20,
+                    "03",
+                    r#"{"event":"steer","mail_ids":[12],"text":"direct question"}"#,
+                )]),
+            });
+            if mail_first {
+                app.on_event(feed);
+                app.on_event(activity);
+            } else {
+                app.on_event(activity);
+                app.on_event(feed);
+            }
+            // Activity only, compact: the direct echo stands in for its mail.
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+            key(&mut app, 'A');
+            key(&mut app, 'A');
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+            let out = screen(&mut app, 80, 24);
+            assert!(
+                out.contains("mail steered into the turn")
+                    && out.matches("direct question").count() == 1
+                    && !out.contains("side chatter"),
+                "mail first {mail_first}: {out}"
+            );
+        }
+    }
+
+    #[test]
     fn a_tool_finishing_while_hidden_restores_finished_and_search_keeps_ctrl_t() {
         let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let (mut app, mut rx) = app();
