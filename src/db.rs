@@ -923,10 +923,10 @@ pub fn begin_side_session(
     now: &str,
 ) -> Result<bool> {
     let current = side_state(conn, agent_id)?;
-    if let Some(current) = &current {
-        if current.generation == generation {
-            return Ok(false);
-        }
+    if let Some(current) = &current
+        && current.generation == generation
+    {
+        return Ok(false);
     }
     let revision = current.map_or(1, |s| s.revision + 1);
     conn.execute(

@@ -1141,23 +1141,23 @@ pub fn request_owner_input(
         if form.len() > MAX_INPUT_TOTAL {
             bail!("question form exceeds {} KiB", MAX_INPUT_TOTAL / 1024);
         }
-        if let Some(latest) = db::latest_owner_input(ctx.conn, me.id)? {
-            if latest.generation == req.generation {
-                if req.request_seq < latest.seq {
-                    bail!("stale request sequence");
+        if let Some(latest) = db::latest_owner_input(ctx.conn, me.id)?
+            && latest.generation == req.generation
+        {
+            if req.request_seq < latest.seq {
+                bail!("stale request sequence");
+            }
+            if req.request_seq == latest.seq {
+                if latest.form != form {
+                    bail!("request sequence reused with a different form");
                 }
-                if req.request_seq == latest.seq {
-                    if latest.form != form {
-                        bail!("request sequence reused with a different form");
-                    }
-                    // A retry after a lost publish reply: the same request.
-                    return Ok(proto::RequestOwnerInputResponse {
-                        request_id: latest.id,
-                    });
-                }
-                if latest.status == "pending" {
-                    bail!("a question set is already pending");
-                }
+                // A retry after a lost publish reply: the same request.
+                return Ok(proto::RequestOwnerInputResponse {
+                    request_id: latest.id,
+                });
+            }
+            if latest.status == "pending" {
+                bail!("a question set is already pending");
             }
         }
         let id = db::insert_owner_input(
@@ -3282,7 +3282,6 @@ mod tests {
                 proto::ReportContextRequest {
                     generation: "run-1".into(),
                     usage: Some(usage),
-                    ..Default::default()
                 },
             )
             .is_err());
