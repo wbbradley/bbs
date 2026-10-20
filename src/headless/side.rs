@@ -221,6 +221,7 @@ async fn run(
                     usage: snapshot.usage,
                     side_supported: None,
                     side_reason: None,
+                    preserve_usage: false,
                 }),
             )
             .await

@@ -336,6 +336,10 @@ message ReportContextRequest {
   // Current-generation report, never a liveness guarantee. Reason <= 4 KiB.
   optional bool side_supported = 3;
   optional string side_reason = 4;
+  // True: keep the stored usage and its report time untouched (a
+  // capability-only update). False: usage is replaced or cleared as usual.
+  // Rejected when usage is also present.
+  bool preserve_usage = 5;
 }
 
 message InputOption {

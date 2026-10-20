@@ -966,6 +966,7 @@ pub fn check_generation(conn: &Connection, agent_id: i64, generation: &str) -> R
 
 /// Replace the agent's reported context usage: usage JSON, or clear.
 /// Capability fields are set only when given; omitted preserves them.
+/// With `preserve_usage`, usage and its report time stay untouched.
 pub fn report_context(
     conn: &Connection,
     agent_id: i64,
@@ -973,7 +974,17 @@ pub fn report_context(
     supported: Option<bool>,
     reason: Option<&str>,
     now: &str,
+    preserve_usage: bool,
 ) -> Result<()> {
+    if preserve_usage {
+        conn.execute(
+            "UPDATE side_state SET revision = revision + 1,
+               supported = coalesce(?2, supported), reason = coalesce(?3, reason)
+             WHERE agent_id = ?1",
+            params![agent_id, supported, reason],
+        )?;
+        return Ok(());
+    }
     conn.execute(
         "UPDATE side_state SET usage = ?2, reported_at = ?3, revision = revision + 1,
            supported = coalesce(?4, supported), reason = coalesce(?5, reason)

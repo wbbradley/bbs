@@ -1067,6 +1067,9 @@ pub fn report_context(
         if req.side_reason.as_deref().is_some_and(|r| r.len() > 4 * 1024) {
             bail!("side reason exceeds 4 KiB");
         }
+        if req.preserve_usage && req.usage.is_some() {
+            bail!("preserve_usage does not take new usage");
+        }
         db::report_context(
             ctx.conn,
             me.id,
@@ -1074,6 +1077,7 @@ pub fn report_context(
             req.side_supported,
             req.side_reason.as_deref(),
             &ctx.now_s,
+            req.preserve_usage,
         )?;
         Ok(proto::Empty {})
     })
@@ -3440,6 +3444,7 @@ mod tests {
                     usage: Some(usage),
                     side_supported: None,
                     side_reason: None,
+                    preserve_usage: false,
                 },
             )
             .is_err());
@@ -3456,6 +3461,7 @@ mod tests {
                 }),
                 side_supported: None,
                 side_reason: None,
+                preserve_usage: false,
             },
         )
         .unwrap();
@@ -3821,6 +3827,7 @@ mod tests {
                 }),
                 side_supported: None,
                 side_reason: None,
+                preserve_usage: false,
             },
         )
         .unwrap();
@@ -3906,6 +3913,7 @@ mod tests {
                     usage: None,
                     side_supported: Some(ok),
                     side_reason: None,
+                preserve_usage: false,
                 },
             )
         };
@@ -4096,10 +4104,83 @@ mod tests {
                 usage: None,
                 side_supported: None,
                 side_reason: None,
+                preserve_usage: false,
             },
         )
         .unwrap();
         assert!(ask(&mut conn, "again").is_ok());
+
+        // preserve_usage: capability-only reports leave usage and its report
+        // time untouched; it never takes new usage.
+        report_context(
+            &mut conn,
+            &mateo,
+            proto::ReportContextRequest {
+                generation: "run-2".into(),
+                usage: Some(proto::ContextUsage {
+                    used_tokens: Some(42),
+                    limit_tokens: Some(100),
+                    source: proto::context_usage::Source::CurrentContext.into(),
+                }),
+                side_supported: None,
+                side_reason: None,
+                preserve_usage: false,
+            },
+        )
+        .unwrap();
+        let stamp = side_report(
+            &mut conn,
+            &mateo,
+            proto::SideReportRequest {
+                agent: String::new(),
+                generation: Some("run-2".into()),
+            },
+        )
+        .unwrap()
+        .reported_at;
+        let err = report_context(
+            &mut conn,
+            &mateo,
+            proto::ReportContextRequest {
+                generation: "run-2".into(),
+                usage: Some(proto::ContextUsage {
+                    used_tokens: Some(1),
+                    limit_tokens: None,
+                    source: proto::context_usage::Source::LastModelRequest.into(),
+                }),
+                side_supported: None,
+                side_reason: None,
+                preserve_usage: true,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not take new usage"), "{err}");
+        report_context(
+            &mut conn,
+            &mateo,
+            proto::ReportContextRequest {
+                generation: "run-2".into(),
+                usage: None,
+                side_supported: Some(false),
+                side_reason: Some("child setup failed".into()),
+                preserve_usage: true,
+            },
+        )
+        .unwrap();
+        let view = side_report(
+            &mut conn,
+            &mateo,
+            proto::SideReportRequest {
+                agent: String::new(),
+                generation: Some("run-2".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(view.usage.unwrap().used_tokens, Some(42));
+        assert_eq!(view.reported_at, stamp);
+        assert_eq!(view.side_supported, Some(false));
+        assert_eq!(view.side_reason.as_deref(), Some("child setup failed"));
 
         // Nothing side-channel ever becomes mail, a delivery, or a conversation.
         assert_eq!(mail_counts(&mut conn), before);

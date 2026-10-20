@@ -1059,6 +1059,7 @@ async fn side_questions_are_asked_claimed_and_answered_over_the_wire() {
                 usage: None,
                 side_supported: Some(true),
                 side_reason: None,
+            preserve_usage: false,
             },
         ))
         .await
