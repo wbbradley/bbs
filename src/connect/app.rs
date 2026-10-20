@@ -3689,6 +3689,10 @@ mod tests {
                     == 1,
                 "{out}"
             );
+            assert!(
+                out.lines().filter(|l| l.contains("is invalid")).count() <= 1,
+                "a long error stays on one line: {out}"
+            );
             press(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert!(
                 screen(&mut app, 80, 24).contains("my answer"),
