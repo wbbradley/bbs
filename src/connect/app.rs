@@ -3340,8 +3340,10 @@ mod tests {
             result: Ok(Box::new(side_report(1, 7, questions))),
         }));
         command(&mut app, "/answer");
-        // Every choice is reachable and shown whole as the focus moves.
+        // Every choice is reachable and shown whole as the focus moves: the
+        // end of each long description wraps into view rather than being cut.
         let mut seen = std::collections::BTreeSet::new();
+        let mut tails = 0;
         for _ in 0..10 {
             let out = screen(&mut app, 80, 24);
             for n in 1..=8 {
@@ -3349,12 +3351,14 @@ mod tests {
                     seen.insert(n);
                 }
             }
+            tails += out.matches("eighty columns").count();
             press(&mut app, KeyCode::Down, KeyModifiers::NONE);
         }
         assert_eq!(seen.len(), 8, "{seen:?}");
+        assert!(tails > 0, "descriptions wrap whole, not clipped");
         let out = screen(&mut app, 80, 24);
         assert!(
-            out.contains("eighty columns") || out.contains("[Submit]"),
+            out.contains("detail line 12") || out.contains("[Submit]"),
             "{out}"
         );
         assert!(rx.try_recv().is_err());
