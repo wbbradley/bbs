@@ -895,6 +895,399 @@ fn send_control(
     })
 }
 
+// ---- side channels (side-questions.v1) -------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InputOptionJson {
+    value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InputQuestionJson {
+    id: String,
+    header: String,
+    text: String,
+    options: Vec<InputOptionJson>,
+    allow_free_text: bool,
+    required: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InputAnswerJson {
+    question_id: String,
+    value: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UsageJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    used_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_tokens: Option<u64>,
+    source: String,
+}
+
+fn question_json(q: &proto::InputQuestion) -> InputQuestionJson {
+    InputQuestionJson {
+        id: q.id.clone(),
+        header: q.header.clone(),
+        text: q.text.clone(),
+        options: q
+            .options
+            .iter()
+            .map(|o| InputOptionJson {
+                value: o.value.clone(),
+                label: o.label.clone(),
+                description: o.description.clone(),
+            })
+            .collect(),
+        allow_free_text: q.allow_free_text,
+        required: q.required,
+    }
+}
+
+fn question_proto(q: InputQuestionJson) -> proto::InputQuestion {
+    proto::InputQuestion {
+        id: q.id,
+        header: q.header,
+        text: q.text,
+        options: q
+            .options
+            .into_iter()
+            .map(|o| proto::InputOption {
+                value: o.value,
+                label: o.label,
+                description: o.description,
+            })
+            .collect(),
+        allow_free_text: q.allow_free_text,
+        required: q.required,
+    }
+}
+
+fn answer_json(a: &proto::InputAnswer) -> InputAnswerJson {
+    InputAnswerJson {
+        question_id: a.question_id.clone(),
+        value: a.value.clone(),
+    }
+}
+
+fn answer_proto(a: InputAnswerJson) -> proto::InputAnswer {
+    proto::InputAnswer {
+        question_id: a.question_id,
+        value: a.value,
+    }
+}
+
+fn usage_proto(usage: Option<String>) -> Result<Option<proto::ContextUsage>> {
+    let Some(json) = usage else { return Ok(None) };
+    let parsed: UsageJson =
+        serde_json::from_str(&json).context("invalid stored context usage")?;
+    let source = match parsed.source.as_str() {
+        "current" => proto::context_usage::Source::CurrentContext,
+        _ => proto::context_usage::Source::LastModelRequest,
+    };
+    Ok(Some(proto::ContextUsage {
+        used_tokens: parsed.used_tokens,
+        limit_tokens: parsed.limit_tokens,
+        source: source.into(),
+    }))
+}
+
+fn validate_generation(ctx: &Ctx, agent: &db::Principal, generation: &str) -> Result<()> {
+    if generation.is_empty() || generation.len() > 128 {
+        bail!("generation must be 1 to 128 bytes");
+    }
+    if !db::check_generation(ctx.conn, agent.id, generation)? {
+        bail!("stale side generation; begin a new side session");
+    }
+    Ok(())
+}
+
+/// A fresh interaction session: same-generation is a no-op (lost ACK safe),
+/// a new generation resets pending input and usage.
+pub fn begin_side_session(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::BeginSideSessionRequest,
+) -> Result<proto::BeginSideSessionResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        if req.generation.is_empty() || req.generation.len() > 128 {
+            bail!("generation must be 1 to 128 bytes");
+        }
+        db::begin_side_session(ctx.conn, me.id, &req.generation, &ctx.now_s)?;
+        Ok(proto::BeginSideSessionResponse {
+            generation: req.generation,
+        })
+    })
+}
+
+/// Latest context usage and capability; replaces or clears usage explicitly.
+pub fn report_context(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::ReportContextRequest,
+) -> Result<proto::Empty> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        validate_generation(ctx, &me, &req.generation)?;
+        let usage_json = match &req.usage {
+            None => None,
+            Some(usage) => {
+                if usage.source() == proto::context_usage::Source::Unspecified {
+                    bail!("usage source is required when usage is reported");
+                }
+                if usage.limit_tokens == Some(0) {
+                    bail!("usage limit must be positive when present");
+                }
+                let source = match usage.source() {
+                    proto::context_usage::Source::CurrentContext => "current",
+                    _ => "request",
+                };
+                Some(serde_json::to_string(&UsageJson {
+                    used_tokens: usage.used_tokens,
+                    limit_tokens: usage.limit_tokens,
+                    source: source.into(),
+                })?)
+            }
+        };
+        db::report_context(
+            ctx.conn,
+            me.id,
+            usage_json.as_deref(),
+            req.side_supported,
+            req.side_reason.as_deref(),
+            &ctx.now_s,
+        )?;
+        Ok(proto::Empty {})
+    })
+}
+
+const MAX_QUESTIONS: usize = 3;
+const MAX_OPTIONS: usize = 16;
+const MAX_INPUT_TOTAL: usize = 32 * 1024;
+
+/// A structured question set for the owning human; one pending per agent.
+pub fn request_owner_input(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::RequestOwnerInputRequest,
+) -> Result<proto::RequestOwnerInputResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        validate_generation(ctx, &me, &req.generation)?;
+        if req.questions.is_empty() || req.questions.len() > MAX_QUESTIONS {
+            bail!("ask 1 to {MAX_QUESTIONS} questions");
+        }
+        let mut total = 0;
+        let mut ids = std::collections::HashSet::new();
+        for q in &req.questions {
+            total += q.id.len() + q.header.len() + q.text.len();
+            if q.id.is_empty() || q.id.len() > 128 || !ids.insert(q.id.clone()) {
+                bail!("question ids must be unique, 1 to 128 bytes");
+            }
+            if q.header.len() > 128 {
+                bail!("question header exceeds 128 bytes");
+            }
+            if q.text.is_empty() || q.text.len() > 4 * 1024 {
+                bail!("question text must be 1 byte to 4 KiB");
+            }
+            if q.options.len() > MAX_OPTIONS {
+                bail!("at most {MAX_OPTIONS} options per question");
+            }
+            for o in &q.options {
+                total += o.value.len();
+                if o.value.is_empty() || o.value.len() > 128 {
+                    bail!("option values must be 1 to 128 bytes");
+                }
+            }
+        }
+        if total > MAX_INPUT_TOTAL {
+            bail!("question form exceeds {} KiB", MAX_INPUT_TOTAL / 1024);
+        }
+        if db::pending_owner_input(ctx.conn, me.id)?.is_some() {
+            bail!("a question set is already pending");
+        }
+        let form: Vec<_> = req.questions.iter().map(question_json).collect();
+        let form = serde_json::to_string(&form)?;
+        let id = db::insert_owner_input(ctx.conn, me.id, &req.generation, &form, &ctx.now_s)?;
+        Ok(proto::RequestOwnerInputResponse { request_id: id })
+    })
+}
+
+fn input_status_proto(status: &str) -> proto::InputStatus {
+    match status {
+        "answered" => proto::InputStatus::Answered,
+        "declined" => proto::InputStatus::Declined,
+        "cancelled" => proto::InputStatus::Cancelled,
+        "stale" => proto::InputStatus::Stale,
+        _ => proto::InputStatus::Pending,
+    }
+}
+
+fn owner_input_proto(row: db::OwnerInputRow) -> Result<proto::OwnerInput> {
+    let questions: Vec<InputQuestionJson> =
+        serde_json::from_str(&row.form).context("invalid stored question form")?;
+    let answers: Vec<InputAnswerJson> = match &row.answers {
+        Some(a) => serde_json::from_str(a).context("invalid stored answers")?,
+        None => Vec::new(),
+    };
+    Ok(proto::OwnerInput {
+        request_id: row.id,
+        status: input_status_proto(&row.status).into(),
+        questions: questions.into_iter().map(question_proto).collect(),
+        answers: answers.into_iter().map(answer_proto).collect(),
+        updated_at: row.updated_at,
+    })
+}
+
+/// The owner's answer, decline or cancel; exact request id, exact question ids.
+pub fn answer_owner_input(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::AnswerOwnerInputRequest,
+) -> Result<proto::Empty> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let Some(row) = db::owner_input(ctx.conn, req.request_id)? else {
+            bail!("no such input request");
+        };
+        if db::agent_owner_id(ctx.conn, row_agent(ctx.conn, req.request_id)?)?
+            != Some(me.id)
+        {
+            bail!("not your agent's question");
+        }
+        if row.status != "pending" {
+            bail!("input request is not pending");
+        }
+        let questions: Vec<InputQuestionJson> =
+            serde_json::from_str(&row.form).context("invalid stored question form")?;
+        let (status, answers) = match req.action() {
+            proto::AnswerAction::Submit => {
+                let mut seen = std::collections::HashSet::new();
+                for a in &req.answers {
+                    if a.value.len() > 4 * 1024 {
+                        bail!("answer exceeds 4 KiB");
+                    }
+                    let Some(q) = questions.iter().find(|q| q.id == a.question_id) else {
+                        bail!("answer names an unknown question");
+                    };
+                    if !seen.insert(a.question_id.clone()) {
+                        bail!("duplicate answer for one question");
+                    }
+                    if !q.allow_free_text
+                        && !q.options.is_empty()
+                        && !q.options.iter().any(|o| o.value == a.value)
+                    {
+                        bail!("answer is not an offered option");
+                    }
+                }
+                for q in &questions {
+                    if q.required && !seen.contains(&q.id) {
+                        bail!("required question unanswered: {}", q.id);
+                    }
+                }
+                ("answered", Some(serde_json::to_string(
+                    &req.answers.iter().map(answer_json).collect::<Vec<_>>(),
+                )?))
+            }
+            proto::AnswerAction::Decline => ("declined", None),
+            proto::AnswerAction::Cancel => ("cancelled", None),
+            _ => bail!("an answer action is required"),
+        };
+        db::finish_owner_input(ctx.conn, row.id, answers.as_deref(), status, &ctx.now_s)?;
+        Ok(proto::Empty {})
+    })
+}
+
+fn row_agent(conn: &Connection, request_id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT agent_id FROM owner_input_requests WHERE id = ?1",
+        [request_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// The driver closes its own pending request (turn cancelled or timed out).
+pub fn close_owner_input(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::CloseOwnerInputRequest,
+) -> Result<proto::Empty> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        validate_generation(ctx, &me, &req.generation)?;
+        let Some(row) = db::owner_input(ctx.conn, req.request_id)? else {
+            bail!("no such input request");
+        };
+        if row_agent(ctx.conn, req.request_id)? != me.id || row.generation != req.generation {
+            bail!("not your input request");
+        }
+        if row.status != "pending" {
+            bail!("input request is not pending");
+        }
+        db::finish_owner_input(ctx.conn, row.id, None, "cancelled", &ctx.now_s)?;
+        Ok(proto::Empty {})
+    })
+}
+
+/// One agent's side state: the owner, or the driver with its generation.
+pub fn side_report(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::SideReportRequest,
+) -> Result<proto::SideReportResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        let agent = match &req.generation {
+            Some(generation) => {
+                let me = ctx.agent()?;
+                validate_generation(ctx, &me, generation)?;
+                me
+            }
+            None => {
+                let human = ctx.human()?;
+                let Some(target) = db::live_agent_by_name(ctx.conn, &req.agent)? else {
+                    bail!("no live agent named {:?}", req.agent);
+                };
+                if db::agent_owner_id(ctx.conn, target.id)? != Some(human.id) {
+                    bail!("{:?} is not your agent", req.agent);
+                }
+                target
+            }
+        };
+        let state = db::side_state(ctx.conn, agent.id)?;
+        let pending = db::latest_owner_input(ctx.conn, agent.id)?
+            .map(owner_input_proto)
+            .transpose()?;
+        let Some(state) = state else {
+            return Ok(proto::SideReportResponse {
+                agent: agent.name,
+                pending_input: pending,
+                usage: None,
+                side_supported: None,
+                side_reason: None,
+                revision: 0,
+                reported_at: String::new(),
+            });
+        };
+        Ok(proto::SideReportResponse {
+            agent: agent.name,
+            pending_input: pending,
+            usage: usage_proto(state.usage)?,
+            side_supported: state.supported,
+            side_reason: state.reason,
+            revision: state.revision,
+            reported_at: state.reported_at,
+        })
+    })
+}
+
 /// Delivery keys are bounded ASCII identifiers, scoped to the sender's
 /// registration.
 fn validate_delivery_key(key: &str) -> Result<()> {

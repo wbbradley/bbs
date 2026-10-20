@@ -26,6 +26,7 @@ pub const CAPABILITIES: &[&str] = &[
     "agent-summary.v1",
     "agent-effort.v1",
     "auto-reply.v1",
+    "side-questions.v1",
 ];
 const MAX_METADATA_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;

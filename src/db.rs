@@ -29,6 +29,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0015_agent_effort.sql"),
     include_str!("../migrations/0016_agent_human_conversations.sql"),
     include_str!("../migrations/0017_auto_replies.sql"),
+    include_str!("../migrations/0018_side_channels.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -873,6 +874,192 @@ pub fn agent_owner_name(conn: &Connection, agent_id: i64) -> Result<Option<Strin
             |r| r.get(0),
         )
         .optional()?)
+}
+
+// ---- side channels (side-questions.v1) -------------------------------------
+
+/// One agent's side state: its current generation, latest reported usage
+/// (JSON), capability, and the side-state revision counter.
+pub struct SideState {
+    pub generation: String,
+    pub usage: Option<String>,
+    pub supported: Option<bool>,
+    pub reason: Option<String>,
+    pub reported_at: String,
+    pub revision: i64,
+}
+
+pub fn side_state(conn: &Connection, agent_id: i64) -> Result<Option<SideState>> {
+    Ok(conn
+        .query_row(
+            "SELECT generation, usage, supported, reason, reported_at, revision
+             FROM side_state WHERE agent_id = ?1",
+            [agent_id],
+            |r| {
+                Ok(SideState {
+                    generation: r.get(0)?,
+                    usage: r.get(1)?,
+                    supported: r.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                    reason: r.get(3)?,
+                    reported_at: r.get(4)?,
+                    revision: r.get(5)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Begin `agent`'s interaction session with `generation`. Idempotent for the
+/// current value; a new value resets side state: usage cleared, pending input
+/// requests marked stale, revision bumped. Returns whether a reset happened.
+pub fn begin_side_session(
+    conn: &Connection,
+    agent_id: i64,
+    generation: &str,
+    now: &str,
+) -> Result<bool> {
+    let current = side_state(conn, agent_id)?;
+    if let Some(current) = &current {
+        if current.generation == generation {
+            return Ok(false);
+        }
+    }
+    let revision = current.map_or(1, |s| s.revision + 1);
+    conn.execute(
+        "INSERT INTO side_state (agent_id, generation, usage, supported, reason, reported_at, revision)
+         VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4)
+         ON CONFLICT (agent_id) DO UPDATE SET
+           generation = excluded.generation, usage = NULL, supported = NULL,
+           reason = NULL, reported_at = excluded.reported_at,
+           revision = excluded.revision",
+        params![agent_id, generation, now, revision],
+    )?;
+    conn.execute(
+        "UPDATE owner_input_requests SET status = 'stale', updated_at = ?2
+         WHERE agent_id = ?1 AND status = 'pending'",
+        params![agent_id, now],
+    )?;
+    Ok(true)
+}
+
+/// Require `generation` to be the agent's current one.
+pub fn check_generation(conn: &Connection, agent_id: i64, generation: &str) -> Result<bool> {
+    Ok(side_state(conn, agent_id)?.is_some_and(|s| s.generation == generation))
+}
+
+/// Replace the agent's reported context: usage JSON or clear, capability.
+pub fn report_context(
+    conn: &Connection,
+    agent_id: i64,
+    usage: Option<&str>,
+    supported: Option<bool>,
+    reason: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE side_state SET usage = ?2, supported = ?3, reason = ?4,
+           reported_at = ?5, revision = revision + 1
+         WHERE agent_id = ?1",
+        params![agent_id, usage, supported, reason, now],
+    )?;
+    Ok(())
+}
+
+/// One owner-input request's stored row.
+pub struct OwnerInputRow {
+    pub id: i64,
+    pub generation: String,
+    pub form: String,
+    pub answers: Option<String>,
+    pub status: String,
+    pub updated_at: String,
+}
+
+fn owner_input_row(r: &rusqlite::Row) -> rusqlite::Result<OwnerInputRow> {
+    Ok(OwnerInputRow {
+        id: r.get(0)?,
+        generation: r.get(1)?,
+        form: r.get(2)?,
+        answers: r.get(3)?,
+        status: r.get(4)?,
+        updated_at: r.get(5)?,
+    })
+}
+
+const OWNER_INPUT_SELECT: &str =
+    "SELECT id, generation, form, answers, status, updated_at FROM owner_input_requests";
+
+/// The agent's pending request, if any (at most one by construction).
+pub fn pending_owner_input(conn: &Connection, agent_id: i64) -> Result<Option<OwnerInputRow>> {
+    Ok(conn
+        .query_row(
+            &format!("{OWNER_INPUT_SELECT} WHERE agent_id = ?1 AND status = 'pending'"),
+            [agent_id],
+            owner_input_row,
+        )
+        .optional()?)
+}
+
+/// The agent's newest request regardless of status.
+pub fn latest_owner_input(conn: &Connection, agent_id: i64) -> Result<Option<OwnerInputRow>> {
+    Ok(conn
+        .query_row(
+            &format!("{OWNER_INPUT_SELECT} WHERE agent_id = ?1 ORDER BY id DESC LIMIT 1"),
+            [agent_id],
+            owner_input_row,
+        )
+        .optional()?)
+}
+
+/// One request by id, for exact-id answers and closes.
+pub fn owner_input(conn: &Connection, id: i64) -> Result<Option<OwnerInputRow>> {
+    Ok(conn
+        .query_row(
+            &format!("{OWNER_INPUT_SELECT} WHERE id = ?1"),
+            [id],
+            owner_input_row,
+        )
+        .optional()?)
+}
+
+/// Store a new pending request; returns its never-reused id.
+pub fn insert_owner_input(
+    conn: &Connection,
+    agent_id: i64,
+    generation: &str,
+    form: &str,
+    now: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO owner_input_requests (agent_id, generation, form, answers, status, updated_at)
+         VALUES (?1, ?2, ?3, NULL, 'pending', ?4)",
+        params![agent_id, generation, form, now],
+    )?;
+    conn.execute(
+        "UPDATE side_state SET revision = revision + 1 WHERE agent_id = ?1",
+        [agent_id],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Set a request's terminal status and answers.
+pub fn finish_owner_input(
+    conn: &Connection,
+    id: i64,
+    answers: Option<&str>,
+    status: &str,
+    now: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE owner_input_requests SET answers = ?2, status = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, answers, status, now],
+    )?;
+    conn.execute(
+        "UPDATE side_state SET revision = revision + 1
+         WHERE agent_id = (SELECT agent_id FROM owner_input_requests WHERE id = ?1)",
+        [id],
+    )?;
+    Ok(())
 }
 
 /// Record a direct message between `agent` and `human`, in either direction,

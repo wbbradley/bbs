@@ -858,6 +858,69 @@ impl Bbs for Server {
             .await
     }
 
+    async fn begin_side_session(
+        &self,
+        req: Request<proto::BeginSideSessionRequest>,
+    ) -> Result<Response<proto::BeginSideSessionResponse>, Status> {
+        self.unary("begin_side_session", req, Effect::Write, service::begin_side_session)
+            .await
+    }
+
+    async fn report_context(
+        &self,
+        req: Request<proto::ReportContextRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        self.unary("report_context", req, Effect::Write, service::report_context)
+            .await
+    }
+
+    async fn request_owner_input(
+        &self,
+        req: Request<proto::RequestOwnerInputRequest>,
+    ) -> Result<Response<proto::RequestOwnerInputResponse>, Status> {
+        self.unary(
+            "request_owner_input",
+            req,
+            Effect::Write,
+            service::request_owner_input,
+        )
+        .await
+    }
+
+    async fn answer_owner_input(
+        &self,
+        req: Request<proto::AnswerOwnerInputRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        self.unary(
+            "answer_owner_input",
+            req,
+            Effect::Write,
+            service::answer_owner_input,
+        )
+        .await
+    }
+
+    async fn close_owner_input(
+        &self,
+        req: Request<proto::CloseOwnerInputRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        self.unary(
+            "close_owner_input",
+            req,
+            Effect::Write,
+            service::close_owner_input,
+        )
+        .await
+    }
+
+    async fn side_report(
+        &self,
+        req: Request<proto::SideReportRequest>,
+    ) -> Result<Response<proto::SideReportResponse>, Status> {
+        self.unary("side_report", req, Effect::Query, service::side_report)
+            .await
+    }
+
     async fn read(
         &self,
         req: Request<proto::ReadRequest>,

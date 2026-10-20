@@ -90,6 +90,22 @@ service Bbs {
   // A headless agent's driver reports its harness-confirmed effort state.
   // Agent token, self only; requires agent-effort.v1.
   rpc ReportEffort(ReportEffortRequest) returns (ReportEffortResponse);
+
+  // Side channels (side-questions.v1): structured owner input and context
+  // usage, outside mail, history and the harness's model input.
+  // A runner begins one interaction session per process; a fresh generation
+  // resets the agent's side state. Agent token, self only.
+  rpc BeginSideSession(BeginSideSessionRequest) returns (BeginSideSessionResponse);
+  // A driver reports context usage and side capability; generation-gated.
+  rpc ReportContext(ReportContextRequest) returns (Empty);
+  // A driver asks its owning human up to three structured questions.
+  rpc RequestOwnerInput(RequestOwnerInputRequest) returns (RequestOwnerInputResponse);
+  // The owning human answers, declines or cancels; exact request id.
+  rpc AnswerOwnerInput(AnswerOwnerInputRequest) returns (Empty);
+  // A driver closes its own pending request (turn cancelled or timed out).
+  rpc CloseOwnerInput(CloseOwnerInputRequest) returns (Empty);
+  // One agent's side state: the owner, or the driver with its generation.
+  rpc SideReport(SideReportRequest) returns (SideReportResponse);
 }
 
 message Empty {}
@@ -245,6 +261,99 @@ message EffortReport {
 }
 message ReportEffortRequest { EffortReport report = 1; }
 message ReportEffortResponse {}
+
+// Side channels (side-questions.v1). Nothing here is mail: no message,
+// delivery, inbox, history or recency row is ever created.
+
+// A fresh opaque generation per runner process. Idempotent for the same
+// value, so a retried begin never resets state; a new value resets the
+// agent's pending input and usage.
+message BeginSideSessionRequest { string generation = 1; }  // 1..=128 bytes
+message BeginSideSessionResponse { string generation = 1; }
+
+message ContextUsage {
+  optional uint64 used_tokens = 1;   // may exceed the limit; never clamped
+  optional uint64 limit_tokens = 2;  // > 0 when present
+  enum Source {
+    SOURCE_UNSPECIFIED = 0;
+    CURRENT_CONTEXT = 1;
+    LAST_MODEL_REQUEST = 2;
+  }
+  Source source = 3;  // required when the usage is present
+}
+
+message ReportContextRequest {
+  string generation = 1;
+  // Present: replace the stored usage. Absent: clear it.
+  optional ContextUsage usage = 2;
+  optional bool side_supported = 3;
+  optional string side_reason = 4;
+}
+
+message InputOption {
+  string value = 1;              // <= 128 bytes
+  optional string label = 2;
+  optional string description = 3;
+}
+message InputQuestion {
+  string id = 1;                 // <= 128 bytes; unique within the request
+  string header = 2;             // <= 128 bytes
+  string text = 3;               // <= 4 KiB
+  repeated InputOption options = 4;  // <= 16; empty means free text only
+  bool allow_free_text = 5;
+  bool required = 6;
+}
+message RequestOwnerInputRequest {
+  string generation = 1;
+  repeated InputQuestion questions = 2;  // 1..=3; whole request <= 32 KiB
+}
+message RequestOwnerInputResponse { int64 request_id = 1; }  // never reused
+
+enum AnswerAction {
+  ANSWER_ACTION_UNSPECIFIED = 0;
+  SUBMIT = 1;
+  DECLINE = 2;
+  CANCEL = 3;
+}
+message InputAnswer {
+  string question_id = 1;  // exact question id
+  string value = 2;        // <= 4 KiB; an option's value, or free text
+}
+message AnswerOwnerInputRequest {
+  int64 request_id = 1;
+  AnswerAction action = 2;
+  repeated InputAnswer answers = 3;  // SUBMIT only; optional questions may be absent
+}
+message CloseOwnerInputRequest { string generation = 1; int64 request_id = 2; }
+
+enum InputStatus {
+  INPUT_STATUS_UNSPECIFIED = 0;
+  PENDING = 1;
+  ANSWERED = 2;
+  DECLINED = 3;
+  CANCELLED = 4;
+  STALE = 5;
+}
+message OwnerInput {
+  int64 request_id = 1;
+  InputStatus status = 2;
+  repeated InputQuestion questions = 3;
+  repeated InputAnswer answers = 4;  // SUBMIT'd answers
+  string updated_at = 5;
+}
+message SideReportRequest {
+  string agent = 1;              // owner: an agent they own
+  optional string generation = 2;  // driver: its own generation, for itself
+}
+message SideReportResponse {
+  string agent = 1;
+  optional OwnerInput pending_input = 2;
+  optional ContextUsage usage = 3;
+  optional bool side_supported = 4;
+  optional string side_reason = 5;
+  int64 revision = 6;      // per agent; changes on every side-state change
+  string reported_at = 7;  // server receipt of the latest driver report
+}
 
 message ReadRequest {
   optional uint32 limit = 1;
