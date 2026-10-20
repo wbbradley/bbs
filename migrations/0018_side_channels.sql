@@ -7,7 +7,6 @@ CREATE TABLE side_state (
     usage       TEXT,
     reported_at TEXT NOT NULL,
     revision    INTEGER NOT NULL,
-    input_seq   INTEGER NOT NULL,
     closed_seq  INTEGER NOT NULL
 ) WITHOUT ROWID;
 

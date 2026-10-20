@@ -280,6 +280,9 @@ message ContextUsage {
     LAST_MODEL_REQUEST = 2;
   }
   Source source = 3;  // required when the usage is present
+  // When the driver received this provider snapshot (RFC3339 UTC); preserved
+  // verbatim across coalescing and retries, never the server's write time.
+  optional string received_at = 4;
 }
 
 message ReportContextRequest {
@@ -308,6 +311,8 @@ message RequestOwnerInputRequest {
   // The form's own question (e.g. ACP params.message), preserved verbatim
   // once; <= 4 KiB, counted in the <= 16 KiB total.
   optional string message = 4;
+  // True when the driver waits on the answer before continuing the turn.
+  bool is_blocking = 5;
 }
 message RequestOwnerInputResponse { int64 request_id = 1; }  // never reused
 
@@ -349,6 +354,7 @@ message OwnerInput {
   repeated InputAnswer answers = 4;  // SUBMIT'd answers
   string updated_at = 5;
   optional string message = 6;  // the form's own question, verbatim
+  bool is_blocking = 7;
 }
 message SideReportRequest {
   string agent = 1;              // owner: an agent they own

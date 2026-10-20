@@ -426,6 +426,11 @@ pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
     conn.execute("DELETE FROM activity WHERE agent_id = ?1", params![id])?;
     conn.execute("DELETE FROM timers WHERE target_id = ?1", params![id])?;
     conn.execute("DELETE FROM activity_seen WHERE agent_id = ?1", params![id])?;
+    conn.execute("DELETE FROM side_state WHERE agent_id = ?1", params![id])?;
+    conn.execute(
+        "DELETE FROM owner_input_requests WHERE agent_id = ?1",
+        params![id],
+    )?;
     conn.execute(
         "UPDATE agents SET effort = NULL, effort_reported_at = NULL WHERE id = ?1",
         params![id],
@@ -885,8 +890,6 @@ pub struct SideState {
     pub usage: Option<String>,
     pub reported_at: String,
     pub revision: i64,
-    /// The newest request sequence seen in this generation.
-    pub input_seq: i64,
     /// Requests at or below this sequence are closed, published or not.
     pub closed_seq: i64,
 }
@@ -894,7 +897,7 @@ pub struct SideState {
 pub fn side_state(conn: &Connection, agent_id: i64) -> Result<Option<SideState>> {
     Ok(conn
         .query_row(
-            "SELECT generation, usage, reported_at, revision, input_seq, closed_seq
+            "SELECT generation, usage, reported_at, revision, closed_seq
              FROM side_state WHERE agent_id = ?1",
             [agent_id],
             |r| {
@@ -903,8 +906,7 @@ pub fn side_state(conn: &Connection, agent_id: i64) -> Result<Option<SideState>>
                     usage: r.get(1)?,
                     reported_at: r.get(2)?,
                     revision: r.get(3)?,
-                    input_seq: r.get(4)?,
-                    closed_seq: r.get(5)?,
+                    closed_seq: r.get(4)?,
                 })
             },
         )
@@ -928,12 +930,12 @@ pub fn begin_side_session(
     }
     let revision = current.map_or(1, |s| s.revision + 1);
     conn.execute(
-        "INSERT INTO side_state (agent_id, generation, usage, reported_at, revision, input_seq, closed_seq)
-         VALUES (?1, ?2, NULL, ?3, ?4, 0, 0)
+        "INSERT INTO side_state (agent_id, generation, usage, reported_at, revision, closed_seq)
+         VALUES (?1, ?2, NULL, ?3, ?4, 0)
          ON CONFLICT (agent_id) DO UPDATE SET
            generation = excluded.generation, usage = NULL,
            reported_at = excluded.reported_at,
-           revision = excluded.revision, input_seq = 0, closed_seq = 0",
+           revision = excluded.revision, closed_seq = 0",
         params![agent_id, generation, now, revision],
     )?;
     conn.execute(
@@ -1043,8 +1045,8 @@ pub fn insert_owner_input(
         params![agent_id, generation, seq, form, now],
     )?;
     conn.execute(
-        "UPDATE side_state SET revision = revision + 1, input_seq = ?2 WHERE agent_id = ?1",
-        params![agent_id, seq],
+        "UPDATE side_state SET revision = revision + 1 WHERE agent_id = ?1",
+        [agent_id],
     )?;
     Ok(conn.last_insert_rowid())
 }

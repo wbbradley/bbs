@@ -926,6 +926,7 @@ struct InputAnswerJson {
 struct InputFormJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    is_blocking: bool,
     questions: Vec<InputQuestionJson>,
 }
 
@@ -936,6 +937,8 @@ struct UsageJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     limit_tokens: Option<u64>,
     source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    received_at: Option<String>,
 }
 
 fn question_json(q: &proto::InputQuestion) -> InputQuestionJson {
@@ -1002,6 +1005,7 @@ fn usage_proto(usage: Option<String>) -> Result<Option<proto::ContextUsage>> {
         used_tokens: parsed.used_tokens,
         limit_tokens: parsed.limit_tokens,
         source: source.into(),
+        received_at: parsed.received_at,
     }))
 }
 
@@ -1060,6 +1064,7 @@ pub fn report_context(
                     used_tokens: usage.used_tokens,
                     limit_tokens: usage.limit_tokens,
                     source: source.into(),
+                    received_at: usage.received_at.clone(),
                 })?)
             }
         };
@@ -1134,6 +1139,7 @@ pub fn request_owner_input(
         }
         let form = serde_json::to_string(&InputFormJson {
             message: req.message.clone(),
+            is_blocking: req.is_blocking,
             questions: req.questions.iter().map(question_json).collect(),
         })?;
         if form.len() > MAX_INPUT_TOTAL {
@@ -1194,6 +1200,7 @@ fn owner_input_proto(row: db::OwnerInputRow) -> Result<proto::OwnerInput> {
         answers: answers.into_iter().map(answer_proto).collect(),
         updated_at: row.updated_at,
         message: form.message,
+        is_blocking: form.is_blocking,
     })
 }
 
@@ -1208,9 +1215,11 @@ pub fn answer_owner_input(
         let Some(row) = db::owner_input(ctx.conn, req.request_id)? else {
             bail!("no such input request");
         };
-        if db::agent_owner_id(ctx.conn, row_agent(ctx.conn, req.request_id)?)?
-            != Some(me.id)
-        {
+        let agent_id = row_agent(ctx.conn, req.request_id)?;
+        if !db::agent_is_live(ctx.conn, agent_id)? {
+            bail!("the agent is retired");
+        }
+        if db::agent_owner_id(ctx.conn, agent_id)? != Some(me.id) {
             bail!("not your agent's question");
         }
         if row.status != "pending" {
@@ -1305,10 +1314,13 @@ pub fn close_owner_input(
             {
                 bail!("request id and sequence disagree");
             }
-            if row.status != "pending" {
+            // Retrying a successful close after a lost ACK is a no-op; any
+            // other terminal state is an error.
+            if row.status == "pending" {
+                db::finish_owner_input(ctx.conn, row.id, None, "cancelled", &ctx.now_s)?;
+            } else if row.status != "cancelled" {
                 bail!("input request is not pending");
             }
-            db::finish_owner_input(ctx.conn, row.id, None, "cancelled", &ctx.now_s)?;
             barrier = Some(row.seq);
         }
         if let Some(seq) = req.request_seq {
@@ -3215,6 +3227,7 @@ mod tests {
                     request_seq: seq,
                     questions: qs,
                     message: None,
+                    is_blocking: false,
                 },
             )
         };
@@ -3255,11 +3268,13 @@ mod tests {
                 used_tokens: Some(10),
                 limit_tokens: Some(100),
                 source: 0,
+                received_at: None,
             },
             proto::ContextUsage {
                 used_tokens: Some(10),
                 limit_tokens: Some(0),
                 source: 1,
+                received_at: None,
             },
         ] {
             assert!(report_context(
@@ -3282,6 +3297,7 @@ mod tests {
                     used_tokens: Some(120),
                     limit_tokens: Some(100),
                     source: proto::context_usage::Source::CurrentContext.into(),
+                    received_at: None,
                 }),
             },
         )
@@ -3341,6 +3357,7 @@ mod tests {
                 request_seq: 1,
                 questions: vec![question("a", true)],
                 message: Some("x".repeat(4 * 1024 + 1)),
+                is_blocking: false,
             },
         )
         .unwrap_err()
@@ -3354,6 +3371,7 @@ mod tests {
                 request_seq: 1,
                 questions: vec![question("a", true), question("b", false)],
                 message: Some("Deploy the release candidate?".into()),
+                is_blocking: false,
             },
         )
         .unwrap();
@@ -3370,6 +3388,7 @@ mod tests {
                 request_seq: 1,
                 questions: vec![question("a", true), question("b", false)],
                 message: Some("Deploy the release candidate?".into()),
+                is_blocking: false,
             },
         )
         .unwrap();
@@ -3616,8 +3635,176 @@ mod tests {
         .to_string();
         assert!(err.contains("only accompany a submit"), "{err}");
 
+        // received_at and is_blocking round-trip verbatim.
+        begin(&mut conn, &mateo, "run-4").unwrap();
+        report_context(
+            &mut conn,
+            &mateo,
+            proto::ReportContextRequest {
+                generation: "run-4".into(),
+                usage: Some(proto::ContextUsage {
+                    used_tokens: Some(9),
+                    limit_tokens: None,
+                    source: proto::context_usage::Source::LastModelRequest.into(),
+                    received_at: Some("2026-10-20T01:00:00Z".into()),
+                }),
+            },
+        )
+        .unwrap();
+        let report = side_report(
+            &mut conn,
+            &mateo,
+            proto::SideReportRequest {
+                agent: String::new(),
+                generation: Some("run-4".into()),
+            },
+        )
+        .unwrap();
+        let usage = report.usage.unwrap();
+        assert_eq!(usage.received_at.as_deref(), Some("2026-10-20T01:00:00Z"));
+        let blocking = request_owner_input(
+            &mut conn,
+            &mateo,
+            proto::RequestOwnerInputRequest {
+                generation: "run-4".into(),
+                request_seq: 1,
+                questions: vec![question("a", true)],
+                message: None,
+                is_blocking: true,
+            },
+        )
+        .unwrap();
+        let report = side_report(
+            &mut conn,
+            &will,
+            proto::SideReportRequest {
+                agent: "Mateo".into(),
+                generation: None,
+            },
+        )
+        .unwrap();
+        assert!(report.pending_input.unwrap().is_blocking);
+
+        // A successful close is idempotent after a lost ACK; other terminal
+        // states still reject.
+        close_owner_input(
+            &mut conn,
+            &mateo,
+            proto::CloseOwnerInputRequest {
+                generation: "run-4".into(),
+                request_id: Some(blocking.request_id),
+                request_seq: None,
+            },
+        )
+        .unwrap();
+        close_owner_input(
+            &mut conn,
+            &mateo,
+            proto::CloseOwnerInputRequest {
+                generation: "run-4".into(),
+                request_id: Some(blocking.request_id),
+                request_seq: None,
+            },
+        )
+        .unwrap();
+
         // Nothing side-channel ever becomes mail, a delivery, or a conversation.
         assert_eq!(mail_counts(&mut conn), before);
+    }
+
+
+    #[test]
+    fn side_channels_clear_on_retirement_and_re_registration() {
+        let (mut conn, will, [mateo, _zed, _lu]) = board();
+        let begin = |conn: &mut Connection, agent: &Caller, g: &str| {
+            begin_side_session(
+                conn,
+                agent,
+                proto::BeginSideSessionRequest {
+                    generation: g.into(),
+                },
+            )
+        };
+        let question = |id: &str| proto::InputQuestion {
+            id: id.into(),
+            header: String::new(),
+            text: "Pick".into(),
+            options: vec![],
+            allow_free_text: true,
+            required: true,
+        };
+        begin(&mut conn, &mateo, "run-1").unwrap();
+        let pending = request_owner_input(
+            &mut conn,
+            &mateo,
+            proto::RequestOwnerInputRequest {
+                generation: "run-1".into(),
+                request_seq: 1,
+                questions: vec![question("b")],
+                message: None,
+                is_blocking: false,
+            },
+        )
+        .unwrap();
+        retire_agent(
+            &mut conn,
+            &will,
+            proto::RetireRequest {
+                agent: "Mateo".into(),
+            },
+        )
+        .unwrap();
+        let err = answer_owner_input(
+            &mut conn,
+            &will,
+            proto::AnswerOwnerInputRequest {
+                request_id: pending.request_id,
+                action: proto::AnswerAction::Submit.into(),
+                answers: vec![proto::InputAnswer {
+                    question_id: "b".into(),
+                    value: "a".into(),
+                }],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("retired") || err.contains("no such input request"),
+            "{err}"
+        );
+        let mateo_rows: i64 = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM side_state WHERE agent_id = 1) + (SELECT count(*) FROM owner_input_requests WHERE agent_id = 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mateo_rows, 0);
+        let token = register(
+            &mut conn,
+            &will,
+            proto::RegisterRequest {
+                name: Some("Mateo".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .token;
+        let mateo2 = Caller {
+            token: Some(token),
+            ..Default::default()
+        };
+        let report = side_report(
+            &mut conn,
+            &will,
+            proto::SideReportRequest {
+                agent: "Mateo".into(),
+                generation: None,
+            },
+        )
+        .unwrap();
+        assert!(report.pending_input.is_none() && report.usage.is_none());
+        assert!(begin(&mut conn, &mateo2, "fresh-1").is_ok());
     }
 
     #[test]
