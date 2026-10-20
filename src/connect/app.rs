@@ -3363,6 +3363,90 @@ mod tests {
     }
 
     #[test]
+    fn an_open_btw_panel_leaves_answer_and_context_working_and_esc_closes_them_first() {
+        use proto::SideStatus;
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        reply_to(&mut app, id, btw_report(1, None));
+        command(&mut app, "/btw side job?");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::AskSide { .. }]
+        ));
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(5) }));
+        // While the side question runs, the agent asks blocking questions.
+        poll(&mut app, &mut rx);
+        let Data::SideReport {
+            result: Ok(mut report),
+            ..
+        } = btw_report(2, Some((5, "side job?", SideStatus::SideOpen, "working")))
+        else {
+            unreachable!()
+        };
+        report.pending_input = side_report(2, 7, deploy_questions()).pending_input;
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(report),
+        }));
+        while rx.try_recv().is_ok() {}
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("Mateo asks 2 questions · /answer to respond")
+                && out.contains("btw · Mateo · answering…")
+                && out.contains("working"),
+            "both show: {out}"
+        );
+        // /answer opens the form over the panel; Esc closes the form only.
+        command(&mut app, "/answer");
+        assert!(app.top().navigation_blocked());
+        assert!(screen(&mut app, 80, 24).contains("[Submit]"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(without_polls(&mut rx).is_empty(), "the side question stays");
+        assert!(!app.top().navigation_blocked());
+        // /context opens beside the panel; Esc closes the context only.
+        command(&mut app, "/context");
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("Context · Mateo") && out.contains("btw · Mateo"),
+            "{out}"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(without_polls(&mut rx).is_empty(), "the side question stays");
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            !out.contains("Context · Mateo") && out.contains("btw · Mateo · answering…"),
+            "{out}"
+        );
+        // The form still answers while the side question runs: choose NO,
+        // then Submit.
+        command(&mut app, "/answer");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let got = without_polls(&mut rx);
+        assert!(matches!(
+            got.as_slice(),
+            [Request::AnswerOwnerInput { req, .. }] if req.request_id == 7
+        ));
+        app.on_event(Event::Data(Data::OwnerAnswered {
+            id,
+            request_id: 7,
+            result: Ok(()),
+        }));
+        assert!(screen(&mut app, 80, 24).contains("btw · Mateo · answering…"));
+        // Only now does Esc reach the panel, and cancels it.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            without_polls(&mut rx),
+            [Request::CancelSide { id, side: 5 }]
+        );
+    }
+
+    #[test]
     fn btw_never_sends_mail_when_it_cannot_ask_and_a_doubled_slash_is_mail() {
         use crate::connect::event::SideError;
         use proto::SideStatus;
