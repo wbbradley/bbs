@@ -297,7 +297,7 @@ message InputQuestion {
   string id = 1;                 // <= 128 bytes; unique within the request
   string header = 2;             // <= 128 bytes
   string text = 3;               // <= 4 KiB
-  repeated InputOption options = 4;  // <= 16; empty means free text only
+  repeated InputOption options = 4;  // <= 8; empty means free text only
   bool allow_free_text = 5;
   bool required = 6;
 }

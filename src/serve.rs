@@ -883,7 +883,7 @@ impl Bbs for Server {
         self.unary(
             "request_owner_input",
             req,
-            Effect::Write,
+            Effect::Query,
             service::request_owner_input,
         )
         .await
@@ -896,7 +896,7 @@ impl Bbs for Server {
         self.unary(
             "answer_owner_input",
             req,
-            Effect::Write,
+            Effect::Query,
             service::answer_owner_input,
         )
         .await
@@ -909,7 +909,7 @@ impl Bbs for Server {
         self.unary(
             "close_owner_input",
             req,
-            Effect::Write,
+            Effect::Query,
             service::close_owner_input,
         )
         .await
