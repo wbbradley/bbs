@@ -30,6 +30,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0016_agent_human_conversations.sql"),
     include_str!("../migrations/0017_auto_replies.sql"),
     include_str!("../migrations/0018_side_channels.sql"),
+    include_str!("../migrations/0019_side_questions.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,6 +432,7 @@ pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
         "DELETE FROM owner_input_requests WHERE agent_id = ?1",
         params![id],
     )?;
+    conn.execute("DELETE FROM side_requests WHERE agent_id = ?1", params![id])?;
     conn.execute(
         "UPDATE agents SET effort = NULL, effort_reported_at = NULL WHERE id = ?1",
         params![id],
@@ -888,6 +890,8 @@ pub fn agent_owner_name(conn: &Connection, agent_id: i64) -> Result<Option<Strin
 pub struct SideState {
     pub generation: String,
     pub usage: Option<String>,
+    pub supported: Option<bool>,
+    pub reason: Option<String>,
     pub reported_at: String,
     pub revision: i64,
     /// Requests at or below this sequence are closed, published or not.
@@ -897,16 +901,18 @@ pub struct SideState {
 pub fn side_state(conn: &Connection, agent_id: i64) -> Result<Option<SideState>> {
     Ok(conn
         .query_row(
-            "SELECT generation, usage, reported_at, revision, closed_seq
+            "SELECT generation, usage, supported, reason, reported_at, revision, closed_seq
              FROM side_state WHERE agent_id = ?1",
             [agent_id],
             |r| {
                 Ok(SideState {
                     generation: r.get(0)?,
                     usage: r.get(1)?,
-                    reported_at: r.get(2)?,
-                    revision: r.get(3)?,
-                    closed_seq: r.get(4)?,
+                    supported: r.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                    reason: r.get(3)?,
+                    reported_at: r.get(4)?,
+                    revision: r.get(5)?,
+                    closed_seq: r.get(6)?,
                 })
             },
         )
@@ -930,17 +936,24 @@ pub fn begin_side_session(
     }
     let revision = current.map_or(1, |s| s.revision + 1);
     conn.execute(
-        "INSERT INTO side_state (agent_id, generation, usage, reported_at, revision, closed_seq)
-         VALUES (?1, ?2, NULL, ?3, ?4, 0)
+        "INSERT INTO side_state (agent_id, generation, usage, supported, reason, reported_at, revision, closed_seq)
+         VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4, 0)
          ON CONFLICT (agent_id) DO UPDATE SET
-           generation = excluded.generation, usage = NULL,
-           reported_at = excluded.reported_at,
+           generation = excluded.generation, usage = NULL, supported = NULL,
+           reason = NULL, reported_at = excluded.reported_at,
            revision = excluded.revision, closed_seq = 0",
         params![agent_id, generation, now, revision],
     )?;
     conn.execute(
         "UPDATE owner_input_requests SET status = 'stale', updated_at = ?2
          WHERE agent_id = ?1 AND status = 'pending'",
+        params![agent_id, now],
+    )?;
+    // A fresh generation interrupts every open side question, claimed or not:
+    // nothing silently carries across a runner restart.
+    conn.execute(
+        "UPDATE side_requests SET status = 'interrupted', updated_at = ?2
+         WHERE agent_id = ?1 AND status = 'open'",
         params![agent_id, now],
     )?;
     Ok(true)
@@ -952,16 +965,20 @@ pub fn check_generation(conn: &Connection, agent_id: i64, generation: &str) -> R
 }
 
 /// Replace the agent's reported context usage: usage JSON, or clear.
+/// Capability fields are set only when given; omitted preserves them.
 pub fn report_context(
     conn: &Connection,
     agent_id: i64,
     usage: Option<&str>,
+    supported: Option<bool>,
+    reason: Option<&str>,
     now: &str,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE side_state SET usage = ?2, reported_at = ?3, revision = revision + 1
+        "UPDATE side_state SET usage = ?2, reported_at = ?3, revision = revision + 1,
+           supported = coalesce(?4, supported), reason = coalesce(?5, reason)
          WHERE agent_id = ?1",
-        params![agent_id, usage, now],
+        params![agent_id, usage, now, supported, reason],
     )?;
     Ok(())
 }
@@ -1057,6 +1074,141 @@ pub fn close_owner_input_seq(conn: &Connection, agent_id: i64, seq: i64) -> Resu
         "UPDATE side_state SET closed_seq = max(closed_seq, ?2), revision = revision + 1
          WHERE agent_id = ?1",
         params![agent_id, seq],
+    )?;
+    Ok(())
+}
+
+/// One side question's stored row (side-questions.v1).
+pub struct SideRequestRow {
+    pub id: i64,
+    pub agent_id: i64,
+    pub generation: Option<String>,
+    pub question: String,
+    pub status: String,
+    pub answer: Option<String>,
+    pub updated_at: String,
+}
+
+fn side_request_row(r: &rusqlite::Row) -> rusqlite::Result<SideRequestRow> {
+    Ok(SideRequestRow {
+        id: r.get(0)?,
+        agent_id: r.get(1)?,
+        generation: r.get(2)?,
+        question: r.get(3)?,
+        status: r.get(4)?,
+        answer: r.get(5)?,
+        updated_at: r.get(6)?,
+    })
+}
+
+const SIDE_REQUEST_SELECT: &str =
+    "SELECT id, agent_id, generation, question, status, answer, updated_at FROM side_requests";
+
+/// The agent's open side question, if any (at most one by the partial index).
+pub fn open_side_request(conn: &Connection, agent_id: i64) -> Result<Option<SideRequestRow>> {
+    Ok(conn
+        .query_row(
+            &format!("{SIDE_REQUEST_SELECT} WHERE agent_id = ?1 AND status = 'open'"),
+            [agent_id],
+            side_request_row,
+        )
+        .optional()?)
+}
+
+/// The agent's newest side question regardless of status.
+pub fn latest_side_request(conn: &Connection, agent_id: i64) -> Result<Option<SideRequestRow>> {
+    Ok(conn
+        .query_row(
+            &format!("{SIDE_REQUEST_SELECT} WHERE agent_id = ?1 ORDER BY id DESC LIMIT 1"),
+            [agent_id],
+            side_request_row,
+        )
+        .optional()?)
+}
+
+/// One side question by id.
+pub fn side_request(conn: &Connection, id: i64) -> Result<Option<SideRequestRow>> {
+    Ok(conn
+        .query_row(
+            &format!("{SIDE_REQUEST_SELECT} WHERE id = ?1"),
+            [id],
+            side_request_row,
+        )
+        .optional()?)
+}
+
+/// Store a new open side question, pruning prior terminal rows.
+pub fn insert_side_request(
+    conn: &Connection,
+    agent_id: i64,
+    question: &str,
+    now: &str,
+) -> Result<i64> {
+    conn.execute(
+        "DELETE FROM side_requests WHERE agent_id = ?1 AND status != 'open'",
+        [agent_id],
+    )?;
+    conn.execute(
+        "INSERT INTO side_requests (agent_id, generation, question, asked_at, status, answer, updated_at)
+         VALUES (?1, NULL, ?2, ?3, 'open', NULL, ?3)",
+        params![agent_id, question, now],
+    )?;
+    bump_side_revision(conn, agent_id)?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn bump_side_revision(conn: &Connection, agent_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE side_state SET revision = revision + 1 WHERE agent_id = ?1",
+        [agent_id],
+    )?;
+    Ok(())
+}
+
+/// Claim the open question for `generation`, once. Returns whether this call
+/// moved it from unclaimed to claimed.
+pub fn claim_side_request(conn: &Connection, agent_id: i64, generation: &str, now: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE side_requests SET generation = ?2, updated_at = ?3
+         WHERE agent_id = ?1 AND status = 'open' AND generation IS NULL",
+        params![agent_id, generation, now],
+    )?;
+    if changed > 0 {
+        bump_side_revision(conn, agent_id)?;
+    }
+    Ok(changed > 0)
+}
+
+/// Update a claimed question's answer and status (open stays open).
+pub fn report_side_request(
+    conn: &Connection,
+    id: i64,
+    answer: Option<&str>,
+    status: &str,
+    now: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE side_requests SET answer = ?2, status = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, answer, status, now],
+    )?;
+    conn.execute(
+        "UPDATE side_state SET revision = revision + 1
+         WHERE agent_id = (SELECT agent_id FROM side_requests WHERE id = ?1)",
+        [id],
+    )?;
+    Ok(())
+}
+
+/// Cancel a side question by exact id.
+pub fn cancel_side_request(conn: &Connection, id: i64, now: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE side_requests SET status = 'cancelled', updated_at = ?2 WHERE id = ?1",
+        params![id, now],
+    )?;
+    conn.execute(
+        "UPDATE side_state SET revision = revision + 1
+         WHERE agent_id = (SELECT agent_id FROM side_requests WHERE id = ?1)",
+        [id],
     )?;
     Ok(())
 }

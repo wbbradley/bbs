@@ -106,6 +106,51 @@ service Bbs {
   rpc CloseOwnerInput(CloseOwnerInputRequest) returns (Empty);
   // One agent's side state: the owner, or the driver with its generation.
   rpc SideReport(SideReportRequest) returns (SideReportResponse);
+
+  // Isolated side questions (side-questions.v1): the owning human asks the
+  // agent a question its runner answers in an isolated turn, outside mail,
+  // history and the parent's model input.
+  rpc AskSide(AskSideRequest) returns (AskSideResponse);
+  rpc CancelSide(CancelSideRequest) returns (Empty);
+  // A runner claims the agent's one open side request, once.
+  rpc ClaimSide(ClaimSideRequest) returns (ClaimSideResponse);
+  // The claiming runner reports progressive text (OPEN) or a terminal result.
+  rpc ReportSide(ReportSideRequest) returns (Empty);
+}
+
+enum SideStatus {
+  SIDE_STATUS_UNSPECIFIED = 0;
+  SIDE_OPEN = 1;
+  SIDE_COMPLETED = 2;
+  SIDE_FAILED = 3;
+  SIDE_CANCELLED = 4;
+  SIDE_INTERRUPTED = 5;
+}
+message SideRequest {
+  int64 id = 1;
+  string question = 2;
+  SideStatus status = 3;
+  // Progressive text while open, the final answer at terminal; never trimmed.
+  optional string answer = 4;
+  string updated_at = 5;
+}
+message AskSideRequest {
+  string agent = 1;
+  string question = 2;  // <= 4 KiB
+}
+message AskSideResponse { int64 id = 1; }  // never reused
+message CancelSideRequest { int64 id = 1; }
+message ClaimSideRequest { string generation = 1; }
+message ClaimSideResponse {
+  // The claimed request, or none when nothing is open. Idempotent per
+  // generation: a lost reply's retry returns the same claim.
+  optional SideRequest request = 1;
+}
+message ReportSideRequest {
+  string generation = 1;
+  int64 id = 2;
+  SideStatus status = 3;       // OPEN, COMPLETED or FAILED
+  optional string answer = 4;  // <= 64 KiB
 }
 
 message Empty {}
@@ -286,6 +331,11 @@ message ReportContextRequest {
   string generation = 1;
   // Present: replace the stored usage. Absent: clear it.
   optional ContextUsage usage = 2;
+  // Whether this generation answers isolated side questions, and why not.
+  // Omitted fields preserve the stored value; a fresh generation clears it.
+  // Current-generation report, never a liveness guarantee. Reason <= 4 KiB.
+  optional bool side_supported = 3;
+  optional string side_reason = 4;
 }
 
 message InputOption {
@@ -365,6 +415,11 @@ message SideReportResponse {
   // Server receipt of the latest driver report (begin or context report);
   // input activity and polls never move it.
   string reported_at = 7;
+  // The open or latest terminal side question, until the next ask.
+  optional SideRequest side = 8;
+  // Whether the current generation answers side questions, and why not.
+  optional bool side_supported = 9;
+  optional string side_reason = 10;
 }
 
 message ReadRequest {

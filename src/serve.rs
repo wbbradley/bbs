@@ -923,6 +923,38 @@ impl Bbs for Server {
             .await
     }
 
+    async fn ask_side(
+        &self,
+        req: Request<proto::AskSideRequest>,
+    ) -> Result<Response<proto::AskSideResponse>, Status> {
+        self.unary("ask_side", req, Effect::Query, service::ask_side)
+            .await
+    }
+
+    async fn cancel_side(
+        &self,
+        req: Request<proto::CancelSideRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        self.unary("cancel_side", req, Effect::Query, service::cancel_side)
+            .await
+    }
+
+    async fn claim_side(
+        &self,
+        req: Request<proto::ClaimSideRequest>,
+    ) -> Result<Response<proto::ClaimSideResponse>, Status> {
+        self.unary("claim_side", req, Effect::Query, service::claim_side)
+            .await
+    }
+
+    async fn report_side(
+        &self,
+        req: Request<proto::ReportSideRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        self.unary("report_side", req, Effect::Query, service::report_side)
+            .await
+    }
+
     async fn read(
         &self,
         req: Request<proto::ReadRequest>,

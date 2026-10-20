@@ -1064,7 +1064,17 @@ pub fn report_context(
                 })?)
             }
         };
-        db::report_context(ctx.conn, me.id, usage_json.as_deref(), &ctx.now_s)?;
+        if req.side_reason.as_deref().is_some_and(|r| r.len() > 4 * 1024) {
+            bail!("side reason exceeds 4 KiB");
+        }
+        db::report_context(
+            ctx.conn,
+            me.id,
+            usage_json.as_deref(),
+            req.side_supported,
+            req.side_reason.as_deref(),
+            &ctx.now_s,
+        )?;
         Ok(proto::Empty {})
     })
 }
@@ -1341,6 +1351,142 @@ pub fn close_owner_input(
     })
 }
 
+// ---- isolated side questions (side-questions.v1) ----------------------------
+
+fn side_status_proto(status: &str) -> proto::SideStatus {
+    match status {
+        "completed" => proto::SideStatus::SideCompleted,
+        "failed" => proto::SideStatus::SideFailed,
+        "cancelled" => proto::SideStatus::SideCancelled,
+        "interrupted" => proto::SideStatus::SideInterrupted,
+        _ => proto::SideStatus::SideOpen,
+    }
+}
+
+fn side_request_proto(row: db::SideRequestRow) -> Result<proto::SideRequest> {
+    Ok(proto::SideRequest {
+        id: row.id,
+        question: row.question,
+        status: side_status_proto(&row.status).into(),
+        answer: row.answer,
+        updated_at: row.updated_at,
+    })
+}
+
+/// The owner asks the agent an isolated side question; one open at a time.
+pub fn ask_side(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::AskSideRequest,
+) -> Result<proto::AskSideResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let Some(agent) = db::live_agent_by_name(ctx.conn, &req.agent)? else {
+            bail!("no live agent named {:?}", req.agent);
+        };
+        if db::agent_owner_id(ctx.conn, agent.id)? != Some(me.id) {
+            bail!("{:?} is not your agent", req.agent);
+        }
+        if req.question.is_empty() || req.question.len() > 4 * 1024 {
+            bail!("question must be 1 byte to 4 KiB");
+        }
+        match db::side_state(ctx.conn, agent.id)? {
+            Some(state) if state.supported == Some(true) => {}
+            _ => bail!("{}'s runner does not answer side questions", agent.name),
+        }
+        if db::open_side_request(ctx.conn, agent.id)?.is_some() {
+            bail!("a side question is already open");
+        }
+        let id = db::insert_side_request(ctx.conn, agent.id, &req.question, &ctx.now_s)?;
+        Ok(proto::AskSideResponse { id })
+    })
+}
+
+/// The owner cancels a side question by exact id; idempotent once cancelled.
+pub fn cancel_side(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::CancelSideRequest,
+) -> Result<proto::Empty> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let Some(row) = db::side_request(ctx.conn, req.id)? else {
+            bail!("no such side question");
+        };
+        if row.status == "cancelled" {
+            return Ok(proto::Empty {});
+        }
+        if row.status != "open" {
+            bail!("side question is not open");
+        }
+        if db::agent_owner_id(ctx.conn, row.agent_id)? != Some(me.id) {
+            bail!("not your agent's question");
+        }
+        db::cancel_side_request(ctx.conn, req.id, &ctx.now_s)?;
+        Ok(proto::Empty {})
+    })
+}
+
+/// The runner claims the agent's one open side question. Idempotent per
+/// generation: a lost reply's retry returns the same claim.
+pub fn claim_side(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::ClaimSideRequest,
+) -> Result<proto::ClaimSideResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        validate_generation(ctx, &me, &req.generation)?;
+        let Some(row) = db::open_side_request(ctx.conn, me.id)? else {
+            return Ok(proto::ClaimSideResponse { request: None });
+        };
+        let claimed = match &row.generation {
+            None => db::claim_side_request(ctx.conn, me.id, &req.generation, &ctx.now_s)?,
+            Some(g) if *g == req.generation => true,
+            Some(_) => bail!("side question already claimed"),
+        };
+        let request = if claimed {
+            Some(side_request_proto(db::open_side_request(ctx.conn, me.id)?.expect("just claimed"))?)
+        } else {
+            // A concurrent claim won the race; treat it as interrupted.
+            None
+        };
+        Ok(proto::ClaimSideResponse { request })
+    })
+}
+
+/// The claiming runner reports progressive text or a terminal result.
+pub fn report_side(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::ReportSideRequest,
+) -> Result<proto::Empty> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        validate_generation(ctx, &me, &req.generation)?;
+        if req.answer.as_deref().is_some_and(|a| a.len() > 64 * 1024) {
+            bail!("answer exceeds 64 KiB");
+        }
+        let status = match req.status() {
+            proto::SideStatus::SideOpen => "open",
+            proto::SideStatus::SideCompleted => "completed",
+            proto::SideStatus::SideFailed => "failed",
+            _ => bail!("a side report must be OPEN, COMPLETED or FAILED"),
+        };
+        let Some(row) = db::side_request(ctx.conn, req.id)? else {
+            bail!("no such side question");
+        };
+        if row.generation.as_deref() != Some(req.generation.as_str()) {
+            bail!("not your claimed side question");
+        }
+        if row.status != "open" {
+            bail!("side question is closed");
+        }
+        db::report_side_request(ctx.conn, req.id, req.answer.as_deref(), status, &ctx.now_s)?;
+        Ok(proto::Empty {})
+    })
+}
+
 /// One agent's side state: the owner, or the driver with its generation.
 pub fn side_report(
     conn: &mut Connection,
@@ -1369,6 +1515,7 @@ pub fn side_report(
         let pending = db::latest_owner_input(ctx.conn, agent.id)?
             .map(owner_input_proto)
             .transpose()?;
+        let side = db::latest_side_request(ctx.conn, agent.id)?;
         let Some(state) = state else {
             return Ok(proto::SideReportResponse {
                 agent: agent.name,
@@ -1376,6 +1523,9 @@ pub fn side_report(
                 usage: None,
                 revision: 0,
                 reported_at: String::new(),
+                side: side.map(side_request_proto).transpose()?,
+                side_supported: None,
+                side_reason: None,
             });
         };
         Ok(proto::SideReportResponse {
@@ -1384,6 +1534,9 @@ pub fn side_report(
             usage: usage_proto(state.usage)?,
             revision: state.revision,
             reported_at: state.reported_at,
+            side: side.map(side_request_proto).transpose()?,
+            side_supported: state.supported,
+            side_reason: state.reason,
         })
     })
 }

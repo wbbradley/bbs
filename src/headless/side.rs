@@ -219,6 +219,8 @@ async fn run(
                 session.backend.report_context(proto::ReportContextRequest {
                     generation: session.generation.clone(),
                     usage: snapshot.usage,
+                    side_supported: None,
+                    side_reason: None,
                 }),
             )
             .await
