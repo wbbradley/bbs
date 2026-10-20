@@ -10,6 +10,7 @@ lock = threading.Lock()
 parent_live = False
 child_live = False
 waiting = set()
+record_pid = os.getpid()
 
 def record(kind, **fields):
     with open('btw-wire.jsonl','a') as f: f.write(json.dumps(dict(kind=kind,**fields))+'\n')
@@ -32,6 +33,7 @@ def later(marker,mid,value):
         reply(mid,value)
     threading.Thread(target=wait,daemon=True).start()
 
+record('provider_pid',pid=os.getpid())
 for line in sys.stdin:
     msg=json.loads(line);method=msg.get('method');mid=msg.get('id');p=msg.get('params',{})
     if method is None:
@@ -60,7 +62,7 @@ for line in sys.stdin:
         else:reply(mid,{})
     elif method=='turn/start':
         if p['threadId']=='parent':
-            parent_live=True;reply(mid,dict(turn=dict(id='p')));text('parent','p','parent before\n');record('parent_active')
+            parent_live=True;reply(mid,dict(turn=dict(id='p')));text('parent','p','parent before\n');note('thread/tokenUsage/updated',dict(threadId='parent',turnId='p',tokenUsage=dict(last=dict(totalTokens=40),modelContextWindow=100)));record('parent_active')
             continue
         assert p['threadId']=='child'
         assert p['input'][0]['text'].startswith('You are answering a side question alongside the main agent.')
@@ -80,10 +82,16 @@ for line in sys.stdin:
         note('thread/tokenUsage/updated',dict(threadId='child',turnId='s',tokenUsage=dict(last=dict(totalTokens=99999),modelContextWindow=100)))
         if scenario=='overflow':text('child','s','é'*40000);continue
         if scenario=='hold':record('side_active');continue
-        waiting={'native','approval','foreign'}
+        waiting={'native','approval','foreign','legacy-command','legacy-patch','ambiguous-legacy'}
         out(dict(jsonrpc='2.0',id='native',method='item/tool/requestUserInput',params=dict(threadId='child',turnId='s',itemId='q',isBlocking=True,questions=[])))
         out(dict(jsonrpc='2.0',id='approval',method='item/commandExecution/requestApproval',params=dict(threadId='child',turnId='s',command='synthetic')))
         out(dict(jsonrpc='2.0',id='foreign',method='item/tool/call',params=dict(threadId='unrelated',turnId='s',callId='f',tool='bbs_status',arguments=dict(text='must not execute'))))
+        out(dict(jsonrpc='2.0',id='legacy-command',method='execCommandApproval',params=dict(conversationId='child',callId='legacy-c',command=['synthetic'])))
+        out(dict(jsonrpc='2.0',id='legacy-patch',method='applyPatchApproval',params=dict(conversationId='child',callId='legacy-p',fileChanges={})))
+        out(dict(jsonrpc='2.0',id='ambiguous-legacy',method='execCommandApproval',params=dict(callId='ambiguous',command=['synthetic'])))
+        if scenario=='tools':
+            waiting.add('parent-tool')
+            out(dict(jsonrpc='2.0',id='parent-tool',method='item/tool/call',params=dict(threadId='parent',turnId='p',callId='parent-t',tool='bbs_agents',arguments={})))
         if scenario in ['tools','tools-cancel','tools-complete']:
             waiting.add('tool')
             out(dict(jsonrpc='2.0',id='tool',method='item/tool/call',params=dict(threadId='child',turnId='s',callId='t',tool='bbs_agents',arguments={})))

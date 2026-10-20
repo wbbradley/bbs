@@ -16,9 +16,19 @@ use tokio::{
 };
 
 const CALL: Duration = Duration::from_secs(3);
+#[derive(Default)]
+struct Hooks {
+    #[cfg(test)]
+    claim_ack: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<bool>,
+    )>,
+}
 pub struct Btw {
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
+    harness: Harness,
+    warnings: mpsc::UnboundedSender<String>,
 }
 struct Active {
     id: i64,
@@ -26,6 +36,13 @@ struct Active {
     task: JoinHandle<Outcome>,
     reported: String,
 }
+impl Drop for Active {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(true);
+        self.task.abort();
+    }
+}
+
 struct Final {
     id: i64,
     status: SideStatus,
@@ -62,8 +79,20 @@ impl Btw {
             return None;
         }
         let (stop, rx) = watch::channel(false);
-        let task = tokio::spawn(run(backend, generation, harness, warnings, rx));
-        Some(Self { stop, task })
+        let task = tokio::spawn(run(
+            backend,
+            generation,
+            harness.clone(),
+            warnings.clone(),
+            rx,
+            Hooks::default(),
+        ));
+        Some(Self {
+            stop,
+            task,
+            harness,
+            warnings,
+        })
     }
     pub async fn finish(mut self) {
         let _ = self.stop.send(true);
@@ -72,6 +101,12 @@ impl Btw {
             .is_err()
         {
             self.task.abort();
+            let _ = (&mut self.task).await;
+        }
+        if !self.harness.finish_side().await {
+            let _ = self
+                .warnings
+                .send("side child cleanup unconfirmed; shared tools may already have run".into());
         }
     }
 }
@@ -90,14 +125,14 @@ async fn availability(b: &mut Backend, g: &str, supported: bool, reason: &str) -
     Ok(())
 }
 async fn snapshot(b: &mut Backend, g: &str) -> Result<proto::SideReportResponse> {
-    Ok(timeout(
+    timeout(
         CALL,
         b.side_report(proto::SideReportRequest {
             agent: String::new(),
             generation: Some(g.into()),
         }),
     )
-    .await??)
+    .await?
 }
 async fn report(b: &mut Backend, g: &str, f: &Final) -> Result<()> {
     timeout(
@@ -112,6 +147,14 @@ async fn report(b: &mut Backend, g: &str, f: &Final) -> Result<()> {
     .await??;
     Ok(())
 }
+fn bounded_detail(mut text: String) -> String {
+    let mut end = text.len().min(super::codex_btw::MAX_ANSWER);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
 fn warning(warnings: &mpsc::UnboundedSender<String>, warned: &mut bool) {
     if !*warned {
         let _ = warnings
@@ -125,6 +168,7 @@ async fn run(
     harness: Harness,
     warnings: mpsc::UnboundedSender<String>,
     mut stop: watch::Receiver<bool>,
+    mut _hooks: Hooks,
 ) {
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -150,8 +194,8 @@ async fn run(
                 let status=if outcome.status==Status::Completed{SideStatus::SideCompleted}else{SideStatus::SideFailed};
                 // Diagnostics stay out of the parent activity/owner outbox. The
                 // dedicated pane shows the terminal status and any exact prefix.
-                let _detail=outcome.detail;
-                final_report=Some(Final{id:a.id,status,answer:(!outcome.answer.is_empty()).then_some(outcome.answer)});
+                let answer=if outcome.answer.is_empty() { bounded_detail(outcome.detail) } else { outcome.answer };
+                final_report=Some(Final{id:a.id,status,answer:(!answer.is_empty()).then_some(answer)});
             },
             _=tick.tick()=>{},
         }
@@ -179,9 +223,7 @@ async fn run(
                 .side
                 .as_ref()
                 .is_some_and(|r| r.id == f.id && r.status() == SideStatus::SideOpen);
-            if !open {
-                final_report = None;
-            } else if report(&mut backend, &generation, f).await.is_ok() {
+            if !open || report(&mut backend, &generation, f).await.is_ok() {
                 final_report = None;
             } else {
                 warning(&warnings, &mut warned);
@@ -239,25 +281,39 @@ async fn run(
             }),
         )
         .await;
+        #[cfg(test)]
+        let claim = if let Some((reached, release)) = _hooks.claim_ack.take() {
+            let _ = reached.send(());
+            if release.await.unwrap_or(true) {
+                claim
+            } else {
+                Ok(Err(tonic::Status::unavailable(
+                    "synthetic lost claim acknowledgment",
+                )
+                .into()))
+            }
+        } else {
+            claim
+        };
         let request = match claim {
             Ok(Ok(r)) => r.request,
             _ => {
                 // Even an idempotent board claim is not permission to invoke a
                 // model after an ambiguous ACK. Retire the exact claim, if ours.
                 disabled = true;
-                if let Ok(r) = snapshot(&mut backend, &generation).await {
-                    if let Some(r) = r.side.filter(|r| r.status() == SideStatus::SideOpen) {
-                        let _ = report(
-                            &mut backend,
-                            &generation,
-                            &Final {
-                                id: r.id,
-                                status: SideStatus::SideFailed,
-                                answer: r.answer,
-                            },
-                        )
-                        .await;
-                    }
+                if let Ok(r) = snapshot(&mut backend, &generation).await
+                    && let Some(r) = r.side.filter(|r| r.status() == SideStatus::SideOpen)
+                {
+                    let _ = report(
+                        &mut backend,
+                        &generation,
+                        &Final {
+                            id: r.id,
+                            status: SideStatus::SideFailed,
+                            answer: r.answer,
+                        },
+                    )
+                    .await;
                 }
                 let _=availability(&mut backend,&generation,false,"side claim acknowledgment was uncertain; restart the runner to resume side questions").await;
                 warning(&warnings, &mut warned);
@@ -294,5 +350,177 @@ async fn run(
     }
     if let Some(a) = active {
         let _ = a.cancel.send(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::headless::{
+        acp::McpServer,
+        harness::BbsTools,
+        mcp::Tools,
+        settings::{HarnessConfig, HarnessType},
+    };
+    use crate::{config::Config, service::Caller};
+    #[tokio::test]
+    async fn lost_or_cancelled_claim_ack_never_invokes_a_model() {
+        for lost in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = Config::default();
+            let mut db = crate::db::open(&dir.path().join("bbs.db")).unwrap();
+            crate::db::migrate(&mut db).unwrap();
+            drop(db);
+            let mut human = Backend::open(
+                &config,
+                dir.path(),
+                Caller {
+                    human: Some("tester".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            human
+                .ensure_human(proto::EnsureHumanRequest {
+                    name: "tester".into(),
+                })
+                .await
+                .unwrap();
+            let agent = human
+                .register(proto::RegisterRequest {
+                    name: Some("ClaimTest".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let mut board = Backend::open(
+                &config,
+                dir.path(),
+                Caller {
+                    token: Some(agent.token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            board
+                .begin_side_session(proto::BeginSideSessionRequest {
+                    generation: "claim-generation".into(),
+                })
+                .await
+                .unwrap();
+            availability(&mut board, "claim-generation", true, "")
+                .await
+                .unwrap();
+            let id = human
+                .ask_side(proto::AskSideRequest {
+                    agent: "ClaimTest".into(),
+                    question: "never submit this after uncertainty".into(),
+                })
+                .await
+                .unwrap()
+                .id;
+            let provider = HarnessConfig {
+                kind: HarnessType::CodexAppServer,
+                command: vec![
+                    "python3".into(),
+                    format!("{}/tests/fake_btw.py", env!("CARGO_MANIFEST_DIR")),
+                    "normal".into(),
+                ],
+                ..Default::default()
+            };
+            let (harness, mut process, _events, _) = Harness::start(
+                &provider,
+                dir.path(),
+                &dir.path().join("stderr"),
+                BbsTools {
+                    mcp: McpServer {
+                        name: "bbs".into(),
+                        command: "unused".into(),
+                        args: vec![],
+                        env: vec![],
+                    },
+                    tools: Tools::new(dir.path(), "synthetic-unused".into()),
+                    input_enabled: true,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let (reached, held) = tokio::sync::oneshot::channel();
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let (stop, rx) = watch::channel(false);
+            let (warnings, _) = mpsc::unbounded_channel();
+            let task = tokio::spawn(run(
+                board,
+                "claim-generation".into(),
+                harness.clone(),
+                warnings,
+                rx,
+                Hooks {
+                    claim_ack: Some((reached, wait)),
+                },
+            ));
+            timeout(Duration::from_secs(5), held)
+                .await
+                .unwrap()
+                .unwrap();
+            if !lost {
+                human
+                    .cancel_side(proto::CancelSideRequest { id })
+                    .await
+                    .unwrap();
+            }
+            release.send(!lost).unwrap();
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let r = human
+                        .side_report(proto::SideReportRequest {
+                            agent: "ClaimTest".into(),
+                            generation: None,
+                        })
+                        .await
+                        .unwrap();
+                    if r.side
+                        .as_ref()
+                        .is_some_and(|s| s.id == id && s.status() != SideStatus::SideOpen)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let _ = stop.send(true);
+            timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            let wire = std::fs::read_to_string(dir.path().join("btw-wire.jsonl")).unwrap();
+            assert!(
+                !wire
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .any(|v| v["method"] == "thread/fork" || v["method"] == "turn/start")
+            );
+            let h = harness.clone();
+            let parent = tokio::spawn(async move { h.prompt("ordinary parent", None).await });
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let w = std::fs::read_to_string(dir.path().join("btw-wire.jsonl")).unwrap();
+                    if w.contains("parent_active") {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            harness.cancel().await.unwrap();
+            parent.await.unwrap().unwrap();
+            process.stop().await;
+        }
     }
 }

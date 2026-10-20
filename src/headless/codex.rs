@@ -290,6 +290,12 @@ impl Codex {
             )
             .await
     }
+    pub async fn finish_side(&self) -> bool {
+        self.side
+            .cleanup(&self.rpc, Instant::now() + Duration::from_secs(5))
+            .await
+    }
+
     #[cfg(test)]
     pub fn side_tools_for_test(&self) -> Arc<tokio::sync::Mutex<Tools>> {
         self.side_tools.clone()
@@ -613,13 +619,25 @@ fn handle(
             });
         }
         Incoming::Request { id, method, params } => {
-            if params.get("threadId").is_some()
+            let scoped_approval = matches!(
+                method.as_str(),
+                "item/commandExecution/requestApproval"
+                    | "item/fileChange/requestApproval"
+                    | "execCommandApproval"
+                    | "applyPatchApproval"
+            );
+            let identity = params["threadId"]
+                .as_str()
+                .or_else(|| params["conversationId"].as_str());
+            if (scoped_approval
+                || params.get("threadId").is_some()
+                || params.get("conversationId").is_some())
                 && effort
                     .lock()
                     .unwrap()
                     .parent
                     .as_deref()
-                    .is_none_or(|p| params["threadId"].as_str() != Some(p))
+                    .is_none_or(|p| identity != Some(p))
             {
                 rpc.respond_later(
                     id,

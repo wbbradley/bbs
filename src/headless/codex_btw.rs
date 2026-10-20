@@ -1,5 +1,6 @@
 //! One ephemeral Codex side conversation. Nothing here emits parent events.
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -41,6 +42,8 @@ struct Child {
     starting: bool,
     completed: bool,
     cancelled: bool,
+    submitted: bool,
+    cleanup_done: bool,
     text: String,
     seen: HashSet<String>,
     done: HashSet<String>,
@@ -54,6 +57,8 @@ struct Child {
 pub struct SideChannel {
     child: Mutex<Option<Child>>,
     gate: tokio::sync::Mutex<()>,
+    cleanup_gate: tokio::sync::Mutex<()>,
+    closing: AtomicBool,
 }
 impl SideChannel {
     pub fn text(&self) -> String {
@@ -66,6 +71,8 @@ impl SideChannel {
     }
     pub fn exited(&self) {
         if let Some(c) = self.child.lock().unwrap().as_mut() {
+            c.completed = true;
+            c.cleanup_done = true;
             finish(c, Err(anyhow!("provider exited")));
         }
     }
@@ -82,10 +89,12 @@ impl SideChannel {
             Incoming::Exited => return Some(msg),
         };
         let mut state = self.child.lock().unwrap();
-        let Some(c) = state
-            .as_mut()
-            .filter(|c| params["threadId"].as_str() == Some(c.thread.as_str()))
-        else {
+        let Some(c) = state.as_mut().filter(|c| {
+            params["threadId"]
+                .as_str()
+                .or_else(|| params["conversationId"].as_str())
+                == Some(c.thread.as_str())
+        }) else {
             return Some(msg);
         };
         if !c.active {
@@ -137,6 +146,16 @@ impl SideChannel {
                 let thread = c.thread.clone();
                 let turn = c.turn.clone();
                 drop(state);
+                if matches!(
+                    method.as_str(),
+                    "execCommandApproval" | "applyPatchApproval"
+                ) {
+                    rpc.respond_later(
+                        id,
+                        Err("legacy approvals are unsupported in a side turn".into()),
+                    );
+                    return None;
+                }
                 if method == "item/tool/requestUserInput" {
                     rpc.respond_later(id, Ok(json!({"answers":{}})));
                     return None;
@@ -220,12 +239,24 @@ impl SideChannel {
                 disable: false,
             };
         }
+        if self.closing.load(Ordering::SeqCst) {
+            return Outcome {
+                status: Status::Failed,
+                answer: String::new(),
+                detail: "previous side cleanup is unconfirmed".into(),
+                disable: true,
+            };
+        }
         *self.child.lock().unwrap() = None;
+        let mut cleanup_guard = CleanupGuard {
+            channel: self.clone(),
+            rpc: rpc.clone(),
+            armed: true,
+        };
         let deadline = Instant::now() + LIFETIME;
         let work_deadline = deadline - CLEANUP;
         let mut unsupported = false;
         let mut ready = false;
-        let mut submitted = false;
         let mut interrupted = false;
         let work = async {
             // No lastTurnId: the native snapshot includes the active parent's context.
@@ -261,6 +292,8 @@ impl SideChannel {
                 starting: false,
                 completed: false,
                 cancelled: false,
+                submitted: false,
+                cleanup_done: false,
                 text: String::new(),
                 seen: HashSet::new(),
                 done: HashSet::new(),
@@ -297,9 +330,9 @@ impl SideChannel {
                 let mut state = self.child.lock().unwrap();
                 let c = state.as_mut().unwrap();
                 c.starting = true;
+                c.submitted = true;
                 c.finish = Some(done);
             }
-            submitted = true;
             let mut ack_reply = observed_call(
                 rpc,
                 "turn/start",
@@ -341,48 +374,9 @@ impl SideChannel {
             }
         };
         let result = work.await;
-        let (answer, thread, turn, needs_interrupt) = {
-            let mut state = self.child.lock().unwrap();
-            if let Some(c) = state.as_mut() {
-                let complete = c.completed;
-                c.active = false;
-                let _ = c.tools_cancel.send(true);
-                (
-                    c.text.clone(),
-                    Some(c.thread.clone()),
-                    c.turn.clone(),
-                    !complete && submitted,
-                )
-            } else {
-                (String::new(), None, None, false)
-            }
-        };
-        // Keep all cleanup inside the total lifetime. Never interrupt the parent.
-        let mut cleanup_ok = true;
-        if let Some(thread) = thread {
-            if needs_interrupt {
-                if let Some(turn) = turn {
-                    cleanup_ok = matches!(
-                        timeout_at(
-                            deadline.min(Instant::now() + Duration::from_secs(2)),
-                            rpc.call("turn/interrupt", json!({"threadId":thread,"turnId":turn}))
-                        )
-                        .await,
-                        Ok(Ok(_))
-                    );
-                } else {
-                    cleanup_ok = false;
-                }
-            }
-            cleanup_ok &= matches!(
-                timeout_at(
-                    deadline,
-                    rpc.call("thread/unsubscribe", json!({"threadId":thread}))
-                )
-                .await,
-                Ok(Ok(_))
-            );
-        }
+        let answer = self.text();
+        let cleanup_ok = self.cleanup(rpc, deadline).await;
+        cleanup_guard.armed = false;
         let status = if unsupported {
             Status::Unsupported
         } else if interrupted {
@@ -402,6 +396,92 @@ impl SideChannel {
             answer,
             detail,
             disable: unsupported || !cleanup_ok || setup_failed,
+        }
+    }
+    fn fence(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        if let Some(c) = self.child.lock().unwrap().as_mut() {
+            c.active = false;
+            c.cancelled = true;
+            let _ = c.tools_cancel.send(true);
+        }
+    }
+    pub async fn cleanup(&self, rpc: &Rpc, deadline: Instant) -> bool {
+        self.fence();
+        let Ok(_serial) = timeout_at(deadline, self.cleanup_gate.lock()).await else {
+            return false;
+        };
+        let target = {
+            let state = self.child.lock().unwrap();
+            state.as_ref().filter(|c| !c.cleanup_done).map(|c| {
+                (
+                    c.thread.clone(),
+                    c.turn.clone(),
+                    c.submitted && !c.completed,
+                )
+            })
+        };
+        let Some((thread, turn, interrupt)) = target else {
+            self.closing.store(false, Ordering::SeqCst);
+            return true;
+        };
+        let mut ok = true;
+        if interrupt {
+            if let Some(turn) = turn {
+                ok = matches!(
+                    timeout_at(
+                        deadline.min(Instant::now() + Duration::from_secs(2)),
+                        rpc.call("turn/interrupt", json!({"threadId":thread,"turnId":turn}))
+                    )
+                    .await,
+                    Ok(Ok(_))
+                );
+            } else {
+                ok = false;
+            }
+        }
+        ok &= matches!(
+            timeout_at(
+                deadline,
+                rpc.call("thread/unsubscribe", json!({"threadId":thread}))
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if ok {
+            if let Some(c) = self
+                .child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .filter(|c| c.thread == thread)
+            {
+                c.cleanup_done = true;
+            }
+            self.closing.store(false, Ordering::SeqCst);
+        }
+        ok
+    }
+}
+
+/// Aborting the driver future still cancels host tools synchronously and
+/// gives the child-only cleanup a bounded owner.
+struct CleanupGuard {
+    channel: Arc<SideChannel>,
+    rpc: Rpc,
+    armed: bool,
+}
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.channel.fence();
+            let channel = self.channel.clone();
+            let rpc = self.rpc.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    channel.cleanup(&rpc, Instant::now() + CLEANUP).await;
+                });
+            }
         }
     }
 }
@@ -486,20 +566,21 @@ fn append(c: &mut Child, text: &str) {
 fn notification(c: &mut Child, method: &str, p: &Value) {
     match method {
         "item/agentMessage/delta" => {
-            if let (Some(id), Some(text)) = (p["itemId"].as_str(), p["delta"].as_str()) {
-                if !text.is_empty() && !c.done.contains(id) {
-                    c.seen.insert(id.into());
-                    append(c, text);
-                }
+            if let (Some(id), Some(text)) = (p["itemId"].as_str(), p["delta"].as_str())
+                && !text.is_empty()
+                && !c.done.contains(id)
+            {
+                c.seen.insert(id.into());
+                append(c, text);
             }
         }
         "item/completed" if p["item"]["type"] == "agentMessage" => {
-            if let Some(id) = p["item"]["id"].as_str() {
-                if c.done.insert(id.into()) && !c.seen.contains(id) {
-                    if let Some(text) = p["item"]["text"].as_str() {
-                        append(c, text);
-                    }
-                }
+            if let Some(id) = p["item"]["id"].as_str()
+                && c.done.insert(id.into())
+                && !c.seen.contains(id)
+                && let Some(text) = p["item"]["text"].as_str()
+            {
+                append(c, text);
             }
         }
         "turn/completed" => {
@@ -641,6 +722,11 @@ mod tests {
                 }
             }
             let wire = r.wire();
+            for id in ["legacy-command", "legacy-patch", "ambiguous-legacy"] {
+                assert!(
+                    wire.iter().find(|v| v["id"] == id).unwrap()["response"]["error"].is_object()
+                );
+            }
             let native = wire.iter().find(|v| v["id"] == "native").unwrap();
             assert_eq!(native["response"]["result"], json!({"answers":{}}));
             assert!(
@@ -802,5 +888,69 @@ mod tests {
             assert!(!parent.is_finished());
             r.finish(parent).await;
         }
+    }
+    #[tokio::test]
+    async fn lifetime_expiry_never_interrupts_or_replays_the_parent() {
+        let mut r = Rig::new("hold").await;
+        let parent = r.parent().await;
+        let (_cancel, rx) = watch::channel(false);
+        let task = r.side(rx);
+        r.wait(|w| w.iter().any(|v| v["kind"] == "side_active"))
+            .await;
+        tokio::time::pause();
+        tokio::time::advance(LIFETIME).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+        let result = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, Status::Interrupted);
+        assert!(result.answer.starts_with("side prefix"));
+        assert!(!parent.is_finished());
+        assert_eq!(
+            r.wire()
+                .iter()
+                .filter(|v| v["method"] == "turn/start" && v["params"]["threadId"] == "child")
+                .count(),
+            1
+        );
+        assert!(
+            !r.wire()
+                .iter()
+                .any(|v| v["method"] == "turn/interrupt" && v["params"]["threadId"] == "parent")
+        );
+        r.finish(parent).await;
+    }
+    #[tokio::test]
+    async fn aborted_driver_owns_child_cleanup_and_cancels_waiting_tools() {
+        let mut r = Rig::new("tools-cancel").await;
+        let parent = r.parent().await;
+        let Harness::Codex(c) = &r.harness else {
+            unreachable!()
+        };
+        let locked = c.side_tools_for_test().lock_owned().await;
+        let (_cancel, rx) = watch::channel(false);
+        let task = r.side(rx);
+        r.wait(|w| w.iter().any(|v| v["kind"] == "tool_pending"))
+            .await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(r.harness.finish_side().await);
+        r.wait(|w| w.iter().any(|v| v["id"] == "tool")).await;
+        let tool = r.wire().into_iter().find(|v| v["id"] == "tool").unwrap();
+        assert!(
+            tool["response"]["error"].is_object() || tool["response"]["result"]["success"] == false
+        );
+        assert!(!parent.is_finished());
+        assert!(
+            !r.wire()
+                .iter()
+                .any(|v| v["method"] == "turn/interrupt" && v["params"]["threadId"] == "parent")
+        );
+        drop(locked);
+        r.finish(parent).await;
     }
 }

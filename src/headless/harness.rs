@@ -116,6 +116,13 @@ impl Harness {
     pub fn side_supported(&self) -> bool {
         matches!(self, Self::Codex(_))
     }
+    pub async fn finish_side(&self) -> bool {
+        match self {
+            Self::Codex(c) => c.finish_side().await,
+            Self::Acp(_) => true,
+        }
+    }
+
     pub fn side_text(&self) -> String {
         match self {
             Self::Codex(c) => c.side_text(),
