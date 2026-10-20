@@ -1036,6 +1036,9 @@ pub fn report_context(
     with_ctx(conn, caller, |ctx| {
         let me = ctx.agent()?;
         validate_generation(ctx, &me, &req.generation)?;
+        if req.side_reason.as_deref().is_some_and(|r| r.len() > 4 * 1024) {
+            bail!("side reason exceeds 4 KiB");
+        }
         let usage_json = match &req.usage {
             None => None,
             Some(usage) => {
@@ -1069,10 +1072,14 @@ pub fn report_context(
 }
 
 const MAX_QUESTIONS: usize = 3;
-const MAX_OPTIONS: usize = 16;
-const MAX_INPUT_TOTAL: usize = 32 * 1024;
+const MAX_OPTIONS: usize = 8;
+const MAX_INPUT_TOTAL: usize = 16 * 1024;
+const MAX_LABEL: usize = 256;
+const MAX_DESCRIPTION: usize = 2 * 1024;
 
 /// A structured question set for the owning human; one pending per agent.
+/// `request_seq` makes a lost publish ACK safe: the same sequence with the
+/// same form returns the original id; anything else at or below it is rejected.
 pub fn request_owner_input(
     conn: &mut Connection,
     caller: &Caller,
@@ -1081,13 +1088,22 @@ pub fn request_owner_input(
     with_ctx(conn, caller, |ctx| {
         let me = ctx.agent()?;
         validate_generation(ctx, &me, &req.generation)?;
+        if db::agent_owner_id(ctx.conn, me.id)?.is_none() {
+            bail!("{} has no registered owner", me.name);
+        }
+        if req.request_seq < 1 {
+            bail!("request sequence must be positive");
+        }
+        let state = db::side_state(ctx.conn, me.id)?
+            .ok_or_else(|| anyhow!("begin a side session first"))?;
+        if req.request_seq <= state.closed_seq {
+            bail!("request sequence is closed");
+        }
         if req.questions.is_empty() || req.questions.len() > MAX_QUESTIONS {
             bail!("ask 1 to {MAX_QUESTIONS} questions");
         }
-        let mut total = 0;
         let mut ids = std::collections::HashSet::new();
         for q in &req.questions {
-            total += q.id.len() + q.header.len() + q.text.len();
             if q.id.is_empty() || q.id.len() > 128 || !ids.insert(q.id.clone()) {
                 bail!("question ids must be unique, 1 to 128 bytes");
             }
@@ -1097,25 +1113,57 @@ pub fn request_owner_input(
             if q.text.is_empty() || q.text.len() > 4 * 1024 {
                 bail!("question text must be 1 byte to 4 KiB");
             }
+            if q.options.is_empty() && !q.allow_free_text {
+                bail!("question {} offers no way to answer", q.id);
+            }
             if q.options.len() > MAX_OPTIONS {
                 bail!("at most {MAX_OPTIONS} options per question");
             }
+            let mut values = std::collections::HashSet::new();
             for o in &q.options {
-                total += o.value.len();
-                if o.value.is_empty() || o.value.len() > 128 {
-                    bail!("option values must be 1 to 128 bytes");
+                if o.value.is_empty() || o.value.len() > 128 || !values.insert(o.value.clone()) {
+                    bail!("option values must be unique, 1 to 128 bytes");
+                }
+                if o.label.as_deref().is_some_and(|l| l.len() > MAX_LABEL) {
+                    bail!("option label exceeds {MAX_LABEL} bytes");
+                }
+                if o.description.as_deref().is_some_and(|d| d.len() > MAX_DESCRIPTION) {
+                    bail!("option description exceeds {} KiB", MAX_DESCRIPTION / 1024);
                 }
             }
         }
-        if total > MAX_INPUT_TOTAL {
-            bail!("question form exceeds {} KiB", MAX_INPUT_TOTAL / 1024);
-        }
-        if db::pending_owner_input(ctx.conn, me.id)?.is_some() {
-            bail!("a question set is already pending");
-        }
         let form: Vec<_> = req.questions.iter().map(question_json).collect();
         let form = serde_json::to_string(&form)?;
-        let id = db::insert_owner_input(ctx.conn, me.id, &req.generation, &form, &ctx.now_s)?;
+        if form.len() > MAX_INPUT_TOTAL {
+            bail!("question form exceeds {} KiB", MAX_INPUT_TOTAL / 1024);
+        }
+        if let Some(latest) = db::latest_owner_input(ctx.conn, me.id)? {
+            if latest.generation == req.generation {
+                if req.request_seq < latest.seq {
+                    bail!("stale request sequence");
+                }
+                if req.request_seq == latest.seq {
+                    if latest.form != form {
+                        bail!("request sequence reused with a different form");
+                    }
+                    // A retry after a lost publish reply: the same request.
+                    return Ok(proto::RequestOwnerInputResponse {
+                        request_id: latest.id,
+                    });
+                }
+                if latest.status == "pending" {
+                    bail!("a question set is already pending");
+                }
+            }
+        }
+        let id = db::insert_owner_input(
+            ctx.conn,
+            me.id,
+            &req.generation,
+            req.request_seq,
+            &form,
+            &ctx.now_s,
+        )?;
         Ok(proto::RequestOwnerInputResponse { request_id: id })
     })
 }
@@ -1188,7 +1236,11 @@ pub fn answer_owner_input(
                     }
                 }
                 for q in &questions {
-                    if q.required && !seen.contains(&q.id) {
+                    let answered = req
+                        .answers
+                        .iter()
+                        .any(|a| a.question_id == q.id && !a.value.is_empty());
+                    if q.required && !answered {
                         bail!("required question unanswered: {}", q.id);
                     }
                 }
@@ -1196,8 +1248,19 @@ pub fn answer_owner_input(
                     &req.answers.iter().map(answer_json).collect::<Vec<_>>(),
                 )?))
             }
-            proto::AnswerAction::Decline => ("declined", None),
-            proto::AnswerAction::Cancel => ("cancelled", None),
+            proto::AnswerAction::Decline | proto::AnswerAction::Cancel => {
+                if !req.answers.is_empty() {
+                    bail!("answers only accompany a submit");
+                }
+                (
+                    if req.action() == proto::AnswerAction::Decline {
+                        "declined"
+                    } else {
+                        "cancelled"
+                    },
+                    None,
+                )
+            }
             _ => bail!("an answer action is required"),
         };
         db::finish_owner_input(ctx.conn, row.id, answers.as_deref(), status, &ctx.now_s)?;
@@ -1213,7 +1276,10 @@ fn row_agent(conn: &Connection, request_id: i64) -> Result<i64> {
     )?)
 }
 
-/// The driver closes its own pending request (turn cancelled or timed out).
+/// The driver closes its own pending request, by id or by sequence. The
+/// sequence barrier rises either way, so a publish delayed past a turn's
+/// cancellation can never create a stale request. Generation and usage are
+/// untouched.
 pub fn close_owner_input(
     conn: &mut Connection,
     caller: &Caller,
@@ -1222,16 +1288,38 @@ pub fn close_owner_input(
     with_ctx(conn, caller, |ctx| {
         let me = ctx.agent()?;
         validate_generation(ctx, &me, &req.generation)?;
-        let Some(row) = db::owner_input(ctx.conn, req.request_id)? else {
-            bail!("no such input request");
+        let mut barrier = None;
+        if let Some(id) = req.request_id {
+            let Some(row) = db::owner_input(ctx.conn, id)? else {
+                bail!("no such input request");
+            };
+            if row_agent(ctx.conn, id)? != me.id || row.generation != req.generation {
+                bail!("not your input request");
+            }
+            if let Some(seq) = req.request_seq
+                && seq != row.seq
+            {
+                bail!("request id and sequence disagree");
+            }
+            if row.status != "pending" {
+                bail!("input request is not pending");
+            }
+            db::finish_owner_input(ctx.conn, row.id, None, "cancelled", &ctx.now_s)?;
+            barrier = Some(row.seq);
+        }
+        if let Some(seq) = req.request_seq {
+            if req.request_id.is_none()
+                && let Some(pending) = db::pending_owner_input(ctx.conn, me.id)?
+                && pending.seq == seq
+            {
+                db::finish_owner_input(ctx.conn, pending.id, None, "cancelled", &ctx.now_s)?;
+            }
+            barrier = Some(barrier.map_or(seq, |b| b.max(seq)));
+        }
+        let Some(barrier) = barrier else {
+            bail!("close needs a request id or sequence");
         };
-        if row_agent(ctx.conn, req.request_id)? != me.id || row.generation != req.generation {
-            bail!("not your input request");
-        }
-        if row.status != "pending" {
-            bail!("input request is not pending");
-        }
-        db::finish_owner_input(ctx.conn, row.id, None, "cancelled", &ctx.now_s)?;
+        db::close_owner_input_seq(ctx.conn, me.id, barrier)?;
         Ok(proto::Empty {})
     })
 }
@@ -3119,12 +3207,13 @@ mod tests {
             allow_free_text: false,
             required,
         };
-        let ask = |conn: &mut Connection, g: &str, qs| {
+        let ask = |conn: &mut Connection, g: &str, seq: i64, qs| {
             request_owner_input(
                 conn,
                 &mateo,
                 proto::RequestOwnerInputRequest {
                     generation: g.into(),
+                    request_seq: seq,
                     questions: qs,
                 },
             )
@@ -3222,10 +3311,11 @@ mod tests {
         assert_eq!(report.side_supported, Some(true));
 
         // Bounds.
-        assert!(ask(&mut conn, "run-1", vec![]).is_err());
+        assert!(ask(&mut conn, "run-1", 1, vec![]).is_err());
         assert!(ask(
             &mut conn,
             "run-1",
+            1,
             vec![question("a", true); 4].to_vec()
         )
         .is_err());
@@ -3237,24 +3327,43 @@ mod tests {
                 description: None,
             })
             .collect();
-        assert!(ask(&mut conn, "run-1", vec![many]).is_err());
+        assert!(ask(&mut conn, "run-1", 1, vec![many]).is_err());
         let mut big = question("a", true);
         big.text = "x".repeat(4 * 1024 + 1);
-        assert!(ask(&mut conn, "run-1", vec![big]).is_err());
+        assert!(ask(&mut conn, "run-1", 1, vec![big]).is_err());
         let dup = vec![question("a", true), question("a", false)];
-        assert!(ask(&mut conn, "run-1", dup).is_err());
+        assert!(ask(&mut conn, "run-1", 1, dup).is_err());
 
         // Ask, and one pending only.
         let request = ask(
             &mut conn,
             "run-1",
+            1,
             vec![question("a", true), question("b", false)],
         )
         .unwrap();
-        let err = ask(&mut conn, "run-1", vec![question("c", true)])
+        let err = ask(&mut conn, "run-1", 2, vec![question("c", true)])
             .unwrap_err()
             .to_string();
         assert!(err.contains("already pending"), "{err}");
+        // A lost publish reply: the same sequence and form returns the same id.
+        let retry = ask(
+            &mut conn,
+            "run-1",
+            1,
+            vec![question("a", true), question("b", false)],
+        )
+        .unwrap();
+        assert_eq!(retry.request_id, request.request_id);
+        // Same sequence, different form; and an older sequence: rejected.
+        let err = ask(&mut conn, "run-1", 1, vec![question("z", true)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different form"), "{err}");
+        let err = ask(&mut conn, "run-1", 0, vec![question("z", true)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("positive"), "{err}");
 
         // Owner scoping: another human cannot answer or read.
         ensure_human(
@@ -3347,17 +3456,18 @@ mod tests {
         assert_eq!(input.answers[0].value, "b");
 
         // The driver closes its own next request; a fresh generation resets.
-        let second = ask(&mut conn, "run-1", vec![question("c", true)]).unwrap();
+        let second = ask(&mut conn, "run-1", 2, vec![question("c", true)]).unwrap();
         close_owner_input(
             &mut conn,
             &mateo,
             proto::CloseOwnerInputRequest {
                 generation: "run-1".into(),
-                request_id: second.request_id,
+                request_id: Some(second.request_id),
+                request_seq: None,
             },
         )
         .unwrap();
-        let third = ask(&mut conn, "run-1", vec![question("d", true)]).unwrap();
+        let third = ask(&mut conn, "run-1", 3, vec![question("d", true)]).unwrap();
         assert!(third.request_id > second.request_id);
         begin(&mut conn, &mateo, "run-2").unwrap();
         // The reset staled the pending request and cleared usage.
@@ -3387,7 +3497,7 @@ mod tests {
             )
             .unwrap_err()
             .to_string(),
-            ask(&mut conn, "run-1", vec![question("e", true)])
+            ask(&mut conn, "run-1", 1, vec![question("e", true)])
                 .unwrap_err()
                 .to_string(),
         ] {
@@ -3396,6 +3506,95 @@ mod tests {
         // Another agent's generation is independent.
         assert!(begin(&mut conn, &zed, "zed-1").is_ok());
         let _ = lu;
+
+        // The closed-sequence barrier retires requests that never arrived.
+        begin(&mut conn, &mateo, "run-3").unwrap();
+        close_owner_input(
+            &mut conn,
+            &mateo,
+            proto::CloseOwnerInputRequest {
+                generation: "run-3".into(),
+                request_id: None,
+                request_seq: Some(2),
+            },
+        )
+        .unwrap();
+        for seq in [1, 2] {
+            let err = ask(&mut conn, "run-3", seq, vec![question("q", true)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("sequence is closed"), "{seq}: {err}");
+        }
+        let open = ask(&mut conn, "run-3", 3, vec![question("q", true)]).unwrap();
+        assert!(open.request_id > 0);
+        // Close by sequence also cancels the matching pending row.
+        close_owner_input(
+            &mut conn,
+            &mateo,
+            proto::CloseOwnerInputRequest {
+                generation: "run-3".into(),
+                request_id: None,
+                request_seq: Some(3),
+            },
+        )
+        .unwrap();
+        let report = side_report(
+            &mut conn,
+            &mateo,
+            proto::SideReportRequest {
+                agent: String::new(),
+                generation: Some("run-3".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report.pending_input.unwrap().status(),
+            proto::InputStatus::Cancelled
+        );
+        // A new request prunes the terminal one: latest-only storage.
+        let rows_before: i64 = conn
+            .query_row("SELECT count(*) FROM owner_input_requests", [], |r| r.get(0))
+            .unwrap();
+        ask(&mut conn, "run-3", 4, vec![question("q", true)]).unwrap();
+        let rows_after: i64 = conn
+            .query_row("SELECT count(*) FROM owner_input_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows_after, rows_before);
+
+        // Form validity: no way to answer; decline/cancel carrying answers.
+        close_owner_input(
+            &mut conn,
+            &mateo,
+            proto::CloseOwnerInputRequest {
+                generation: "run-3".into(),
+                request_id: None,
+                request_seq: Some(4),
+            },
+        )
+        .unwrap();
+        let mut impossible = question("x", true);
+        impossible.options = vec![];
+        impossible.allow_free_text = false;
+        let err = ask(&mut conn, "run-3", 5, vec![impossible])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no way to answer"), "{err}");
+        let fifth = ask(&mut conn, "run-3", 5, vec![question("q", true)]).unwrap();
+        let err = answer_owner_input(
+            &mut conn,
+            &will,
+            proto::AnswerOwnerInputRequest {
+                request_id: fifth.request_id,
+                action: proto::AnswerAction::Cancel.into(),
+                answers: vec![proto::InputAnswer {
+                    question_id: "q".into(),
+                    value: "a".into(),
+                }],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only accompany a submit"), "{err}");
 
         // Nothing side-channel ever becomes mail, a delivery, or a conversation.
         assert_eq!(mail_counts(&mut conn), before);

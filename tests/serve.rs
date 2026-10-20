@@ -981,6 +981,7 @@ async fn side_questions_are_advertised_and_answered_over_the_wire() {
             &agent.token,
             proto::RequestOwnerInputRequest {
                 generation: "proc-1".into(),
+                request_seq: 1,
                 questions: vec![proto::InputQuestion {
                     id: "q".into(),
                     header: "Deploy?".into(),

@@ -887,12 +887,16 @@ pub struct SideState {
     pub reason: Option<String>,
     pub reported_at: String,
     pub revision: i64,
+    /// The newest request sequence seen in this generation.
+    pub input_seq: i64,
+    /// Requests at or below this sequence are closed, published or not.
+    pub closed_seq: i64,
 }
 
 pub fn side_state(conn: &Connection, agent_id: i64) -> Result<Option<SideState>> {
     Ok(conn
         .query_row(
-            "SELECT generation, usage, supported, reason, reported_at, revision
+            "SELECT generation, usage, supported, reason, reported_at, revision, input_seq, closed_seq
              FROM side_state WHERE agent_id = ?1",
             [agent_id],
             |r| {
@@ -903,6 +907,8 @@ pub fn side_state(conn: &Connection, agent_id: i64) -> Result<Option<SideState>>
                     reason: r.get(3)?,
                     reported_at: r.get(4)?,
                     revision: r.get(5)?,
+                    input_seq: r.get(6)?,
+                    closed_seq: r.get(7)?,
                 })
             },
         )
@@ -926,12 +932,12 @@ pub fn begin_side_session(
     }
     let revision = current.map_or(1, |s| s.revision + 1);
     conn.execute(
-        "INSERT INTO side_state (agent_id, generation, usage, supported, reason, reported_at, revision)
-         VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4)
+        "INSERT INTO side_state (agent_id, generation, usage, supported, reason, reported_at, revision, input_seq, closed_seq)
+         VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4, 0, 0)
          ON CONFLICT (agent_id) DO UPDATE SET
            generation = excluded.generation, usage = NULL, supported = NULL,
            reason = NULL, reported_at = excluded.reported_at,
-           revision = excluded.revision",
+           revision = excluded.revision, input_seq = 0, closed_seq = 0",
         params![agent_id, generation, now, revision],
     )?;
     conn.execute(
@@ -969,6 +975,7 @@ pub fn report_context(
 pub struct OwnerInputRow {
     pub id: i64,
     pub generation: String,
+    pub seq: i64,
     pub form: String,
     pub answers: Option<String>,
     pub status: String,
@@ -979,15 +986,16 @@ fn owner_input_row(r: &rusqlite::Row) -> rusqlite::Result<OwnerInputRow> {
     Ok(OwnerInputRow {
         id: r.get(0)?,
         generation: r.get(1)?,
-        form: r.get(2)?,
-        answers: r.get(3)?,
-        status: r.get(4)?,
-        updated_at: r.get(5)?,
+        seq: r.get(2)?,
+        form: r.get(3)?,
+        answers: r.get(4)?,
+        status: r.get(5)?,
+        updated_at: r.get(6)?,
     })
 }
 
 const OWNER_INPUT_SELECT: &str =
-    "SELECT id, generation, form, answers, status, updated_at FROM owner_input_requests";
+    "SELECT id, generation, seq, form, answers, status, updated_at FROM owner_input_requests";
 
 /// The agent's pending request, if any (at most one by construction).
 pub fn pending_owner_input(conn: &Connection, agent_id: i64) -> Result<Option<OwnerInputRow>> {
@@ -1022,24 +1030,40 @@ pub fn owner_input(conn: &Connection, id: i64) -> Result<Option<OwnerInputRow>> 
         .optional()?)
 }
 
-/// Store a new pending request; returns its never-reused id.
+/// Store a new pending request at `seq`, pruning prior terminal rows so only
+/// the latest request is kept. Returns its never-reused id.
 pub fn insert_owner_input(
     conn: &Connection,
     agent_id: i64,
     generation: &str,
+    seq: i64,
     form: &str,
     now: &str,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO owner_input_requests (agent_id, generation, form, answers, status, updated_at)
-         VALUES (?1, ?2, ?3, NULL, 'pending', ?4)",
-        params![agent_id, generation, form, now],
-    )?;
-    conn.execute(
-        "UPDATE side_state SET revision = revision + 1 WHERE agent_id = ?1",
+        "DELETE FROM owner_input_requests WHERE agent_id = ?1 AND status != 'pending'",
         [agent_id],
     )?;
+    conn.execute(
+        "INSERT INTO owner_input_requests (agent_id, generation, seq, form, answers, status, updated_at)
+         VALUES (?1, ?2, ?3, ?4, NULL, 'pending', ?5)",
+        params![agent_id, generation, seq, form, now],
+    )?;
+    conn.execute(
+        "UPDATE side_state SET revision = revision + 1, input_seq = ?2 WHERE agent_id = ?1",
+        params![agent_id, seq],
+    )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Raise the closed-sequence barrier; a delayed publish at or below it is rejected.
+pub fn close_owner_input_seq(conn: &Connection, agent_id: i64, seq: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE side_state SET closed_seq = max(closed_seq, ?2), revision = revision + 1
+         WHERE agent_id = ?1",
+        params![agent_id, seq],
+    )?;
+    Ok(())
 }
 
 /// Set a request's terminal status and answers.
