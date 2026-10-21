@@ -6,6 +6,14 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Changed
+
+- `bbs connect` agent conversations: `↑` on the draft's first display row
+  switches to navigation and scrolls up a line, and `↓` at the newest view
+  returns to writing, as `PgDn` does. Page keys move two thirds of the view.
+
 ## 0.12.0 - 2026-10-21
 
 Continuing side conversations add database schema 20 and the
@@ -27,13 +35,6 @@ the pre-upgrade backup loses subsequent changes.
   The side conversation ends on Esc, after 30 minutes idle, or when the runner
   restarts. Needs a server and runner with `side-conversations.v1`. While any
   side panel is up, typing no longer goes to the agent as mail.
-
-### Changed
-
-- `bbs connect` agent conversations: `↑` on the draft's first display row
-  switches to navigation and scrolls up a line, and `↓` at the newest view
-  returns to writing, as `PgDn` does. Page keys move two thirds of the view.
-
 
 ## 0.11.2 - 2026-10-21
 
