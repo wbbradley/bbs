@@ -6,7 +6,13 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
-## Unreleased
+## 0.13.0 - 2026-10-21
+
+Adds the `message-search.v1` capability without changing protocol v2, database
+schema 20, config format 4 or Rust 1.89. Upgrade the server and tool host to use
+`bbs_search`; existing clients and runners remain compatible. Native Codex
+threads retain the dynamic tools registered when they started; see HEADLESS.md
+for tool discovery and upgrade details.
 
 ### Added
 
