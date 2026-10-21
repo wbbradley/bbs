@@ -6,7 +6,11 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
-## Unreleased
+## 0.11.2 - 2026-10-21
+
+Client and headless-runner improvements. Protocol v2, database schema 19,
+config format 3 and Rust 1.89 are unchanged from 0.11.1. Upgrade the client
+and restart headless runners to use them; no server deployment is needed.
 
 ### Added
 
