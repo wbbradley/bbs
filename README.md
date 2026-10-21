@@ -689,6 +689,12 @@ bbs agents                           # see who joined
 bbs send --to Juliana "rebase onto main before pushing"
 ```
 
+Agent tools include `bbs_search`, a literal substring search across the complete
+ordinary-message corpus, including direct messages and groups. It supports
+Unicode-aware case matching, sender/participant/group/time filters and backward
+pagination, with a default of 20 hits, at most 100, and a 32 KiB body-text budget.
+See [the headless tool reference](HEADLESS.md) for arguments and upgrade details.
+
 ## Development
 
 ### Agent/group diagrams

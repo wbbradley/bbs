@@ -199,6 +199,13 @@ impl Tools {
                     .await?;
                 "Status updated.".to_string()
             }
+            "bbs_search" => {
+                let request = search_request(args)?;
+                let since = request.since.clone();
+                let until = request.until.clone();
+                let response = b.search(request).await?;
+                format_search(response, since, until)?
+            }
             "bbs_history" => {
                 let since = args["since"].as_str().unwrap_or(DEFAULT_HISTORY_SINCE);
                 let limit = match args["limit"].as_u64() {
@@ -273,6 +280,81 @@ impl Tools {
     }
 }
 
+fn search_request(args: &Value) -> Result<proto::SearchRequest> {
+    let query = args["query"]
+        .as_str()
+        .context(r#"missing string argument "query""#)?;
+    let string = |key: &str| -> Result<Option<String>> {
+        args.get(key)
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .with_context(|| format!("{key} must be a string"))
+            })
+            .transpose()
+    };
+    let integer = |key: &str| -> Result<Option<u64>> {
+        args.get(key)
+            .map(|v| {
+                v.as_u64()
+                    .with_context(|| format!("{key} must be a positive integer"))
+            })
+            .transpose()
+    };
+    let case_sensitive = args
+        .get("case_sensitive")
+        .map(|v| v.as_bool().context("case_sensitive must be a boolean"))
+        .transpose()?
+        .unwrap_or(false);
+    let now = Utc::now();
+    Ok(proto::SearchRequest {
+        query: query.to_owned(),
+        case_sensitive,
+        limit: integer("limit")?
+            .map(u32::try_from)
+            .transpose()
+            .context("limit is too large")?,
+        before_id: integer("before_id")?
+            .map(i64::try_from)
+            .transpose()
+            .context("before_id is too large")?,
+        from: string("from")?,
+        with: string("with")?,
+        group: string("group")?,
+        since: string("since")?
+            .map(|s| parse_time("since", &s, now))
+            .transpose()?,
+        until: string("until")?
+            .map(|s| parse_time("until", &s, now))
+            .transpose()?,
+    })
+}
+
+fn format_search(
+    response: proto::SearchResponse,
+    since: Option<String>,
+    until: Option<String>,
+) -> Result<String> {
+    let hits = response.hits.into_iter().map(|hit| {
+        let m = hit.message.context("server returned a search hit without a message")?;
+        Ok(json!({
+            "id": m.id, "created_at": m.created_at,
+            "from": { "kind": if m.from_kind == proto::Kind::Agent as i32 { "agent" } else { "human" },
+                "name": m.from_name, "owner": m.from_owner },
+            "to": { "group": m.to_group, "name": m.to_name, "owner": m.to_owner },
+            "body": m.body, "truncated": hit.truncated,
+            "body_offset_bytes": hit.body_offset_bytes,
+            "original_body_bytes": hit.original_body_bytes,
+            "match_offset_bytes": hit.match_offset_bytes,
+            "match_length_bytes": hit.match_length_bytes,
+        }))
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(serde_json::to_string(
+        &json!({ "hits": hits, "has_more": response.has_more,
+        "next_before_id": response.next_before_id, "since": since, "until": until }),
+    )?)
+}
+
 pub fn tool_list() -> Value {
     let object = |props: Value, required: &[&str]| json!({ "type": "object", "properties": props, "required": required });
     let string = |description: &str| json!({ "type": "string", "description": description });
@@ -294,6 +376,21 @@ pub fn tool_list() -> Value {
             "name": "bbs_status",
             "description": "Set your status note: one line on what you are working on, shown to others in bbs_agents.",
             "inputSchema": object(json!({ "text": string("Status text") }), &["text"]),
+        },
+        {
+            "name": "bbs_search",
+            "description": "Search literal substrings in ALL ordinary BBS message bodies, including other agents' direct messages and groups. Read-only; does not mark mail read. Unicode case-insensitive by default, accents significant. Newest message IDs first. Returns JSON hits with IDs, time, sender, destination and original body; oversized bodies are marked excerpts. At most 32 KiB of body text per call. For older results repeat the same query and filters with next_before_id as before_id. Requires message-search.v1 on the server.",
+            "inputSchema": object(json!({
+                "query": { "type": "string", "minLength": 1, "description": "Literal substring, including whitespace and punctuation; at most 4096 UTF-8 bytes. No regex or wildcard syntax." },
+                "case_sensitive": { "type": "boolean", "default": false },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+                "before_id": { "type": "integer", "minimum": 1, "description": "Exclusive message-ID cursor from the previous response's next_before_id." },
+                "from": string("Only messages sent by this agent or human name; retired agents included."),
+                "with": string("Only messages sent by or directly to this agent or human; not broadcasts delivered to it."),
+                "group": string("Only broadcasts to this group name, with or without @; archived groups included."),
+                "since": string("Inclusive start time: RFC3339 or a duration like 7d."),
+                "until": string("Exclusive end time: RFC3339 or a duration like 1h."),
+            }), &["query"]),
         },
         {
             "name": "bbs_history",
@@ -338,4 +435,37 @@ pub fn tool_list() -> Value {
             "inputSchema": object(json!({ "id": { "type": "integer", "description": "Timer id" } }), &["id"]),
         },
     ])
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    #[test]
+    fn search_tool_preserves_literal_input_filters_and_cursor() {
+        let args = json!({"query":"  É.*  ","case_sensitive":true,"limit":100,"before_id":42,
+            "from":"Ada","with":"Mateo","group":"@crew","since":"2020-01-01T00:00:00Z","until":"2020-01-02T00:00:00Z"});
+        let r = search_request(&args).unwrap();
+        assert_eq!(r.query, "  É.*  ");
+        assert!(r.case_sensitive);
+        assert_eq!(r.limit, Some(100));
+        assert_eq!(r.before_id, Some(42));
+        assert_eq!(r.from.as_deref(), Some("Ada"));
+        assert_eq!(r.with.as_deref(), Some("Mateo"));
+        assert_eq!(r.group.as_deref(), Some("@crew"));
+        assert_eq!(r.since.as_deref(), Some("2020-01-01T00:00:00.000000Z"));
+        let r = search_request(&json!({"query":"x","since":"7d"})).unwrap();
+        assert!(r.limit.is_none() && !r.case_sensitive && r.before_id.is_none());
+        assert!(r.since.is_some());
+        for bad in [
+            json!({}),
+            json!({"query":1}),
+            json!({"query":"x","limit":-1}),
+            json!({"query":"x","limit":"20"}),
+            json!({"query":"x","case_sensitive":"false"}),
+            json!({"query":"x","before_id":u64::MAX}),
+            json!({"query":"x","from":1}),
+        ] {
+            assert!(search_request(&bad).is_err(), "{bad}");
+        }
+    }
 }

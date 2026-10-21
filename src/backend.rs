@@ -35,6 +35,7 @@ pub const AUTO_REPLY: &str = "auto-reply.v1";
 pub const AGENT_INTERACTIONS: &str = "agent-interactions.v1";
 pub const SIDE_QUESTIONS: &str = "side-questions.v1";
 pub const SIDE_CONVERSATIONS: &str = "side-conversations.v1";
+pub const MESSAGE_SEARCH: &str = "message-search.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -357,6 +358,16 @@ impl Backend {
         match self {
             Backend::Local(l) => service::group_list(&mut l.conn, &l.caller),
             Backend::Remote(r) => rpc!(r, group_list, proto::Empty {}),
+        }
+    }
+
+    /// Search all ordinary message bodies; requires message-search.v1.
+    pub async fn search(&mut self, req: proto::SearchRequest) -> Result<proto::SearchResponse> {
+        match self {
+            Backend::Local(l) => service::search(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, search, req, &[MESSAGE_SEARCH]).map_err(|e| missing_rpc(e, MESSAGE_SEARCH))
+            }
         }
     }
 
@@ -1122,6 +1133,15 @@ mod tests {
             assert!(backend.report_side(report).await.is_err());
         }
         server.abort();
+        assert!(
+            backend
+                .search(proto::SearchRequest {
+                    query: "x".into(),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
         let expected = [
             ("EnsureHuman", None),
             ("Register", Some("named-agents.v1")),
@@ -1146,6 +1166,7 @@ mod tests {
             ("CancelSide", Some("side-conversations.v1")),
             ("ReportSide", Some("side-questions.v1")),
             ("ReportSide", Some("side-conversations.v1")),
+            ("Search", Some("message-search.v1")),
         ];
         let observed = observations.lock().unwrap();
         assert_eq!(
@@ -1220,6 +1241,14 @@ mod tests {
             })
             .await
             .unwrap_err();
+        let search_error = backend
+            .search(proto::SearchRequest {
+                query: "x".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(search_error.to_string().contains("message-search.v1"));
         server.abort();
         assert_eq!(
             error.to_string(),

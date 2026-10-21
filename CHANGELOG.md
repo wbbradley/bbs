@@ -6,6 +6,15 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Added
+
+- `bbs_search` agent tool: literal search across all ordinary message bodies,
+  including direct messages and groups, with Unicode case matching, optional
+  filters, newest-first pagination and bounded results. Requires the new
+  `message-search.v1` server capability and updated tools; no schema migration.
+
 ## 0.12.1 - 2026-10-21
 
 A client-only improvement to `bbs connect`. Protocol v2, database schema 20,

@@ -13,6 +13,7 @@ mod names;
 mod proto;
 mod protocol;
 mod release;
+mod search;
 mod serve;
 mod service;
 mod setup;

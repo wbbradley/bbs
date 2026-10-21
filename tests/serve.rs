@@ -2033,3 +2033,63 @@ async fn trust_mode_servers_refuse_rotation() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("--require-human-token"), "{err:?}");
 }
+
+#[tokio::test]
+async fn search_is_advertised_and_returns_bounded_hits_over_the_wire() {
+    let server = Server::start("search-wire");
+    let mut client = server.client().await;
+    let reader = register_as(&mut client, "will", Some("Reader")).await;
+    let recipient = register_as(&mut client, "ada", Some("Recipient")).await;
+    let info = client
+        .server_info(proto::Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(info.capabilities.iter().any(|c| c == "message-search.v1"));
+    let body = format!("{} ÉQUIPE", "界".repeat(21000));
+    let id = client
+        .send(as_human(
+            "ada",
+            proto::SendRequest {
+                to: "Recipient".into(),
+                body: body.clone(),
+                control: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .id
+        .unwrap();
+    let req = proto::SearchRequest {
+        query: "équipe".into(),
+        ..Default::default()
+    };
+    assert!(
+        client.search(req.clone()).await.is_err(),
+        "anonymous calls fail"
+    );
+    let mut request = as_agent(&reader.token, req);
+    request.metadata_mut().insert(
+        "bbs-required-capabilities",
+        "message-search.v1".parse().unwrap(),
+    );
+    let response = client.search(request).await.unwrap().into_inner();
+    assert_eq!(response.hits.len(), 1);
+    let hit = &response.hits[0];
+    let message = hit.message.as_ref().unwrap();
+    assert_eq!(message.id, id);
+    assert_eq!(message.to_name.as_deref(), Some("Recipient"));
+    assert!(hit.truncated && message.body.len() <= 32 * 1024 && message.body.contains("ÉQUIPE"));
+    assert_eq!(
+        &body[hit.body_offset_bytes as usize..hit.body_offset_bytes as usize + message.body.len()],
+        message.body
+    );
+    let unread = client
+        .read(as_agent(&recipient.token, proto::ReadRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(unread.messages.len(), 1);
+    assert_eq!(unread.messages[0].body, body);
+}

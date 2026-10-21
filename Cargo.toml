@@ -38,6 +38,7 @@ libc = "0.2.190"
 prost = "0.14.4"
 rand = "0.9"
 rpassword = "7.4"
+regex = "1.13.1"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 semver = "1.0.28"

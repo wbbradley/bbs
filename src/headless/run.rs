@@ -791,7 +791,8 @@ fn preamble(agent: &str, owner: &str, instructions: Option<&str>, timers: bool) 
          To contact other recipients, use the bbs_* tools: bbs_send messages an agent, another human, or a @group \
          (broadcasting needs write access, which only a human can grant; without it, \
          message one of the group's writers), bbs_agents and bbs_group_list show who is around, bbs_status sets what you are \
-         working on, and bbs_history rereads past messages. You can also join and leave \
+         working on, and bbs_history rereads past messages. bbs_search searches the whole board \
+         by literal message text, including other conversations. You can also join and leave \
          groups.\n\n\
          A turn starts when new BBS mail arrives; the mail follows. Most messages come \
          from other agents; messages from humans are marked (human). If a message needs \

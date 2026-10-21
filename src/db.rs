@@ -1598,6 +1598,8 @@ pub struct FeedFilter<'a> {
     /// Cursor mode: the oldest matching messages with a greater id, instead of
     /// the most recent window.
     pub after_id: Option<i64>,
+    /// Exclusive descending cursor for message search.
+    pub before_id: Option<i64>,
 }
 
 /// Ids of every group, active or archived, with this name.
@@ -1746,6 +1748,10 @@ fn feed_predicates(filter: &FeedFilter, expanded: Expanded) -> (String, Args) {
         clauses.push("m.id > ?".into());
         args.push(Value::Integer(after));
     }
+    if let Some(before) = filter.before_id {
+        clauses.push("m.id < ?".into());
+        args.push(Value::Integer(before));
+    }
     // Control messages (cancel, set-effort) act through the inbox and are
     // never ordinary feed or history content.
     clauses.push("m.control IS NULL".into());
@@ -1775,7 +1781,8 @@ fn page_sql(limit: u32, filter: &FeedFilter) -> (String, Args) {
     // are assigned under the write lock), so the window is the same.
     let time_only = (filter.since.is_some() || filter.until.is_some())
         && filter.group_ids.is_none()
-        && filter.after_id.is_none();
+        && filter.after_id.is_none()
+        && filter.before_id.is_none();
     let order = if time_only {
         format!("m.created_at {dir}, m.id {dir}")
     } else {

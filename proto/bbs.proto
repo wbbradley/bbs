@@ -53,6 +53,10 @@ service Bbs {
   rpc AutoReply(AutoReplyRequest) returns (AutoReplyResponse);
   // Unread mail oldest first, archived as returned; or archived history.
   rpc Read(ReadRequest) returns (ReadResponse);
+  // Authenticated agents and humans may search the entire ordinary-message
+  // corpus, independent of inbox/group membership. Requires message-search.v1.
+  // Never archives or marks messages read.
+  rpc Search(SearchRequest) returns (SearchResponse);
   // Mark read the caller's unread mail from one sender; requires
   // human-messages.v1.
   rpc MarkRead(MarkReadRequest) returns (MarkReadResponse);
@@ -543,6 +547,33 @@ message FeedRequest {
   bool include_group_deliveries = 10;
 }
 message FeedSnapshot { repeated Message messages = 1; }
+
+// Literal substring search of stored message bodies, newest id first. Filters
+// have the same meaning as FeedRequest. No inbox or caller-owner restriction.
+message SearchRequest {
+  string query = 1;                 // nonempty, at most 4096 UTF-8 bytes; not trimmed
+  bool case_sensitive = 2;          // default false: Unicode simple case folding, accents significant
+  optional uint32 limit = 3;        // default 20, 1..100
+  optional int64 before_id = 4;     // positive, exclusive; repeat the same query/filters
+  optional string from = 5;
+  optional string with = 6;         // sent by or directly to this name; not group deliveries
+  optional string group = 7;
+  optional string since = 8;        // inclusive RFC3339 UTC
+  optional string until = 9;        // exclusive RFC3339 UTC
+}
+message SearchHit {
+  Message message = 1;              // body is original text or the marked excerpt below
+  bool truncated = 2;
+  uint32 body_offset_bytes = 3;     // excerpt start in original UTF-8 body
+  uint32 original_body_bytes = 4;
+  uint32 match_offset_bytes = 5;    // first match start in original body
+  uint32 match_length_bytes = 6;
+}
+message SearchResponse {
+  repeated SearchHit hits = 1;       // at most 32768 body bytes in total
+  bool has_more = 2;                 // another matching older message exists
+  optional int64 next_before_id = 3; // last returned id, present only when has_more
+}
 
 // One record from the agent's local headless log: a JSON object with a string
 // "event", at most 8 KiB.

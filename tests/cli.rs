@@ -2248,6 +2248,63 @@ fn bodies(rows: &[serde_json::Value]) -> Vec<&str> {
     rows.iter().map(|r| r["body"].as_str().unwrap()).collect()
 }
 
+fn headless_search_reads_the_corpus_and_pages_without_archiving(mode: Mode) {
+    let bbs = Bbs::with_mode("search-tools", mode);
+    let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    bbs.ok(&["send", "--to", &b, "older Équipe [a.*]_%"]);
+    bbs.ok(&["send", "--to", &b, "newer Équipe [a.*]_%"]);
+    let search = |args: serde_json::Value| -> serde_json::Value {
+        let input = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"bbs_search","arguments":args}})
+        .to_string();
+        let out = bbs.run_with_env(
+            &["headless", "mcp"],
+            &format!("{input}\n"),
+            &[("BBS_HEADLESS_TOKEN", &ta)],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let response: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    let page = search(serde_json::json!({"query":"équipe [a.*]_%","limit":1,"since":"7d"}));
+    assert_eq!(page["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(page["hits"][0]["body"], "newer Équipe [a.*]_%");
+    assert_eq!(page["hits"][0]["to"]["name"], b);
+    assert_eq!(page["hits"][0]["from"]["name"], "will");
+    assert_eq!(page["has_more"], true);
+    assert!(page["since"].as_str().unwrap().contains('T'));
+    assert_ne!(a, b, "caller has no inbox copy of the search hits");
+    bbs.ok(&["send", "--to", &b, "newest Équipe [a.*]_%"]);
+    let older = search(
+        serde_json::json!({"query":"équipe [a.*]_%","limit":1,"before_id":page["next_before_id"],"since":page["since"]}),
+    );
+    assert_eq!(older["hits"][0]["body"], "older Équipe [a.*]_%");
+    assert_eq!(older["has_more"], false);
+    assert!(older["next_before_id"].is_null());
+    let exact = search(serde_json::json!({"query":"équipe","case_sensitive":true}));
+    assert_eq!(exact["hits"], serde_json::json!([]));
+    assert!(
+        bbs.ok(&["--token", &tb, "read"]).contains("older Équipe"),
+        "still unread after another agent searched"
+    );
+    let list = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n";
+    let out = bbs.run_with_env(&["headless", "mcp"], list, &[("BBS_HEADLESS_TOKEN", &ta)]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "bbs_search")
+    );
+}
+
 fn headless_agents_manage_timers_with_tools(mode: Mode) {
     let bbs = Bbs::with_mode("timer-tools", mode);
     let (a, ta) = bbs.register();
@@ -3848,6 +3905,7 @@ both_modes!(
     view_with_shows_what_a_name_sent_and_was_sent_directly,
     timers_are_set_listed_fired_and_removed,
     headless_agents_manage_timers_with_tools,
+    headless_search_reads_the_corpus_and_pages_without_archiving,
     view_since_and_until_bound_history,
     view_json_follow_emits_each_message_once,
     view_json_follow_survives_full_windows_and_bursts,

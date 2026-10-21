@@ -1941,6 +1941,100 @@ fn parse_time(field: &str, s: &str) -> Result<String> {
         .with_context(|| format!("invalid {field} {s:?}: expected RFC3339"))
 }
 
+fn message_groups(conn: &Connection, name: Option<&str>) -> Result<Option<Vec<i64>>> {
+    name.map(group_name)
+        .map(|name| {
+            let ids = db::group_ids_named(conn, name)?;
+            if ids.is_empty() {
+                bail!("no such group @{name}");
+            }
+            Ok(ids)
+        })
+        .transpose()
+}
+
+fn message_principals(
+    conn: &Connection,
+    name: Option<&str>,
+) -> Result<Option<Vec<(db::Kind, i64)>>> {
+    name.map(|name| {
+        let ids = db::principals_named(conn, name)?;
+        if ids.is_empty() {
+            bail!("no agent or human named {name:?}");
+        }
+        Ok(ids)
+    })
+    .transpose()
+}
+
+/// Search all ordinary messages, regardless of the caller's inbox or groups.
+/// Actor authentication/activity bookkeeping is normal; message/delivery state
+/// is never changed.
+pub fn search(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::SearchRequest,
+) -> Result<proto::SearchResponse> {
+    // Validate before taking a transaction or scanning any messages.
+    let limit = req.limit.unwrap_or(crate::search::DEFAULT_LIMIT);
+    if !(1..=crate::search::MAX_LIMIT).contains(&limit) {
+        bail!(
+            "search limit must be 1 to {}, not {limit}",
+            crate::search::MAX_LIMIT
+        );
+    }
+    if req.before_id.is_some_and(|id| id <= 0) {
+        bail!("before_id must be positive");
+    }
+    let since = req
+        .since
+        .as_deref()
+        .map(|s| parse_time("since", s))
+        .transpose()?;
+    let until = req
+        .until
+        .as_deref()
+        .map(|s| parse_time("until", s))
+        .transpose()?;
+    if let (Some(since), Some(until)) = (&since, &until)
+        && since >= until
+    {
+        bail!("since ({since}) must be earlier than until ({until})");
+    }
+    with_ctx(conn, caller, |ctx| {
+        ctx.actor()?;
+        let matcher = crate::search::Matcher::new(&req.query, req.case_sensitive)?;
+        let mut filter = db::FeedFilter {
+            group_ids: message_groups(ctx.conn, req.group.as_deref())?,
+            senders: message_principals(ctx.conn, req.from.as_deref())?,
+            with: message_principals(ctx.conn, req.with.as_deref())?,
+            since: since.as_deref(),
+            until: until.as_deref(),
+            before_id: Some(req.before_id.unwrap_or(i64::MAX)),
+            ..Default::default()
+        };
+        let (hits, has_more) =
+            crate::search::messages(ctx.conn, &matcher, limit as usize, &mut filter)?;
+        let next_before_id = has_more.then(|| hits.last().unwrap().message.id);
+        let hits = hits
+            .into_iter()
+            .map(|h| proto::SearchHit {
+                truncated: h.message.body.len() != h.original_body_bytes,
+                body_offset_bytes: h.body_offset_bytes as u32,
+                original_body_bytes: h.original_body_bytes as u32,
+                match_offset_bytes: h.matched.start as u32,
+                match_length_bytes: h.matched.len() as u32,
+                message: Some(message(h.message, None)),
+            })
+            .collect();
+        Ok(proto::SearchResponse {
+            hits,
+            has_more,
+            next_before_id,
+        })
+    })
+}
+
 /// Largest feed window or batch a client may request.
 pub const MAX_FEED_WINDOW: u32 = 1000;
 
@@ -1965,40 +2059,9 @@ pub fn feed(
         if req.include_group_deliveries && req.with.is_none() {
             bail!("include_group_deliveries requires a with filter");
         }
-        let group_ids = req
-            .group
-            .as_deref()
-            .map(group_name)
-            .map(|group| {
-                let ids = db::group_ids_named(ctx.conn, group)?;
-                if ids.is_empty() {
-                    bail!("no such group @{group}");
-                }
-                Ok(ids)
-            })
-            .transpose()?;
-        let senders = req
-            .from
-            .as_deref()
-            .map(|from| {
-                let ids = db::principals_named(ctx.conn, from)?;
-                if ids.is_empty() {
-                    bail!("no agent or human named {from:?}");
-                }
-                Ok(ids)
-            })
-            .transpose()?;
-        let with = req
-            .with
-            .as_deref()
-            .map(|name| {
-                let ids = db::principals_named(ctx.conn, name)?;
-                if ids.is_empty() {
-                    bail!("no agent or human named {name:?}");
-                }
-                Ok(ids)
-            })
-            .transpose()?;
+        let group_ids = message_groups(ctx.conn, req.group.as_deref())?;
+        let senders = message_principals(ctx.conn, req.from.as_deref())?;
+        let with = message_principals(ctx.conn, req.with.as_deref())?;
         let from_human = req
             .from_human
             .as_deref()
@@ -2033,6 +2096,7 @@ pub fn feed(
             until: until.as_deref(),
             scope: req.mine.then_some(me.id),
             after_id: req.after_id,
+            before_id: None,
         };
         let messages = db::feed_messages(ctx.conn, req.backlog, &filter)?
             .into_iter()
@@ -2803,6 +2867,376 @@ mod tests {
             group_join(&mut conn, agent, req).unwrap();
         }
         (conn, will, agents)
+    }
+
+    fn search_req(query: &str) -> proto::SearchRequest {
+        proto::SearchRequest {
+            query: query.into(),
+            ..Default::default()
+        }
+    }
+
+    fn search_ids(r: &proto::SearchResponse) -> Vec<i64> {
+        r.hits
+            .iter()
+            .map(|h| h.message.as_ref().unwrap().id)
+            .collect()
+    }
+
+    fn search_insert(
+        conn: &Connection,
+        from: &db::Principal,
+        to: &db::Principal,
+        body: &str,
+        time: &str,
+    ) -> i64 {
+        let id = db::insert_message(conn, from, None, body, time).unwrap();
+        db::insert_delivery(conn, id, to.kind, to.id).unwrap();
+        id
+    }
+
+    #[test]
+    fn search_is_literal_unicode_board_wide_and_does_not_read_mail() {
+        let (mut conn, will, [mateo, _, lu]) = board();
+        let one = send(
+            &mut conn,
+            &will,
+            proto::SendRequest {
+                to: "Lu".into(),
+                body: "**ÉQUIPE** a.*%_[]\nnext line".into(),
+                control: None,
+            },
+        )
+        .unwrap()
+        .id
+        .unwrap();
+        // A different owner's private DM; Mateo shares neither its owner nor a group.
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        let eve = Caller {
+            token: Some(
+                register(
+                    &mut conn,
+                    &ada,
+                    proto::RegisterRequest {
+                        name: Some("Eve".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .token,
+            ),
+            ..Default::default()
+        };
+        let private = send(
+            &mut conn,
+            &ada,
+            proto::SendRequest {
+                to: "Eve".into(),
+                body: "équipe private".into(),
+                control: None,
+            },
+        )
+        .unwrap()
+        .id
+        .unwrap();
+        read(&mut conn, &eve, proto::ReadRequest::default()).unwrap();
+        let retired = send(
+            &mut conn,
+            &eve,
+            proto::SendRequest {
+                to: "ada".into(),
+                body: "équipe reply".into(),
+                control: None,
+            },
+        )
+        .unwrap()
+        .id
+        .unwrap();
+        retire_agent(
+            &mut conn,
+            &ada,
+            proto::RetireRequest {
+                agent: "Eve".into(),
+            },
+        )
+        .unwrap();
+        send(
+            &mut conn,
+            &will,
+            proto::SendRequest {
+                to: "@crew".into(),
+                body: "équipe group".into(),
+                control: None,
+            },
+        )
+        .unwrap();
+        let group: i64 = conn
+            .query_row(
+                "SELECT id FROM messages WHERE body = ?",
+                ["équipe group"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let control = send(
+            &mut conn,
+            &will,
+            proto::SendRequest {
+                to: "Lu".into(),
+                body: "équipe control".into(),
+                control: None,
+            },
+        )
+        .unwrap()
+        .id
+        .unwrap();
+        db::set_message_control(&conn, control, "cancel").unwrap();
+        let before: Vec<_> = conn.prepare("SELECT message_id, recipient_id, archived_at FROM deliveries ORDER BY message_id, recipient_id")
+            .unwrap().query_map([], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,i64>(1)?, row.get::<_,Option<String>>(2)?)))
+            .unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        let got = search(&mut conn, &mateo, search_req("équipe")).unwrap();
+        assert_eq!(search_ids(&got), [group, retired, private, one]);
+        assert!(!got.has_more && got.next_before_id.is_none());
+        assert_eq!(
+            got.hits[2].message.as_ref().unwrap().to_name.as_deref(),
+            Some("Eve")
+        );
+        assert_eq!(got.hits[2].message.as_ref().unwrap().from_name, "ada");
+        let after: Vec<_> = conn.prepare("SELECT message_id, recipient_id, archived_at FROM deliveries ORDER BY message_id, recipient_id")
+            .unwrap().query_map([], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,i64>(1)?, row.get::<_,Option<String>>(2)?)))
+            .unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(before, after, "search never marks anybody's mail read");
+        let mut exact = search_req("équipe");
+        exact.case_sensitive = true;
+        assert_eq!(
+            search_ids(&search(&mut conn, &lu, exact).unwrap()),
+            [group, retired, private]
+        );
+        assert_eq!(
+            search_ids(&search(&mut conn, &mateo, search_req("a.*%_[]\nnext")).unwrap()),
+            [one]
+        );
+        assert!(
+            search(&mut conn, &mateo, search_req("equipe"))
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        let mut filtered = search_req("équipe");
+        filtered.from = Some("eVe".into());
+        assert_eq!(
+            search_ids(&search(&mut conn, &mateo, filtered).unwrap()),
+            [retired]
+        );
+        assert!(search(&mut conn, &Caller::default(), search_req("x")).is_err());
+        assert!(
+            search(&mut conn, &eve, search_req("x")).is_err(),
+            "retired tokens fail"
+        );
+    }
+
+    #[test]
+    fn search_filters_and_cursor_apply_before_the_count_limit() {
+        let (mut conn, will, [mateo, _, _]) = board();
+        let owner = db::find_human(&conn, "will").unwrap().unwrap();
+        let agent = db::live_agent_by_name(&conn, "Mateo").unwrap().unwrap();
+        // More than a scan batch of misses, and more than the maximum result count.
+        let mut wanted = Vec::new();
+        for i in 0..260 {
+            let body = if i % 2 == 0 { "needle" } else { "miss" };
+            // Deliberately nonmonotonic times: results must still order by id.
+            let time = if i % 4 == 0 {
+                "2020-01-01T00:00:00.000000Z"
+            } else {
+                "2020-01-02T00:00:00.000000Z"
+            };
+            let id = search_insert(&conn, &owner, &agent, body, time);
+            if i % 2 == 0 {
+                wanted.push(id);
+            }
+        }
+        wanted.reverse();
+        assert_eq!(
+            search_ids(&search(&mut conn, &mateo, search_req("needle")).unwrap()),
+            wanted[..20]
+        );
+        let mut req = search_req("needle");
+        req.limit = Some(100);
+        let page1 = search(&mut conn, &mateo, req.clone()).unwrap();
+        assert_eq!(search_ids(&page1), wanted[..100]);
+        assert_eq!(page1.next_before_id, Some(wanted[99]));
+        search_insert(
+            &conn,
+            &owner,
+            &agent,
+            "needle newest",
+            "2020-01-03T00:00:00.000000Z",
+        );
+        req.before_id = page1.next_before_id;
+        let page2 = search(&mut conn, &mateo, req).unwrap();
+        assert_eq!(search_ids(&page2), wanted[100..]);
+        assert!(!page2.has_more && page2.next_before_id.is_none());
+        let mut req = search_req("needle");
+        req.from = Some("WILL".into());
+        req.with = Some("mateo".into());
+        req.since = Some("2020-01-02T00:00:00Z".into());
+        req.until = Some("2020-01-03T00:00:00Z".into());
+        req.limit = Some(1);
+        let got = search(&mut conn, &mateo, req).unwrap();
+        assert_eq!(
+            search_ids(&got),
+            [wanted[0]],
+            "all filters intersect before limit; id order wins"
+        );
+        send(
+            &mut conn,
+            &will,
+            proto::SendRequest {
+                to: "@crew".into(),
+                body: "needle group".into(),
+                control: None,
+            },
+        )
+        .unwrap();
+        let group: i64 = conn
+            .query_row(
+                "SELECT id FROM messages WHERE body = ?",
+                ["needle group"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut req = search_req("needle");
+        req.group = Some("@crew".into());
+        assert_eq!(
+            search_ids(&search(&mut conn, &mateo, req.clone()).unwrap()),
+            [group]
+        );
+        req.with = Some("Mateo".into());
+        assert!(
+            search(&mut conn, &mateo, req).unwrap().hits.is_empty(),
+            "with does not mean group delivery"
+        );
+        for req in [
+            proto::SearchRequest {
+                from: Some("missing".into()),
+                ..search_req("x")
+            },
+            proto::SearchRequest {
+                with: Some("missing".into()),
+                ..search_req("x")
+            },
+            proto::SearchRequest {
+                group: Some("missing".into()),
+                ..search_req("x")
+            },
+            proto::SearchRequest {
+                limit: Some(0),
+                ..search_req("x")
+            },
+            proto::SearchRequest {
+                limit: Some(101),
+                ..search_req("x")
+            },
+            proto::SearchRequest {
+                before_id: Some(0),
+                ..search_req("x")
+            },
+            proto::SearchRequest {
+                before_id: Some(-1),
+                ..search_req("x")
+            },
+            proto::SearchRequest {
+                since: Some("bad".into()),
+                ..search_req("x")
+            },
+            proto::SearchRequest {
+                since: Some("2020-01-02T00:00:00Z".into()),
+                until: Some("2020-01-02T00:00:00Z".into()),
+                ..search_req("x")
+            },
+            search_req(""),
+            search_req(&"x".repeat(4097)),
+        ] {
+            assert!(search(&mut conn, &mateo, req).is_err());
+        }
+    }
+
+    #[test]
+    fn search_text_budget_preserves_pagination_and_marks_original_excerpts() {
+        let (mut conn, _, [mateo, _, _]) = board();
+        conn.execute("DELETE FROM deliveries", []).unwrap();
+        conn.execute("DELETE FROM messages", []).unwrap();
+        let owner = db::find_human(&conn, "will").unwrap().unwrap();
+        let agent = db::live_agent_by_name(&conn, "Mateo").unwrap().unwrap();
+        let one = search_insert(
+            &conn,
+            &owner,
+            &agent,
+            &"a".repeat(17000),
+            "2020-01-01T00:00:00Z",
+        );
+        let two = search_insert(
+            &conn,
+            &owner,
+            &agent,
+            &"a".repeat(16000),
+            "2020-01-01T00:00:00Z",
+        );
+        let got = search(&mut conn, &mateo, search_req("a")).unwrap();
+        assert_eq!(search_ids(&got), [two]);
+        assert_eq!(got.next_before_id, Some(two));
+        let got = search(
+            &mut conn,
+            &mateo,
+            proto::SearchRequest {
+                before_id: got.next_before_id,
+                ..search_req("a")
+            },
+        )
+        .unwrap();
+        assert_eq!(search_ids(&got), [one]);
+        assert!(!got.has_more);
+        for position in [0, 30000, 60000] {
+            let body = format!(
+                "{}ÉQUIPE{}",
+                "界".repeat(position / 3),
+                "界".repeat((64000 - position) / 3)
+            );
+            let id = search_insert(&conn, &owner, &agent, &body, "2020-01-01T00:00:00Z");
+            let got = search(&mut conn, &mateo, search_req("équipe")).unwrap();
+            let h = &got.hits[0];
+            let m = h.message.as_ref().unwrap();
+            assert_eq!(m.id, id);
+            assert!(h.truncated);
+            assert!(m.body.len() <= crate::search::TEXT_BUDGET);
+            assert_eq!(h.original_body_bytes as usize, body.len());
+            assert_eq!(
+                &body[h.body_offset_bytes as usize..h.body_offset_bytes as usize + m.body.len()],
+                m.body
+            );
+            assert!(m.body.contains("ÉQUIPE"));
+            assert_eq!(
+                &body[h.match_offset_bytes as usize
+                    ..(h.match_offset_bytes + h.match_length_bytes) as usize],
+                "ÉQUIPE"
+            );
+            assert!(
+                got.hits
+                    .iter()
+                    .map(|h| h.message.as_ref().unwrap().body.len())
+                    .sum::<usize>()
+                    <= crate::search::TEXT_BUDGET
+            );
+        }
+        let exact = "z".repeat(crate::search::TEXT_BUDGET);
+        let id = search_insert(&conn, &owner, &agent, &exact, "2020-01-01T00:00:00Z");
+        let got = search(&mut conn, &mateo, search_req("z")).unwrap();
+        assert_eq!(search_ids(&got), [id]);
+        assert!(!got.hits[0].truncated);
+        assert_eq!(got.hits[0].message.as_ref().unwrap().body, exact);
     }
 
     fn add(

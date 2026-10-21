@@ -29,6 +29,7 @@ pub const CAPABILITIES: &[&str] = &[
     "agent-interactions.v1",
     "side-questions.v1",
     "side-conversations.v1",
+    "message-search.v1",
 ];
 const MAX_METADATA_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;

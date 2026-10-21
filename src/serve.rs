@@ -1042,6 +1042,14 @@ impl Bbs for Server {
         self.0.protocol.finish(result)
     }
 
+    async fn search(
+        &self,
+        req: Request<proto::SearchRequest>,
+    ) -> Result<Response<proto::SearchResponse>, Status> {
+        self.unary("search", req, Effect::Query, service::search)
+            .await
+    }
+
     async fn list_agents(
         &self,
         req: Request<proto::ListAgentsRequest>,
