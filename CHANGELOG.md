@@ -15,6 +15,8 @@ under the new package version and its publication date.
 
 ### Fixed
 
+- Sending from paused conversation history preserves the scroll position and
+  returns to navigation instead of jumping to the newest messages.
 - Entering an agent conversation no longer reopens an already-ended `/btw`
   panel. Running and continuable side conversations still resume their panel.
 
