@@ -1322,6 +1322,21 @@ impl Screen for Thread {
                 self.composing = true;
                 return Some(Transition::Stay);
             }
+            // The arrows, unlike `j`/`k`, return to writing at the newest
+            // view, as PgDn does.
+            if self.agent.is_some()
+                && self.prompt.is_none()
+                && key.modifiers.is_empty()
+                && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            {
+                if key.code == KeyCode::Up {
+                    self.view.scroll_up(1);
+                } else {
+                    self.view.scroll_down_by(1);
+                }
+                self.write_at_tail();
+                return Some(Transition::Stay);
+            }
             if let Some((_, admin)) = &mut self.group
                 && let Some(transition) = admin.key(self.id, key)
             {
@@ -1411,14 +1426,8 @@ impl Screen for Thread {
         let page = self.view.page();
         let jump = self.jump();
         match action {
-            Action::Up => {
-                self.view.scroll_up(1);
-                self.write_at_tail();
-            }
-            Action::Down => {
-                self.view.scroll_down_by(1);
-                self.write_at_tail();
-            }
+            Action::Up => self.view.scroll_up(1),
+            Action::Down => self.view.scroll_down_by(1),
             Action::PageUp => self.view.scroll_up(jump),
             Action::PageDown => {
                 self.view.scroll_down_by(jump);

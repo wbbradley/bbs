@@ -5502,6 +5502,19 @@ mod tests {
     }
 
     #[test]
+    fn j_and_k_at_the_newest_view_keep_navigating_and_type_nothing() {
+        let (mut app, mut rx) = app();
+        mateo_with(&mut app, &mut rx, 2);
+        screen(&mut app, 80, 24);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        for c in ['j', 'j', 'k', 'k'] {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+            assert!(!editor_focused(&mut app), "{c}");
+        }
+        assert_eq!(draft_text(&mut app), "");
+    }
+
+    #[test]
     fn a_page_key_moves_two_thirds_of_the_view_keeping_context() {
         let visible = |out: &str| -> Vec<i64> {
             out.lines()
