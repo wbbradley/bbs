@@ -214,8 +214,16 @@ impl Blockers {
                 .map(|b| (b.id, b.body.clone(), b.can_answer, b.can_cancel))
                 .collect()
         };
+        // Only what the server listed: rows kept here for a reply or a
+        // refusal are not news on every poll.
+        let listed: Vec<proto::Blocker> = self
+            .rows
+            .iter()
+            .filter(|b| !self.held.contains(&b.root_id))
+            .cloned()
+            .collect();
         let changed = self.loaded
-            && (shown(&self.rows) != shown(&list.blockers) || self.active != list.active_count);
+            && (shown(&listed) != shown(&list.blockers) || self.active != list.active_count);
         let old: Vec<i64> = self.rows.iter().map(|b| b.root_id).collect();
         self.support = Support::Supported;
         self.poll_error = None;
@@ -1406,6 +1414,35 @@ mod tests {
         // With the last one gone too, the goodbye can start.
         blockers.on_data(SCREEN, &list(vec![]), now);
         assert_eq!(blockers.panel.as_ref().unwrap().done_at, Some(now + DONE));
+    }
+
+    #[test]
+    fn a_kept_refusal_does_not_renew_the_update_notice() {
+        let now = Instant::now();
+        let mut blockers = open(now);
+        typed(&mut blockers, "go", now);
+        let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+        let others = list(vec![row(2, 2, "Mateo", "second?")]);
+        blockers.on_data(SCREEN, &others, now);
+        blockers.on_data(
+            SCREEN,
+            &written(&req.request_key, Err(SideError::Refused("taken".into()))),
+            now,
+        );
+        // The other blocker is selected while the refusal stays listed.
+        blockers.key(SCREEN, alt(KeyCode::Down), now);
+        assert_eq!(blockers.selected().unwrap().root_id, 2);
+        let status = |b: &Blockers, at| b.status_line(b.selected_chain(), at).to_string();
+        // Identical polls each second: the notice from the change ends.
+        for at in 1..=10 {
+            blockers.on_data(SCREEN, &others, now + Duration::from_secs(at));
+        }
+        assert_eq!(status(&blockers, now + Duration::from_secs(10)), "");
+        assert_eq!(blockers.next_frame(now + Duration::from_secs(10)), None);
+        assert!(
+            blockers.chains.contains_key(&1),
+            "the refusal is still kept"
+        );
     }
 
     #[test]
