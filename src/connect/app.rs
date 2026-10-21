@@ -5409,10 +5409,18 @@ mod tests {
             press(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert!(editor_focused(&mut app), "a lower display row edits");
         }
-        // From the first display row, Up starts navigation, a line up.
+        // From the first display row, Up starts navigation, a line up: the
+        // timeline's rows move down by exactly one.
+        let before = screen(&mut app, 80, 24);
         press(&mut app, KeyCode::Up, KeyModifiers::NONE);
         let out = screen(&mut app, 80, 24);
         assert!(!editor_focused(&mut app) && out.contains("paused"), "{out}");
+        let rows = |s: &str| s.lines().take(10).map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            rows(&out)[1..],
+            rows(&before)[..9],
+            "one line up:\n{before}\n{out}"
+        );
         assert_eq!(
             draft_text(&mut app),
             "word ".repeat(40),
