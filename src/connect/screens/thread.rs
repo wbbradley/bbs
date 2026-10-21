@@ -628,6 +628,16 @@ mod status_tests {
     }
 
     #[test]
+    fn group_and_feed_page_keys_keep_moving_a_whole_view() {
+        for mut thread in [super::Thread::group("ops"), super::Thread::feed()] {
+            for (height, jump) in [(30, 30), (24, 24), (2, 2), (1, 1), (0, 1)] {
+                thread.view.layout(80, height);
+                assert_eq!(thread.jump(), jump, "height {height}");
+            }
+        }
+    }
+
+    #[test]
     fn feedback_clipping_keeps_whole_graphemes_from_either_end() {
         assert_eq!(fit_status("👍🏽🇺🇸👩‍💻", 3, false), "👍🏽…");
         assert_eq!(fit_status("👍🏽🇺🇸👩‍💻", 3, true), "…👩‍💻");
@@ -639,8 +649,9 @@ mod status_tests {
 }
 
 impl Thread {
-    /// Agent conversations open in insert mode; only PgUp switches to
-    /// navigation. Groups keep Esc as the way out of their composer.
+    /// Agent conversations open in insert mode; PgUp, or Up on the draft's
+    /// top row, switches to navigation. Groups keep Esc as the way out of
+    /// their composer.
     fn compose(&mut self, key: KeyEvent) -> Option<Transition> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             // Quit through the keymap, as everywhere.
@@ -767,12 +778,16 @@ impl Thread {
         }
     }
 
-    /// How far a page key moves: two thirds of the view, at least a line.
+    /// How far a page key moves: in an agent conversation, two thirds of
+    /// the view and at least a line; elsewhere, the whole view.
     fn jump(&self) -> usize {
+        if self.agent.is_none() {
+            return self.view.page();
+        }
         (self.view.page() * 2 / 3).max(1)
     }
 
-    /// In an agent conversation, scrolling down to the newest view resumes
+    /// In an agent conversation, scrolling to the newest view resumes
     /// following and returns to writing.
     fn write_at_tail(&mut self) {
         if self.agent.is_some() && self.view.top() == self.view.frame.bottom() {
@@ -1396,7 +1411,10 @@ impl Screen for Thread {
         let page = self.view.page();
         let jump = self.jump();
         match action {
-            Action::Up => self.view.scroll_up(1),
+            Action::Up => {
+                self.view.scroll_up(1);
+                self.write_at_tail();
+            }
             Action::Down => {
                 self.view.scroll_down_by(1);
                 self.write_at_tail();

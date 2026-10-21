@@ -5482,6 +5482,26 @@ mod tests {
     }
 
     #[test]
+    fn up_in_a_short_or_empty_view_returns_to_writing() {
+        for count in [0, 2] {
+            let (mut app, mut rx) = app();
+            mateo_with(&mut app, &mut rx, count);
+            screen(&mut app, 80, 24);
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+            assert!(!editor_focused(&mut app), "{count} messages");
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert!(editor_focused(&mut app), "{count} messages");
+        }
+        // A view with room to scroll: Up keeps navigating.
+        let (mut app, mut rx) = app();
+        mateo_with(&mut app, &mut rx, 200);
+        screen(&mut app, 80, 24);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert!(!editor_focused(&mut app));
+    }
+
+    #[test]
     fn a_page_key_moves_two_thirds_of_the_view_keeping_context() {
         let visible = |out: &str| -> Vec<i64> {
             out.lines()
