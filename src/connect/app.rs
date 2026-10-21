@@ -3990,6 +3990,89 @@ mod tests {
     }
 
     #[test]
+    fn an_ended_side_conversation_does_not_reopen_its_panel_on_entry() {
+        use proto::SideStatus::*;
+        for (status, ended) in [
+            (SideCompleted, true),
+            (SideFailed, true),
+            (SideCancelled, true),
+            (SideInterrupted, true),
+            (SideEnded, true),
+            (SideEnded, false),
+        ] {
+            let (mut app, mut rx) = app();
+            mateo_streams(&mut app, &mut rx);
+            typed(&mut app, "parent draft");
+            let old = Row {
+                ended,
+                ..row(5, "old question?", status, "old answer")
+            };
+            // Repeated polls and reopening the agent must both leave the
+            // composer available, without requiring an Esc to dismiss history.
+            for visit in 0..2 {
+                for revision in 1..=2 {
+                    let id = poll(&mut app, &mut rx);
+                    reply_to(&mut app, id, conv_report(revision, Some(old)));
+                    let out = screen(&mut app, 100, 24);
+                    assert!(!out.contains("btw · Mateo"), "{status:?}/{ended}: {out}");
+                    assert!(editor_focused(&mut app));
+                    assert_eq!(draft_text(&mut app), "parent draft");
+                    assert!(without_polls(&mut rx).is_empty());
+                }
+                if visit == 0 {
+                    press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+                    key(&mut app, 'q');
+                    while rx.try_recv().is_ok() {}
+                    reopen(&mut app, &mut rx);
+                    while rx.try_recv().is_ok() {}
+                }
+            }
+            enter(&mut app);
+            let sent = without_polls(&mut rx);
+            assert!(
+                matches!(sent.as_slice(), [Request::Send { req, .. }] if req.body == "parent draft"),
+                "{sent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn entering_an_agent_restores_a_running_or_continuable_side_conversation() {
+        use proto::SideStatus::*;
+        for (status, ended) in [(SideOpen, false), (SideOpen, true), (SideCompleted, false)] {
+            let (mut app, mut rx) = app();
+            mateo_streams(&mut app, &mut rx);
+            let id = poll(&mut app, &mut rx);
+            reply_to(
+                &mut app,
+                id,
+                conv_report(
+                    1,
+                    Some(Row {
+                        ended,
+                        ..row(5, "earlier?", status, "answer")
+                    }),
+                ),
+            );
+            let out = screen(&mut app, 100, 24);
+            assert!(out.contains("btw · Mateo"), "{status:?}/{ended}: {out}");
+            command(&mut app, "follow up?");
+            let sent = without_polls(&mut rx);
+            if status == SideCompleted {
+                assert!(
+                    matches!(sent.as_slice(), [Request::AskSide { follows: Some(5), question, .. }] if question == "follow up?"),
+                    "{sent:?}"
+                );
+            } else {
+                assert!(sent.is_empty(), "{sent:?}");
+                assert!(
+                    screen(&mut app, 100, 24).contains("Wait for the answer, or Esc to cancel it.")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn leaving_with_the_side_panel_up_never_keeps_side_text_as_the_parent_draft() {
         use proto::SideStatus;
         // Adopted from Theo's review repro: a report opens the panel over a

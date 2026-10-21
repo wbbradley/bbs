@@ -536,7 +536,14 @@ impl Session {
             {
                 *side = Side::adopt(latest);
             }
-            None if first => self.side = Some(Side::adopt(latest)),
+            // Restore an unfinished conversation, not an ended historical
+            // panel on every visit. An open turn still needs its controls.
+            None if first
+                && latest.status() != proto::SideStatus::SideEnded
+                && (!latest.ended || latest.status() == proto::SideStatus::SideOpen) =>
+            {
+                self.side = Some(Side::adopt(latest));
+            }
             _ => {}
         }
     }

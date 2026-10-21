@@ -13,6 +13,11 @@ under the new package version and its publication date.
 - `bbs connect` agent conversations mark your messages the agent has not yet
   read with a quiet `unread` below them, which clears when the agent reads them.
 
+### Fixed
+
+- Entering an agent conversation no longer reopens an already-ended `/btw`
+  panel. Running and continuable side conversations still resume their panel.
+
 ## 0.13.0 - 2026-10-21
 
 Adds the `message-search.v1` capability without changing protocol v2, database
