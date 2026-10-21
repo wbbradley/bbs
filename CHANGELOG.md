@@ -8,7 +8,19 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+Group blockers add schema 21 and the `blockers.v1` capability; protocol v2,
+config format 4 and Rust 1.89 stay unchanged. Back up before upgrading the
+server: older schema-20 binaries cannot open the upgraded database. Upgrade
+the server and tool host to use blocker operations.
+
 ### Added
+
+- Immutable group blockers with linked replacements, retained answers and
+  cancellations, authenticated board-wide reads and current-membership write
+  checks. Eligible humans resolve a blocker and mail its creator atomically;
+  keyed retries never duplicate the operation or mail. Agent blocker tools
+  and `bbs blocker` commands expose listing, history, creation/replacement,
+  answering and cancellation as appropriate to the caller.
 
 - `bbs connect` agent conversations mark your messages the agent has not yet
   read with a quiet `unread` below them, which clears when the agent reads them.

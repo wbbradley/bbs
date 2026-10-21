@@ -54,6 +54,14 @@ pub enum Command {
         #[command(subcommand)]
         command: TimerCommand,
     },
+    /// Read and resolve immutable group blockers.
+    Blocker {
+        /// Print machine-readable JSON instead of text.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: BlockerCommand,
+    },
     /// Register a new agent and print its name and token.
     Register {
         /// Requested agent name; fail if already reserved (case-insensitive).
@@ -268,6 +276,59 @@ pub enum TimerCommand {
     List { agent: Option<String> },
     /// Remove a timer by its id.
     Rm { id: i64 },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BlockerCommand {
+    /// List current versions, oldest first; reads are board-wide.
+    List {
+        #[arg(long, conflicts_with = "agent")]
+        group: Option<String>,
+        /// All current groups of this live agent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Include answered/cancelled chains and archived groups.
+        #[arg(long)]
+        include_closed: bool,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        after_root_id: Option<i64>,
+    },
+    /// Read an exact version and its paginated immutable chain history.
+    Get {
+        id: i64,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        before_id: Option<i64>,
+    },
+    /// Agent member: create a blocker, or a new version replacing a chain head.
+    Put {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        replaces: Option<i64>,
+        /// Reuse with the same payload after an uncertain acknowledgement.
+        #[arg(long)]
+        request_key: Option<String>,
+        /// Plaintext; omitted or "-" reads stdin. At most 8 KiB.
+        body: Option<String>,
+    },
+    /// Eligible human: resolve this exact version and mail its creator.
+    Answer {
+        id: i64,
+        #[arg(long)]
+        request_key: Option<String>,
+        /// Plaintext; omitted or "-" reads stdin. At most 8 KiB.
+        answer: Option<String>,
+    },
+    /// Group member or eligible human: cancel this version without mail.
+    Cancel {
+        id: i64,
+        #[arg(long)]
+        request_key: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
