@@ -577,7 +577,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connect::event::Admin;
+    use crate::connect::event::{Admin, BlockerScope, SideError};
     use crate::proto;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -725,8 +725,10 @@ mod tests {
             key(&mut app, 'x');
             app.on_event(Event::Tick);
         }
+        // Only the conversation's one blocker poll, still awaiting its reply.
         assert!(
-            rx.try_recv().is_err(),
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .all(|r| matches!(r, Request::Blockers { .. })),
             "stale local unread rows cause no repeat requests"
         );
         // A's next unread message can even have the same timestamp as before.
@@ -3159,8 +3161,12 @@ mod tests {
     }
 
     fn without_sends(rx: &mut UnboundedReceiver<Request>) -> Option<Request> {
-        std::iter::from_fn(|| rx.try_recv().ok())
-            .find(|r| !matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. }))
+        std::iter::from_fn(|| rx.try_recv().ok()).find(|r| {
+            !matches!(
+                r,
+                Request::MarkRead(_) | Request::MarkSeen { .. } | Request::Blockers { .. }
+            )
+        })
     }
 
     fn command(app: &mut App, text: &str) {
@@ -5052,7 +5058,7 @@ mod tests {
     /// The requests waiting, but the owner's once-a-second side polls.
     fn without_polls(rx: &mut UnboundedReceiver<Request>) -> Vec<Request> {
         std::iter::from_fn(|| rx.try_recv().ok())
-            .filter(|r| !matches!(r, Request::SideReport { .. }))
+            .filter(|r| !matches!(r, Request::SideReport { .. } | Request::Blockers { .. }))
             .collect()
     }
 
@@ -5520,6 +5526,280 @@ mod tests {
         );
     }
 
+    fn blocker(id: i64, root: i64, creator: &str, body: &str) -> proto::Blocker {
+        proto::Blocker {
+            id,
+            root_id: root,
+            group: "crew".into(),
+            creator: Some(proto::Principal {
+                kind: proto::Kind::Agent.into(),
+                id: 100 + root,
+                name: creator.into(),
+                owner: Some("ada".into()),
+            }),
+            body: body.into(),
+            status: proto::BlockerStatus::BlockerOpen.into(),
+            can_answer: true,
+            can_cancel: true,
+            ..Default::default()
+        }
+    }
+
+    fn blockers_listed(app: &mut App, id: u64, rows: Vec<proto::Blocker>) {
+        app.on_event(Event::Data(Data::Blockers {
+            id,
+            result: Ok(Box::new(proto::ListBlockersResponse {
+                active_count: rows.len() as u64,
+                blockers: rows,
+                ..Default::default()
+            })),
+        }));
+    }
+
+    /// The tick's blocker poll, with its screen and scope.
+    fn blocker_poll(
+        app: &mut App,
+        rx: &mut UnboundedReceiver<Request>,
+    ) -> Option<(u64, BlockerScope)> {
+        app.on_event(Event::Tick);
+        std::iter::from_fn(|| rx.try_recv().ok()).find_map(|r| match r {
+            Request::Blockers { id, scope } => Some((id, scope)),
+            _ => None,
+        })
+    }
+
+    /// Mateo's conversation, its first blocker poll answered with `rows`.
+    fn mateo_blockers(
+        app: &mut App,
+        rx: &mut UnboundedReceiver<Request>,
+        rows: Vec<proto::Blocker>,
+    ) -> u64 {
+        let id = mateo(app, rx);
+        assert_eq!(
+            blocker_poll(app, rx),
+            Some((id, BlockerScope::Agent("Mateo".into())))
+        );
+        blockers_listed(app, id, rows);
+        id
+    }
+
+    fn answered(rx: &mut UnboundedReceiver<Request>) -> proto::AnswerBlockerRequest {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|r| match r {
+                Request::AnswerBlocker { req, .. } => Some(req),
+                _ => None,
+            })
+            .expect("an answer")
+    }
+
+    #[test]
+    fn f2_answers_blockers_in_the_composers_place_keeping_the_parent_draft() {
+        let (mut app, mut rx) = app();
+        let id = mateo_blockers(
+            &mut app,
+            &mut rx,
+            vec![
+                blocker(1, 1, "Zed", "first?"),
+                blocker(2, 2, "Mateo", "second?"),
+            ],
+        );
+        typed(&mut app, "parent");
+        assert!(bottom(&mut app).contains("2 blockers · F2"));
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        let out = screen(&mut app, 60, 24);
+        assert!(
+            out.contains("answer → Zed @crew") && out.contains("first?"),
+            "{out}"
+        );
+        assert!(!out.contains("parent"), "the composer gives way: {out}");
+        // Typing is the answer's; Tab is the panel's, never effort: it
+        // reaches Cancel, which asks first, and Esc steps back.
+        typed(&mut app, "yes");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        enter(&mut app);
+        assert!(screen(&mut app, 60, 24).contains("Cancel this blocker?"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(draft_text(&mut app), "parent");
+        enter(&mut app);
+        let req = answered(&mut rx);
+        assert_eq!((req.id, req.answer.as_str()), (1, "yes"));
+        // Alt-↓ moves to the next blocker, whose recipient the box names.
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        assert!(screen(&mut app, 60, 24).contains("answer → Mateo @crew"));
+        // Esc returns to writing the parent draft, the answer still out.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(editor_focused(&mut app));
+        assert_eq!(draft_text(&mut app), "parent");
+        assert!(screen(&mut app, 60, 24).contains("parent"));
+        // A late reply settles it without touching the parent.
+        app.on_event(Event::Data(Data::BlockerWritten {
+            id,
+            key: req.request_key,
+            result: Ok(Default::default()),
+        }));
+        assert!(bottom(&mut app).contains("1 blocker · F2"));
+        assert_eq!(draft_text(&mut app), "parent");
+    }
+
+    #[test]
+    fn the_last_answer_says_done_then_writing_resumes_with_the_parent_draft() {
+        let (mut app, mut rx) = app();
+        let (clock, now) = test_clock();
+        app.ctx.now = now;
+        let id = mateo_blockers(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "only?")]);
+        typed(&mut app, "parent");
+        // Opened from navigation, it still returns to writing.
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        typed(&mut app, "ok");
+        enter(&mut app);
+        let req = answered(&mut rx);
+        app.on_event(Event::Data(Data::BlockerWritten {
+            id,
+            key: req.request_key,
+            result: Ok(Default::default()),
+        }));
+        assert!(screen(&mut app, 80, 24).contains("Done with blockers."));
+        assert!(app.next_animation_frame().is_some());
+        // Typing during the goodbye is swallowed, never parent mail.
+        typed(&mut app, "x");
+        enter(&mut app);
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, Request::Send { .. }))
+        );
+        clock.advance(Duration::from_millis(749));
+        assert!(screen(&mut app, 80, 24).contains("Done with blockers."));
+        clock.advance(Duration::from_millis(1));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("parent") && !out.contains("Done with"),
+            "{out}"
+        );
+        assert!(editor_focused(&mut app));
+        typed(&mut app, "!");
+        assert_eq!(draft_text(&mut app), "parent!");
+    }
+
+    #[test]
+    fn f2_waits_for_modals_side_conversations_and_a_newer_server() {
+        // The search prompt keeps its keys.
+        let (mut app, mut rx) = self::app();
+        mateo_blockers(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, '/');
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(!screen(&mut app, 80, 24).contains("answer →"));
+        // A side conversation must end first, and says so.
+        let (mut app, mut rx) = self::app();
+        mateo_streams(&mut app, &mut rx);
+        answered_btw(&mut app, &mut rx);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        let out = screen(&mut app, 100, 24);
+        assert!(out.contains("Leave the side conversation (Esc)"), "{out}");
+        assert!(!out.contains("answer →"));
+        // An old server is asked once; F2 explains, and reload asks again.
+        let (mut app, mut rx) = self::app();
+        let id = mateo(&mut app, &mut rx);
+        assert!(blocker_poll(&mut app, &mut rx).is_some());
+        app.on_event(Event::Data(Data::Blockers {
+            id,
+            result: Err(SideError::Unsupported(
+                "required capability blockers.v1 is unavailable".into(),
+            )),
+        }));
+        for _ in 0..3 {
+            assert_eq!(blocker_poll(&mut app, &mut rx), None);
+        }
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(bottom(&mut app).contains("newer server (blockers.v1)"));
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, 'r');
+        assert!(blocker_poll(&mut app, &mut rx).is_some());
+    }
+
+    #[test]
+    fn a_group_thread_polls_its_group_and_shows_the_count() {
+        let (mut app, mut rx) = app();
+        crew_list(&mut app, &mut rx);
+        enter(&mut app);
+        let (id, _) = watched(&mut rx);
+        assert_eq!(
+            blocker_poll(&mut app, &mut rx),
+            Some((id, BlockerScope::Group("crew".into())))
+        );
+        blockers_listed(&mut app, id, vec![blocker(1, 1, "Zed", "q?")]);
+        assert!(screen(&mut app, 80, 24).contains("1 blocker · F2"));
+        // F2 from the group's navigation; Esc returns to its composer.
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(screen(&mut app, 80, 24).contains("answer → Zed @crew"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        typed(&mut app, "hi");
+        assert_eq!(draft_text(&mut app), "hi");
+    }
+
+    #[test]
+    fn a_long_blocker_reads_to_its_end_with_page_keys_at_sixty_by_twenty_four() {
+        let (mut app, mut rx) = app();
+        let mut body = String::from("START of the question\n");
+        while body.len() < 8 * 1024 - 40 {
+            body.push_str("line of detail to read before answering\n");
+        }
+        body.push_str("END of the question");
+        mateo_blockers(&mut app, &mut rx, vec![blocker(1, 1, "Zed", &body)]);
+        typed(&mut app, "parent");
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        let out = screen(&mut app, 60, 24);
+        assert!(out.contains("START") && !out.contains("END of"), "{out}");
+        assert!(out.contains("PgUp/PgDn text"), "{out}");
+        let mut pages = 0;
+        while !screen(&mut app, 60, 24).contains("END of the question") {
+            press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+            pages += 1;
+            assert!(pages < 100, "the end is reachable");
+        }
+        assert!(pages > 5, "an 8 KiB question takes several pages");
+        // The answer and its recipient stay in view throughout.
+        assert!(screen(&mut app, 60, 24).contains("answer → Zed @crew"));
+        for _ in 0..pages {
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        }
+        assert!(screen(&mut app, 60, 24).contains("START"));
+        // Paging is the panel's: the parent draft is untouched.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(draft_text(&mut app), "parent");
+    }
+
+    #[test]
+    fn the_blocker_panel_draws_in_every_scheme_at_sixty_columns() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let (mut app, mut rx) = app();
+                let mut theirs = blocker(2, 2, "Zed", &"a long question ".repeat(60));
+                theirs.can_answer = false;
+                mateo_blockers(
+                    &mut app,
+                    &mut rx,
+                    vec![blocker(1, 1, "Zed", "first?"), theirs],
+                );
+                press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+                typed(&mut app, "an answer");
+                let out = screen(&mut app, 60, 24);
+                assert!(
+                    out.contains("an answer") && out.contains("[Cancel blocker]"),
+                    "{out}"
+                );
+                press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+                let out = screen(&mut app, 60, 24);
+                assert!(out.contains("Read only:"), "{scheme:?}: {out}");
+                // A long blocker still leaves the timeline a third.
+                let panel = out.lines().position(|l| l.starts_with("Blockers ·"));
+                assert!(panel >= Some(8), "{out}");
+                assert!(out.lines().next().unwrap().contains("No messages yet"));
+            });
+        }
+    }
+
     #[test]
     fn up_scrolls_only_from_the_first_display_row_of_a_wrapped_draft() {
         let (mut app, mut rx) = app();
@@ -5900,7 +6180,9 @@ mod tests {
                 mateo(&mut first, &mut rx);
                 typed(&mut first, "draft");
                 first.on_event(Event::Tick);
-                // The owner's open conversation polls the agent's side state.
+                // The conversation polls its blockers, and the owner's polls
+                // the agent's side state.
+                assert!(matches!(rx.try_recv().unwrap(), Request::Blockers { .. }));
                 assert!(matches!(rx.try_recv().unwrap(), Request::SideReport { .. }));
                 enter(&mut first);
                 let Request::Send { id, .. } = rx.try_recv().unwrap() else {

@@ -96,6 +96,28 @@ pub enum Request {
     },
     /// Stream per-agent summaries, replacing any stream with the same id.
     WatchSummary(u64),
+    /// The open blockers in a screen's scope (blockers.v1), for the screen `id`.
+    Blockers {
+        id: u64,
+        scope: BlockerScope,
+    },
+    /// A human's answer to one exact blocker version, for the screen `id`.
+    AnswerBlocker {
+        id: u64,
+        req: proto::AnswerBlockerRequest,
+    },
+    /// Cancel one exact blocker version, for the screen `id`.
+    CancelBlocker {
+        id: u64,
+        req: proto::CancelBlockerRequest,
+    },
+}
+
+/// Whose blockers a screen shows: a group's, or every group of a live agent.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BlockerScope {
+    Group(String),
+    Agent(String),
 }
 
 /// One group change, as the CLI's `bbs group` commands make it.
@@ -216,6 +238,43 @@ fn side_error(local: bool, error: anyhow::Error) -> SideError {
     }
 }
 
+/// A failed blocker poll. The server reports an ordinary refusal (a retired
+/// agent, no such group) with the same code as a missing capability, so a
+/// failed precondition asks once what the server offers; only a server
+/// without blockers.v1, or without the RPC at all, is an old server.
+async fn blocker_poll_error(backend: &mut Backend, local: bool, error: anyhow::Error) -> SideError {
+    let precondition = error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(|s| s.code() == tonic::Code::FailedPrecondition);
+    match side_error(local, error) {
+        SideError::Unsupported(text) if precondition => {
+            match bounded(backend.server_info(), local).await {
+                Ok(info)
+                    if info
+                        .capabilities
+                        .iter()
+                        .any(|c| c == crate::backend::BLOCKERS) =>
+                {
+                    SideError::Refused(text)
+                }
+                Ok(_) => SideError::Unsupported(text),
+                // Unknown: the next tick asks again.
+                Err(_) => SideError::Transient(text),
+            }
+        }
+        other => other,
+    }
+}
+
+/// A blocker answer or cancel is never how a missing feature shows: a
+/// refusal stays a refusal, and the panel stays usable.
+fn blocker_write_error(error: SideError) -> SideError {
+    match error {
+        SideError::Unsupported(text) => SideError::Refused(text),
+        other => other,
+    }
+}
+
 fn effort_send_error(local: bool, error: anyhow::Error) -> EffortSendError {
     use tonic::Code;
     let rejected = local
@@ -314,6 +373,17 @@ pub enum Data {
     Admin {
         id: u64,
         result: Result<Notice, String>,
+    },
+    /// The first page of the screen `id`'s open blockers.
+    Blockers {
+        id: u64,
+        result: Result<Box<proto::ListBlockersResponse>, SideError>,
+    },
+    /// The outcome of the blocker write `key`, for the screen `id`.
+    BlockerWritten {
+        id: u64,
+        key: String,
+        result: Result<Box<proto::BlockerMutationResponse>, SideError>,
     },
 }
 
@@ -463,6 +533,55 @@ pub async fn serve(
                     continue;
                 }
                 Data::Groups(backend.group_list().await.map_err(error))
+            }
+            Request::Blockers { id, scope } => {
+                let local = matches!(backend, Backend::Local(_));
+                let (group, agent) = match scope {
+                    BlockerScope::Group(group) => (Some(group), None),
+                    BlockerScope::Agent(agent) => (None, Some(agent)),
+                };
+                let req = proto::ListBlockersRequest {
+                    group,
+                    agent,
+                    ..Default::default()
+                };
+                let result =
+                    match tokio::time::timeout(SIDE_CALL_TIMEOUT, backend.list_blockers(req)).await
+                    {
+                        Ok(Ok(list)) => Ok(Box::new(list)),
+                        Ok(Err(e)) => Err(blocker_poll_error(&mut backend, local, e).await),
+                        Err(_) => Err(SideError::Transient(format!(
+                            "no reply within {} seconds",
+                            SIDE_CALL_TIMEOUT.as_secs()
+                        ))),
+                    };
+                Data::Blockers { id, result }
+            }
+            // Bounded like side calls; a timeout leaves the write uncertain,
+            // and only the screen retries it, with the same key.
+            Request::AnswerBlocker { id, req } => {
+                let local = matches!(backend, Backend::Local(_));
+                let key = req.request_key.clone();
+                Data::BlockerWritten {
+                    id,
+                    key,
+                    result: bounded(backend.answer_blocker(req), local)
+                        .await
+                        .map(Box::new)
+                        .map_err(blocker_write_error),
+                }
+            }
+            Request::CancelBlocker { id, req } => {
+                let local = matches!(backend, Backend::Local(_));
+                let key = req.request_key.clone();
+                Data::BlockerWritten {
+                    id,
+                    key,
+                    result: bounded(backend.cancel_blocker(req), local)
+                        .await
+                        .map(Box::new)
+                        .map_err(blocker_write_error),
+                }
             }
             Request::MarkRead(from) => Data::MarkedRead {
                 agent: from.clone(),
@@ -914,6 +1033,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blocker_writes_never_read_as_an_old_server() {
+        let write =
+            |s: tonic::Status| blocker_write_error(side_error(false, anyhow::Error::new(s)));
+        // An answer or cancel refused for any reason stays a refusal.
+        for status in [
+            tonic::Status::failed_precondition("blocker #1 is not open"),
+            tonic::Status::unimplemented("AnswerBlocker"),
+            tonic::Status::permission_denied("not yours"),
+        ] {
+            assert!(matches!(write(status), SideError::Refused(_)));
+        }
+        assert!(matches!(
+            write(tonic::Status::unavailable("reset")),
+            SideError::Transient(_)
+        ));
+    }
+
+    /// A local board refuses an answer to a blocker that is not there; the
+    /// refusal is a refusal, and the next poll still works.
+    #[tokio::test]
+    async fn a_refused_blocker_answer_leaves_polling_working() {
+        let (_dir, conn, opener, _) = board();
+        let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
+        let poll = || Request::Blockers {
+            id: 60,
+            scope: BlockerScope::Agent("Mateo".into()),
+        };
+        tx.send(poll()).unwrap();
+        tx.send(Request::AnswerBlocker {
+            id: 60,
+            req: proto::AnswerBlockerRequest {
+                id: 999,
+                answer: "yes".into(),
+                request_key: "k1".into(),
+            },
+        })
+        .unwrap();
+        tx.send(poll()).unwrap();
+        drop(tx);
+        serve(backend, opener, rx, events).await;
+        let mut next = || match replies.try_recv() {
+            Ok(Event::Data(data)) => data,
+            _ => panic!("expected data"),
+        };
+        assert!(
+            matches!(next(), Data::Blockers { id: 60, result: Ok(list) } if list.active_count == 0)
+        );
+        assert!(matches!(
+            next(),
+            Data::BlockerWritten { id: 60, ref key, result: Err(SideError::Refused(_)) } if key == "k1"
+        ));
+        assert!(matches!(
+            next(),
+            Data::Blockers {
+                id: 60,
+                result: Ok(_)
+            }
+        ));
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "no mail"
+        );
+    }
+
+    #[test]
     fn side_errors_are_classified_by_status_code_not_text() {
         let status = |s: tonic::Status| side_error(false, anyhow::Error::new(s));
         assert!(matches!(
@@ -1051,6 +1241,113 @@ mod tests {
                 })
                 .await
         );
+    }
+
+    /// A server whose blocker poll fails as a refusal or a missing capability
+    /// would: a failed precondition either way.
+    mod blocker_capability {
+        use super::*;
+        use std::convert::Infallible;
+        use std::task::{Context, Poll};
+        use tonic::{
+            Response, Status,
+            body::Body,
+            codegen::{BoxFuture, Service, http},
+        };
+
+        #[derive(Clone)]
+        struct Server {
+            offers: bool,
+        }
+
+        impl tonic::server::UnaryService<proto::Empty> for Server {
+            type Response = proto::ServerInfoResponse;
+            type Future = BoxFuture<Response<proto::ServerInfoResponse>, Status>;
+            fn call(&mut self, _: tonic::Request<proto::Empty>) -> Self::Future {
+                // A current server's answer, with or without blockers.v1.
+                let mut info = crate::protocol::Policy::default().info(false);
+                assert!(
+                    info.capabilities
+                        .iter()
+                        .any(|c| c == crate::backend::BLOCKERS)
+                );
+                if !self.offers {
+                    info.capabilities.retain(|c| c != crate::backend::BLOCKERS);
+                }
+                Box::pin(async move { Ok(Response::new(info)) })
+            }
+        }
+        impl tonic::server::NamedService for Server {
+            const NAME: &'static str = "bbs.v2.Bbs";
+        }
+        impl Service<http::Request<Body>> for Server {
+            type Response = http::Response<Body>;
+            type Error = Infallible;
+            type Future = BoxFuture<Self::Response, Self::Error>;
+            fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, req: http::Request<Body>) -> Self::Future {
+                let server = self.clone();
+                Box::pin(async move {
+                    Ok(match req.uri().path() {
+                        "/bbs.v2.Bbs/ServerInfo" => {
+                            tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+                                proto::ServerInfoResponse,
+                                proto::Empty,
+                            >::default())
+                            .unary(server, req)
+                            .await
+                        }
+                        "/bbs.v2.Bbs/ListBlockers" => {
+                            Status::failed_precondition("refused").into_http()
+                        }
+                        _ => Status::unimplemented("unexpected RPC").into_http(),
+                    })
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn a_failed_poll_is_an_old_server_only_when_it_lacks_the_capability() {
+            for offers in [true, false] {
+                let (_dir, _conn, mut opener, _) = board();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                opener.config.server = Some(listener.local_addr().unwrap().to_string());
+                let serving = tokio::spawn(
+                    tonic::transport::Server::builder()
+                        .add_service(Server { offers })
+                        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                            listener,
+                        )),
+                );
+                let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
+                    .await
+                    .unwrap();
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
+                tx.send(Request::Blockers {
+                    id: 61,
+                    scope: BlockerScope::Group("crew".into()),
+                })
+                .unwrap();
+                drop(tx);
+                serve(backend, opener, rx, events).await;
+                let Some(Event::Data(Data::Blockers { id: 61, result })) = replies.recv().await
+                else {
+                    panic!("a poll reply")
+                };
+                if offers {
+                    assert!(matches!(result, Err(SideError::Refused(_))), "{result:?}");
+                } else {
+                    assert!(
+                        matches!(result, Err(SideError::Unsupported(_))),
+                        "{result:?}"
+                    );
+                }
+                serving.abort();
+            }
+        }
     }
 
     mod reconnect_wire {

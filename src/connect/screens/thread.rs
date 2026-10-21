@@ -16,11 +16,12 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::connect::admin::GroupAdmin;
 use crate::connect::app::{Ctx, Screen, Transition, next_id};
+use crate::connect::blockers::{self, Blockers};
 use crate::connect::composer::Composer;
 use crate::connect::dialog::{Dialog, Outcome};
 use crate::connect::drafts::{Draft, DraftStore};
 use crate::connect::effort::Decision;
-use crate::connect::event::{Data, Request};
+use crate::connect::event::{BlockerScope, Data, Request};
 use crate::connect::keys::{Action, GroupOp};
 use crate::connect::theme;
 use crate::connect::timeline::{Entry, Kinds, Loaded, Show, Stream};
@@ -87,6 +88,8 @@ pub struct Thread {
     hidden_from: Option<i64>,
     /// The clock for activity freshness and animation; the app's, or a test's.
     now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
+    /// An agent's or group's blockers, and the F2 panel.
+    blockers: Option<Blockers>,
 }
 
 impl Thread {
@@ -125,6 +128,7 @@ impl Thread {
             side_draft: None,
             hidden_from: None,
             now: std::sync::Arc::new(Instant::now),
+            blockers: None,
         }
     }
 
@@ -148,6 +152,7 @@ impl Thread {
         thread.stream = Some(Stream::new(agent));
         thread.opening_until = Some(now() + INITIAL_LOAD_GRACE);
         thread.now = now;
+        thread.blockers = Some(Blockers::new(BlockerScope::Agent(agent.to_string())));
         thread
     }
 
@@ -355,6 +360,7 @@ impl Thread {
         };
         thread.group = Some((listed, GroupAdmin::default()));
         thread.draft_key = Some(format!("group:{}", group.to_ascii_lowercase()));
+        thread.blockers = Some(Blockers::new(BlockerScope::Group(group.to_string())));
         thread
     }
 
@@ -392,6 +398,12 @@ impl Thread {
         if let Some((query, hits)) = self.view.search_status() {
             text.push_str(&format!(" · /{query}: {hits} matches · n/N"));
         }
+        if let Some(count) = self.blockers.as_ref().and_then(Blockers::count) {
+            text.push_str(&format!(" · {} · F2", blocker_count(count)));
+        }
+        if let Some(notice) = &self.effort_notice {
+            text.push_str(&format!(" · {notice}"));
+        }
         Line::styled(text, theme::dim())
     }
 
@@ -415,6 +427,9 @@ impl Thread {
             if !searching {
                 mode.push_str(" · G follows");
             }
+        }
+        if let Some(count) = self.blockers.as_ref().and_then(Blockers::count) {
+            mode.push_str(&format!(" · {} · F2", blocker_count(count)));
         }
         let issue = draft_error
             .map(|e| ("draft error", e.to_string()))
@@ -588,6 +603,11 @@ pub(crate) fn running_pane(
     pane.extend(calls.into_iter().take(room));
     pane.push(Line::default());
     pane
+}
+
+/// "1 blocker", "3 blockers".
+fn blocker_count(count: u64) -> String {
+    format!("{count} blocker{}", if count == 1 { "" } else { "s" })
 }
 
 /// Clip feedback by display columns without splitting emoji or combining marks.
@@ -912,6 +932,7 @@ impl Screen for Thread {
 
     fn navigation_blocked(&self) -> bool {
         self.prompt.is_some()
+            || self.blockers.as_ref().is_some_and(Blockers::is_open)
             || self.effort_picker.is_some()
             || self.owner.as_ref().is_some_and(|o| o.form.is_some())
             || self
@@ -1046,6 +1067,9 @@ impl Screen for Thread {
     }
 
     fn reload(&mut self) -> Vec<Request> {
+        if let Some(blockers) = &mut self.blockers {
+            blockers.reload();
+        }
         // The stream starts over from its oldest record.
         if let Some(stream) = &mut self.stream {
             let cancel = stream.unwatch();
@@ -1073,6 +1097,7 @@ impl Screen for Thread {
         animation
             .into_iter()
             .chain(self.opening_until.filter(|deadline| *deadline > now))
+            .chain(self.blockers.as_ref().and_then(|b| b.next_frame(now)))
             .min()
     }
 
@@ -1118,6 +1143,10 @@ impl Screen for Thread {
     }
 
     fn on_data(&mut self, data: &Data) {
+        let now = (self.now)();
+        if let Some(blockers) = &mut self.blockers {
+            blockers.on_data(self.id, data, now);
+        }
         let side = self.compact_side();
         let thoughts = self.compact_hides_thoughts;
         if let Some(owner) = &mut self.owner {
@@ -1254,6 +1283,26 @@ impl Screen for Thread {
                         .map_or(Transition::Stay, Transition::Request),
                 });
             }
+            // The blocker panel holds every key it can while open; once its
+            // goodbye has shown, the key goes to the composer it returns to.
+            let now = (self.now)();
+            if let Some(panel) = &mut self.blockers
+                && panel.is_open()
+            {
+                if panel.settle(now) {
+                    self.composing = self.composer.is_some();
+                } else {
+                    return match panel.key(self.id, key, now) {
+                        blockers::Outcome::Stay => Some(Transition::Stay),
+                        blockers::Outcome::Close => {
+                            self.composing = self.composer.is_some();
+                            Some(Transition::Stay)
+                        }
+                        blockers::Outcome::Request(request) => Some(Transition::Request(request)),
+                        blockers::Outcome::Pass => None,
+                    };
+                }
+            }
             if key.code == KeyCode::Esc
                 && let Some(owner) = &mut self.owner
                 && owner.context_open
@@ -1303,6 +1352,19 @@ impl Screen for Thread {
                 });
             }
             self.effort_notice = None;
+            // F2 opens the blockers in the composer's place; a modal keeps it.
+            if key.code == KeyCode::F(2)
+                && !self.navigation_blocked()
+                && let Some(panel) = &mut self.blockers
+            {
+                if self.owner.as_ref().is_some_and(|o| o.side.is_some()) {
+                    self.effort_notice =
+                        Some("Leave the side conversation (Esc) before opening blockers.".into());
+                } else if let Err(why) = panel.open(now) {
+                    self.effort_notice = Some(why);
+                }
+                return Some(Transition::Stay);
+            }
             // Compact and verbose views, while writing or navigating.
             if self.agent.is_some()
                 && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1363,11 +1425,18 @@ impl Screen for Thread {
         transition
     }
 
-    /// The same order as `raw_key`: the effort picker (choices take no
-    /// text), the composer, a group dialog, then the search prompt.
+    /// The same order as `raw_key`: an owner form, the blocker panel, the
+    /// effort picker (choices take no text), the composer, a group dialog,
+    /// then the search prompt.
     fn paste(&mut self, text: &str) {
         if let Some(form) = self.owner.as_mut().and_then(|o| o.form.as_mut()) {
             form.paste(text);
+            return;
+        }
+        if let Some(panel) = &mut self.blockers
+            && panel.is_open()
+        {
+            panel.paste(text);
             return;
         }
         if self.effort_picker.is_some() {
@@ -1481,21 +1550,30 @@ impl Screen for Thread {
         }
     }
 
-    /// The owner's open conversation asks once a second for the agent's
-    /// side state; anyone else's, or the server without it, never does.
+    /// Agent and group threads ask once a second for their blockers. The
+    /// owner's open conversation also asks for the agent's side state;
+    /// anyone else's, or the server without it, never does.
     fn on_tick(&mut self, ctx: &Ctx) -> Vec<Request> {
+        let id = self.id;
+        let mut requests: Vec<Request> = self
+            .blockers
+            .as_mut()
+            .and_then(|b| b.poll(id))
+            .into_iter()
+            .collect();
         let Some(agent) = &self.agent else {
-            return Vec::new();
+            return requests;
         };
         if !ctx.efforts.owned_by(agent, &ctx.me) {
             self.owner = None;
-            return Vec::new();
+            return requests;
         }
-        self.owner
-            .get_or_insert_with(crate::connect::owner::Session::new)
-            .poll(agent)
-            .into_iter()
-            .collect()
+        requests.extend(
+            self.owner
+                .get_or_insert_with(crate::connect::owner::Session::new)
+                .poll(agent),
+        );
+        requests
     }
 }
 
@@ -1506,14 +1584,33 @@ impl Thread {
         } else {
             theme::screen_line(frame, area, self.title_line())
         };
+        let now = (self.now)();
+        if self.blockers.as_mut().is_some_and(|b| b.settle(now)) {
+            // The goodbye has shown: back to the composer and its draft.
+            self.composing = self.composer.is_some();
+        }
+        let panel = self.blockers.as_ref().is_some_and(Blockers::is_open);
         let max_lines = frame.area().height * u16::from(ctx.composer_max_height_percent) / 100;
-        let composer_height = self
-            .composer
-            .as_ref()
-            .map_or(0, |c| c.height(inner.width, max_lines));
+        // The blocker panel takes the composer's place, growing to two
+        // thirds of the height so the timeline stays in view.
+        let composer_height = if panel {
+            self.blockers
+                .as_ref()
+                .map_or(0, |b| b.height(inner.width))
+                .min(inner.height * 2 / 3)
+        } else {
+            self.composer
+                .as_ref()
+                .map_or(0, |c| c.height(inner.width, max_lines))
+        };
         // The owner's questions card or context panel, then the `/btw` panel,
-        // sit above the composer, together in a third of the height.
-        let side = self.side_lines(inner.width);
+        // sit above the composer, together in a third of the height; the
+        // blocker panel hides them until it closes.
+        let side = if panel {
+            Vec::new()
+        } else {
+            self.side_lines(inner.width)
+        };
         let room = inner.height / 3;
         let btw = self
             .owner
@@ -1563,7 +1660,11 @@ impl Thread {
                 self.btw_hidden(),
             );
         }
-        if let Some(c) = &mut self.composer {
+        if panel {
+            if let Some(blockers) = &mut self.blockers {
+                blockers.render(frame, composer, now);
+            }
+        } else if let Some(c) = &mut self.composer {
             c.render(frame, composer, self.composing);
         }
         if let Some(error) = &self.error {

@@ -32,6 +32,10 @@ const AGENT_KEYS: &[(&str, &str)] = &[
         "agent insert: move within the draft; ↑ on its top row navigates",
     ),
     (
+        "F2",
+        "agent/group: blockers; Alt-↑/↓ select, PgUp/PgDn text, Tab cancel, Esc back",
+    ),
+    (
         "Tab / Shift-Tab",
         "agents: increase / decrease effort; default opens picker",
     ),
