@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 /// The smallest terminal the layout is drawn for.
-pub const MIN_WIDTH: u16 = 80;
+pub const MIN_WIDTH: u16 = 60;
 pub const MIN_HEIGHT: u16 = 24;
 
 pub use crate::ui::theme::{Role, on_surface, style};

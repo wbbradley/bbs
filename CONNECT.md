@@ -59,7 +59,7 @@ several separate `bbs group` commands.
 - A splash screen with a large logo, shown on connect and skipped with any key.
   Its geometry is embedded from `assets/connect/logo.txt` and colored by the
   scheme's Logo role. Menu items have hot keys shown in brackets, `[A]gents`.
-- If the terminal is too small (below 80×24), show a centred
+- If the terminal is too small (below 60×24), show a centred
   "terminal too small" notice instead of a broken layout.
 
 ## Screens
