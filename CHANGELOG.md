@@ -6,10 +6,14 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
-## Unreleased
+## 0.12.0 - 2026-10-21
 
-Continuing side conversations require a server upgrade to database schema 20.
-Take a backup before upgrading; schema-19 binaries cannot open the upgraded database.
+Continuing side conversations add database schema 20 and the
+`side-conversations.v1` capability; config format becomes 4. Protocol v2 and
+Rust 1.89 are unchanged. Upgrade the server, runner and client to continue
+side conversations; older clients and runners keep one-question `/btw`. Back up
+before upgrading the server. Older binaries cannot open schema 20; restoring
+the pre-upgrade backup loses subsequent changes.
 
 ### Added
 
@@ -17,7 +21,6 @@ Take a backup before upgrading; schema-19 binaries cannot open the upgraded data
   `compact_hides_thoughts = true` under `[connect]` in
   `~/.config/bbs/config.toml`. Reasoning still shows by default. Config format
   becomes 4, since older clients reject the new setting.
-
 - `bbs connect` side questions continue as side conversations: after a
   `/btw` answer, Enter asks a follow-up in the same side copy, with the parent
   timeline out of view (new messages counted, not marked read) until Esc.
