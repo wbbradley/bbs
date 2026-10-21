@@ -1223,7 +1223,12 @@ fn bump_side_revision(conn: &Connection, agent_id: i64) -> Result<()> {
 
 /// Claim the open question for `generation`, once. Returns whether this call
 /// moved it from unclaimed to claimed.
-pub fn claim_side_request(conn: &Connection, agent_id: i64, generation: &str, now: &str) -> Result<bool> {
+pub fn claim_side_request(
+    conn: &Connection,
+    agent_id: i64,
+    generation: &str,
+    now: &str,
+) -> Result<bool> {
     let changed = conn.execute(
         "UPDATE side_requests SET generation = ?2, updated_at = ?3
          WHERE agent_id = ?1 AND status = 'open' AND generation IS NULL",
@@ -2207,16 +2212,34 @@ mod tests {
             [],
         )
         .unwrap();
-        post_activity(&conn, 1, "2026-10-17T09:00:00Z", &[("text".into(), "e".into())]).unwrap();
+        post_activity(
+            &conn,
+            1,
+            "2026-10-17T09:00:00Z",
+            &[("text".into(), "e".into())],
+        )
+        .unwrap();
         assert_eq!(last_sent("Mateo").as_deref(), Some("2026-10-17T10:00:00Z"));
         // Zed only posts activity.
-        post_activity(&conn, 2, "2026-10-17T11:00:00Z", &[("text".into(), "e".into())]).unwrap();
+        post_activity(
+            &conn,
+            2,
+            "2026-10-17T11:00:00Z",
+            &[("text".into(), "e".into())],
+        )
+        .unwrap();
         assert_eq!(last_sent("Zed").as_deref(), Some("2026-10-17T11:00:00Z"));
         // Trimming keeps the newest events, so the max survives it.
         let events = |n: i64| -> Vec<(String, String)> {
             (0..n).map(|i| ("text".into(), format!("e{i}"))).collect()
         };
-        post_activity(&conn, 2, "2026-10-17T12:00:00Z", &events(ACTIVITY_PER_AGENT)).unwrap();
+        post_activity(
+            &conn,
+            2,
+            "2026-10-17T12:00:00Z",
+            &events(ACTIVITY_PER_AGENT),
+        )
+        .unwrap();
         post_activity(&conn, 2, "2026-10-17T13:00:00Z", &events(5)).unwrap();
         assert_eq!(last_sent("Zed").as_deref(), Some("2026-10-17T13:00:00Z"));
     }
@@ -2440,7 +2463,10 @@ mod tests {
         assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
         for (agent, id) in [(1, 7), (2, 9)] {
             let row = latest_side_request(&conn, agent).unwrap().unwrap();
-            assert_eq!((row.id, row.conversation, row.follows, row.ended), (id, id, None, false));
+            assert_eq!(
+                (row.id, row.conversation, row.follows, row.ended),
+                (id, id, None, false)
+            );
         }
         let state = side_state(&conn, 1).unwrap().unwrap();
         assert_eq!((state.supported, state.followups), (Some(true), None));
@@ -2921,8 +2947,8 @@ mod tests {
         // Controls straddle the ordinary message in time: one older (pins
         // archived history's oldest-first limit), one newer (pins the feed's
         // newest-first limit). A post-LIMIT filter would fail either window.
-        let cancel = insert_message(&conn, &will, None, "cancel", "2026-10-08T23:59:58.000000Z")
-            .unwrap();
+        let cancel =
+            insert_message(&conn, &will, None, "cancel", "2026-10-08T23:59:58.000000Z").unwrap();
         set_message_control(&conn, cancel, "cancel").unwrap();
         insert_delivery(&conn, cancel, Kind::Agent, bram.id).unwrap();
         let effort = insert_message(
@@ -2981,9 +3007,15 @@ mod tests {
                 ("set-effort".to_string(), Some("set-effort".to_string())),
             ]
         );
-        assert!(effort_control_body(&conn, bram.id, ordinary).unwrap().is_none());
+        assert!(
+            effort_control_body(&conn, bram.id, ordinary)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
-            effort_control_body(&conn, bram.id, effort).unwrap().as_deref(),
+            effort_control_body(&conn, bram.id, effort)
+                .unwrap()
+                .as_deref(),
             Some("set-effort")
         );
         // Archived history excludes controls too, oldest-first and limited.

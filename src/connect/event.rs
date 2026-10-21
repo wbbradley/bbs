@@ -1785,7 +1785,12 @@ mod tests {
             .unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(Request::CancelSide { id: 52, side, end: false }).unwrap();
+        tx.send(Request::CancelSide {
+            id: 52,
+            side,
+            end: false,
+        })
+        .unwrap();
         tx.send(Request::CancelSide {
             end: false,
             id: 53,

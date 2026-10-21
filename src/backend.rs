@@ -402,7 +402,10 @@ impl Backend {
 
     /// Report context usage and side capability. A server needs
     /// `agent-interactions.v1`.
-    pub async fn report_context(&mut self, req: proto::ReportContextRequest) -> Result<proto::Empty> {
+    pub async fn report_context(
+        &mut self,
+        req: proto::ReportContextRequest,
+    ) -> Result<proto::Empty> {
         match self {
             Backend::Local(l) => service::report_context(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => rpc!(r, report_context, req, &[AGENT_INTERACTIONS])
@@ -457,9 +460,8 @@ impl Backend {
     ) -> Result<proto::SideReportResponse> {
         match self {
             Backend::Local(l) => service::side_report(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => {
-                rpc!(r, side_report, req, &[AGENT_INTERACTIONS]).map_err(|e| missing_rpc(e, AGENT_INTERACTIONS))
-            }
+            Backend::Remote(r) => rpc!(r, side_report, req, &[AGENT_INTERACTIONS])
+                .map_err(|e| missing_rpc(e, AGENT_INTERACTIONS)),
         }
     }
 
@@ -467,7 +469,11 @@ impl Backend {
     /// `side-questions.v1`, and `side-conversations.v1` for a follow-up, so
     /// an older server refuses one rather than asking it fresh.
     pub async fn ask_side(&mut self, req: proto::AskSideRequest) -> Result<proto::AskSideResponse> {
-        let cap = if req.follows.is_some() { SIDE_CONVERSATIONS } else { SIDE_QUESTIONS };
+        let cap = if req.follows.is_some() {
+            SIDE_CONVERSATIONS
+        } else {
+            SIDE_QUESTIONS
+        };
         match self {
             Backend::Local(l) => service::ask_side(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => rpc!(r, ask_side, req, &[cap]).map_err(|e| missing_rpc(e, cap)),
@@ -477,16 +483,25 @@ impl Backend {
     /// Cancel a side question by exact id. A server needs `side-questions.v1`,
     /// and `side-conversations.v1` to end a conversation.
     pub async fn cancel_side(&mut self, req: proto::CancelSideRequest) -> Result<proto::Empty> {
-        let cap = if req.end { SIDE_CONVERSATIONS } else { SIDE_QUESTIONS };
+        let cap = if req.end {
+            SIDE_CONVERSATIONS
+        } else {
+            SIDE_QUESTIONS
+        };
         match self {
             Backend::Local(l) => service::cancel_side(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, cancel_side, req, &[cap]).map_err(|e| missing_rpc(e, cap)),
+            Backend::Remote(r) => {
+                rpc!(r, cancel_side, req, &[cap]).map_err(|e| missing_rpc(e, cap))
+            }
         }
     }
 
     /// Claim the calling agent's open side question. A server needs
     /// `side-questions.v1`.
-    pub async fn claim_side(&mut self, req: proto::ClaimSideRequest) -> Result<proto::ClaimSideResponse> {
+    pub async fn claim_side(
+        &mut self,
+        req: proto::ClaimSideRequest,
+    ) -> Result<proto::ClaimSideResponse> {
         match self {
             Backend::Local(l) => service::claim_side(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => rpc!(r, claim_side, req, &[SIDE_QUESTIONS])
@@ -505,7 +520,9 @@ impl Backend {
         };
         match self {
             Backend::Local(l) => service::report_side(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, report_side, req, &[cap]).map_err(|e| missing_rpc(e, cap)),
+            Backend::Remote(r) => {
+                rpc!(r, report_side, req, &[cap]).map_err(|e| missing_rpc(e, cap))
+            }
         }
     }
 
@@ -517,9 +534,8 @@ impl Backend {
     ) -> Result<proto::ReportEffortResponse> {
         match self {
             Backend::Local(l) => service::report_effort(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => {
-                rpc!(r, report_effort, req, &[AGENT_EFFORT]).map_err(|e| missing_rpc(e, AGENT_EFFORT))
-            }
+            Backend::Remote(r) => rpc!(r, report_effort, req, &[AGENT_EFFORT])
+                .map_err(|e| missing_rpc(e, AGENT_EFFORT)),
         }
     }
 
@@ -1093,7 +1109,10 @@ mod tests {
             let cancel = proto::CancelSideRequest { id: 7, end };
             assert!(backend.cancel_side(cancel).await.is_err());
         }
-        for status in [proto::SideStatus::SideCompleted, proto::SideStatus::SideEnded] {
+        for status in [
+            proto::SideStatus::SideCompleted,
+            proto::SideStatus::SideEnded,
+        ] {
             let report = proto::ReportSideRequest {
                 generation: "run-1".into(),
                 id: 7,

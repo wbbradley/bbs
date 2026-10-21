@@ -56,8 +56,7 @@ async fn main() -> ExitCode {
     // Handled before logging, which creates ~/bbs.log, so they have no side effects.
     // Bare `bbs` outside a terminal behaves as it did before defaulting to
     // connect: usage on stderr, exit 2, no log file or database touched.
-    if cli.command.is_none()
-        && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
+    if cli.command.is_none() && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
     {
         use clap::CommandFactory;
         cli::Cli::command()

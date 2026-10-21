@@ -864,16 +864,26 @@ impl Bbs for Server {
         &self,
         req: Request<proto::BeginSideSessionRequest>,
     ) -> Result<Response<proto::BeginSideSessionResponse>, Status> {
-        self.unary("begin_side_session", req, Effect::Query, service::begin_side_session)
-            .await
+        self.unary(
+            "begin_side_session",
+            req,
+            Effect::Query,
+            service::begin_side_session,
+        )
+        .await
     }
 
     async fn report_context(
         &self,
         req: Request<proto::ReportContextRequest>,
     ) -> Result<Response<proto::Empty>, Status> {
-        self.unary("report_context", req, Effect::Query, service::report_context)
-            .await
+        self.unary(
+            "report_context",
+            req,
+            Effect::Query,
+            service::report_context,
+        )
+        .await
     }
 
     async fn request_owner_input(

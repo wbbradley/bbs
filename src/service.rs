@@ -993,8 +993,7 @@ fn answer_proto(a: InputAnswerJson) -> proto::InputAnswer {
 
 fn usage_proto(usage: Option<String>) -> Result<Option<proto::ContextUsage>> {
     let Some(json) = usage else { return Ok(None) };
-    let parsed: UsageJson =
-        serde_json::from_str(&json).context("invalid stored context usage")?;
+    let parsed: UsageJson = serde_json::from_str(&json).context("invalid stored context usage")?;
     let source = match parsed.source.as_str() {
         "current" => proto::context_usage::Source::CurrentContext,
         _ => proto::context_usage::Source::LastModelRequest,
@@ -1064,7 +1063,11 @@ pub fn report_context(
                 })?)
             }
         };
-        if req.side_reason.as_deref().is_some_and(|r| r.len() > 4 * 1024) {
+        if req
+            .side_reason
+            .as_deref()
+            .is_some_and(|r| r.len() > 4 * 1024)
+        {
             bail!("side reason exceeds 4 KiB");
         }
         if req.preserve_usage && req.usage.is_some() {
@@ -1142,7 +1145,10 @@ pub fn request_owner_input(
                 if o.label.as_deref().is_some_and(|l| l.len() > MAX_LABEL) {
                     bail!("option label exceeds {MAX_LABEL} bytes");
                 }
-                if o.description.as_deref().is_some_and(|d| d.len() > MAX_DESCRIPTION) {
+                if o.description
+                    .as_deref()
+                    .is_some_and(|d| d.len() > MAX_DESCRIPTION)
+                {
                     bail!("option description exceeds {} KiB", MAX_DESCRIPTION / 1024);
                 }
             }
@@ -1270,9 +1276,12 @@ pub fn answer_owner_input(
                         bail!("required question unanswered: {}", q.id);
                     }
                 }
-                ("answered", Some(serde_json::to_string(
-                    &req.answers.iter().map(answer_json).collect::<Vec<_>>(),
-                )?))
+                (
+                    "answered",
+                    Some(serde_json::to_string(
+                        &req.answers.iter().map(answer_json).collect::<Vec<_>>(),
+                    )?),
+                )
             }
             proto::AnswerAction::Decline | proto::AnswerAction::Cancel => {
                 if !req.answers.is_empty() {
@@ -1565,9 +1574,7 @@ pub fn report_side(
         let Some(row) = db::side_request(ctx.conn, req.id)? else {
             bail!("no such side question");
         };
-        if row.agent_id != me.id
-            || row.generation.as_deref() != Some(req.generation.as_str())
-        {
+        if row.agent_id != me.id || row.generation.as_deref() != Some(req.generation.as_str()) {
             bail!("not your claimed side question");
         }
         if row.status != "open" {
@@ -1709,8 +1716,7 @@ pub fn auto_reply(
         }
         let owner = db::agent_owner_id(ctx.conn, me.id)?
             .ok_or_else(|| anyhow!("{} has no registered owner", me.name))?;
-        if let Some((message_id, body, recipient)) =
-            db::find_auto_reply(ctx.conn, me.id, &req.key)?
+        if let Some((message_id, body, recipient)) = db::find_auto_reply(ctx.conn, me.id, &req.key)?
         {
             if body != req.body {
                 bail!("delivery key reused with a different body");
@@ -2075,7 +2081,10 @@ pub fn report_effort(
 fn validate_effort(ctx: &Ctx, agent: i64, report: &proto::EffortReport) -> Result<()> {
     let state = report.state.as_ref().context("report without state")?;
     if state.choices.len() > MAX_EFFORT_CHOICES {
-        bail!("{} choices; the limit is {MAX_EFFORT_CHOICES}", state.choices.len());
+        bail!(
+            "{} choices; the limit is {MAX_EFFORT_CHOICES}",
+            state.choices.len()
+        );
     }
     let mut seen = HashSet::new();
     for choice in &state.choices {
@@ -2105,8 +2114,8 @@ fn validate_effort(ctx: &Ctx, agent: i64, report: &proto::EffortReport) -> Resul
         if pending.value.len() > MAX_EFFORT_VALUE {
             bail!("requested value is too long");
         }
-        let body = db::effort_control_body(ctx.conn, agent, pending.request_id)?
-            .expect("checked above");
+        let body =
+            db::effort_control_body(ctx.conn, agent, pending.request_id)?.expect("checked above");
         if pending.value != body {
             bail!(
                 "pending request {} value {:?} does not match the control's {:?}",
@@ -2128,7 +2137,10 @@ fn validate_effort(ctx: &Ctx, agent: i64, report: &proto::EffortReport) -> Resul
     if let (Some(pending), Some(answered)) = (&report.pending, &report.answered)
         && pending.request_id == answered.request_id
     {
-        bail!("request {} is both pending and answered", pending.request_id);
+        bail!(
+            "request {} is both pending and answered",
+            pending.request_id
+        );
     }
     Ok(())
 }
@@ -2173,9 +2185,8 @@ fn effort_from_json(stored: &str) -> Option<proto::EffortReport> {
         }
         Some(proto::EffortOutcome {
             request_id: o.get("request_id")?.as_i64()?,
-            result: proto::effort_outcome::Result::from_str_name(
-                o.get("result")?.as_str()?,
-            )? as i32,
+            result: proto::effort_outcome::Result::from_str_name(o.get("result")?.as_str()?)?
+                as i32,
             detail: o.get("detail")?.as_str()?.to_string(),
         })
     });
@@ -2188,13 +2199,9 @@ fn effort_from_json(stored: &str) -> Option<proto::EffortReport> {
                 .get("current")
                 .and_then(|c| c.as_str().map(str::to_string)),
         }),
-        pending: v.get("pending").and_then(|p| {
-            if p.is_null() {
-                None
-            } else {
-                request(p)
-            }
-        }),
+        pending: v
+            .get("pending")
+            .and_then(|p| if p.is_null() { None } else { request(p) }),
         answered: outcome,
     })
 }
@@ -2828,28 +2835,30 @@ mod tests {
         let mateo = agents[0].clone();
         let zed = agents[1].clone();
         let report = |pending: Option<proto::EffortRequest>,
-                      answered: Option<proto::EffortOutcome>| proto::ReportEffortRequest {
-            report: Some(proto::EffortReport {
-                state: Some(proto::EffortState {
-                    supported: true,
-                    reason: String::new(),
-                    choices: vec![
-                        proto::EffortChoice {
-                            value: "low".into(),
-                            label: "Low".into(),
-                            rank: Some(1),
-                        },
-                        proto::EffortChoice {
-                            value: "high".into(),
-                            label: "High".into(),
-                            rank: Some(2),
-                        },
-                    ],
-                    current: Some("low".into()),
+                      answered: Option<proto::EffortOutcome>| {
+            proto::ReportEffortRequest {
+                report: Some(proto::EffortReport {
+                    state: Some(proto::EffortState {
+                        supported: true,
+                        reason: String::new(),
+                        choices: vec![
+                            proto::EffortChoice {
+                                value: "low".into(),
+                                label: "Low".into(),
+                                rank: Some(1),
+                            },
+                            proto::EffortChoice {
+                                value: "high".into(),
+                                label: "High".into(),
+                                rank: Some(2),
+                            },
+                        ],
+                        current: Some("low".into()),
+                    }),
+                    pending,
+                    answered,
                 }),
-                pending,
-                answered,
-            }),
+            }
         };
         // Humans cannot report.
         assert!(report_effort(&mut conn, &will, report(None, None)).is_err());
@@ -2917,7 +2926,10 @@ mod tests {
             None,
         );
         let err = report_effort(&mut conn, &mateo, bad).unwrap_err();
-        assert!(format!("{err:#}").contains("not a set-effort control"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("not a set-effort control"),
+            "{err:#}"
+        );
         // A real control's id validates, and the send returns it.
         let sent = send(
             &mut conn,
@@ -2955,7 +2967,10 @@ mod tests {
             ),
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains("not a set-effort control"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("not a set-effort control"),
+            "{err:#}"
+        );
         // The control reads back with its kind, and retirement clears reports.
         let mail = read(&mut conn, &mateo, proto::ReadRequest::default())
             .unwrap()
@@ -2988,10 +3003,7 @@ mod tests {
             .unwrap();
         let answered = e.answered.unwrap();
         assert_eq!(answered.request_id, id);
-        assert_eq!(
-            answered.result(),
-            proto::effort_outcome::Result::Applied
-        );
+        assert_eq!(answered.result(), proto::effort_outcome::Result::Applied);
         // A request cannot be pending and answered in one report.
         let both = report(
             Some(proto::EffortRequest {
@@ -3005,7 +3017,10 @@ mod tests {
             }),
         );
         let err = report_effort(&mut conn, &mateo, both).unwrap_err();
-        assert!(format!("{err:#}").contains("both pending and answered"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("both pending and answered"),
+            "{err:#}"
+        );
         // Pending values must match the control's body exactly.
         let mismatched = report(
             Some(proto::EffortRequest {
@@ -3289,9 +3304,7 @@ mod tests {
         // preserved, exactly as sent. Zero-byte bodies stay invalid.
         let spaces = reply(&mut conn, "part-1", "  \n ").unwrap();
         let mail = inbox(&mut conn, &will);
-        assert!(mail
-            .iter()
-            .any(|m| m.id == spaces.id && m.body == "  \n "));
+        assert!(mail.iter().any(|m| m.id == spaces.id && m.body == "  \n "));
 
         // The destination is the registered owner, resolved server-side.
         let first = reply(&mut conn, "turn-1", "done").unwrap();
@@ -3300,7 +3313,11 @@ mod tests {
         let auto: Vec<_> = mail.iter().filter(|m| m.auto_reply == Some(true)).collect();
         assert_eq!(auto.len(), 1);
         assert_eq!(
-            (auto[0].id, auto[0].from_name.as_str(), auto[0].body.as_str()),
+            (
+                auto[0].id,
+                auto[0].from_name.as_str(),
+                auto[0].body.as_str()
+            ),
             (first.id, "Mateo", "done")
         );
         assert_eq!(auto[0].to_name.as_deref(), Some("will"));
@@ -3315,9 +3332,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(inbox(&mut conn, &will)
-            .iter()
-            .any(|m| m.id == manual.id.unwrap() && m.auto_reply.is_none()));
+        assert!(
+            inbox(&mut conn, &will)
+                .iter()
+                .any(|m| m.id == manual.id.unwrap() && m.auto_reply.is_none())
+        );
         // The feed carries the provenance too.
         let feed = feed(
             &mut conn,
@@ -3328,10 +3347,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(feed
-            .messages
-            .iter()
-            .any(|m| m.id == first.id && m.auto_reply == Some(true)));
+        assert!(
+            feed.messages
+                .iter()
+                .any(|m| m.id == first.id && m.auto_reply == Some(true))
+        );
 
         // The normal send effects happened exactly once. Make the pair's
         // timestamp observably old so a replay that wrongly touches recency
@@ -3435,13 +3455,7 @@ mod tests {
         )
         .unwrap();
         assert!(!third.replayed);
-        ensure_human(
-            &mut conn,
-            proto::EnsureHumanRequest {
-                name: "ada".into(),
-            },
-        )
-        .unwrap();
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
         conn.execute(
             "UPDATE agent_owners SET human_id = (SELECT id FROM humans WHERE name = 'ada')
              WHERE agent_id = (SELECT id FROM agents WHERE name = 'Mateo' AND retired_at IS NULL)",
@@ -3558,19 +3572,21 @@ mod tests {
                 source: 1,
             },
         ] {
-            assert!(report_context(
-                &mut conn,
-                &mateo,
-                proto::ReportContextRequest {
-                    side_followups: None,
-                    generation: "run-1".into(),
-                    usage: Some(usage),
-                    side_supported: None,
-                    side_reason: None,
-                    preserve_usage: false,
-                },
-            )
-            .is_err());
+            assert!(
+                report_context(
+                    &mut conn,
+                    &mateo,
+                    proto::ReportContextRequest {
+                        side_followups: None,
+                        generation: "run-1".into(),
+                        usage: Some(usage),
+                        side_supported: None,
+                        side_reason: None,
+                        preserve_usage: false,
+                    },
+                )
+                .is_err()
+            );
         }
         report_context(
             &mut conn,
@@ -3612,13 +3628,7 @@ mod tests {
 
         // Bounds.
         assert!(ask(&mut conn, "run-1", 1, vec![]).is_err());
-        assert!(ask(
-            &mut conn,
-            "run-1",
-            1,
-            vec![question("a", true); 4].to_vec()
-        )
-        .is_err());
+        assert!(ask(&mut conn, "run-1", 1, vec![question("a", true); 4].to_vec()).is_err());
         let mut many = question("a", true);
         many.options = (0..17)
             .map(|n| proto::InputOption {
@@ -3691,13 +3701,7 @@ mod tests {
         assert!(err.contains("positive"), "{err}");
 
         // Owner scoping: another human cannot answer or read.
-        ensure_human(
-            &mut conn,
-            proto::EnsureHumanRequest {
-                name: "ada".into(),
-            },
-        )
-        .unwrap();
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
         let ada = Caller {
             human: Some("ada".into()),
             ..Default::default()
@@ -3740,16 +3744,20 @@ mod tests {
             .unwrap_err()
             .to_string()
         };
-        assert!(bad(vec![proto::InputAnswer {
-            question_id: "zzz".into(),
-            value: "a".into(),
-        }])
-        .contains("unknown question"));
-        assert!(bad(vec![proto::InputAnswer {
-            question_id: "a".into(),
-            value: "off-script".into(),
-        }])
-        .contains("not an offered option"));
+        assert!(
+            bad(vec![proto::InputAnswer {
+                question_id: "zzz".into(),
+                value: "a".into(),
+            }])
+            .contains("unknown question")
+        );
+        assert!(
+            bad(vec![proto::InputAnswer {
+                question_id: "a".into(),
+                value: "off-script".into(),
+            }])
+            .contains("not an offered option")
+        );
         assert!(bad(vec![]).contains("required question unanswered"));
 
         // Owner submits; an optional question may be skipped.
@@ -3779,7 +3787,10 @@ mod tests {
         assert_eq!(input.status(), proto::InputStatus::Answered);
         assert_eq!(input.answers.len(), 1);
         assert_eq!(input.answers[0].value, "b");
-        assert_eq!(input.message.as_deref(), Some("Deploy the release candidate?"));
+        assert_eq!(
+            input.message.as_deref(),
+            Some("Deploy the release candidate?")
+        );
 
         // The driver closes its own next request; a fresh generation resets.
         let second = ask(&mut conn, "run-1", 2, vec![question("c", true)]).unwrap();
@@ -3894,11 +3905,15 @@ mod tests {
         );
         // A new request prunes the terminal one: latest-only storage.
         let rows_before: i64 = conn
-            .query_row("SELECT count(*) FROM owner_input_requests", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM owner_input_requests", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         ask(&mut conn, "run-3", 4, vec![question("q", true)]).unwrap();
         let rows_after: i64 = conn
-            .query_row("SELECT count(*) FROM owner_input_requests", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM owner_input_requests", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(rows_after, rows_before);
 
@@ -4016,7 +4031,6 @@ mod tests {
         assert_eq!(mail_counts(&mut conn), before);
     }
 
-
     #[test]
     fn side_conversations_follow_end_and_derive_ended() {
         let (mut conn, will, [mateo, zed, _lu]) = board();
@@ -4056,7 +4070,9 @@ mod tests {
             let revisions: Vec<String> = conn
                 .prepare("SELECT agent_id, revision FROM side_state ORDER BY agent_id")
                 .unwrap()
-                .query_map([], |r| Ok(format!("{}:{}", r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                .query_map([], |r| {
+                    Ok(format!("{}:{}", r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
                 .unwrap()
                 .collect::<Result<_, _>>()
                 .unwrap();
@@ -4117,7 +4133,8 @@ mod tests {
             .map_err(|e| e.to_string())
         };
         let cancel = |conn: &mut Connection, id: i64, end: bool| {
-            cancel_side(conn, &will, proto::CancelSideRequest { id, end }).map_err(|e| e.to_string())
+            cancel_side(conn, &will, proto::CancelSideRequest { id, end })
+                .map_err(|e| e.to_string())
         };
         let view = |conn: &mut Connection| {
             side_report(
@@ -4156,7 +4173,10 @@ mod tests {
         support(&mut conn, "run-1", None);
         let first = ask(&mut conn, "q1", None).unwrap();
         let row = latest(&mut conn);
-        assert_eq!((row.conversation, row.follows, row.ended), (Some(first), None, false));
+        assert_eq!(
+            (row.conversation, row.follows, row.ended),
+            (Some(first), None, false)
+        );
         assert_eq!(claim(&mut conn, "run-1").conversation, Some(first));
         report(&mut conn, "run-1", first, proto::SideStatus::SideCompleted).unwrap();
         let err = ask(&mut conn, "q2", Some(first)).unwrap_err();
@@ -4168,7 +4188,11 @@ mod tests {
         assert_eq!(view(&mut conn).side_followups, Some(true));
 
         // Only the latest question continues; a stale or unknown id is refused.
-        assert!(ask(&mut conn, "q2", Some(first + 100)).unwrap_err().contains(ended));
+        assert!(
+            ask(&mut conn, "q2", Some(first + 100))
+                .unwrap_err()
+                .contains(ended)
+        );
         let second = ask(&mut conn, "q2", Some(first)).unwrap();
         let row = latest(&mut conn);
         assert_eq!(
@@ -4177,18 +4201,33 @@ mod tests {
         );
         // A second follow-up of the same id is refused while the first is
         // open, and once it is answered the old id is no longer the latest.
-        assert!(ask(&mut conn, "q2b", Some(first)).unwrap_err().contains("already open"));
+        assert!(
+            ask(&mut conn, "q2b", Some(first))
+                .unwrap_err()
+                .contains("already open")
+        );
         assert_eq!(claim(&mut conn, "run-1").follows, Some(first));
         report(&mut conn, "run-1", second, proto::SideStatus::SideCompleted).unwrap();
-        assert!(ask(&mut conn, "q2b", Some(first)).unwrap_err().contains(ended));
+        assert!(
+            ask(&mut conn, "q2b", Some(first))
+                .unwrap_err()
+                .contains(ended)
+        );
 
         // ENDED for an open follow-up the runner cannot continue: terminal.
         let third = ask(&mut conn, "q3", Some(second)).unwrap();
         claim(&mut conn, "run-1");
         report(&mut conn, "run-1", third, proto::SideStatus::SideEnded).unwrap();
         let row = latest(&mut conn);
-        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideEnded, true));
-        assert!(ask(&mut conn, "q4", Some(third)).unwrap_err().contains(ended));
+        assert_eq!(
+            (row.status(), row.ended),
+            (proto::SideStatus::SideEnded, true)
+        );
+        assert!(
+            ask(&mut conn, "q4", Some(third))
+                .unwrap_err()
+                .contains(ended)
+        );
         // An open first question cannot be reported ENDED.
         let fresh = ask(&mut conn, "fresh", None).unwrap();
         assert_eq!(latest(&mut conn).conversation, Some(fresh));
@@ -4204,13 +4243,23 @@ mod tests {
         report(&mut conn, "run-1", fresh, proto::SideStatus::SideEnded).unwrap();
         assert_eq!(snapshot(&mut conn), flagged);
         let row = latest(&mut conn);
-        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCompleted, true));
-        assert!(ask(&mut conn, "more", Some(fresh)).unwrap_err().contains(ended));
+        assert_eq!(
+            (row.status(), row.ended),
+            (proto::SideStatus::SideCompleted, true)
+        );
+        assert!(
+            ask(&mut conn, "more", Some(fresh))
+                .unwrap_err()
+                .contains(ended)
+        );
         let one = answered(&mut conn, "run-1", "one", None);
         let two = answered(&mut conn, "run-1", "two", Some(one));
         report(&mut conn, "run-1", two, proto::SideStatus::SideEnded).unwrap();
         let row = latest(&mut conn);
-        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCompleted, true));
+        assert_eq!(
+            (row.status(), row.ended),
+            (proto::SideStatus::SideCompleted, true)
+        );
         // A question a newer one replaced (and pruned) is a no-op too: the
         // current row, its status, answer and the revision stay.
         answered(&mut conn, "run-1", "replacing", None);
@@ -4259,7 +4308,11 @@ mod tests {
         .unwrap();
         assert!(latest(&mut conn).ended);
         assert_eq!(view(&mut conn).revision, revision);
-        assert!(ask(&mut conn, "late", Some(newer)).unwrap_err().contains(ended));
+        assert!(
+            ask(&mut conn, "late", Some(newer))
+                .unwrap_err()
+                .contains(ended)
+        );
 
         // A restart ends what the old generation answered, even once the new
         // one says it continues conversations; it starts without followups.
@@ -4270,22 +4323,44 @@ mod tests {
         assert_eq!(view(&mut conn).side_followups, None);
         support(&mut conn, "run-2", Some(true));
         assert!(latest(&mut conn).ended);
-        assert!(ask(&mut conn, "after", Some(before_restart)).unwrap_err().contains(ended));
+        assert!(
+            ask(&mut conn, "after", Some(before_restart))
+                .unwrap_err()
+                .contains(ended)
+        );
         // The stale generation cannot report on it.
-        assert!(report(&mut conn, "run-1", before_restart, proto::SideStatus::SideEnded).is_err());
+        assert!(
+            report(
+                &mut conn,
+                "run-1",
+                before_restart,
+                proto::SideStatus::SideEnded
+            )
+            .is_err()
+        );
 
         // The owner ends a terminal conversation: status kept, idempotent.
         let done = answered(&mut conn, "run-2", "done", None);
         cancel(&mut conn, done, true).unwrap();
         cancel(&mut conn, done, true).unwrap();
         let row = latest(&mut conn);
-        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCompleted, true));
-        assert!(ask(&mut conn, "next", Some(done)).unwrap_err().contains(ended));
+        assert_eq!(
+            (row.status(), row.ended),
+            (proto::SideStatus::SideCompleted, true)
+        );
+        assert!(
+            ask(&mut conn, "next", Some(done))
+                .unwrap_err()
+                .contains(ended)
+        );
         // Ending an open question also cancels it; only the latest can be ended.
         let open = ask(&mut conn, "open", None).unwrap();
         cancel(&mut conn, open, true).unwrap();
         let row = latest(&mut conn);
-        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCancelled, true));
+        assert_eq!(
+            (row.status(), row.ended),
+            (proto::SideStatus::SideCancelled, true)
+        );
         let after = answered(&mut conn, "run-2", "after", None);
         assert!(cancel(&mut conn, open, true).is_err());
         // Cancelling one turn keeps the conversation going.
@@ -4293,7 +4368,10 @@ mod tests {
         claim(&mut conn, "run-2");
         cancel(&mut conn, turn, false).unwrap();
         let row = latest(&mut conn);
-        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCancelled, false));
+        assert_eq!(
+            (row.status(), row.ended),
+            (proto::SideStatus::SideCancelled, false)
+        );
         let again = ask(&mut conn, "again", Some(turn)).unwrap();
         assert_eq!(latest(&mut conn).conversation, Some(after));
         cancel(&mut conn, again, true).unwrap();
@@ -4301,7 +4379,11 @@ mod tests {
         let unclaimed = ask(&mut conn, "unclaimed", None).unwrap();
         cancel(&mut conn, unclaimed, false).unwrap();
         assert!(latest(&mut conn).ended);
-        assert!(ask(&mut conn, "never", Some(unclaimed)).unwrap_err().contains(ended));
+        assert!(
+            ask(&mut conn, "never", Some(unclaimed))
+                .unwrap_err()
+                .contains(ended)
+        );
 
         // None of it is mail.
         assert_eq!(mail(&mut conn), before);
@@ -4329,7 +4411,7 @@ mod tests {
                     usage: None,
                     side_supported: Some(ok),
                     side_reason: None,
-                preserve_usage: false,
+                    preserve_usage: false,
                 },
             )
         };
@@ -4411,9 +4493,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("OPEN, COMPLETED, FAILED or ENDED"), "{err}");
-        let err = report(&mut conn, "run-1", proto::SideStatus::SideOpen, &"x".repeat(64 * 1024 + 1))
-            .unwrap_err()
-            .to_string();
+        let err = report(
+            &mut conn,
+            "run-1",
+            proto::SideStatus::SideOpen,
+            &"x".repeat(64 * 1024 + 1),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("64 KiB"), "{err}");
         report(&mut conn, "run-1", proto::SideStatus::SideOpen, "looking\n").unwrap();
         let view = side_report(
@@ -4430,14 +4517,20 @@ mod tests {
         cancel_side(
             &mut conn,
             &will,
-            proto::CancelSideRequest { id: first.id, end: false },
+            proto::CancelSideRequest {
+                id: first.id,
+                end: false,
+            },
         )
         .unwrap();
         // Cancel is idempotent for the exact id.
         cancel_side(
             &mut conn,
             &will,
-            proto::CancelSideRequest { id: first.id, end: false },
+            proto::CancelSideRequest {
+                id: first.id,
+                end: false,
+            },
         )
         .unwrap();
         let err = report(&mut conn, "run-1", proto::SideStatus::SideCompleted, "done")
@@ -4470,13 +4563,7 @@ mod tests {
         assert!(err.contains("not your claimed"), "{err}");
         // Ownership precedes cancel idempotence: a cancelled id from another
         // human's agent still rejects.
-        ensure_human(
-            &mut conn,
-            proto::EnsureHumanRequest {
-                name: "ada".into(),
-            },
-        )
-        .unwrap();
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
         let ada = Caller {
             human: Some("ada".into()),
             ..Default::default()
@@ -4484,7 +4571,10 @@ mod tests {
         let err = cancel_side(
             &mut conn,
             &ada,
-            proto::CancelSideRequest { id: first.id, end: false },
+            proto::CancelSideRequest {
+                id: first.id,
+                end: false,
+            },
         )
         .unwrap_err()
         .to_string();
@@ -4507,7 +4597,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(view.side.unwrap().status(), proto::SideStatus::SideInterrupted);
+        assert_eq!(
+            view.side.unwrap().status(),
+            proto::SideStatus::SideInterrupted
+        );
         assert_eq!(view.side_supported, None);
         let err = ask(&mut conn, "again").unwrap_err().to_string();
         assert!(err.contains("does not answer side questions"), "{err}");
@@ -4614,9 +4707,11 @@ mod tests {
         )
         .unwrap();
         let rows: i64 = conn
-            .query_row("SELECT count(*) FROM side_requests WHERE agent_id = 1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT count(*) FROM side_requests WHERE agent_id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(rows, 0);
         let token = register(
@@ -5112,7 +5207,10 @@ mod tests {
         // they are messages the joining agent sent, so they set last_sent_at.
         let s = summary(&mut conn);
         assert_eq!(s.len(), 3, "{s:?}");
-        assert!(s.iter().all(|s| s.unread_messages == 0 && s.unseen_stream == 0));
+        assert!(
+            s.iter()
+                .all(|s| s.unread_messages == 0 && s.unseen_stream == 0)
+        );
         assert!(find(&s, "Lu").last_sent_at.is_none());
         assert!(find(&s, "Mateo").last_sent_at.is_some());
         let dm = proto::SendRequest {

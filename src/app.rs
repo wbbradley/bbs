@@ -60,14 +60,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             human,
             human_token_stdin,
         } => {
-            return init(
-                &dir,
-                server,
-                human,
-                *human_token_stdin,
-                as_human.as_deref(),
-            )
-            .await;
+            return init(&dir, server, human, *human_token_stdin, as_human.as_deref()).await;
         }
         Command::Hook { harness } => return crate::hook::run(*harness, &dir).await,
         Command::Headless { .. } => {
