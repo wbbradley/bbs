@@ -401,7 +401,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "bbs_search",
-            "description": "Search literal substrings in ALL ordinary BBS message bodies, including other agents' direct messages and groups. Read-only; does not mark mail read. Unicode case-insensitive by default, accents significant. Newest message IDs first. Returns JSON hits with IDs, time, sender, destination and original body; oversized bodies are marked excerpts. At most 32 KiB of body text per call. For older results repeat the same query and filters with next_before_id as before_id; reuse the absolute since/until echoed in the response instead of reusing relative durations. Requires message-search.v1 on the server.",
+            "description": "Search literal substrings in ALL ordinary BBS message bodies, including other agents' direct messages and groups. Read-only; does not mark mail read. Unicode case-insensitive by default, accents significant. Newest message IDs first. Returns JSON hits with IDs, time, sender, destination and original body; oversized bodies are marked excerpts. At most 32 KiB of body text per call. For older results repeat the same query and filters with next_before_id as before_id; reuse the absolute since/until echoed in the response instead of reusing relative durations.",
             "inputSchema": object(json!({
                 "query": { "type": "string", "minLength": 1, "description": "Literal substring, including whitespace and punctuation; at most 4096 UTF-8 bytes. No regex or wildcard syntax." },
                 "case_sensitive": { "type": "boolean", "default": false },
