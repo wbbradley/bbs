@@ -1115,6 +1115,55 @@ async fn side_questions_are_asked_claimed_and_answered_over_the_wire() {
     let side = report.side.unwrap();
     assert_eq!(side.status(), proto::SideStatus::SideCompleted);
     assert_eq!(side.answer.as_deref(), Some("green across the board"));
+    assert_eq!((side.conversation, side.ended), (Some(asked.id), false));
+
+    // side-conversations.v1: a follow-up, required as a client sends it,
+    // joins the conversation once the runner says it continues them.
+    assert!(info.capabilities.iter().any(|c| c == "side-conversations.v1"));
+    client
+        .report_context(as_agent(
+            &agent.token,
+            proto::ReportContextRequest {
+                side_followups: Some(true),
+                generation: "proc-1".into(),
+                usage: None,
+                side_supported: None,
+                side_reason: None,
+                preserve_usage: true,
+            },
+        ))
+        .await
+        .unwrap();
+    let mut req = as_human(
+        "will",
+        proto::AskSideRequest {
+            follows: Some(asked.id),
+            agent: agent.name.clone(),
+            question: "and staging?".into(),
+        },
+    );
+    req.metadata_mut().insert(
+        "bbs-required-capabilities",
+        "side-conversations.v1".parse().unwrap(),
+    );
+    let follow = client.ask_side(req).await.unwrap().into_inner();
+    let report = client
+        .side_report(as_human(
+            "will",
+            proto::SideReportRequest {
+                agent: agent.name.clone(),
+                generation: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(report.side_followups, Some(true));
+    let side = report.side.unwrap();
+    assert_eq!(
+        (side.id, side.conversation, side.follows),
+        (follow.id, Some(asked.id), Some(asked.id))
+    );
 }
 
 #[tokio::test]

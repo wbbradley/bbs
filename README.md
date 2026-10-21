@@ -837,7 +837,12 @@ Side questions (schema 19) add a bounded request/result table and runner
 capability metadata. They require `side-questions.v1` and a supporting runner.
 Pending requests are interrupted when the runner generation changes; questions
 are never replayed into a model after restart.
+Side conversations (schema 20) let a side question follow up the latest one,
+in the same conversation, while the runner generation that answered it is
+still current, says it continues conversations, and has not ended it; the
+owner can end one, and it ends after 30 minutes idle. They require
+`side-conversations.v1`; clients that use them require it of the server.
 
 Back up before the server first opens the database with this version: older
-binaries cannot open schema 19. Downgrading requires restoring the pre-upgrade
+binaries cannot open schema 20. Downgrading requires restoring the pre-upgrade
 backup, losing any changes made after that backup.

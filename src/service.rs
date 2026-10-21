@@ -4018,6 +4018,226 @@ mod tests {
 
 
     #[test]
+    fn side_conversations_follow_end_and_derive_ended() {
+        let (mut conn, will, [mateo, _zed, _lu]) = board();
+        let begin = |conn: &mut Connection, g: &str| {
+            begin_side_session(
+                conn,
+                &mateo,
+                proto::BeginSideSessionRequest {
+                    generation: g.into(),
+                },
+            )
+            .unwrap();
+        };
+        let support = |conn: &mut Connection, g: &str, followups: Option<bool>| {
+            report_context(
+                conn,
+                &mateo,
+                proto::ReportContextRequest {
+                    side_followups: followups,
+                    generation: g.into(),
+                    usage: None,
+                    side_supported: Some(true),
+                    side_reason: None,
+                    preserve_usage: false,
+                },
+            )
+            .unwrap();
+        };
+        let ask = |conn: &mut Connection, q: &str, follows: Option<i64>| {
+            ask_side(
+                conn,
+                &will,
+                proto::AskSideRequest {
+                    follows,
+                    agent: "Mateo".into(),
+                    question: q.into(),
+                },
+            )
+            .map(|r| r.id)
+            .map_err(|e| e.to_string())
+        };
+        let claim = |conn: &mut Connection, g: &str| {
+            claim_side(
+                conn,
+                &mateo,
+                proto::ClaimSideRequest {
+                    generation: g.into(),
+                },
+            )
+            .unwrap()
+            .request
+            .unwrap()
+        };
+        let report = |conn: &mut Connection, g: &str, id: i64, status: proto::SideStatus| {
+            report_side(
+                conn,
+                &mateo,
+                proto::ReportSideRequest {
+                    generation: g.into(),
+                    id,
+                    status: status.into(),
+                    answer: Some("answer".into()),
+                },
+            )
+            .map_err(|e| e.to_string())
+        };
+        let cancel = |conn: &mut Connection, id: i64, end: bool| {
+            cancel_side(conn, &will, proto::CancelSideRequest { id, end }).map_err(|e| e.to_string())
+        };
+        let view = |conn: &mut Connection| {
+            side_report(
+                conn,
+                &will,
+                proto::SideReportRequest {
+                    agent: "Mateo".into(),
+                    generation: None,
+                },
+            )
+            .unwrap()
+        };
+        let latest = |conn: &mut Connection| view(conn).side.unwrap();
+        // Ask, claim and complete a fresh question on `g`.
+        let answered = |conn: &mut Connection, g: &str, q: &str, follows: Option<i64>| {
+            let id = ask(conn, q, follows).unwrap();
+            assert_eq!(claim(conn, g).id, id);
+            report(conn, g, id, proto::SideStatus::SideCompleted).unwrap();
+            id
+        };
+        let mail = |conn: &mut Connection| -> i64 {
+            conn.query_row(
+                "SELECT (SELECT count(*) FROM messages) + (SELECT count(*) FROM deliveries)
+                   + (SELECT count(*) FROM agent_human_conversations)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let before = mail(&mut conn);
+        let ended = "side conversation ended";
+
+        // A first question is its own conversation; open and unclaimed, it
+        // is not ended. Follow-ups need the runner to say it continues them.
+        begin(&mut conn, "run-1");
+        support(&mut conn, "run-1", None);
+        let first = ask(&mut conn, "q1", None).unwrap();
+        let row = latest(&mut conn);
+        assert_eq!((row.conversation, row.follows, row.ended), (Some(first), None, false));
+        assert_eq!(claim(&mut conn, "run-1").conversation, Some(first));
+        report(&mut conn, "run-1", first, proto::SideStatus::SideCompleted).unwrap();
+        let err = ask(&mut conn, "q2", Some(first)).unwrap_err();
+        assert!(err.contains("need an updated runner"), "{err}");
+        support(&mut conn, "run-1", Some(true));
+        assert_eq!(view(&mut conn).side_followups, Some(true));
+        // Omitted preserves it.
+        support(&mut conn, "run-1", None);
+        assert_eq!(view(&mut conn).side_followups, Some(true));
+
+        // Only the latest question continues; a stale or unknown id is refused.
+        assert!(ask(&mut conn, "q2", Some(first + 100)).unwrap_err().contains(ended));
+        let second = ask(&mut conn, "q2", Some(first)).unwrap();
+        let row = latest(&mut conn);
+        assert_eq!(
+            (row.conversation, row.follows, row.ended),
+            (Some(first), Some(first), false)
+        );
+        // A second follow-up of the same id is refused while the first is
+        // open, and once it is answered the old id is no longer the latest.
+        assert!(ask(&mut conn, "q2b", Some(first)).unwrap_err().contains("already open"));
+        assert_eq!(claim(&mut conn, "run-1").follows, Some(first));
+        report(&mut conn, "run-1", second, proto::SideStatus::SideCompleted).unwrap();
+        assert!(ask(&mut conn, "q2b", Some(first)).unwrap_err().contains(ended));
+
+        // ENDED for an open follow-up the runner cannot continue: terminal.
+        let third = ask(&mut conn, "q3", Some(second)).unwrap();
+        claim(&mut conn, "run-1");
+        report(&mut conn, "run-1", third, proto::SideStatus::SideEnded).unwrap();
+        let row = latest(&mut conn);
+        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideEnded, true));
+        assert!(ask(&mut conn, "q4", Some(third)).unwrap_err().contains(ended));
+        // An open first question cannot be reported ENDED.
+        let fresh = ask(&mut conn, "fresh", None).unwrap();
+        assert_eq!(latest(&mut conn).conversation, Some(fresh));
+        claim(&mut conn, "run-1");
+        let err = report(&mut conn, "run-1", fresh, proto::SideStatus::SideEnded).unwrap_err();
+        assert!(err.contains("only a follow-up"), "{err}");
+        report(&mut conn, "run-1", fresh, proto::SideStatus::SideCompleted).unwrap();
+
+        // A lost child on the latest terminal question, with or without
+        // follows, flags it ended and keeps its status; a repeat is a no-op.
+        report(&mut conn, "run-1", fresh, proto::SideStatus::SideEnded).unwrap();
+        report(&mut conn, "run-1", fresh, proto::SideStatus::SideEnded).unwrap();
+        let row = latest(&mut conn);
+        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCompleted, true));
+        assert!(ask(&mut conn, "more", Some(fresh)).unwrap_err().contains(ended));
+        let one = answered(&mut conn, "run-1", "one", None);
+        let two = answered(&mut conn, "run-1", "two", Some(one));
+        report(&mut conn, "run-1", two, proto::SideStatus::SideEnded).unwrap();
+        let row = latest(&mut conn);
+        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCompleted, true));
+        // A question a newer one replaced (and pruned) is a no-op too.
+        let newer = answered(&mut conn, "run-1", "newer", None);
+        report(&mut conn, "run-1", two, proto::SideStatus::SideEnded).unwrap();
+        assert!(!latest(&mut conn).ended);
+
+        // Idle past the limit, the latest terminal question is ended.
+        let stale = fmt_time(Utc::now() - SIDE_IDLE_LIMIT - chrono::TimeDelta::seconds(1));
+        conn.execute(
+            "UPDATE side_requests SET updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![newer, stale],
+        )
+        .unwrap();
+        assert!(latest(&mut conn).ended);
+        assert!(ask(&mut conn, "late", Some(newer)).unwrap_err().contains(ended));
+
+        // A restart ends what the old generation answered, even once the new
+        // one says it continues conversations; it starts without followups.
+        let before_restart = answered(&mut conn, "run-1", "before", None);
+        assert!(!latest(&mut conn).ended);
+        begin(&mut conn, "run-2");
+        support(&mut conn, "run-2", None);
+        assert_eq!(view(&mut conn).side_followups, None);
+        support(&mut conn, "run-2", Some(true));
+        assert!(latest(&mut conn).ended);
+        assert!(ask(&mut conn, "after", Some(before_restart)).unwrap_err().contains(ended));
+        // The stale generation cannot report on it.
+        assert!(report(&mut conn, "run-1", before_restart, proto::SideStatus::SideEnded).is_err());
+
+        // The owner ends a terminal conversation: status kept, idempotent.
+        let done = answered(&mut conn, "run-2", "done", None);
+        cancel(&mut conn, done, true).unwrap();
+        cancel(&mut conn, done, true).unwrap();
+        let row = latest(&mut conn);
+        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCompleted, true));
+        assert!(ask(&mut conn, "next", Some(done)).unwrap_err().contains(ended));
+        // Ending an open question also cancels it; only the latest can be ended.
+        let open = ask(&mut conn, "open", None).unwrap();
+        cancel(&mut conn, open, true).unwrap();
+        let row = latest(&mut conn);
+        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCancelled, true));
+        let after = answered(&mut conn, "run-2", "after", None);
+        assert!(cancel(&mut conn, open, true).is_err());
+        // Cancelling one turn keeps the conversation going.
+        let turn = ask(&mut conn, "turn", Some(after)).unwrap();
+        claim(&mut conn, "run-2");
+        cancel(&mut conn, turn, false).unwrap();
+        let row = latest(&mut conn);
+        assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCancelled, false));
+        let again = ask(&mut conn, "again", Some(turn)).unwrap();
+        assert_eq!(latest(&mut conn).conversation, Some(after));
+        cancel(&mut conn, again, true).unwrap();
+        // Cancelled before any runner claimed it: no child, so ended.
+        let unclaimed = ask(&mut conn, "unclaimed", None).unwrap();
+        cancel(&mut conn, unclaimed, false).unwrap();
+        assert!(latest(&mut conn).ended);
+        assert!(ask(&mut conn, "never", Some(unclaimed)).unwrap_err().contains(ended));
+
+        // None of it is mail.
+        assert_eq!(mail(&mut conn), before);
+    }
+
+    #[test]
     fn side_questions_lifecycle_claim_cancel_reset_and_exclusion() {
         let (mut conn, will, [mateo, _zed, _lu]) = board();
         let begin = |conn: &mut Connection, g: &str| {

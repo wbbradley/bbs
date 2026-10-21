@@ -2418,6 +2418,35 @@ mod tests {
     }
 
     #[test]
+    fn side_conversations_migrate_each_question_into_its_own_conversation() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for sql in &MIGRATIONS[..19] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA user_version = 19;
+             INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at)
+                 VALUES (1, 'Mateo', 'a', '/', 'h', 't', 't'), (2, 'Zed', 'b', '/', 'h', 't', 't');
+             INSERT INTO side_state (agent_id, generation, reported_at, revision, closed_seq, supported)
+                 VALUES (1, 'run-1', 't', 1, 0, 1);
+             INSERT INTO side_requests (id, agent_id, generation, question, asked_at, status, answer, updated_at)
+                 VALUES (7, 1, 'run-1', 'old', 't', 'completed', 'yes', 't'),
+                        (9, 2, NULL, 'open', 't', 'open', NULL, 't');",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        for (agent, id) in [(1, 7), (2, 9)] {
+            let row = latest_side_request(&conn, agent).unwrap().unwrap();
+            assert_eq!((row.id, row.conversation, row.follows, row.ended), (id, id, None, false));
+        }
+        let state = side_state(&conn, 1).unwrap().unwrap();
+        assert_eq!((state.supported, state.followups), (Some(true), None));
+    }
+
+    #[test]
     fn group_description_migrates_existing_groups_and_limits_length() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
