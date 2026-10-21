@@ -1033,7 +1033,7 @@ async fn side_questions_are_advertised_and_answered_over_the_wire() {
 
 #[tokio::test]
 async fn side_questions_are_asked_claimed_and_answered_over_the_wire() {
-    let server = Server::start("side-questions");
+    let server = Server::start("side-questions-wire");
     let mut client = server.client().await;
     let info = client
         .server_info(proto::Empty {})
