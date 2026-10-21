@@ -67,11 +67,15 @@ pub enum Request {
         id: u64,
         agent: String,
         question: String,
+        /// Continue the side conversation whose latest question this is.
+        follows: Option<i64>,
     },
-    /// Cancel the owner's open side question `side`, for the screen `id`.
+    /// Cancel the owner's open side question `side`, for the screen `id`;
+    /// with `end`, also end its side conversation.
     CancelSide {
         id: u64,
         side: i64,
+        end: bool,
     },
     /// The owner's reply to an agent's questions, for the screen `id`.
     AnswerOwnerInput {
@@ -427,24 +431,22 @@ pub async fn serve(
                 id,
                 agent,
                 question,
+                follows,
             } => {
                 let local = matches!(backend, Backend::Local(_));
                 let call = backend.ask_side(proto::AskSideRequest {
                     agent,
                     question,
-                    follows: None,
+                    follows,
                 });
                 Data::SideAsked {
                     id,
                     result: bounded(call, local).await.map(|r| r.id),
                 }
             }
-            Request::CancelSide { id, side } => {
+            Request::CancelSide { id, side, end } => {
                 let local = matches!(backend, Backend::Local(_));
-                let call = backend.cancel_side(proto::CancelSideRequest {
-                    id: side,
-                    end: false,
-                });
+                let call = backend.cancel_side(proto::CancelSideRequest { id: side, end });
                 Data::SideCancelled {
                     id,
                     side,
@@ -1754,6 +1756,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
         let ask = |id| Request::AskSide {
+            follows: None,
             id,
             agent: "Mateo".into(),
             question: "which branch?".into(),
@@ -1782,8 +1785,9 @@ mod tests {
             .unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(Request::CancelSide { id: 52, side }).unwrap();
+        tx.send(Request::CancelSide { id: 52, side, end: false }).unwrap();
         tx.send(Request::CancelSide {
+            end: false,
             id: 53,
             side: side + 1,
         })

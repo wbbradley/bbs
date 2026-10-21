@@ -74,6 +74,17 @@ pub struct Thread {
     /// The owner's side view of this agent: its questions and context.
     owner: Option<crate::connect::owner::Session>,
     effort_notice: Option<String>,
+    /// The side panel was up after the last event.
+    side_open: bool,
+    /// The panel opened from this screen's own /btw, not a report.
+    side_asked: bool,
+    /// The parent draft, kept aside while the side panel takes the composer.
+    parent_draft: Option<Draft>,
+    /// A side draft left when the panel closed: never parent mail; it comes
+    /// back with the next fresh /btw panel.
+    side_draft: Option<Draft>,
+    /// The newest message held when btw mode began; newer ones are hidden.
+    hidden_from: Option<i64>,
     /// The clock for activity freshness and animation; the app's, or a test's.
     now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
 }
@@ -108,6 +119,11 @@ impl Thread {
             effort_picker: None,
             owner: None,
             effort_notice: None,
+            side_open: false,
+            side_asked: false,
+            parent_draft: None,
+            side_draft: None,
+            hidden_from: None,
             now: std::sync::Arc::new(Instant::now),
         }
     }
@@ -647,9 +663,19 @@ impl Thread {
                 }
             }
             let draft = composer.draft().text;
+            let panel = self.owner.as_ref().is_some_and(|o| o.side.is_some());
             match crate::connect::owner::side_draft(&draft) {
                 crate::connect::owner::SideDraft::Ask(question) => {
-                    return Some(self.ask_side(&agent, &draft, question));
+                    return Some(self.ask_side(&agent, &draft, question, false));
+                }
+                // While the side panel is up, typing goes to the side
+                // conversation, or nowhere: never to the agent as mail.
+                _ if panel => {
+                    let question = draft.trim();
+                    if question.is_empty() {
+                        return Some(Transition::Stay);
+                    }
+                    return Some(self.ask_side(&agent, &draft, question, true));
                 }
                 crate::connect::owner::SideDraft::Literal(body) => literal = Some(body),
                 crate::connect::owner::SideDraft::Mail => {}
@@ -698,19 +724,80 @@ impl Thread {
         lines
     }
 
-    /// `/btw <question>` asks the agent aside; the draft stays until the
-    /// server takes it. Never mail, even when it cannot be asked.
-    fn ask_side(&mut self, agent: &str, draft: &str, question: &str) -> Transition {
+    /// `/btw <question>` asks the agent aside, or with `follow`, continues
+    /// the side conversation; the draft stays until the server takes it.
+    /// Never mail, even when it cannot be asked.
+    fn ask_side(&mut self, agent: &str, draft: &str, question: &str, follow: bool) -> Transition {
         let Some(owner) = &mut self.owner else {
             self.effort_notice = Some(format!("Only {agent}'s owner can ask it side questions."));
             return Transition::Stay;
         };
-        match owner.ask_side(agent, draft, question) {
-            Ok(request) => Transition::Request(request),
+        match owner.ask_side(agent, draft, question, follow) {
+            Ok(request) => {
+                self.side_asked = true;
+                Transition::Request(request)
+            }
             Err(why) => {
                 self.effort_notice = Some(why);
                 Transition::Stay
             }
+        }
+    }
+
+    /// btw mode: the side conversation holds the view and the input.
+    fn btw_mode(&self) -> bool {
+        self.owner.as_ref().is_some_and(|o| o.btw_mode())
+    }
+
+    /// Mail held while btw mode hides the parent view is counted from here.
+    fn btw_hidden(&self) -> usize {
+        self.hidden_from.map_or(0, |from| {
+            self.messages.iter().filter(|m| m.id > from).count()
+        })
+    }
+
+    /// Keep the parent and side drafts apart as the side panel opens and
+    /// closes, and count mail hidden behind btw mode.
+    fn sync_side(&mut self) {
+        let open = self.owner.as_ref().is_some_and(|o| o.side.is_some());
+        if open != self.side_open {
+            self.side_open = open;
+            if let Some(composer) = &mut self.composer {
+                if open {
+                    if std::mem::take(&mut self.side_asked) {
+                        // The composer holds the /btw draft: the parent's is
+                        // what it replaced, nothing.
+                        self.parent_draft = Some(Draft::default());
+                    } else {
+                        // Opened by a report (a reopened conversation).
+                        self.parent_draft = Some(composer.draft());
+                        composer.restore(self.side_draft.take().unwrap_or_default());
+                    }
+                } else {
+                    let left = composer.draft();
+                    let parent = self.parent_draft.take().unwrap_or_default();
+                    let ask = matches!(
+                        crate::connect::owner::side_draft(&left.text),
+                        crate::connect::owner::SideDraft::Ask(_)
+                    );
+                    if ask && parent.text.is_empty() {
+                        // A fresh /btw can never go as mail: it stays.
+                    } else {
+                        if !left.text.trim().is_empty() {
+                            self.side_draft = Some(left);
+                        }
+                        composer.restore(parent);
+                    }
+                }
+            }
+        }
+        self.side_asked = false;
+        match (self.btw_mode(), self.hidden_from) {
+            (true, None) => {
+                self.hidden_from = Some(self.messages.iter().map(|m| m.id).max().unwrap_or(0))
+            }
+            (false, Some(_)) => self.hidden_from = None,
+            _ => {}
         }
     }
 
@@ -782,6 +869,10 @@ impl Screen for Thread {
     }
 
     fn unread_mail(&self) -> Option<(String, i64)> {
+        // Mail hidden behind btw mode is not read yet.
+        if self.btw_mode() {
+            return None;
+        }
         let agent = self.agent.as_ref()?;
         let through = self
             .messages
@@ -935,8 +1026,15 @@ impl Screen for Thread {
 
     fn save_draft(&mut self, drafts: &mut HashMap<String, Composer>) {
         if let Some(key) = &self.draft_key
-            && let Some(composer) = self.composer.take()
+            && let Some(mut composer) = self.composer.take()
         {
+            if std::mem::take(&mut self.side_open) {
+                // The side panel holds the composer: cache the parent's draft
+                // under the parent's key. The side text is dropped with this
+                // screen, never kept where it could go as mail.
+                composer.restore(self.parent_draft.take().unwrap_or_default());
+                self.side_draft = None;
+            }
             drafts.insert(key.clone(), composer);
         }
     }
@@ -953,8 +1051,18 @@ impl Screen for Thread {
         }
     }
 
+    #[cfg(test)]
+    fn composer_text(&self) -> Option<String> {
+        Some(self.composer.as_ref()?.draft().text)
+    }
+
     fn draft(&self) -> Option<(&str, Draft)> {
-        Some((self.draft_key.as_deref()?, self.composer.as_ref()?.draft()))
+        let key = self.draft_key.as_deref()?;
+        // While the side panel holds the composer, the parent draft is aside.
+        if self.side_open {
+            return Some((key, self.parent_draft.clone().unwrap_or_default()));
+        }
+        Some((key, self.composer.as_ref()?.draft()))
     }
 
     fn on_data(&mut self, data: &Data) {
@@ -965,8 +1073,11 @@ impl Screen for Thread {
             // The server took the question: clear the draft unless it changed.
             if let Some(draft) = owner.asked_draft.take()
                 && let Some(composer) = &mut self.composer
+                && composer.clear_if(&draft)
+                && let Some(left) = self.side_draft.take()
             {
-                composer.clear_if(&draft);
+                // A side draft left by the last panel comes back here.
+                composer.restore(left);
             }
         }
         let loaded = self.loaded();
@@ -1042,6 +1153,8 @@ impl Screen for Thread {
         {
             self.opening_until = None;
         }
+        // A report may have opened or ended the side conversation.
+        self.sync_side();
     }
 
     /// An open conversation marks received mail read and activity seen,
@@ -1058,7 +1171,9 @@ impl Screen for Thread {
             return Vec::new();
         };
         let mut requests = Vec::new();
-        if let Some(newest) = self.stream.as_ref().and_then(Stream::newest)
+        // Activity hidden behind btw mode is not seen yet.
+        if !self.btw_mode()
+            && let Some(newest) = self.stream.as_ref().and_then(Stream::newest)
             && newest > self.seen
         {
             self.seen = newest;
@@ -1071,109 +1186,114 @@ impl Screen for Thread {
     }
 
     fn raw_key(&mut self, key: KeyEvent) -> Option<Transition> {
-        use crate::connect::owner::Outcome as Form;
-        if let Some(owner) = &mut self.owner
-            && let Some(form) = &mut owner.form
-        {
-            return Some(match form.key(key) {
-                Form::Open => Transition::Stay,
-                Form::Close => {
-                    owner.form = None;
-                    Transition::Stay
-                }
-                Form::Reply(reply) => owner
-                    .reply(reply)
-                    .map_or(Transition::Stay, Transition::Request),
-            });
-        }
-        if key.code == KeyCode::Esc
-            && let Some(owner) = &mut self.owner
-            && owner.context_open
-        {
-            owner.context_open = false;
-            return Some(Transition::Stay);
-        }
-        if self.effort_picker.is_none()
-            && self.prompt.is_none()
-            && let Some(owner) = &mut self.owner
-            && let Some(side) = &owner.side
-        {
-            let alt = key.modifiers.contains(KeyModifiers::ALT);
-            match key.code {
-                KeyCode::Esc => {
-                    return Some(
-                        owner
-                            .side_escape()
-                            .map_or(Transition::Stay, Transition::Request),
-                    );
-                }
-                KeyCode::Up if alt => {
-                    side.scroll.set(side.scroll.get().saturating_add(1));
-                    return Some(Transition::Stay);
-                }
-                KeyCode::Down if alt => {
-                    side.scroll.set(side.scroll.get().saturating_sub(1));
-                    return Some(Transition::Stay);
-                }
-                _ => {}
-            }
-        }
-        if let Some(picker) = &mut self.effort_picker {
-            return Some(match picker.key(key) {
-                Outcome::Open => Transition::Stay,
-                Outcome::Cancel => {
-                    self.effort_picker = None;
-                    Transition::Stay
-                }
-                Outcome::Submit(values) => {
-                    self.effort_picker = None;
-                    Transition::Effort {
-                        agent: self.agent.clone().expect("agent picker"),
-                        value: values[0].clone(),
+        let transition = (|| -> Option<Transition> {
+            use crate::connect::owner::Outcome as Form;
+            if let Some(owner) = &mut self.owner
+                && let Some(form) = &mut owner.form
+            {
+                return Some(match form.key(key) {
+                    Form::Open => Transition::Stay,
+                    Form::Close => {
+                        owner.form = None;
+                        Transition::Stay
                     }
-                }
-            });
-        }
-        self.effort_notice = None;
-        // Compact and verbose views, while writing or navigating.
-        if self.agent.is_some()
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.code == KeyCode::Char('t')
-        {
-            // An open search prompt keeps its input and the view.
-            if self.prompt.is_some() {
+                    Form::Reply(reply) => owner
+                        .reply(reply)
+                        .map_or(Transition::Stay, Transition::Request),
+                });
+            }
+            if key.code == KeyCode::Esc
+                && let Some(owner) = &mut self.owner
+                && owner.context_open
+            {
+                owner.context_open = false;
                 return Some(Transition::Stay);
             }
-            self.set_compact(!self.compact);
-            return Some(Transition::Compact(self.compact));
-        }
-        if self.composing {
-            return self.compose(key);
-        }
-        if self.agent.is_some() && self.prompt.is_none() && key.code == KeyCode::Esc {
-            self.composing = true;
-            return Some(Transition::Stay);
-        }
-        if let Some((_, admin)) = &mut self.group
-            && let Some(transition) = admin.key(self.id, key)
-        {
-            return Some(transition);
-        }
-        let prompt = self.prompt.as_mut()?;
-        match key.code {
-            KeyCode::Enter => {
-                let query = std::mem::take(prompt);
-                self.prompt = None;
-                self.view.search(&query);
+            if self.effort_picker.is_none()
+                && self.prompt.is_none()
+                && let Some(owner) = &mut self.owner
+                && let Some(side) = &owner.side
+            {
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
+                match key.code {
+                    KeyCode::Esc => {
+                        return Some(
+                            owner
+                                .side_escape()
+                                .map_or(Transition::Stay, Transition::Request),
+                        );
+                    }
+                    KeyCode::Up if alt => {
+                        side.scroll.set(side.scroll.get().saturating_add(1));
+                        return Some(Transition::Stay);
+                    }
+                    KeyCode::Down if alt => {
+                        side.scroll.set(side.scroll.get().saturating_sub(1));
+                        return Some(Transition::Stay);
+                    }
+                    _ => {}
+                }
             }
-            KeyCode::Esc => self.prompt = None,
-            KeyCode::Backspace => {
-                prompt.pop();
+            if let Some(picker) = &mut self.effort_picker {
+                return Some(match picker.key(key) {
+                    Outcome::Open => Transition::Stay,
+                    Outcome::Cancel => {
+                        self.effort_picker = None;
+                        Transition::Stay
+                    }
+                    Outcome::Submit(values) => {
+                        self.effort_picker = None;
+                        Transition::Effort {
+                            agent: self.agent.clone().expect("agent picker"),
+                            value: values[0].clone(),
+                        }
+                    }
+                });
             }
-            KeyCode::Char(c) => prompt.push(c),
-            _ => {}
-        }
-        Some(Transition::Stay)
+            self.effort_notice = None;
+            // Compact and verbose views, while writing or navigating.
+            if self.agent.is_some()
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('t')
+            {
+                // An open search prompt keeps its input and the view.
+                if self.prompt.is_some() {
+                    return Some(Transition::Stay);
+                }
+                self.set_compact(!self.compact);
+                return Some(Transition::Compact(self.compact));
+            }
+            if self.composing {
+                return self.compose(key);
+            }
+            if self.agent.is_some() && self.prompt.is_none() && key.code == KeyCode::Esc {
+                self.composing = true;
+                return Some(Transition::Stay);
+            }
+            if let Some((_, admin)) = &mut self.group
+                && let Some(transition) = admin.key(self.id, key)
+            {
+                return Some(transition);
+            }
+            let prompt = self.prompt.as_mut()?;
+            match key.code {
+                KeyCode::Enter => {
+                    let query = std::mem::take(prompt);
+                    self.prompt = None;
+                    self.view.search(&query);
+                }
+                KeyCode::Esc => self.prompt = None,
+                KeyCode::Backspace => {
+                    prompt.pop();
+                }
+                KeyCode::Char(c) => prompt.push(c),
+                _ => {}
+            }
+            Some(Transition::Stay)
+        })();
+        // The side panel may have opened or closed: keep the drafts apart.
+        self.sync_side();
+        transition
     }
 
     /// The same order as `raw_key`: the effort picker (choices take no
@@ -1335,23 +1455,48 @@ impl Thread {
             .as_ref()
             .and_then(|o| Some((o.side.as_ref()?, o.side_view()?)));
         let side_height = (side.len() as u16).min(if btw.is_some() { room / 2 } else { room });
+        // btw mode: the side conversation takes the timeline's place, which
+        // keeps ingesting out of view. Otherwise a finished panel sits above
+        // the composer.
+        let btw_mode = self.btw_mode();
         let btw_height = match (&btw, &self.agent) {
-            (Some((_, view)), Some(agent)) => {
-                crate::connect::owner::side_height(agent, view, inner.width, room - side_height)
-            }
+            (Some((side, view)), Some(agent)) if !btw_mode => crate::connect::owner::side_height(
+                agent,
+                side,
+                view,
+                inner.width,
+                room - side_height,
+            ),
             _ => 0,
         };
         let [status, body, side_area, btw_area, composer] = Layout::vertical([
             Constraint::Length(u16::from(self.agent.is_none())),
-            Constraint::Min(0),
+            if btw_mode {
+                Constraint::Length(0)
+            } else {
+                Constraint::Min(0)
+            },
             Constraint::Length(side_height),
-            Constraint::Length(btw_height),
+            if btw_mode {
+                Constraint::Min(0)
+            } else {
+                Constraint::Length(btw_height)
+            },
             Constraint::Length(composer_height),
         ])
         .areas(inner);
         frame.render_widget(Paragraph::new(side), side_area);
         if let (Some((side, view)), Some(agent)) = (&btw, &self.agent) {
-            crate::connect::owner::render_side(frame, btw_area, agent, side, view);
+            let follow_up = self.owner.as_ref().is_some_and(|o| o.continuable());
+            crate::connect::owner::render_side(
+                frame,
+                btw_area,
+                agent,
+                side,
+                view,
+                follow_up,
+                self.btw_hidden(),
+            );
         }
         if let Some(c) = &mut self.composer {
             c.render(frame, composer, self.composing);

@@ -126,6 +126,11 @@ pub trait Screen {
     fn draft(&self) -> Option<(&str, Draft)> {
         None
     }
+    /// The composer's text, whichever draft it holds.
+    #[cfg(test)]
+    fn composer_text(&self) -> Option<String> {
+        None
+    }
     /// Optional screen feedback for the shared bottom bar, after layout.
     fn bottom_status(
         &self,
@@ -3284,6 +3289,80 @@ mod tests {
         }
     }
 
+    /// One side row as a side-conversations.v1 server reports it.
+    #[derive(Clone, Copy)]
+    struct Row<'a> {
+        id: i64,
+        question: &'a str,
+        status: proto::SideStatus,
+        answer: &'a str,
+        follows: Option<i64>,
+        ended: bool,
+        /// Defaults to 5 for a follow-up and the row's own id otherwise.
+        conversation: Option<i64>,
+    }
+
+    /// A side report from a runner that continues side conversations.
+    fn conv_report(revision: i64, row: Option<Row>) -> Data {
+        let Data::SideReport {
+            result: Ok(mut report),
+            ..
+        } = btw_report(revision, None)
+        else {
+            unreachable!()
+        };
+        report.side_followups = Some(true);
+        report.side = row.map(|r| proto::SideRequest {
+            id: r.id,
+            question: r.question.into(),
+            status: r.status.into(),
+            answer: (!r.answer.is_empty()).then(|| r.answer.into()),
+            updated_at: "2026-10-20T02:31:00Z".into(),
+            follows: r.follows,
+            ended: r.ended,
+            conversation: r.conversation.or(Some(r.follows.map_or(r.id, |_| 5))),
+        });
+        Data::SideReport {
+            id: 0,
+            result: Ok(report),
+        }
+    }
+
+    fn row<'a>(id: i64, question: &'a str, status: proto::SideStatus, answer: &'a str) -> Row<'a> {
+        Row {
+            id,
+            question,
+            status,
+            answer,
+            follows: None,
+            ended: false,
+            conversation: None,
+        }
+    }
+
+    /// Ask `/btw first?`, have it taken as 5 and answered, in btw mode.
+    fn answered_btw(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> u64 {
+        use proto::SideStatus;
+        let id = poll(app, rx);
+        reply_to(app, id, conv_report(1, None));
+        command(app, "/btw first?");
+        assert!(matches!(
+            without_polls(rx).as_slice(),
+            [Request::AskSide { follows: None, .. }]
+        ));
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(5) }));
+        poll(app, rx);
+        reply_to(
+            app,
+            id,
+            conv_report(
+                2,
+                Some(row(5, "first?", SideStatus::SideCompleted, "first answer")),
+            ),
+        );
+        id
+    }
+
     /// Deliver `data` as the reply to the session's poll `id`.
     fn reply_to(app: &mut App, id: u64, data: Data) {
         let Data::SideReport { result, .. } = data else {
@@ -3292,8 +3371,9 @@ mod tests {
         app.on_event(Event::Data(Data::SideReport { id, result }));
     }
 
+    /// What the composer holds: the side draft while the side panel is up.
     fn draft_text(app: &mut App) -> String {
-        app.top().draft().unwrap().1.text
+        app.top().composer_text().unwrap()
     }
 
     #[test]
@@ -3309,7 +3389,8 @@ mod tests {
             [Request::AskSide {
                 id,
                 agent: "Mateo".into(),
-                question: "which branch?".into()
+                question: "which branch?".into(),
+                follows: None,
             }],
             "asked aside, never sent as mail"
         );
@@ -3320,7 +3401,8 @@ mod tests {
         app.on_event(Event::Data(Data::SideAsked { id, result: Ok(5) }));
         assert_eq!(draft_text(&mut app), "/btw which branch? also");
         assert!(screen(&mut app, 80, 24).contains("btw · Mateo · asked"));
-        // The answer streams in; mail to the parent conversation still lands.
+        // The answer streams in. This runner answers one question at a time,
+        // so the panel sits above a visible parent conversation.
         poll(&mut app, &mut rx);
         reply_to(
             &mut app,
@@ -3342,8 +3424,8 @@ mod tests {
                 && out.contains("parent mail meanwhile"),
             "{out}"
         );
-        // A second question waits for this one.
         while rx.try_recv().is_ok() {}
+        // A second question waits for this one.
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         command(&mut app, "/btw another");
         assert!(without_polls(&mut rx).is_empty());
@@ -3353,7 +3435,11 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(
             without_polls(&mut rx),
-            [Request::CancelSide { id, side: 5 }]
+            [Request::CancelSide {
+                id,
+                side: 5,
+                end: false
+            }]
         );
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(without_polls(&mut rx).is_empty(), "one cancel in flight");
@@ -3408,6 +3494,605 @@ mod tests {
             "{out}"
         );
         close_conversation(&mut app, &mut rx);
+    }
+
+    #[test]
+    fn btw_mode_takes_follow_ups_hides_the_parent_and_keeps_its_draft_apart() {
+        use proto::SideStatus;
+        let (mut app, mut rx) = app();
+        let (feed, act) = mateo_streams(&mut app, &mut rx);
+        let id = answered_btw(&mut app, &mut rx);
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("btw · Mateo · answered")
+                && out.contains("first answer")
+                && out.contains("Enter asks a follow-up · Esc ends"),
+            "{out}"
+        );
+        // Parent mail arrives out of view, counted and unread.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(40, "Mateo", "ada", "parent mail meanwhile")]),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("1 new message in Mateo") && !out.contains("parent mail meanwhile"),
+            "{out}"
+        );
+        // Activity arrives out of view too, and is not marked seen.
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![activity(
+                30,
+                "09",
+                r#"{"event":"thought","text":"hidden work"}"#,
+            )]),
+        }));
+        assert!(!screen(&mut app, 80, 24).contains("hidden work"));
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(
+            r,
+            Request::MarkRead(_) | Request::MarkSeen { .. } | Request::Send { .. }
+        )));
+        // Plain text is a follow-up of the latest question, never mail.
+        command(&mut app, "and why?");
+        assert_eq!(
+            without_polls(&mut rx),
+            [Request::AskSide {
+                id,
+                agent: "Mateo".into(),
+                question: "and why?".into(),
+                follows: Some(5),
+            }]
+        );
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(6) }));
+        assert_eq!(draft_text(&mut app), "");
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            conv_report(
+                3,
+                Some(Row {
+                    follows: Some(5),
+                    ..row(6, "and why?", SideStatus::SideCompleted, "because")
+                }),
+            ),
+        );
+        // The earlier exchange shows above, from this session's history.
+        let out = screen(&mut app, 80, 30);
+        assert!(
+            out.contains("› first?")
+                && out.contains("first answer")
+                && out.contains("and why?")
+                && out.contains("because"),
+            "{out}"
+        );
+        // Esc while idle ends the conversation and gives the parent back.
+        typed(&mut app, "half a side thought");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let sent = without_polls(&mut rx);
+        assert!(
+            sent.contains(&Request::CancelSide {
+                id,
+                side: 6,
+                end: true
+            }),
+            "{sent:?}"
+        );
+        // The mail that arrived out of view shows now, and is read.
+        assert!(
+            sent.contains(&Request::MarkRead("Mateo".into())),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|r| matches!(r, Request::MarkSeen { through_id: 30, .. })),
+            "{sent:?}"
+        );
+        assert!(screen(&mut app, 80, 24).contains("parent mail meanwhile"));
+        assert_eq!(draft_text(&mut app), "", "the parent draft is back");
+        // The side draft never became mail; it returns with the next panel.
+        command(&mut app, "/btw again?");
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(7) }));
+        assert_eq!(draft_text(&mut app), "half a side thought");
+    }
+
+    #[test]
+    fn btw_typing_is_fenced_when_a_follow_up_cannot_go_and_never_becomes_mail() {
+        use crate::connect::event::SideError;
+        use proto::SideStatus;
+        let fenced = |app: &mut App, rx: &mut UnboundedReceiver<Request>, why: &str| {
+            command(app, "plain text");
+            let sent = without_polls(rx);
+            assert!(
+                !sent
+                    .iter()
+                    .any(|r| matches!(r, Request::Send { .. } | Request::AskSide { .. })),
+                "{sent:?}"
+            );
+            assert!(screen(app, 100, 24).contains(why), "{why}");
+            assert_eq!(draft_text(app), "plain text", "the draft stays");
+            press(app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        };
+        // While an answer runs: wait, or Esc cancels just that turn.
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = answered_btw(&mut app, &mut rx);
+        command(&mut app, "and then?");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::AskSide {
+                follows: Some(5),
+                ..
+            }]
+        ));
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(6) }));
+        poll(&mut app, &mut rx);
+        let open = Row {
+            follows: Some(5),
+            ..row(6, "and then?", SideStatus::SideOpen, "")
+        };
+        reply_to(&mut app, id, conv_report(3, Some(open)));
+        while rx.try_recv().is_ok() {}
+        fenced(
+            &mut app,
+            &mut rx,
+            "Wait for the answer, or Esc to cancel it.",
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            without_polls(&mut rx),
+            [Request::CancelSide {
+                id,
+                side: 6,
+                end: false
+            }]
+        );
+        // Cancelled, the conversation goes on: btw mode stays.
+        poll(&mut app, &mut rx);
+        let cancelled = Row {
+            status: SideStatus::SideCancelled,
+            ..open
+        };
+        reply_to(&mut app, id, conv_report(4, Some(cancelled)));
+        assert!(screen(&mut app, 80, 24).contains("Enter asks a follow-up"));
+        // The server says the conversation cannot go on (idle, restart):
+        // fenced, with the ended notice.
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            conv_report(
+                5,
+                Some(Row {
+                    ended: true,
+                    ..cancelled
+                }),
+            ),
+        );
+        fenced(
+            &mut app,
+            &mut rx,
+            "Side conversation ended; your next /btw starts fresh.",
+        );
+        // A refused follow-up ends it too, whatever the reason.
+        let (mut app, mut rx) = self::app();
+        mateo_streams(&mut app, &mut rx);
+        let id = answered_btw(&mut app, &mut rx);
+        command(&mut app, "more?");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::AskSide {
+                follows: Some(5),
+                ..
+            }]
+        ));
+        app.on_event(Event::Data(Data::SideAsked {
+            id,
+            result: Err(SideError::Refused("not your agent".into())),
+        }));
+        let out = screen(&mut app, 100, 24);
+        assert!(out.contains("btw · Mateo · ended"), "{out}");
+        assert_eq!(
+            draft_text(&mut app),
+            "more?",
+            "a refused follow-up keeps its draft"
+        );
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        fenced(
+            &mut app,
+            &mut rx,
+            "Side conversation ended; your next /btw starts fresh.",
+        );
+        // A runner without follow-ups: the panel stays, typing is fenced.
+        let (mut app, mut rx) = self::app();
+        mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        reply_to(&mut app, id, btw_report(1, None));
+        command(&mut app, "/btw only one?");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::AskSide { follows: None, .. }]
+        ));
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(5) }));
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            btw_report(2, Some((5, "only one?", SideStatus::SideCompleted, "yes"))),
+        );
+        fenced(
+            &mut app,
+            &mut rx,
+            "Follow-ups need an update; Esc closes the side panel.",
+        );
+        // Esc closes it without ending anything, and typing is mail again.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            !without_polls(&mut rx)
+                .iter()
+                .any(|r| matches!(r, Request::CancelSide { .. }))
+        );
+        command(&mut app, "now mail");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::Send { req, .. }] if req.body == "now mail"
+        ));
+    }
+
+    #[test]
+    fn btw_unconfirmed_follow_ups_adopt_only_their_own_row_and_reopen_resumes() {
+        use crate::connect::event::SideError;
+        use proto::SideStatus;
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = answered_btw(&mut app, &mut rx);
+        command(&mut app, "same text");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::AskSide {
+                follows: Some(5),
+                ..
+            }]
+        ));
+        app.on_event(Event::Data(Data::SideAsked {
+            id,
+            result: Err(SideError::Transient("timed out".into())),
+        }));
+        assert!(screen(&mut app, 100, 24).contains("not confirmed"));
+        // A newer row with the same text from a fresh /btw elsewhere (no
+        // follows) is not this follow-up.
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            conv_report(
+                3,
+                Some(row(6, "same text", SideStatus::SideOpen, "elsewhere")),
+            ),
+        );
+        assert!(!screen(&mut app, 100, 24).contains("elsewhere"));
+        // The same text following 5 is.
+        poll(&mut app, &mut rx);
+        let mine = Row {
+            follows: Some(5),
+            ..row(7, "same text", SideStatus::SideOpen, "mine")
+        };
+        reply_to(&mut app, id, conv_report(4, Some(mine)));
+        let out = screen(&mut app, 100, 24);
+        assert!(out.contains("mine") && out.contains("› first?"), "{out}");
+        assert!(without_polls(&mut rx).is_empty(), "never retried");
+        // Reopened, a continuable conversation resumes btw mode; its earlier
+        // exchanges are the agent's alone.
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        while rx.try_recv().is_ok() {}
+        reopen(&mut app, &mut rx);
+        while rx.try_recv().is_ok() {}
+        let new = poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            new,
+            conv_report(
+                5,
+                Some(Row {
+                    status: SideStatus::SideCompleted,
+                    ..mine
+                }),
+            ),
+        );
+        let out = screen(&mut app, 100, 24);
+        assert!(
+            out.contains("Earlier side questions aren't shown here; Mateo still has them")
+                && out.contains("Enter asks a follow-up"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_panel_opened_by_a_report_keeps_the_parent_draft_aside_until_exit() {
+        use proto::SideStatus;
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        typed(&mut app, "keep me");
+        let id = poll(&mut app, &mut rx);
+        // The first report shows a continuable side conversation: btw mode.
+        reply_to(
+            &mut app,
+            id,
+            conv_report(
+                1,
+                Some(row(5, "earlier?", SideStatus::SideCompleted, "an answer")),
+            ),
+        );
+        assert!(screen(&mut app, 80, 24).contains("Enter asks a follow-up"));
+        assert_eq!(draft_text(&mut app), "", "the composer is the side's");
+        assert_eq!(
+            app.top().draft().unwrap().1.text,
+            "keep me",
+            "the saved draft stays the parent's"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(draft_text(&mut app), "keep me");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [
+                ..,
+                Request::CancelSide {
+                    side: 5,
+                    end: true,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn btw_follows_its_conversation_across_views_and_never_splices_another() {
+        use crate::connect::event::SideError;
+        use proto::SideStatus;
+        // Another view went on in the same conversation, past a row this one
+        // missed: the exchange seen stays, with the lost-history notice.
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = answered_btw(&mut app, &mut rx);
+        typed(&mut app, "my side draft");
+        poll(&mut app, &mut rx);
+        let later = Row {
+            follows: Some(6),
+            ..row(7, "third?", SideStatus::SideCompleted, "third answer")
+        };
+        reply_to(&mut app, id, conv_report(3, Some(later)));
+        let out = screen(&mut app, 100, 30);
+        assert!(
+            out.contains("› first?")
+                && out.contains("first answer")
+                && out.contains("third?")
+                && out.contains("Earlier side questions aren't shown here"),
+            "{out}"
+        );
+        assert_eq!(draft_text(&mut app), "my side draft");
+        // Another view started a different conversation: that one shows,
+        // without this one's history, and the side draft stays fenced.
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            conv_report(
+                4,
+                Some(row(9, "elsewhere?", SideStatus::SideCompleted, "other")),
+            ),
+        );
+        let out = screen(&mut app, 100, 30);
+        assert!(
+            out.contains("elsewhere?")
+                && !out.contains("› first?")
+                && !out.contains("third answer"),
+            "{out}"
+        );
+        assert_eq!(draft_text(&mut app), "my side draft");
+        assert!(
+            !without_polls(&mut rx)
+                .iter()
+                .any(|r| matches!(r, Request::Send { .. }))
+        );
+        // An unconfirmed follow-up never adopts a row of another conversation,
+        // even with the same text and follows.
+        let (mut app, mut rx) = self::app();
+        mateo_streams(&mut app, &mut rx);
+        let id = answered_btw(&mut app, &mut rx);
+        command(&mut app, "same?");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::AskSide {
+                follows: Some(5),
+                ..
+            }]
+        ));
+        app.on_event(Event::Data(Data::SideAsked {
+            id,
+            result: Err(SideError::Transient("timed out".into())),
+        }));
+        poll(&mut app, &mut rx);
+        let foreign = Row {
+            follows: Some(5),
+            conversation: Some(8),
+            ..row(6, "same?", SideStatus::SideOpen, "foreign")
+        };
+        reply_to(&mut app, id, conv_report(3, Some(foreign)));
+        let out = screen(&mut app, 100, 24);
+        assert!(
+            out.contains("not confirmed") && !out.contains("foreign"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn btw_mode_counts_hidden_mail_by_id_when_the_feed_is_full() {
+        let (mut app, mut rx) = app();
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        let cap = crate::ui::thread::MAX_ROWS as i64;
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok((1..=cap)
+                .map(|n| message(n, "Mateo", "ada", "old"))
+                .collect()),
+        }));
+        answered_btw(&mut app, &mut rx);
+        // One more arrives; the oldest is dropped, but it still counts.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(cap + 1, "Mateo", "ada", "new while hidden")]),
+        }));
+        assert!(screen(&mut app, 80, 24).contains("1 new message in Mateo"));
+    }
+
+    #[test]
+    fn a_one_answer_runner_keeps_the_parent_in_view_while_typing_stays_fenced() {
+        use proto::SideStatus;
+        let (mut app, mut rx) = app();
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        let id = poll(&mut app, &mut rx);
+        reply_to(&mut app, id, btw_report(1, None));
+        command(&mut app, "/btw quick?");
+        assert!(matches!(
+            without_polls(&mut rx).as_slice(),
+            [Request::AskSide { .. }]
+        ));
+        app.on_event(Event::Data(Data::SideAsked { id, result: Ok(5) }));
+        poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            btw_report(2, Some((5, "quick?", SideStatus::SideOpen, "working"))),
+        );
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(40, "Mateo", "ada", "parent stays visible")]),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("btw · Mateo · answering…")
+                && out.contains("parent stays visible")
+                && !out.contains("new message"),
+            "not btw mode: {out}"
+        );
+        // Its mail is read as usual, but typing still never goes as mail.
+        assert!(without_polls(&mut rx).contains(&Request::MarkRead("Mateo".into())));
+        command(&mut app, "plain text");
+        assert!(
+            !without_polls(&mut rx)
+                .iter()
+                .any(|r| matches!(r, Request::Send { .. } | Request::AskSide { .. }))
+        );
+        assert!(screen(&mut app, 80, 24).contains("Wait for the answer, or Esc to cancel it."));
+        assert_eq!(draft_text(&mut app), "plain text");
+    }
+
+    #[test]
+    fn leaving_with_the_side_panel_up_never_keeps_side_text_as_the_parent_draft() {
+        use proto::SideStatus;
+        // Adopted from Theo's review repro: a report opens the panel over a
+        // parent draft; side text is typed; the conversation is left and
+        // reopened; Enter goes before any side report.
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        typed(&mut app, "parent draft");
+        let id = poll(&mut app, &mut rx);
+        reply_to(
+            &mut app,
+            id,
+            conv_report(
+                1,
+                Some(row(5, "earlier?", SideStatus::SideCompleted, "answer")),
+            ),
+        );
+        typed(&mut app, "private side draft");
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, 'q');
+        while rx.try_recv().is_ok() {}
+        reopen(&mut app, &mut rx);
+        while rx.try_recv().is_ok() {}
+        assert_eq!(
+            draft_text(&mut app),
+            "parent draft",
+            "the parent's text survives"
+        );
+        enter(&mut app);
+        let sent = without_polls(&mut rx);
+        assert!(
+            sent.iter()
+                .any(|r| matches!(r, Request::Send { req, .. } if req.body == "parent draft")),
+            "{sent:?}"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|r| matches!(r, Request::Send { req, .. } if req.body.contains("private side draft"))),
+            "side text escaped: {sent:?}"
+        );
+        // Saved drafts, by tick or at shutdown, hold the parent's text only.
+        for tick in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut first, mut rx) = persistent_app(dir.path());
+            mateo_streams(&mut first, &mut rx);
+            typed(&mut first, "parent draft");
+            let id = poll(&mut first, &mut rx);
+            reply_to(
+                &mut first,
+                id,
+                conv_report(
+                    1,
+                    Some(row(5, "earlier?", SideStatus::SideCompleted, "answer")),
+                ),
+            );
+            typed(&mut first, "private side draft");
+            if tick {
+                first.on_event(Event::Tick);
+            } else {
+                first.finish().unwrap();
+            }
+            let (mut next, mut rx) = persistent_app(dir.path());
+            mateo_streams(&mut next, &mut rx);
+            assert_eq!(draft_text(&mut next), "parent draft", "tick {tick}");
+        }
+    }
+
+    #[test]
+    fn btw_mode_keeps_waiting_questions_in_view_and_answerable() {
+        use proto::SideStatus;
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = answered_btw(&mut app, &mut rx);
+        poll(&mut app, &mut rx);
+        let Data::SideReport {
+            result: Ok(mut report),
+            ..
+        } = conv_report(
+            3,
+            Some(row(5, "first?", SideStatus::SideCompleted, "first answer")),
+        )
+        else {
+            unreachable!()
+        };
+        report.pending_input = side_report(3, 7, deploy_questions()).pending_input;
+        app.on_event(Event::Data(Data::SideReport {
+            id,
+            result: Ok(report),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("Mateo asks 2 questions · /answer to respond")
+                && out.contains("btw · Mateo · answered"),
+            "{out}"
+        );
+        command(&mut app, "/answer");
+        assert!(app.top().navigation_blocked(), "/answer opens the form");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            screen(&mut app, 80, 24).contains("btw · Mateo"),
+            "still in btw mode"
+        );
     }
 
     #[test]
@@ -3490,7 +4175,11 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(
             without_polls(&mut rx),
-            [Request::CancelSide { id, side: 5 }]
+            [Request::CancelSide {
+                id,
+                side: 5,
+                end: false
+            }]
         );
     }
 

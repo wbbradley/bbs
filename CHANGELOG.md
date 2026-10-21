@@ -8,12 +8,22 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+Continuing side conversations require a server upgrade to database schema 20.
+Take a backup before upgrading; schema-19 binaries cannot open the upgraded database.
+
 ### Added
 
 - `bbs connect` compact view can hide reasoning too: set
   `compact_hides_thoughts = true` under `[connect]` in
   `~/.config/bbs/config.toml`. Reasoning still shows by default. Config format
   becomes 4, since older clients reject the new setting.
+
+- `bbs connect` side questions continue as side conversations: after a
+  `/btw` answer, Enter asks a follow-up in the same side copy, with the parent
+  timeline out of view (new messages counted, not marked read) until Esc.
+  The side conversation ends on Esc, after 30 minutes idle, or when the runner
+  restarts. Needs a server and runner with `side-conversations.v1`. While any
+  side panel is up, typing no longer goes to the agent as mail.
 
 ## 0.11.2 - 2026-10-21
 

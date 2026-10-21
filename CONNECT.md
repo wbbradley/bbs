@@ -131,17 +131,37 @@ agent's owner.
 
 ### Side questions
 
-In an owned agent conversation, `/btw QUESTION` opens a separate answer panel
-above the composer. The parent timeline and composer remain usable while it
-runs. Questions are at most 4 KiB and answers at most 64 KiB; one question may
-run at a time. `//btw QUESTION` sends the literal text `/btw QUESTION` as mail.
+In an owned agent conversation, `/btw QUESTION` opens a side answer panel.
+Questions are at most 4 KiB and answers at most 64 KiB; one question may run
+at a time. `//btw QUESTION` sends the literal text `/btw QUESTION` as mail.
 An empty question, missing support or a refusal keeps the draft and explains
 the problem. A confirmed start clears the submitted draft only if it has not
 changed; an uncertain start keeps it and is never automatically retried.
 
-The panel shows the request's state and answer. Esc cancels a running request
-or dismisses a finished one. Closing the conversation keeps the request running;
-reopening shows its latest result. A runner restart interrupts pending work.
+While the panel is up, typing goes to the side conversation or nowhere: Enter
+never sends the draft to the agent as mail. `/answer`, `/context` and a fresh
+`/btw QUESTION` still work. The panel holds the composer with its own draft;
+the parent draft is kept aside and returns when the panel closes, and a side
+draft left then comes back with the next `/btw` panel.
+
+With an updated server and runner (`side-conversations.v1`), the side
+question starts a side conversation in btw mode: the panel takes the
+timeline's place, and Enter asks a follow-up in the same side copy, which
+remembers the earlier side questions. The parent timeline keeps loading out of
+view; the panel's header counts new messages from the agent, which are not
+marked read, nor its activity seen, until the timeline shows again. Questions
+the agent is waiting on still show, and `/answer` still opens them. Esc while
+an answer runs cancels that answer and stays; otherwise it ends the side
+conversation and returns to the timeline. The side conversation also ends
+after 30 minutes idle or when the runner restarts; the panel then says so and
+keeps typing fenced until Esc, and the next `/btw` starts fresh. Earlier
+exchanges show for this session only; after reopening, the panel shows the
+latest one and notes that the agent still has the rest.
+
+Without that support, a finished panel stays above the composer, where the
+parent timeline remains visible, typing is fenced until Esc closes it, and
+closing the conversation keeps the request running; reopening shows its
+latest result. A runner restart interrupts pending work.
 Side questions require `side-questions.v1` and a supporting runner; the initial
 implementation supports Codex app-server. Tools and shared systems remain
 available to the child, as described in [HEADLESS.md](HEADLESS.md#side-questions).

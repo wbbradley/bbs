@@ -114,6 +114,18 @@ pub struct Session {
 /// The longest side question the server takes.
 pub const SIDE_QUESTION_LIMIT: usize = 4 * 1024;
 
+/// Earlier exchanges a side conversation keeps for display, in this session:
+/// the newest of at most this many, and this many bytes.
+const HISTORY_EXCHANGES: usize = 20;
+const HISTORY_BYTES: usize = 256 * 1024;
+
+/// One earlier question and answer of a side conversation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Exchange {
+    pub question: String,
+    pub answer: String,
+}
+
 /// The owner's `/btw` question and where it stands.
 #[derive(Debug, PartialEq)]
 pub struct Side {
@@ -129,6 +141,65 @@ pub struct Side {
     pub notice: Option<String>,
     /// Lines scrolled up from the answer's end.
     pub scroll: Cell<usize>,
+    /// The question this one follows up, in the same side conversation.
+    follows: Option<i64>,
+    /// The exchange this follow-up continues, kept until the server takes it.
+    previous: Option<Exchange>,
+    /// Earlier exchanges of this side conversation seen in this session,
+    /// oldest first; bounded, never sent anywhere.
+    pub history: Vec<Exchange>,
+    /// History was lost (a reopened conversation shows only its latest
+    /// exchange), though the agent's side copy keeps it.
+    pub history_lost: bool,
+    /// The side conversation's id (its first question's), once known.
+    conversation: Option<i64>,
+    /// The tracked question's answer as last reported.
+    answer: String,
+}
+
+impl Side {
+    fn new(draft: &str, question: &str, baseline: i64, state: SideState) -> Side {
+        Side {
+            draft: draft.to_string(),
+            question: question.to_string(),
+            baseline,
+            state,
+            cancelling: false,
+            notice: None,
+            scroll: Cell::new(0),
+            follows: None,
+            previous: None,
+            history: Vec::new(),
+            history_lost: false,
+            conversation: None,
+            answer: String::new(),
+        }
+    }
+
+    /// The side panel for `row`, a conversation's latest question seen in a
+    /// report: earlier exchanges, if any, are the agent's alone.
+    fn adopt(row: &proto::SideRequest) -> Side {
+        let mut side = Side::new("", &row.question, row.id, SideState::Tracking(row.id));
+        side.conversation = row.conversation;
+        side.history_lost = row.follows.is_some();
+        side
+    }
+
+    /// Keep `exchange` in the bounded history.
+    fn remember(&mut self, exchange: Exchange) {
+        self.history.push(exchange);
+        let size = |h: &[Exchange]| {
+            h.iter()
+                .map(|e| e.question.len() + e.answer.len())
+                .sum::<usize>()
+        };
+        while self.history.len() > HISTORY_EXCHANGES
+            || (self.history.len() > 1 && size(&self.history) > HISTORY_BYTES)
+        {
+            self.history.remove(0);
+            self.history_lost = true;
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -141,6 +212,8 @@ pub enum SideState {
     Unconfirmed(String),
     /// Not asked, for this reason.
     NotAsked(String),
+    /// A follow-up the server refused: the side conversation cannot go on.
+    Ended,
 }
 
 /// What a side question shows: its server status and answer so far.
@@ -158,6 +231,8 @@ pub enum SideView {
     Interrupted(String),
     /// A newer side question took its place in the reports.
     Replaced,
+    /// The side conversation cannot go on; the answer so far, if any.
+    Ended(String),
 }
 
 impl SideView {
@@ -185,14 +260,19 @@ impl Session {
         }
     }
 
-    /// Ask `question` aside, from `draft`; the reason it cannot be asked
+    /// Ask `question` aside, from `draft`, starting a side conversation, or
+    /// with `follow`, continuing the open one; the reason it cannot be asked
     /// otherwise. Never sent as mail either way.
     pub fn ask_side(
         &mut self,
         agent: &str,
         draft: &str,
         question: &str,
+        follow: bool,
     ) -> Result<Request, String> {
+        if follow {
+            self.side_input()?;
+        }
         if self.side_view().is_some_and(|v| v.running()) {
             return Err("A side question is already running (Esc cancels it).".into());
         }
@@ -226,19 +306,77 @@ impl Session {
         {
             return Err("A side question is already open for this agent.".into());
         }
-        self.side = Some(Side {
-            draft: draft.to_string(),
-            question: question.to_string(),
-            baseline: report.side.as_ref().map_or(0, |s| s.id),
-            state: SideState::Asking,
-            cancelling: false,
-            notice: None,
-            scroll: Cell::new(0),
-        });
+        let baseline = report.side.as_ref().map_or(0, |s| s.id);
+        let mut side = Side::new(draft, question, baseline, SideState::Asking);
+        if follow {
+            let current = self.side.take().expect("an open side conversation");
+            side.follows = Some(baseline);
+            side.conversation = current.conversation;
+            side.history = current.history;
+            side.history_lost = current.history_lost;
+            side.previous = Some(Exchange {
+                question: current.question,
+                answer: report
+                    .side
+                    .as_ref()
+                    .and_then(|s| s.answer.clone())
+                    .unwrap_or_default(),
+            });
+        }
+        let follows = side.follows;
+        self.side = Some(side);
         Ok(Request::AskSide {
             id: self.id,
             agent: agent.to_string(),
             question: question.to_string(),
+            follows,
+        })
+    }
+
+    /// Whether the runner continues side conversations.
+    fn followups(&self) -> bool {
+        self.report.as_ref().and_then(|r| r.side_followups) == Some(true)
+    }
+
+    /// Whether the panel's side conversation can take a follow-up now.
+    pub fn continuable(&self) -> bool {
+        let (Some(side), Some(latest)) = (
+            self.side.as_ref(),
+            self.report.as_ref().and_then(|r| r.side.as_ref()),
+        ) else {
+            return false;
+        };
+        side.state == SideState::Tracking(latest.id)
+            && !latest.ended
+            && matches!(
+                latest.status(),
+                proto::SideStatus::SideCompleted
+                    | proto::SideStatus::SideFailed
+                    | proto::SideStatus::SideCancelled
+            )
+            && self.followups()
+    }
+
+    /// btw mode: the side conversation takes the view and the input, while a
+    /// question runs or a follow-up can be asked.
+    pub fn btw_mode(&self) -> bool {
+        // A runner without follow-ups keeps the one-answer panel.
+        self.followups() && (self.side_view().is_some_and(|v| v.running()) || self.continuable())
+    }
+
+    /// Whether typing can go to the side conversation now, and why not. While
+    /// the panel is up, typing never goes to the agent as mail.
+    pub fn side_input(&self) -> Result<(), String> {
+        if self.side_view().is_some_and(|v| v.running()) {
+            return Err("Wait for the answer, or Esc to cancel it.".into());
+        }
+        if self.continuable() {
+            return Ok(());
+        }
+        Err(if self.followups() {
+            "Side conversation ended; your next /btw starts fresh.".into()
+        } else {
+            "Follow-ups need an update; Esc closes the side panel.".into()
         })
     }
 
@@ -249,16 +387,23 @@ impl Session {
             SideState::Asking => SideView::Asking,
             SideState::Unconfirmed(why) => SideView::Unconfirmed(why.clone()),
             SideState::NotAsked(why) => SideView::NotAsked(why.clone()),
+            SideState::Ended => SideView::Ended(String::new()),
             SideState::Tracking(id) => {
                 match self.report.as_ref().and_then(|r| r.side.as_ref()) {
                     Some(s) if s.id == *id => {
                         let answer = s.answer.clone().unwrap_or_default();
+                        // A follow-up could not go on, or the conversation can
+                        // no longer be continued (ended, idle, restarted).
+                        if s.status() == proto::SideStatus::SideEnded
+                            || (s.ended && s.status() != proto::SideStatus::SideOpen)
+                        {
+                            return Some(SideView::Ended(answer));
+                        }
                         match s.status() {
                             proto::SideStatus::SideOpen => SideView::Open(answer),
                             proto::SideStatus::SideCompleted => SideView::Completed(answer),
                             proto::SideStatus::SideFailed => SideView::Failed(answer),
                             proto::SideStatus::SideCancelled => SideView::Cancelled(answer),
-                            // A follow-up's conversation is gone; none are sent yet.
                             proto::SideStatus::SideInterrupted | proto::SideStatus::SideEnded => {
                                 SideView::Interrupted(answer)
                             }
@@ -273,8 +418,9 @@ impl Session {
         })
     }
 
-    /// Esc on the panel: cancel a question still running, or close one that
-    /// has finished. `None` when there is nothing to send.
+    /// Esc on the panel: cancel a question still running and stay, or close
+    /// the panel, ending a side conversation that could go on. `None` when
+    /// there is nothing to send.
     pub fn side_escape(&mut self) -> Option<Request> {
         let view = self.side_view()?;
         let side = self.side.as_mut()?;
@@ -293,6 +439,18 @@ impl Session {
                 Some(Request::CancelSide {
                     id: self.id,
                     side: *id,
+                    end: false,
+                })
+            }
+            (SideState::Tracking(id), _) => {
+                let id = *id;
+                let end = self.continuable();
+                self.side = None;
+                // Closed at once; a lost end falls to the runner's idle limit.
+                end.then_some(Request::CancelSide {
+                    id: self.id,
+                    side: id,
+                    end: true,
                 })
             }
             _ => {
@@ -309,27 +467,76 @@ impl Session {
         let Some(latest) = self.report.as_ref().and_then(|r| r.side.as_ref()) else {
             return;
         };
+        // A cancel shows done once its row is: a lost reply must not leave
+        // "Cancelling…" up.
+        if let Some(side) = self.side.as_mut()
+            && side.cancelling
+            && side.state == SideState::Tracking(latest.id)
+            && latest.status() != proto::SideStatus::SideOpen
+        {
+            side.cancelling = false;
+            side.notice = None;
+        }
+        // The asked conversation: a fresh question starts its own.
+        let own = |side: &Side| match side.conversation {
+            Some(c) => latest.conversation == Some(c),
+            None => latest.conversation.is_none_or(|c| c == latest.id),
+        };
         match &mut self.side {
+            Some(side) if side.state == SideState::Tracking(latest.id) => {
+                side.answer = latest.answer.clone().unwrap_or_default();
+                if side.conversation.is_none() {
+                    side.conversation = latest.conversation;
+                }
+            }
             Some(side)
                 if matches!(side.state, SideState::Unconfirmed(_))
                     && latest.id > side.baseline
-                    && latest.question == side.question =>
+                    && latest.question == side.question
+                    && latest.follows == side.follows
+                    && own(side) =>
             {
                 side.state = SideState::Tracking(latest.id);
                 side.notice = None;
+                side.conversation = latest.conversation;
+                if let Some(previous) = side.previous.take() {
+                    side.remember(previous);
+                }
                 self.asked_draft = Some(side.draft.clone());
             }
-            None if first => {
-                self.side = Some(Side {
-                    draft: String::new(),
-                    question: latest.question.clone(),
-                    baseline: latest.id,
-                    state: SideState::Tracking(latest.id),
-                    cancelling: false,
-                    notice: None,
-                    scroll: Cell::new(0),
-                });
+            // The same conversation went on from another view: keep this
+            // exchange, and say so if some were missed.
+            Some(side)
+                if matches!(side.state, SideState::Tracking(id) if latest.id > id)
+                    && side.conversation.is_some()
+                    && latest.conversation == side.conversation =>
+            {
+                let SideState::Tracking(tracked) = side.state else {
+                    unreachable!()
+                };
+                let exchange = Exchange {
+                    question: std::mem::replace(&mut side.question, latest.question.clone()),
+                    answer: std::mem::take(&mut side.answer),
+                };
+                side.remember(exchange);
+                if latest.follows != Some(tracked) {
+                    side.history_lost = true;
+                }
+                side.state = SideState::Tracking(latest.id);
+                side.baseline = latest.id;
+                side.answer = latest.answer.clone().unwrap_or_default();
             }
+            // Another view started a different conversation: show that one,
+            // never splicing in this one's history.
+            Some(side)
+                if matches!(side.state, SideState::Tracking(id) if latest.id > id)
+                    && side.conversation.is_some()
+                    && latest.conversation.is_some()
+                    && latest.conversation != side.conversation =>
+            {
+                *side = Side::adopt(latest);
+            }
+            None if first => self.side = Some(Side::adopt(latest)),
             _ => {}
         }
     }
@@ -499,11 +706,27 @@ impl Session {
                 side.state = match result {
                     Ok(side_id) => {
                         self.asked_draft = Some(side.draft.clone());
+                        if let Some(previous) = side.previous.take() {
+                            side.remember(previous);
+                        }
+                        // A fresh question starts its own conversation.
+                        if side.follows.is_none() {
+                            side.conversation = Some(*side_id);
+                        }
+                        side.answer.clear();
                         SideState::Tracking(*side_id)
                     }
                     // The server may have taken it: a newer report with the
                     // same question settles it; nothing is retried.
                     Err(SideError::Transient(why)) => SideState::Unconfirmed(why.clone()),
+                    // Any refused follow-up ends the conversation, whatever
+                    // the reason; the draft stays, fenced.
+                    Err(_) if side.follows.is_some() => {
+                        if let Some(previous) = side.previous.take() {
+                            side.remember(previous);
+                        }
+                        SideState::Ended
+                    }
                     Err(SideError::Unsupported(why) | SideError::Refused(why)) => {
                         SideState::NotAsked(why.clone())
                     }
@@ -691,8 +914,8 @@ pub fn context_lines(agent: &str, usage: Option<&ContextUsage>) -> Vec<Line<'sta
 
 /// The `/btw` panel's rows: a header, the question, the answer and a
 /// footer, at most `rows`.
-pub fn side_height(agent: &str, view: &SideView, width: u16, rows: u16) -> u16 {
-    let answer = Paragraph::new(side_body(agent, view))
+pub fn side_height(agent: &str, side: &Side, view: &SideView, width: u16, rows: u16) -> u16 {
+    let answer = Paragraph::new(side_text(agent, side, view))
         .wrap(Wrap { trim: false })
         .line_count(width);
     u16::try_from(answer.saturating_add(3))
@@ -702,7 +925,16 @@ pub fn side_height(agent: &str, view: &SideView, width: u16, rows: u16) -> u16 {
 
 /// Draw the `/btw` panel: the answer shows its end, less what was scrolled
 /// up.
-pub fn render_side(frame: &mut Frame, area: Rect, agent: &str, side: &Side, view: &SideView) {
+/// With `follow_up`, a follow-up can be asked now.
+pub fn render_side(
+    frame: &mut Frame,
+    area: Rect,
+    agent: &str,
+    side: &Side,
+    view: &SideView,
+    follow_up: bool,
+    hidden: usize,
+) {
     let width = usize::from(area.width);
     let (label, role) = match view {
         SideView::Asking => ("asking…", theme::Role::Muted),
@@ -715,6 +947,7 @@ pub fn render_side(frame: &mut Frame, area: Rect, agent: &str, side: &Side, view
         SideView::Unconfirmed(_) => ("not confirmed", theme::Role::Warning),
         SideView::NotAsked(_) => ("not asked", theme::Role::Error),
         SideView::Replaced => ("replaced", theme::Role::Muted),
+        SideView::Ended(_) => ("ended", theme::Role::Warning),
     };
     let header = theme::clip_line(
         Line::from(vec![
@@ -722,6 +955,14 @@ pub fn render_side(frame: &mut Frame, area: Rect, agent: &str, side: &Side, view
             Span::styled(agent.to_string(), theme::style(theme::Role::Agent)),
             Span::styled(" · ", theme::heading()),
             Span::styled(label, theme::style(role)),
+            Span::styled(
+                match hidden {
+                    0 => String::new(),
+                    1 => format!(" · 1 new message in {agent}"),
+                    n => format!(" · {n} new messages in {agent}"),
+                },
+                theme::dim(),
+            ),
         ]),
         width,
     );
@@ -738,6 +979,8 @@ pub fn render_side(frame: &mut Frame, area: Rect, agent: &str, side: &Side, view
             None => Line::styled(
                 if view.running() {
                     "Esc cancels · Alt-↑/↓ scrolls"
+                } else if follow_up {
+                    "Enter asks a follow-up · Esc ends · Alt-↑/↓ scrolls"
                 } else {
                     "Esc closes · Alt-↑/↓ scrolls"
                 },
@@ -756,7 +999,7 @@ pub fn render_side(frame: &mut Frame, area: Rect, agent: &str, side: &Side, view
     frame.render_widget(Paragraph::new(header), top);
     frame.render_widget(Paragraph::new(question), middle);
     frame.render_widget(Paragraph::new(footer), bottom);
-    let answer = Paragraph::new(side_body(agent, view)).wrap(Wrap { trim: false });
+    let answer = Paragraph::new(side_text(agent, side, view)).wrap(Wrap { trim: false });
     let total = answer.line_count(area.width);
     let shown = usize::from(answer_area.height);
     let scroll = side.scroll.get().min(total.saturating_sub(shown));
@@ -806,7 +1049,46 @@ fn side_body<'a>(agent: &str, view: &'a SideView) -> ratatui::text::Text<'a> {
             "A newer side question took this one's place.".into(),
             theme::dim(),
         ),
+        SideView::Ended(text) => {
+            let mut body = if text.trim().is_empty() {
+                Text::default()
+            } else {
+                let mut body = crate::ui::markdown::render(text);
+                body.lines.push(Line::default());
+                body
+            };
+            body.lines.push(Line::styled(
+                "Side conversation ended; your next /btw starts fresh.",
+                theme::style(theme::Role::Warning),
+            ));
+            body
+        }
     }
+}
+
+/// The side conversation's earlier exchanges kept in this session, then what
+/// the panel says below the question.
+fn side_text<'a>(agent: &str, side: &'a Side, view: &'a SideView) -> ratatui::text::Text<'a> {
+    use ratatui::text::Text;
+    let mut text = Text::default();
+    if side.history_lost {
+        text.lines.push(Line::styled(
+            format!("Earlier side questions aren't shown here; {agent} still has them in this side conversation."),
+            theme::dim(),
+        ));
+        text.lines.push(Line::default());
+    }
+    for exchange in &side.history {
+        text.lines.push(Line::styled(
+            format!("› {}", one_line(&exchange.question)),
+            theme::heading(),
+        ));
+        text.lines
+            .extend(crate::ui::markdown::render(&exchange.answer).lines);
+        text.lines.push(Line::default());
+    }
+    text.lines.extend(side_body(agent, view).lines);
+    text
 }
 
 /// A token count in a few columns: 950, 84k, 1.2M.
@@ -1412,6 +1694,39 @@ mod tests {
         press(&mut form, KeyCode::Char('c'));
         press(&mut form, KeyCode::Char('d'));
         assert_eq!(form.text[1].len(), 4096);
+    }
+
+    #[test]
+    fn side_history_keeps_the_newest_exchanges_within_its_bounds() {
+        let mut side = Side::new("", "q", 0, SideState::Asking);
+        for n in 0..25 {
+            side.remember(Exchange {
+                question: format!("q{n}"),
+                answer: "a".into(),
+            });
+        }
+        assert_eq!(side.history.len(), 20);
+        assert_eq!(side.history[0].question, "q5", "the oldest go first");
+        assert!(
+            side.history_lost,
+            "the panel says earlier ones are not shown"
+        );
+        let mut big = Side::new("", "q", 0, SideState::Asking);
+        for n in 0..3 {
+            big.remember(Exchange {
+                question: format!("q{n}"),
+                answer: "x".repeat(100 * 1024),
+            });
+        }
+        assert_eq!(big.history.len(), 2, "within 256 KiB");
+        assert!(big.history_lost);
+        // One exchange is always kept, however large.
+        let mut one = Side::new("", "q", 0, SideState::Asking);
+        one.remember(Exchange {
+            question: "q".into(),
+            answer: "x".repeat(300 * 1024),
+        });
+        assert_eq!(one.history.len(), 1);
     }
 
     #[test]
