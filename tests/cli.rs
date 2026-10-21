@@ -2921,6 +2921,21 @@ impl RunGuard {
         self.0.take().unwrap().wait_with_output().unwrap()
     }
 
+    /// Wait for the process to exit on its own; one still running after
+    /// `within` is killed and fails the test.
+    fn exits(mut self, within: std::time::Duration) -> std::process::Output {
+        let child = self.0.as_mut().unwrap();
+        let deadline = std::time::Instant::now() + within;
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("the runner was expected to exit within {within:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+
     /// Send `signal` to the process and return its output.
     fn stop_with(mut self, signal: &str) -> std::process::Output {
         let child = self.0.take().unwrap();
@@ -3377,6 +3392,175 @@ fn headless_codex_replies_steers_and_interrupts(mode: Mode) {
     assert!(!shown.contains("turn_error"), "{shown}");
 }
 
+fn headless_codex_adopts_an_acp_thread_and_never_starts_one_in_its_place(mode: Mode) {
+    let bbs = Bbs::with_mode("codex-adopt", mode);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_codex_resume.py");
+    let wire = bbs.home.join("codex-wire.jsonl");
+    let dir = bbs.home.join(".config/bbs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[headless]\n[headless.harness.codex]\ntype = \"codex-app-server\"\n\
+             command = [\"python3\", {fake:?}, {wire:?}]\n"
+        ),
+    )
+    .unwrap();
+    let state_path = bbs.home.join(".local/state/bbs/headless/zed/state.json");
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    // Run until the session opens, then stop; the requests bbs sent.
+    let session = |extra: &[&str]| -> Vec<serde_json::Value> {
+        let _ = std::fs::remove_file(&wire);
+        let _ = std::fs::remove_file(&log);
+        let run = RunGuard::start_with(&bbs, "Zed", extra);
+        eventually("the session", || {
+            std::fs::read_to_string(&log)
+                .ok()
+                .filter(|l| l.contains("\"event\":\"session\""))
+        });
+        run.stop();
+        std::fs::read_to_string(&wire)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+    let opened = |wire: &[serde_json::Value]| -> serde_json::Value {
+        wire.iter()
+            .find(|v| v["method"] == "thread/start" || v["method"] == "thread/resume")
+            .unwrap()
+            .clone()
+    };
+    let set_state = |harness: &str, session: &str, dynamic: bool| {
+        let mut state = headless_state(&bbs, "Zed");
+        state["harness"] = harness.into();
+        state["session_id"] = session.into();
+        match dynamic {
+            true => state["dynamic_tools"] = true.into(),
+            false => {
+                state.as_object_mut().unwrap().remove("dynamic_tools");
+            }
+        }
+        std::fs::write(&state_path, state.to_string()).unwrap();
+    };
+
+    // A new thread gets the tools as functions, and remembers it.
+    let first = opened(&session(&[]));
+    assert_eq!(first["method"], "thread/start");
+    assert!(first["params"]["dynamicTools"].is_array());
+    assert_eq!(headless_state(&bbs, "Zed")["dynamic_tools"], true);
+    // Resuming it sends no MCP server: the thread keeps its tools.
+    let again = opened(&session(&[]));
+    assert_eq!(again["method"], "thread/resume");
+    assert!(again["params"].get("config").is_none(), "{again}");
+
+    // A thread opened through ACP (codex-acp), saved under the same
+    // profile name: resumed with the BBS MCP server, as ACP gave it.
+    set_state("codex", "acp-thread", false);
+    let wire = session(&[]);
+    let resume = opened(&wire);
+    assert_eq!(resume["method"], "thread/resume");
+    assert_eq!(resume["params"]["threadId"], "acp-thread");
+    let server = &resume["params"]["config"]["mcp_servers"]["bbs"];
+    assert!(
+        server["command"].as_str().unwrap().ends_with("bbs"),
+        "{server}"
+    );
+    assert_eq!(server["args"][0], "headless");
+    assert!(server["env"]["BBS_HEADLESS_TOKEN"].is_string(), "{server}");
+    assert!(resume["params"].get("dynamicTools").is_none());
+    assert!(!wire.iter().any(|v| v["method"] == "thread/start"));
+    let state = headless_state(&bbs, "Zed");
+    assert_eq!(state["session_id"], "acp-thread");
+    assert!(state.get("dynamic_tools").is_none(), "{state}");
+
+    // If that thread cannot be resumed, bbs stops; it never starts a new
+    // thread in its place or forgets the saved one.
+    set_state("codex", "gone-thread", false);
+    let before = headless_state(&bbs, "Zed");
+    let _ = std::fs::remove_file(bbs.home.join("codex-wire.jsonl"));
+    let out = RunGuard::start_with(&bbs, "Zed", &[]).exits(std::time::Duration::from_secs(30));
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not starting a new thread"), "{err}");
+    assert_eq!(headless_state(&bbs, "Zed"), before);
+    let wire_text = std::fs::read_to_string(bbs.home.join("codex-wire.jsonl")).unwrap();
+    assert!(!wire_text.contains("thread/start"), "{wire_text}");
+
+    // A session saved under another profile name, as after renaming one, is
+    // adopted only when asked, and then strictly.
+    set_state("codex-old", "acp-thread", false);
+    let fresh = opened(&session(&[]));
+    assert_eq!(fresh["method"], "thread/start", "another profile's session");
+    set_state("codex-old", "acp-thread", false);
+    let adopted = opened(&session(&["--adopt-session", "codex-old"]));
+    assert_eq!(adopted["params"]["threadId"], "acp-thread");
+    assert!(adopted["params"]["config"]["mcp_servers"]["bbs"].is_object());
+    assert_eq!(headless_state(&bbs, "Zed")["harness"], "codex");
+    set_state("codex-old", "gone-thread", false);
+    let out = RunGuard::start_with(&bbs, "Zed", &["--adopt-session", "codex-old"])
+        .exits(std::time::Duration::from_secs(30));
+    assert!(!out.status.success());
+    assert_eq!(headless_state(&bbs, "Zed")["session_id"], "gone-thread");
+    // Asked to adopt from a profile nothing is saved under: refused.
+    let out = RunGuard::start_with(&bbs, "Zed", &["--adopt-session", "nowhere"])
+        .exits(std::time::Duration::from_secs(30));
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no session saved under harness \"nowhere\""),
+        "{err}"
+    );
+}
+
+fn headless_acp_adopts_a_renamed_profiles_session_or_stops(mode: Mode) {
+    let bbs = Bbs::with_mode("acp-adopt", mode);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");
+    headless_config(&bbs, &["python3", fake]);
+    let state_path = bbs.home.join(".local/state/bbs/headless/zed/state.json");
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    let opened = |extra: &[&str]| {
+        let _ = std::fs::remove_file(&log);
+        let run = RunGuard::start_with(&bbs, "Zed", extra);
+        let line = eventually("the session", || {
+            std::fs::read_to_string(&log)
+                .ok()?
+                .lines()
+                .find(|l| l.contains("\"event\":\"session\""))
+                .map(str::to_string)
+        });
+        run.stop();
+        line
+    };
+    opened(&[]);
+    let saved = |session: &str| {
+        let mut state = headless_state(&bbs, "Zed");
+        state["harness"] = "codex".into();
+        state["session_id"] = session.into();
+        std::fs::write(&state_path, state.to_string()).unwrap();
+    };
+    // Saved under the profile's old name: adopted when asked.
+    saved("acp-session");
+    let line = opened(&["--adopt-session", "codex"]);
+    assert!(
+        line.contains("\"resumed\":true") && line.contains("acp-session"),
+        "{line}"
+    );
+    let state = headless_state(&bbs, "Zed");
+    assert_eq!(
+        (&state["harness"], &state["session_id"]),
+        (&"fake".into(), &"acp-session".into())
+    );
+    // If it cannot be resumed, the run stops and keeps the saved session.
+    saved("gone-session");
+    let out = RunGuard::start_with(&bbs, "Zed", &["--adopt-session", "codex"])
+        .exits(std::time::Duration::from_secs(30));
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not opening a new one"), "{err}");
+    assert_eq!(headless_state(&bbs, "Zed")["session_id"], "gone-session");
+}
+
 fn headless_stops_after_repeated_turn_errors(mode: Mode) {
     let bbs = Bbs::with_mode("turn-errors", mode);
     let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");
@@ -3673,6 +3857,8 @@ both_modes!(
     headless_process_mcp_env_routes_without_serializing_credentials,
     headless_shares_activity_by_default,
     headless_codex_replies_steers_and_interrupts,
+    headless_codex_adopts_an_acp_thread_and_never_starts_one_in_its_place,
+    headless_acp_adopts_a_renamed_profiles_session_or_stops,
     headless_stops_after_repeated_turn_errors,
     headless_new_session_skips_resume,
     connect_is_for_humans_at_a_terminal,

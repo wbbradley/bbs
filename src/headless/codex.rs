@@ -14,9 +14,10 @@ use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 
+use super::acp::McpServer;
 use super::effort;
 use super::harness::{
-    EffortUnconfirmed, Event, MAX_INPUT_CHARS, PromptNotStarted, SETUP_TIMEOUT, truncate,
+    EffortUnconfirmed, Event, MAX_INPUT_CHARS, PromptNotStarted, Resume, SETUP_TIMEOUT, truncate,
 };
 use super::mcp::{Tools, tool_list};
 use super::rpc::{Incoming, Process, Rpc};
@@ -158,6 +159,10 @@ pub struct Codex {
     events: mpsc::UnboundedSender<Event>,
     thread_id: String,
     pub resumed: bool,
+    /// The thread holds the BBS tools as plain functions; otherwise they come
+    /// from `mcp`, the MCP server config sent with the thread and its forks.
+    pub dynamic_tools: bool,
+    mcp: Option<Value>,
     turn: Arc<TurnState>,
     side: Arc<codex_btw::SideChannel>,
     side_tools: Arc<tokio::sync::Mutex<Tools>>,
@@ -171,7 +176,8 @@ impl Codex {
         cwd: &Path,
         stderr: &Path,
         tools: Tools,
-        resume: Option<&str>,
+        mcp: &McpServer,
+        resume: Option<Resume<'_>>,
         input_enabled: bool,
     ) -> Result<(Codex, Process, mpsc::UnboundedReceiver<Event>)> {
         let (events, rx) = mpsc::unbounded_channel();
@@ -203,11 +209,13 @@ impl Codex {
             events,
             thread_id: String::new(),
             resumed: false,
+            dynamic_tools: false,
+            mcp: None,
             turn,
             side,
             side_tools,
         };
-        match timeout(SETUP_TIMEOUT, codex.open_thread(config, cwd, resume)).await {
+        match timeout(SETUP_TIMEOUT, codex.open_thread(config, cwd, mcp, resume)).await {
             Ok(Ok(())) => Ok((codex, process, rx)),
             Ok(Err(err)) => {
                 process.stop().await;
@@ -224,7 +232,8 @@ impl Codex {
         &mut self,
         config: &HarnessConfig,
         cwd: &Path,
-        resume: Option<&str>,
+        mcp: &McpServer,
+        resume: Option<Resume<'_>>,
     ) -> Result<()> {
         self.rpc
             .request(
@@ -236,8 +245,9 @@ impl Codex {
                 }),
             )
             .await?;
-        // Sent on resume too, so config changes apply; the dynamic tools are
-        // sent only on thread/start, since a resumed thread keeps them.
+        // Sent on resume too, so config changes apply. The dynamic tools are
+        // sent only on thread/start, since a resumed thread keeps them; a
+        // thread opened through ACP has none, so its MCP server comes again.
         let mut params = json!({
             "cwd": cwd.display().to_string(),
             "approvalPolicy": "never",
@@ -249,22 +259,37 @@ impl Codex {
         if let Some(provider) = &config.provider {
             params["modelProvider"] = provider.clone().into();
         }
-        if let Some(id) = resume {
+        if let Some(Resume {
+            id,
+            dynamic_tools,
+            strict,
+        }) = resume
+        {
             self.effort.lock().unwrap().parent = Some(id.to_string());
             let mut resume_params = params.clone();
             resume_params["threadId"] = id.into();
+            let mcp = (!dynamic_tools).then(|| mcp_config(mcp));
+            if let Some(mcp) = &mcp {
+                resume_params["config"] = mcp.clone();
+            }
             match self.rpc.request("thread/resume", resume_params).await {
                 Ok(result) => {
                     self.discover_effort(&result).await;
                     self.thread_id = id.to_string();
                     self.resumed = true;
+                    self.dynamic_tools = dynamic_tools;
+                    self.mcp = mcp;
                     return Ok(());
+                }
+                Err(err) if strict => {
+                    bail!("resuming codex thread {id} failed: {err:#}; not starting a new thread")
                 }
                 Err(err) => tracing::warn!("resuming codex thread {id} failed: {err:#}"),
             }
         }
         self.effort.lock().unwrap().parent = None;
         params["dynamicTools"] = dynamic_tools();
+        self.dynamic_tools = true;
         let result = self.rpc.request("thread/start", params).await?;
         self.thread_id = result["thread"]["id"]
             .as_str()
@@ -284,6 +309,7 @@ impl Codex {
             .run(
                 &self.rpc,
                 &self.thread_id,
+                self.mcp.as_ref(),
                 question,
                 cancel,
                 &self.side_tools,
@@ -528,6 +554,19 @@ impl Codex {
 
 fn input(text: &str) -> Value {
     json!([{ "type": "text", "text": text }])
+}
+
+/// Codex session config starting `mcp`, as ACP harnesses give it to Codex.
+fn mcp_config(mcp: &McpServer) -> Value {
+    json!({ "mcp_servers": { mcp.name.clone(): {
+        "command": mcp.command,
+        "args": mcp.args,
+        "env": mcp
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::from(v.clone())))
+            .collect::<serde_json::Map<String, Value>>(),
+    }}})
 }
 
 /// The BBS tools as plain functions, which reach the model without a namespace.

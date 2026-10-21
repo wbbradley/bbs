@@ -219,6 +219,7 @@ impl SideChannel {
         self: &Arc<Self>,
         rpc: &Rpc,
         parent: &str,
+        mcp: Option<&Value>,
         question: &str,
         mut cancel: watch::Receiver<bool>,
         tools: &Arc<tokio::sync::Mutex<Tools>>,
@@ -267,7 +268,14 @@ impl SideChannel {
             let fork_reply = observed_call(
                 rpc,
                 "thread/fork",
-                json!({"threadId":parent,"ephemeral":true,"excludeTurns":true}),
+                {
+                    // A fork inherits plain-function tools but not MCP servers.
+                    let mut fork = json!({"threadId":parent,"ephemeral":true,"excludeTurns":true});
+                    if let Some(mcp) = mcp {
+                        fork["config"] = mcp.clone();
+                    }
+                    fork
+                },
                 Late::Fork(parent.into()),
             );
             let fork = timeout_at(work_deadline.min(Instant::now() + SETUP), fork_reply).await??;
@@ -587,7 +595,7 @@ mod tests {
     use super::*;
     use crate::headless::{
         acp::McpServer,
-        harness::{BbsTools, Event, Harness},
+        harness::{BbsTools, Event, Harness, Resume},
         rpc::Process,
         settings::{HarnessConfig, HarnessType},
     };
@@ -600,6 +608,21 @@ mod tests {
     use tokio::sync::mpsc;
     impl Rig {
         async fn new(scenario: &str) -> Self {
+            Self::open(scenario, None).await
+        }
+        /// A parent opened through ACP, resumed with its BBS MCP server.
+        async fn adopted() -> Self {
+            Self::open(
+                "adopted",
+                Some(Resume {
+                    id: "parent",
+                    dynamic_tools: false,
+                    strict: true,
+                }),
+            )
+            .await
+        }
+        async fn open(scenario: &str, resume: Option<Resume<'_>>) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let config = HarnessConfig {
                 kind: HarnessType::CodexAppServer,
@@ -617,14 +640,14 @@ mod tests {
                 BbsTools {
                     mcp: McpServer {
                         name: "bbs".into(),
-                        command: "unused".into(),
+                        command: "bbs-fixture".into(),
                         args: vec![],
-                        env: vec![],
+                        env: vec![("BBS_HEADLESS_TOKEN".into(), "fixture".into())],
                     },
                     tools: Tools::new(dir.path(), "synthetic-unused".into()),
                     input_enabled: true,
                 },
-                None,
+                resume,
             )
             .await
             .unwrap();
@@ -735,6 +758,26 @@ mod tests {
             }));
             r.finish(parent).await;
         }
+    }
+    #[tokio::test]
+    async fn an_adopted_parent_forks_its_side_child_with_its_mcp_server() {
+        let mut r = Rig::adopted().await;
+        let parent = r.parent().await;
+        let (_cancel, rx) = watch::channel(false);
+        let result = timeout(Duration::from_secs(5), r.side(rx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, Status::Completed);
+        assert_eq!(result.answer, "side prefix\nside final\n");
+        assert!(!r.harness.dynamic_tools());
+        // The fake checked the resume and fork both carry the MCP server.
+        let wire = r.wire();
+        assert!(!wire.iter().any(|v| v["method"] == "thread/start"));
+        let fork = wire.iter().find(|v| v["method"] == "thread/fork").unwrap();
+        assert!(fork["params"]["config"]["mcp_servers"]["bbs"].is_object());
+        assert!(!parent.is_finished());
+        r.finish(parent).await;
     }
     #[tokio::test]
     async fn unsupported_prerequisites_never_submit_child_prompt() {

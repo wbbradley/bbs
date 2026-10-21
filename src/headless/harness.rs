@@ -51,6 +51,18 @@ pub struct BbsTools {
     pub input_enabled: bool,
 }
 
+/// A saved session to resume.
+#[derive(Clone, Copy)]
+pub struct Resume<'a> {
+    pub id: &'a str,
+    /// Codex: the thread was started with the BBS tools as plain functions,
+    /// which it keeps. Otherwise it was opened through ACP and has them only
+    /// from an MCP server, which must be supplied again.
+    pub dynamic_tools: bool,
+    /// Fail rather than open a new session when this one cannot be resumed.
+    pub strict: bool,
+}
+
 #[derive(Clone)]
 pub enum Harness {
     Acp(Acp),
@@ -71,7 +83,7 @@ impl Harness {
         cwd: &Path,
         stderr: &Path,
         bbs: BbsTools,
-        resume: Option<&str>,
+        resume: Option<Resume<'_>>,
     ) -> Result<Started> {
         Ok(match config.kind {
             HarnessType::Acp => {
@@ -80,11 +92,27 @@ impl Harness {
                 (Harness::Acp(acp), process, events, warnings)
             }
             HarnessType::CodexAppServer => {
-                let (codex, process, events) =
-                    Codex::start(config, cwd, stderr, bbs.tools, resume, bbs.input_enabled).await?;
+                let (codex, process, events) = Codex::start(
+                    config,
+                    cwd,
+                    stderr,
+                    bbs.tools,
+                    &bbs.mcp,
+                    resume,
+                    bbs.input_enabled,
+                )
+                .await?;
                 (Harness::Codex(codex), process, events, Vec::new())
             }
         })
+    }
+
+    /// Whether the session's thread holds the BBS tools as plain functions.
+    pub fn dynamic_tools(&self) -> bool {
+        match self {
+            Harness::Acp(_) => false,
+            Harness::Codex(codex) => codex.dynamic_tools,
+        }
     }
 
     pub fn session_id(&self) -> &str {

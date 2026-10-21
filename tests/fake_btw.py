@@ -11,6 +11,8 @@ parent_live = False
 child_live = False
 waiting = set()
 record_pid = os.getpid()
+# The BBS MCP server an "adopted" parent (opened through ACP) is resumed with.
+MCP = dict(mcp_servers=dict(bbs=dict(command='bbs-fixture',args=[],env=dict(BBS_HEADLESS_TOKEN='fixture'))))
 
 def record(kind, **fields):
     with open('btw-wire.jsonl','a') as f: f.write(json.dumps(dict(kind=kind,**fields))+'\n')
@@ -39,7 +41,7 @@ for line in sys.stdin:
     if method is None:
         record('callback',id=mid,response=msg)
         waiting.discard(mid)
-        if not waiting and child_live and scenario in ['normal','early','tools']:
+        if not waiting and child_live and scenario in ['normal','early','tools','adopted']:
             text('child','s','side final\n')
             done('child','s')
         continue
@@ -47,13 +49,20 @@ for line in sys.stdin:
     if method=='initialize':reply(mid,{})
     elif method=='model/list':reply(mid,dict(data=[],nextCursor=None))
     elif method in ['thread/start','thread/resume']:
-        if method=='thread/start':assert any(t['name']=='bbs_agents' for t in p['dynamicTools'])
+        if method=='thread/start':assert scenario!='adopted' and any(t['name']=='bbs_agents' for t in p['dynamicTools'])
+        # A thread opened through ACP gets its MCP server again; one bbs
+        # started keeps its plain-function tools and gets none.
+        elif scenario=='adopted':assert p['config']==MCP and 'dynamicTools' not in p
+        else:assert 'config' not in p and 'dynamicTools' not in p
         reply(mid,dict(thread=dict(id='parent'),model='fixture',reasoningEffort='low'))
     elif method=='thread/fork':
         # As Codex 0.160.1 refuses it.
         if p.get('ephemeral') and p.get('deferGoalContinuation'):
             error(mid,-32600,'`deferGoalContinuation` cannot be combined with `ephemeral`');continue
-        assert p==dict(threadId='parent',ephemeral=True,excludeTurns=True)
+        expected=dict(threadId='parent',ephemeral=True,excludeTurns=True)
+        # A fork inherits plain-function tools, but an MCP server only if given.
+        if scenario=='adopted':expected['config']=MCP
+        assert p==expected
         if scenario=='no-fork':error(mid);continue
         fork=dict(thread=dict(id='child',forkedFromId='parent',ephemeral=True))
         if scenario=='bad-fork':fork['thread']['ephemeral']=False

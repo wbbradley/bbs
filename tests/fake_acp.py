@@ -81,6 +81,8 @@ def main():
                 "agentCapabilities": caps,
                 "authMethods": [],
             }})
+        elif method in ("session/load", "session/resume") and params["sessionId"].startswith("gone"):
+            out({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": "no such session"}})
         elif method in ("session/new", "session/load", "session/resume"):
             mcp = Mcp(params["mcpServers"][0])
             if os.environ.get("FAKE_MCP_PROCESS_ENV"):

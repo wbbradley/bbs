@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -12,11 +12,11 @@ use tokio::time::Instant;
 
 use super::acp::McpServer;
 use super::effort;
-use super::harness::{BbsTools, EffortUnconfirmed, Event, Harness, PromptNotStarted};
+use super::harness::{BbsTools, EffortUnconfirmed, Event, Harness, PromptNotStarted, Resume};
 use super::log::Log;
 use super::mcp::{TOKEN_ENV, Tools};
 use super::outbox::{self, Outbox};
-use super::settings::{DEFAULT_MAX_TURN_ERRORS, McpEnv, MidTurn, Settings};
+use super::settings::{DEFAULT_MAX_TURN_ERRORS, HarnessType, McpEnv, MidTurn, Settings};
 use super::state::{AgentDir, State};
 use super::{share, side};
 use crate::app::format_messages;
@@ -148,10 +148,32 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             )
             .collect(),
     };
+    let saved = state.harness.as_deref();
+    if let Some(from) = &args.adopt_session
+        && saved != Some(from.as_str())
+        && saved != Some(harness.as_str())
+    {
+        bail!(
+            "no session saved under harness {from:?} to adopt (saved under {})",
+            saved.map_or("none".to_string(), |s| format!("{s:?}"))
+        );
+    }
+    let adopting = args.adopt_session.is_some();
     let resume = state
         .session_id
-        .clone()
-        .filter(|_| !args.new_session && state.harness.as_deref() == Some(harness.as_str()));
+        .as_deref()
+        .filter(|_| {
+            !args.new_session
+                && (saved == Some(harness.as_str()) || saved == args.adopt_session.as_deref())
+        })
+        .map(|id| Resume {
+            id,
+            dynamic_tools: state.dynamic_tools,
+            // Adopting, or a Codex app-server resuming a thread opened through
+            // ACP: a new session would lose the conversation, so fail instead.
+            strict: adopting
+                || (harness_config.kind == HarnessType::CodexAppServer && !state.dynamic_tools),
+        });
     // Listen before starting the harness: a signal during setup drops the
     // start, which kills the harness's process group.
     let mut signals = Signals::new()?;
@@ -171,7 +193,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             &cwd,
             &stderr,
             BbsTools { mcp, tools: Tools::new(dir, token.clone()).auto_owner_reply(), input_enabled: side_session.is_some() },
-            resume.as_deref(),
+            resume,
         ) => started,
         _ = signals.recv() => Err(anyhow::anyhow!("stopped during harness setup")),
     };
@@ -189,6 +211,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     };
     state.harness = Some(harness.clone());
     state.session_id = Some(agent_harness.session_id().to_string());
+    state.dynamic_tools = agent_harness.dynamic_tools();
     agent_dir.save(&state)?;
     log.event(
         "session",

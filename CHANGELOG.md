@@ -8,6 +8,14 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- `bbs headless` Codex app-server harnesses continue conversations opened
+  through `codex-acp`: a resumed thread gets its BBS MCP server again, on
+  every resume and for `/btw` side forks, and failing to resume it stops the
+  runner instead of starting a new thread. `--adopt-session PROFILE` resumes a
+  session saved under another harness profile, such as a renamed one.
+
 ### Fixed
 
 - In agent conversations, paging down to the newest view resumes following

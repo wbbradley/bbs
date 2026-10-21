@@ -377,6 +377,10 @@ pub struct HeadlessRunArgs {
     /// Start a new harness session instead of resuming the saved one.
     #[arg(long)]
     pub new_session: bool,
+    /// Resume the session saved under another harness profile, such as the
+    /// one a profile was renamed from; fail rather than start a new session.
+    #[arg(long, value_name = "PROFILE", conflicts_with = "new_session")]
+    pub adopt_session: Option<String>,
     /// What to do with mail that arrives during a turn.
     #[arg(long, value_enum)]
     pub mid_turn: Option<crate::headless::MidTurn>,

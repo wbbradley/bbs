@@ -159,7 +159,7 @@ impl Acp {
         cwd: &Path,
         stderr: &Path,
         mcp: &McpServer,
-        resume: Option<&str>,
+        resume: Option<super::harness::Resume<'_>>,
         input_enabled: bool,
     ) -> Result<(Acp, Process, mpsc::UnboundedReceiver<Event>, Vec<String>)> {
         let mut env = config.env.clone();
@@ -222,14 +222,14 @@ impl Acp {
         config: &HarnessConfig,
         cwd: &Path,
         mcp: &McpServer,
-        resume: Option<&str>,
+        resume: Option<super::harness::Resume<'_>>,
     ) -> Result<Vec<String>> {
         let acp = self;
         let caps = acp.initialize().await?;
         let cwd = cwd.display().to_string();
         let servers = json!([mcp.to_json()]);
         let mut opened = None;
-        if let Some(id) = resume {
+        if let Some(super::harness::Resume { id, strict, .. }) = resume {
             let params = json!({ "sessionId": id, "cwd": cwd, "mcpServers": servers });
             let method = if caps.resume {
                 Some("session/resume")
@@ -249,8 +249,15 @@ impl Acp {
                         acp.session_resumed = true;
                         opened = Some(result);
                     }
+                    Err(err) if strict => {
+                        bail!(
+                            "resuming harness session {id} failed: {err:#}; not opening a new one"
+                        )
+                    }
                     Err(err) => tracing::warn!("resuming harness session {id} failed: {err:#}"),
                 }
+            } else if strict {
+                bail!("the harness cannot resume session {id}; not opening a new one");
             }
         }
         let result = match opened {

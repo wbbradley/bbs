@@ -17,6 +17,10 @@ pub struct State {
     /// The harness that owns `session_id`.
     pub harness: Option<String>,
     pub session_id: Option<String>,
+    /// Codex: the session's thread holds the BBS tools as plain functions.
+    /// Without it, the thread was opened through ACP with an MCP server.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dynamic_tools: bool,
 }
 
 pub struct AgentDir {
