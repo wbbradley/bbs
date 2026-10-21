@@ -145,6 +145,9 @@ message SideRequest {
   // answered it is gone, or it was INTERRUPTED or ENDED. Derived by the
   // server.
   bool ended = 7;
+  // side-conversations.v1: the id of this conversation's first question; a
+  // question that starts a conversation has its own id.
+  optional int64 conversation = 8;
 }
 message AskSideRequest {
   string agent = 1;
@@ -172,7 +175,9 @@ message ClaimSideResponse {
 message ReportSideRequest {
   string generation = 1;
   int64 id = 2;
-  // OPEN, COMPLETED, FAILED, or ENDED (only for an OPEN follow-up).
+  // OPEN, COMPLETED, FAILED, or ENDED: for an OPEN follow-up whose
+  // conversation is gone, or the latest terminal question this generation
+  // answered when its child is lost (marks the conversation ended).
   SideStatus status = 3;
   optional string answer = 4;  // <= 64 KiB
 }

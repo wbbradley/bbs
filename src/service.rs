@@ -1369,6 +1369,7 @@ fn side_status_proto(status: &str) -> proto::SideStatus {
 
 fn side_request_proto(row: db::SideRequestRow) -> Result<proto::SideRequest> {
     Ok(proto::SideRequest {
+        conversation: None,
         ended: false,
         follows: None,
         id: row.id,

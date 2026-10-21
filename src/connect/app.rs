@@ -3270,6 +3270,7 @@ mod tests {
             result: Ok(Box::new(proto::SideReportResponse {
                 side_supported: Some(true),
                 side: side.map(|(id, question, status, answer)| proto::SideRequest {
+                    conversation: None,
                     ended: false,
                     follows: None,
                     id,
