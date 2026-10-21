@@ -5386,6 +5386,135 @@ mod tests {
         }
     }
 
+    /// Mateo's conversation holding `n` one-line messages from Zed.
+    fn mateo_with(app: &mut App, rx: &mut UnboundedReceiver<Request>, n: i64) {
+        let id = mateo(app, rx);
+        app.on_event(Event::Data(Data::Feed {
+            id,
+            result: Ok((1..=n)
+                .map(|id| message(id, "Zed", "Mateo", &format!("message {id}")))
+                .collect()),
+        }));
+    }
+
+    #[test]
+    fn up_scrolls_only_from_the_first_display_row_of_a_wrapped_draft() {
+        let (mut app, mut rx) = app();
+        mateo_with(&mut app, &mut rx, 60);
+        // One logical line that wraps onto three display rows at 80 columns.
+        typed(&mut app, &"word ".repeat(40));
+        screen(&mut app, 80, 24);
+        // From the last and middle rows, Up moves within the draft.
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert!(editor_focused(&mut app), "a lower display row edits");
+        }
+        // From the first display row, Up starts navigation, a line up.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        let out = screen(&mut app, 80, 24);
+        assert!(!editor_focused(&mut app) && out.contains("paused"), "{out}");
+        assert_eq!(
+            draft_text(&mut app),
+            "word ".repeat(40),
+            "the draft is untouched"
+        );
+        // A first line that wraps, with a second line below: Up from the
+        // second line goes to the first line's last row, still editing.
+        let (mut app, mut rx) = self::app();
+        mateo_with(&mut app, &mut rx, 60);
+        typed(&mut app, &"word ".repeat(20));
+        press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+        typed(&mut app, "second");
+        screen(&mut app, 80, 24);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert!(editor_focused(&mut app), "the first line's lower row edits");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert!(editor_focused(&mut app), "row 0 is reached, still editing");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert!(!editor_focused(&mut app), "only now does Up scroll");
+    }
+
+    #[test]
+    fn down_at_the_newest_view_follows_and_returns_to_writing() {
+        let (mut app, mut rx) = app();
+        let id = mateo(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id,
+            result: Ok((1..=60)
+                .map(|id| message(id, "Zed", "Mateo", &format!("message {id}")))
+                .collect()),
+        }));
+        screen(&mut app, 80, 24);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        // Mail arrives while paused, and is counted.
+        app.on_event(Event::Data(Data::Feed {
+            id,
+            result: Ok(vec![message(61, "Zed", "Mateo", "message 61")]),
+        }));
+        assert!(bottom(&mut app).contains("1 new"));
+        // Down a line at a time; at the newest view, follow and write.
+        let mut steps = 0;
+        while !editor_focused(&mut app) {
+            assert!(bottom(&mut app).contains("paused"));
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            steps += 1;
+            assert!(steps < 200, "Down reaches the newest view");
+        }
+        let row = bottom(&mut app);
+        assert!(row.contains("following") && !row.contains("new"), "{row}");
+        assert!(steps > 1, "one line at a time");
+        // A view that already fits: Down from navigation writes at once.
+        let (mut app, mut rx) = self::app();
+        mateo_with(&mut app, &mut rx, 2);
+        screen(&mut app, 80, 24);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        assert!(!editor_focused(&mut app));
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert!(editor_focused(&mut app));
+    }
+
+    #[test]
+    fn a_page_key_moves_two_thirds_of_the_view_keeping_context() {
+        let visible = |out: &str| -> Vec<i64> {
+            out.lines()
+                .filter_map(|l| l.trim().strip_prefix("message "))
+                .filter_map(|n| n.trim().parse().ok())
+                .collect()
+        };
+        let (mut app, mut rx) = app();
+        mateo_with(&mut app, &mut rx, 200);
+        let before = visible(&screen(&mut app, 80, 24));
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        let after = visible(&screen(&mut app, 80, 24));
+        let kept: Vec<_> = after.iter().filter(|n| before.contains(n)).collect();
+        assert!(
+            !kept.is_empty(),
+            "a third of the view stays: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.iter().min() < before.iter().min(),
+            "and older mail shows"
+        );
+        // The same distance back down.
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(visible(&screen(&mut app, 80, 24)), before);
+    }
+
+    #[test]
+    fn up_at_the_top_of_a_side_draft_stays_in_the_side_conversation() {
+        let (mut app, mut rx) = app();
+        mateo_with(&mut app, &mut rx, 60);
+        answered_btw(&mut app, &mut rx);
+        typed(&mut app, "side thought");
+        screen(&mut app, 80, 24);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            editor_focused(&mut app) && out.contains("btw · Mateo") && !out.contains("paused"),
+            "{out}"
+        );
+    }
+
     #[test]
     fn agent_insert_and_navigation_modes_use_explicit_switches() {
         let (mut app, mut rx) = app();
@@ -5400,11 +5529,15 @@ mod tests {
         typed(&mut app, "first");
         press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
         typed(&mut app, "second");
-        // Up from either line stays in the editor, including at its top.
-        for _ in 0..3 {
-            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
-            assert!(editor_focused(&mut app));
-        }
+        // Up from the second line stays in the editor; Up from its top
+        // switches to navigation, scrolling up a line. Esc writes again.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert!(editor_focused(&mut app));
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        let out = screen(&mut app, 100, 24);
+        assert!(!editor_focused(&mut app) && out.contains("paused"), "{out}");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(editor_focused(&mut app));
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         let out = screen(&mut app, 100, 24);
         assert!(!editor_focused(&mut app) && out.contains("paused"), "{out}");

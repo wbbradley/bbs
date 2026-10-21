@@ -153,6 +153,15 @@ impl Composer {
             .saturating_add(2)
     }
 
+    /// Whether the cursor is on the first display row of the whole draft, as
+    /// last drawn; before any draw, on its first line.
+    pub fn on_first_row(&self) -> bool {
+        if self.area.width == 0 {
+            return self.text.cursor().0 == 0;
+        }
+        self.layout(self.area.width).point(self.text.cursor()).row == 0
+    }
+
     /// Only movements defined in display rows use the local map. Logical edits,
     /// selection, history and word/paragraph movements remain in TextArea.
     fn navigate(&mut self, key: KeyEvent) -> bool {

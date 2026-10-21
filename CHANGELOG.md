@@ -28,6 +28,13 @@ the pre-upgrade backup loses subsequent changes.
   restarts. Needs a server and runner with `side-conversations.v1`. While any
   side panel is up, typing no longer goes to the agent as mail.
 
+### Changed
+
+- `bbs connect` agent conversations: `↑` on the draft's first display row
+  switches to navigation and scrolls up a line, and `↓` at the newest view
+  returns to writing, as `PgDn` does. Page keys move two thirds of the view.
+
+
 ## 0.11.2 - 2026-10-21
 
 Client and headless-runner improvements. Protocol v2, database schema 19,

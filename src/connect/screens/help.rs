@@ -16,10 +16,10 @@ const AGENT_KEYS: &[(&str, &str)] = &[
         "Agent insert",
         "Enter sends; Esc back, saving the draft/cursor",
     ),
-    ("PgUp", "agent insert: navigate the timeline"),
+    ("PgUp", "agent insert: navigate, two thirds of a page up"),
     (
-        "PgDn",
-        "agent navigation: follow and focus input at the bottom",
+        "PgDn / ↓",
+        "agent navigation: at the bottom, follow and focus input",
     ),
     ("Ctrl-U", "insert: delete to line start; join at column 0"),
     ("Esc", "agent navigation: return to insert mode"),
@@ -27,7 +27,10 @@ const AGENT_KEYS: &[(&str, &str)] = &[
         "Ctrl-T",
         "agents: compact (no tool calls or others' mail) / verbose",
     ),
-    ("↑ / ↓", "agent insert: move within the draft"),
+    (
+        "↑ / ↓",
+        "agent insert: move within the draft; ↑ on its top row navigates",
+    ),
     (
         "Tab / Shift-Tab",
         "agents: increase / decrease effort; default opens picker",

@@ -378,10 +378,13 @@ and Home/End work everywhere too.
   straight to a screen.
 - Agent conversations open in Insert mode, with the composer active. `PgUp` switches to navigation and scrolls the timeline. In navigation,
   `Esc` returns to Insert mode; in Insert mode, `Esc` goes back to Agents.
-  Paging down to the newest view resumes following and returns focus to the composer.
-  Agent and group drafts and cursor positions are restored when their discussions
-  are reopened, including in a later `connect` session. Arrow keys, including `Up`
-  on the first line, stay within the editor while in Insert mode.
+  Paging or arrowing down to the newest view resumes following and returns
+  focus to the composer. Page keys move two thirds of the view. Agent and group
+  drafts and cursor positions are restored when their discussions are reopened,
+  including in a later `connect` session. Arrow keys move within the draft in
+  Insert mode; `Up` on the draft's first display row (of a wrapped first line,
+  its first row) switches to navigation and scrolls the timeline up a line. In
+  btw mode, `Up` stays in the side draft.
 - In a group thread, `i` (or `Tab`) focuses the composer and `Esc` returns
   to navigation.
 - In every composer, `Ctrl-u` deletes back to the start of the logical line;

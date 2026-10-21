@@ -618,6 +618,16 @@ mod status_tests {
     use super::fit_status;
 
     #[test]
+    fn a_page_key_moves_two_thirds_of_the_view_and_at_least_a_line() {
+        let mut thread =
+            super::Thread::agent("Mateo", "ada", std::sync::Arc::new(std::time::Instant::now));
+        for (height, jump) in [(30, 20), (24, 16), (2, 1), (1, 1), (0, 1)] {
+            thread.view.layout(80, height);
+            assert_eq!(thread.jump(), jump, "height {height}");
+        }
+    }
+
+    #[test]
     fn feedback_clipping_keeps_whole_graphemes_from_either_end() {
         assert_eq!(fit_status("👍🏽🇺🇸👩‍💻", 3, false), "👍🏽…");
         assert_eq!(fit_status("👍🏽🇺🇸👩‍💻", 3, true), "…👩‍💻");
@@ -645,8 +655,21 @@ impl Thread {
         }
         if self.agent.is_some() && key.code == KeyCode::PageUp {
             self.composing = false;
-            let page = self.view.page();
-            self.view.scroll_up(page);
+            let jump = self.jump();
+            self.view.scroll_up(jump);
+            return Some(Transition::Stay);
+        }
+        // Up from the draft's first row scrolls the timeline a line, as if
+        // the timeline continued above the composer. Not in btw mode, where
+        // the side conversation holds the view.
+        if self.agent.is_some()
+            && key.code == KeyCode::Up
+            && key.modifiers.is_empty()
+            && !self.btw_mode()
+            && self.composer.as_ref().is_some_and(Composer::on_first_row)
+        {
+            self.composing = false;
+            self.view.scroll_up(1);
             return Some(Transition::Stay);
         }
         // `//btw …` goes as mail starting `/btw …`.
@@ -741,6 +764,20 @@ impl Thread {
                 self.effort_notice = Some(why);
                 Transition::Stay
             }
+        }
+    }
+
+    /// How far a page key moves: two thirds of the view, at least a line.
+    fn jump(&self) -> usize {
+        (self.view.page() * 2 / 3).max(1)
+    }
+
+    /// In an agent conversation, scrolling down to the newest view resumes
+    /// following and returns to writing.
+    fn write_at_tail(&mut self) {
+        if self.agent.is_some() && self.view.top() == self.view.frame.bottom() {
+            self.view.follow();
+            self.composing = true;
         }
     }
 
@@ -1357,16 +1394,17 @@ impl Screen for Thread {
             };
         }
         let page = self.view.page();
+        let jump = self.jump();
         match action {
             Action::Up => self.view.scroll_up(1),
-            Action::Down => self.view.scroll_down_by(1),
-            Action::PageUp => self.view.scroll_up(page),
+            Action::Down => {
+                self.view.scroll_down_by(1);
+                self.write_at_tail();
+            }
+            Action::PageUp => self.view.scroll_up(jump),
             Action::PageDown => {
-                self.view.scroll_down_by(page);
-                if self.agent.is_some() && self.view.top() == self.view.frame.bottom() {
-                    self.view.follow();
-                    self.composing = true;
-                }
+                self.view.scroll_down_by(jump);
+                self.write_at_tail();
             }
             Action::HalfPageUp => self.view.scroll_up(page / 2),
             Action::HalfPageDown => self.view.scroll_down_by(page / 2),
