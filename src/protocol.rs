@@ -42,6 +42,9 @@ const REQUEST_KEYS: &[&str] = &[
 pub struct Policy {
     minimum: Option<Version>,
     recommended: Option<Version>,
+    /// Capabilities this server acts as if it lacked, as an older one would.
+    #[cfg(test)]
+    withheld: Vec<&'static str>,
 }
 
 impl Policy {
@@ -59,14 +62,35 @@ impl Policy {
         Ok(Self {
             minimum,
             recommended,
+            #[cfg(test)]
+            withheld: Vec::new(),
         })
+    }
+
+    /// A server that lacks `capability`, as one from before it would.
+    #[cfg(test)]
+    pub fn without(mut self, capability: &'static str) -> Self {
+        self.withheld.push(capability);
+        self
+    }
+
+    fn offers(&self, capability: &str) -> bool {
+        #[cfg(test)]
+        if self.withheld.contains(&capability) {
+            return false;
+        }
+        CAPABILITIES.contains(&capability)
     }
 
     pub fn info(&self, require_human_token: bool) -> proto::ServerInfoResponse {
         proto::ServerInfoResponse {
             require_human_token,
             protocol_epoch: Some(EPOCH),
-            capabilities: CAPABILITIES.iter().map(|s| (*s).into()).collect(),
+            capabilities: CAPABILITIES
+                .iter()
+                .filter(|c| self.offers(c))
+                .map(|s| (*s).into())
+                .collect(),
             release: Some(release::info()),
             minimum_client_version: self.minimum.as_ref().map(ToString::to_string),
             recommended_client_version: self.recommended.as_ref().map(ToString::to_string),
@@ -151,7 +175,7 @@ impl Policy {
                         "malformed required BBS capability",
                     ));
                 }
-                if !CAPABILITIES.contains(&capability) {
+                if !self.offers(capability) {
                     return Err(Status::failed_precondition(format!(
                         "incompatible BBS server: required capability {capability} is unavailable; upgrade the server or use a compatible client",
                     )));

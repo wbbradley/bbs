@@ -1295,6 +1295,218 @@ mod tests {
         assert!(state.waiters.lock().unwrap().is_empty());
     }
 
+    /// Against a server from before side-conversations.v1, a follow-up, an
+    /// end and an ENDED report are refused before they touch any state, so a
+    /// follow-up is never asked fresh; one-shot side questions still work.
+    #[tokio::test]
+    async fn an_older_server_refuses_side_conversations_before_any_write() {
+        use crate::backend::{Backend, Remote, SIDE_CONVERSATIONS};
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::migrate(&mut conn).unwrap();
+        let will = Caller {
+            human: Some("will".into()),
+            ..Default::default()
+        };
+        service::ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: "will".into(),
+            },
+        )
+        .unwrap();
+        let token = service::register(
+            &mut conn,
+            &will,
+            proto::RegisterRequest {
+                name: Some("Mateo".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .token;
+        let mateo = Caller {
+            token: Some(token),
+            ..Default::default()
+        };
+        service::begin_side_session(
+            &mut conn,
+            &mateo,
+            proto::BeginSideSessionRequest {
+                generation: "run-1".into(),
+            },
+        )
+        .unwrap();
+        // Even a runner claiming follow-ups cannot get past the transport.
+        service::report_context(
+            &mut conn,
+            &mateo,
+            proto::ReportContextRequest {
+                generation: "run-1".into(),
+                usage: None,
+                side_supported: Some(true),
+                side_reason: None,
+                preserve_usage: false,
+                side_followups: Some(true),
+            },
+        )
+        .unwrap();
+        let first = service::ask_side(
+            &mut conn,
+            &will,
+            proto::AskSideRequest {
+                agent: "Mateo".into(),
+                question: "q1".into(),
+                follows: None,
+            },
+        )
+        .unwrap()
+        .id;
+        service::claim_side(
+            &mut conn,
+            &mateo,
+            proto::ClaimSideRequest {
+                generation: "run-1".into(),
+            },
+        )
+        .unwrap();
+        let done = proto::ReportSideRequest {
+            generation: "run-1".into(),
+            id: first,
+            status: proto::SideStatus::SideCompleted.into(),
+            answer: Some("a1".into()),
+        };
+        service::report_side(&mut conn, &mateo, done).unwrap();
+        let state = Arc::new(State {
+            conn: Mutex::new(conn),
+            notify: watch::Sender::new(0),
+            activity: watch::Sender::new(0),
+            waiters: Mutex::new(HashSet::new()),
+            shutdown: watch::Sender::new(false),
+            require_human_token: false,
+            protocol: Policy::default().without(SIDE_CONVERSATIONS),
+            auth_failures: Mutex::new(HashMap::new()),
+            timer_limits: TimerLimits::default(),
+            clock: Arc::new(Utc::now),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(BbsServer::new(Server(state.clone())))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let snapshot = || -> Vec<String> {
+            let conn = state.conn.lock().unwrap();
+            let mut rows: Vec<String> = conn
+                .prepare(
+                    "SELECT id, status, answer, ended, follows, conversation, updated_at
+                     FROM side_requests ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |r| {
+                    Ok(format!(
+                        "{}|{}|{:?}|{}|{:?}|{}|{}",
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, String>(6)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let revision: i64 = conn
+                .query_row("SELECT revision FROM side_state", [], |r| r.get(0))
+                .unwrap();
+            rows.push(format!("revision {revision}"));
+            rows
+        };
+        let mut owner = Backend::Remote(Remote::connect(&address, will).await.unwrap());
+        let mut runner = Backend::Remote(Remote::connect(&address, mateo).await.unwrap());
+        let before = snapshot();
+        let refused = |e: anyhow::Error| {
+            let text = format!("{e:#}");
+            assert!(text.contains("side-conversations.v1"), "{text}");
+            let status = e.downcast_ref::<Status>().expect("a gRPC status");
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{text}");
+        };
+        refused(
+            owner
+                .ask_side(proto::AskSideRequest {
+                    agent: "Mateo".into(),
+                    question: "q2".into(),
+                    follows: Some(first),
+                })
+                .await
+                .unwrap_err(),
+        );
+        refused(
+            owner
+                .cancel_side(proto::CancelSideRequest {
+                    id: first,
+                    end: true,
+                })
+                .await
+                .unwrap_err(),
+        );
+        refused(
+            runner
+                .report_side(proto::ReportSideRequest {
+                    generation: "run-1".into(),
+                    id: first,
+                    status: proto::SideStatus::SideEnded.into(),
+                    answer: None,
+                })
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(snapshot(), before);
+        // The one-shot path is unchanged.
+        let fresh = owner
+            .ask_side(proto::AskSideRequest {
+                agent: "Mateo".into(),
+                question: "fresh".into(),
+                follows: None,
+            })
+            .await
+            .unwrap()
+            .id;
+        let claimed = runner
+            .claim_side(proto::ClaimSideRequest {
+                generation: "run-1".into(),
+            })
+            .await
+            .unwrap()
+            .request
+            .unwrap();
+        assert_eq!(claimed.id, fresh);
+        runner
+            .report_side(proto::ReportSideRequest {
+                generation: "run-1".into(),
+                id: fresh,
+                status: proto::SideStatus::SideCompleted.into(),
+                answer: Some("a2".into()),
+            })
+            .await
+            .unwrap();
+        let err = owner
+            .cancel_side(proto::CancelSideRequest {
+                id: fresh,
+                end: false,
+            })
+            .await
+            .unwrap_err();
+        // Reached the one-shot rules: a plain cancel of a closed question.
+        assert!(format!("{err:#}").contains("not open"), "{err:#}");
+        let info = owner.server_info().await.unwrap();
+        assert!(!info.capabilities.iter().any(|c| c == SIDE_CONVERSATIONS));
+        assert!(info.capabilities.iter().any(|c| c == "side-questions.v1"));
+        server.abort();
+    }
+
     #[tokio::test]
     async fn terminal_error_bypasses_full_message_buffer() {
         use tokio_stream::StreamExt;

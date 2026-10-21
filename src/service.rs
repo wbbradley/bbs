@@ -4019,7 +4019,7 @@ mod tests {
 
     #[test]
     fn side_conversations_follow_end_and_derive_ended() {
-        let (mut conn, will, [mateo, _zed, _lu]) = board();
+        let (mut conn, will, [mateo, zed, _lu]) = board();
         let begin = |conn: &mut Connection, g: &str| {
             begin_side_session(
                 conn,
@@ -4029,6 +4029,39 @@ mod tests {
                 },
             )
             .unwrap();
+        };
+        // Every side row and each agent's revision, to show a call wrote nothing.
+        let snapshot = |conn: &mut Connection| -> Vec<String> {
+            let mut out: Vec<String> = conn
+                .prepare(
+                    "SELECT id, agent_id, generation, status, answer, ended, updated_at
+                     FROM side_requests ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |r| {
+                    Ok(format!(
+                        "{}|{}|{:?}|{}|{:?}|{}|{}",
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, String>(6)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let revisions: Vec<String> = conn
+                .prepare("SELECT agent_id, revision FROM side_state ORDER BY agent_id")
+                .unwrap()
+                .query_map([], |r| Ok(format!("{}:{}", r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            out.extend(revisions);
+            out
         };
         let support = |conn: &mut Connection, g: &str, followups: Option<bool>| {
             report_context(
@@ -4167,7 +4200,9 @@ mod tests {
         // A lost child on the latest terminal question, with or without
         // follows, flags it ended and keeps its status; a repeat is a no-op.
         report(&mut conn, "run-1", fresh, proto::SideStatus::SideEnded).unwrap();
+        let flagged = snapshot(&mut conn);
         report(&mut conn, "run-1", fresh, proto::SideStatus::SideEnded).unwrap();
+        assert_eq!(snapshot(&mut conn), flagged);
         let row = latest(&mut conn);
         assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCompleted, true));
         assert!(ask(&mut conn, "more", Some(fresh)).unwrap_err().contains(ended));
@@ -4176,19 +4211,53 @@ mod tests {
         report(&mut conn, "run-1", two, proto::SideStatus::SideEnded).unwrap();
         let row = latest(&mut conn);
         assert_eq!((row.status(), row.ended), (proto::SideStatus::SideCompleted, true));
-        // A question a newer one replaced (and pruned) is a no-op too.
-        let newer = answered(&mut conn, "run-1", "newer", None);
+        // A question a newer one replaced (and pruned) is a no-op too: the
+        // current row, its status, answer and the revision stay.
+        answered(&mut conn, "run-1", "replacing", None);
+        let current = snapshot(&mut conn);
         report(&mut conn, "run-1", two, proto::SideStatus::SideEnded).unwrap();
+        assert_eq!(snapshot(&mut conn), current);
         assert!(!latest(&mut conn).ended);
 
-        // Idle past the limit, the latest terminal question is ended.
+        // Another agent's existing question is refused, not a no-op, and
+        // left as it was, even though Mateo has a newer one.
+        begin_side_session(
+            &mut conn,
+            &zed,
+            proto::BeginSideSessionRequest {
+                generation: "zed-1".into(),
+            },
+        )
+        .unwrap();
+        let zed_row: i64 = conn
+            .query_row(
+                "INSERT INTO side_requests
+                   (agent_id, generation, question, asked_at, status, answer, updated_at, conversation)
+                 SELECT id, 'zed-1', 'z', 't', 'completed', 'za', 't', 0 FROM agents WHERE name = 'Zed'
+                 RETURNING id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let theirs = snapshot(&mut conn);
+        let err = report(&mut conn, "run-1", zed_row, proto::SideStatus::SideEnded).unwrap_err();
+        assert!(err.contains("not your claimed"), "{err}");
+        assert_eq!(snapshot(&mut conn), theirs);
+        let newer = answered(&mut conn, "run-1", "newer", None);
+
+        // Idle past the limit, the latest terminal question is ended: derived
+        // from the clock at read time, with no write to the revision. (The
+        // test moves the row's time back instead of the clock forward.)
         let stale = fmt_time(Utc::now() - SIDE_IDLE_LIMIT - chrono::TimeDelta::seconds(1));
+        let revision = view(&mut conn).revision;
+        assert!(!latest(&mut conn).ended);
         conn.execute(
             "UPDATE side_requests SET updated_at = ?2 WHERE id = ?1",
             rusqlite::params![newer, stale],
         )
         .unwrap();
         assert!(latest(&mut conn).ended);
+        assert_eq!(view(&mut conn).revision, revision);
         assert!(ask(&mut conn, "late", Some(newer)).unwrap_err().contains(ended));
 
         // A restart ends what the old generation answered, even once the new
