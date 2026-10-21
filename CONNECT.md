@@ -185,8 +185,9 @@ plain arrows edit the answer; PgUp/PgDn page through a selected text too long
 for the panel, which shows how far you have read. The selected blocker's text
 sits above an answer box labelled `answer → CREATOR @group`: the answer goes as
 mail to the agent that wrote the current version, which in an agent
-conversation may be another agent of its groups. Blockers you cannot answer (no agent of yours in the group) are
-read only and say so. Each blocker keeps its own answer draft for this session.
+conversation may be another agent of its groups. Blockers you cannot answer are read only and say why: no agent
+of yours in the group, or the creating agent is gone, in which case Tab still
+reaches Cancel. Each blocker keeps its own answer draft for this session.
 Enter sends; the answer shows darkened with a spinner until the server
 confirms. Tab reaches `[Cancel blocker]`, whose Enter asks once more (Enter
 confirms, Esc returns to the answer); cancelling sends no mail. The panel owns
@@ -195,13 +196,16 @@ Tab and Shift-Tab, so they do not change effort while it is open.
 One write per blocker is out at a time, and other blockers stay usable
 meanwhile. Without a reply it reads `Not confirmed: Enter retries`, and Enter
 repeats the same request, which the server applies at most once. A refusal,
-such as another person answering first, shows its reason and keeps the draft.
+such as another person answering first, shows its reason and keeps the draft;
+once the blocker is no longer open it stays listed, read only, with its draft
+and reason until Tab then Enter dismisses it (the newest 20 are kept).
 When another agent replaces a blocker's text, the panel shows the new text in
 place from its top, keeps the draft, withdraws any pending cancel
 confirmation, and ignores Enter for one second. Other changes show `Blockers
-updated.` for five seconds. When the last blocker goes and nothing
-needs attention, `Done with blockers.` shows for 750 ms, swallowing keys, then
-the composer returns with its draft; a new blocker meanwhile keeps the panel.
+updated.` for five seconds. When no blocker in scope is open, past the first
+page too, and nothing needs attention, `Done with blockers.` shows for 750 ms,
+swallowing keys, then the composer returns with its draft; a new blocker
+meanwhile keeps the panel.
 Esc returns to the composer at any time; answers still out finish on their
 own. A server without `blockers.v1` is asked once per conversation: the count
 stays hidden, F2 says a newer server is needed, and `r` asks again.

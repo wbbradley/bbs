@@ -27,6 +27,8 @@ pub const GUARD: Duration = Duration::from_secs(1);
 pub const NOTICE: Duration = Duration::from_secs(5);
 /// Blockers listed above the selected one's text.
 const LIST_ROWS: usize = 4;
+/// Refused blockers kept, with their drafts, after the server drops them.
+const KEPT_REFUSALS: usize = 20;
 
 #[derive(Debug, PartialEq)]
 enum Support {
@@ -106,7 +108,8 @@ pub struct Blockers {
     polling: bool,
     loaded: bool,
     rows: Vec<proto::Blocker>,
-    /// Rows kept for a write still out, which the server no longer counts.
+    /// Rows the server no longer lists, kept for a write still out or a
+    /// refusal to read; the server does not count them.
     held: Vec<i64>,
     active: u64,
     poll_error: Option<String>,
@@ -221,14 +224,29 @@ impl Blockers {
         let mut rows = list.blockers.clone();
         self.held.clear();
         for row in &self.rows {
-            let pending = self
+            let keep = self
                 .chains
                 .get(&row.root_id)
-                .is_some_and(|c| c.pending.is_some());
-            if pending && !rows.iter().any(|b| b.root_id == row.root_id) {
+                .is_some_and(|c| c.pending.is_some() || c.error.is_some());
+            if keep && !rows.iter().any(|b| b.root_id == row.root_id) {
                 rows.push(row.clone());
                 self.held.push(row.root_id);
             }
+        }
+        // Only so many refusals are kept: the oldest go first.
+        let refused: Vec<i64> = self
+            .held
+            .iter()
+            .copied()
+            .filter(|r| self.chains.get(r).is_some_and(|c| c.pending.is_none()))
+            .collect();
+        for root in refused
+            .iter()
+            .take(refused.len().saturating_sub(KEPT_REFUSALS))
+        {
+            rows.retain(|b| b.root_id != *root);
+            self.held.retain(|r| r != root);
+            self.chains.remove(root);
         }
         rows.sort_by_key(|b| b.root_id);
         self.rows = rows;
@@ -263,6 +281,16 @@ impl Blockers {
                 }
             }
             panel.selected = selected;
+            // Cancelling is offered only while allowed.
+            let gone = selected.is_some_and(|r| self.held.contains(&r));
+            let can_cancel = self
+                .rows
+                .iter()
+                .find(|b| Some(b.root_id) == selected)
+                .is_some_and(|b| b.can_cancel);
+            if !gone && !can_cancel && panel.focus != Focus::Answer {
+                panel.focus = Focus::Answer;
+            }
             if !self.rows.is_empty() {
                 // Something new or still open: stay.
                 panel.done_at = None;
@@ -346,9 +374,11 @@ impl Blockers {
             .chains
             .values()
             .any(|c| c.pending.is_some() || c.error.is_some());
+        // Blockers past the first page are still open: the next poll lists them.
         if let Some(panel) = &mut self.panel
             && self.loaded
             && self.rows.is_empty()
+            && self.active == 0
             && !busy
             && panel.done_at.is_none()
         {
@@ -368,6 +398,21 @@ impl Blockers {
             return true;
         }
         false
+    }
+
+    /// Drop a kept refusal and its draft.
+    fn dismiss(&mut self, root: i64, now: Instant) {
+        let old: Vec<i64> = self.rows.iter().map(|b| b.root_id).collect();
+        self.rows.retain(|b| b.root_id != root);
+        self.held.retain(|r| *r != root);
+        self.chains.remove(&root);
+        let roots: Vec<i64> = self.rows.iter().map(|b| b.root_id).collect();
+        if let Some(panel) = &mut self.panel {
+            panel.selected = nearest(panel.selected, &old, &roots);
+            panel.focus = Focus::Answer;
+            panel.scroll = 0;
+        }
+        self.settle_done(now);
     }
 
     /// When the panel next changes by itself.
@@ -465,12 +510,25 @@ impl Blockers {
         let Some(row) = self.selected().cloned() else {
             return Outcome::Stay;
         };
+        let gone = self.held.contains(&row.root_id);
+        if gone
+            && key.code == KeyCode::Enter
+            && self.panel.as_ref().map(|p| p.focus) == Some(Focus::Cancel)
+            && self
+                .chains
+                .get(&row.root_id)
+                .is_some_and(|c| c.pending.is_none())
+        {
+            // Dismiss a refusal kept for reading.
+            self.dismiss(row.root_id, now);
+            return Outcome::Stay;
+        }
         let panel = self.panel.as_mut().expect("open");
         let chain = self.chains.entry(row.root_id).or_insert_with(Chain::new);
         match key.code {
             KeyCode::Tab | KeyCode::BackTab => {
                 panel.focus = match panel.focus {
-                    Focus::Answer if row.can_cancel => Focus::Cancel,
+                    Focus::Answer if row.can_cancel || gone => Focus::Cancel,
                     _ => Focus::Answer,
                 };
                 Outcome::Stay
@@ -488,6 +546,11 @@ impl Blockers {
                     return Outcome::Request(request(id, &pending.key, &pending.write));
                 }
                 match panel.focus {
+                    // Permission is checked at each step, not only on Tab.
+                    Focus::Cancel | Focus::Confirm if !row.can_cancel || gone => {
+                        panel.focus = Focus::Answer;
+                        Outcome::Stay
+                    }
                     Focus::Cancel => {
                         panel.focus = Focus::Confirm;
                         Outcome::Stay
@@ -497,7 +560,8 @@ impl Blockers {
                         submit(id, chain, Write::Cancel { id: row.id }, now)
                     }
                     Focus::Answer => {
-                        if !row.can_answer {
+                        // A blocker no longer open takes no answer.
+                        if !row.can_answer || gone {
                             return Outcome::Stay;
                         }
                         let answer = chain.answer.draft().text;
@@ -527,7 +591,9 @@ impl Blockers {
 
     fn answer_height(&self, width: u16) -> u16 {
         match (self.selected(), self.selected_chain()) {
-            (Some(row), Some(chain)) if row.can_answer => chain.answer.height(width, 6),
+            (Some(row), Some(chain)) if row.can_answer || chain.error.is_some() => {
+                chain.answer.height(width, 6)
+            }
             _ => 0,
         }
     }
@@ -600,18 +666,33 @@ impl Blockers {
                 theme::dim(),
             ));
         }
+        if self.rows.is_empty() && self.active > 0 {
+            lines.push(Line::styled("Loading more…", theme::dim()));
+        }
         let Some(row) = self.selected() else {
             return (lines, Vec::new(), None);
         };
         let mut body = vec![Line::default()];
         body.extend(row.body.lines().map(|text| Line::raw(format!("  {text}"))));
-        let label = if row.can_answer {
+        let label = if self.held.contains(&row.root_id) {
+            Line::styled("No longer open: your draft is kept below.", theme::dim())
+        } else if row.can_answer {
             Line::from(vec![
                 Span::styled("answer → ", theme::dim()),
                 Span::styled(creator(row), theme::style(Role::Agent)),
                 Span::raw(" "),
                 Span::styled(format!("@{}", row.group), theme::style(Role::Group)),
             ])
+        } else if row.can_cancel {
+            // The server allows answering whoever may cancel, unless the
+            // creating agent is gone.
+            Line::styled(
+                format!(
+                    "Can't answer: {} is no longer available; it can still be cancelled.",
+                    creator(row)
+                ),
+                theme::dim(),
+            )
         } else {
             Line::styled(
                 format!(
@@ -631,7 +712,19 @@ impl Blockers {
         else {
             return vec![Line::default(), self.status_line(None, now)];
         };
+        let gone = self.held.contains(&row.root_id) && chain.pending.is_none();
         let action = match panel.focus {
+            focus if gone => Line::from(vec![
+                Span::styled(
+                    "[Dismiss]",
+                    if focus == Focus::Cancel {
+                        theme::style(Role::Selection)
+                    } else {
+                        theme::dim()
+                    },
+                ),
+                Span::styled(" Tab", theme::dim()),
+            ]),
             Focus::Confirm => Line::from(vec![
                 Span::styled("Cancel this blocker? ", theme::style(Role::Warning)),
                 Span::styled("Enter confirms · Esc returns", theme::dim()),
@@ -1187,6 +1280,172 @@ mod tests {
             Outcome::Request(Request::CancelBlocker { req, .. }) => assert_eq!(req.id, 5),
             _ => panic!("expected a cancel of the new version"),
         }
+    }
+
+    #[test]
+    fn done_waits_while_blockers_past_the_first_page_are_open() {
+        let now = Instant::now();
+        let mut blockers = open(now);
+        blockers.active = 60;
+        for _ in 0..2 {
+            typed(&mut blockers, "ok", now);
+            let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+            blockers.on_data(
+                SCREEN,
+                &written(&req.request_key, Ok(Default::default())),
+                now,
+            );
+        }
+        assert_eq!(blockers.count(), Some(58));
+        assert!(blockers.panel.as_ref().unwrap().done_at.is_none());
+        assert!(!blockers.settle(now + DONE));
+        let text: Vec<String> = blockers
+            .lines_above(80)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(text.iter().any(|l| l == "Loading more…"), "{text:?}");
+        // The next poll refills the panel.
+        blockers.poll(SCREEN);
+        blockers.on_data(SCREEN, &list(vec![row(3, 3, "Zed", "third?")]), now);
+        assert_eq!(blockers.selected().unwrap().id, 3);
+    }
+
+    #[test]
+    fn losing_cancel_permission_withdraws_the_confirmation() {
+        let now = Instant::now();
+        let mut blockers = open(now);
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        blockers.key(SCREEN, press(KeyCode::Enter), now);
+        let mut first = row(1, 1, "Zed", "first?");
+        first.can_cancel = false;
+        first.can_answer = false;
+        blockers.on_data(
+            SCREEN,
+            &list(vec![first, row(2, 2, "Mateo", "second?")]),
+            now,
+        );
+        assert_eq!(blockers.panel.as_ref().unwrap().focus, Focus::Answer);
+        for _ in 0..3 {
+            assert!(matches!(
+                blockers.key(SCREEN, press(KeyCode::Enter), now),
+                Outcome::Stay
+            ));
+        }
+        assert!(blockers.chains[&1].pending.is_none());
+        // Tab cannot reach Cancel either, and Enter rechecks it if it did.
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        assert_eq!(blockers.panel.as_ref().unwrap().focus, Focus::Answer);
+        blockers.panel.as_mut().unwrap().focus = Focus::Confirm;
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        assert!(blockers.chains[&1].pending.is_none());
+    }
+
+    #[test]
+    fn a_refusal_stays_with_its_draft_across_polls_until_dismissed() {
+        let now = Instant::now();
+        let mut blockers = open(now);
+        typed(&mut blockers, "valuable answer", now);
+        let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+        let others = list(vec![row(2, 2, "Mateo", "second?")]);
+        blockers.on_data(SCREEN, &others, now);
+        blockers.on_data(
+            SCREEN,
+            &written(
+                &req.request_key,
+                Err(SideError::Refused("another human answered first".into())),
+            ),
+            now,
+        );
+        for at in 1..3 {
+            blockers.on_data(SCREEN, &others, now + Duration::from_secs(at));
+        }
+        assert_eq!(blockers.chains[&1].answer.draft().text, "valuable answer");
+        assert_eq!(blockers.selected().unwrap().root_id, 1);
+        assert_eq!(blockers.count(), Some(1), "the server's count");
+        assert!(
+            blockers
+                .lines_above(80)
+                .iter()
+                .any(|l| l.to_string().starts_with("No longer open"))
+        );
+        assert_eq!(
+            blockers
+                .status_line(blockers.selected_chain(), now)
+                .to_string(),
+            "another human answered first"
+        );
+        assert!(blockers.answer_height(80) > 0, "the draft shows");
+        // Enter cannot answer it again; Tab and Enter dismiss it.
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        assert!(blockers.chains[&1].pending.is_none());
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        assert!(
+            blockers
+                .lines_below(now)
+                .iter()
+                .any(|l| l.to_string().starts_with("[Dismiss]"))
+        );
+        blockers.key(SCREEN, press(KeyCode::Enter), now);
+        assert!(!blockers.chains.contains_key(&1));
+        assert_eq!(blockers.selected().unwrap().root_id, 2);
+        // With the last one gone too, the goodbye can start.
+        blockers.on_data(SCREEN, &list(vec![]), now);
+        assert_eq!(blockers.panel.as_ref().unwrap().done_at, Some(now + DONE));
+    }
+
+    #[test]
+    fn only_so_many_refusals_are_kept() {
+        let now = Instant::now();
+        let mut blockers = Blockers::new(BlockerScope::Group("crew".into()));
+        blockers.poll(SCREEN);
+        let all: Vec<_> = (1..=25).map(|i| row(i, i, "Zed", "q?")).collect();
+        blockers.on_data(SCREEN, &list(all), now);
+        blockers.open(now).unwrap();
+        for _ in 1..=25 {
+            typed(&mut blockers, "a", now);
+            let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+            blockers.on_data(
+                SCREEN,
+                &written(&req.request_key, Err(SideError::Refused("no".into()))),
+                now,
+            );
+            blockers.key(SCREEN, alt(KeyCode::Down), now);
+        }
+        blockers.on_data(SCREEN, &list(vec![]), now);
+        assert_eq!(blockers.rows.len(), KEPT_REFUSALS);
+        assert_eq!(blockers.rows[0].root_id, 6, "the oldest went first");
+        assert_eq!(blockers.chains.len(), KEPT_REFUSALS);
+    }
+
+    #[test]
+    fn read_only_says_whether_the_creator_or_ownership_is_missing() {
+        let now = Instant::now();
+        let mut blockers = Blockers::new(BlockerScope::Group("crew".into()));
+        blockers.poll(SCREEN);
+        let mut retired = row(1, 1, "Zed", "q?");
+        retired.can_answer = false;
+        let mut theirs = row(2, 2, "Mateo", "q?");
+        theirs.can_answer = false;
+        theirs.can_cancel = false;
+        blockers.on_data(SCREEN, &list(vec![retired, theirs]), now);
+        blockers.open(now).unwrap();
+        let label = |b: &Blockers| b.lines_above(200).last().unwrap().to_string();
+        assert_eq!(
+            label(&blockers),
+            "Can't answer: Zed is no longer available; it can still be cancelled."
+        );
+        blockers.key(SCREEN, alt(KeyCode::Down), now);
+        assert_eq!(
+            label(&blockers),
+            "Read only: answering needs an agent of yours in @crew."
+        );
     }
 
     #[test]
