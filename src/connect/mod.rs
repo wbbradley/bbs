@@ -3,6 +3,7 @@
 mod admin;
 mod app;
 mod art;
+mod blockers;
 mod composer;
 mod dialog;
 mod drafts;
