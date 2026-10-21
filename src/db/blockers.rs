@@ -106,13 +106,14 @@ pub fn history(conn: &Connection, root: i64, before: i64, limit: usize) -> Resul
 }
 
 /// Counts and pages use exactly the same current membership/group predicate.
-const SCOPE: &str = "(?1 IS NULL OR b.group_id = ?1)
+const SCOPE: &str = "(?1 IS NULL OR g.name = ?1)
     AND (?2 IS NULL OR b.group_id IN (
-      SELECT group_id FROM group_members WHERE agent_id = ?2))";
+      SELECT m.group_id FROM group_members m JOIN bbs_groups scope_group ON scope_group.id = m.group_id
+      WHERE m.agent_id = ?2 AND scope_group.archived_at IS NULL))";
 
 pub fn list(
     conn: &Connection,
-    group: Option<i64>,
+    group: Option<&str>,
     agent: Option<i64>,
     closed: bool,
     after: i64,
@@ -129,7 +130,7 @@ pub fn list(
         .collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn active_count(conn: &Connection, group: Option<i64>, agent: Option<i64>) -> Result<u64> {
+pub fn active_count(conn: &Connection, group: Option<&str>, agent: Option<i64>) -> Result<u64> {
     Ok(conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM blockers b JOIN bbs_groups g ON g.id = b.group_id
@@ -154,17 +155,6 @@ pub fn human_owns_member(conn: &Connection, group: i64, human: i64) -> Result<bo
         params![group, human],
         |r| r.get(0),
     )?)
-}
-
-/// Historical reads may name an archived group.
-pub fn group_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT id FROM bbs_groups WHERE lower(name) = lower(?1)",
-            [name],
-            |r| r.get(0),
-        )
-        .optional()?)
 }
 
 pub fn insert(

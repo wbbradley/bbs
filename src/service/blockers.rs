@@ -115,14 +115,12 @@ pub fn list_blockers(
     }
     with_ctx(conn, caller, |ctx| {
         let actor = ctx.actor()?;
-        let group = req
-            .group
-            .as_ref()
-            .map(|g| {
-                store::group_id(ctx.conn, group_name(g))?
-                    .with_context(|| format!("no such group @{g}"))
-            })
-            .transpose()?;
+        let group = req.group.as_deref().map(group_name);
+        if let Some(name) = group
+            && db::group_ids_named(ctx.conn, name)?.is_empty()
+        {
+            bail!("no such group @{name}");
+        }
         let agent = req
             .agent
             .as_ref()
@@ -235,16 +233,15 @@ pub fn put_blocker(
     }
     with_ctx(conn, caller, |ctx| {
         let actor = ctx.agent()?;
-        let group = store::group_id(ctx.conn, group_name(&req.group))?
-            .with_context(|| format!("no such group @{}", group_name(&req.group)))?;
+        let groups = db::group_ids_named(ctx.conn, group_name(&req.group))?;
         if let Some(response) = replay(ctx, &actor, &req.request_key, |op| {
             matches!(op,
             store::Operation::Put { group: old_group, body, replaces, .. }
-            if *old_group == group && *body == req.body && *replaces == req.replaces)
+            if groups.contains(old_group) && *body == req.body && *replaces == req.replaces)
         })? {
             return Ok(response);
         }
-        require_group(ctx.conn, group_name(&req.group))?;
+        let group = require_group(ctx.conn, group_name(&req.group))?;
         authorize(ctx, &actor, group)?;
         let prior = req.replaces.map(|id| require_row(ctx, id)).transpose()?;
         if let Some(prior) = &prior {
@@ -1053,6 +1050,110 @@ mod tests {
                 proto::CancelBlockerRequest {
                     id: first.id,
                     request_key: "different-cancel".into()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn recreated_group_names_use_current_membership_and_keep_original_retry_identity() {
+        let mut b = Board::memory();
+        let old = b.put(0, "Original group", None, "old-key");
+        service::group_delete(
+            &mut b.conn,
+            &b.humans[0],
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        service::group_register(
+            &mut b.conn,
+            &b.humans[0],
+            proto::GroupRegisterRequest {
+                group: "crew".into(),
+                description: None,
+            },
+        )
+        .unwrap();
+        service::group_join(
+            &mut b.conn,
+            &b.agents[0],
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        let current = b.put(0, "New group", None, "new-key");
+        assert_ne!(old.group_id, current.group_id);
+        let replay = put_blocker(
+            &mut b.conn,
+            &b.agents[0],
+            proto::PutBlockerRequest {
+                group: "@crew".into(),
+                body: "Original group".into(),
+                request_key: "old-key".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.blocker.unwrap().id, old.id);
+        let active = list_blockers(
+            &mut b.conn,
+            &b.humans[0],
+            proto::ListBlockersRequest {
+                group: Some("crew".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(active.active_count, 1);
+        assert_eq!(
+            active.blockers.iter().map(|x| x.id).collect::<Vec<_>>(),
+            [current.id]
+        );
+        let all = list_blockers(
+            &mut b.conn,
+            &b.humans[0],
+            proto::ListBlockersRequest {
+                group: Some("crew".into()),
+                include_closed: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(all.active_count, 1);
+        assert_eq!(
+            all.blockers.iter().map(|x| x.id).collect::<Vec<_>>(),
+            [old.id, current.id]
+        );
+        let agent = list_blockers(
+            &mut b.conn,
+            &b.humans[0],
+            proto::ListBlockersRequest {
+                agent: Some("Mateo".into()),
+                include_closed: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(agent.active_count, 1);
+        assert_eq!(
+            agent.blockers.iter().map(|x| x.id).collect::<Vec<_>>(),
+            [current.id]
+        );
+        // A predecessor in the archived identity cannot be moved to the new group.
+        assert!(
+            put_blocker(
+                &mut b.conn,
+                &b.agents[0],
+                proto::PutBlockerRequest {
+                    group: "crew".into(),
+                    body: "Move history".into(),
+                    replaces: Some(old.id),
+                    request_key: "cross-group".into()
                 }
             )
             .is_err()
