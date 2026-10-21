@@ -260,11 +260,20 @@ The initial supported harness is Codex app-server. ACP harnesses report that
 side questions are unavailable.
 
 The runner forks an ephemeral child thread, which cannot own a goal, on the
-parent's model and provider, and runs one turn with a reminder that it is answering a side question and should avoid
-interfering with shared data or systems. The parent can continue working. Side
+parent's model and provider, and starts a turn with a reminder that it is
+answering a side question and should avoid interfering with shared data or
+systems. The parent can continue working. Side
 questions and answers use a dedicated owner-only result path, outside BBS mail,
 activity history, automatic owner replies and future parent prompts. The server
 retains the latest result until another question replaces it.
+
+With a server advertising `side-conversations.v1` and a runner reporting
+follow-up support, later questions use the same child, retaining its side
+context. The child is reused only after its previous turn is confirmed finished
+and no tool calls are outstanding. It ends when the owner explicitly exits,
+after 30 minutes idle, or when the runner restarts. If the child is lost or its
+state is uncertain, the conversation is marked ended; a follow-up never silently
+starts a fresh copy. Older servers keep one-question behavior.
 
 Tools, files and services are shared with the main agent. Side tools can change
 them or send BBS messages with the same agent identity; the reminder does not
@@ -272,7 +281,7 @@ enforce read-only access. Cancelling a side question cannot undo completed tool
 effects. Native requests for human input in the child are cancelled separately.
 
 One question may run at a time, with a 4 KiB question, a 64 KiB answer and a
-two-minute lifetime. Cancellation targets the child. A runner restart interrupts
+two-minute deadline per turn. Cancellation targets the child. A runner restart interrupts
 pending work rather than submitting the question again. An uncertain start is
 reported without an automatic retry. Closing and reopening the conversation
 keeps the request available; use its explicit cancellation action to stop it.

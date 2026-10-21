@@ -141,8 +141,10 @@ changed; an uncertain start keeps it and is never automatically retried.
 While the panel is up, typing goes to the side conversation or nowhere: Enter
 never sends the draft to the agent as mail. `/answer`, `/context` and a fresh
 `/btw QUESTION` still work. The panel holds the composer with its own draft;
-the parent draft is kept aside and returns when the panel closes, and a side
-draft left then comes back with the next `/btw` panel.
+the parent draft is kept aside and returns when the panel closes. Within the
+open agent conversation, a side draft left then comes back with the next
+`/btw` panel. Leaving the agent conversation drops its unfinished side draft;
+it never becomes a parent draft.
 
 With an updated server and runner (`side-conversations.v1`), the side
 question starts a side conversation in btw mode: the panel takes the
