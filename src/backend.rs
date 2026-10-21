@@ -1078,6 +1078,30 @@ mod tests {
                 .await
                 .is_err()
         );
+        // A follow-up, an end or ENDED that an older server ignored would
+        // become a fresh question or a plain cancel, so each requires
+        // side-conversations.v1; one-shot side calls keep side-questions.v1.
+        for follows in [None, Some(7)] {
+            let ask = proto::AskSideRequest {
+                agent: "Mateo".into(),
+                question: "q".into(),
+                follows,
+            };
+            assert!(backend.ask_side(ask).await.is_err());
+        }
+        for end in [false, true] {
+            let cancel = proto::CancelSideRequest { id: 7, end };
+            assert!(backend.cancel_side(cancel).await.is_err());
+        }
+        for status in [proto::SideStatus::SideCompleted, proto::SideStatus::SideEnded] {
+            let report = proto::ReportSideRequest {
+                generation: "run-1".into(),
+                id: 7,
+                status: status.into(),
+                answer: None,
+            };
+            assert!(backend.report_side(report).await.is_err());
+        }
         server.abort();
         let expected = [
             ("EnsureHuman", None),
@@ -1097,6 +1121,12 @@ mod tests {
             ("GroupRegister", Some("group-description.v1")),
             ("GroupRegister", None),
             ("GroupDescribe", Some("group-description.v1")),
+            ("AskSide", Some("side-questions.v1")),
+            ("AskSide", Some("side-conversations.v1")),
+            ("CancelSide", Some("side-questions.v1")),
+            ("CancelSide", Some("side-conversations.v1")),
+            ("ReportSide", Some("side-questions.v1")),
+            ("ReportSide", Some("side-conversations.v1")),
         ];
         let observed = observations.lock().unwrap();
         assert_eq!(
