@@ -1295,9 +1295,12 @@ mod tests {
         assert!(state.waiters.lock().unwrap().is_empty());
     }
 
-    /// Against a server from before side-conversations.v1, a follow-up, an
-    /// end and an ENDED report are refused before they touch any state, so a
-    /// follow-up is never asked fresh; one-shot side questions still work.
+    /// Old-capability transport emulation: a server that does not advertise
+    /// side-conversations.v1 refuses a follow-up, an end and an ENDED report
+    /// on the required-capability header, before they touch any state, and
+    /// one-shot side questions still work. Its service still understands
+    /// the new fields, so without the header such a request would be
+    /// accepted; this is not a schema-19 decoder.
     #[tokio::test]
     async fn an_older_server_refuses_side_conversations_before_any_write() {
         use crate::backend::{Backend, Remote, SIDE_CONVERSATIONS};

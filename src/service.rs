@@ -4220,12 +4220,13 @@ mod tests {
         assert!(!latest(&mut conn).ended);
 
         // Another agent's existing question is refused, not a no-op, and
-        // left as it was, even though Mateo has a newer one.
+        // left as it was, even though Mateo has a newer one. Zed uses the
+        // same generation string, so only the agent check refuses it.
         begin_side_session(
             &mut conn,
             &zed,
             proto::BeginSideSessionRequest {
-                generation: "zed-1".into(),
+                generation: "run-1".into(),
             },
         )
         .unwrap();
@@ -4233,7 +4234,7 @@ mod tests {
             .query_row(
                 "INSERT INTO side_requests
                    (agent_id, generation, question, asked_at, status, answer, updated_at, conversation)
-                 SELECT id, 'zed-1', 'z', 't', 'completed', 'za', 't', 0 FROM agents WHERE name = 'Zed'
+                 SELECT id, 'run-1', 'z', 't', 'completed', 'za', 't', 0 FROM agents WHERE name = 'Zed'
                  RETURNING id",
                 [],
                 |r| r.get(0),
