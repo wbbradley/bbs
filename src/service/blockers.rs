@@ -235,8 +235,8 @@ pub fn put_blocker(
     }
     with_ctx(conn, caller, |ctx| {
         let actor = ctx.agent()?;
-        let group = require_group(ctx.conn, group_name(&req.group))?;
-        authorize(ctx, &actor, group)?;
+        let group = store::group_id(ctx.conn, group_name(&req.group))?
+            .with_context(|| format!("no such group @{}", group_name(&req.group)))?;
         if let Some(response) = replay(ctx, &actor, &req.request_key, |op| {
             matches!(op,
             store::Operation::Put { group: old_group, body, replaces, .. }
@@ -244,6 +244,8 @@ pub fn put_blocker(
         })? {
             return Ok(response);
         }
+        require_group(ctx.conn, group_name(&req.group))?;
+        authorize(ctx, &actor, group)?;
         let prior = req.replaces.map(|id| require_row(ctx, id)).transpose()?;
         if let Some(prior) = &prior {
             if prior.group_id != group {
@@ -293,14 +295,14 @@ pub fn answer_blocker(
     key(&req.request_key)?;
     with_ctx(conn, caller, |ctx| {
         let actor = ctx.human()?;
-        let row = require_row(ctx, req.id)?;
-        authorize(ctx, &actor, row.group_id)?;
         if let Some(response) = replay(ctx, &actor, &req.request_key, |op| {
             matches!(op,
             store::Operation::Answer { id, answer, .. } if *id == req.id && *answer == req.answer)
         })? {
             return Ok(response);
         }
+        let row = require_row(ctx, req.id)?;
+        authorize(ctx, &actor, row.group_id)?;
         require_open(&row)?;
         if !db::agent_is_live(ctx.conn, row.creator.id)? {
             bail!("creating agent is retired; cancel or replace this blocker instead");
@@ -335,14 +337,14 @@ pub fn cancel_blocker(
     key(&req.request_key)?;
     with_ctx(conn, caller, |ctx| {
         let actor = ctx.actor()?;
-        let row = require_row(ctx, req.id)?;
-        authorize(ctx, &actor, row.group_id)?;
         if let Some(response) = replay(ctx, &actor, &req.request_key, |op| {
             matches!(op,
             store::Operation::Cancel { id } if *id == req.id)
         })? {
             return Ok(response);
         }
+        let row = require_row(ctx, req.id)?;
+        authorize(ctx, &actor, row.group_id)?;
         require_open(&row)?;
         store::event(
             ctx.conn,
@@ -962,6 +964,99 @@ mod tests {
             before
         );
         assert_eq!(b.list().blockers[0].id, next.id);
+    }
+
+    #[test]
+    fn committed_blocker_retries_survive_membership_changes_and_group_archive() {
+        let mut b = Board::memory();
+        let first = b.put(0, "Need approval", None, "put");
+        let answered = b.answer(0, first.id, "answer").unwrap();
+        service::group_leave(
+            &mut b.conn,
+            &b.agents[0],
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        let before = b.messages();
+        let replay = b.answer(0, first.id, "answer").unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.message_id, answered.message_id);
+        assert_eq!(b.messages(), before);
+        assert!(b.answer(0, first.id, "different-answer").is_err());
+
+        let mut b = Board::memory();
+        let first = b.put(0, "Archive after commit", None, "put");
+        service::group_delete(
+            &mut b.conn,
+            &b.humans[0],
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        let replay = put_blocker(
+            &mut b.conn,
+            &b.agents[0],
+            proto::PutBlockerRequest {
+                group: "crew".into(),
+                body: "Archive after commit".into(),
+                request_key: "put".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.blocker.unwrap().id, first.id);
+        assert!(
+            put_blocker(
+                &mut b.conn,
+                &b.agents[0],
+                proto::PutBlockerRequest {
+                    group: "crew".into(),
+                    body: "New write after archive".into(),
+                    request_key: "new".into(),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+
+        let mut b = Board::memory();
+        let first = b.put(0, "Cancel before leaving", None, "put");
+        let request = proto::CancelBlockerRequest {
+            id: first.id,
+            request_key: "cancel".into(),
+        };
+        cancel_blocker(&mut b.conn, &b.agents[1], request.clone()).unwrap();
+        service::group_leave(
+            &mut b.conn,
+            &b.agents[1],
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        let before = b.messages();
+        let replay = cancel_blocker(&mut b.conn, &b.agents[1], request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(
+            replay.blocker.unwrap().status(),
+            proto::BlockerStatus::BlockerCancelled
+        );
+        assert_eq!(b.messages(), before);
+        assert!(
+            cancel_blocker(
+                &mut b.conn,
+                &b.agents[1],
+                proto::CancelBlockerRequest {
+                    id: first.id,
+                    request_key: "different-cancel".into()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
