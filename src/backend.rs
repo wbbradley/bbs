@@ -34,6 +34,7 @@ pub const AGENT_EFFORT: &str = "agent-effort.v1";
 pub const AUTO_REPLY: &str = "auto-reply.v1";
 pub const AGENT_INTERACTIONS: &str = "agent-interactions.v1";
 pub const SIDE_QUESTIONS: &str = "side-questions.v1";
+pub const SIDE_CONVERSATIONS: &str = "side-conversations.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -463,21 +464,23 @@ impl Backend {
     }
 
     /// Ask the owning agent an isolated side question. A server needs
-    /// `side-questions.v1`.
+    /// `side-questions.v1`, and `side-conversations.v1` for a follow-up, so
+    /// an older server refuses one rather than asking it fresh.
     pub async fn ask_side(&mut self, req: proto::AskSideRequest) -> Result<proto::AskSideResponse> {
+        let cap = if req.follows.is_some() { SIDE_CONVERSATIONS } else { SIDE_QUESTIONS };
         match self {
             Backend::Local(l) => service::ask_side(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, ask_side, req, &[SIDE_QUESTIONS])
-                .map_err(|e| missing_rpc(e, SIDE_QUESTIONS)),
+            Backend::Remote(r) => rpc!(r, ask_side, req, &[cap]).map_err(|e| missing_rpc(e, cap)),
         }
     }
 
-    /// Cancel a side question by exact id. A server needs `side-questions.v1`.
+    /// Cancel a side question by exact id. A server needs `side-questions.v1`,
+    /// and `side-conversations.v1` to end a conversation.
     pub async fn cancel_side(&mut self, req: proto::CancelSideRequest) -> Result<proto::Empty> {
+        let cap = if req.end { SIDE_CONVERSATIONS } else { SIDE_QUESTIONS };
         match self {
             Backend::Local(l) => service::cancel_side(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, cancel_side, req, &[SIDE_QUESTIONS])
-                .map_err(|e| missing_rpc(e, SIDE_QUESTIONS)),
+            Backend::Remote(r) => rpc!(r, cancel_side, req, &[cap]).map_err(|e| missing_rpc(e, cap)),
         }
     }
 
@@ -492,12 +495,17 @@ impl Backend {
     }
 
     /// Report progressive text or a terminal result for a claimed side
-    /// question. A server needs `side-questions.v1`.
+    /// question. A server needs `side-questions.v1`, and
+    /// `side-conversations.v1` for ENDED.
     pub async fn report_side(&mut self, req: proto::ReportSideRequest) -> Result<proto::Empty> {
+        let cap = if req.status() == proto::SideStatus::SideEnded {
+            SIDE_CONVERSATIONS
+        } else {
+            SIDE_QUESTIONS
+        };
         match self {
             Backend::Local(l) => service::report_side(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, report_side, req, &[SIDE_QUESTIONS])
-                .map_err(|e| missing_rpc(e, SIDE_QUESTIONS)),
+            Backend::Remote(r) => rpc!(r, report_side, req, &[cap]).map_err(|e| missing_rpc(e, cap)),
         }
     }
 

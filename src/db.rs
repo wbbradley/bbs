@@ -31,6 +31,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0017_auto_replies.sql"),
     include_str!("../migrations/0018_side_channels.sql"),
     include_str!("../migrations/0019_side_questions.sql"),
+    include_str!("../migrations/0020_side_conversations.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -892,6 +893,8 @@ pub struct SideState {
     pub usage: Option<String>,
     pub supported: Option<bool>,
     pub reason: Option<String>,
+    /// Whether this generation continues side conversations.
+    pub followups: Option<bool>,
     pub reported_at: String,
     pub revision: i64,
     /// Requests at or below this sequence are closed, published or not.
@@ -901,7 +904,8 @@ pub struct SideState {
 pub fn side_state(conn: &Connection, agent_id: i64) -> Result<Option<SideState>> {
     Ok(conn
         .query_row(
-            "SELECT generation, usage, supported, reason, reported_at, revision, closed_seq
+            "SELECT generation, usage, supported, reason, reported_at, revision, closed_seq,
+               followups
              FROM side_state WHERE agent_id = ?1",
             [agent_id],
             |r| {
@@ -913,6 +917,7 @@ pub fn side_state(conn: &Connection, agent_id: i64) -> Result<Option<SideState>>
                     reported_at: r.get(4)?,
                     revision: r.get(5)?,
                     closed_seq: r.get(6)?,
+                    followups: r.get::<_, Option<i64>>(7)?.map(|v| v != 0),
                 })
             },
         )
@@ -936,11 +941,11 @@ pub fn begin_side_session(
     }
     let revision = current.map_or(1, |s| s.revision + 1);
     conn.execute(
-        "INSERT INTO side_state (agent_id, generation, usage, supported, reason, reported_at, revision, closed_seq)
-         VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4, 0)
+        "INSERT INTO side_state (agent_id, generation, usage, supported, reason, followups, reported_at, revision, closed_seq)
+         VALUES (?1, ?2, NULL, NULL, NULL, NULL, ?3, ?4, 0)
          ON CONFLICT (agent_id) DO UPDATE SET
            generation = excluded.generation, usage = NULL, supported = NULL,
-           reason = NULL, reported_at = excluded.reported_at,
+           reason = NULL, followups = NULL, reported_at = excluded.reported_at,
            revision = excluded.revision, closed_seq = 0",
         params![agent_id, generation, now, revision],
     )?;
@@ -964,6 +969,14 @@ pub fn check_generation(conn: &Connection, agent_id: i64, generation: &str) -> R
     Ok(side_state(conn, agent_id)?.is_some_and(|s| s.generation == generation))
 }
 
+/// The side capability a runner reports; each field omitted preserves it.
+#[derive(Clone, Copy, Default)]
+pub struct SideCapability<'a> {
+    pub supported: Option<bool>,
+    pub reason: Option<&'a str>,
+    pub followups: Option<bool>,
+}
+
 /// Replace the agent's reported context usage: usage JSON, or clear.
 /// Capability fields are set only when given; omitted preserves them.
 /// With `preserve_usage`, usage and its report time stay untouched.
@@ -971,25 +984,31 @@ pub fn report_context(
     conn: &Connection,
     agent_id: i64,
     usage: Option<&str>,
-    supported: Option<bool>,
-    reason: Option<&str>,
+    capability: SideCapability,
     now: &str,
     preserve_usage: bool,
 ) -> Result<()> {
+    let SideCapability {
+        supported,
+        reason,
+        followups,
+    } = capability;
     if preserve_usage {
         conn.execute(
             "UPDATE side_state SET revision = revision + 1,
-               supported = coalesce(?2, supported), reason = coalesce(?3, reason)
+               supported = coalesce(?2, supported), reason = coalesce(?3, reason),
+               followups = coalesce(?4, followups)
              WHERE agent_id = ?1",
-            params![agent_id, supported, reason],
+            params![agent_id, supported, reason, followups],
         )?;
         return Ok(());
     }
     conn.execute(
         "UPDATE side_state SET usage = ?2, reported_at = ?3, revision = revision + 1,
-           supported = coalesce(?4, supported), reason = coalesce(?5, reason)
+           supported = coalesce(?4, supported), reason = coalesce(?5, reason),
+           followups = coalesce(?6, followups)
          WHERE agent_id = ?1",
-        params![agent_id, usage, now, supported, reason],
+        params![agent_id, usage, now, supported, reason, followups],
     )?;
     Ok(())
 }
@@ -1098,6 +1117,12 @@ pub struct SideRequestRow {
     pub status: String,
     pub answer: Option<String>,
     pub updated_at: String,
+    /// The id of the conversation's first question; a first question's own.
+    pub conversation: i64,
+    /// The question this one follows up, if any.
+    pub follows: Option<i64>,
+    /// The stored ended flag: the owner ended it, or the runner lost its child.
+    pub ended: bool,
 }
 
 fn side_request_row(r: &rusqlite::Row) -> rusqlite::Result<SideRequestRow> {
@@ -1109,11 +1134,14 @@ fn side_request_row(r: &rusqlite::Row) -> rusqlite::Result<SideRequestRow> {
         status: r.get(4)?,
         answer: r.get(5)?,
         updated_at: r.get(6)?,
+        conversation: r.get(7)?,
+        follows: r.get(8)?,
+        ended: r.get::<_, i64>(9)? != 0,
     })
 }
 
-const SIDE_REQUEST_SELECT: &str =
-    "SELECT id, agent_id, generation, question, status, answer, updated_at FROM side_requests";
+const SIDE_REQUEST_SELECT: &str = "SELECT id, agent_id, generation, question, status, answer,
+     updated_at, conversation, follows, ended FROM side_requests";
 
 /// The agent's open side question, if any (at most one by the partial index).
 pub fn open_side_request(conn: &Connection, agent_id: i64) -> Result<Option<SideRequestRow>> {
@@ -1148,11 +1176,14 @@ pub fn side_request(conn: &Connection, id: i64) -> Result<Option<SideRequestRow>
         .optional()?)
 }
 
-/// Store a new open side question, pruning prior terminal rows.
+/// Store a new open side question, pruning prior terminal rows. A follow-up
+/// (`follows`, the followed row) joins that row's conversation; any other
+/// question starts its own.
 pub fn insert_side_request(
     conn: &Connection,
     agent_id: i64,
     question: &str,
+    follows: Option<&SideRequestRow>,
     now: &str,
 ) -> Result<i64> {
     conn.execute(
@@ -1160,12 +1191,26 @@ pub fn insert_side_request(
         [agent_id],
     )?;
     conn.execute(
-        "INSERT INTO side_requests (agent_id, generation, question, asked_at, status, answer, updated_at)
-         VALUES (?1, NULL, ?2, ?3, 'open', NULL, ?3)",
-        params![agent_id, question, now],
+        "INSERT INTO side_requests
+           (agent_id, generation, question, asked_at, status, answer, updated_at, conversation, follows)
+         VALUES (?1, NULL, ?2, ?3, 'open', NULL, ?3, ?4, ?5)",
+        params![
+            agent_id,
+            question,
+            now,
+            follows.map_or(0, |r| r.conversation),
+            follows.map(|r| r.id)
+        ],
     )?;
+    let id = conn.last_insert_rowid();
+    if follows.is_none() {
+        conn.execute(
+            "UPDATE side_requests SET conversation = id WHERE id = ?1",
+            [id],
+        )?;
+    }
     bump_side_revision(conn, agent_id)?;
-    Ok(conn.last_insert_rowid())
+    Ok(id)
 }
 
 fn bump_side_revision(conn: &Connection, agent_id: i64) -> Result<()> {
@@ -1201,6 +1246,20 @@ pub fn report_side_request(
     conn.execute(
         "UPDATE side_requests SET answer = ?2, status = ?3, updated_at = ?4 WHERE id = ?1",
         params![id, answer, status, now],
+    )?;
+    conn.execute(
+        "UPDATE side_state SET revision = revision + 1
+         WHERE agent_id = (SELECT agent_id FROM side_requests WHERE id = ?1)",
+        [id],
+    )?;
+    Ok(())
+}
+
+/// Set a side question's stored ended flag, leaving its status.
+pub fn end_side_request(conn: &Connection, id: i64, now: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE side_requests SET ended = 1, updated_at = ?2 WHERE id = ?1",
+        params![id, now],
     )?;
     conn.execute(
         "UPDATE side_state SET revision = revision + 1

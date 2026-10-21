@@ -1074,8 +1074,11 @@ pub fn report_context(
             ctx.conn,
             me.id,
             usage_json.as_deref(),
-            req.side_supported,
-            req.side_reason.as_deref(),
+            db::SideCapability {
+                supported: req.side_supported,
+                reason: req.side_reason.as_deref(),
+                followups: req.side_followups,
+            },
             &ctx.now_s,
             req.preserve_usage,
         )?;
@@ -1363,15 +1366,49 @@ fn side_status_proto(status: &str) -> proto::SideStatus {
         "failed" => proto::SideStatus::SideFailed,
         "cancelled" => proto::SideStatus::SideCancelled,
         "interrupted" => proto::SideStatus::SideInterrupted,
+        "ended" => proto::SideStatus::SideEnded,
         _ => proto::SideStatus::SideOpen,
     }
 }
 
-fn side_request_proto(row: db::SideRequestRow) -> Result<proto::SideRequest> {
+/// A terminal side conversation idle this long cannot be continued; the
+/// runner keeps its child a minute longer.
+const SIDE_IDLE_LIMIT: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
+
+/// Statuses a follow-up may continue from.
+fn side_continuable_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled")
+}
+
+/// Whether `row`'s conversation cannot be continued, derived at read time:
+/// stored ended, INTERRUPTED or ENDED, claimed by a generation other than
+/// the current one, or terminal and either never claimed or idle past the
+/// limit. A new open row that no runner has claimed yet is not ended.
+fn side_ended(row: &db::SideRequestRow, state: Option<&db::SideState>, now: DateTime<Utc>) -> bool {
+    if row.ended || matches!(row.status.as_str(), "interrupted" | "ended") {
+        return true;
+    }
+    let current = state.map(|s| s.generation.as_str());
+    match &row.generation {
+        Some(g) if Some(g.as_str()) != current => return true,
+        Some(_) => {}
+        None => return row.status != "open",
+    }
+    row.status != "open"
+        && DateTime::parse_from_rfc3339(&row.updated_at)
+            .ok()
+            .is_none_or(|t| now - t.with_timezone(&Utc) >= SIDE_IDLE_LIMIT)
+}
+
+fn side_request_proto(
+    row: db::SideRequestRow,
+    state: Option<&db::SideState>,
+    now: DateTime<Utc>,
+) -> Result<proto::SideRequest> {
     Ok(proto::SideRequest {
-        conversation: None,
-        ended: false,
-        follows: None,
+        ended: side_ended(&row, state, now),
+        conversation: Some(row.conversation),
+        follows: row.follows,
         id: row.id,
         question: row.question,
         status: side_status_proto(&row.status).into(),
@@ -1381,6 +1418,8 @@ fn side_request_proto(row: db::SideRequestRow) -> Result<proto::SideRequest> {
 }
 
 /// The owner asks the agent an isolated side question; one open at a time.
+/// A follow-up continues the conversation whose latest question it names,
+/// checked and inserted in this one write transaction.
 pub fn ask_side(
     conn: &mut Connection,
     caller: &Caller,
@@ -1397,19 +1436,46 @@ pub fn ask_side(
         if req.question.is_empty() || req.question.len() > 4 * 1024 {
             bail!("question must be 1 byte to 4 KiB");
         }
-        match db::side_state(ctx.conn, agent.id)? {
-            Some(state) if state.supported == Some(true) => {}
+        let state = match db::side_state(ctx.conn, agent.id)? {
+            Some(state) if state.supported == Some(true) => state,
             _ => bail!("{}'s runner does not answer side questions", agent.name),
-        }
+        };
         if db::open_side_request(ctx.conn, agent.id)?.is_some() {
             bail!("a side question is already open");
         }
-        let id = db::insert_side_request(ctx.conn, agent.id, &req.question, &ctx.now_s)?;
+        let followed = match req.follows {
+            None => None,
+            Some(follows) => {
+                if state.followups != Some(true) {
+                    bail!("follow-ups need an updated runner");
+                }
+                let latest = db::latest_side_request(ctx.conn, agent.id)?;
+                match latest {
+                    Some(row)
+                        if row.id == follows
+                            && side_continuable_status(&row.status)
+                            && !side_ended(&row, Some(&state), ctx.now) =>
+                    {
+                        Some(row)
+                    }
+                    _ => bail!("side conversation ended"),
+                }
+            }
+        };
+        let id = db::insert_side_request(
+            ctx.conn,
+            agent.id,
+            &req.question,
+            followed.as_ref(),
+            &ctx.now_s,
+        )?;
         Ok(proto::AskSideResponse { id })
     })
 }
 
 /// The owner cancels a side question by exact id; idempotent once cancelled.
+/// With `end`, the owner ends the conversation whose latest question is
+/// `id`, cancelling it too if open; idempotent.
 pub fn cancel_side(
     conn: &mut Connection,
     caller: &Caller,
@@ -1422,6 +1488,18 @@ pub fn cancel_side(
         };
         if db::agent_owner_id(ctx.conn, row.agent_id)? != Some(me.id) {
             bail!("not your agent's question");
+        }
+        if req.end {
+            if db::latest_side_request(ctx.conn, row.agent_id)?.map(|r| r.id) != Some(row.id) {
+                bail!("not the agent's latest side question");
+            }
+            if row.status == "open" {
+                db::cancel_side_request(ctx.conn, row.id, &ctx.now_s)?;
+            }
+            if !row.ended {
+                db::end_side_request(ctx.conn, row.id, &ctx.now_s)?;
+            }
+            return Ok(proto::Empty {});
         }
         // Idempotent after a lost reply: already cancelled is a no-op.
         if row.status == "cancelled" {
@@ -1454,7 +1532,9 @@ pub fn claim_side(
             Some(_) => bail!("side question already claimed"),
         };
         let request = if claimed {
-            Some(side_request_proto(db::open_side_request(ctx.conn, me.id)?.expect("just claimed"))?)
+            let row = db::open_side_request(ctx.conn, me.id)?.expect("just claimed");
+            let state = db::side_state(ctx.conn, me.id)?;
+            Some(side_request_proto(row, state.as_ref(), ctx.now)?)
         } else {
             // A concurrent claim won the race; treat it as interrupted.
             None
@@ -1479,7 +1559,8 @@ pub fn report_side(
             proto::SideStatus::SideOpen => "open",
             proto::SideStatus::SideCompleted => "completed",
             proto::SideStatus::SideFailed => "failed",
-            _ => bail!("a side report must be OPEN, COMPLETED or FAILED"),
+            proto::SideStatus::SideEnded => return report_side_ended(ctx, &me, &req),
+            _ => bail!("a side report must be OPEN, COMPLETED, FAILED or ENDED"),
         };
         let Some(row) = db::side_request(ctx.conn, req.id)? else {
             bail!("no such side question");
@@ -1495,6 +1576,40 @@ pub fn report_side(
         db::report_side_request(ctx.conn, req.id, req.answer.as_deref(), status, &ctx.now_s)?;
         Ok(proto::Empty {})
     })
+}
+
+/// ENDED from the runner, never after a model call: an open follow-up whose
+/// conversation it no longer holds ends with that status; the latest
+/// terminal question it answered keeps its status and is flagged ended when
+/// its child is lost. A repeat, or a question a newer one has replaced
+/// (pruned or not), is a no-op so the runner never retries in a loop.
+fn report_side_ended(
+    ctx: &Ctx,
+    me: &db::Principal,
+    req: &proto::ReportSideRequest,
+) -> Result<proto::Empty> {
+    let latest = db::latest_side_request(ctx.conn, me.id)?;
+    let Some(row) = db::side_request(ctx.conn, req.id)? else {
+        if latest.is_some_and(|l| l.id > req.id) {
+            return Ok(proto::Empty {});
+        }
+        bail!("no such side question");
+    };
+    if row.agent_id != me.id || row.generation.as_deref() != Some(req.generation.as_str()) {
+        bail!("not your claimed side question");
+    }
+    if row.status == "open" {
+        if row.follows.is_none() {
+            bail!("only a follow-up can be reported ENDED while open");
+        }
+        db::report_side_request(ctx.conn, row.id, req.answer.as_deref(), "ended", &ctx.now_s)?;
+        return Ok(proto::Empty {});
+    }
+    let replaced = latest.is_some_and(|l| l.id != row.id);
+    if !replaced && !row.ended && row.status != "ended" {
+        db::end_side_request(ctx.conn, row.id, &ctx.now_s)?;
+    }
+    Ok(proto::Empty {})
 }
 
 /// One agent's side state: the owner, or the driver with its generation.
@@ -1525,7 +1640,9 @@ pub fn side_report(
         let pending = db::latest_owner_input(ctx.conn, agent.id)?
             .map(owner_input_proto)
             .transpose()?;
-        let side = db::latest_side_request(ctx.conn, agent.id)?;
+        let side = db::latest_side_request(ctx.conn, agent.id)?
+            .map(|row| side_request_proto(row, state.as_ref(), ctx.now))
+            .transpose()?;
         let Some(state) = state else {
             return Ok(proto::SideReportResponse {
                 side_followups: None,
@@ -1534,19 +1651,19 @@ pub fn side_report(
                 usage: None,
                 revision: 0,
                 reported_at: String::new(),
-                side: side.map(side_request_proto).transpose()?,
+                side,
                 side_supported: None,
                 side_reason: None,
             });
         };
         Ok(proto::SideReportResponse {
-            side_followups: None,
+            side_followups: state.followups,
             agent: agent.name,
             pending_input: pending,
             usage: usage_proto(state.usage)?,
             revision: state.revision,
             reported_at: state.reported_at,
-            side: side.map(side_request_proto).transpose()?,
+            side,
             side_supported: state.supported,
             side_reason: state.reason,
         })
@@ -4003,7 +4120,7 @@ mod tests {
         let err = report(&mut conn, "run-1", proto::SideStatus::Unspecified, "x")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("OPEN, COMPLETED or FAILED"), "{err}");
+        assert!(err.contains("OPEN, COMPLETED, FAILED or ENDED"), "{err}");
         let err = report(&mut conn, "run-1", proto::SideStatus::SideOpen, &"x".repeat(64 * 1024 + 1))
             .unwrap_err()
             .to_string();
