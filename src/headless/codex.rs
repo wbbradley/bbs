@@ -160,9 +160,11 @@ pub struct Codex {
     thread_id: String,
     pub resumed: bool,
     /// The thread holds the BBS tools as plain functions; otherwise they come
-    /// from `mcp`, the MCP server config sent with the thread and its forks.
+    /// from the MCP server config sent with the thread and its forks.
     pub dynamic_tools: bool,
-    mcp: Option<Value>,
+    /// What a side fork must be told, or it takes Codex's own defaults: the
+    /// session's model and provider, and an adopted thread's MCP server.
+    fork: Value,
     turn: Arc<TurnState>,
     side: Arc<codex_btw::SideChannel>,
     side_tools: Arc<tokio::sync::Mutex<Tools>>,
@@ -210,7 +212,7 @@ impl Codex {
             thread_id: String::new(),
             resumed: false,
             dynamic_tools: false,
-            mcp: None,
+            fork: json!({}),
             turn,
             side,
             side_tools,
@@ -255,9 +257,11 @@ impl Codex {
         });
         if let Some(model) = &config.model {
             params["model"] = model.clone().into();
+            self.fork["model"] = model.clone().into();
         }
         if let Some(provider) = &config.provider {
             params["modelProvider"] = provider.clone().into();
+            self.fork["modelProvider"] = provider.clone().into();
         }
         if let Some(Resume {
             id,
@@ -278,7 +282,9 @@ impl Codex {
                     self.thread_id = id.to_string();
                     self.resumed = true;
                     self.dynamic_tools = dynamic_tools;
-                    self.mcp = mcp;
+                    if let Some(mcp) = mcp {
+                        self.fork["config"] = mcp;
+                    }
                     return Ok(());
                 }
                 Err(err) if strict => {
@@ -309,7 +315,7 @@ impl Codex {
             .run(
                 &self.rpc,
                 &self.thread_id,
-                self.mcp.as_ref(),
+                &self.fork,
                 question,
                 cancel,
                 &self.side_tools,

@@ -259,8 +259,8 @@ the main agent's context. It requires an updated client and server advertising
 The initial supported harness is Codex app-server. ACP harnesses report that
 side questions are unavailable.
 
-The runner forks an ephemeral child thread, which cannot own a goal, and runs
-one turn with a reminder that it is answering a side question and should avoid
+The runner forks an ephemeral child thread, which cannot own a goal, on the
+parent's model and provider, and runs one turn with a reminder that it is answering a side question and should avoid
 interfering with shared data or systems. The parent can continue working. Side
 questions and answers use a dedicated owner-only result path, outside BBS mail,
 activity history, automatic owner replies and future parent prompts. The server

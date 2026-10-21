@@ -41,7 +41,7 @@ for line in sys.stdin:
     if method is None:
         record('callback',id=mid,response=msg)
         waiting.discard(mid)
-        if not waiting and child_live and scenario in ['normal','early','tools','adopted']:
+        if not waiting and child_live and scenario in ['normal','early','tools','adopted','model']:
             text('child','s','side final\n')
             done('child','s')
         continue
@@ -49,7 +49,9 @@ for line in sys.stdin:
     if method=='initialize':reply(mid,{})
     elif method=='model/list':reply(mid,dict(data=[],nextCursor=None))
     elif method in ['thread/start','thread/resume']:
-        if method=='thread/start':assert scenario!='adopted' and any(t['name']=='bbs_agents' for t in p['dynamicTools'])
+        if method=='thread/start':
+            assert scenario!='adopted' and any(t['name']=='bbs_agents' for t in p['dynamicTools'])
+            if scenario=='model':assert p['model']=='fixture-model' and p['modelProvider']=='fixture-provider'
         # A thread opened through ACP gets its MCP server again; one bbs
         # started keeps its plain-function tools and gets none.
         elif scenario=='adopted':assert p['config']==MCP and 'dynamicTools' not in p
@@ -62,6 +64,9 @@ for line in sys.stdin:
         expected=dict(threadId='parent',ephemeral=True,excludeTurns=True)
         # A fork inherits plain-function tools, but an MCP server only if given.
         if scenario=='adopted':expected['config']=MCP
+        # Nor the session's model and provider, which Codex would otherwise
+        # take from its own defaults.
+        if scenario=='model':expected.update(model='fixture-model',modelProvider='fixture-provider')
         assert p==expected
         if scenario=='no-fork':error(mid);continue
         fork=dict(thread=dict(id='child',forkedFromId='parent',ephemeral=True))

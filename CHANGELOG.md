@@ -20,6 +20,9 @@ under the new package version and its publication date.
 
 ### Fixed
 
+- `/btw` side questions on Codex app-server run on the agent's model and
+  provider. The side thread took Codex's configured default model instead,
+  which could re-send the whole conversation to another model and time out.
 - In agent conversations, paging down to the newest view resumes following
   and returns focus to the composer, keeping the draft and cursor position.
 - `/btw` side questions on Codex app-server fork with options current Codex
@@ -36,6 +39,7 @@ under the new package version and its publication date.
   notice clears after one page instead of the agent's whole retained history,
   which joins the timeline in one step when it arrives, without moving the
   view.
+
 
 ## 0.11.1 - 2026-10-20
 

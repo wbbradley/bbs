@@ -219,7 +219,7 @@ impl SideChannel {
         self: &Arc<Self>,
         rpc: &Rpc,
         parent: &str,
-        mcp: Option<&Value>,
+        inherit: &Value,
         question: &str,
         mut cancel: watch::Receiver<bool>,
         tools: &Arc<tokio::sync::Mutex<Tools>>,
@@ -269,10 +269,12 @@ impl SideChannel {
                 rpc,
                 "thread/fork",
                 {
-                    // A fork inherits plain-function tools but not MCP servers.
+                    // A fork inherits plain-function tools, but not the
+                    // session's model, provider or MCP servers: given here.
                     let mut fork = json!({"threadId":parent,"ephemeral":true,"excludeTurns":true});
-                    if let Some(mcp) = mcp {
-                        fork["config"] = mcp.clone();
+                    if let (Some(fork), Some(inherit)) = (fork.as_object_mut(), inherit.as_object())
+                    {
+                        fork.extend(inherit.clone());
                     }
                     fork
                 },
@@ -610,6 +612,10 @@ mod tests {
         async fn new(scenario: &str) -> Self {
             Self::open(scenario, None).await
         }
+        /// A parent whose model and provider bbs chose, not Codex's defaults.
+        async fn with_model() -> Self {
+            Self::open("model", None).await
+        }
         /// A parent opened through ACP, resumed with its BBS MCP server.
         async fn adopted() -> Self {
             Self::open(
@@ -631,6 +637,8 @@ mod tests {
                     format!("{}/tests/fake_btw.py", env!("CARGO_MANIFEST_DIR")),
                     scenario.into(),
                 ],
+                model: (scenario == "model").then(|| "fixture-model".into()),
+                provider: (scenario == "model").then(|| "fixture-provider".into()),
                 ..Default::default()
             };
             let (harness, process, events, _) = Harness::start(
@@ -777,6 +785,26 @@ mod tests {
         let fork = wire.iter().find(|v| v["method"] == "thread/fork").unwrap();
         assert!(fork["params"]["config"]["mcp_servers"]["bbs"].is_object());
         assert!(!parent.is_finished());
+        r.finish(parent).await;
+    }
+    #[tokio::test]
+    async fn a_side_child_runs_on_the_parents_model_and_provider() {
+        let mut r = Rig::with_model().await;
+        let parent = r.parent().await;
+        let (_cancel, rx) = watch::channel(false);
+        let result = timeout(Duration::from_secs(5), r.side(rx))
+            .await
+            .unwrap()
+            .unwrap();
+        // The fake refuses a fork without them; check they are there.
+        assert_eq!(result.status, Status::Completed);
+        let fork = r
+            .wire()
+            .into_iter()
+            .find(|v| v["method"] == "thread/fork")
+            .unwrap();
+        assert_eq!(fork["params"]["model"], "fixture-model");
+        assert_eq!(fork["params"]["modelProvider"], "fixture-provider");
         r.finish(parent).await;
     }
     #[tokio::test]
