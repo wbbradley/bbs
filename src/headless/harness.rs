@@ -157,18 +157,35 @@ impl Harness {
             Self::Acp(_) => String::new(),
         }
     }
+    pub fn side_retained(&self) -> bool {
+        match self {
+            Self::Codex(c) => c.side_retained(),
+            Self::Acp(_) => false,
+        }
+    }
+    #[cfg(test)]
     pub async fn side_question(
         &self,
         question: &str,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> super::codex_btw::Outcome {
+        self.side_turn(question, super::codex_btw::Mode::OneShot, cancel)
+            .await
+    }
+    pub async fn side_turn(
+        &self,
+        question: &str,
+        mode: super::codex_btw::Mode,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> super::codex_btw::Outcome {
         match self {
-            Self::Codex(c) => c.side_question(question, cancel).await,
+            Self::Codex(c) => c.side_turn(question, mode, cancel).await,
             Self::Acp(_) => super::codex_btw::Outcome {
                 status: super::codex_btw::Status::Unsupported,
                 answer: String::new(),
                 detail: "ACP side-fork isolation has not been verified".into(),
                 disable: true,
+                retained: false,
             },
         }
     }

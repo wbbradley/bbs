@@ -9,6 +9,7 @@ scenario = sys.argv[1]
 lock = threading.Lock()
 parent_live = False
 child_live = False
+child_turn = 0
 waiting = set()
 record_pid = os.getpid()
 # The BBS MCP server an "adopted" parent (opened through ACP) is resumed with.
@@ -50,23 +51,24 @@ for line in sys.stdin:
     elif method=='model/list':reply(mid,dict(data=[],nextCursor=None))
     elif method in ['thread/start','thread/resume']:
         if method=='thread/start':
-            assert scenario!='adopted' and any(t['name']=='bbs_agents' for t in p['dynamicTools'])
-            if scenario=='model':assert p['model']=='fixture-model' and p['modelProvider']=='fixture-provider'
+            assert 'adopted' not in scenario and any(t['name']=='bbs_agents' for t in p['dynamicTools'])
+            if 'model' in scenario:assert p['model']=='fixture-model' and p['modelProvider']=='fixture-provider'
         # A thread opened through ACP gets its MCP server again; one bbs
         # started keeps its plain-function tools and gets none.
-        elif scenario=='adopted':assert p['config']==MCP and 'dynamicTools' not in p
+        elif 'adopted' in scenario:assert p['config']==MCP and 'dynamicTools' not in p
         else:assert 'config' not in p and 'dynamicTools' not in p
         reply(mid,dict(thread=dict(id='parent'),model='fixture',reasoningEffort='low'))
     elif method=='thread/fork':
+        if scenario.startswith('continue'):child_turn=0
         # As Codex 0.160.1 refuses it.
         if p.get('ephemeral') and p.get('deferGoalContinuation'):
             error(mid,-32600,'`deferGoalContinuation` cannot be combined with `ephemeral`');continue
         expected=dict(threadId='parent',ephemeral=True,excludeTurns=True)
         # A fork inherits plain-function tools, but an MCP server only if given.
-        if scenario=='adopted':expected['config']=MCP
+        if 'adopted' in scenario:expected['config']=MCP
         # Nor the session's model and provider, which Codex would otherwise
         # take from its own defaults.
-        if scenario=='model':expected.update(model='fixture-model',modelProvider='fixture-provider')
+        if 'model' in scenario:expected.update(model='fixture-model',modelProvider='fixture-provider')
         assert p==expected
         if scenario=='no-fork':error(mid);continue
         fork=dict(thread=dict(id='child',forkedFromId='parent',ephemeral=True))
@@ -81,6 +83,32 @@ for line in sys.stdin:
             parent_live=True;reply(mid,dict(turn=dict(id='p')));text('parent','p','parent before\n');note('thread/tokenUsage/updated',dict(threadId='parent',turnId='p',tokenUsage=dict(last=dict(totalTokens=40),modelContextWindow=100)));record('parent_active')
             continue
         assert p['threadId']=='child'
+        if scenario.startswith('continue'):
+            child_turn += 1
+            turn = 's'+str(child_turn)
+            body = p['input'][0]['text']
+            if child_turn == 1:
+                assert body.startswith('You are answering a side question alongside the main agent.')
+            else:
+                assert not body.startswith('You are answering a side question alongside the main agent.')
+                text('child','s'+str(child_turn-1),'STALE SIDE TEXT')
+                done('child','s'+str(child_turn-1))
+            child_live=True
+            ack=dict(turn=dict(id=turn))
+            if scenario=='continue-late-start' and child_turn>1:
+                record('start_pending');later('release-start',mid,ack);continue
+            if scenario!='continue-early':reply(mid,ack)
+            text('parent','p','parent alongside\n')
+            text('child',turn,'side answer '+str(child_turn)+'\n')
+            note('thread/tokenUsage/updated',dict(threadId='child',turnId=turn,tokenUsage=dict(last=dict(totalTokens=99999),modelContextWindow=100)))
+            if 'tool' in scenario:
+                note('item/started',dict(threadId='child',turnId=turn,item=dict(id='provider-tool',type='mcpToolCall' if 'adopted' in scenario else 'commandExecution')))
+                if 'pending' not in scenario and ('cancel' not in scenario or 'HOLD SIDE' not in body):
+                    note('item/completed',dict(threadId='child',turnId=turn,item=dict(id='provider-tool',type='mcpToolCall')))
+            if 'HOLD SIDE' in body:record('side_active',turn=turn);continue
+            done('child',turn,'failed' if scenario=='continue-failed' else 'interrupted' if scenario=='continue-unsolicited' else 'completed')
+            if scenario=='continue-early':reply(mid,ack)
+            continue
         assert p['input'][0]['text'].startswith('You are answering a side question alongside the main agent.')
         child_live=True
         ack=dict(turn=dict(id='s'))
@@ -116,7 +144,11 @@ for line in sys.stdin:
         if scenario=='early':reply(mid,ack)
     elif method=='turn/interrupt':
         assert p['threadId'] in ['parent','child']
+        if p['threadId']=='child' and scenario=='continue-bad-interrupt':error(mid,-32603,'synthetic interrupt failure');continue
         reply(mid,{})
+        if p['threadId']=='child' and scenario=='continue-no-terminal':continue
+        if 'tool-cancel' in scenario:
+            note('item/completed',dict(threadId='child',turnId=p['turnId'],item=dict(id='provider-tool',type='mcpToolCall')))
         done(p['threadId'],p['turnId'],'interrupted')
     elif method=='thread/unsubscribe':
         assert p['threadId']=='child';reply(mid,{})

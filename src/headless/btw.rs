@@ -1,6 +1,6 @@
 //! Board lifecycle for one side request, independent of parent mail and metadata.
 use super::{
-    codex_btw::{Outcome, Status},
+    codex_btw::{Mode, Outcome, Status},
     harness::Harness,
 };
 use crate::{
@@ -12,10 +12,12 @@ use std::time::Duration;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
-    time::{MissedTickBehavior, interval, timeout},
+    time::{Instant, MissedTickBehavior, interval, timeout},
 };
 
 const CALL: Duration = Duration::from_secs(3);
+const IDLE: Duration = Duration::from_secs(31 * 60);
+const CONVERSATIONS: &str = "side-conversations.v1";
 #[derive(Default)]
 struct Hooks {
     #[cfg(test)]
@@ -32,6 +34,8 @@ pub struct Btw {
 }
 struct Active {
     id: i64,
+    conversation: i64,
+    ending: bool,
     cancel: watch::Sender<bool>,
     task: JoinHandle<Outcome>,
     reported: String,
@@ -40,6 +44,19 @@ impl Drop for Active {
     fn drop(&mut self) {
         let _ = self.cancel.send(true);
         self.task.abort();
+    }
+}
+
+struct Held {
+    conversation: i64,
+    latest: i64,
+    deadline: Instant,
+}
+impl Held {
+    fn follows(&self, request: &proto::SideRequest) -> bool {
+        request.conversation == Some(self.conversation)
+            && request.follows == Some(self.latest)
+            && Instant::now() < self.deadline
     }
 }
 
@@ -56,11 +73,17 @@ impl Btw {
         harness: Harness,
         warnings: mpsc::UnboundedSender<String>,
     ) -> Option<Self> {
+        let followups = timeout(CALL, backend.server_info())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|r| r.capabilities.iter().any(|c| c == CONVERSATIONS));
         let supported = harness.side_supported();
         if availability(
             &mut backend,
             &generation,
             supported,
+            followups.then_some(supported),
             if supported {
                 "Codex ephemeral fork is required; shared tools are allowed"
             } else {
@@ -86,6 +109,7 @@ impl Btw {
             warnings.clone(),
             rx,
             Hooks::default(),
+            followups,
         ));
         Some(Self {
             stop,
@@ -110,11 +134,17 @@ impl Btw {
         }
     }
 }
-async fn availability(b: &mut Backend, g: &str, supported: bool, reason: &str) -> Result<()> {
+async fn availability(
+    b: &mut Backend,
+    g: &str,
+    supported: bool,
+    followups: Option<bool>,
+    reason: &str,
+) -> Result<()> {
     timeout(
         CALL,
         b.report_context(proto::ReportContextRequest {
-            side_followups: None,
+            side_followups: followups,
             generation: g.into(),
             usage: None,
             side_supported: Some(supported),
@@ -170,36 +200,87 @@ async fn run(
     warnings: mpsc::UnboundedSender<String>,
     mut stop: watch::Receiver<bool>,
     mut _hooks: Hooks,
+    followups: bool,
 ) {
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut active: Option<Active> = None;
+    let mut held: Option<Held> = None;
     let mut final_report: Option<Final> = None;
+    let mut lost: Option<i64> = None;
     let mut attempted = 0i64;
     let mut warned = false;
     let mut ending = false;
     let mut disabled = false;
     loop {
-        if (ending || disabled) && active.is_none() && final_report.is_none() {
+        if (ending || disabled)
+            && active.is_none()
+            && final_report.is_none()
+            && lost.is_none()
+            && held.is_none()
+        {
             break;
         }
-        tokio::select! {biased;
-            changed=stop.changed(),if !ending=>{if changed.is_err()||*stop.borrow(){ending=true;if let Some(a)=&active{let _=a.cancel.send(true);}}},
-            result=async{(&mut active.as_mut().unwrap().task).await},if active.is_some()=>{
-                let a=active.take().unwrap();
-                let outcome=result.unwrap_or_else(|_|Outcome{status:Status::Failed,answer:harness.side_text(),detail:"side task stopped".into(),disable:true});
-                if outcome.disable{
-                    disabled=true;
-                    let _=availability(&mut backend,&generation,false,"provider side-fork prerequisites or cleanup could not be confirmed; restart after resolving the provider failure").await;
+        tokio::select! { biased;
+            changed = stop.changed(), if !ending => {
+                if changed.is_err() || *stop.borrow() {
+                    ending = true;
+                    if let Some(a) = &mut active {
+                        a.ending = true;
+                        let _ = a.cancel.send(true);
+                    }
                 }
-                let status=if outcome.status==Status::Completed{SideStatus::SideCompleted}else{SideStatus::SideFailed};
-                // Diagnostics stay out of the parent activity/owner outbox. The
-                // dedicated pane shows the terminal status and any exact prefix.
-                let answer=if outcome.answer.is_empty() { bounded_detail(outcome.detail) } else { outcome.answer };
-                final_report=Some(Final{id:a.id,status,answer:(!answer.is_empty()).then_some(answer)});
             },
-            _=tick.tick()=>{},
+            result = async { (&mut active.as_mut().unwrap().task).await }, if active.is_some() => {
+                let a = active.take().unwrap();
+                let outcome = result.unwrap_or_else(|_| Outcome {
+                    status: Status::Failed, answer: harness.side_text(),
+                    detail: "side task stopped".into(), disable: true, retained: false,
+                });
+                if outcome.disable {
+                    disabled = true;
+                    let _ = availability(&mut backend, &generation, false, followups.then_some(false),
+                        "provider side-fork prerequisites or cleanup could not be confirmed; restart after resolving the provider failure").await;
+                }
+                if outcome.retained && !a.ending && !ending && !disabled {
+                    held = Some(Held { conversation: a.conversation, latest: a.id,
+                        deadline: Instant::now() + IDLE });
+                } else if followups && outcome.status != Status::Ended {
+                    lost = Some(a.id);
+                    if outcome.retained { let _ = harness.finish_side().await; }
+                    held = None;
+                }
+                let status = match outcome.status {
+                    Status::Completed => SideStatus::SideCompleted,
+                    Status::Ended if followups => SideStatus::SideEnded,
+                    _ => SideStatus::SideFailed,
+                };
+                let answer = if outcome.answer.is_empty() { bounded_detail(outcome.detail) } else { outcome.answer };
+                final_report = Some(Final { id: a.id, status,
+                    answer: (!answer.is_empty()).then_some(answer) });
+            },
+            _ = tick.tick() => {},
         }
+        // Local expiry and process loss must release the child even when the
+        // board cannot be reached. Reporting its loss can wait for the board.
+        if held.as_ref().is_some_and(|h| {
+            ending || disabled || !harness.side_retained() || Instant::now() >= h.deadline
+        }) {
+            lost = held.take().map(|h| h.latest);
+            if !harness.finish_side().await {
+                disabled = true;
+                let _ = availability(
+                    &mut backend,
+                    &generation,
+                    false,
+                    followups.then_some(false),
+                    "side child cleanup could not be confirmed",
+                )
+                .await;
+            }
+        }
+        // Poll even with a retained but idle child: owner end and provider loss
+        // must not wait for another question to release the ephemeral thread.
         let current = match snapshot(&mut backend, &generation).await {
             Ok(r) => {
                 warned = false;
@@ -208,7 +289,8 @@ async fn run(
             Err(e) => {
                 warning(&warnings, &mut warned);
                 if super::side::permanent(&backend, &e) {
-                    if let Some(a) = &active {
+                    if let Some(a) = &mut active {
+                        a.ending = true;
                         let _ = a.cancel.send(true);
                     }
                     ending = true;
@@ -219,13 +301,64 @@ async fn run(
                 continue;
             }
         };
+        if let Some(h) = &held {
+            let row = current.side.as_ref();
+            if row.is_none_or(|r| r.ended || r.conversation != Some(h.conversation)) {
+                if row.is_some_and(|r| r.id == h.latest && !r.ended) {
+                    lost = Some(h.latest);
+                }
+                held = None;
+                if !harness.finish_side().await {
+                    disabled = true;
+                    let _ = availability(
+                        &mut backend,
+                        &generation,
+                        false,
+                        followups.then_some(false),
+                        "side child cleanup could not be confirmed",
+                    )
+                    .await;
+                }
+            }
+        }
         if let Some(f) = &final_report {
-            let open = current
+            let writable = current.side.as_ref().is_some_and(|r| {
+                r.id == f.id
+                    && if f.status == SideStatus::SideEnded {
+                        !r.ended
+                    } else {
+                        r.status() == SideStatus::SideOpen
+                    }
+            });
+            if !writable || report(&mut backend, &generation, f).await.is_ok() {
+                final_report = None;
+            } else {
+                warning(&warnings, &mut warned);
+                if ending {
+                    break;
+                }
+            }
+            continue;
+        }
+        if let Some(id) = lost {
+            let writable = current
                 .side
                 .as_ref()
-                .is_some_and(|r| r.id == f.id && r.status() == SideStatus::SideOpen);
-            if !open || report(&mut backend, &generation, f).await.is_ok() {
-                final_report = None;
+                .is_some_and(|r| r.id == id && !r.ended);
+            if !writable
+                || report(
+                    &mut backend,
+                    &generation,
+                    &Final {
+                        id,
+                        status: SideStatus::SideEnded,
+                        answer: None,
+                    },
+                )
+                .await
+                .is_ok()
+            {
+                lost = None;
             } else {
                 warning(&warnings, &mut warned);
                 if ending {
@@ -239,8 +372,13 @@ async fn run(
                 || current
                     .side
                     .as_ref()
-                    .is_none_or(|r| r.id != a.id || r.status() != SideStatus::SideOpen)
+                    .is_none_or(|r| r.id != a.id || r.ended || r.status() != SideStatus::SideOpen)
             {
+                a.ending |= ending
+                    || current
+                        .side
+                        .as_ref()
+                        .is_none_or(|r| r.id != a.id || r.ended);
                 let _ = a.cancel.send(true);
             } else {
                 let text = harness.side_text();
@@ -299,8 +437,6 @@ async fn run(
         let request = match claim {
             Ok(Ok(r)) => r.request,
             _ => {
-                // Even an idempotent board claim is not permission to invoke a
-                // model after an ambiguous ACK. Retire the exact claim, if ours.
                 disabled = true;
                 if let Ok(r) = snapshot(&mut backend, &generation).await
                     && let Some(r) = r.side.filter(|r| r.status() == SideStatus::SideOpen)
@@ -316,7 +452,8 @@ async fn run(
                     )
                     .await;
                 }
-                let _=availability(&mut backend,&generation,false,"side claim acknowledgment was uncertain; restart the runner to resume side questions").await;
+                let _ = availability(&mut backend, &generation, false, followups.then_some(false),
+                    "side claim acknowledgment was uncertain; restart the runner to resume side questions").await;
                 warning(&warnings, &mut warned);
                 None
             }
@@ -325,32 +462,54 @@ async fn run(
             continue;
         };
         attempted = attempted.max(request.id);
-        // Owner cancellation may have committed while the claim reply was in flight.
         let still_open = snapshot(&mut backend, &generation).await.is_ok_and(|r| {
-            r.side
-                .is_some_and(|r| r.id == request.id && r.status() == SideStatus::SideOpen)
+            r.side.is_some_and(|r| {
+                r.id == request.id && !r.ended && r.status() == SideStatus::SideOpen
+            })
         });
         if !still_open {
-            final_report = Some(Final {
-                id: request.id,
-                status: SideStatus::SideFailed,
-                answer: request.answer,
-            });
             continue;
         }
+        let mode = if request.follows.is_some() {
+            if !followups
+                || !held.as_ref().is_some_and(|h| h.follows(&request))
+                || !harness.side_retained()
+            {
+                final_report = Some(Final {
+                    id: request.id,
+                    status: if followups {
+                        SideStatus::SideEnded
+                    } else {
+                        SideStatus::SideFailed
+                    },
+                    answer: Some("Side conversation ended; start a fresh /btw.".into()),
+                });
+                continue;
+            }
+            Mode::Followup
+        } else if followups {
+            Mode::Fresh
+        } else {
+            Mode::OneShot
+        };
+        // A held identity only describes a quiescent child, never an active turn.
+        held = None;
         let (cancel, rx) = watch::channel(false);
         let h = harness.clone();
-        let question = request.question;
-        let task = tokio::spawn(async move { h.side_question(&question, rx).await });
+        let task = tokio::spawn(async move { h.side_turn(&request.question, mode, rx).await });
         active = Some(Active {
             id: request.id,
+            conversation: request.conversation.unwrap_or(request.id),
+            ending: false,
             cancel,
             task,
             reported: String::new(),
         });
     }
-    if let Some(a) = active {
-        let _ = a.cancel.send(true);
+    drop(active);
+    if !harness.finish_side().await {
+        let _ = warnings
+            .send("side child cleanup unconfirmed; shared tools may already have run".into());
     }
 }
 
@@ -411,7 +570,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            availability(&mut board, "claim-generation", true, "")
+            availability(&mut board, "claim-generation", true, None, "")
                 .await
                 .unwrap();
             let id = human
@@ -463,6 +622,7 @@ mod tests {
                 Hooks {
                     claim_ack: Some((reached, wait)),
                 },
+                false,
             ));
             timeout(Duration::from_secs(5), held)
                 .await

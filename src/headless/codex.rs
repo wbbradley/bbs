@@ -306,9 +306,10 @@ impl Codex {
         Ok(())
     }
 
-    pub async fn side_question(
+    pub async fn side_turn(
         &self,
         question: &str,
+        mode: codex_btw::Mode,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> codex_btw::Outcome {
         self.side
@@ -317,10 +318,14 @@ impl Codex {
                 &self.thread_id,
                 &self.fork,
                 question,
+                mode,
                 cancel,
                 &self.side_tools,
             )
             .await
+    }
+    pub fn side_retained(&self) -> bool {
+        self.side.retained()
     }
     pub async fn finish_side(&self) -> bool {
         self.side
