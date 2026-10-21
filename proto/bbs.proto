@@ -120,6 +120,110 @@ service Bbs {
   rpc ClaimSide(ClaimSideRequest) returns (ClaimSideResponse);
   // The claiming runner reports progressive text (OPEN) or a terminal result.
   rpc ReportSide(ReportSideRequest) returns (Empty);
+
+  // Immutable group blockers; all require blockers.v1. Reads are board-wide
+  // for authenticated callers. Writes enforce current group relationships.
+  rpc ListBlockers(ListBlockersRequest) returns (ListBlockersResponse);
+  rpc GetBlocker(GetBlockerRequest) returns (GetBlockerResponse);
+  // Agent group members create a new version, optionally replacing the head
+  // of a prior blocker's chain. Original content is never edited.
+  rpc PutBlocker(PutBlockerRequest) returns (BlockerMutationResponse);
+  // A human owning any current group member answers and resolves the exact
+  // version, atomically delivering ordinary mail to its creating agent.
+  rpc AnswerBlocker(AnswerBlockerRequest) returns (BlockerMutationResponse);
+  // Current member agents and humans owning a member may cancel; no mail.
+  rpc CancelBlocker(CancelBlockerRequest) returns (BlockerMutationResponse);
+}
+
+enum BlockerStatus {
+  BLOCKER_STATUS_UNSPECIFIED = 0;
+  BLOCKER_OPEN = 1;
+  BLOCKER_ANSWERED = 2;
+  BLOCKER_CANCELLED = 3;
+  BLOCKER_SUPERSEDED = 4;
+}
+
+message BlockerOutcome {
+  BlockerStatus status = 1;
+  Principal actor = 2;
+  string created_at = 3;
+  optional string answer = 4;
+  optional int64 message_id = 5;
+}
+
+message Blocker {
+  int64 id = 1;
+  int64 group_id = 2;
+  string group = 3;
+  Principal creator = 4;
+  string body = 5;
+  string created_at = 6;
+  // Stable queue position, shared by every version in the chain.
+  int64 root_id = 7;
+  optional int64 replaces = 8;
+  optional int64 replaced_by = 9;
+  BlockerStatus status = 10;
+  BlockerOutcome outcome = 11;
+  bool can_answer = 12;
+  bool can_cancel = 13;
+}
+
+message ListBlockersRequest {
+  // Optional mutually exclusive scopes. Neither means the whole board.
+  optional string group = 1;
+  optional string agent = 2;
+  bool include_closed = 3;
+  optional uint32 limit = 4;
+  // Exclusive stable-root cursor; oldest roots first, including replacements.
+  optional int64 after_root_id = 5;
+}
+
+message ListBlockersResponse {
+  repeated Blocker blockers = 1;
+  uint64 active_count = 2;
+  bool has_more = 3;
+  optional int64 next_after_root_id = 4;
+
+}
+
+message GetBlockerRequest {
+  int64 id = 1;
+  optional uint32 limit = 2;
+  // Exclusive version-ID cursor for newest-first chain history.
+  optional int64 before_id = 3;
+}
+
+message GetBlockerResponse {
+  Blocker blocker = 1;
+  Blocker current = 2;
+  repeated Blocker history = 3;
+  bool has_more = 4;
+  optional int64 next_before_id = 5;
+}
+
+message PutBlockerRequest {
+  string group = 1;
+  string body = 2;
+  optional int64 replaces = 3;
+  // Caller-scoped idempotency key: reuse only for the same exact operation.
+  string request_key = 4;
+}
+
+message AnswerBlockerRequest {
+  int64 id = 1;
+  string answer = 2;
+  string request_key = 3;
+}
+
+message CancelBlockerRequest {
+  int64 id = 1;
+  string request_key = 2;
+}
+
+message BlockerMutationResponse {
+  Blocker blocker = 1;
+  bool replayed = 2;
+  optional int64 message_id = 3;
 }
 
 enum SideStatus {

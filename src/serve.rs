@@ -1042,6 +1042,56 @@ impl Bbs for Server {
         self.0.protocol.finish(result)
     }
 
+    async fn list_blockers(
+        &self,
+        req: Request<proto::ListBlockersRequest>,
+    ) -> Result<Response<proto::ListBlockersResponse>, Status> {
+        self.unary("list_blockers", req, Effect::Query, service::list_blockers)
+            .await
+    }
+
+    async fn get_blocker(
+        &self,
+        req: Request<proto::GetBlockerRequest>,
+    ) -> Result<Response<proto::GetBlockerResponse>, Status> {
+        self.unary("get_blocker", req, Effect::Query, service::get_blocker)
+            .await
+    }
+
+    async fn put_blocker(
+        &self,
+        req: Request<proto::PutBlockerRequest>,
+    ) -> Result<Response<proto::BlockerMutationResponse>, Status> {
+        self.unary("put_blocker", req, Effect::Write, service::put_blocker)
+            .await
+    }
+
+    async fn answer_blocker(
+        &self,
+        req: Request<proto::AnswerBlockerRequest>,
+    ) -> Result<Response<proto::BlockerMutationResponse>, Status> {
+        self.unary(
+            "answer_blocker",
+            req,
+            Effect::Write,
+            service::answer_blocker,
+        )
+        .await
+    }
+
+    async fn cancel_blocker(
+        &self,
+        req: Request<proto::CancelBlockerRequest>,
+    ) -> Result<Response<proto::BlockerMutationResponse>, Status> {
+        self.unary(
+            "cancel_blocker",
+            req,
+            Effect::Write,
+            service::cancel_blocker,
+        )
+        .await
+    }
+
     async fn search(
         &self,
         req: Request<proto::SearchRequest>,
@@ -1231,6 +1281,192 @@ impl Bbs for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn blockers_round_trip_and_old_capability_refusal_preserve_atomicity() {
+        use crate::backend::{BLOCKERS, Backend, Remote};
+        for supported in [false, true] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            db::migrate(&mut conn).unwrap();
+            service::ensure_human(
+                &mut conn,
+                proto::EnsureHumanRequest {
+                    name: "will".into(),
+                },
+            )
+            .unwrap();
+            let will = Caller {
+                human: Some("will".into()),
+                ..Default::default()
+            };
+            service::group_register(
+                &mut conn,
+                &will,
+                proto::GroupRegisterRequest {
+                    group: "crew".into(),
+                    description: None,
+                },
+            )
+            .unwrap();
+            let token = service::register(
+                &mut conn,
+                &will,
+                proto::RegisterRequest {
+                    name: Some("Mateo".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .token;
+            let mateo = Caller {
+                token: Some(token),
+                ..Default::default()
+            };
+            service::group_join(
+                &mut conn,
+                &mateo,
+                proto::GroupRequest {
+                    group: "crew".into(),
+                },
+            )
+            .unwrap();
+            let first = service::put_blocker(
+                &mut conn,
+                &mateo,
+                proto::PutBlockerRequest {
+                    group: "crew".into(),
+                    body: "Question one".into(),
+                    request_key: "one".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .blocker
+            .unwrap()
+            .id;
+            let state = Arc::new(State {
+                conn: Mutex::new(conn),
+                notify: watch::Sender::new(0),
+                activity: watch::Sender::new(0),
+                waiters: Mutex::new(HashSet::new()),
+                shutdown: watch::Sender::new(false),
+                require_human_token: false,
+                protocol: if supported {
+                    Policy::default()
+                } else {
+                    Policy::default().without(BLOCKERS)
+                },
+                auth_failures: Mutex::new(HashMap::new()),
+                timer_limits: TimerLimits::default(),
+                clock: Arc::new(Utc::now),
+            });
+            let snapshot = || {
+                let conn = state.conn.lock().unwrap();
+                ["blockers", "blocker_events", "messages", "deliveries"].map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .unwrap()
+                })
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(BbsServer::new(Server(state.clone())))
+                    .serve_with_incoming(TcpListenerStream::new(listener)),
+            );
+            let mut human = Backend::Remote(Remote::connect(&address, will).await.unwrap());
+            let mut agent = Backend::Remote(Remote::connect(&address, mateo).await.unwrap());
+            let put = proto::PutBlockerRequest {
+                group: "crew".into(),
+                body: "Question two".into(),
+                request_key: "two".into(),
+                ..Default::default()
+            };
+            let answer = proto::AnswerBlockerRequest {
+                id: first,
+                answer: "Proceed".into(),
+                request_key: "answer".into(),
+            };
+            let cancel = proto::CancelBlockerRequest {
+                id: first,
+                request_key: "cancel".into(),
+            };
+            if !supported {
+                let before = snapshot();
+                let errors = [
+                    agent.put_blocker(put).await.unwrap_err(),
+                    human.answer_blocker(answer).await.unwrap_err(),
+                    agent.cancel_blocker(cancel).await.unwrap_err(),
+                    human
+                        .list_blockers(proto::ListBlockersRequest::default())
+                        .await
+                        .unwrap_err(),
+                    human
+                        .get_blocker(proto::GetBlockerRequest {
+                            id: first,
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap_err(),
+                ];
+                for error in errors {
+                    assert!(format!("{error:#}").contains(BLOCKERS));
+                    assert_eq!(
+                        error.downcast_ref::<Status>().unwrap().code(),
+                        tonic::Code::FailedPrecondition
+                    );
+                }
+                assert_eq!(snapshot(), before);
+            } else {
+                let made = agent.put_blocker(put.clone()).await.unwrap();
+                assert!(agent.put_blocker(put).await.unwrap().replayed);
+                let list = human
+                    .list_blockers(proto::ListBlockersRequest {
+                        agent: Some("Mateo".into()),
+                        limit: Some(1),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(list.active_count, 2);
+                assert_eq!(list.blockers[0].id, first);
+                assert!(list.has_more);
+                let response = human.answer_blocker(answer.clone()).await.unwrap();
+                let replay = human.answer_blocker(answer).await.unwrap();
+                assert_eq!(response.message_id, replay.message_id);
+                assert!(replay.replayed);
+                let get = human
+                    .get_blocker(proto::GetBlockerRequest {
+                        id: first,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    get.blocker.unwrap().status(),
+                    proto::BlockerStatus::BlockerAnswered
+                );
+                agent
+                    .cancel_blocker(proto::CancelBlockerRequest {
+                        id: made.blocker.unwrap().id,
+                        ..cancel
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    human
+                        .list_blockers(proto::ListBlockersRequest::default())
+                        .await
+                        .unwrap()
+                        .active_count,
+                    0
+                );
+            }
+            server.abort();
+        }
+    }
 
     #[tokio::test]
     async fn protocol_rejection_precedes_auth_budget_identity_lookup() {

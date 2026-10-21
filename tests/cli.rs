@@ -249,7 +249,7 @@ fn version_reports_identity_without_side_effects() {
             );
             assert_eq!(report["protocol"]["epoch"], 2);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
-            assert_eq!(report["schema_version"], 20);
+            assert_eq!(report["schema_version"], 21);
             assert_eq!(report["config_format"], 4);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {

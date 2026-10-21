@@ -36,6 +36,7 @@ pub const AGENT_INTERACTIONS: &str = "agent-interactions.v1";
 pub const SIDE_QUESTIONS: &str = "side-questions.v1";
 pub const SIDE_CONVERSATIONS: &str = "side-conversations.v1";
 pub const MESSAGE_SEARCH: &str = "message-search.v1";
+pub const BLOCKERS: &str = "blockers.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -367,6 +368,66 @@ impl Backend {
             Backend::Local(l) => service::search(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => {
                 rpc!(r, search, req, &[MESSAGE_SEARCH]).map_err(|e| missing_rpc(e, MESSAGE_SEARCH))
+            }
+        }
+    }
+
+    pub async fn list_blockers(
+        &mut self,
+        req: proto::ListBlockersRequest,
+    ) -> Result<proto::ListBlockersResponse> {
+        match self {
+            Backend::Local(l) => service::list_blockers(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, list_blockers, req, &[BLOCKERS]).map_err(|e| missing_rpc(e, BLOCKERS))
+            }
+        }
+    }
+
+    pub async fn get_blocker(
+        &mut self,
+        req: proto::GetBlockerRequest,
+    ) -> Result<proto::GetBlockerResponse> {
+        match self {
+            Backend::Local(l) => service::get_blocker(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, get_blocker, req, &[BLOCKERS]).map_err(|e| missing_rpc(e, BLOCKERS))
+            }
+        }
+    }
+
+    pub async fn put_blocker(
+        &mut self,
+        req: proto::PutBlockerRequest,
+    ) -> Result<proto::BlockerMutationResponse> {
+        match self {
+            Backend::Local(l) => service::put_blocker(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, put_blocker, req, &[BLOCKERS]).map_err(|e| missing_rpc(e, BLOCKERS))
+            }
+        }
+    }
+
+    pub async fn answer_blocker(
+        &mut self,
+        req: proto::AnswerBlockerRequest,
+    ) -> Result<proto::BlockerMutationResponse> {
+        match self {
+            Backend::Local(l) => service::answer_blocker(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, answer_blocker, req, &[BLOCKERS]).map_err(|e| missing_rpc(e, BLOCKERS))
+            }
+        }
+    }
+
+    pub async fn cancel_blocker(
+        &mut self,
+        req: proto::CancelBlockerRequest,
+    ) -> Result<proto::BlockerMutationResponse> {
+        match self {
+            Backend::Local(l) => service::cancel_blocker(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, cancel_blocker, req, &[BLOCKERS]).map_err(|e| missing_rpc(e, BLOCKERS))
             }
         }
     }
@@ -1132,6 +1193,36 @@ mod tests {
             };
             assert!(backend.report_side(report).await.is_err());
         }
+        assert!(
+            backend
+                .list_blockers(proto::ListBlockersRequest::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .get_blocker(proto::GetBlockerRequest::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .put_blocker(proto::PutBlockerRequest::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .answer_blocker(proto::AnswerBlockerRequest::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .cancel_blocker(proto::CancelBlockerRequest::default())
+                .await
+                .is_err()
+        );
         server.abort();
         assert!(
             backend
@@ -1166,6 +1257,11 @@ mod tests {
             ("CancelSide", Some("side-conversations.v1")),
             ("ReportSide", Some("side-questions.v1")),
             ("ReportSide", Some("side-conversations.v1")),
+            ("ListBlockers", Some("blockers.v1")),
+            ("GetBlocker", Some("blockers.v1")),
+            ("PutBlocker", Some("blockers.v1")),
+            ("AnswerBlocker", Some("blockers.v1")),
+            ("CancelBlocker", Some("blockers.v1")),
             ("Search", Some("message-search.v1")),
         ];
         let observed = observations.lock().unwrap();

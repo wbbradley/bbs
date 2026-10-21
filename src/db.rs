@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 
+pub mod blockers;
+
 /// The schema every migrating open advances to.
 pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
 
@@ -32,6 +34,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0018_side_channels.sql"),
     include_str!("../migrations/0019_side_questions.sql"),
     include_str!("../migrations/0020_side_conversations.sql"),
+    include_str!("../migrations/0021_blockers.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
