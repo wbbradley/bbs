@@ -537,7 +537,15 @@ async fn waiter_slot_is_released_on_disconnect_and_retirement_ends_wait() {
         .await
         .expect("waiter ended")
         .unwrap_err();
-    assert!(err.message().contains("retired while waiting"), "{err}");
+    // Retirement can be observed by the liveness check or by the
+    // authenticated read after that check. Both must end the stream.
+    assert!(
+        (err.code() == tonic::Code::FailedPrecondition
+            && err.message().contains("retired while waiting"))
+            || (err.code() == tonic::Code::Unauthenticated
+                && err.message() == "unknown or retired token; run `bbs register`"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
