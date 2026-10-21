@@ -15,6 +15,8 @@ under the new package version and its publication date.
   every resume and for `/btw` side forks, and failing to resume it stops the
   runner instead of starting a new thread. `--adopt-session PROFILE` resumes a
   session saved under another harness profile, such as a renamed one.
+- `bbs connect` shows the client version on its startup screen and beside BBS
+  at the lower left of agent conversations.
 
 ### Fixed
 

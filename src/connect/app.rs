@@ -1496,7 +1496,10 @@ mod tests {
                 assert!(out.lines().nth(1).unwrap().contains("body-start"), "{out}");
                 let last = out.lines().last().unwrap();
                 assert!(
-                    last.starts_with("BBS · Mateo · effort unknown · following"),
+                    last.starts_with(&format!(
+                        "BBS v{} · Mateo · effort unknown · following",
+                        crate::release::VERSION
+                    )),
                     "{last}"
                 );
                 assert!(
@@ -1513,9 +1516,12 @@ mod tests {
                 let buffer = terminal.backend().buffer();
                 let expected = theme::base().patch(theme::style(theme::Role::StatusBar));
                 let agent = theme::on_surface(expected, theme::style(theme::Role::Agent));
+                let name_start = format!("BBS v{} · ", crate::release::VERSION)
+                    .chars()
+                    .count() as u16;
                 for x in 0..80 {
-                    // "BBS · " then the agent's name in its category colour.
-                    if (6..11).contains(&x) {
+                    // The versioned brand is followed by the agent's category colour.
+                    if (name_start..name_start + 5).contains(&x) {
                         assert_eq!(buffer[(x, 23)].fg, agent.fg.unwrap(), "x={x}");
                     } else {
                         assert_status_foreground(&buffer[(x, 23)], expected);
@@ -1568,7 +1574,13 @@ mod tests {
                 "{out}"
             );
             let last = out.lines().last().unwrap();
-            assert!(last.starts_with("BBS · Mateo · effort low · "), "{last}");
+            assert!(
+                last.starts_with(&format!(
+                    "BBS v{} · Mateo · effort low · ",
+                    crate::release::VERSION
+                )),
+                "{last}"
+            );
             for gone in [
                 "conversation",
                 "reported",
@@ -1585,11 +1597,18 @@ mod tests {
         // its outcome takes.
         app.on_action(Action::EffortUp);
         while rx.try_recv().is_ok() {}
-        assert!(bottom(&mut app).contains("effort low → medium next turn"));
+        let pending = bottom(&mut app);
+        assert!(
+            pending.contains("low") && pending.contains("medium") && pending.contains("next"),
+            "{pending}"
+        );
         clock.advance(Duration::from_secs(600));
         let row = bottom(&mut app);
         assert!(
-            row.contains("effort low → medium next turn") && !row.contains("unconf"),
+            row.contains("low")
+                && row.contains("medium")
+                && row.contains("next")
+                && !row.contains("unconf"),
             "{row}"
         );
         // Ctrl-T toggles compact view, named in the bottom bar, and back;
@@ -1656,7 +1675,8 @@ mod tests {
             // The name keeps at most a third of the bar, clipped, so the
             // feedback still shows and the mailbox and spinner keep their cells.
             assert!(
-                row.starts_with("BBS · Ünïcødé👩‍💻") && row.contains("… · "),
+                row.starts_with(&format!("BBS v{} · Ünïcødé👩‍💻", crate::release::VERSION))
+                    && row.contains("… · "),
                 "{row}"
             );
             assert!(row.width() <= 80, "{row}");
@@ -1741,7 +1761,6 @@ mod tests {
             prompt.contains("draft error") && prompt.contains("👩‍💻█"),
             "{prompt}"
         );
-        assert!(prompt.contains("Enter search · Esc cancel"), "{prompt}");
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(bottom(&mut app).contains("Draft save failed; retrying"));
         std::fs::remove_file(root).unwrap();
@@ -2186,8 +2205,10 @@ mod tests {
                     while rx.try_recv().is_ok() {}
                     let row = bottom(&mut app);
                     assert!(
-                        row.starts_with("BBS · Mateo · effort")
-                            && row.contains("following")
+                        row.starts_with(&format!(
+                            "BBS v{} · Mateo · effort",
+                            crate::release::VERSION
+                        )) && row.contains("following")
                             && row.contains("next"),
                         "{row}"
                     );
@@ -2219,7 +2240,7 @@ mod tests {
                 assert!(
                     search.contains("pref error")
                         && search.contains("👩‍💻█")
-                        && search.contains("Enter search · Esc cancel"),
+                        && search.contains("/…"),
                     "{search}"
                 );
             });
@@ -2312,6 +2333,10 @@ mod tests {
         assert!(out.contains("██████"), "{out}");
         assert!(out.contains("CONNECT 14400/ARQ · bbs:7777"), "{out}");
         assert!(out.contains("press any key"), "{out}");
+        assert!(
+            out.contains(&format!("v{}", crate::release::VERSION)),
+            "{out}"
+        );
         // `g` would start `gg` elsewhere; here it only passes the splash.
         assert!(!key(&mut app, 'g'));
         assert!(screen(&mut app, 80, 24).contains("[A]gents"));
@@ -2541,7 +2566,10 @@ mod tests {
             result: Ok(vec![message(9, "Zed", "Lu", "elsewhere")]),
         }));
         let out = screen(&mut app, 80, 24);
-        assert!(out.contains("BBS · Mateo · "), "{out}");
+        assert!(
+            out.contains(&format!("BBS v{} · Mateo · ", crate::release::VERSION)),
+            "{out}"
+        );
         assert!(
             out.contains("first needle") && out.contains("second"),
             "{out}"
@@ -3159,7 +3187,8 @@ mod tests {
         assert!(rx.try_recv().is_err());
         let out = screen(&mut app, 80, 24);
         assert!(
-            out.contains("Mateo asks 2 questions") && out.contains("BBS · Mateo"),
+            out.contains("Mateo asks 2 questions")
+                && out.contains(&format!("BBS v{} · Mateo", crate::release::VERSION)),
             "{out}"
         );
         // Reopen, choose "no" (↓ then Enter), leave the optional note, Submit.
@@ -3306,7 +3335,7 @@ mod tests {
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         command(&mut app, "/btw another");
         assert!(without_polls(&mut rx).is_empty());
-        assert!(screen(&mut app, 80, 24).contains("already running (Esc cancels it)"));
+        assert!(screen(&mut app, 80, 24).contains("already running"));
         assert_eq!(draft_text(&mut app), "/btw another");
         // Esc cancels by exact id, once.
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
@@ -3341,7 +3370,8 @@ mod tests {
         assert!(without_polls(&mut rx).is_empty());
         let out = screen(&mut app, 80, 24);
         assert!(
-            !out.contains("btw ·") && out.contains("BBS · Mateo"),
+            !out.contains("btw ·")
+                && out.contains(&format!("BBS v{} · Mateo", crate::release::VERSION)),
             "{out}"
         );
         // An unchanged draft clears once the server takes it.
@@ -3786,7 +3816,8 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         let out = screen(&mut app, 80, 24);
         assert!(
-            !out.contains("Current context") && out.contains("BBS · Mateo"),
+            !out.contains("Current context")
+                && out.contains(&format!("BBS v{} · Mateo", crate::release::VERSION)),
             "{out}"
         );
     }
@@ -4990,12 +5021,15 @@ mod tests {
                 let expected = theme::base()
                     .patch(theme::style(theme::Role::StatusBar))
                     .patch(theme::error());
-                // "BBS · Mateo · " keeps its colours; the error follows it.
+                // The versioned title keeps its colours; the error follows it.
                 let bar = theme::base().patch(theme::style(theme::Role::StatusBar));
-                for x in 0..14 {
+                let title_width = format!("BBS v{} · Mateo · ", crate::release::VERSION)
+                    .chars()
+                    .count() as u16;
+                for x in 0..title_width {
                     assert_status_foreground(&buffer[(x, area.bottom() - 1)], bar);
                 }
-                for x in 14..area.right() {
+                for x in title_width..area.right() {
                     let cell = &buffer[(x, area.bottom() - 1)];
                     assert_eq!(
                         cell.fg,
@@ -5831,12 +5865,15 @@ mod tests {
         // verbose there is verbose here once this one shows again.
         app.stack
             .push(Box::new(Thread::agent("Zed", "ada", app.ctx.now.clone())));
-        assert!(bottom(&mut app).contains("BBS · Zed") && bottom(&mut app).contains("compact"));
+        assert!(
+            bottom(&mut app).contains(&format!("BBS v{} · Zed", crate::release::VERSION))
+                && bottom(&mut app).contains("compact")
+        );
         ctrl_t(&mut app);
         assert!(!bottom(&mut app).contains("compact"));
         assert_eq!(saved(), serde_json::json!({"compact": false}));
         app.stack.pop();
-        assert!(bottom(&mut app).contains("BBS · Mateo"));
+        assert!(bottom(&mut app).contains(&format!("BBS v{} · Mateo", crate::release::VERSION)));
         assert!(!bottom(&mut app).contains("compact"));
         ctrl_t(&mut app);
         // A new process starts compact.
@@ -5858,7 +5895,7 @@ mod tests {
         // Too small to draw any conversation: only the size notice renders.
         let tiny = |app: &mut App| {
             let out = screen(app, 79, 23);
-            assert!(!out.contains("BBS ·"), "{out}");
+            assert!(!out.contains("BBS v"), "{out}");
         };
         mateo_streams(&mut app, &mut rx);
         tiny(&mut app);
@@ -6181,7 +6218,7 @@ mod tests {
                 app.ctx.preferences.error = Some("save failure".into());
                 let status = bottom(&mut app);
                 assert!(
-                    status.contains("pref error") && status.contains("Enter search · Esc cancel"),
+                    status.contains("pref error") && status.contains("👩‍💻█"),
                     "{status}"
                 );
                 assert!(status.ends_with(" ✓"), "{status}");

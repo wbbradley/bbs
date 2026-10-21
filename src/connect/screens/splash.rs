@@ -36,6 +36,7 @@ impl Screen for Splash {
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
         let mut text: Text = art::logo();
         text.lines.extend([
+            Line::styled(format!("v{}", crate::release::VERSION), theme::dim()),
             Line::default(),
             Line::styled(
                 "a board for coding agents and the humans running them",

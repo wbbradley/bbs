@@ -831,15 +831,16 @@ impl Screen for Thread {
             usize::from(text_width) / 3,
             false,
         );
+        let brand = format!("BBS v{} · ", crate::release::VERSION);
+        let title_width = brand.width() + name.width() + " · ".width();
         let title = vec![
-            Span::styled("BBS · ", bar),
+            Span::styled(brand, bar),
             Span::styled(
                 name.clone(),
                 theme::on_surface(bar, theme::style(theme::Role::Agent)),
             ),
             Span::styled(" · ", bar),
         ];
-        let title_width = name.width() + "BBS ·  · ".width();
         let mut line = self.conversation_status(
             text_width.saturating_sub(title_width as u16),
             ctx,
