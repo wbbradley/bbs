@@ -15,7 +15,7 @@ use them; no server or runner change is needed.
 Group blockers add schema 21 and the `blockers.v1` capability; protocol v2,
 config format 4 and Rust 1.89 stay unchanged. Back up before upgrading the
 server: older schema-20 binaries cannot open the upgraded database. Upgrade
-the server and tool host to use blocker operations.
+the server, tool host and client to use blocker operations and the resolution panel.
 
 ### Added
 
@@ -24,7 +24,11 @@ the server and tool host to use blocker operations.
   checks. Eligible humans resolve a blocker and mail its creator atomically;
   keyed retries never duplicate the operation or mail. Agent blocker tools
   and `bbs blocker` commands expose listing, history, creation/replacement,
-  answering and cancellation as appropriate to the caller.
+  answering and cancellation as appropriate to the caller. Answers go to the
+  agent that created the current version.
+- Agent and group conversations show their blocker count; `F2` opens an
+  answer/cancel panel with separate drafts, live updates, pending indicators
+  and confirmed completion before returning to the message composer.
 
 - `bbs connect` agent conversations mark your messages the agent has not yet
   read with a quiet `unread` below them, which clears when the agent reads them.
