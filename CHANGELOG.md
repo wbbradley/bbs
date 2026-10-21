@@ -6,6 +6,15 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Added
+
+- `bbs connect` compact view can hide reasoning too: set
+  `compact_hides_thoughts = true` under `[connect]` in
+  `~/.config/bbs/config.toml`. Reasoning still shows by default. Config format
+  becomes 4, since older clients reject the new setting.
+
 ## 0.11.2 - 2026-10-21
 
 Client and headless-runner improvements. Protocol v2, database schema 19,

@@ -109,6 +109,7 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
             .clone()
             .unwrap_or_else(|| "local".into()),
         composer_max_height_percent: opener.config.composer_max_height_percent(),
+        compact_hides_thoughts: opener.config.compact_hides_thoughts(),
         preferences,
         now: std::sync::Arc::new(Instant::now),
         inbox: Default::default(),

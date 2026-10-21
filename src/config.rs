@@ -12,7 +12,7 @@ use crate::headless::Settings;
 
 /// Version of the fields `Config` accepts. Increase it when a change means an
 /// older binary can no longer read a config this one writes.
-pub const FORMAT: u32 = 3;
+pub const FORMAT: u32 = 4;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +44,9 @@ pub struct ConnectSettings {
         deserialize_with = "percent"
     )]
     pub composer_max_height_percent: Option<u8>,
+    /// Compact view also hides reasoning. Unset means it shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_hides_thoughts: Option<bool>,
 }
 
 /// The composer's height limit when the config sets none.
@@ -126,6 +129,13 @@ impl Config {
             .unwrap_or(COMPOSER_MAX_HEIGHT_PERCENT)
     }
 
+    pub fn compact_hides_thoughts(&self) -> bool {
+        self.connect
+            .as_ref()
+            .and_then(|c| c.compact_hides_thoughts)
+            .unwrap_or(false)
+    }
+
     /// The human name: `--as`, then the config, then `$USER`.
     pub fn human(&self, as_human: Option<&str>) -> Option<String> {
         as_human
@@ -165,5 +175,13 @@ mod tests {
             assert!(err.starts_with("line 2: "), "{bad}: {err}");
         }
         assert!(parse("[connect]\nwidth = 3\n").is_err());
+    }
+
+    #[test]
+    fn compact_shows_thoughts_unless_the_config_hides_them() {
+        assert!(!parse("").unwrap().compact_hides_thoughts());
+        let config = parse("[connect]\ncompact_hides_thoughts = true\n").unwrap();
+        assert!(config.compact_hides_thoughts());
+        assert!(parse("[connect]\ncompact_hides_thoughts = \"yes\"\n").is_err());
     }
 }

@@ -36,6 +36,8 @@ pub struct Ctx {
     pub server: String,
     /// `[connect] composer_max_height_percent`.
     pub composer_max_height_percent: u8,
+    /// `[connect] compact_hides_thoughts`.
+    pub compact_hides_thoughts: bool,
     pub preferences: Preferences,
     /// The clock for activity freshness and animation; tests pin it.
     pub now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
@@ -1423,6 +1425,7 @@ mod tests {
             me: "ada".into(),
             server: "bbs:7777".into(),
             composer_max_height_percent: 20,
+            compact_hides_thoughts: false,
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
             inbox: Default::default(),
@@ -2322,6 +2325,7 @@ mod tests {
             me: "ada".into(),
             server: "bbs:7777".into(),
             composer_max_height_percent: 20,
+            compact_hides_thoughts: false,
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
             inbox: Default::default(),
@@ -2351,6 +2355,7 @@ mod tests {
             me: "ada".into(),
             server: "local".into(),
             composer_max_height_percent: 20,
+            compact_hides_thoughts: false,
             preferences: Preferences::default(),
             now: std::sync::Arc::new(Instant::now),
             inbox: Default::default(),
@@ -5568,6 +5573,55 @@ mod tests {
             );
         }
         assert!(!bottom(&mut app).contains("compact"));
+    }
+
+    #[test]
+    fn compact_hides_reasoning_only_when_the_config_says_so() {
+        let ctrl_t = |app: &mut App| press(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let (mut app, mut rx) = app();
+        app.ctx.compact_hides_thoughts = true;
+        let (feed, act) = mateo_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![proto::Message {
+                from_kind: proto::Kind::Human.into(),
+                ..at(10, "01", "ada", "Mateo", "my question")
+            }]),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![
+                activity(20, "02", r#"{"event":"thought","text":"pondering"}"#),
+                activity(21, "03", r#"{"event":"text","text":"agent reply"}"#),
+            ]),
+        }));
+        let verbose = screen(&mut app, 80, 30);
+        assert!(
+            verbose.contains("pondering"),
+            "verbose keeps reasoning: {verbose}"
+        );
+        ctrl_t(&mut app);
+        let compact = screen(&mut app, 80, 30);
+        assert!(!compact.contains("pondering"), "{compact}");
+        assert!(compact.contains("my question") && compact.contains("agent reply"));
+        // Live reasoning stays hidden too.
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![activity(
+                22,
+                "04",
+                r#"{"event":"thought","text":"more musing"}"#,
+            )]),
+        }));
+        assert!(!screen(&mut app, 80, 30).contains("more musing"));
+        // Without the setting, compact view shows it again.
+        app.ctx.compact_hides_thoughts = false;
+        let compact = screen(&mut app, 80, 30);
+        assert!(
+            compact.contains("pondering") && compact.contains("more musing"),
+            "{compact}"
+        );
+        assert!(bottom(&mut app).contains("compact"));
     }
 
     #[test]

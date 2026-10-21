@@ -263,7 +263,8 @@ Compact view hides finished tool calls, the calls still running below the
 timeline, and mail among other participants (the side messages above), along
 with their echoes in activity even when `A` shows activity only. Your mail with
 the agent, its replies, reasoning and other activity stay, and `A` and `E`
-still apply on top. The bottom bar says `compact` while it is on. The
+still apply on top. Setting `compact_hides_thoughts = true` under `[connect]`
+hides reasoning in compact view as well. The bottom bar says `compact` while it is on. The
 choice applies to every agent conversation, including ones already open, and is
 saved with the color scheme in `~/.local/state/bbs/connect.json`, so later
 sessions start in it; without a saved choice, conversations are verbose. If the
@@ -418,11 +419,12 @@ A `[connect]` table in `config.toml`, alongside `[headless]`:
 ```toml
 [connect]
 composer_max_height_percent = 20   # of the window height
+compact_hides_thoughts = false     # compact view also hides reasoning
 ```
 
-This is the only setting planned for now; more are added when a feature needs
-one. A new table means older clients reject the file, so config `FORMAT`
-becomes 3.
+More settings are added when a feature needs one. Older clients reject a file
+with a setting they do not know, so each new one raises config `FORMAT`:
+`[connect]` made it 3, and `compact_hides_thoughts` made it 4.
 
 ## Architecture
 

@@ -50,6 +50,8 @@ pub struct Thread {
     /// the saved choice shared by agent conversations; `show` and the
     /// activity kinds still apply.
     compact: bool,
+    /// `[connect] compact_hides_thoughts`: compact view hides reasoning too.
+    compact_hides_thoughts: bool,
     human: Option<String>,
     /// The stream's last error; it has ended until a reload.
     error: Option<String>,
@@ -92,6 +94,7 @@ impl Thread {
             message_gaps: BTreeSet::new(),
             show: Show::All,
             compact: false,
+            compact_hides_thoughts: false,
             human: None,
             error: None,
             prompt: None,
@@ -145,7 +148,11 @@ impl Thread {
         {
             entries.extend(stream.entries(&loaded));
         }
-        let entries = compacted(self.compact_side().as_ref(), entries);
+        let entries = compacted(
+            self.compact_side().as_ref(),
+            self.compact_hides_thoughts,
+            entries,
+        );
         let query = self.view.query.clone();
         self.view = ThreadView::new(entries, BACKLOG as usize);
         if let Some(query) = query {
@@ -221,6 +228,21 @@ impl Thread {
             self.compact = compact;
             self.reconcile();
         }
+    }
+
+    /// The choice is global: follow one made in another conversation, and
+    /// the config's choice for reasoning.
+    fn follow_compact(&mut self, ctx: &Ctx) {
+        if self.agent.is_none() {
+            return;
+        }
+        if self.compact_hides_thoughts != ctx.compact_hides_thoughts {
+            self.compact_hides_thoughts = ctx.compact_hides_thoughts;
+            if self.compact {
+                self.reconcile();
+            }
+        }
+        self.set_compact(ctx.preferences.compact());
     }
 
     /// While compact, the ids of held mail among other participants.
@@ -715,10 +737,10 @@ impl Thread {
 }
 
 /// `entries` less what compact view hides, given the ids of mail among
-/// other participants while it is on.
-fn compacted(side: Option<&HashSet<i64>>, mut entries: Vec<Entry>) -> Vec<Entry> {
+/// other participants while it is on and whether it hides reasoning.
+fn compacted(side: Option<&HashSet<i64>>, thoughts: bool, mut entries: Vec<Entry>) -> Vec<Entry> {
     if let Some(side) = side {
-        entries.retain(|e| !e.compact_hides(side));
+        entries.retain(|e| !e.compact_hides(side, thoughts));
     }
     entries
 }
@@ -937,6 +959,7 @@ impl Screen for Thread {
 
     fn on_data(&mut self, data: &Data) {
         let side = self.compact_side();
+        let thoughts = self.compact_hides_thoughts;
         if let Some(owner) = &mut self.owner {
             owner.on_data(data);
             // The server took the question: clear the draft unless it changed.
@@ -955,7 +978,8 @@ impl Screen for Thread {
                 // reader's place.
                 self.reconcile();
             } else if self.show.stream() && !entries.is_empty() {
-                self.view.ingest(compacted(side.as_ref(), entries));
+                self.view
+                    .ingest(compacted(side.as_ref(), thoughts, entries));
             }
         }
         match data {
@@ -980,7 +1004,8 @@ impl Screen for Thread {
                         self.reconcile();
                     } else if self.show.messages() {
                         let entries = self.message_entries(messages);
-                        self.view.ingest(compacted(side.as_ref(), entries));
+                        self.view
+                            .ingest(compacted(side.as_ref(), thoughts, entries));
                     }
                 }
                 Err(e) => self.error = Some(describe(e)),
@@ -1022,11 +1047,8 @@ impl Screen for Thread {
     /// An open conversation marks received mail read and activity seen,
     /// independently of the display filters.
     fn on_view(&mut self, ctx: &Ctx) -> Vec<Request> {
-        // The choice is global: follow one made in another conversation,
-        // before the next key, even while the terminal is too small to draw.
-        if self.agent.is_some() {
-            self.set_compact(ctx.preferences.compact());
-        }
+        // Before the next key, even while the terminal is too small to draw.
+        self.follow_compact(ctx);
         if let Some(picker) = &mut self.effort_picker
             && let Some(agent) = &self.agent
         {
@@ -1258,10 +1280,7 @@ impl Screen for Thread {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
-        // The choice is global: follow one made in another conversation.
-        if self.agent.is_some() {
-            self.set_compact(ctx.preferences.compact());
-        }
+        self.follow_compact(ctx);
         self.draw(frame, area, ctx);
         if let Some((_, admin)) = &self.group {
             admin.render(frame, area);
@@ -1411,8 +1430,13 @@ impl Thread {
                 theme::dim(),
             )
         } else if self.compact {
+            let hidden = if self.compact_hides_thoughts {
+                "tool calls and reasoning"
+            } else {
+                "tool calls"
+            };
             Line::styled(
-                "Compact view hides tool calls. Ctrl-T returns to verbose view.",
+                format!("Compact view hides {hidden}. Ctrl-T returns to verbose view."),
                 theme::dim(),
             )
         } else {

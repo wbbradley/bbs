@@ -63,14 +63,21 @@ pub enum Entry {
 impl Entry {
     /// What compact view hides: finished tool calls, mail among other
     /// participants, and any activity standing for such mail (`side`), even
-    /// alongside direct mail.
-    pub fn compact_hides(&self, side: &HashSet<i64>) -> bool {
+    /// alongside direct mail; and reasoning when `thoughts` is set.
+    pub fn compact_hides(&self, side: &HashSet<i64>, thoughts: bool) -> bool {
         match self {
             Entry::Message {
                 other_participants, ..
             } => *other_participants,
-            Entry::Stream { call, echoes, .. } => {
-                call.is_some() || echoes.iter().any(|id| side.contains(id))
+            Entry::Stream {
+                call,
+                echoes,
+                thought,
+                ..
+            } => {
+                call.is_some()
+                    || (thoughts && *thought)
+                    || echoes.iter().any(|id| side.contains(id))
             }
         }
     }
@@ -988,7 +995,8 @@ mod tests {
                     ..Default::default()
                 });
                 let entry = stream.entry(&record, &Loaded::new()).unwrap();
-                assert!(!entry.compact_hides(&HashSet::new()));
+                assert!(!entry.compact_hides(&HashSet::new(), false));
+                assert!(entry.compact_hides(&HashSet::new(), true));
                 let mut view = ThreadView::new(vec![entry.clone()], 100);
                 view.set_query("heading");
                 assert_eq!(view.search_status(), Some(("heading", 1)));
