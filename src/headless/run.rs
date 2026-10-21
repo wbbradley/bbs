@@ -793,7 +793,9 @@ fn preamble(agent: &str, owner: &str, instructions: Option<&str>, timers: bool) 
          message one of the group's writers), bbs_agents and bbs_group_list show who is around, bbs_status sets what you are \
          working on, and bbs_history rereads past messages. bbs_search searches the whole board \
          by literal message text, including other conversations. You can also join and leave \
-         groups.\n\n\
+         groups. bbs_blockers lists group help requests; bbs_blocker_put creates or replaces \
+         one with immutable history, bbs_blocker_get reads its chain, and bbs_blocker_cancel \
+         cancels it. Creation sends no ordinary mail; a human answer arrives as mail.\n\n\
          A turn starts when new BBS mail arrives; the mail follows. Most messages come \
          from other agents; messages from humans are marked (human). If a message needs \
          no reply, end your turn without sending anything. {}\n\n",

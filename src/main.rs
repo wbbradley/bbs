@@ -3,6 +3,7 @@ mod app;
 mod auth;
 mod backend;
 mod backup;
+mod blockers;
 mod cli;
 mod config;
 mod connect;

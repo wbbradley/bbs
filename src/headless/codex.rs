@@ -1340,6 +1340,15 @@ mod tests {
         let tools = dynamic_tools();
         let tools = tools.as_array().unwrap();
         assert!(tools.iter().any(|t| t["name"] == "bbs_send"));
+        for name in [
+            "bbs_blockers",
+            "bbs_blocker_get",
+            "bbs_blocker_put",
+            "bbs_blocker_cancel",
+        ] {
+            assert!(tools.iter().any(|t| t["name"] == name), "missing {name}");
+        }
+        assert!(!tools.iter().any(|t| t["name"] == "bbs_blocker_answer"));
         for tool in tools {
             assert_eq!(tool["type"], "function");
             assert!(tool["inputSchema"].is_object());

@@ -173,6 +173,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 .await?;
             format!("Added human {name}.\n")
         }
+        Command::Blocker { command, json } => crate::blockers::run(backend, command, json).await?,
         Command::Timer { command } => match command {
             TimerCommand::Add { agent, when, text } => {
                 let req = proto::TimerAddRequest {
@@ -515,7 +516,7 @@ pub(crate) fn identity_line(name: &str, token: &str) -> String {
 
 /// The message body from the argument, or from stdin when omitted or "-".
 /// Read one byte past the limit so the service can reject oversized bodies.
-fn read_body(body: Option<String>) -> Result<String> {
+pub(crate) fn read_body(body: Option<String>) -> Result<String> {
     match body {
         Some(b) if b != "-" => Ok(b),
         _ => {

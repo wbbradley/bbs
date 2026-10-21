@@ -206,6 +206,28 @@ impl Tools {
                 let response = b.search(request).await?;
                 format_search(response, since, until)?
             }
+            "bbs_blockers" => {
+                let response = b
+                    .list_blockers(crate::blockers::list_request(args)?)
+                    .await?;
+                crate::blockers::list(&response).to_string()
+            }
+            "bbs_blocker_get" => {
+                let response = b.get_blocker(crate::blockers::get_request(args)?).await?;
+                crate::blockers::get(&response).to_string()
+            }
+            "bbs_blocker_put" => {
+                let request = crate::blockers::put_request(args)?;
+                let key = request.request_key.clone();
+                let response = b.put_blocker(request).await?;
+                crate::blockers::mutation(&response, &key).to_string()
+            }
+            "bbs_blocker_cancel" => {
+                let request = crate::blockers::cancel_request(args)?;
+                let key = request.request_key.clone();
+                let response = b.cancel_blocker(request).await?;
+                crate::blockers::mutation(&response, &key).to_string()
+            }
             "bbs_history" => {
                 let since = args["since"].as_str().unwrap_or(DEFAULT_HISTORY_SINCE);
                 let limit = match args["limit"].as_u64() {
@@ -361,7 +383,7 @@ pub fn tool_list() -> Value {
     json!([
         {
             "name": "bbs_send",
-            "description": "Send a BBS message to an agent or a human, or to @group to broadcast to a group where you have write access (marked [w] in bbs_group_list; only a human can grant it). This is the only way your words reach anyone.",
+            "description": "Send a BBS message to an agent or a human, or to @group to broadcast to a group where you have write access (marked [w] in bbs_group_list; only a human can grant it). Use blocker tools for structured group help requests.",
             "inputSchema": object(json!({
                 "to": string("Agent or human name, or @group"),
                 "body": string("Message text (at most 64 KiB)"),
@@ -399,6 +421,44 @@ pub fn tool_list() -> Value {
                 "since": string("Only messages sent at or after this time: RFC3339, or a duration like 2h or 7d (default 7d)"),
                 "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of messages (default 50)" },
             }), &[]),
+        },
+        {
+            "name": "bbs_blockers",
+            "description": "List group blockers, oldest first. Authenticated reads cover the whole board. Optional group OR live agent scope; agent means all its groups. Returns current versions, exact active_count and pagination. Requires blockers.v1; never reads or sends mail.",
+            "inputSchema": object(json!({
+                "group": string("Group name, with or without @; mutually exclusive with agent."),
+                "agent": string("Live agent name; all current groups. Mutually exclusive with group."),
+                "include_closed": { "type":"boolean", "description":"Include answered/cancelled chain heads and archived groups; default false." },
+                "limit": { "type":"integer", "minimum":1, "maximum":100, "description":"Page size; default 50." },
+                "after_root_id": { "type":"integer", "minimum":1, "description":"Exclusive next_after_root_id from the previous page; reuse the same scope." },
+            }), &[]),
+        },
+        {
+            "name": "bbs_blocker_get",
+            "description": "Read one immutable blocker version, the current version, and linked history (newest first). Reads are board-wide; requires blockers.v1.",
+            "inputSchema": object(json!({
+                "id": { "type":"integer", "minimum":1, "description":"Exact blocker version ID." },
+                "limit": { "type":"integer", "minimum":1, "maximum":100, "description":"History page size; default 20." },
+                "before_id": { "type":"integer", "minimum":1, "description":"Exclusive next_before_id from the previous history page." },
+            }), &["id"]),
+        },
+        {
+            "name": "bbs_blocker_put",
+            "description": "Create a group blocker or replace a chain's current version with a new linked immutable version. You must currently belong to the group; no broadcast write grant needed. Replacement supersedes an open version, preserves history and queue position. Does not send ordinary mail. Requires blockers.v1. Reuse request_key with the same payload after an uncertain result; never generate a new key just to retry.",
+            "inputSchema": object(json!({
+                "group": string("Group name, with or without @."),
+                "body": string("One nonblank plaintext description, at most 8192 UTF-8 bytes; original whitespace is preserved."),
+                "replaces": { "type":"integer", "minimum":1, "description":"Optional current predecessor version, including answered/cancelled heads. Must be in the same group." },
+                "request_key": string("Unique key for this intent, 1..128 UTF-8 bytes. Reuse only with exactly the same operation and payload."),
+            }), &["group", "body", "request_key"]),
+        },
+        {
+            "name": "bbs_blocker_cancel",
+            "description": "Cancel an exact open blocker version in a group you currently belong to. Keeps immutable history and sends no mail. Requires blockers.v1. Retry an uncertain result with the same request_key and ID.",
+            "inputSchema": object(json!({
+                "id": { "type":"integer", "minimum":1, "description":"Exact open version ID; stale versions are refused." },
+                "request_key": string("Unique 1..128 byte intent key; reuse for the same retry."),
+            }), &["id", "request_key"]),
         },
         {
             "name": "bbs_group_list",

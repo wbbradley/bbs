@@ -2248,6 +2248,194 @@ fn bodies(rows: &[serde_json::Value]) -> Vec<&str> {
     rows.iter().map(|r| r["body"].as_str().unwrap()).collect()
 }
 
+fn blocker_tools_and_cli_keep_versions_retries_and_answer_delivery(mode: Mode) {
+    use serde_json::{Value, json};
+    let bbs = Bbs::with_mode("blockers-tools", mode);
+    let (agent, token) = bbs.register();
+    bbs.ok(&["group", "register", "crew"]);
+    bbs.ok(&["--token", &token, "group", "join", "crew"]);
+    bbs.ok(&["--token", &token, "read"]);
+    bbs.ok(&["read"]);
+    let catalog = bbs.run_with_env(
+        &["headless", "mcp"],
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
+        &[("BBS_HEADLESS_TOKEN", &token)],
+    );
+    assert!(catalog.status.success());
+    let catalog: Value = serde_json::from_slice(&catalog.stdout).unwrap();
+    let tools = catalog["result"]["tools"].as_array().unwrap();
+    for name in [
+        "bbs_blockers",
+        "bbs_blocker_get",
+        "bbs_blocker_put",
+        "bbs_blocker_cancel",
+    ] {
+        assert!(tools.iter().any(|t| t["name"] == name), "missing {name}");
+    }
+    assert!(!tools.iter().any(|t| t["name"] == "bbs_blocker_answer"));
+    let call = |name: &str, args: Value| -> Value {
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":name,"arguments":args}});
+        let out = bbs.run_with_env(
+            &["headless", "mcp"],
+            &format!("{request}\n"),
+            &[("BBS_HEADLESS_TOKEN", &token)],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let success = |name: &str, args: Value| -> Value {
+        let response = call(name, args);
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    let args = json!({"group":"crew","body":"  Need approval\nOption A?","request_key":"first"});
+    let first = success("bbs_blocker_put", args.clone());
+    let id = first["blocker"]["id"].as_i64().unwrap();
+    assert_eq!(success("bbs_blocker_put", args)["replayed"], true);
+    assert_eq!(
+        bbs.ok(&["read"]),
+        "",
+        "creating a blocker sends no owner mail"
+    );
+    assert_eq!(bbs.ok(&["--token", &token, "read"]), "");
+    let listing = success("bbs_blockers", json!({"agent":agent,"limit":1}));
+    assert_eq!(listing["active_count"], 1);
+    assert_eq!(listing["blockers"][0]["body"], "  Need approval\nOption A?");
+    let next = success(
+        "bbs_blocker_put",
+        json!({"group":"crew","body":"Need approval for B instead","replaces":id,"request_key":"second"}),
+    );
+    let next_id = next["blocker"]["id"].as_i64().unwrap();
+    assert_ne!(next_id, id);
+    assert_eq!(next["blocker"]["root_id"], id);
+    assert_eq!(
+        call(
+            "bbs_blocker_put",
+            json!({"group":"crew","body":"changed under first key","request_key":"first"})
+        )["result"]["isError"],
+        true
+    );
+    assert_eq!(
+        call(
+            "bbs_blocker_put",
+            json!({"group":"crew","body":"missing key"})
+        )["result"]["isError"],
+        true
+    );
+    assert_eq!(
+        call("bbs_blockers", json!({"limit":"1"}))["result"]["isError"],
+        true
+    );
+    assert_eq!(
+        call("bbs_blocker_get", json!({"id":id,"unknown":1}))["result"]["isError"],
+        true
+    );
+    let next_s = next_id.to_string();
+    let answer = bbs.ok(&[
+        "blocker",
+        "answer",
+        &next_s,
+        "Proceed with B",
+        "--request-key",
+        "answer",
+        "--json",
+    ]);
+    let answer: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(answer["blocker"]["status"], "answered");
+    let replay: Value = serde_json::from_str(&bbs.ok(&[
+        "blocker",
+        "answer",
+        &next_s,
+        "Proceed with B",
+        "--request-key",
+        "answer",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["message_id"], answer["message_id"]);
+    let mail = bbs.ok(&["--token", &token, "read"]);
+    assert!(mail.contains("Proceed with B"), "{mail}");
+    assert_eq!(
+        bbs.ok(&["--token", &token, "read"]),
+        "",
+        "no duplicate answer delivery"
+    );
+    let history = success("bbs_blocker_get", json!({"id":id,"limit":1}));
+    assert_eq!(history["blocker"]["body"], "  Need approval\nOption A?");
+    assert_eq!(history["blocker"]["status"], "superseded");
+    assert_eq!(history["current"]["id"], next_id);
+    assert_eq!(history["history"][0]["outcome"]["answer"], "Proceed with B");
+    assert_eq!(history["has_more"], true);
+    let older = success(
+        "bbs_blocker_get",
+        json!({"id":id,"limit":1,"before_id":history["next_before_id"]}),
+    );
+    assert_eq!(older["history"][0]["id"], id);
+    assert_eq!(older["has_more"], false);
+    let put_out = bbs.run_with_stdin(
+        &[
+            "--token",
+            &token,
+            "blocker",
+            "put",
+            "--group",
+            "crew",
+            "--replaces",
+            &next_s,
+            "--request-key",
+            "third",
+            "--json",
+        ],
+        "A follow-up after the answer\n",
+    );
+    assert!(
+        put_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&put_out.stderr)
+    );
+    let third: Value = serde_json::from_slice(&put_out.stdout).unwrap();
+    assert_eq!(third["blocker"]["body"], "A follow-up after the answer\n");
+    let third_id = third["blocker"]["id"].as_i64().unwrap();
+    let cancelled = success(
+        "bbs_blocker_cancel",
+        json!({"id":third_id,"request_key":"cancel"}),
+    );
+    assert_eq!(cancelled["blocker"]["status"], "cancelled");
+    assert_eq!(
+        success(
+            "bbs_blocker_cancel",
+            json!({"id":third_id,"request_key":"cancel"})
+        )["replayed"],
+        true
+    );
+    assert_eq!(bbs.ok(&["read"]), "", "cancellation sends no owner mail");
+    let list: Value = serde_json::from_str(&bbs.ok(&[
+        "blocker",
+        "list",
+        "--group",
+        "crew",
+        "--include-closed",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(list["active_count"], 0);
+    assert_eq!(list["blockers"][0]["id"], third_id);
+    assert!(
+        bbs.ok(&["blocker", "get", &id.to_string()])
+            .contains("History (newest first)")
+    );
+    assert!(
+        bbs.err(&["blocker", "list", "--group", "crew", "--agent", &agent])
+            .contains("cannot be used")
+    );
+}
+
 fn headless_search_reads_the_corpus_and_pages_without_archiving(mode: Mode) {
     let bbs = Bbs::with_mode("search-tools", mode);
     let (a, ta) = bbs.register();
@@ -3870,6 +4058,7 @@ fn headless_run_takes_over_an_owned_agent(mode: Mode) {
 }
 
 both_modes!(
+    blocker_tools_and_cli_keep_versions_retries_and_answer_delivery,
     requested_names_are_validated_and_reserved,
     concurrent_registration_reserves_one_name,
     registration_records_human_from_as_config_or_user,
