@@ -591,7 +591,12 @@ impl Blockers {
 
     fn answer_height(&self, width: u16) -> u16 {
         match (self.selected(), self.selected_chain()) {
-            (Some(row), Some(chain)) if row.can_answer || chain.error.is_some() => {
+            // A draft written before the row became read only still shows.
+            (Some(row), Some(chain))
+                if row.can_answer
+                    || chain.error.is_some()
+                    || !chain.answer.draft().text.is_empty() =>
+            {
                 chain.answer.height(width, 6)
             }
             _ => 0,
@@ -812,10 +817,13 @@ impl Blockers {
         }
         frame.render_widget(Paragraph::new(Vec::from_iter(label)), label_area);
         frame.render_widget(Paragraph::new(below), bottom);
-        let focused = self.panel.as_ref().map(|p| p.focus) == Some(Focus::Answer);
-        let Some(root) = self.selected().map(|b| b.root_id) else {
+        let Some((root, editable)) = self
+            .selected()
+            .map(|b| (b.root_id, b.can_answer && !self.held.contains(&b.root_id)))
+        else {
             return;
         };
+        let focused = editable && self.panel.as_ref().map(|p| p.focus) == Some(Focus::Answer);
         if let Some(chain) = self.chains.get_mut(&root) {
             let pending = chain.pending.is_some();
             chain.answer.render(frame, middle, focused && !pending);
@@ -1422,6 +1430,36 @@ mod tests {
         assert_eq!(blockers.rows.len(), KEPT_REFUSALS);
         assert_eq!(blockers.rows[0].root_id, 6, "the oldest went first");
         assert_eq!(blockers.chains.len(), KEPT_REFUSALS);
+    }
+
+    #[test]
+    fn a_draft_stays_in_view_read_only_when_answering_is_no_longer_allowed() {
+        let now = Instant::now();
+        let mut blockers = open(now);
+        typed(&mut blockers, "half written", now);
+        let mut first = row(1, 1, "Zed", "first?");
+        first.can_answer = false;
+        blockers.on_data(
+            SCREEN,
+            &list(vec![first, row(2, 2, "Mateo", "second?")]),
+            now,
+        );
+        assert!(blockers.answer_height(80) > 0, "the draft still shows");
+        typed(&mut blockers, "x", now);
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        assert_eq!(blockers.chains[&1].answer.draft().text, "half written");
+        assert!(blockers.chains[&1].pending.is_none());
+        // With no draft, a read-only row has no answer box.
+        blockers.key(SCREEN, alt(KeyCode::Down), now);
+        let mut second = row(2, 2, "Mateo", "second?");
+        second.can_answer = false;
+        let mut first = row(1, 1, "Zed", "first?");
+        first.can_answer = false;
+        blockers.on_data(SCREEN, &list(vec![first, second]), now);
+        assert_eq!(blockers.answer_height(80), 0);
     }
 
     #[test]
