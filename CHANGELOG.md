@@ -29,6 +29,9 @@ under the new package version and its publication date.
 
 ### Changed
 
+- `bbs connect` runs in terminals down to 60×24, such as a side-by-side split
+  pane; it used to need 80×24. Below 80 columns some tables and key hints are
+  clipped rather than reflowed.
 - `bbs connect` agent conversations open on the newest activity: the loading
   notice clears after one page instead of the agent's whole retained history,
   which joins the timeline in one step when it arrives, without moving the

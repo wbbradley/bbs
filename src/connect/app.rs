@@ -2380,10 +2380,13 @@ mod tests {
     #[test]
     fn a_small_terminal_gets_a_notice() {
         let (mut app, _rx) = app();
-        let out = screen(&mut app, 79, 24);
+        let out = screen(&mut app, 59, 24);
         assert!(out.contains("terminal too small"), "{out}");
-        assert!(out.contains("79×24; needs 80×24"), "{out}");
+        assert!(out.contains("59×24; needs 60×24"), "{out}");
         assert!(!out.contains("[A]gents"), "{out}");
+        assert!(screen(&mut app, 60, 23).contains("60×23; needs 60×24"));
+        // A side-by-side split pane is enough.
+        assert!(screen(&mut app, 60, 24).contains("[A]gents"));
     }
 
     #[test]
@@ -4584,7 +4587,7 @@ mod tests {
         }));
         assert!(app.next_animation_frame().is_some());
         clock.advance(Duration::from_secs(2));
-        assert!(screen(&mut app, 79, 24).contains("terminal too small"));
+        assert!(screen(&mut app, 59, 24).contains("terminal too small"));
         assert!(app.next_animation_frame().is_none());
         let restored = screen(&mut app, 80, 24);
         assert!(restored.contains("available mail") && !restored.contains("Loading…"));
