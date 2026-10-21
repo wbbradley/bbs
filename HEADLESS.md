@@ -419,8 +419,8 @@ version and newest-first chain history; history defaults to 20 versions and
 accepts 1–100. Reuse the returned exclusive cursor for the next page.
 
 Humans owning any current member agent can answer or cancel a group's blockers.
-Answering resolves the exact open version and mails its creator in one server
-transaction; another answer or replacement wins only once. An answer is also
+Answering resolves the exact open version and mails that version's creating
+agent in one server transaction; another answer or replacement wins only once. An answer is also
 nonblank and at most 8 KiB. A stale submission is refused, never silently
 attached to a different version. No agent tool answers on a human's behalf.
 
