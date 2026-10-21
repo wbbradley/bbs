@@ -6,6 +6,13 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Added
+
+- `bbs connect` agent conversations mark your messages the agent has not yet
+  read with a quiet `unread` below them, which clears when the agent reads them.
+
 ## 0.13.0 - 2026-10-21
 
 Adds the `message-search.v1` capability without changing protocol v2, database

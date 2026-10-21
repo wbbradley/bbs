@@ -16,6 +16,8 @@ pub enum Role {
     Heading,
     Accent,
     HumanSurface,
+    /// A quiet note on the human surface, a little lighter than it.
+    HumanNote,
     /// Conversation mail between participants other than the viewing human.
     OtherConversation,
     OtherConversationHeader,
@@ -123,7 +125,7 @@ impl Scheme {
         if self == Self::NoColor {
             return match role {
                 Screen => Style::new().fg(Color::Reset).bg(Color::Reset),
-                Muted | Timestamp => Style::new().dim(),
+                Muted | Timestamp | HumanNote => Style::new().dim(),
                 KeyHint => Style::new().italic(),
                 Heading | Agent | Human | Group | Hotkey | Success | Warning | Error => {
                     Style::new().bold()
@@ -182,6 +184,11 @@ impl Scheme {
             Screen => Style::new().fg(text).bg(bg),
             Text => Style::new().fg(text),
             HumanSurface => Style::new().fg(text).bg(surface),
+            HumanNote => Style::new().fg(match self {
+                Self::Gruvbox => tint(surface, text, 25),
+                Self::Terminal => Color::Indexed(240),
+                Self::NoColor => unreachable!(),
+            }),
             OtherConversation => Style::new().fg(text).bg(match self {
                 Self::Gruvbox => Color::Rgb(44, 54, 52),
                 Self::Terminal => Color::Indexed(235),
@@ -426,6 +433,7 @@ pub(crate) mod testing {
             Heading,
             Accent,
             HumanSurface,
+            HumanNote,
             OtherConversation,
             OtherConversationHeader,
             GroupConversation,

@@ -5398,6 +5398,46 @@ mod tests {
     }
 
     #[test]
+    fn my_mail_shows_unread_until_the_agent_reads_it() {
+        let (mut app, mut rx) = app();
+        let id = mateo(&mut app, &mut rx);
+        let feed = |read: bool| Data::Feed {
+            id,
+            result: Ok(vec![
+                message(1, "Mateo", "ada", "agent asks"),
+                proto::Message {
+                    from_kind: proto::Kind::Human.into(),
+                    read_at: read.then(|| "2026-10-16T18:01:00.000000Z".into()),
+                    ..message(2, "ada", "Mateo", "human answers")
+                },
+            ]),
+        };
+        app.on_event(Event::Data(feed(false)));
+        let out = screen(&mut app, 80, 24);
+        let lines: Vec<&str> = out.lines().collect();
+        let answer = lines.iter().position(|l| l.contains("human answers"));
+        let unread: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("unread"))
+            .collect();
+        // Once, on the row below my message, at its right edge; never on the
+        // agent's unread mail to me.
+        assert_eq!(unread.len(), 1, "{out}");
+        let (row, line) = unread[0];
+        assert_eq!(Some(row - 1), answer, "{out}");
+        assert!(line.ends_with("unread  "), "{out}");
+        assert!(line.find("unread") > Some(60), "{out}");
+        // The live feed marks it read, and the note goes.
+        app.on_event(Event::Data(feed(true)));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("human answers") && !out.contains("unread"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn up_scrolls_only_from_the_first_display_row_of_a_wrapped_draft() {
         let (mut app, mut rx) = app();
         mateo_with(&mut app, &mut rx, 60);
@@ -7566,8 +7606,19 @@ mod tests {
                             })
                             .bg
                             .unwrap()
-                            && buffer[(x, padding)].symbol() == " "
                     }));
+                    // The lower padding holds only the unread note.
+                    let text: String = (area.left()..area.right())
+                        .map(|x| buffer[(x, padding)].symbol())
+                        .collect();
+                    assert_eq!(
+                        text.trim(),
+                        if headerless && padding > y {
+                            "unread"
+                        } else {
+                            ""
+                        }
+                    );
                 }
                 if headerless {
                     assert!((area.left()..area.right()).all(|x| {

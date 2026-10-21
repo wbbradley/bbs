@@ -161,10 +161,17 @@ impl Row for Entry {
                     if *headerless {
                         lines.insert(1 + usize::from(gap || *raw_gap), Line::default());
                     }
+                    // Until the agent reads it, the bottom padding says so,
+                    // inset from the right as the body is from the left.
+                    lines.push(if *headerless && message.read_at.is_none() {
+                        Line::styled("unread  ", theme::style(theme::Role::HumanNote))
+                            .right_aligned()
+                    } else {
+                        Line::default()
+                    });
                     for line in &mut lines {
                         line.style = theme::style(theme::Role::HumanSurface).patch(line.style);
                     }
-                    lines.push(Line::default());
                 }
                 lines
             }
@@ -1643,8 +1650,27 @@ mod tests {
                         }
                     }
                 }
-                for y in [start, end - 1] {
-                    assert!((0..width).all(|x| buffer[(x, y)].symbol() == " "));
+                assert!((0..width).all(|x| buffer[(x, start)].symbol() == " "));
+                // Unread, the bottom padding notes it at the right in the
+                // quiet note color; with headers, the header says so instead.
+                let bottom: String = (0..width).map(|x| buffer[(x, end - 1)].symbol()).collect();
+                if compact {
+                    assert!(bottom.ends_with("unread  "), "{bottom:?}");
+                    assert_eq!(bottom.trim(), "unread");
+                    let note = theme::style(theme::Role::HumanNote);
+                    for x in width - 8..width - 2 {
+                        let cell = &buffer[(x, end - 1)];
+                        assert_eq!(cell.fg, note.fg.or(human.fg).unwrap(), "{scheme:?}");
+                        assert_eq!(cell.bg, human.bg.unwrap());
+                        if scheme != crate::ui::theme::Scheme::NoColor {
+                            assert_ne!(cell.fg, human.fg.unwrap(), "a quieter color");
+                            assert_ne!(cell.fg, cell.bg);
+                        } else {
+                            assert!(cell.modifier.contains(Modifier::DIM));
+                        }
+                    }
+                } else {
+                    assert!(bottom.trim().is_empty(), "{bottom:?}");
                 }
                 if compact {
                     assert!((0..width).all(|x| buffer[(x, start + 1)].symbol() == " "));

@@ -268,6 +268,8 @@ own indentation inside that margin. Anyone else's mail (other humans, other
 agents, the agent's group posts) keeps a sender/recipient header. The connected
 human's outgoing messages have a lighter background, one blank row above and
 below the body, and a conversation-background separator above that padding.
+Until the agent reads one, its lower padding row shows `unread` at the right,
+in a color a little lighter than that background; the live feed clears it.
 Mail neither from nor addressed to the connected human has a subtle contrasting
 background across its header and body. These side-message headers show only
 `• Sender → Recipient`, with the themed bullet in column one and the names
