@@ -333,8 +333,13 @@ impl Blockers {
                     .iter()
                     .any(|b| b.root_id == root && b.id != version)
                 {
-                    // A newer version of the chain came first: it stays,
-                    // with its draft, for the next poll to settle.
+                    // A newer version of the chain came first: it stays for
+                    // the next poll to settle. The delivered answer leaves
+                    // the draft, so Enter cannot send it again to the new
+                    // version; a cancel sent no text, and the draft stays.
+                    if let Write::Answer { answer, .. } = &pending.write {
+                        chain.answer.clear_if(answer);
+                    }
                     chain.error = None;
                     return;
                 }
@@ -1256,8 +1261,23 @@ mod tests {
             assert_eq!(blockers.count(), Some(2));
             let chain = &blockers.chains[&1];
             assert!(chain.pending.is_none() && chain.error.is_none());
-            assert_eq!(chain.answer.draft().text, "go", "the draft stays");
+            // The delivered answer is not a draft for the new version; an
+            // unsent draft survives a cancel.
+            let draft = if cancel { "go" } else { "" };
+            assert_eq!(chain.answer.draft().text, draft, "cancel={cancel}");
             assert!(blockers.panel.as_ref().unwrap().done_at.is_none());
+            // After the guard, a plain Enter sends nothing on the answer's
+            // behalf; after a cancel it answers version 5 with the draft.
+            if cancel {
+                blockers.key(SCREEN, press(KeyCode::BackTab), now + GUARD);
+            }
+            let after = blockers.key(SCREEN, press(KeyCode::Enter), now + GUARD);
+            if cancel {
+                let req = answer_request(after);
+                assert_eq!((req.id, req.answer.as_str()), (5, "go"));
+            } else {
+                assert!(matches!(after, Outcome::Stay));
+            }
         }
     }
 
