@@ -173,6 +173,7 @@ impl Rig {
         self.client()
             .await
             .ask_side(req(proto::AskSideRequest {
+                follows: None,
                 agent: "BtwTest".into(),
                 question: "A PRIVATE SIDE QUESTION".into(),
             }))
@@ -313,7 +314,7 @@ async fn owner_cancel_is_independent_and_restart_never_replays_a_claimed_questio
     .await;
     r.client()
         .await
-        .cancel_side(req(proto::CancelSideRequest { id }))
+        .cancel_side(req(proto::CancelSideRequest { id, end: false }))
         .await
         .unwrap();
     r.wait_wire(|w| {

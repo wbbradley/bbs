@@ -251,6 +251,7 @@ async fn run(
             let result = timeout(
                 CALL_TIMEOUT,
                 session.backend.report_context(proto::ReportContextRequest {
+                    side_followups: None,
                     generation: session.generation.clone(),
                     usage: snapshot.usage,
                     side_supported: None,

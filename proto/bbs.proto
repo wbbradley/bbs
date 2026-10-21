@@ -125,6 +125,10 @@ enum SideStatus {
   SIDE_FAILED = 3;
   SIDE_CANCELLED = 4;
   SIDE_INTERRUPTED = 5;
+  // side-conversations.v1: a follow-up whose side conversation no longer
+  // exists (the runner restarted, timed it out idle, or it was ended); the
+  // runner reports it without a model call. The owner's next /btw is fresh.
+  SIDE_ENDED = 6;
 }
 message SideRequest {
   int64 id = 1;
@@ -133,13 +137,29 @@ message SideRequest {
   // Progressive text while open, the final answer at terminal; never trimmed.
   optional string answer = 4;
   string updated_at = 5;
+  // side-conversations.v1: the side question this one follows up, in the
+  // same side conversation; absent for a conversation's first question.
+  optional int64 follows = 6;
+  // side-conversations.v1: the owner ended this question's conversation.
+  bool ended = 7;
 }
 message AskSideRequest {
   string agent = 1;
   string question = 2;  // <= 4 KiB
+  // side-conversations.v1: continue the side conversation whose latest
+  // question this is. Refused unless it is the agent's latest side question,
+  // terminal (COMPLETED, FAILED or CANCELLED), not ended or interrupted, and
+  // the current runner generation answers follow-ups.
+  optional int64 follows = 3;
 }
 message AskSideResponse { int64 id = 1; }  // never reused
-message CancelSideRequest { int64 id = 1; }
+message CancelSideRequest {
+  int64 id = 1;
+  // side-conversations.v1: false cancels the OPEN question `id` only (its
+  // conversation continues); true also ends the conversation whose latest
+  // question is `id`, open or terminal. Idempotent.
+  bool end = 2;
+}
 message ClaimSideRequest { string generation = 1; }
 message ClaimSideResponse {
   // The claimed request, or none when nothing is open. Idempotent per
@@ -149,7 +169,7 @@ message ClaimSideResponse {
 message ReportSideRequest {
   string generation = 1;
   int64 id = 2;
-  SideStatus status = 3;       // OPEN, COMPLETED or FAILED
+  SideStatus status = 3;       // OPEN, COMPLETED, FAILED or (follow-ups) ENDED
   optional string answer = 4;  // <= 64 KiB
 }
 
@@ -340,6 +360,10 @@ message ReportContextRequest {
   // capability-only update). False: usage is replaced or cleared as usual.
   // Rejected when usage is also present.
   bool preserve_usage = 5;
+  // side-conversations.v1: whether this generation continues side
+  // conversations (answers AskSide.follows). Omitted preserves the stored
+  // value; a fresh generation clears it.
+  optional bool side_followups = 6;
 }
 
 message InputOption {
@@ -424,6 +448,9 @@ message SideReportResponse {
   // Whether the current generation answers side questions, and why not.
   optional bool side_supported = 9;
   optional string side_reason = 10;
+  // side-conversations.v1: whether the current generation continues side
+  // conversations.
+  optional bool side_followups = 11;
 }
 
 message ReadRequest {

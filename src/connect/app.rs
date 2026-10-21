@@ -3091,6 +3091,7 @@ mod tests {
         questions: Vec<proto::InputQuestion>,
     ) -> proto::SideReportResponse {
         proto::SideReportResponse {
+            side_followups: None,
             side: None,
             side_supported: None,
             side_reason: None,
@@ -3269,6 +3270,8 @@ mod tests {
             result: Ok(Box::new(proto::SideReportResponse {
                 side_supported: Some(true),
                 side: side.map(|(id, question, status, answer)| proto::SideRequest {
+                    ended: false,
+                    follows: None,
                     id,
                     question: question.into(),
                     status: status.into(),

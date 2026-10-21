@@ -1369,6 +1369,8 @@ fn side_status_proto(status: &str) -> proto::SideStatus {
 
 fn side_request_proto(row: db::SideRequestRow) -> Result<proto::SideRequest> {
     Ok(proto::SideRequest {
+        ended: false,
+        follows: None,
         id: row.id,
         question: row.question,
         status: side_status_proto(&row.status).into(),
@@ -1525,6 +1527,7 @@ pub fn side_report(
         let side = db::latest_side_request(ctx.conn, agent.id)?;
         let Some(state) = state else {
             return Ok(proto::SideReportResponse {
+                side_followups: None,
                 agent: agent.name,
                 pending_input: pending,
                 usage: None,
@@ -1536,6 +1539,7 @@ pub fn side_report(
             });
         };
         Ok(proto::SideReportResponse {
+            side_followups: None,
             agent: agent.name,
             pending_input: pending,
             usage: usage_proto(state.usage)?,
@@ -3440,6 +3444,7 @@ mod tests {
                 &mut conn,
                 &mateo,
                 proto::ReportContextRequest {
+                    side_followups: None,
                     generation: "run-1".into(),
                     usage: Some(usage),
                     side_supported: None,
@@ -3453,6 +3458,7 @@ mod tests {
             &mut conn,
             &mateo,
             proto::ReportContextRequest {
+                side_followups: None,
                 generation: "run-1".into(),
                 usage: Some(proto::ContextUsage {
                     used_tokens: Some(120),
@@ -3819,6 +3825,7 @@ mod tests {
             &mut conn,
             &mateo,
             proto::ReportContextRequest {
+                side_followups: None,
                 generation: "run-4".into(),
                 usage: Some(proto::ContextUsage {
                     used_tokens: Some(9),
@@ -3909,6 +3916,7 @@ mod tests {
                 conn,
                 &mateo,
                 proto::ReportContextRequest {
+                    side_followups: None,
                     generation: g.into(),
                     usage: None,
                     side_supported: Some(ok),
@@ -3922,6 +3930,7 @@ mod tests {
                 conn,
                 &will,
                 proto::AskSideRequest {
+                    follows: None,
                     agent: "Mateo".into(),
                     question: q.into(),
                 },
@@ -4013,14 +4022,14 @@ mod tests {
         cancel_side(
             &mut conn,
             &will,
-            proto::CancelSideRequest { id: first.id },
+            proto::CancelSideRequest { id: first.id, end: false },
         )
         .unwrap();
         // Cancel is idempotent for the exact id.
         cancel_side(
             &mut conn,
             &will,
-            proto::CancelSideRequest { id: first.id },
+            proto::CancelSideRequest { id: first.id, end: false },
         )
         .unwrap();
         let err = report(&mut conn, "run-1", proto::SideStatus::SideCompleted, "done")
@@ -4067,7 +4076,7 @@ mod tests {
         let err = cancel_side(
             &mut conn,
             &ada,
-            proto::CancelSideRequest { id: first.id },
+            proto::CancelSideRequest { id: first.id, end: false },
         )
         .unwrap_err()
         .to_string();
@@ -4100,6 +4109,7 @@ mod tests {
             &mut conn,
             &mateo,
             proto::ReportContextRequest {
+                side_followups: None,
                 generation: "run-2".into(),
                 usage: None,
                 side_supported: None,
@@ -4116,6 +4126,7 @@ mod tests {
             &mut conn,
             &mateo,
             proto::ReportContextRequest {
+                side_followups: None,
                 generation: "run-2".into(),
                 usage: Some(proto::ContextUsage {
                     used_tokens: Some(42),
@@ -4140,6 +4151,7 @@ mod tests {
             &mut conn,
             &mateo,
             proto::ReportContextRequest {
+                side_followups: None,
                 generation: "run-2".into(),
                 usage: Some(proto::ContextUsage {
                     used_tokens: Some(1),
@@ -4158,6 +4170,7 @@ mod tests {
             &mut conn,
             &mateo,
             proto::ReportContextRequest {
+                side_followups: None,
                 generation: "run-2".into(),
                 usage: None,
                 side_supported: Some(false),

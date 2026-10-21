@@ -258,7 +258,10 @@ impl Session {
                             proto::SideStatus::SideCompleted => SideView::Completed(answer),
                             proto::SideStatus::SideFailed => SideView::Failed(answer),
                             proto::SideStatus::SideCancelled => SideView::Cancelled(answer),
-                            proto::SideStatus::SideInterrupted => SideView::Interrupted(answer),
+                            // A follow-up's conversation is gone; none are sent yet.
+                            proto::SideStatus::SideInterrupted | proto::SideStatus::SideEnded => {
+                                SideView::Interrupted(answer)
+                            }
                             proto::SideStatus::Unspecified => SideView::Asked,
                         }
                     }

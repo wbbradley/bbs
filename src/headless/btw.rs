@@ -114,6 +114,7 @@ async fn availability(b: &mut Backend, g: &str, supported: bool, reason: &str) -
     timeout(
         CALL,
         b.report_context(proto::ReportContextRequest {
+            side_followups: None,
             generation: g.into(),
             usage: None,
             side_supported: Some(supported),
@@ -415,6 +416,7 @@ mod tests {
                 .unwrap();
             let id = human
                 .ask_side(proto::AskSideRequest {
+                    follows: None,
                     agent: "ClaimTest".into(),
                     question: "never submit this after uncertainty".into(),
                 })
@@ -468,7 +470,7 @@ mod tests {
                 .unwrap();
             if !lost {
                 human
-                    .cancel_side(proto::CancelSideRequest { id })
+                    .cancel_side(proto::CancelSideRequest { id, end: false })
                     .await
                     .unwrap();
             }

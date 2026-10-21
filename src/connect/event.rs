@@ -429,7 +429,11 @@ pub async fn serve(
                 question,
             } => {
                 let local = matches!(backend, Backend::Local(_));
-                let call = backend.ask_side(proto::AskSideRequest { agent, question });
+                let call = backend.ask_side(proto::AskSideRequest {
+                    agent,
+                    question,
+                    follows: None,
+                });
                 Data::SideAsked {
                     id,
                     result: bounded(call, local).await.map(|r| r.id),
@@ -437,7 +441,10 @@ pub async fn serve(
             }
             Request::CancelSide { id, side } => {
                 let local = matches!(backend, Backend::Local(_));
-                let call = backend.cancel_side(proto::CancelSideRequest { id: side });
+                let call = backend.cancel_side(proto::CancelSideRequest {
+                    id: side,
+                    end: false,
+                });
                 Data::SideCancelled {
                     id,
                     side,
