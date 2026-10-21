@@ -11,7 +11,7 @@ under the new package version and its publication date.
 ### Fixed
 
 - Markdown table cells wrap to the available conversation width and reflow on
-  resize, including streamed replies and reasoning. Pretty terminal logs use
+  resize, including streamed replies, reasoning and `/btw` history. Pretty terminal logs use
   `COLUMNS` or the detected terminal width for tables.
 - F5 reloads a conversation while its composer is focused; refresh feedback
   has a separate animated status-bar indicator until new mail and activity

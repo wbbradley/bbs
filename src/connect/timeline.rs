@@ -17,8 +17,8 @@ use crate::backend::AGENT_ACTIVITY;
 use crate::proto::{self, Message};
 use crate::ui::activity::{Activity, ToolLine};
 use crate::ui::message::{
-    compact_message_lines_at, conversation_roles, find_matches, message_lines_with_recipient_at,
-    message_prefix, side_header, side_message_lines_at,
+    compact_message_lines, conversation_roles, find_matches, message_lines_with_recipient_at,
+    message_prefix, side_header, side_message_lines,
 };
 use crate::ui::thread::Row;
 
@@ -105,9 +105,9 @@ impl Entry {
                 gap: raw_gap,
             } => {
                 let mut lines = if *headerless {
-                    compact_message_lines_at(message, gap || *raw_gap, query, width)
+                    compact_message_lines(message, gap || *raw_gap, query, width)
                 } else if *other_participants {
-                    side_message_lines_at(message, gap || *raw_gap, query, *recipient, width)
+                    side_message_lines(message, gap || *raw_gap, query, *recipient, width)
                 } else {
                     message_lines_with_recipient_at(
                         message,

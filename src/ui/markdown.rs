@@ -69,10 +69,6 @@ impl StyleSheet for Styles {
         })
     }
 }
-pub fn render(source: &str) -> Text<'_> {
-    render_at(source, None)
-}
-
 /// `width` includes table borders and prefixes; callers subtract their own inset.
 pub fn render_at(source: &str, width: Option<u16>) -> Text<'_> {
     let options = Options::new(Styles);
@@ -152,7 +148,12 @@ mod tests {
             "| Key | Value |\n| --- | --- |\n| marker | {} lastcell |\n",
             "unbrokenword".repeat(12)
         );
-        assert!(render(&source).lines.iter().any(|l| l.width() > 80));
+        assert!(
+            render_at(&source, None)
+                .lines
+                .iter()
+                .any(|l| l.width() > 80)
+        );
         for width in [24, 58, 78] {
             let text = render_at(&source, Some(width));
             assert!(

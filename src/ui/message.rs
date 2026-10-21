@@ -50,15 +50,6 @@ pub fn side_message_lines<'a>(
     gap: bool,
     query: Option<&str>,
     recipient: Option<Kind>,
-) -> Vec<Line<'a>> {
-    side_message_lines_at(row, gap, query, recipient, None)
-}
-
-pub fn side_message_lines_at<'a>(
-    row: &'a Message,
-    gap: bool,
-    query: Option<&str>,
-    recipient: Option<Kind>,
     width: Option<u16>,
 ) -> Vec<Line<'a>> {
     with_header(
@@ -115,14 +106,6 @@ pub fn conversation_roles(row: &Message) -> (Role, Role) {
 /// The body and search rendering without a header or literal inset; the
 /// conversation supplies its margin so wrapped lines keep the same inset.
 pub fn compact_message_lines<'a>(
-    row: &'a Message,
-    gap: bool,
-    query: Option<&str>,
-) -> Vec<Line<'a>> {
-    compact_message_lines_at(row, gap, query, None)
-}
-
-pub fn compact_message_lines_at<'a>(
     row: &'a Message,
     gap: bool,
     query: Option<&str>,
@@ -427,7 +410,7 @@ mod tests {
                     body: "2026-10-19 Tim@ada remains in the body".into(),
                     ..Default::default()
                 };
-                let lines = side_message_lines(&row, false, Some("tim"), None);
+                let lines = side_message_lines(&row, false, Some("tim"), None, None);
                 assert_eq!(lines[1].to_string(), "Tim → Theo");
                 assert_eq!(lines[1].spans[0].style.fg, style(Role::Agent).fg);
                 assert!(
@@ -443,7 +426,7 @@ mod tests {
                 );
                 row.to_group = Some("crew".into());
                 assert_eq!(
-                    side_message_lines(&row, false, None, None)[1].to_string(),
+                    side_message_lines(&row, false, None, None, None)[1].to_string(),
                     "Tim → @crew"
                 );
             });
@@ -529,7 +512,7 @@ mod tests {
                     style(Role::Group).fg
                 );
                 assert!(
-                    !compact_message_lines(&row, false, None)
+                    !compact_message_lines(&row, false, None, None)
                         .iter()
                         .any(|l| l.to_string().contains("Mateo"))
                 );
@@ -547,7 +530,7 @@ mod tests {
             ..Default::default()
         };
         let full = message_lines(&row, false, Some("answer"));
-        let compact = compact_message_lines(&row, false, Some("answer"));
+        let compact = compact_message_lines(&row, false, Some("answer"), None);
         let mut body = full[2..].to_vec();
         for line in &mut body {
             line.spans.remove(0);
@@ -559,7 +542,7 @@ mod tests {
                 .iter()
                 .all(|line| !line.to_string().contains("2026-"))
         );
-        let with_gap = compact_message_lines(&row, true, Some("answer"));
+        let with_gap = compact_message_lines(&row, true, Some("answer"), None);
         assert!(with_gap[1].to_string().contains("messages may be missing"));
         assert_eq!(&with_gap[2..], &compact[1..]);
         let answer = compact[1]

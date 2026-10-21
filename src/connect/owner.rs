@@ -922,7 +922,7 @@ pub fn context_lines(agent: &str, usage: Option<&ContextUsage>) -> Vec<Line<'sta
 /// The `/btw` panel's rows: a header, the question, the answer and a
 /// footer, at most `rows`.
 pub fn side_height(agent: &str, side: &Side, view: &SideView, width: u16, rows: u16) -> u16 {
-    let answer = Paragraph::new(side_text(agent, side, view))
+    let answer = Paragraph::new(side_text(agent, side, view, width))
         .wrap(Wrap { trim: false })
         .line_count(width);
     u16::try_from(answer.saturating_add(3))
@@ -1006,7 +1006,8 @@ pub fn render_side(
     frame.render_widget(Paragraph::new(header), top);
     frame.render_widget(Paragraph::new(question), middle);
     frame.render_widget(Paragraph::new(footer), bottom);
-    let answer = Paragraph::new(side_text(agent, side, view)).wrap(Wrap { trim: false });
+    let answer =
+        Paragraph::new(side_text(agent, side, view, area.width)).wrap(Wrap { trim: false });
     let total = answer.line_count(area.width);
     let shown = usize::from(answer_area.height);
     let scroll = side.scroll.get().min(total.saturating_sub(shown));
@@ -1019,14 +1020,14 @@ pub fn render_side(
 }
 
 /// What the panel says below the question.
-fn side_body<'a>(agent: &str, view: &'a SideView) -> ratatui::text::Text<'a> {
+fn side_body<'a>(agent: &str, view: &'a SideView, width: u16) -> ratatui::text::Text<'a> {
     use ratatui::text::Text;
     let note = |text: String, style| Text::from(Line::styled(text, style));
     let answer = |text: &'a str, empty: String| {
         if text.trim().is_empty() {
             note(empty, theme::dim())
         } else {
-            crate::ui::markdown::render(text)
+            crate::ui::markdown::render_at(text, Some(width))
         }
     };
     match view {
@@ -1060,7 +1061,7 @@ fn side_body<'a>(agent: &str, view: &'a SideView) -> ratatui::text::Text<'a> {
             let mut body = if text.trim().is_empty() {
                 Text::default()
             } else {
-                let mut body = crate::ui::markdown::render(text);
+                let mut body = crate::ui::markdown::render_at(text, Some(width));
                 body.lines.push(Line::default());
                 body
             };
@@ -1075,7 +1076,12 @@ fn side_body<'a>(agent: &str, view: &'a SideView) -> ratatui::text::Text<'a> {
 
 /// The side conversation's earlier exchanges kept in this session, then what
 /// the panel says below the question.
-fn side_text<'a>(agent: &str, side: &'a Side, view: &'a SideView) -> ratatui::text::Text<'a> {
+fn side_text<'a>(
+    agent: &str,
+    side: &'a Side,
+    view: &'a SideView,
+    width: u16,
+) -> ratatui::text::Text<'a> {
     use ratatui::text::Text;
     let mut text = Text::default();
     if side.history_lost {
@@ -1091,10 +1097,10 @@ fn side_text<'a>(agent: &str, side: &'a Side, view: &'a SideView) -> ratatui::te
             theme::heading(),
         ));
         text.lines
-            .extend(crate::ui::markdown::render(&exchange.answer).lines);
+            .extend(crate::ui::markdown::render_at(&exchange.answer, Some(width)).lines);
         text.lines.push(Line::default());
     }
-    text.lines.extend(side_body(agent, view).lines);
+    text.lines.extend(side_body(agent, view, width).lines);
     text
 }
 
@@ -1764,6 +1770,61 @@ mod tests {
             lines
                 .iter()
                 .all(|l| l.width() <= 40 && !l.to_string().contains('\n'))
+        );
+    }
+
+    #[test]
+    fn side_conversation_tables_reflow_in_the_answer_and_retained_history() {
+        let source = format!(
+            "| Name | Details |\n| --- | --- |\n| marker | {} tailtoken |",
+            "side table words ".repeat(15)
+        );
+        let mut side = Side::new("", "question", 0, SideState::Tracking(1));
+        side.remember(Exchange {
+            question: "earlier?".into(),
+            answer: source.clone(),
+        });
+        for view in [
+            SideView::Open(source.clone()),
+            SideView::Completed(source.clone()),
+            SideView::Ended(source.clone()),
+        ] {
+            let mut heights = Vec::new();
+            for width in [60, 100, 60] {
+                let text = side_text("Mateo", &side, &view, width);
+                let grid: Vec<_> = text
+                    .lines
+                    .iter()
+                    .filter(|l| l.to_string().contains('│'))
+                    .collect();
+                assert!(!grid.is_empty());
+                assert!(
+                    grid.iter().all(|l| l.width() <= usize::from(width)),
+                    "{text:?}"
+                );
+                assert_eq!(
+                    grid.iter()
+                        .filter(|l| l.to_string().contains("tailtoken"))
+                        .count(),
+                    2,
+                    "history and latest remain readable"
+                );
+                let measured = Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .line_count(width)
+                    + 3;
+                assert_eq!(
+                    usize::from(side_height("Mateo", &side, &view, width, 300)),
+                    measured
+                );
+                heights.push(measured);
+            }
+            assert!(heights[0] > heights[1]);
+            assert_eq!(heights[0], heights[2]);
+        }
+        assert_eq!(
+            side.history[0].answer, source,
+            "rendering never changes side history"
         );
     }
 }
