@@ -305,8 +305,8 @@ pub fn answer_blocker(
             bail!("creating agent is retired; cancel or replace this blocker instead");
         }
         let body = format!(
-            "Blocker #{} in @{}:\n{}\n\nAnswer:\n{}",
-            row.id, row.group, row.body, req.answer
+            "Blocker #{} · version #{} in @{}:\n{}\n\nAnswer:\n{}",
+            row.root_id, row.id, row.group, row.body, req.answer
         );
         super::validate_body(&body)?;
         let message_id = db::insert_message(ctx.conn, &actor, None, &body, &ctx.now_s)?;
@@ -519,6 +519,17 @@ mod tests {
             [answered.message_id.unwrap()], |r| r.get(0),
         ).unwrap();
         assert_eq!(recipient, b.ids[1]);
+        // The delivered mail joins to the exact immutable question version.
+        let (version, mail): (i64, String) = b.conn.query_row(
+            "SELECT e.blocker_id, m.body FROM blocker_events e JOIN messages m ON m.id = e.message_id WHERE m.id = ?1",
+            [answered.message_id.unwrap()], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(version, next.id);
+        assert!(mail.starts_with(&format!(
+            "Blocker #{} · version #{} in @crew:\n",
+            old.id, next.id
+        )));
+        assert!(mail.contains(&next.body));
         let history = get_blocker(
             &mut b.conn,
             &b.humans[2],
