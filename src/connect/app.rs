@@ -5777,6 +5777,7 @@ mod tests {
                 let (mut app, mut rx) = app();
                 let mut theirs = blocker(2, 2, "Zed", &"a long question ".repeat(60));
                 theirs.can_answer = false;
+                theirs.can_cancel = false;
                 mateo_blockers(
                     &mut app,
                     &mut rx,
