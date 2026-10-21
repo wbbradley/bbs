@@ -317,8 +317,10 @@ impl Codex {
                 &self.rpc,
                 &self.thread_id,
                 &self.fork,
-                question,
-                mode,
+                codex_btw::Prompt {
+                    text: question,
+                    mode,
+                },
                 cancel,
                 &self.side_tools,
             )
@@ -338,6 +340,9 @@ impl Codex {
         self.side_tools.clone()
     }
 
+    pub fn side_progress(&self) -> Option<String> {
+        self.side.progress()
+    }
     pub fn side_text(&self) -> String {
         self.side.text()
     }

@@ -151,6 +151,12 @@ impl Harness {
         }
     }
 
+    pub fn side_progress(&self) -> Option<String> {
+        match self {
+            Self::Codex(c) => c.side_progress(),
+            Self::Acp(_) => None,
+        }
+    }
     pub fn side_text(&self) -> String {
         match self {
             Self::Codex(c) => c.side_text(),

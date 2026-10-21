@@ -146,9 +146,18 @@ for line in sys.stdin:
         assert p['threadId'] in ['parent','child']
         if p['threadId']=='child' and scenario=='continue-bad-interrupt':error(mid,-32603,'synthetic interrupt failure');continue
         reply(mid,{})
+        if p['threadId']=='parent' and scenario.startswith('continue'):
+            text('parent',p['turnId'],'parent cancellation final\n')
         if p['threadId']=='child' and scenario=='continue-no-terminal':continue
         if 'tool-cancel' in scenario:
             note('item/completed',dict(threadId='child',turnId=p['turnId'],item=dict(id='provider-tool',type='mcpToolCall')))
+        if p['threadId']=='child' and scenario=='continue-delayed-interrupt':
+            record('interrupt_pending')
+            def complete(turn=p['turnId']):
+                while not os.path.exists('release-interrupt'):time.sleep(.01)
+                done('child',turn,'interrupted')
+            threading.Thread(target=complete,daemon=True).start()
+            continue
         done(p['threadId'],p['turnId'],'interrupted')
     elif method=='thread/unsubscribe':
         assert p['threadId']=='child';reply(mid,{})

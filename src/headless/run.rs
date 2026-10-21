@@ -204,7 +204,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             return Err(err);
         }
     };
-    let interactions = if let Some(s) = side_session {
+    let mut interactions = if let Some(s) = side_session {
         Some(s.start(agent_harness.clone(), share_warn.clone()).await)
     } else {
         None
@@ -461,6 +461,10 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     }
     if turn.is_some() {
         let _ = agent_harness.cancel().await;
+    }
+    // Retained side children must finish while the provider can still reply.
+    if let Some(interactions) = interactions.as_mut() {
+        interactions.finish_btw().await;
     }
     // Stop the producer before draining, so late cancellation text is retained.
     if !process.stop().await {

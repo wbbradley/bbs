@@ -163,10 +163,13 @@ impl Side {
                 .send("human input disabled: its bounded delivery queue is full or stopped".into());
         }
     }
-    pub async fn finish(mut self) {
+    pub async fn finish_btw(&mut self) {
         if let Some(btw) = self.btw.take() {
             btw.finish().await;
         }
+    }
+    pub async fn finish(mut self) {
+        self.finish_btw().await;
         self.harness.enable_input(false);
         self.harness.cancel_input();
         let _ = self.stop.send(true);

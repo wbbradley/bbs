@@ -27,6 +27,11 @@ pub enum Mode {
     Followup,
 }
 
+pub struct Prompt<'a> {
+    pub text: &'a str,
+    pub mode: Mode,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Status {
     Completed,
@@ -83,6 +88,14 @@ impl SideChannel {
             .as_ref()
             .map(|c| c.text.clone())
             .unwrap_or_default()
+    }
+    pub fn progress(&self) -> Option<String> {
+        self.child
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|c| c.active && !c.starting && c.turn.is_some())
+            .map(|c| c.text.clone())
     }
     pub fn retained(&self) -> bool {
         self.child.lock().unwrap().as_ref().is_some_and(|c| {
@@ -264,11 +277,14 @@ impl SideChannel {
         rpc: &Rpc,
         parent: &str,
         inherit: &Value,
-        question: &str,
-        mode: Mode,
+        prompt: Prompt<'_>,
         mut cancel: watch::Receiver<bool>,
         tools: &Arc<tokio::sync::Mutex<Tools>>,
     ) -> Outcome {
+        let Prompt {
+            text: question,
+            mode,
+        } = prompt;
         let Ok(_guard) = self.gate.try_lock() else {
             return Outcome {
                 status: Status::Failed,
@@ -1411,5 +1427,52 @@ mod tests {
             assert!(!parent.is_finished());
             r.finish(parent).await;
         }
+    }
+    #[tokio::test]
+    async fn uncertain_followup_start_is_not_replayed_and_late_ack_only_cleans_child() {
+        let mut r = Rig::new("continue-late-start").await;
+        let parent = r.parent().await;
+        let (_cancel, rx) = watch::channel(false);
+        assert!(r.turn("FIRST", Mode::Fresh, rx).await.unwrap().retained);
+        let (cancel, rx) = watch::channel(false);
+        let task = r.turn("SECOND", Mode::Followup, rx);
+        r.wait(|w| w.iter().any(|v| v["kind"] == "start_pending"))
+            .await;
+        cancel.send(true).unwrap();
+        let result = timeout(Duration::from_secs(7), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!result.retained);
+        let (_cancel, rx) = watch::channel(false);
+        assert_eq!(
+            r.turn("NEVER RETRY", Mode::Followup, rx)
+                .await
+                .unwrap()
+                .status,
+            Status::Ended
+        );
+        std::fs::write(r.dir.path().join("release-start"), "").unwrap();
+        r.wait(|w| {
+            w.iter()
+                .any(|v| v["method"] == "turn/interrupt" && v["params"]["turnId"] == "s2")
+        })
+        .await;
+        assert_eq!(
+            r.wire()
+                .iter()
+                .filter(|v| v["method"] == "thread/fork")
+                .count(),
+            1
+        );
+        assert_eq!(
+            r.wire()
+                .iter()
+                .filter(|v| v["method"] == "turn/start" && v["params"]["threadId"] == "child")
+                .count(),
+            2
+        );
+        assert!(!parent.is_finished());
+        r.finish(parent).await;
     }
 }

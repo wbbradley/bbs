@@ -4,7 +4,7 @@ use super::{
     harness::Harness,
 };
 use crate::{
-    backend::Backend,
+    backend::{Backend, SIDE_CONVERSATIONS},
     proto::{self, SideStatus},
 };
 use anyhow::Result;
@@ -17,7 +17,6 @@ use tokio::{
 
 const CALL: Duration = Duration::from_secs(3);
 const IDLE: Duration = Duration::from_secs(31 * 60);
-const CONVERSATIONS: &str = "side-conversations.v1";
 #[derive(Default)]
 struct Hooks {
     #[cfg(test)]
@@ -77,7 +76,7 @@ impl Btw {
             .await
             .ok()
             .and_then(Result::ok)
-            .is_some_and(|r| r.capabilities.iter().any(|c| c == CONVERSATIONS));
+            .is_some_and(|r| r.capabilities.iter().any(|c| c == SIDE_CONVERSATIONS));
         let supported = harness.side_supported();
         if availability(
             &mut backend,
@@ -213,14 +212,6 @@ async fn run(
     let mut ending = false;
     let mut disabled = false;
     loop {
-        if (ending || disabled)
-            && active.is_none()
-            && final_report.is_none()
-            && lost.is_none()
-            && held.is_none()
-        {
-            break;
-        }
         tokio::select! { biased;
             changed = stop.changed(), if !ending => {
                 if changed.is_err() || *stop.borrow() {
@@ -237,18 +228,21 @@ async fn run(
                     status: Status::Failed, answer: harness.side_text(),
                     detail: "side task stopped".into(), disable: true, retained: false,
                 });
-                if outcome.disable {
+                let mut disable = outcome.disable;
+                if outcome.retained && !a.ending && !ending && !disabled && !disable {
+                    held = Some(Held { conversation: a.conversation, latest: a.id,
+                        deadline: Instant::now() + IDLE });
+                } else {
+                    if followups && outcome.status != Status::Ended { lost = Some(a.id); }
+                    held = None;
+                    // Early validation/refusal may leave a previously held
+                    // child untouched. Dispose it too; never orphan it locally.
+                    disable |= !harness.finish_side().await;
+                }
+                if disable {
                     disabled = true;
                     let _ = availability(&mut backend, &generation, false, followups.then_some(false),
                         "provider side-fork prerequisites or cleanup could not be confirmed; restart after resolving the provider failure").await;
-                }
-                if outcome.retained && !a.ending && !ending && !disabled {
-                    held = Some(Held { conversation: a.conversation, latest: a.id,
-                        deadline: Instant::now() + IDLE });
-                } else if followups && outcome.status != Status::Ended {
-                    lost = Some(a.id);
-                    if outcome.retained { let _ = harness.finish_side().await; }
-                    held = None;
                 }
                 let status = match outcome.status {
                     Status::Completed => SideStatus::SideCompleted,
@@ -378,11 +372,12 @@ async fn run(
                     || current
                         .side
                         .as_ref()
-                        .is_none_or(|r| r.id != a.id || r.ended);
+                        .is_none_or(|r| r.ended || r.conversation != Some(a.conversation));
                 let _ = a.cancel.send(true);
             } else {
-                let text = harness.side_text();
-                if text != a.reported {
+                if let Some(text) = harness.side_progress()
+                    && text != a.reported
+                {
                     if report(
                         &mut backend,
                         &generation,
@@ -403,8 +398,13 @@ async fn run(
             }
             continue;
         }
-        if ending || disabled {
-            continue;
+        if (ending || disabled)
+            && current
+                .side
+                .as_ref()
+                .is_none_or(|r| r.status() != SideStatus::SideOpen || r.id <= attempted)
+        {
+            break;
         }
         let Some(row) = current
             .side
@@ -462,12 +462,62 @@ async fn run(
             continue;
         };
         attempted = attempted.max(request.id);
-        let still_open = snapshot(&mut backend, &generation).await.is_ok_and(|r| {
-            r.side.is_some_and(|r| {
+        let after_claim = snapshot(&mut backend, &generation).await;
+        let still_open = after_claim.as_ref().is_ok_and(|r| {
+            r.side.as_ref().is_some_and(|r| {
                 r.id == request.id && !r.ended && r.status() == SideStatus::SideOpen
             })
         });
         if !still_open {
+            // A definite cancellation before submission leaves a previously
+            // quiescent child usable. Advance only the exact claimed row.
+            let cancelled = after_claim.as_ref().is_ok_and(|r| {
+                r.side.as_ref().is_some_and(|r| {
+                    r.id == request.id && !r.ended && r.status() == SideStatus::SideCancelled
+                })
+            });
+            if cancelled
+                && let Some(h) = held.as_mut().filter(|h| h.follows(&request))
+                && harness.side_retained()
+            {
+                h.latest = request.id;
+                h.deadline = Instant::now() + IDLE;
+                continue;
+            }
+            // A failed verification is not permission to invoke, but the known
+            // claim still needs a terminal report if it is open when reachable.
+            held = None;
+            if !harness.finish_side().await {
+                disabled = true;
+            }
+            final_report = Some(Final {
+                id: request.id,
+                status: SideStatus::SideFailed,
+                answer: Some(
+                    "Side question was not submitted; its state could not be confirmed.".into(),
+                ),
+            });
+            if followups {
+                lost = Some(request.id);
+            }
+            continue;
+        }
+        if ending || disabled {
+            let is_followup = followups && request.follows.is_some();
+            final_report = Some(Final {
+                id: request.id,
+                status: if is_followup {
+                    SideStatus::SideEnded
+                } else {
+                    SideStatus::SideFailed
+                },
+                answer: Some(
+                    "Side conversation ended; the runner cannot continue this child.".into(),
+                ),
+            });
+            if followups && !is_followup {
+                lost = Some(request.id);
+            }
             continue;
         }
         let mode = if request.follows.is_some() {
@@ -523,9 +573,44 @@ mod tests {
         settings::{HarnessConfig, HarnessType},
     };
     use crate::{config::Config, service::Caller};
+    #[tokio::test(start_paused = true)]
+    async fn held_identity_and_idle_grace_are_per_conversation_and_per_turn() {
+        let mut held = Held {
+            conversation: 10,
+            latest: 11,
+            deadline: Instant::now() + IDLE,
+        };
+        let mut request = proto::SideRequest {
+            conversation: Some(10),
+            follows: Some(11),
+            ..Default::default()
+        };
+        assert!(held.follows(&request));
+        request.conversation = Some(9);
+        assert!(!held.follows(&request));
+        request.conversation = Some(10);
+        request.follows = Some(10);
+        assert!(!held.follows(&request));
+        request.follows = Some(11);
+        tokio::time::advance(Duration::from_secs(30 * 60)).await;
+        assert!(
+            held.follows(&request),
+            "runner keeps the server's one-minute expiry grace"
+        );
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(!held.follows(&request));
+        // A completed follow-up refreshes idle time; no conversation-age cap.
+        held.deadline = Instant::now() + IDLE;
+        held.latest = 12;
+        request.follows = Some(12);
+        tokio::time::advance(Duration::from_secs(30 * 60)).await;
+        assert!(held.follows(&request));
+    }
     #[tokio::test]
-    async fn lost_or_cancelled_claim_ack_never_invokes_a_model() {
-        for lost in [true, false] {
+    async fn claim_ack_uncertainty_cancel_and_legacy_one_shot_routing() {
+        for case in 0..3 {
+            let lost = case == 0;
+            let cancelled = case == 1;
             let dir = tempfile::tempdir().unwrap();
             let config = Config::default();
             let mut db = crate::db::open(&dir.path().join("bbs.db")).unwrap();
@@ -628,7 +713,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            if !lost {
+            if cancelled {
                 human
                     .cancel_side(proto::CancelSideRequest { id, end: false })
                     .await
@@ -661,12 +746,40 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let wire = std::fs::read_to_string(dir.path().join("btw-wire.jsonl")).unwrap();
-            assert!(
-                !wire
-                    .lines()
-                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                    .any(|v| v["method"] == "thread/fork" || v["method"] == "turn/start")
-            );
+            let wire: Vec<serde_json::Value> = wire
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            if case == 2 {
+                assert_eq!(
+                    wire.iter().filter(|v| v["method"] == "thread/fork").count(),
+                    1
+                );
+                assert_eq!(
+                    wire.iter()
+                        .filter(
+                            |v| v["method"] == "turn/start" && v["params"]["threadId"] == "child"
+                        )
+                        .count(),
+                    1
+                );
+                assert!(wire.iter().any(|v| v["method"] == "thread/unsubscribe"));
+                let r = human
+                    .side_report(proto::SideReportRequest {
+                        agent: "ClaimTest".into(),
+                        generation: None,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(r.side_followups, None);
+                assert_eq!(r.side.unwrap().status(), SideStatus::SideCompleted);
+            } else {
+                assert!(
+                    !wire
+                        .iter()
+                        .any(|v| v["method"] == "thread/fork" || v["method"] == "turn/start")
+                );
+            }
             let h = harness.clone();
             let parent = tokio::spawn(async move { h.prompt("ordinary parent", None).await });
             timeout(Duration::from_secs(5), async {

@@ -170,17 +170,28 @@ impl Rig {
         );
     }
     async fn ask(&self) -> i64 {
+        self.ask_text(None, "A PRIVATE SIDE QUESTION").await
+    }
+    async fn ask_text(&self, follows: Option<i64>, question: &str) -> i64 {
         self.client()
             .await
             .ask_side(req(proto::AskSideRequest {
-                follows: None,
+                follows,
                 agent: "BtwTest".into(),
-                question: "A PRIVATE SIDE QUESTION".into(),
+                question: question.into(),
             }))
             .await
             .unwrap()
             .into_inner()
             .id
+    }
+    async fn completed(&self, id: i64) -> proto::SideReportResponse {
+        self.wait_report(|r| {
+            r.side
+                .as_ref()
+                .is_some_and(|s| s.id == id && s.status() == proto::SideStatus::SideCompleted)
+        })
+        .await
     }
     fn messages(&self) -> i64 {
         let conn = rusqlite::Connection::open(self.home.path().join("board/bbs.db")).unwrap();
@@ -363,4 +374,273 @@ async fn owner_cancel_is_independent_and_restart_never_replays_a_claimed_questio
             .count(),
         count
     );
+}
+
+#[tokio::test]
+async fn continuing_side_cancel_waits_for_quiescence_without_replacing_child_or_touching_parent() {
+    let mut r = Rig::new("continue-delayed-interrupt").await;
+    r.wait_report(|r| r.side_followups == Some(true)).await;
+    r.send("HOLD MAIN", None).await;
+    let before = r
+        .wait_report(|r| r.usage.is_some_and(|u| u.used_tokens == Some(40)))
+        .await;
+    let messages = r.messages();
+    let first = r.ask().await;
+    assert_eq!(
+        r.completed(first).await.side.unwrap().conversation,
+        Some(first)
+    );
+    let second = r.ask_text(Some(first), "HOLD SIDE").await;
+    r.wait_report(|r| {
+        r.side
+            .as_ref()
+            .is_some_and(|s| s.id == second && s.answer.as_deref() == Some("side answer 2\n"))
+    })
+    .await;
+    r.client()
+        .await
+        .cancel_side(req(proto::CancelSideRequest {
+            id: second,
+            end: false,
+        }))
+        .await
+        .unwrap();
+    // A follow-up may be accepted while the previous interrupted turn is
+    // settling. It must wait for that same child's terminal confirmation.
+    let third = r.ask_text(Some(second), "FOLLOWUP AFTER CANCEL").await;
+    r.wait_wire(|w| w.iter().any(|v| v["kind"] == "interrupt_pending"))
+        .await;
+    assert_eq!(
+        r.wire()
+            .iter()
+            .filter(|v| v["method"] == "turn/start" && v["params"]["threadId"] == "child")
+            .count(),
+        2
+    );
+    std::fs::write(r.home.path().join("release-interrupt"), "").unwrap();
+    let result = r.completed(third).await;
+    let side = result.side.unwrap();
+    assert_eq!(
+        (side.conversation, side.follows, side.ended),
+        (Some(first), Some(second), false)
+    );
+    assert_eq!(side.answer.as_deref(), Some("side answer 3\n"));
+    assert_eq!(
+        (result.usage, result.reported_at),
+        (before.usage, before.reported_at)
+    );
+    assert_eq!(r.messages(), messages);
+    assert_eq!(
+        r.wire()
+            .iter()
+            .filter(|v| v["method"] == "thread/fork")
+            .count(),
+        1
+    );
+    assert!(!r.wire().iter().any(|v| v["method"] == "thread/unsubscribe"
+        || (v["method"] == "turn/interrupt" && v["params"]["threadId"] == "parent")));
+    r.client()
+        .await
+        .cancel_side(req(proto::CancelSideRequest {
+            id: third,
+            end: true,
+        }))
+        .await
+        .unwrap();
+    r.wait_wire(|w| w.iter().any(|v| v["method"] == "thread/unsubscribe"))
+        .await;
+    assert!(r.report().await.side.unwrap().ended);
+    r.stop();
+}
+
+#[tokio::test]
+async fn idle_snapshot_releases_ended_or_replaced_conversations_and_restart_never_replays() {
+    for cause in ["owner", "idle", "replace", "restart", "stop"] {
+        let mut r = Rig::new("continue").await;
+        r.wait_report(|r| r.side_followups == Some(true)).await;
+        let first = r.ask().await;
+        r.completed(first).await;
+        match cause {
+            "owner" => {
+                r.client()
+                    .await
+                    .cancel_side(req(proto::CancelSideRequest {
+                        id: first,
+                        end: true,
+                    }))
+                    .await
+                    .unwrap();
+            }
+            "idle" => {
+                let conn = rusqlite::Connection::open(r.home.path().join("board/bbs.db")).unwrap();
+                let old = (chrono::Utc::now() - chrono::Duration::minutes(31)).to_rfc3339();
+                conn.execute(
+                    "UPDATE side_requests SET updated_at=? WHERE id=?",
+                    rusqlite::params![old, first],
+                )
+                .unwrap();
+            }
+            "replace" => {
+                let second = r.ask().await;
+                assert_eq!(
+                    r.completed(second).await.side.unwrap().conversation,
+                    Some(second)
+                );
+            }
+            "stop" => {
+                r.stop();
+            }
+            "restart" => {
+                r.crash();
+                r.restart();
+                r.wait_report(|r| {
+                    r.side_followups == Some(true) && r.side.as_ref().is_some_and(|s| s.ended)
+                })
+                .await;
+            }
+            _ => unreachable!(),
+        }
+        if cause != "restart" {
+            r.wait_wire(|w| w.iter().any(|v| v["method"] == "thread/unsubscribe"))
+                .await;
+        }
+        let expected = if cause == "replace" { 2 } else { 1 };
+        assert_eq!(
+            r.wire()
+                .iter()
+                .filter(|v| v["method"] == "turn/start" && v["params"]["threadId"] == "child")
+                .count(),
+            expected
+        );
+        if cause != "replace" {
+            assert!(r.report().await.side.unwrap().ended);
+            assert!(
+                r.client()
+                    .await
+                    .ask_side(req(proto::AskSideRequest {
+                        follows: Some(first),
+                        agent: "BtwTest".into(),
+                        question: "must not replay".into()
+                    }))
+                    .await
+                    .is_err()
+            );
+        }
+        r.stop();
+    }
+}
+
+#[tokio::test]
+async fn followup_accepted_during_uncertain_cancel_ends_without_fork_or_replay() {
+    let mut r = Rig::new("continue-bad-interrupt").await;
+    r.wait_report(|r| r.side_followups == Some(true)).await;
+    let first = r.ask_text(None, "HOLD SIDE").await;
+    r.wait_report(|r| {
+        r.side
+            .as_ref()
+            .is_some_and(|s| s.id == first && s.answer.is_some())
+    })
+    .await;
+    r.client()
+        .await
+        .cancel_side(req(proto::CancelSideRequest {
+            id: first,
+            end: false,
+        }))
+        .await
+        .unwrap();
+    let second = r.ask_text(Some(first), "MUST NOT BE REPLAYED").await;
+    let result = r
+        .wait_report(|r| {
+            r.side
+                .as_ref()
+                .is_some_and(|s| s.id == second && s.status() == proto::SideStatus::SideEnded)
+        })
+        .await;
+    assert!(result.side.unwrap().ended);
+    assert_eq!(
+        r.wire()
+            .iter()
+            .filter(|v| v["method"] == "thread/fork")
+            .count(),
+        1
+    );
+    assert_eq!(
+        r.wire()
+            .iter()
+            .filter(|v| v["method"] == "turn/start" && v["params"]["threadId"] == "child")
+            .count(),
+        1
+    );
+    r.stop();
+}
+
+#[tokio::test]
+async fn active_side_end_and_runner_stop_clean_only_child_and_keep_parent_final_text() {
+    for owner_end in [true, false] {
+        let mut r = Rig::new("continue").await;
+        r.send("HOLD MAIN", None).await;
+        r.wait_wire(|w| w.iter().any(|v| v["kind"] == "parent_active"))
+            .await;
+        let id = r.ask_text(None, "HOLD SIDE").await;
+        r.wait_report(|r| {
+            r.side
+                .as_ref()
+                .is_some_and(|s| s.id == id && s.answer.is_some())
+        })
+        .await;
+        if owner_end {
+            r.client()
+                .await
+                .cancel_side(req(proto::CancelSideRequest { id, end: true }))
+                .await
+                .unwrap();
+            r.wait_wire(|w| w.iter().any(|v| v["method"] == "thread/unsubscribe"))
+                .await;
+            assert!(!r.wire().iter().any(|v| v["method"] == "turn/interrupt" && v["params"]["threadId"] == "parent"));
+        }
+        r.stop();
+        let wire = r.wire();
+        assert!(
+            wire.iter()
+                .any(|v| v["method"] == "turn/interrupt" && v["params"]["threadId"] == "child")
+        );
+        assert!(
+            wire.iter()
+                .any(|v| v["method"] == "thread/unsubscribe" && v["params"]["threadId"] == "child")
+        );
+        assert!(r.report().await.side.unwrap().ended);
+        let mail = r
+            .client()
+            .await
+            .read(req(proto::ReadRequest::default()))
+            .await
+            .unwrap()
+            .into_inner()
+            .messages;
+        assert!(mail.iter().any(|m| m.auto_reply == Some(true) && m.body.contains("parent cancellation final")));
+        assert!(mail.iter().all(|m| !m.body.contains("side answer")));
+    }
+}
+
+#[tokio::test]
+async fn rejected_followup_cleans_held_child_without_submitting_or_replaying_it() {
+    let mut r = Rig::new("continue").await;
+    let first = r.ask().await;
+    r.completed(first).await;
+    let second = r.ask_text(Some(first), "   ").await;
+    let result = r
+        .wait_report(|r| r.side.as_ref().is_some_and(|s| s.id == second && s.ended))
+        .await;
+    assert_eq!(result.side.unwrap().status(), proto::SideStatus::SideFailed);
+    r.wait_wire(|w| w.iter().any(|v| v["method"] == "thread/unsubscribe"))
+        .await;
+    assert_eq!(
+        r.wire()
+            .iter()
+            .filter(|v| v["method"] == "turn/start" && v["params"]["threadId"] == "child")
+            .count(),
+        1
+    );
+    r.stop();
 }
