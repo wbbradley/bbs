@@ -105,6 +105,7 @@ fn fit(text: &str, width: usize) -> String {
 pub struct Activity {
     /// Render `text` records' markdown, rather than showing their source.
     markdown: bool,
+    table_width: Option<u16>,
     /// Show times in local time rather than the log's UTC.
     local: bool,
     /// Mark turns: a separator before each prompt and a `turn end` line.
@@ -122,6 +123,7 @@ impl Activity {
     pub fn new(markdown: bool) -> Activity {
         Activity {
             markdown,
+            table_width: None,
             local: false,
             turns: true,
             compact_thoughts: false,
@@ -149,6 +151,11 @@ impl Activity {
     pub fn compact_thoughts(mut self) -> Activity {
         self.compact_thoughts = true;
         self
+    }
+
+    /// Table width for subsequently printed records; raw log data is unchanged.
+    pub fn set_table_width(&mut self, width: Option<u16>) {
+        self.table_width = width;
     }
 
     /// One log line as styled lines; none for hidden records.
@@ -397,25 +404,7 @@ impl Activity {
     }
 
     fn thought(&self, out: &mut Vec<Line<'static>>, text: &str) {
-        // Parse before removing blank display lines so paragraph and code syntax
-        // retain their meaning. Only the rendered conversation is compacted.
-        for line in crate::ui::markdown::render(text.trim()).lines {
-            if line.spans.iter().all(|span| span.content.trim().is_empty()) {
-                continue;
-            }
-            let spans = line
-                .spans
-                .iter()
-                .map(|span| {
-                    let mut rendered = line.style.patch(span.style);
-                    if rendered.fg == style(Role::Text).fg {
-                        rendered.fg = dim().fg;
-                    }
-                    Span::styled(span.content.to_string(), dim().italic().patch(rendered))
-                })
-                .collect::<Vec<_>>();
-            out.push(Line::from(spans));
-        }
+        out.extend(markdown_lines(text, self.table_width, true));
     }
 
     /// Markdown as styled lines, or the source text.
@@ -423,14 +412,39 @@ impl Activity {
         if !self.markdown {
             return self.block(out, text, style(Role::Text));
         }
-        for line in crate::ui::markdown::render(text.trim_end()).lines {
-            let spans = line
-                .spans
-                .iter()
-                .map(|span| Span::styled(span.content.to_string(), line.style.patch(span.style)));
-            out.push(Line::from(spans.collect::<Vec<_>>()));
-        }
+        out.extend(markdown_lines(text, self.table_width, false));
     }
+}
+
+/// Pure content rendering: reflowing a row never replays tool/turn state.
+pub fn markdown_lines(text: &str, width: Option<u16>, thought: bool) -> Vec<Line<'static>> {
+    let text = if thought {
+        text.trim()
+    } else {
+        text.trim_end()
+    };
+    crate::ui::markdown::render_at(text, width)
+        .lines
+        .into_iter()
+        .filter(|line| !thought || line.spans.iter().any(|s| !s.content.trim().is_empty()))
+        .map(|line| {
+            Line::from(
+                line.spans
+                    .into_iter()
+                    .map(|span| {
+                        let mut rendered = line.style.patch(span.style);
+                        if thought {
+                            if rendered.fg == style(Role::Text).fg {
+                                rendered.fg = dim().fg;
+                            }
+                            rendered = dim().italic().patch(rendered);
+                        }
+                        Span::styled(span.content.into_owned(), rendered)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
 }
 
 fn running_line(name: &str) -> Vec<Line<'static>> {

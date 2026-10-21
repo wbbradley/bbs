@@ -17,8 +17,8 @@ use crate::backend::AGENT_ACTIVITY;
 use crate::proto::{self, Message};
 use crate::ui::activity::{Activity, ToolLine};
 use crate::ui::message::{
-    compact_message_lines, conversation_roles, find_matches, message_lines_with_recipient,
-    message_prefix, side_header, side_message_lines,
+    compact_message_lines_at, conversation_roles, find_matches, message_lines_with_recipient_at,
+    message_prefix, side_header, side_message_lines_at,
 };
 use crate::ui::thread::Row;
 
@@ -47,6 +47,8 @@ pub enum Entry {
         id: i64,
         created_at: String,
         lines: Vec<Line<'static>>,
+        /// Original reply/reasoning content for reflow at the live pane width.
+        markdown: Option<String>,
         /// A finished tool call, kept whole and drawn as one line fitted to
         /// the width; runs of these sit together after one blank.
         call: Option<ToolLine>,
@@ -88,6 +90,58 @@ impl Entry {
 
     fn is_thought(&self) -> bool {
         matches!(self, Entry::Stream { thought: true, .. })
+    }
+}
+
+impl Entry {
+    fn rendered_lines(&self, gap: bool, query: Option<&str>, width: Option<u16>) -> Vec<Line<'_>> {
+        match self {
+            Entry::Message {
+                message,
+                headerless,
+                recipient,
+                outgoing,
+                other_participants,
+                gap: raw_gap,
+            } => {
+                let mut lines = if *headerless {
+                    compact_message_lines_at(message, gap || *raw_gap, query, width)
+                } else if *other_participants {
+                    side_message_lines_at(message, gap || *raw_gap, query, *recipient, width)
+                } else {
+                    message_lines_with_recipient_at(
+                        message,
+                        gap || *raw_gap,
+                        query,
+                        *recipient,
+                        width,
+                    )
+                };
+                if *outgoing {
+                    if *headerless {
+                        lines.insert(1 + usize::from(gap || *raw_gap), Line::default());
+                    }
+                    // Until the agent reads it, the bottom padding says so,
+                    // inset from the right as the body is from the left.
+                    lines.push(if *headerless && message.read_at.is_none() {
+                        Line::styled("unread  ", theme::style(theme::Role::HumanNote))
+                            .right_aligned()
+                    } else {
+                        Line::default()
+                    });
+                    for line in &mut lines {
+                        line.style = theme::style(theme::Role::HumanSurface).patch(line.style);
+                    }
+                }
+                lines
+            }
+            Entry::Stream {
+                markdown: Some(text),
+                thought,
+                ..
+            } if width.is_some() => crate::ui::activity::markdown_lines(text, width, *thought),
+            Entry::Stream { lines, .. } => lines.clone(),
+        }
     }
 }
 
@@ -141,42 +195,7 @@ impl Row for Entry {
     }
 
     fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>> {
-        match self {
-            Entry::Message {
-                message,
-                headerless,
-                recipient,
-                outgoing,
-                other_participants,
-                gap: raw_gap,
-            } => {
-                let mut lines = if *headerless {
-                    compact_message_lines(message, gap || *raw_gap, query)
-                } else if *other_participants {
-                    side_message_lines(message, gap || *raw_gap, query, *recipient)
-                } else {
-                    message_lines_with_recipient(message, gap || *raw_gap, query, *recipient)
-                };
-                if *outgoing {
-                    if *headerless {
-                        lines.insert(1 + usize::from(gap || *raw_gap), Line::default());
-                    }
-                    // Until the agent reads it, the bottom padding says so,
-                    // inset from the right as the body is from the left.
-                    lines.push(if *headerless && message.read_at.is_none() {
-                        Line::styled("unread  ", theme::style(theme::Role::HumanNote))
-                            .right_aligned()
-                    } else {
-                        Line::default()
-                    });
-                    for line in &mut lines {
-                        line.style = theme::style(theme::Role::HumanSurface).patch(line.style);
-                    }
-                }
-                lines
-            }
-            Entry::Stream { lines, .. } => lines.clone(),
-        }
+        self.rendered_lines(gap, query, None)
     }
 
     fn style(&self) -> Style {
@@ -208,7 +227,7 @@ impl Row for Entry {
 
     fn gutter(&self, gap: bool, query: Option<&str>, width: u16) -> Vec<Line<'_>> {
         if self.is_thought() {
-            let height = Paragraph::new(self.lines(gap, query))
+            let height = Paragraph::new(self.lines_at(gap, query, width))
                 .wrap(Wrap { trim: false })
                 .line_count(width);
             return vec![Line::styled("│ ", theme::dim().italic()); height];
@@ -269,7 +288,7 @@ impl Row for Entry {
             Entry::Stream {
                 call: Some(call), ..
             } => vec![call.one_line(usize::from(width))],
-            _ => self.lines(gap, query),
+            _ => self.rendered_lines(gap, query, Some(width)),
         }
     }
 
@@ -545,6 +564,11 @@ impl Stream {
             id: record.id,
             created_at: record.created_at.clone(),
             lines,
+            markdown: if matches!(event.as_str(), "text" | "thought") {
+                value["text"].as_str().map(str::to_owned)
+            } else {
+                None
+            },
             call: self.renderer.take_tool(),
             thought: event == "thought",
             reply: event == "text",
@@ -1071,6 +1095,7 @@ mod tests {
             id: 1,
             created_at: "2026-10-16T18:00:00Z".into(),
             lines,
+            markdown: None,
             call: tool.then(|| ToolLine::running("a")),
             thought: false,
             reply: false,
@@ -1167,7 +1192,12 @@ mod tests {
                     terminal
                         .resize(ratatui::layout::Rect::new(0, 0, width, 3))
                         .unwrap();
-                    terminal.draw(|f| view.render(f, f.area())).unwrap();
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(Block::new().style(theme::base()), f.area());
+                            view.render(f, f.area());
+                        })
+                        .unwrap();
                     assert!((0..3).all(|y| {
                         (0..2).all(|x| terminal.backend().buffer()[(x, y)].symbol() == " ")
                     }));
@@ -1250,7 +1280,12 @@ mod tests {
                     terminal
                         .resize(ratatui::layout::Rect::new(0, 0, width, 3))
                         .unwrap();
-                    terminal.draw(|f| view.render(f, f.area())).unwrap();
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(Block::new().style(theme::base()), f.area());
+                            view.render(f, f.area());
+                        })
+                        .unwrap();
                     assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
                     let mut x = 0;
                     while x < width {
@@ -1405,6 +1440,7 @@ mod tests {
             id: 1,
             created_at: String::new(),
             lines: vec![Line::raw(" \t")],
+            markdown: None,
             call: None,
             thought: false,
             reply: false,
@@ -1418,6 +1454,7 @@ mod tests {
             id: 2,
             created_at: String::new(),
             lines: vec![Line::raw("tool")],
+            markdown: None,
             call: Some(ToolLine::running("read")),
             thought: false,
             reply: false,
@@ -1736,6 +1773,111 @@ mod tests {
                         .content
                         .iter()
                         .all(|c| c.bg == human.bg.unwrap())
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn tables_reflow_in_mail_replies_and_reasoning_without_replaying_state() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        let source = format!(
+            "| Name | Detail |\n| :--- | ---: |\n| **Choice** | {} tailtoken |\n",
+            "Unicode 界 café e\u{301} ".repeat(12)
+        );
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let mut rows = Vec::new();
+                for (headerless, outgoing, side) in [
+                    (true, false, false),
+                    (true, true, false),
+                    (false, false, false),
+                    (false, false, true),
+                ] {
+                    rows.push(Entry::Message {
+                        message: Message {
+                            id: rows.len() as i64 + 1,
+                            body: source.clone(),
+                            from_name: "A".into(),
+                            to_name: Some("B".into()),
+                            ..Default::default()
+                        },
+                        headerless,
+                        outgoing,
+                        recipient: Some(proto::Kind::Agent),
+                        other_participants: side,
+                        gap: false,
+                    });
+                }
+                let mut stream = Stream::new("Mateo");
+                let running = Kept::new(&proto::Activity {
+                    id: 20,
+                    record: r#"{"event":"tool","id":"one","title":"read","status":"pending"}"#
+                        .into(),
+                    ..Default::default()
+                });
+                stream.entry(&running, &Loaded::new());
+                let before = stream.running(80);
+                assert!(!before.is_empty());
+                for (id, kind) in [(21, "text"), (22, "thought")] {
+                    let raw = serde_json::json!({"event":kind,"text":source}).to_string();
+                    let kept = Kept::new(&proto::Activity {
+                        id,
+                        record: raw.clone(),
+                        ..Default::default()
+                    });
+                    rows.push(stream.entry(&kept, &Loaded::new()).unwrap());
+                    assert_eq!(kept.activity.record, raw);
+                }
+                for row in rows {
+                    let mut heights = Vec::new();
+                    let mut view = ThreadView::new(vec![row.clone()], 100);
+                    view.set_query("choice");
+                    assert_eq!(view.search_status(), Some(("choice", 1)));
+                    for width in [60, 100, 72, 60] {
+                        view.follow();
+                        let inner = width - row.inset();
+                        let lines = row.lines_at(false, Some("choice"), inner);
+                        assert!(
+                            lines.iter().all(|l| l.width() <= usize::from(inner)),
+                            "{width}: {lines:?}"
+                        );
+                        assert!(lines.iter().any(|l| l.to_string().contains("tailtoken")));
+                        let height = Paragraph::new(lines.clone())
+                            .wrap(Wrap { trim: false })
+                            .line_count(inner);
+                        heights.push(height);
+                        if row.is_thought() {
+                            assert_eq!(row.gutter(false, None, inner).len(), height);
+                            assert!(
+                                lines
+                                    .iter()
+                                    .flat_map(|l| &l.spans)
+                                    .all(|s| s.style.add_modifier.contains(Modifier::ITALIC))
+                            );
+                        }
+                        let mut terminal = Terminal::new(TestBackend::new(width, 200)).unwrap();
+                        terminal
+                            .draw(|f| {
+                                f.render_widget(Block::new().style(theme::base()), f.area());
+                                view.render(f, f.area());
+                            })
+                            .unwrap();
+                        assert!(view.frame.total >= height);
+                        crate::ui::theme::testing::assert_buffer(terminal.backend().buffer());
+                        view.layout(width, 5);
+                        view.scroll_to(2);
+                        assert!(!view.following());
+                        view.layout(100, 5);
+                        assert_eq!(view.paused.unwrap().id, row.key());
+                    }
+                    assert!(heights[0] > heights[1], "table cells reflow: {heights:?}");
+                    assert_eq!(heights[0], heights[3], "resize back restores geometry");
+                }
+                assert_eq!(
+                    stream.running(80),
+                    before,
+                    "content reflow cannot touch tool lifecycle"
                 );
             });
         }

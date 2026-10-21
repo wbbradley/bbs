@@ -73,6 +73,9 @@ impl Row for Message {
     fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>> {
         message_lines(self, gap, query)
     }
+    fn lines_at(&self, gap: bool, query: Option<&str>, width: u16) -> Vec<Line<'_>> {
+        crate::ui::message::message_lines_with_recipient_at(self, gap, query, None, Some(width))
+    }
     /// The sender, recipient, group, or body as sent (markdown included).
     fn matches(&self, query: &str) -> bool {
         [

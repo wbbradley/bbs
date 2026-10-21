@@ -23,7 +23,24 @@ pub fn message_lines_with_recipient<'a>(
     query: Option<&str>,
     recipient: Option<Kind>,
 ) -> Vec<Line<'a>> {
-    with_header(row, gap, query, Some(header(row, query, recipient)), true)
+    message_lines_with_recipient_at(row, gap, query, recipient, None)
+}
+
+pub fn message_lines_with_recipient_at<'a>(
+    row: &'a Message,
+    gap: bool,
+    query: Option<&str>,
+    recipient: Option<Kind>,
+    width: Option<u16>,
+) -> Vec<Line<'a>> {
+    with_header(
+        row,
+        gap,
+        query,
+        Some(header(row, query, recipient)),
+        true,
+        width,
+    )
 }
 
 /// A side conversation identifies its participants without delivery metadata
@@ -34,12 +51,23 @@ pub fn side_message_lines<'a>(
     query: Option<&str>,
     recipient: Option<Kind>,
 ) -> Vec<Line<'a>> {
+    side_message_lines_at(row, gap, query, recipient, None)
+}
+
+pub fn side_message_lines_at<'a>(
+    row: &'a Message,
+    gap: bool,
+    query: Option<&str>,
+    recipient: Option<Kind>,
+    width: Option<u16>,
+) -> Vec<Line<'a>> {
     with_header(
         row,
         gap,
         query,
         Some(side_header(row, query, recipient)),
         false,
+        width,
     )
 }
 
@@ -91,7 +119,16 @@ pub fn compact_message_lines<'a>(
     gap: bool,
     query: Option<&str>,
 ) -> Vec<Line<'a>> {
-    with_header(row, gap, query, None, false)
+    compact_message_lines_at(row, gap, query, None)
+}
+
+pub fn compact_message_lines_at<'a>(
+    row: &'a Message,
+    gap: bool,
+    query: Option<&str>,
+    width: Option<u16>,
+) -> Vec<Line<'a>> {
+    with_header(row, gap, query, None, false, width)
 }
 
 fn with_header<'a>(
@@ -100,9 +137,15 @@ fn with_header<'a>(
     query: Option<&str>,
     header: Option<Line<'static>>,
     indent: bool,
+    width: Option<u16>,
 ) -> Vec<Line<'a>> {
     let mut body = Vec::new();
-    for mut line in crate::ui::markdown::render(&row.body).lines {
+    for mut line in crate::ui::markdown::render_at(
+        &row.body,
+        width.map(|w| w.saturating_sub(if indent { 2 } else { 0 })),
+    )
+    .lines
+    {
         if indent {
             line.spans.insert(0, Span::raw("  "));
         }

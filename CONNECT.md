@@ -567,7 +567,9 @@ src/ui/         shared with `bbs view` and `bbs headless logs`
 Libraries: `ratatui` 0.30 and its `crossterm` backend draw the terminal UI;
 `ratatui-textarea` 0.9 supplies composer editing. Shared Markdown rendering uses
 `tui-markdown` with a semantic StyleSheet and syntax highlighting disabled, so
-code uses the selected scheme's Technical role. The logo is plain text geometry.
+code uses the selected scheme's Technical role. Markdown tables wrap their cells
+to the live pane width, including conversation margins, and reflow on resize.
+The logo is plain text geometry.
 
 ## Server changes
 

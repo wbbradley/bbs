@@ -159,10 +159,25 @@ pub async fn print(path: &Path, follow: bool, pretty: bool) -> Result<()> {
             continue;
         }
         match &mut pretty {
-            Some(pretty) => print!("{}", to_ansi(&pretty.render(&line), color)),
+            Some(pretty) => {
+                let columns = std::env::var("COLUMNS").ok();
+                let terminal = color
+                    .then(|| ratatui::crossterm::terminal::size().ok().map(|s| s.0))
+                    .flatten();
+                pretty.set_table_width(output_width(columns.as_deref(), terminal));
+                print!("{}", to_ansi(&pretty.render(&line), color));
+            }
             None => print!("{}", render(&line)),
         }
     }
+}
+
+/// An explicit valid column count overrides the detected terminal width.
+fn output_width(columns: Option<&str>, terminal: Option<u16>) -> Option<u16> {
+    columns
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|w| *w > 0)
+        .or(terminal.filter(|w| *w > 0))
 }
 
 /// One record as text: `HH:MM:SS event: details`.
@@ -262,6 +277,30 @@ mod tests {
         assert!(
             shown.contains("turn_end: {\"stop_reason\":\"end_turn\"}"),
             "{shown}"
+        );
+    }
+
+    #[test]
+    fn pretty_table_width_uses_columns_then_the_actual_terminal() {
+        for (columns, terminal, want) in [
+            (Some("40"), Some(80), Some(40)),
+            (None, Some(80), Some(80)),
+            (Some("0"), Some(80), Some(80)),
+            (Some("wrong"), Some(80), Some(80)),
+            (Some("999999"), None, None),
+            (None, None, None),
+        ] {
+            assert_eq!(output_width(columns, terminal), want);
+        }
+        let record = json!({"event":"text","text":format!("| Key | Value |\n| --- | --- |\n| choice | {} tailtoken |", "words ".repeat(20))}).to_string();
+        let mut renderer = Activity::new(true);
+        renderer.set_table_width(output_width(Some("40"), Some(80)));
+        let shown = renderer.render(&record);
+        assert!(shown.iter().all(|l| l.width() <= 40));
+        assert!(shown.iter().any(|l| l.to_string().contains("tailtoken")));
+        assert_eq!(
+            serde_json::from_str::<Value>(&record).unwrap()["event"],
+            "text"
         );
     }
 }

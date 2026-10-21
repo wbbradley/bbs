@@ -70,7 +70,18 @@ impl StyleSheet for Styles {
     }
 }
 pub fn render(source: &str) -> Text<'_> {
-    let mut text = tui_markdown::from_str_with_options(source, &Options::new(Styles));
+    render_at(source, None)
+}
+
+/// `width` includes table borders and prefixes; callers subtract their own inset.
+pub fn render_at(source: &str, width: Option<u16>) -> Text<'_> {
+    let options = Options::new(Styles);
+    let options = if let Some(width) = width {
+        options.table_width(width)
+    } else {
+        options
+    };
+    let mut text = tui_markdown::from_str_with_options(source, &options);
     // Set ordinary text on each line too: callers may consume lines directly.
     for line in &mut text.lines {
         line.style = theme::style(Role::Text).patch(line.style);
@@ -132,6 +143,28 @@ mod tests {
                     .unwrap();
                 assert_buffer(terminal.backend().buffer());
             });
+        }
+    }
+
+    #[test]
+    fn table_width_wraps_cells_instead_of_breaking_the_complete_grid() {
+        let source = format!(
+            "| Key | Value |\n| --- | --- |\n| marker | {} lastcell |\n",
+            "unbrokenword".repeat(12)
+        );
+        assert!(render(&source).lines.iter().any(|l| l.width() > 80));
+        for width in [24, 58, 78] {
+            let text = render_at(&source, Some(width));
+            assert!(
+                text.lines.iter().all(|l| l.width() <= usize::from(width)),
+                "{text:?}"
+            );
+            assert!(
+                text.lines
+                    .iter()
+                    .any(|l| l.to_string().contains("lastcell"))
+            );
+            assert!(text.lines.len() > 5);
         }
     }
 }

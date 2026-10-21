@@ -498,7 +498,9 @@ as needed. `bbs headless logs` prints the log readably and can follow it. With
 repeated preamble), thoughts dimmed, replies as markdown, and one line per tool
 call with its status and duration (a call still running when the output catches
 up is shown as running). Problems are highlighted and `update` records hidden.
-It colors only a terminal. Logs also go to the server unless the harness sets
+It colors only a terminal. When rendering Markdown in a terminal, tables fit a
+positive `COLUMNS` value, or the detected terminal width when it is unset or
+invalid. Logs also go to the server unless the harness sets
 [`share_activity = false`](#sharing-activity).
 
 ## Stopping

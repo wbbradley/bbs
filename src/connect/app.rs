@@ -9978,4 +9978,44 @@ mod tests {
         key(&mut app, 'A');
         assert!(rx.try_recv().is_err());
     }
+
+    #[test]
+    fn conversation_tables_follow_the_live_pane_width_and_preserve_the_draft() {
+        let (mut app, mut rx) = app();
+        let feed = mateo(&mut app, &mut rx);
+        let body = format!(
+            "| Choice | Detail |\n| --- | --- |\n| marker | {} tailtoken |",
+            "pane width words ".repeat(12)
+        );
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(1, "Mateo", "ada", &body)]),
+        }));
+        for c in "unfinished draft".chars() {
+            key(&mut app, c);
+        }
+        let mut heights = Vec::new();
+        for width in [60, 100, 72, 60] {
+            let out = screen(&mut app, width, 80);
+            assert!(out.contains("tailtoken"), "{out}");
+            assert!(out.contains("unfinished draft"));
+            let grid: Vec<_> = out.lines().filter(|l| l.contains('│')).collect();
+            assert!(!grid.is_empty(), "table rendered: {out}");
+            assert!(
+                grid.iter().all(|l| l.trim_end().ends_with('│')),
+                "cells wrap inside a complete grid: {out}"
+            );
+            heights.push(grid.len());
+        }
+        assert!(heights[0] > heights[1], "narrow table grows: {heights:?}");
+        assert_eq!(heights[0], heights[3]);
+        enter(&mut app);
+        let req = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|request| match request {
+                Request::Send { req, .. } => Some(req),
+                _ => None, // Reading the incoming mail also acknowledges it.
+            })
+            .expect("the preserved draft sends");
+        assert_eq!(req.body, "unfinished draft");
+    }
 }
