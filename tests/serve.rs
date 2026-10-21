@@ -839,7 +839,10 @@ async fn auto_replies_are_advertised_deduped_and_owned() {
         .unwrap()
         .into_inner();
     assert_eq!(
-        mail.messages.iter().filter(|m| m.body == "raced").count(),
+        mail.messages
+            .iter()
+            .filter(|m| m.body == "raced")
+            .count(),
         1
     );
 }
@@ -962,11 +965,7 @@ async fn side_questions_are_advertised_and_answered_over_the_wire() {
         .await
         .unwrap()
         .into_inner();
-    assert!(
-        info.capabilities
-            .iter()
-            .any(|c| c == "agent-interactions.v1")
-    );
+    assert!(info.capabilities.iter().any(|c| c == "agent-interactions.v1"));
     let agent = register(&mut client).await;
     client
         .begin_side_session(as_agent(
@@ -1061,7 +1060,7 @@ async fn side_questions_are_asked_claimed_and_answered_over_the_wire() {
                 usage: None,
                 side_supported: Some(true),
                 side_reason: None,
-                preserve_usage: false,
+            preserve_usage: false,
             },
         ))
         .await

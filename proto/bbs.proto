@@ -140,7 +140,10 @@ message SideRequest {
   // side-conversations.v1: the side question this one follows up, in the
   // same side conversation; absent for a conversation's first question.
   optional int64 follows = 6;
-  // side-conversations.v1: the owner ended this question's conversation.
+  // side-conversations.v1: this question's conversation cannot be
+  // continued: the owner ended it, it went idle, the runner generation that
+  // answered it is gone, or it was INTERRUPTED or ENDED. Derived by the
+  // server.
   bool ended = 7;
 }
 message AskSideRequest {
@@ -148,8 +151,8 @@ message AskSideRequest {
   string question = 2;  // <= 4 KiB
   // side-conversations.v1: continue the side conversation whose latest
   // question this is. Refused unless it is the agent's latest side question,
-  // terminal (COMPLETED, FAILED or CANCELLED), not ended or interrupted, and
-  // the current runner generation answers follow-ups.
+  // terminal (COMPLETED, FAILED or CANCELLED), answered by the current
+  // runner generation, not ended, and that generation answers follow-ups.
   optional int64 follows = 3;
 }
 message AskSideResponse { int64 id = 1; }  // never reused
@@ -169,7 +172,8 @@ message ClaimSideResponse {
 message ReportSideRequest {
   string generation = 1;
   int64 id = 2;
-  SideStatus status = 3;       // OPEN, COMPLETED, FAILED or (follow-ups) ENDED
+  // OPEN, COMPLETED, FAILED, or ENDED (only for an OPEN follow-up).
+  SideStatus status = 3;
   optional string answer = 4;  // <= 64 KiB
 }
 
