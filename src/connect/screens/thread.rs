@@ -49,6 +49,8 @@ pub struct SavedView {
     composing: bool,
     /// Receipts were held (older mail sought): they stay held on return.
     hold: bool,
+    /// The message sought there, kept in view on return whatever the filters.
+    sought: Option<i64>,
 }
 
 /// A message opened from the launcher: shown whatever the filters, glowing
@@ -330,14 +332,26 @@ impl Thread {
             query: self.view.query.clone(),
             composing: self.composing,
             hold: self.holding_receipts(),
+            sought: self.sought.as_ref().map(|s| s.id),
         }
     }
 
     /// Return to a saved place: filters and search now, the scroll anchor
     /// once its row arrives.
     pub fn restore_view(&mut self, saved: SavedView) {
+        // The sought message stays in view, before any rebuild, without
+        // glowing again.
+        if let Some(id) = saved.sought {
+            self.sought = Some(Sought {
+                id,
+                glow_until: (self.now)(),
+            });
+        }
         let kinds = self.stream.as_ref().map(|s| s.kinds);
-        let refilter = saved.show != self.show || (saved.kinds.is_some() && saved.kinds != kinds);
+        // A sought message the filters would hide needs a rebuild to show.
+        let refilter = saved.show != self.show
+            || (saved.kinds.is_some() && saved.kinds != kinds)
+            || saved.sought.is_some();
         self.show = saved.show;
         if let (Some(stream), Some(kinds)) = (&mut self.stream, saved.kinds) {
             stream.kinds = kinds;
@@ -2482,5 +2496,62 @@ mod seek_tests {
         plain.restore_view(back.saved_view());
         plain.seed_messages(&[mail(60, "Mateo", "ada", "unread")]);
         assert_eq!(plain.unread_mail(), Some(("Mateo".into(), 60)));
+    }
+
+    #[test]
+    fn a_sought_message_hidden_by_the_filter_returns_with_its_place() {
+        let (_, now) = clock();
+        let mut ctx = ctx(now.clone());
+        let rows = vec![
+            mail(1, "Mateo", "Lu", "between others, sought"),
+            mail(2, "Mateo", "ada", "to me, unread"),
+        ];
+        for compact in [false, true] {
+            ctx.preferences.set_compact(compact);
+            let mut seeking = Thread::agent("Mateo", "ada", now.clone());
+            seeking.human = Some("ada".into());
+            seeking.follow_compact(&ctx);
+            if !compact {
+                seeking.show = Show::Stream;
+            }
+            seeking.seed_messages(&rows);
+            assert!(seeking.seek_message(1));
+            let saved = seeking.saved_view();
+            // Reopened: the cache seeds it, the place comes back filtered as it was.
+            let mut back = Thread::agent("Mateo", "ada", now.clone());
+            back.human = Some("ada".into());
+            back.follow_compact(&ctx);
+            back.seed_messages(&rows);
+            back.restore_view(saved);
+            assert!(
+                !back.view.following(),
+                "compact={compact}: the place is held"
+            );
+            assert_eq!(back.show, if compact { Show::All } else { Show::Stream });
+            let out = draw(&mut back, &ctx);
+            let y = find(&out, "between others, sought").expect("the hit is in view");
+            assert!(y <= 4);
+            let glow = theme::style(theme::Role::Selection).bg;
+            assert_ne!(Some(out[(70, y)].bg), glow, "no second glow");
+            assert_eq!(back.unread_mail(), None, "receipts still held");
+            // Following releases it: the filter hides it again, mail reads.
+            back.view.follow();
+            let out = draw(&mut back, &ctx);
+            assert!(find(&out, "between others, sought").is_none());
+            assert_eq!(back.unread_mail(), Some(("Mateo".into(), 2)));
+        }
+        // Restored in the other order too: before the cache seeds it.
+        ctx.preferences.set_compact(false);
+        let mut seeking = Thread::agent("Mateo", "ada", now.clone());
+        seeking.human = Some("ada".into());
+        seeking.show = Show::Stream;
+        seeking.seed_messages(&rows);
+        assert!(seeking.seek_message(1));
+        let mut early = Thread::agent("Mateo", "ada", now);
+        early.human = Some("ada".into());
+        early.restore_view(seeking.saved_view());
+        early.seed_messages(&rows);
+        assert!(!early.view.following());
+        assert!(find(&draw(&mut early, &ctx), "between others, sought").is_some());
     }
 }
