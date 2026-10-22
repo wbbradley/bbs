@@ -349,8 +349,13 @@ impl Thread {
     /// Show cached messages before the live feed's first snapshot; the feed
     /// still loads and settles as usual.
     pub fn seed_messages(&mut self, rows: &[Message]) {
+        if rows.is_empty() {
+            return;
+        }
         self.absorb(rows);
         self.settle_anchor();
+        // Cached rows are worth showing now: no hold for the first snapshot.
+        self.opening_until = None;
     }
 
     /// Pause at message `id`, shown even where the filters would hide it,
@@ -2372,5 +2377,24 @@ mod seek_tests {
             "a new side question"
         );
         assert!(!thread.side_aside);
+    }
+
+    #[test]
+    fn cached_rows_show_at_once_while_the_live_feed_still_loads() {
+        let (_, now) = clock();
+        let ctx = ctx(now.clone());
+        let mut thread = Thread::agent("Mateo", "ada", now);
+        thread.human = Some("ada".into());
+        // Nothing cached: the usual hold for the first live snapshot.
+        thread.seed_messages(&[]);
+        assert!(find(&draw(&mut thread, &ctx), "Loading…").is_some());
+        thread.seed_messages(&[mail(1, "Mateo", "ada", "cached reply")]);
+        let out = draw(&mut thread, &ctx);
+        assert!(find(&out, "cached reply").is_some() && find(&out, "Loading…").is_none());
+        assert!(!thread.feed_loaded, "the live feed has not settled");
+        feed(&mut thread, vec![mail(2, "Mateo", "ada", "live reply")]);
+        assert!(thread.feed_loaded);
+        let out = draw(&mut thread, &ctx);
+        assert!(find(&out, "cached reply").is_some() && find(&out, "live reply").is_some());
     }
 }
