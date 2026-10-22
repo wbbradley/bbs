@@ -63,6 +63,14 @@ pub enum Entry {
 }
 
 impl Entry {
+    /// The message a row shows, if it is mail.
+    pub fn message_id(&self) -> Option<i64> {
+        match self {
+            Entry::Message { message, .. } => Some(message.id),
+            Entry::Stream { .. } => None,
+        }
+    }
+
     /// What compact view hides: finished tool calls, mail among other
     /// participants, and any activity standing for such mail (`side`), even
     /// alongside direct mail; and reasoning when `thoughts` is set.

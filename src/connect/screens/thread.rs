@@ -25,13 +25,36 @@ use crate::connect::keys::{Action, GroupOp};
 use crate::connect::theme;
 use crate::connect::timeline::{Entry, Kinds, Loaded, Show, Stream};
 use crate::proto::{self, FeedRequest, Message, SendRequest};
-use crate::ui::thread::{MAX_ROWS, ThreadView};
+use crate::ui::thread::{Anchor, MAX_ROWS, Row, ThreadView};
 
 /// Messages each feed snapshot holds, as for `bbs view`.
 const BACKLOG: u32 = 200;
 
 /// Bound the initial display hold without timing out either subscription.
 const INITIAL_LOAD_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a sought message glows.
+const GLOW: Duration = Duration::from_millis(1500);
+
+type EntryKey = <Entry as crate::ui::thread::Row>::Key;
+
+/// A conversation's place, kept while it is closed: where it was scrolled,
+/// its filters, search and mode. Never its subscriptions or data.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedView {
+    paused: Option<Anchor<EntryKey>>,
+    show: Show,
+    kinds: Option<Kinds>,
+    query: Option<String>,
+    composing: bool,
+}
+
+/// A message opened from the launcher: shown whatever the filters, glowing
+/// briefly; receipts wait until the view follows again.
+struct Sought {
+    id: i64,
+    glow_until: Instant,
+}
 
 /// One explicit refresh: settle each replacement subscription, independently
 /// of the agent's turn progress.
@@ -57,6 +80,9 @@ pub struct Thread {
     id: u64,
     feed_id: u64,
     refresh: Option<Refresh>,
+    /// A restored place whose row has not arrived yet.
+    pending_anchor: Option<Anchor<EntryKey>>,
+    sought: Option<Sought>,
     req: FeedRequest,
     view: ThreadView<Entry>,
     /// Every message received, so another `show` can rebuild the view.
@@ -118,6 +144,8 @@ impl Thread {
             id,
             feed_id: id,
             refresh: None,
+            pending_anchor: None,
+            sought: None,
             req: FeedRequest {
                 backlog: BACKLOG,
                 ..req
@@ -178,10 +206,7 @@ impl Thread {
     /// Lay the timeline out afresh from everything held, for a new `show` or
     /// activity kinds, keeping the search.
     fn rebuild(&mut self) {
-        let mut entries = Vec::new();
-        if self.show.messages() {
-            entries.extend(self.message_entries(&self.messages));
-        }
+        let mut entries = self.shown_messages(&self.messages);
         let loaded = self.loaded();
         if self.show.stream()
             && let Some(stream) = &mut self.stream
@@ -191,6 +216,7 @@ impl Thread {
         let entries = compacted(
             self.compact_side().as_ref(),
             self.compact_hides_thoughts,
+            self.sought.as_ref().map(|s| s.id),
             entries,
         );
         let query = self.view.query.clone();
@@ -229,6 +255,134 @@ impl Thread {
         self.rebuild();
         self.view.paused = paused;
         self.view.new_count = new_count;
+    }
+
+    /// The entries for `messages` the filter shows, plus the sought message
+    /// whatever the filter.
+    fn shown_messages(&self, messages: &[Message]) -> Vec<Entry> {
+        if self.show.messages() {
+            return self.message_entries(messages);
+        }
+        let sought = self.sought.as_ref().map(|s| s.id);
+        let kept: Vec<Message> = messages
+            .iter()
+            .filter(|m| Some(m.id) == sought)
+            .cloned()
+            .collect();
+        self.message_entries(&kept)
+    }
+
+    /// Take messages in as a feed snapshot would, without settling the feed.
+    fn absorb(&mut self, messages: &[Message]) {
+        let held: HashSet<i64> = self.messages.iter().map(|m| m.id).collect();
+        let mut changed: Vec<i64> = messages
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| !held.contains(id))
+            .collect();
+        changed.extend(self.keep(messages));
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|s| self.show.stream() && s.references(&changed))
+        {
+            // Records drawn before this mail arrived give way to it, and
+            // records for evicted mail draw again.
+            self.reconcile();
+        } else {
+            let entries = self.shown_messages(messages);
+            let entries = compacted(
+                self.compact_side().as_ref(),
+                self.compact_hides_thoughts,
+                self.sought.as_ref().map(|s| s.id),
+                entries,
+            );
+            self.view.ingest(entries);
+        }
+    }
+
+    /// Apply a restored place once its row is held.
+    fn settle_anchor(&mut self) {
+        if let Some(anchor) = self.pending_anchor
+            && self.view.rows.iter().any(|r| r.key() == anchor.id)
+        {
+            self.view.paused = Some(anchor);
+            self.view.new_count = 0;
+            self.pending_anchor = None;
+        }
+    }
+
+    /// Where this conversation is, for the app to restore when it reopens.
+    pub fn saved_view(&self) -> SavedView {
+        SavedView {
+            paused: self.view.paused.or(self.pending_anchor),
+            show: self.show,
+            kinds: self.stream.as_ref().map(|s| s.kinds),
+            query: self.view.query.clone(),
+            composing: self.composing,
+        }
+    }
+
+    /// Return to a saved place: filters and search now, the scroll anchor
+    /// once its row arrives.
+    pub fn restore_view(&mut self, saved: SavedView) {
+        let kinds = self.stream.as_ref().map(|s| s.kinds);
+        let refilter = saved.show != self.show || (saved.kinds.is_some() && saved.kinds != kinds);
+        self.show = saved.show;
+        if let (Some(stream), Some(kinds)) = (&mut self.stream, saved.kinds) {
+            stream.kinds = kinds;
+        }
+        if refilter {
+            self.rebuild();
+        }
+        self.view
+            .set_query(saved.query.as_deref().unwrap_or_default());
+        self.composing = saved.composing && self.composer.is_some();
+        self.pending_anchor = saved.paused;
+        self.settle_anchor();
+    }
+
+    /// Show cached messages before the live feed's first snapshot; the feed
+    /// still loads and settles as usual.
+    pub fn seed_messages(&mut self, rows: &[Message]) {
+        self.absorb(rows);
+        self.settle_anchor();
+    }
+
+    /// Pause at message `id`, shown even where the filters would hide it,
+    /// glowing briefly. False, changing nothing, when it is not held.
+    pub fn seek_message(&mut self, id: i64) -> bool {
+        if !self.messages.iter().any(|m| m.id == id) {
+            return false;
+        }
+        self.sought = Some(Sought {
+            id,
+            glow_until: (self.now)() + GLOW,
+        });
+        self.reconcile();
+        let Some(key) = self
+            .view
+            .rows
+            .iter()
+            .find(|r| r.message_id() == Some(id))
+            .map(Row::key)
+        else {
+            self.sought = None;
+            return false;
+        };
+        self.view.paused = Some(Anchor { id: key, line: 0 });
+        self.view.new_count = 0;
+        self.pending_anchor = None;
+        self.composing = false;
+        // The hit is the thing to show; nothing waits on the first snapshot.
+        self.opening_until = None;
+        true
+    }
+
+    /// Reading older mail found by the launcher marks nothing newer read or
+    /// seen until the view follows again.
+    fn holding_receipts(&self) -> bool {
+        self.sought.is_some() && !self.view.following()
     }
 
     fn message_entries(&self, messages: &[Message]) -> Vec<Entry> {
@@ -910,9 +1064,17 @@ impl Thread {
 
 /// `entries` less what compact view hides, given the ids of mail among
 /// other participants while it is on and whether it hides reasoning.
-fn compacted(side: Option<&HashSet<i64>>, thoughts: bool, mut entries: Vec<Entry>) -> Vec<Entry> {
+/// Drop what compact view hides, except the message being sought.
+fn compacted(
+    side: Option<&HashSet<i64>>,
+    thoughts: bool,
+    sought: Option<i64>,
+    mut entries: Vec<Entry>,
+) -> Vec<Entry> {
     if let Some(side) = side {
-        entries.retain(|e| !e.compact_hides(side, thoughts));
+        entries.retain(|e| {
+            sought.is_some_and(|id| e.message_id() == Some(id)) || !e.compact_hides(side, thoughts)
+        });
     }
     entries
 }
@@ -977,8 +1139,9 @@ impl Screen for Thread {
     }
 
     fn unread_mail(&self) -> Option<(String, i64)> {
-        // Mail hidden behind btw mode is not read yet.
-        if self.btw_mode() {
+        // Mail hidden behind btw mode is not read yet, nor newer mail while
+        // a sought older message holds the view.
+        if self.btw_mode() || self.holding_receipts() {
             return None;
         }
         let agent = self.agent.as_ref()?;
@@ -1168,6 +1331,12 @@ impl Screen for Thread {
             .into_iter()
             .chain(self.opening_until.filter(|deadline| *deadline > now))
             .chain(
+                self.sought
+                    .as_ref()
+                    .map(|s| s.glow_until)
+                    .filter(|until| *until > now),
+            )
+            .chain(
                 self.refresh
                     .as_ref()
                     .map(|_| now + Duration::from_millis(100)),
@@ -1219,6 +1388,7 @@ impl Screen for Thread {
     fn on_data(&mut self, data: &Data) {
         let side = self.compact_side();
         let thoughts = self.compact_hides_thoughts;
+        let sought = self.sought.as_ref().map(|s| s.id);
         if let Some(owner) = &mut self.owner {
             owner.on_data(data);
             // The server took the question: clear the draft unless it changed.
@@ -1241,7 +1411,7 @@ impl Screen for Thread {
                 self.reconcile();
             } else if self.show.stream() && !entries.is_empty() {
                 self.view
-                    .ingest(compacted(side.as_ref(), thoughts, entries));
+                    .ingest(compacted(side.as_ref(), thoughts, sought, entries));
             }
         }
         match data {
@@ -1253,26 +1423,7 @@ impl Screen for Thread {
                     Ok(messages) => {
                         self.feed_loaded = true;
                         self.error = None;
-                        let held: HashSet<i64> = self.messages.iter().map(|m| m.id).collect();
-                        let mut changed: Vec<i64> = messages
-                            .iter()
-                            .map(|m| m.id)
-                            .filter(|id| !held.contains(id))
-                            .collect();
-                        changed.extend(self.keep(messages));
-                        if self
-                            .stream
-                            .as_ref()
-                            .is_some_and(|s| self.show.stream() && s.references(&changed))
-                        {
-                            // Records drawn before this mail arrived give way to
-                            // it, and records for evicted mail draw again.
-                            self.reconcile();
-                        } else if self.show.messages() {
-                            let entries = self.message_entries(messages);
-                            self.view
-                                .ingest(compacted(side.as_ref(), thoughts, entries));
-                        }
+                        self.absorb(messages);
                     }
                     Err(e) => self.error = Some(describe(e)),
                 }
@@ -1319,6 +1470,8 @@ impl Screen for Thread {
         {
             self.opening_until = None;
         }
+        // A restored place may be held now.
+        self.settle_anchor();
         // A report may have opened or ended the side conversation.
         self.sync_side();
     }
@@ -1339,8 +1492,10 @@ impl Screen for Thread {
             return Vec::new();
         };
         let mut requests = Vec::new();
-        // Activity hidden behind btw mode is not seen yet.
+        // Activity hidden behind btw mode, or below a sought message, is not
+        // seen yet.
         if !self.btw_mode()
+            && !self.holding_receipts()
             && let Some(newest) = self.stream.as_ref().and_then(Stream::newest)
             && newest > self.seen
         {
@@ -1354,6 +1509,9 @@ impl Screen for Thread {
     }
 
     fn raw_key(&mut self, key: KeyEvent) -> Option<Transition> {
+        // The reader has taken over: a restored place still on its way is
+        // no longer wanted.
+        self.pending_anchor = None;
         let transition = (|| -> Option<Transition> {
             use crate::connect::owner::Outcome as Form;
             if let Some(owner) = &mut self.owner
@@ -1740,6 +1898,54 @@ impl Thread {
             Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(body);
         frame.render_widget(Paragraph::new(running), below);
         self.view.render(frame, body);
+        self.glow(frame, body);
+    }
+
+    /// The sought message's rows, highlighted while it glows. Once the view
+    /// follows again, the message is no longer sought.
+    fn glow(&mut self, frame: &mut Frame, area: Rect) {
+        if self.sought.is_some() && self.view.following() {
+            self.sought = None;
+            // A filtered-out message leaves with it.
+            self.reconcile();
+            return;
+        }
+        let Some(sought) = &self.sought else {
+            return;
+        };
+        if (self.now)() >= sought.glow_until {
+            return;
+        }
+        let Some(i) = self
+            .view
+            .rows
+            .iter()
+            .position(|r| r.message_id() == Some(sought.id))
+        else {
+            return;
+        };
+        let top = self.view.top();
+        let start = self.view.frame.starts[i].max(top);
+        let end = self
+            .view
+            .frame
+            .starts
+            .get(i + 1)
+            .copied()
+            .unwrap_or(self.view.frame.total)
+            .min(top + usize::from(area.height));
+        if start >= end {
+            return;
+        }
+        let rows = Rect::new(
+            area.x,
+            area.y + (start - top) as u16,
+            area.width,
+            (end - start) as u16,
+        );
+        frame
+            .buffer_mut()
+            .set_style(rows, theme::style(theme::Role::Selection));
     }
 
     /// Why an activity-only timeline is empty.
@@ -1779,5 +1985,261 @@ impl Thread {
                 theme::dim(),
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+    use crate::connect::preferences::Preferences;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+    /// A pinned clock and the handle that advances it.
+    fn clock() -> (Arc<AtomicU64>, Clock) {
+        let base = Instant::now();
+        let millis = Arc::new(AtomicU64::new(0));
+        let read = millis.clone();
+        let now: Clock =
+            Arc::new(move || base + Duration::from_millis(read.load(Ordering::Relaxed)));
+        (millis, now)
+    }
+
+    fn ctx(now: Clock) -> Ctx {
+        Ctx {
+            me: "ada".into(),
+            server: "bbs".into(),
+            composer_max_height_percent: 20,
+            compact_hides_thoughts: false,
+            preferences: Preferences::default(),
+            now,
+            inbox: Default::default(),
+            efforts: Default::default(),
+            navigation_notice: None,
+            blocker_marker: None,
+        }
+    }
+
+    fn at(id: i64) -> String {
+        format!(
+            "2026-10-16T{:02}:{:02}:{:02}Z",
+            10 + id / 3600,
+            id / 60 % 60,
+            id % 60
+        )
+    }
+
+    fn to_crew(id: i64) -> Message {
+        Message {
+            id,
+            created_at: at(id),
+            from_kind: proto::Kind::Agent.into(),
+            from_name: "Zed".into(),
+            to_group: Some("crew".into()),
+            body: format!("message {id}"),
+            ..Default::default()
+        }
+    }
+
+    fn mail(id: i64, from: &str, to: &str, body: &str) -> Message {
+        Message {
+            id,
+            created_at: at(id),
+            from_kind: if from == "ada" {
+                proto::Kind::Human
+            } else {
+                proto::Kind::Agent
+            }
+            .into(),
+            from_name: from.into(),
+            to_name: Some(to.into()),
+            body: body.into(),
+            ..Default::default()
+        }
+    }
+
+    fn draw(thread: &mut Thread, ctx: &Ctx) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| thread.render(f, f.area(), ctx)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    fn find(buffer: &Buffer, text: &str) -> Option<u16> {
+        (0..buffer.area.height).find(|y| row(buffer, *y).contains(text))
+    }
+
+    fn feed(thread: &mut Thread, rows: Vec<Message>) {
+        let id = thread.feed_id;
+        thread.on_data(&Data::Feed {
+            id,
+            result: Ok(rows),
+        });
+    }
+
+    #[test]
+    fn seeking_pauses_at_a_seeded_message_which_glows_then_fades() {
+        let (millis, now) = clock();
+        let ctx = ctx(now.clone());
+        let mut thread = Thread::group("crew");
+        thread.now = now;
+        thread.seed_messages(&(1..=120).map(to_crew).collect::<Vec<_>>());
+        assert!(!thread.seek_message(999), "not held");
+        assert!(thread.view.following(), "and nothing changed");
+        assert!(thread.seek_message(30));
+        assert!(!thread.view.following() && !thread.composing);
+        let buffer = draw(&mut thread, &ctx);
+        let y = find(&buffer, "message 30 ").expect("the hit is in view");
+        assert!(y <= 4, "near the top: {y}");
+        let glow = theme::style(theme::Role::Selection).bg;
+        assert_eq!(Some(buffer[(70, y)].bg), glow, "it glows");
+        assert!(thread.next_animation_frame().is_some());
+        // The live feed's newer rows leave the place where it is.
+        feed(&mut thread, (100..=130).map(to_crew).collect());
+        assert_eq!(thread.view.new_count, 10);
+        let buffer = draw(&mut thread, &ctx);
+        assert_eq!(find(&buffer, "message 30 "), Some(y));
+        millis.fetch_add(1500, Ordering::Relaxed);
+        let buffer = draw(&mut thread, &ctx);
+        assert_eq!(find(&buffer, "message 30 "), Some(y));
+        assert_ne!(Some(buffer[(70, y)].bg), glow, "the glow has faded");
+        assert_eq!(thread.next_animation_frame(), None);
+    }
+
+    #[test]
+    fn a_sought_message_shows_through_the_filters_until_following_again() {
+        let (_, now) = clock();
+        let mut ctx = ctx(now.clone());
+        let mut thread = Thread::agent("Mateo", "ada", now);
+        thread.human = Some("ada".into());
+        thread.seed_messages(&[
+            mail(1, "Mateo", "ada", "to me"),
+            mail(2, "Mateo", "Lu", "between others"),
+            mail(3, "ada", "Mateo", "from me"),
+        ]);
+        let shown = |t: &Thread, id| t.view.rows.iter().any(|r| r.message_id() == Some(id));
+        // Compact view hides mail between others; activity-only hides mail.
+        // The app's preference drives it, as each draw follows that.
+        ctx.preferences.set_compact(true);
+        thread.follow_compact(&ctx);
+        assert!(!shown(&thread, 2));
+        assert!(thread.seek_message(2));
+        assert!(shown(&thread, 2), "compact view keeps the sought message");
+        thread.view.follow();
+        draw(&mut thread, &ctx);
+        assert!(thread.sought.is_none() && !shown(&thread, 2), "released");
+        ctx.preferences.set_compact(false);
+        thread.follow_compact(&ctx);
+        thread.show = Show::Stream;
+        thread.rebuild();
+        assert!(!shown(&thread, 1));
+        assert!(thread.seek_message(1));
+        assert!(
+            shown(&thread, 1) && !shown(&thread, 3),
+            "only the sought one"
+        );
+    }
+
+    #[test]
+    fn reading_older_mail_found_by_seeking_marks_nothing_newer() {
+        let (_, now) = clock();
+        let ctx = ctx(now.clone());
+        let mut thread = Thread::agent("Mateo", "ada", now);
+        thread.human = Some("ada".into());
+        thread.seed_messages(&[
+            mail(1, "Mateo", "ada", "old"),
+            mail(50, "Mateo", "ada", "new, unread"),
+        ]);
+        let Request::WatchActivity { id: activity, .. } = thread.stream.as_ref().unwrap().watch()
+        else {
+            unreachable!()
+        };
+        thread.on_data(&Data::Activity {
+            id: activity,
+            result: Ok(vec![proto::Activity {
+                id: 9,
+                record: r#"{"event":"text","text":"hi"}"#.into(),
+                created_at: at(60),
+                ..Default::default()
+            }]),
+        });
+        assert_eq!(thread.unread_mail(), Some(("Mateo".into(), 50)));
+        assert!(thread.seek_message(1));
+        assert_eq!(thread.unread_mail(), None);
+        assert!(
+            !thread
+                .on_view(&ctx)
+                .iter()
+                .any(|r| matches!(r, Request::MarkSeen { .. })),
+            "activity below is not seen either"
+        );
+        // Following again reads and sees as usual.
+        thread.view.follow();
+        assert_eq!(thread.unread_mail(), Some(("Mateo".into(), 50)));
+        assert!(
+            thread
+                .on_view(&ctx)
+                .iter()
+                .any(|r| matches!(r, Request::MarkSeen { through_id: 9, .. }))
+        );
+    }
+
+    #[test]
+    fn a_saved_place_returns_once_its_row_arrives() {
+        let (_, now) = clock();
+        let ctx = ctx(now.clone());
+        let rows: Vec<_> = (1..=100).map(to_crew).collect();
+        let mut first = Thread::group("crew");
+        first.now = now.clone();
+        feed(&mut first, rows.clone());
+        draw(&mut first, &ctx);
+        first.view.scroll_up(30);
+        first.view.set_query("message 4");
+        first.composing = true;
+        let saved = first.saved_view();
+        let before = draw(&mut first, &ctx);
+        // Reopened: filters, search and mode now; the place once its row is
+        // held, even arriving after the restore.
+        let mut again = Thread::group("crew");
+        again.now = now.clone();
+        again.restore_view(saved.clone());
+        assert!(again.view.following() && again.composing);
+        assert_eq!(
+            again.view.search_status().map(|(q, _)| q),
+            Some("message 4")
+        );
+        feed(&mut again, rows.clone());
+        assert!(!again.view.following());
+        let after = draw(&mut again, &ctx);
+        for y in 1..15 {
+            assert_eq!(row(&after, y), row(&before, y), "line {y}");
+        }
+        assert_eq!(again.saved_view(), saved);
+        // A key before the row arrives means the reader has moved on.
+        let mut moved = Thread::group("crew");
+        moved.now = now.clone();
+        moved.restore_view(saved);
+        moved.raw_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        feed(&mut moved, rows.clone());
+        assert!(moved.view.following());
+        // A following view restores as following.
+        let mut tail = Thread::group("crew");
+        tail.now = now;
+        feed(&mut tail, rows.clone());
+        let following = tail.saved_view();
+        let mut back = Thread::group("crew");
+        back.restore_view(following);
+        feed(&mut back, rows);
+        assert!(back.view.following());
     }
 }
