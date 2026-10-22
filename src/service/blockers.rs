@@ -516,7 +516,10 @@ mod tests {
         // Zed, ada's agent, supersedes Mateo's blocker and cancels its own.
         let first = b.put(0, "Which option?", None, "first");
         let second = b.put(1, "Which option, now with costs?", Some(first.id), "second");
-        assert_eq!(owner_of(&mut b, first.id), ("Zed".into(), Some("ada".into())));
+        assert_eq!(
+            owner_of(&mut b, first.id),
+            ("Zed".into(), Some("ada".into()))
+        );
         cancel_blocker(
             &mut b.conn,
             &b.agents[1],
@@ -526,7 +529,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(owner_of(&mut b, second.id), ("Zed".into(), Some("ada".into())));
+        assert_eq!(
+            owner_of(&mut b, second.id),
+            ("Zed".into(), Some("ada".into()))
+        );
         // A human actor has no owner.
         let third = b.put(0, "Ship today?", None, "third");
         b.answer(0, third.id, "answer").unwrap();
