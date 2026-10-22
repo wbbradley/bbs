@@ -627,6 +627,9 @@ impl App {
                 }
                 // Activity can fill the current timeline's row cap even when
                 // the message is still cached. A fresh seeded view can show it.
+                if destination.is_none() {
+                    self.pop();
+                }
             } else {
                 return;
             }
@@ -6900,6 +6903,45 @@ mod tests {
             "the chosen cached hit remains reachable at the row cap: {shown}"
         );
         assert!(!editor_focused(&mut app));
+    }
+
+    #[test]
+    fn an_unseekable_feed_is_closed_before_its_seeded_replacement_opens() {
+        // Model a Feed that cannot retain the selected row. The Screen seam
+        // reports this by returning false from seek_message after seeding.
+        struct PrunedFeed;
+        impl Screen for PrunedFeed {
+            fn title(&self) -> String {
+                "Feed".into()
+            }
+            fn is_thread(&self) -> bool {
+                true
+            }
+            fn on_close(&self) -> Vec<Request> {
+                vec![Request::Unwatch(77)]
+            }
+            fn handle(&mut self, _: Action, _: &Ctx) -> Transition {
+                Transition::Stay
+            }
+            fn render(&mut self, _: &mut Frame, _: Rect, _: &Ctx) {}
+        }
+        let (mut app, mut rx) = app();
+        app.push(Box::new(PrunedFeed));
+        let mut row = message(1, "ada", "bob", "cached human mail");
+        row.from_kind = proto::Kind::Human as i32;
+        app.on_event(Event::Data(Data::Feed {
+            id: 77,
+            result: Ok(vec![row]),
+        }));
+        ctrl(&mut app, 'p');
+        typed(&mut app, "cached human mail");
+        enter(&mut app);
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(77));
+        let (_, request) = watched(&mut rx);
+        assert!(request.with.is_none() && request.group.is_none());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.stack.iter().filter(|s| s.is_thread()).count(), 1);
+        assert!(screen(&mut app, 80, 24).contains("cached human mail"));
     }
 
     #[test]
