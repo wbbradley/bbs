@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui_textarea::TextArea;
 
 use super::event::Data;
+use super::navigation::Conversation;
 use super::theme::{self, Role};
 use crate::proto;
 use crate::ui::message::fold;
@@ -44,6 +45,8 @@ pub struct Cache {
 
 struct CachedMessage {
     message: proto::Message,
+    /// Conversations that actually delivered this cached row to the app.
+    sources: Vec<Conversation>,
     /// Indexed once when body text arrives, never on a picker keystroke.
     folded: String,
 }
@@ -54,6 +57,10 @@ fn folded(text: &str) -> String {
 
 impl Cache {
     pub fn observe(&mut self, data: &Data) {
+        self.observe_from(data, None);
+    }
+
+    pub fn observe_from(&mut self, data: &Data, source: Option<&Conversation>) {
         match data {
             Data::Agents(Ok(list)) => {
                 self.revision = self.revision.wrapping_add(1);
@@ -92,6 +99,11 @@ impl Cache {
                         continue;
                     }
                     if let Some(old) = self.messages.get_mut(&row.id) {
+                        if let Some(source) = source
+                            && !old.sources.iter().any(|s| s.same(source))
+                        {
+                            old.sources.push(source.clone());
+                        }
                         if old.message == *row {
                             continue;
                         }
@@ -105,22 +117,24 @@ impl Cache {
                             continue;
                         }
                     }
-                    let indexed = match self.messages.remove(&row.id) {
+                    let (indexed, sources) = match self.messages.remove(&row.id) {
                         Some(old) => {
                             self.text_bytes -= old.message.body.len();
-                            if old.message.body == row.body {
+                            let indexed = if old.message.body == row.body {
                                 old.folded
                             } else {
                                 folded(&row.body)
-                            }
+                            };
+                            (indexed, old.sources)
                         }
-                        None => folded(&row.body),
+                        None => (folded(&row.body), source.into_iter().cloned().collect()),
                     };
                     self.messages.insert(
                         row.id,
                         CachedMessage {
                             message: row.clone(),
                             folded: indexed,
+                            sources,
                         },
                     );
                     self.text_bytes += row.body.len();
@@ -167,6 +181,63 @@ impl Cache {
 
     pub fn message(&self, id: i64) -> Option<&proto::Message> {
         self.messages.get(&id).map(|cached| &cached.message)
+    }
+
+    /// A broadcast opens its group; direct mail opens its agent's conversation.
+    /// Mail without an agent participant belongs in Feed.
+    pub fn destination(&self, id: i64) -> Option<Conversation> {
+        let row = self.message(id)?;
+        if let Some(group) = &row.to_group {
+            Some(Conversation::Group(group.clone()))
+        } else if row.from_kind() == proto::Kind::Agent {
+            Some(Conversation::Agent(row.from_name.clone()))
+        } else if row.to_owner.is_some() {
+            row.to_name
+                .as_ref()
+                .map(|name| Conversation::Agent(name.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Only already received rows. A selected hit gets a bounded window around
+    /// it, rather than the latest window, without fetching older history.
+    pub fn context(
+        &self,
+        destination: Option<&Conversation>,
+        hit: Option<i64>,
+    ) -> Vec<proto::Message> {
+        let rows: Vec<_> = self
+            .messages
+            .values()
+            .filter(|cached| {
+                let m = &cached.message;
+                match destination {
+                    None => true,
+                    Some(Conversation::Group(group)) => m
+                        .to_group
+                        .as_ref()
+                        .is_some_and(|g| g.eq_ignore_ascii_case(group)),
+                    Some(scope @ Conversation::Agent(agent)) => {
+                        cached.sources.iter().any(|s| s.same(scope))
+                            || (m.from_kind() == proto::Kind::Agent
+                                && m.from_name.eq_ignore_ascii_case(agent))
+                            || (m.to_owner.is_some()
+                                && m.to_name
+                                    .as_ref()
+                                    .is_some_and(|to| to.eq_ignore_ascii_case(agent)))
+                    }
+                }
+            })
+            .collect();
+        let rows = if let Some(at) = hit.and_then(|id| rows.iter().position(|r| r.message.id == id))
+        {
+            let start = at.saturating_sub(100).min(rows.len().saturating_sub(200));
+            &rows[start..rows.len().min(start + 200)]
+        } else {
+            &rows[..]
+        };
+        rows.iter().map(|cached| cached.message.clone()).collect()
     }
 
     pub fn search(&self, query: &str) -> Vec<Hit> {
@@ -637,6 +708,90 @@ mod tests {
         assert!(cache.search("İσ").is_empty());
         assert_eq!(cache.search("界 éq")[0].text, "界 ÉQUIPE");
         assert!(cache.revision > revision);
+    }
+
+    #[test]
+    fn cached_context_keeps_actual_group_deliveries_and_routes_each_message_kind() {
+        let mut cache = Cache::default();
+        let mateo = Conversation::Agent("Mateo".into());
+        let data = Data::Feed {
+            id: 1,
+            result: Ok(vec![proto::Message {
+                id: 1,
+                from_kind: proto::Kind::Agent as i32,
+                from_name: "Zed".into(),
+                to_group: Some("crew".into()),
+                body: "a delivered broadcast".into(),
+                ..Default::default()
+            }]),
+        };
+        cache.observe_from(&data, Some(&mateo));
+        cache.observe_from(&data, Some(&mateo));
+        assert_eq!(cache.messages[&1].sources.len(), 1);
+        assert_eq!(cache.context(Some(&mateo), None)[0].id, 1);
+        assert_eq!(
+            cache.destination(1),
+            Some(Conversation::Group("crew".into()))
+        );
+        for (id, from_kind, from_name, to_name, to_owner) in [
+            (2, proto::Kind::Agent, "Zed", "ada", None),
+            (3, proto::Kind::Human, "ada", "Mateo", Some("ada")),
+            (4, proto::Kind::Human, "ada", "bob", None),
+        ] {
+            cache.observe(&Data::Feed {
+                id: 2,
+                result: Ok(vec![proto::Message {
+                    id,
+                    from_kind: from_kind as i32,
+                    from_name: from_name.into(),
+                    to_name: Some(to_name.into()),
+                    to_owner: to_owner.map(Into::into),
+                    body: "cached".into(),
+                    ..Default::default()
+                }]),
+            });
+        }
+        assert_eq!(
+            cache.destination(2),
+            Some(Conversation::Agent("Zed".into()))
+        );
+        assert_eq!(cache.destination(3), Some(mateo.clone()));
+        assert_eq!(cache.destination(4), None, "human mail belongs in Feed");
+        assert_eq!(
+            cache
+                .context(Some(&mateo), None)
+                .iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(cache.context(None, None).len(), 4);
+    }
+
+    #[test]
+    fn a_message_selection_seeds_its_cached_neighbors_instead_of_only_the_latest_window() {
+        let mut cache = Cache::default();
+        cache.observe(&Data::Feed {
+            id: 1,
+            result: Ok((1..=1000)
+                .map(|id| proto::Message {
+                    id,
+                    from_kind: proto::Kind::Agent as i32,
+                    from_name: "Zed".into(),
+                    body: format!("message {id}"),
+                    ..Default::default()
+                })
+                .collect()),
+        });
+        let zed = Conversation::Agent("zed".into());
+        for id in [1, 500, 1000] {
+            let rows = cache.context(Some(&zed), Some(id));
+            assert_eq!(rows.len(), 200);
+            assert!(rows.iter().any(|m| m.id == id));
+            assert!(rows.windows(2).all(|w| w[0].id < w[1].id));
+        }
+        assert_eq!(cache.context(Some(&zed), Some(1))[0].id, 1);
+        assert_eq!(cache.context(Some(&zed), Some(500))[100].id, 500);
     }
 
     #[test]
