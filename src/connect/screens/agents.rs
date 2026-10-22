@@ -1,6 +1,8 @@
 //! Agents ordered by open blockers, then the age of their latest activity.
 
+use std::cell::Cell;
 use std::cmp::Reverse;
+use std::collections::HashSet;
 
 use chrono::{DateTime, Local};
 use ratatui::Frame;
@@ -30,6 +32,11 @@ pub struct Agents {
     state: TableState,
     /// Rows in view at the last draw, for paging.
     page: usize,
+    /// List requests are finite; a tick or reload must not duplicate one.
+    loading: Cell<bool>,
+    /// Listed names and summary discoveries already refreshed, including
+    /// failed attempts. A failed refresh is retried explicitly with r/F5.
+    known: HashSet<String>,
 }
 
 impl Default for Agents {
@@ -41,6 +48,8 @@ impl Default for Agents {
             now: None,
             state: TableState::default(),
             page: 0,
+            loading: Cell::new(false),
+            known: HashSet::new(),
         }
     }
 }
@@ -142,11 +151,20 @@ impl Screen for Agents {
     }
 
     fn requests(&self) -> Vec<Request> {
-        vec![Request::Agents]
+        if self.loading.replace(true) {
+            Vec::new()
+        } else {
+            vec![Request::Agents]
+        }
     }
 
     fn on_data(&mut self, data: &Data) {
         if let Data::Agents(result) = data {
+            self.loading.set(false);
+            if let Ok(list) = result {
+                self.known
+                    .extend(list.agents.iter().map(|a| a.name.to_ascii_lowercase()));
+            }
             self.agents = Some(
                 result
                     .as_ref()
@@ -157,6 +175,23 @@ impl Screen for Agents {
                 self.state.select(Some(0));
             }
         }
+    }
+
+    fn on_tick(&mut self, ctx: &Ctx) -> Vec<Request> {
+        if self.loading.get()
+            || !ctx
+                .inbox
+                .summaries
+                .keys()
+                .any(|name| !self.known.contains(name))
+        {
+            return Vec::new();
+        }
+        if self.selected.is_none() {
+            self.remember(ctx);
+        }
+        self.known.extend(ctx.inbox.summaries.keys().cloned());
+        self.requests()
     }
 
     fn handle(&mut self, action: Action, ctx: &Ctx) -> Transition {

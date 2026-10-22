@@ -6,6 +6,13 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Fixed
+
+- The Agents page refreshes when live summaries reveal new agents, including
+  owned agents without group memberships, while keeping the selected agent.
+
 ## 0.15.1 - 2026-10-22
 
 Client-only `bbs connect` and rendering fixes. Protocol v2, database schema 21,

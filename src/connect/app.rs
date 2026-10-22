@@ -3169,6 +3169,143 @@ mod tests {
     }
 
     #[test]
+    fn new_owned_agents_appear_from_summaries_without_group_membership_or_reopening() {
+        let (mut app, mut rx) = app();
+        open_agents(&mut app, &mut rx);
+        let rows = |agents| {
+            Data::Agents(Ok(proto::ListAgentsResponse {
+                humans: Vec::new(),
+                agents,
+            }))
+        };
+        app.on_event(Event::Data(rows(vec![
+            agent("Mateo", "ada", &[]),
+            agent("Zed", "ada", &[]),
+        ])));
+        screen(&mut app, 80, 24);
+        key(&mut app, 'j');
+        let id = app.ctx.inbox.id;
+        app.on_event(Event::Data(Data::Summary {
+            id,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "Grove".into(),
+                ..Default::default()
+            }]),
+        }));
+        assert_eq!(agent_list_tick(&mut app, &mut rx), 1);
+        assert_eq!(agent_list_tick(&mut app, &mut rx), 0);
+        app.on_event(Event::Data(rows(vec![
+            agent("Grove", "ada", &[]),
+            agent("Mateo", "ada", &[]),
+            agent("Zed", "ada", &[]),
+        ])));
+        let text = screen(&mut app, 80, 24);
+        assert!(text.contains("Your agents (3)"), "{text}");
+        assert!(
+            text.contains("Grove"),
+            "a new agent with no groups is shown: {text}"
+        );
+        assert_eq!(agent_list_tick(&mut app, &mut rx), 0);
+        enter(&mut app);
+        assert_eq!(
+            opened(&app),
+            Some(Conversation::Agent("Zed".into())),
+            "refresh keeps the selected identity"
+        );
+    }
+
+    fn agent_list_tick(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> usize {
+        app.on_event(Event::Tick);
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|r| matches!(r, Request::AgentsAt { .. }))
+            .count()
+    }
+
+    #[test]
+    fn agent_discoveries_coalesce_and_wait_for_the_current_list_reply() {
+        let (mut app, mut rx) = app();
+        open_agents(&mut app, &mut rx);
+        let summary = |app: &mut App, names: &[&str]| {
+            app.on_event(Event::Data(Data::Summary {
+                id: app.ctx.inbox.id,
+                result: Ok(names
+                    .iter()
+                    .map(|name| proto::AgentSummary {
+                        agent: (*name).into(),
+                        ..Default::default()
+                    })
+                    .collect()),
+            }));
+        };
+        let listed = |names: &[&str]| {
+            Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+                humans: Vec::new(),
+                agents: names.iter().map(|name| agent(name, "ada", &[])).collect(),
+            })))
+        };
+        summary(&mut app, &["NewOne"]);
+        assert_eq!(
+            agent_list_tick(&mut app, &mut rx),
+            0,
+            "opening request is already in flight"
+        );
+        app.on_event(listed(&["Mateo"]));
+        assert_eq!(agent_list_tick(&mut app, &mut rx), 1);
+        summary(&mut app, &["NewOne", "NewTwo", "NewThree"]);
+        for _ in 0..3 {
+            assert_eq!(agent_list_tick(&mut app, &mut rx), 0);
+        }
+        app.on_event(listed(&["Mateo", "NewOne"]));
+        assert_eq!(
+            agent_list_tick(&mut app, &mut rx),
+            1,
+            "discoveries during a request get one follow-up"
+        );
+        app.on_event(listed(&["Mateo", "NewOne", "NewTwo", "NewThree"]));
+        summary(&mut app, &["newone", "NEWTWO", "NewThree"]);
+        assert_eq!(agent_list_tick(&mut app, &mut rx), 0);
+    }
+
+    #[test]
+    fn failed_agent_discovery_refreshes_wait_for_retry_and_ignore_stale_summaries() {
+        let (mut app, mut rx) = app();
+        open_agents(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![agent("Mateo", "ada", &[])],
+        }))));
+        let found = |id| {
+            Event::Data(Data::Summary {
+                id,
+                result: Ok(vec![proto::AgentSummary {
+                    agent: "Grove".into(),
+                    ..Default::default()
+                }]),
+            })
+        };
+        app.on_event(found(app.ctx.inbox.id + 1));
+        assert_eq!(agent_list_tick(&mut app, &mut rx), 0);
+        app.on_event(found(app.ctx.inbox.id));
+        assert_eq!(agent_list_tick(&mut app, &mut rx), 1);
+        app.on_event(Event::Data(Data::Agents(Err("offline".into()))));
+        for _ in 0..3 {
+            assert_eq!(
+                agent_list_tick(&mut app, &mut rx),
+                0,
+                "the same discovery must not retry every tick"
+            );
+        }
+        key(&mut app, 'r');
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|r| matches!(r, Request::AgentsAt { .. }))
+                .count(),
+            1,
+            "manual refresh retries"
+        );
+    }
+
+    #[test]
     fn agents_active_ages_update_live_from_the_summary_stream() {
         let (mut app, mut rx) = app();
         key(&mut app, 'a');
