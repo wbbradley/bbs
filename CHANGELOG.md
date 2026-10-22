@@ -6,6 +6,15 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Changed
+
+- The Agents page shows BLOCKERS before INBOX and orders agents by open
+  blocker count descending, then ACTIVE age ascending. Counts cover current
+  group memberships and update through the shared summary stream. Older
+  servers show an unknown count; narrow panes prioritize the new column.
+
 ## 0.14.1 - 2026-10-22
 
 Blocker display improvements. Protocol v2, database schema 21, config format 4
@@ -14,10 +23,6 @@ panel and status bar; the outcome owner fix appears once the server is upgraded.
 
 ### Changed
 
-- The Agents page shows BLOCKERS before INBOX and orders agents by open
-  blocker count descending, then ACTIVE age ascending. Counts cover current
-  group memberships and update through the shared summary stream. Older
-  servers show an unknown count; narrow panes prioritize the new column.
 - `bbs connect`'s blocker panel is a card on the colour scheme's warning
   surface under a warning title bar naming the blocker being answered; its
   cancel action reads `[Cancel]`. Open blockers show as `[N blockers · F2]` at
