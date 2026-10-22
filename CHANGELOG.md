@@ -6,6 +6,13 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Fixed
+
+- Blocker outcomes (replacement, cancellation, answer) name the acting
+  agent's owner, as the creator field does; the owner was always empty.
+
 ## 0.14.0 - 2026-10-22
 
 Group blockers add schema 21 and the `blockers.v1` capability; protocol v2,

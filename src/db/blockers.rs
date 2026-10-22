@@ -8,6 +8,8 @@ use super::{Kind, Principal};
 pub struct Outcome {
     pub kind: String,
     pub actor: Principal,
+    /// The acting agent's owner; none for a human actor.
+    pub actor_owner: Option<String>,
     pub created_at: String,
     pub answer: Option<String>,
     pub message_id: Option<i64>,
@@ -32,7 +34,7 @@ const SELECT: &str = "SELECT b.id, b.group_id, g.name, g.archived_at,
     a.id, a.name, h.name, b.body, b.created_at, COALESCE(b.root_id, b.id),
     b.replaces, successor.id, e.kind, e.actor_kind, e.actor_id,
     CASE e.actor_kind WHEN 'human' THEN eh.name ELSE ea.name END,
-    e.created_at, e.answer, e.message_id
+    e.created_at, e.answer, e.message_id, actor_owner.name
     FROM blockers b JOIN bbs_groups g ON g.id = b.group_id
     JOIN agents a ON a.id = b.creator_id
     LEFT JOIN agent_owners owner ON owner.agent_id = a.id
@@ -40,7 +42,9 @@ const SELECT: &str = "SELECT b.id, b.group_id, g.name, g.archived_at,
     LEFT JOIN blockers successor ON successor.replaces = b.id
     LEFT JOIN blocker_events e ON e.blocker_id = b.id AND e.kind != 'created'
     LEFT JOIN humans eh ON e.actor_kind = 'human' AND eh.id = e.actor_id
-    LEFT JOIN agents ea ON e.actor_kind = 'agent' AND ea.id = e.actor_id";
+    LEFT JOIN agents ea ON e.actor_kind = 'agent' AND ea.id = e.actor_id
+    LEFT JOIN agent_owners actor_link ON e.actor_kind = 'agent' AND actor_link.agent_id = e.actor_id
+    LEFT JOIN humans actor_owner ON actor_owner.id = actor_link.human_id";
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     let outcome = if let Some(kind) = r.get::<_, Option<String>>(12)? {
@@ -55,6 +59,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
                 id: r.get(14)?,
                 name: r.get(15)?,
             },
+            actor_owner: r.get(19)?,
             created_at: r.get(16)?,
             answer: r.get(17)?,
             message_id: r.get(18)?,

@@ -91,7 +91,10 @@ fn as_proto(ctx: &Ctx<'_>, actor: &Principal, row: store::Row) -> Result<proto::
         status: status.into(),
         outcome: row.outcome.map(|o| proto::BlockerOutcome {
             status: status.into(),
-            actor: Some(principal(o.actor)),
+            actor: Some(proto::Principal {
+                owner: o.actor_owner,
+                ..principal(o.actor)
+            }),
             created_at: o.created_at,
             answer: o.answer,
             message_id: o.message_id,
@@ -488,6 +491,46 @@ mod tests {
             )
             .unwrap()
         }
+    }
+
+    #[test]
+    fn outcome_actors_carry_their_owner_like_creators_do() {
+        let mut b = Board::memory();
+        let owner_of = |b: &mut Board, id: i64| {
+            let outcome = get_blocker(
+                &mut b.conn,
+                &b.humans[2],
+                proto::GetBlockerRequest {
+                    id,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .blocker
+            .unwrap()
+            .outcome
+            .unwrap();
+            let actor = outcome.actor.unwrap();
+            (actor.name, actor.owner)
+        };
+        // Zed, ada's agent, supersedes Mateo's blocker and cancels its own.
+        let first = b.put(0, "Which option?", None, "first");
+        let second = b.put(1, "Which option, now with costs?", Some(first.id), "second");
+        assert_eq!(owner_of(&mut b, first.id), ("Zed".into(), Some("ada".into())));
+        cancel_blocker(
+            &mut b.conn,
+            &b.agents[1],
+            proto::CancelBlockerRequest {
+                id: second.id,
+                request_key: "cancel".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(owner_of(&mut b, second.id), ("Zed".into(), Some("ada".into())));
+        // A human actor has no owner.
+        let third = b.put(0, "Ship today?", None, "third");
+        b.answer(0, third.id, "answer").unwrap();
+        assert_eq!(owner_of(&mut b, third.id), ("will".into(), None));
     }
 
     #[test]
