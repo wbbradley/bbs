@@ -2,13 +2,22 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Margin, Rect};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui_textarea::TextArea;
+
 use super::event::Data;
+use super::theme::{self, Role};
 use crate::proto;
 use crate::ui::message::fold;
 
 const MAX_MESSAGES: usize = 10_000;
 const MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESULTS: usize = 50;
+const MAX_QUERY_CHARS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -49,12 +58,14 @@ pub struct Cache {
     retired: HashSet<String>,
     messages: BTreeMap<i64, proto::Message>,
     text_bytes: usize,
+    revision: u64,
 }
 
 impl Cache {
     pub fn observe(&mut self, data: &Data) {
         match data {
             Data::Agents(Ok(list)) => {
+                self.revision = self.revision.wrapping_add(1);
                 self.agents.clear();
                 self.retired = list
                     .agents
@@ -97,10 +108,14 @@ impl Cache {
                     if row.body.len() > MAX_TEXT_BYTES {
                         continue;
                     }
+                    if self.messages.get(&row.id) == Some(row) {
+                        continue;
+                    }
                     if let Some(old) = self.messages.insert(row.id, row.clone()) {
                         self.text_bytes -= old.body.len();
                     }
                     self.text_bytes += row.body.len();
+                    self.revision = self.revision.wrapping_add(1);
                 }
                 self.prune(MAX_MESSAGES, MAX_TEXT_BYTES);
             }
@@ -118,13 +133,22 @@ impl Cache {
     fn agent(&mut self, name: &str) {
         let key = name.to_lowercase();
         if !name.is_empty() && !self.retired.contains(&key) {
-            self.agents.insert(key, name.into());
+            if self.agents.insert(key, name.into()).as_deref() != Some(name) {
+                self.revision = self.revision.wrapping_add(1);
+            }
         }
     }
 
     fn group(&mut self, name: &str) {
         if !name.is_empty() {
-            self.groups.insert(name.to_lowercase(), name.into());
+            if self
+                .groups
+                .insert(name.to_lowercase(), name.into())
+                .as_deref()
+                != Some(name)
+            {
+                self.revision = self.revision.wrapping_add(1);
+            }
         }
     }
 
@@ -134,6 +158,7 @@ impl Cache {
                 break;
             };
             self.text_bytes -= old.body.len();
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
@@ -183,6 +208,214 @@ impl Cache {
         });
         hits.truncate(MAX_RESULTS);
         hits
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Stay,
+    Cancel,
+    Choose(Target),
+    Quit,
+}
+
+/// A single-line query and local result selection. It never owns a connection.
+pub struct Picker {
+    query: TextArea<'static>,
+    hits: Vec<Hit>,
+    selected: usize,
+    revision: u64,
+}
+
+impl Picker {
+    pub fn new(cache: &Cache) -> Picker {
+        let mut query = TextArea::default();
+        query.set_placeholder_text("Search agents, groups and messages");
+        Picker {
+            query,
+            hits: cache.search(""),
+            selected: 0,
+            revision: cache.revision,
+        }
+    }
+
+    pub fn refresh(&mut self, cache: &Cache) {
+        if self.revision == cache.revision {
+            return;
+        }
+        let selected = self.hits.get(self.selected).map(|h| h.target.clone());
+        self.hits = cache.search(&self.query.lines()[0]);
+        self.selected = selected
+            .and_then(|target| self.hits.iter().position(|h| h.target == target))
+            .unwrap_or(0);
+        self.revision = cache.revision;
+    }
+
+    fn edited(&mut self, cache: &Cache) {
+        self.hits = cache.search(&self.query.lines()[0]);
+        self.selected = 0;
+        self.revision = cache.revision;
+    }
+
+    pub fn paste(&mut self, text: &str, cache: &Cache) {
+        let room = MAX_QUERY_CHARS.saturating_sub(self.query.lines()[0].chars().count());
+        let text: String = text
+            .replace("\r\n", "\n")
+            .chars()
+            .map(|c| if c.is_whitespace() { ' ' } else { c })
+            .filter(|c| !c.is_control())
+            .take(room)
+            .collect();
+        self.query.insert_str(text);
+        self.edited(cache);
+    }
+
+    pub fn key(&mut self, key: KeyEvent, cache: &Cache) -> Outcome {
+        self.refresh(cache);
+        match key.code {
+            KeyCode::Esc => return Outcome::Cancel,
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => return Outcome::Quit,
+            KeyCode::Up | KeyCode::BackTab => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => {
+                self.selected = (self.selected + 1).min(self.hits.len().saturating_sub(1))
+            }
+            KeyCode::Enter => {
+                return self
+                    .hits
+                    .get(self.selected)
+                    .map_or(Outcome::Stay, |h| Outcome::Choose(h.target.clone()));
+            }
+            // Enter's control aliases must not create a second query line.
+            KeyCode::Char('m' | 'j') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                self.selected = self.selected.saturating_sub(1)
+            }
+            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+                self.selected = (self.selected + 1).min(self.hits.len().saturating_sub(1))
+            }
+            KeyCode::Char('\n' | '\r') => {}
+            _ => {
+                let before = self.query.lines()[0].clone();
+                if matches!(key.code, KeyCode::Char(_))
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && before.chars().count() >= MAX_QUERY_CHARS
+                {
+                    return Outcome::Stay;
+                }
+                self.query.input(key);
+                if self.query.lines()[0] != before {
+                    self.edited(cache);
+                }
+            }
+        }
+        Outcome::Stay
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, cache: &Cache) {
+        self.refresh(cache);
+        frame.render_widget(Clear, area);
+        frame.render_widget(Block::new().style(theme::base()), area);
+        if theme::too_small(area) {
+            return;
+        }
+        let shown = usize::from(area.height.saturating_sub(9) / 2).clamp(1, 8);
+        let width = area.width.saturating_sub(4).min(88);
+        let height = 7 + shown as u16 * 2;
+        let panel = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 3,
+            width,
+            height,
+        );
+        let surface = theme::style(Role::HumanSurface);
+        frame.render_widget(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Go to · cached data ")
+                .style(theme::on_surface(surface, theme::style(Role::Accent))),
+            panel,
+        );
+        let inner = panel.inner(Margin::new(2, 1));
+        self.query.set_style(surface);
+        self.query.set_cursor_line_style(surface);
+        self.query.set_cursor_style(theme::style(Role::Cursor));
+        self.query
+            .set_selection_style(theme::style(Role::Selection));
+        self.query
+            .set_placeholder_style(theme::on_surface(surface, theme::style(Role::Muted)));
+        frame.render_widget(&self.query, Rect::new(inner.x, inner.y, inner.width, 1));
+        let first = self.selected.saturating_sub(shown - 1);
+        if self.hits.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No cached matches")
+                    .style(theme::on_surface(surface, theme::style(Role::Muted))),
+                Rect::new(inner.x, inner.y + 2, inner.width, 1),
+            );
+        }
+        for (at, hit) in self.hits.iter().enumerate().skip(first).take(shown) {
+            let y = inner.y + 2 + (at - first) as u16 * 2;
+            let row_style = if at == self.selected {
+                theme::style(Role::Selection)
+            } else {
+                surface
+            };
+            let (title, detail, role) = match &hit.target {
+                Target::Agent(name) => (
+                    format!("Agent · {name}"),
+                    "Agent conversation".to_string(),
+                    Role::Agent,
+                ),
+                Target::Group(name) => (
+                    format!("Group · @{name}"),
+                    "Group conversation".to_string(),
+                    Role::Group,
+                ),
+                Target::Message(id) => {
+                    let participants = cache
+                        .message(*id)
+                        .map(|m| {
+                            let to = m
+                                .to_group
+                                .as_ref()
+                                .map(|g| format!("@{g}"))
+                                .or_else(|| m.to_name.clone())
+                                .unwrap_or_default();
+                            format!(" · {} → {to}", m.from_name)
+                        })
+                        .unwrap_or_default();
+                    (
+                        format!("Message #{id}{participants}"),
+                        hit.text.clone(),
+                        Role::Text,
+                    )
+                }
+            };
+            let lines = vec![
+                theme::clip_line(
+                    Line::from(Span::styled(
+                        title,
+                        theme::on_surface(row_style, theme::style(role)),
+                    )),
+                    inner.width as usize,
+                ),
+                theme::clip_line(Line::raw(detail), inner.width as usize),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines).style(row_style),
+                Rect::new(inner.x, y, inner.width, 2),
+            );
+        }
+        let footer = format!(
+            "↑/↓ select · Enter opens · Esc back · {} results",
+            self.hits.len()
+        );
+        frame.render_widget(
+            Paragraph::new(theme::clip_line(Line::raw(footer), inner.width as usize))
+                .style(theme::on_surface(surface, theme::style(Role::Muted))),
+            Rect::new(inner.x, panel.bottom() - 2, inner.width, 1),
+        );
     }
 }
 
@@ -269,6 +502,8 @@ fn snippet(text: &str, at: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn feed(id: i64, body: &str) -> Data {
         Data::Feed {
@@ -315,5 +550,161 @@ mod tests {
         cache.prune(1, 1);
         assert_eq!(cache.text_bytes, 0);
         assert!(cache.messages.is_empty());
+    }
+
+    fn key(picker: &mut Picker, cache: &Cache, code: KeyCode) -> Outcome {
+        picker.key(KeyEvent::new(code, KeyModifiers::NONE), cache)
+    }
+
+    #[test]
+    fn enter_selects_the_best_local_hit_and_arrows_select_other_hits() {
+        let mut cache = Cache::default();
+        cache.agent("Mat");
+        cache.agent("Mateo");
+        cache.group("matters");
+        cache.observe(&feed(8, "format"));
+        let mut picker = Picker::new(&cache);
+        picker.paste("mat", &cache);
+        assert_eq!(
+            key(&mut picker, &cache, KeyCode::Enter),
+            Outcome::Choose(Target::Agent("Mat".into()))
+        );
+        key(&mut picker, &cache, KeyCode::Down);
+        assert_eq!(
+            key(&mut picker, &cache, KeyCode::Enter),
+            Outcome::Choose(Target::Agent("Mateo".into()))
+        );
+        key(&mut picker, &cache, KeyCode::Tab);
+        assert_eq!(
+            key(&mut picker, &cache, KeyCode::Enter),
+            Outcome::Choose(Target::Group("matters".into()))
+        );
+        for _ in 0..100 {
+            key(&mut picker, &cache, KeyCode::Down);
+        }
+        assert_eq!(
+            key(&mut picker, &cache, KeyCode::Enter),
+            Outcome::Choose(Target::Message(8))
+        );
+        picker.paste("zzzz", &cache);
+        assert_eq!(key(&mut picker, &cache, KeyCode::Enter), Outcome::Stay);
+        assert_eq!(key(&mut picker, &cache, KeyCode::Esc), Outcome::Cancel);
+        assert_eq!(
+            picker.key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &cache
+            ),
+            Outcome::Quit
+        );
+    }
+
+    #[test]
+    fn the_query_is_single_line_utf8_editable_and_bounded() {
+        let mut cache = Cache::default();
+        cache.agent("Équipe");
+        let mut picker = Picker::new(&cache);
+        picker.paste("é\r\nq\t\u{1b}", &cache);
+        assert_eq!(picker.query.lines(), ["é q "]);
+        for code in ['m', 'j'] {
+            picker.key(
+                KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL),
+                &cache,
+            );
+        }
+        assert_eq!(picker.query.lines(), ["é q "]);
+        key(&mut picker, &cache, KeyCode::Home);
+        key(&mut picker, &cache, KeyCode::Delete);
+        assert_eq!(picker.query.lines(), [" q "]);
+        key(&mut picker, &cache, KeyCode::End);
+        picker.paste(&"界".repeat(MAX_QUERY_CHARS), &cache);
+        assert_eq!(picker.query.lines().len(), 1);
+        assert_eq!(picker.query.lines()[0].chars().count(), MAX_QUERY_CHARS);
+        key(&mut picker, &cache, KeyCode::Char('x'));
+        assert_eq!(picker.query.lines()[0].chars().count(), MAX_QUERY_CHARS);
+        key(&mut picker, &cache, KeyCode::Backspace);
+        key(&mut picker, &cache, KeyCode::Char('é'));
+        assert!(picker.query.lines()[0].ends_with('é'));
+    }
+
+    #[test]
+    fn passive_updates_preserve_the_selected_identity_until_it_disappears() {
+        let mut cache = Cache::default();
+        cache.agent("Beta");
+        cache.agent("Gamma");
+        let mut picker = Picker::new(&cache);
+        key(&mut picker, &cache, KeyCode::Down);
+        cache.agent("Alpha");
+        picker.refresh(&cache);
+        assert_eq!(
+            key(&mut picker, &cache, KeyCode::Enter),
+            Outcome::Choose(Target::Agent("Gamma".into()))
+        );
+        let revision = cache.revision;
+        cache.summaries(&[proto::AgentSummary {
+            agent: "Gamma".into(),
+            ..Default::default()
+        }]);
+        assert_eq!(
+            cache.revision, revision,
+            "unchanged summaries do not rerank"
+        );
+        cache.observe(&Data::Agents(Ok(proto::ListAgentsResponse::default())));
+        picker.refresh(&cache);
+        assert!(picker.hits.is_empty());
+        assert_eq!(key(&mut picker, &cache, KeyCode::Enter), Outcome::Stay);
+    }
+
+    #[test]
+    fn the_picker_covers_the_screen_and_keeps_input_and_selection_visible() {
+        use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                for width in [60, 80] {
+                    let mut cache = Cache::default();
+                    for i in 0..30 {
+                        cache.agent(&format!("Agent{i:02}"));
+                    }
+                    let mut picker = Picker::new(&cache);
+                    picker.paste("Agent", &cache);
+                    for _ in 0..25 {
+                        key(&mut picker, &cache, KeyCode::Down);
+                    }
+                    let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(
+                                Paragraph::new(vec![Line::raw("Z".repeat(width as usize)); 24]),
+                                f.area(),
+                            );
+                            picker.render(f, f.area(), &cache);
+                        })
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    assert_buffer(buffer);
+                    let lines: Vec<String> = (0..24)
+                        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                        .collect();
+                    let text = lines.join("\n");
+                    assert!(
+                        !text.contains('Z'),
+                        "the origin must not show through: {text}"
+                    );
+                    assert!(text.contains("Go to · cached data"), "{text}");
+                    assert!(
+                        text.contains("Agent · Agent25"),
+                        "the selected result stays in view: {text}"
+                    );
+                    assert!(text.contains("Enter opens"), "{text}");
+                    let query = lines
+                        .iter()
+                        .find(|line| line.trim_matches([' ', '│']) == "Agent")
+                        .expect("query has its own row");
+                    assert!(
+                        query.find("Agent").unwrap() > 2,
+                        "input is inset into the centered panel"
+                    );
+                }
+            });
+        }
     }
 }
