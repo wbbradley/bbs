@@ -238,7 +238,10 @@ impl App {
     }
 
     fn open_at(&mut self, mut screen: Box<dyn Screen>, record: bool, opening: Opening) {
-        let hit = match opening { Opening::Seek(id) => Some(id), _ => None };
+        let hit = match opening {
+            Opening::Seek(id) => Some(id),
+            _ => None,
+        };
         if let Some(target) = screen.conversation() {
             if let Conversation::Agent(agent) = &target {
                 self.ctx.inbox.retry_failed(agent);
@@ -621,7 +624,11 @@ impl App {
             Some(Conversation::Group(name)) => Thread::group(&name),
             None => Thread::feed(),
         };
-        self.open_at(Box::new(screen), true, hit.map_or(Opening::Restore, Opening::Seek));
+        self.open_at(
+            Box::new(screen),
+            true,
+            hit.map_or(Opening::Restore, Opening::Seek),
+        );
     }
 
     /// F2 and the open blocker modal, ahead of every screen: `Some(quit)`
