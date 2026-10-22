@@ -1839,6 +1839,8 @@ impl Screen for Thread {
 
 impl Thread {
     fn draw(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
+        // Before any layout, so a released row is never painted.
+        self.release_seek();
         let inner = if self.agent.is_some() {
             area
         } else {
@@ -1961,9 +1963,9 @@ impl Thread {
         self.glow(frame, body);
     }
 
-    /// The sought message's rows, highlighted while it glows. Once the view
-    /// follows again, the message is no longer sought.
-    fn glow(&mut self, frame: &mut Frame, area: Rect) {
+    /// Once the view follows again, the message is no longer sought and
+    /// receipts are no longer held.
+    fn release_seek(&mut self) {
         if self.receipts_held && self.view.following() && self.pending_anchor.is_none() {
             self.receipts_held = false;
         }
@@ -1971,8 +1973,11 @@ impl Thread {
             self.sought = None;
             // A filtered-out message leaves with it.
             self.reconcile();
-            return;
         }
+    }
+
+    /// The sought message's rows, highlighted while it glows.
+    fn glow(&self, frame: &mut Frame, area: Rect) {
         let Some(sought) = &self.sought else {
             return;
         };
@@ -2198,8 +2203,14 @@ mod seek_tests {
         assert!(!shown(&thread, 2));
         assert!(thread.seek_message(2));
         assert!(shown(&thread, 2), "compact view keeps the sought message");
+        assert!(find(&draw(&mut thread, &ctx), "between others").is_some());
         thread.view.follow();
-        draw(&mut thread, &ctx);
+        // The very first frame after following no longer paints it.
+        let out = draw(&mut thread, &ctx);
+        assert!(
+            find(&out, "between others").is_none(),
+            "not painted once released"
+        );
         assert!(thread.sought.is_none() && !shown(&thread, 2), "released");
         ctx.preferences.set_compact(false);
         thread.follow_compact(&ctx);
