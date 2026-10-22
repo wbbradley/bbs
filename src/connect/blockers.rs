@@ -632,13 +632,23 @@ impl Blockers {
         let panel = self.panel.as_ref();
         let done = panel.is_some_and(|p| p.done_at.is_some());
         let left = match self.selected() {
+            // A kept refusal is closed: it has no place in the open queue.
+            Some(row) if !done && self.held.contains(&row.root_id) => {
+                format!(
+                    " Blocker from {} @{} · no longer open",
+                    creator(row),
+                    row.group
+                )
+            }
             Some(row) if !done => {
+                // The place among open rows, of the server's open count.
                 let at = self
                     .rows
                     .iter()
+                    .filter(|b| !self.held.contains(&b.root_id))
                     .position(|b| b.root_id == row.root_id)
                     .map_or(0, |i| i + 1);
-                let what = if row.can_answer && !self.held.contains(&row.root_id) {
+                let what = if row.can_answer {
                     "Answering a blocker from"
                 } else {
                     "Blocker from"
@@ -647,7 +657,7 @@ impl Blockers {
                     " {what} {} @{} · {at} of {} open",
                     creator(row),
                     row.group,
-                    self.active.max(self.rows.len() as u64)
+                    self.active
                 )
             }
             _ => " Blockers".to_string(),
@@ -1601,6 +1611,40 @@ mod tests {
         done.on_data(SCREEN, &list(vec![]), now);
         done.open(now).unwrap();
         assert_eq!(title(&done, 80), " Blockers");
+    }
+
+    #[test]
+    fn a_kept_refusal_is_not_counted_open_in_the_title() {
+        let now = Instant::now();
+        let mut blockers = open(now);
+        typed(&mut blockers, "go", now);
+        let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+        // The server resolved #1 elsewhere: refused, and no longer listed.
+        blockers.on_data(SCREEN, &list(vec![row(2, 2, "Mateo", "second?")]), now);
+        blockers.on_data(
+            SCREEN,
+            &written(&req.request_key, Err(SideError::Refused("taken".into()))),
+            now,
+        );
+        let title = |b: &Blockers| b.title(100).to_string();
+        assert!(
+            title(&blockers).starts_with(" Blocker from Zed @crew · no longer open"),
+            "{}",
+            title(&blockers)
+        );
+        // The open one counts from the server, without the kept refusal.
+        blockers.key(SCREEN, alt(KeyCode::Down), now);
+        assert!(
+            title(&blockers).starts_with(" Answering a blocker from Mateo @crew · 1 of 1 open"),
+            "{}",
+            title(&blockers)
+        );
+        // When it resolves too, only the refusal remains: nothing is open.
+        blockers.on_data(SCREEN, &list(vec![]), now);
+        assert_eq!(blockers.count(), None);
+        assert_eq!(blockers.selected().unwrap().root_id, 1);
+        assert!(title(&blockers).starts_with(" Blocker from Zed @crew · no longer open"));
+        assert!(!title(&blockers).contains(" of "));
     }
 
     #[test]
