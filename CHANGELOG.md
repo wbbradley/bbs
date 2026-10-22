@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- Ctrl-P opens a full-screen fuzzy launcher for known agents, groups and
+  cached message text without search requests. Enter opens normal live
+  conversations, restores their session view state, or pauses at a cached
+  message with a brief highlight; Esc restores the original screen.
+
 ### Fixed
 
 - The Agents page refreshes when live summaries reveal new agents, including

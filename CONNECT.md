@@ -432,6 +432,36 @@ the existing RPCs (`GroupRegister`, `GroupDescribe`, `GroupDelete`,
 and the same rules apply as on the CLI: humans only, and every change is
 announced to the group.
 
+## Local launcher
+
+`Ctrl-p` opens a full-screen launcher from any screen, with a centered query
+and fuzzy matches for agent names, group names and cached message lines.
+`Up`/`Down` select a result; `Enter` opens the selection (the top match by
+default). `Esc` closes the launcher and restores the screen beneath it,
+including its draft, cursor, selection, scroll position and open dialogs.
+`Ctrl-c` still quits. The blocker modal keeps `Ctrl-p` while it is open;
+likewise, the launcher keeps `F2` until it closes.
+
+Search uses only data this `connect` process has already received. It does
+not list agents or groups, call message search, or fetch older history.
+Messages remain searchable after leaving a conversation, within a session
+cache of up to 10,000 messages and 16 MiB of body text, with an additional
+folded-text index. The cache is held in memory and disappears on exit.
+Names learned from historical messages may still appear. Matching ignores
+case, keeps accents significant, and searches each message line separately.
+At most the top 50 results are shown.
+
+Accepting a result opens the destination's ordinary live subscriptions.
+Agent and group names return to their conversations, remembering the scroll
+position, editing mode, filters and search for up to 128 recent discussions
+in this session. Drafts and cursors continue to use the existing draft store.
+A message opens its group for a broadcast, its sending agent for agent mail,
+or its receiving agent for human-to-agent mail. Mail between humans opens
+Feed. The selected message and nearby cached text are shown immediately;
+the view pauses at it and briefly highlights it. Newer mail and activity are
+not marked read or seen while reading this old result; following the newest
+view resumes the usual read behaviour.
+
 ## Keys
 
 Navigation uses vim keys and editing uses emacs keys. Arrow keys, PgUp/PgDn
@@ -462,7 +492,8 @@ and Home/End work everywhere too.
   forward and back a character, `Alt-f`/`Alt-b` a word, `Ctrl-k` kill to end of
   line, `Ctrl-y` yank, `Ctrl-w`/`Alt-Backspace` delete a word back, `Ctrl-d`
   delete forward, `Ctrl-_` (or `Ctrl-/`) undo, `Ctrl-r` redo,
-  `Ctrl-p`/`Ctrl-n` previous and next line. `Enter` sends;
+  `Ctrl-n` next line; `Up` moves to the previous line. `Ctrl-p` opens the
+  launcher globally. `Enter` sends;
   `Alt-Enter` (or `Ctrl-j`) inserts a newline. A paste is inserted as
   text, newlines included, and never sends; one undo removes it. Search and
   dialog fields take a paste on one line.

@@ -13,6 +13,10 @@ use crate::connect::theme;
 
 const AGENT_KEYS: &[(&str, &str)] = &[
     (
+        "Ctrl-P",
+        "local launcher: type, arrows select, Enter opens, Esc returns",
+    ),
+    (
         "Agent insert",
         "Enter sends; Esc back, saving the draft/cursor",
     ),

@@ -15,6 +15,7 @@ use super::composer::Composer;
 use super::drafts::{Draft, DraftStore};
 use super::event::{Data, Event, Request};
 use super::keys::{Action, Keymap};
+use super::launcher::{self, Picker, Target};
 use super::navigation::{Conversation, Feedback, History, Inbox};
 use super::preferences::Preferences;
 use super::screens::help::Help;
@@ -22,6 +23,8 @@ use super::screens::menu::Menu;
 use super::screens::splash::Splash;
 use super::screens::thread::Thread;
 use super::theme;
+
+const MAX_SAVED_VIEWS: usize = 128;
 
 /// A fresh id for a screen, stream or send request.
 pub fn next_id() -> u64 {
@@ -75,6 +78,17 @@ pub trait Screen {
     }
     fn conversation(&self) -> Option<Conversation> {
         None
+    }
+    fn feed_scope(&self, _id: u64) -> Option<Conversation> {
+        None
+    }
+    fn saved_view(&self) -> Option<super::screens::thread::SavedView> {
+        None
+    }
+    fn restore_view(&mut self, _view: super::screens::thread::SavedView) {}
+    fn seed_messages(&mut self, _rows: &[crate::proto::Message]) {}
+    fn seek_message(&mut self, _id: i64) -> bool {
+        false
     }
     fn is_thread(&self) -> bool {
         false
@@ -168,6 +182,9 @@ pub struct App {
     blockers_id: u64,
     /// Data already delivered to this app; the launcher never fetches it.
     launcher_cache: super::launcher::Cache,
+    picker: Option<Picker>,
+    /// Lightweight session state; subscriptions and activity are never retained.
+    saved_views: Vec<(Conversation, super::screens::thread::SavedView)>,
 }
 
 /// `[1 blocker · F2]`, `[3 blockers · F2]`: the human's open blockers.
@@ -193,6 +210,8 @@ impl App {
             blockers: Blockers::new(),
             blockers_id: next_id(),
             launcher_cache: super::launcher::Cache::default(),
+            picker: None,
+            saved_views: Vec::new(),
         };
         app.send(vec![Request::WatchSummary(app.ctx.inbox.id)]);
         app.push(Box::new(Menu::default()));
@@ -204,7 +223,11 @@ impl App {
         self.open(screen, true);
     }
 
-    fn open(&mut self, mut screen: Box<dyn Screen>, record: bool) {
+    fn open(&mut self, screen: Box<dyn Screen>, record: bool) {
+        self.open_at(screen, record, None);
+    }
+
+    fn open_at(&mut self, mut screen: Box<dyn Screen>, record: bool, hit: Option<i64>) {
         if let Some(target) = screen.conversation() {
             if let Conversation::Agent(agent) = &target {
                 self.ctx.inbox.retry_failed(agent);
@@ -213,10 +236,19 @@ impl App {
                 self.pop();
             }
             if record {
-                self.history.visit(target);
+                self.history.visit(target.clone());
             }
+            screen.seed_messages(&self.launcher_cache.context(Some(&target), hit));
+            if let Some(at) = self.saved_views.iter().position(|(c, _)| c.same(&target)) {
+                screen.restore_view(self.saved_views.remove(at).1);
+            }
+        } else if hit.is_some() {
+            screen.seed_messages(&self.launcher_cache.context(None, hit));
         }
         screen.restore_draft(&mut self.drafts, &mut self.draft_store);
+        if let Some(id) = hit {
+            screen.seek_message(id);
+        }
         self.fetch(screen.as_ref());
         self.stack.push(screen);
     }
@@ -251,6 +283,13 @@ impl App {
 
     fn pop(&mut self) {
         if let Some(mut screen) = self.stack.pop() {
+            if let (Some(target), Some(view)) = (screen.conversation(), screen.saved_view()) {
+                self.saved_views.retain(|(c, _)| !c.same(&target));
+                self.saved_views.push((target, view));
+                if self.saved_views.len() > MAX_SAVED_VIEWS {
+                    self.saved_views.remove(0);
+                }
+            }
             self.send(screen.on_close());
             screen.save_draft(&mut self.drafts);
             self.flush_drafts();
@@ -258,8 +297,8 @@ impl App {
     }
 
     fn viewed(&mut self) {
-        // The blocker modal covers the screen: nothing under it is viewed.
-        if self.blockers.is_open() {
+        // Covered screens still receive data, but nothing under a modal is viewed.
+        if self.blockers.is_open() || self.picker.is_some() {
             return;
         }
         let screen = self.stack.last_mut().expect("the menu is never popped");
@@ -341,6 +380,9 @@ impl App {
     pub fn on_event(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) => {
+                if let Some(quit) = self.picker_key(key) {
+                    return quit;
+                }
                 if let Some(quit) = self.blocker_key(key) {
                     return quit;
                 }
@@ -383,6 +425,10 @@ impl App {
             }
             Event::Paste(text) => {
                 self.keymap = Keymap::default();
+                if let Some(picker) = &mut self.picker {
+                    picker.paste(&text, &self.launcher_cache);
+                    return false;
+                }
                 self.ctx.navigation_notice = None;
                 if self.blockers.is_open() {
                     self.blockers.paste(&text);
@@ -456,7 +502,15 @@ impl App {
                     }
                     _ => {}
                 }
-                self.launcher_cache.observe(&data);
+                let scope = match &data {
+                    Data::Feed { id, .. } => self.stack.iter().find_map(|s| s.feed_scope(*id)),
+                    _ => None,
+                };
+                if scope.is_some() {
+                    self.launcher_cache.observe_from(&data, scope.as_ref());
+                } else {
+                    self.launcher_cache.observe(&data);
+                }
                 self.blockers
                     .on_data(self.blockers_id, &data, (self.ctx.now)());
                 if let Data::Sent { id, result } = &data {
@@ -485,6 +539,75 @@ impl App {
             }
             Event::Resize => false,
         }
+    }
+
+    /// One modal at a time, ahead of screen forms, dialogs and composers.
+    fn picker_key(&mut self, key: KeyEvent) -> Option<bool> {
+        if let Some(picker) = &mut self.picker {
+            self.keymap = Keymap::default();
+            return Some(match picker.key(key, &self.launcher_cache) {
+                launcher::Outcome::Stay => false,
+                launcher::Outcome::Quit => true,
+                launcher::Outcome::Cancel => {
+                    self.picker = None;
+                    self.viewed();
+                    false
+                }
+                launcher::Outcome::Choose(target) => {
+                    self.picker = None;
+                    self.launch(target);
+                    self.viewed();
+                    false
+                }
+            });
+        }
+        if self.blockers.is_open()
+            || key.code != KeyCode::Char('p')
+            || key.modifiers != KeyModifiers::CONTROL
+        {
+            return None;
+        }
+        self.keymap = Keymap::default();
+        self.picker = Some(Picker::new(&self.launcher_cache));
+        Some(false)
+    }
+
+    fn launch(&mut self, target: Target) {
+        self.ctx.navigation_notice = None;
+        let (destination, hit) = match target {
+            Target::Agent(name) => (Some(Conversation::Agent(name)), None),
+            Target::Group(name) => (Some(Conversation::Group(name)), None),
+            Target::Message(id) => {
+                if self.launcher_cache.message(id).is_none() {
+                    self.ctx.navigation_notice =
+                        Some(Feedback::Other("That message is no longer cached.".into()));
+                    return;
+                }
+                (self.launcher_cache.destination(id), Some(id))
+            }
+        };
+        let current = self.stack.last().and_then(|s| s.conversation());
+        let same = match (&destination, &current) {
+            (Some(a), Some(b)) => a.same(b),
+            (None, None) => self.stack.last().is_some_and(|s| s.is_thread()),
+            _ => false,
+        };
+        if same {
+            if let Some(id) = hit {
+                let rows = self.launcher_cache.context(destination.as_ref(), hit);
+                self.top().seed_messages(&rows);
+                self.top().seek_message(id);
+            }
+            return;
+        }
+        let screen = match destination {
+            Some(Conversation::Agent(name)) => {
+                Thread::agent(&name, &self.ctx.me, self.ctx.now.clone())
+            }
+            Some(Conversation::Group(name)) => Thread::group(&name),
+            None => Thread::feed(),
+        };
+        self.open_at(Box::new(screen), true, hit);
     }
 
     /// F2 and the open blocker modal, ahead of every screen: `Some(quit)`
@@ -678,6 +801,9 @@ impl App {
             // Clear first: styling alone would leave the screen's text.
             frame.render_widget(ratatui::widgets::Clear, frame.area());
             self.blockers.render(frame, frame.area(), now);
+        }
+        if let Some(picker) = &mut self.picker {
+            picker.render(frame, frame.area(), &self.launcher_cache);
         }
     }
 }
@@ -6464,6 +6590,207 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_launcher_covers_the_splash_and_leaves_the_blocker_modal_in_charge() {
+        let (mut app, mut rx) = splash_app();
+        let before = buffer(&mut app, 80);
+        ctrl(&mut app, 'p');
+        assert!(screen(&mut app, 80, 24).contains("Go to · cached data"));
+        assert!(rx.try_recv().is_err());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(buffer(&mut app, 80), before);
+        key(&mut app, ' ');
+        queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        ctrl(&mut app, 'p');
+        assert!(app.picker.is_none(), "the open blocker modal owns Ctrl-P");
+        assert!(app.blockers.is_open());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        ctrl(&mut app, 'p');
+        assert!(press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn launcher_name_search_is_passive_and_enter_starts_only_the_normal_destination_requests() {
+        let (mut app, mut rx) = app();
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "Grove".into(),
+                ..Default::default()
+            }]),
+        }));
+        ctrl(&mut app, 'p');
+        typed(&mut app, "grove");
+        assert!(
+            rx.try_recv().is_err(),
+            "searching names must not list or fetch anything"
+        );
+        enter(&mut app);
+        assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
+        let (_, req) = watched(&mut rx);
+        assert_eq!(req.with.as_deref(), Some("Grove"));
+        assert!(matches!(rx.try_recv(), Ok(Request::WatchActivity { .. })));
+        assert!(rx.try_recv().is_err());
+        // Choosing the current name preserves the actual screen and its draft.
+        typed(&mut app, "parent");
+        let before = app.top().draft().unwrap().1;
+        ctrl(&mut app, 'p');
+        typed(&mut app, "grove");
+        enter(&mut app);
+        assert_eq!(app.top().draft().unwrap().1, before);
+        assert!(
+            rx.try_recv().is_err(),
+            "the same conversation is not reopened"
+        );
+        app.on_event(Event::Data(Data::Groups(Ok(proto::GroupListResponse {
+            groups: vec![proto::Group {
+                name: "crew".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))));
+        ctrl(&mut app, 'p');
+        typed(&mut app, "crew");
+        assert!(rx.try_recv().is_err());
+        enter(&mut app);
+        assert_eq!(opened(&app), Some(Conversation::Group("crew".into())));
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(sent.iter().any(
+            |r| matches!(r, Request::Watch { req, .. } if req.group.as_deref() == Some("crew"))
+        ));
+        assert_eq!(
+            sent.iter()
+                .filter(|r| matches!(r, Request::Unwatch(_)))
+                .count(),
+            2
+        );
+        assert!(sent.iter().any(|r| matches!(r, Request::Groups)));
+    }
+
+    #[test]
+    fn the_launcher_seeks_cached_mail_from_an_earlier_conversation_without_fetching_old_history() {
+        let (mut app, mut rx) = app();
+        let (clock, now) = test_clock();
+        app.ctx.now = now;
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok((1..=400)
+                .map(|id| {
+                    let mut row = message(
+                        id,
+                        "Mateo",
+                        "ada",
+                        if id == 1 {
+                            "unique launcher needle"
+                        } else {
+                            "later mail"
+                        },
+                    );
+                    row.read_at = Some("2026-10-22T00:00:00Z".into());
+                    row
+                })
+                .collect()),
+        }));
+        screen(&mut app, 80, 24);
+        typed(&mut app, "parent draft");
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        app.pop();
+        while rx.try_recv().is_ok() {}
+        ctrl(&mut app, 'p');
+        typed(&mut app, "unique launcher needle");
+        assert!(rx.try_recv().is_err());
+        enter(&mut app);
+        let (new_feed, req) = watched(&mut rx);
+        assert_eq!(req.with.as_deref(), Some("Mateo"));
+        assert_eq!(
+            req.backlog, 200,
+            "only the ordinary live subscription is opened"
+        );
+        assert_ne!(feed, new_feed);
+        assert!(matches!(rx.try_recv(), Ok(Request::WatchActivity { .. })));
+        let shown = screen(&mut app, 80, 24);
+        assert!(
+            shown.contains("unique launcher needle"),
+            "the cached old hit is visible immediately: {shown}"
+        );
+        assert!(!editor_focused(&mut app));
+        assert_eq!(draft_text(&mut app), "parent draft");
+        app.on_event(Event::Data(Data::Feed {
+            id: new_feed,
+            result: Ok((401..=600)
+                .map(|id| message(id, "Mateo", "ada", "new unseen mail"))
+                .collect()),
+        }));
+        let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
+            "old message seek must not read newer mail: {requests:?}"
+        );
+        assert!(screen(&mut app, 80, 24).contains("unique launcher needle"));
+        assert!(
+            app.next_animation_frame().is_some(),
+            "the hit briefly glows"
+        );
+        clock.advance(Duration::from_secs(2));
+        let shown = screen(&mut app, 80, 24);
+        assert!(
+            shown.contains("unique launcher needle"),
+            "glow expiry preserves the anchor: {shown}"
+        );
+    }
+
+    #[test]
+    fn launcher_name_navigation_restores_the_saved_scroll_mode_and_draft_cursor() {
+        let (mut app, mut rx) = app();
+        let (_, now) = test_clock();
+        app.ctx.now = now;
+        mateo_with(&mut app, &mut rx, 60);
+        typed(&mut app, "parent draft");
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        let before = buffer(&mut app, 80);
+        while rx.try_recv().is_ok() {}
+        ctrl(&mut app, 'p');
+        typed(&mut app, "zed");
+        enter(&mut app);
+        while rx.try_recv().is_ok() {}
+        assert_eq!(opened(&app), Some(Conversation::Agent("Zed".into())));
+        ctrl(&mut app, 'p');
+        typed(&mut app, "mateo");
+        enter(&mut app);
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        let after = buffer(&mut app, 80);
+        for y in 0..10 {
+            for x in 0..80 {
+                assert_eq!(after[(x, y)], before[(x, y)], "restored history {x},{y}");
+            }
+        }
+        assert!(
+            !editor_focused(&mut app),
+            "the saved navigation mode is restored"
+        );
+        assert_eq!(draft_text(&mut app), "parent draft");
+        while rx.try_recv().is_ok() {}
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        key(&mut app, 'X');
+        enter(&mut app);
+        let sent = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|r| match r {
+                Request::Send { req, .. } => Some(req),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            sent.body, "parent drafXt",
+            "the draft cursor is restored with the view"
+        );
+    }
+
     /// The app still on its splash screen.
     fn splash_app() -> (App, UnboundedReceiver<Request>) {
         let (tx, mut rx) = unbounded_channel();
@@ -6545,6 +6872,101 @@ mod tests {
         assert!(!screen(&mut app, 80, 24).contains("Answering"));
         key(&mut app, 'r');
         assert!(blocker_poll(&mut app, &mut rx).is_some());
+    }
+
+    #[test]
+    fn ctrl_p_uses_only_cache_and_esc_restores_every_origin_exactly() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        type Setup = fn(&mut App, &mut UnboundedReceiver<Request>);
+        let origins: [(&str, Setup); 8] = [
+            ("menu", |_, _| {}),
+            ("agents, a row selected", |app, rx| {
+                open_agents(app, rx);
+                app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+                    humans: vec![],
+                    agents: vec![
+                        agent("Mateo", "ada", &["crew"]),
+                        agent("Zed", "ada", &["crew"]),
+                    ],
+                }))));
+                key(app, 'j');
+            }),
+            ("a draft, cursor moved", |app, rx| {
+                mateo_with(app, rx, 40);
+                typed(app, "parent draft");
+                press(app, KeyCode::Left, KeyModifiers::NONE);
+                press(app, KeyCode::Left, KeyModifiers::NONE);
+            }),
+            ("history, paused", |app, rx| {
+                mateo_with(app, rx, 60);
+                typed(app, "kept");
+                press(app, KeyCode::PageUp, KeyModifiers::NONE);
+                press(app, KeyCode::Up, KeyModifiers::NONE);
+            }),
+            ("the search prompt", |app, rx| {
+                mateo_with(app, rx, 10);
+                press(app, KeyCode::PageUp, KeyModifiers::NONE);
+                key(app, '/');
+                typed(app, "needle");
+            }),
+            ("a group dialog", |app, rx| {
+                crew_list(app, rx);
+                key(app, 'c');
+                typed(app, "ops");
+            }),
+            ("a side conversation", |app, rx| {
+                mateo_streams(app, rx);
+                answered_btw(app, rx);
+                typed(app, "follow-up draft");
+            }),
+            ("help", |app, _| {
+                key(app, '?');
+            }),
+        ];
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                for (origin, setup) in origins {
+                    let (mut app, mut rx) = self::app();
+                    let (_, now) = test_clock();
+                    app.ctx.now = now;
+                    setup(&mut app, &mut rx);
+                    queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+                    while rx.try_recv().is_ok() {}
+                    for width in [60, 80] {
+                        let before = buffer(&mut app, width);
+                        ctrl(&mut app, 'p');
+                        let open = buffer(&mut app, width);
+                        crate::ui::theme::testing::assert_buffer(&open);
+                        let text: String = open.content.iter().map(|c| c.symbol()).collect();
+                        assert!(text.contains("Go to · cached data"), "{origin}: {text}");
+                        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+                        assert!(!app.blockers.is_open(), "the launcher owns F2");
+                        // Keys and paste edit only the local query.
+                        typed(&mut app, "x");
+                        app.on_event(Event::Paste("y".into()));
+                        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                        let after = buffer(&mut app, width);
+                        for y in 0..24 {
+                            for x in 0..width {
+                                assert_eq!(
+                                    after[(x, y)],
+                                    before[(x, y)],
+                                    "{scheme:?} {origin} {width}: {x},{y}"
+                                );
+                            }
+                        }
+                    }
+                    // Opening, typing, F2, paste and closing never fetch launcher data.
+                    assert!(
+                        std::iter::from_fn(|| rx.try_recv().ok()).all(|r| matches!(
+                            r,
+                            Request::SideReport { .. } | Request::Blockers { .. }
+                        )),
+                        "{origin}"
+                    );
+                }
+            });
+        }
     }
 
     #[test]
@@ -6727,6 +7149,45 @@ mod tests {
             assert!(!editor_focused(&mut app), "back in navigation");
             assert_eq!(draft_text(&mut app), "parent");
         }
+    }
+
+    #[test]
+    fn the_launcher_keeps_receiving_data_but_defers_read_and_seen_until_escape() {
+        let (mut app, mut rx) = app();
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+        // The side poll from that tick is answered, so the next one asks again.
+        let side = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|r| match r {
+                Request::SideReport { id, .. } => Some(id),
+                _ => None,
+            })
+            .expect("the owner's side poll");
+        reply_to(&mut app, side, conv_report(1, None));
+        ctrl(&mut app, 'p');
+        while rx.try_recv().is_ok() {}
+        // Mail to the human arrives while covered: kept, not marked read.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(1, "Mateo", "ada", "arrived while covered")]),
+        }));
+        // Its side state is still polled.
+        app.on_event(Event::Tick);
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::SideReport { .. })),
+            "{sent:?}"
+        );
+        // Closing uncovers it: read now, and shown.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("Mateo".into()));
+        assert!(screen(&mut app, 80, 24).contains("arrived while covered"));
     }
 
     #[test]
