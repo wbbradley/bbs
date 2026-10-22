@@ -6,7 +6,12 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
-## Unreleased
+## 0.14.2 - 2026-10-22
+
+Agents page blocker counts. Protocol v2, database schema 21, config format 4
+and Rust 1.89 are unchanged from 0.14.1; the agent list and summaries gain an
+optional blocker count, which older servers omit. Upgrade the server for the
+counts and the client for the column.
 
 ### Changed
 
