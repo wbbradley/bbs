@@ -10,9 +10,10 @@ under the new package version and its publication date.
 
 A personal blocker queue on every screen adds the `blockers-mine.v1`
 capability; protocol v2, database schema 21, config format 4 and Rust 1.89 are
-unchanged. Upgrade the server before or with the client: a 0.15.0 client shows
-blockers only from a server with `blockers-mine.v1`, and against an older
-server it says the server needs an upgrade instead.
+unchanged. Upgrade the server before or with the client: `bbs connect` 0.15.0
+shows its blocker queue only from a server with `blockers-mine.v1`, and against
+an older server it says the server needs an upgrade instead. The other
+`bbs blocker` commands still work with older servers.
 
 ### Added
 
