@@ -25,6 +25,8 @@ pub const DONE: Duration = Duration::from_millis(750);
 pub const GUARD: Duration = Duration::from_secs(1);
 /// How long an update notice stays.
 pub const NOTICE: Duration = Duration::from_secs(5);
+/// Why the queue is unavailable: the server lacks the personal scope.
+const UNSUPPORTED: &str = "Blockers need a newer server (blockers-mine.v1).";
 /// Blockers listed above the selected one's text.
 const LIST_ROWS: usize = 4;
 /// Refused blockers kept, with their drafts, after the server drops them.
@@ -170,7 +172,7 @@ impl Blockers {
     /// F2: open the panel, or say why not.
     pub fn open(&mut self, now: Instant) -> Result<(), String> {
         if self.support == Support::Unsupported {
-            return Err("Blockers need a newer server (blockers-mine.v1); r retries.".into());
+            return Err(format!("{UNSUPPORTED} r retries."));
         }
         self.panel = Some(Panel {
             selected: self.rows.first().map(|b| b.root_id),
@@ -192,6 +194,10 @@ impl Blockers {
                         self.support = Support::Unsupported;
                         self.rows.clear();
                         self.active = 0;
+                        // An open card says why, and never says Done.
+                        if let Some(panel) = &mut self.panel {
+                            panel.done_at = None;
+                        }
                     }
                     // Background errors stay quiet; the panel shows the last.
                     Err(SideError::Refused(e) | SideError::Transient(e)) => {
@@ -390,6 +396,7 @@ impl Blockers {
         // Blockers past the first page are still open: the next poll lists them.
         if let Some(panel) = &mut self.panel
             && self.loaded
+            && self.support == Support::Supported
             && self.rows.is_empty()
             && self.active == 0
             && !busy
@@ -679,6 +686,14 @@ impl Blockers {
             return Default::default();
         };
         let mut lines = vec![self.title(width)];
+        if self.support == Support::Unsupported {
+            lines.push(Line::default());
+            lines.push(Line::styled(
+                format!("  {UNSUPPORTED} Esc returns."),
+                theme::style(Role::Warning),
+            ));
+            return (lines, Vec::new(), None);
+        }
         if self.done() {
             lines.push(Line::default());
             lines.push(Line::styled(
@@ -1796,6 +1811,72 @@ mod tests {
         assert!(!blockers.settle(now + DONE - Duration::from_millis(1)));
         assert!(blockers.settle(now + DONE));
         assert!(!blockers.is_open());
+    }
+
+    #[test]
+    fn an_open_card_explains_an_old_server_and_never_says_done() {
+        let now = Instant::now();
+        let unsupported = || Data::Blockers {
+            id: SCREEN,
+            result: Err(SideError::Unsupported("no blockers-mine.v1".into())),
+        };
+        let text = |b: &Blockers| {
+            b.lines_above(80)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Opened before the first reply: Loading, then the reason.
+        let mut blockers = Blockers::new(BlockerScope::Mine);
+        blockers.poll(SCREEN);
+        blockers.open(now).unwrap();
+        assert!(text(&blockers).contains("Loading…"));
+        blockers.on_data(SCREEN, &unsupported(), now);
+        let shown = text(&blockers);
+        assert!(
+            shown.contains("blockers-mine.v1") && !shown.contains("Loading"),
+            "{shown}"
+        );
+        assert!(!blockers.done());
+        assert!(!blockers.settle(now + DONE), "no goodbye for an upgrade");
+        assert_eq!(blockers.poll(SCREEN), None);
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Esc), now),
+            Outcome::Close
+        ));
+        // Open on a supported queue that then loses support: the same.
+        let mut blockers = open(now);
+        blockers.poll(SCREEN);
+        blockers.on_data(SCREEN, &unsupported(), now);
+        assert!(text(&blockers).contains("blockers-mine.v1"));
+        assert!(!blockers.done());
+        assert!(!blockers.settle(now + DONE));
+        assert_eq!(blockers.count(), None);
+        // A goodbye already showing gives way to the reason.
+        let mut blockers = Blockers::new(BlockerScope::Mine);
+        blockers.poll(SCREEN);
+        blockers.on_data(SCREEN, &list(vec![]), now);
+        blockers.open(now).unwrap();
+        assert!(blockers.done());
+        blockers.on_data(SCREEN, &unsupported(), now);
+        assert!(!blockers.done() && text(&blockers).contains("blockers-mine.v1"));
+        assert!(!blockers.settle(now + DONE));
+        // An answer confirmed after support went away does not say Done.
+        let mut blockers = Blockers::new(BlockerScope::Mine);
+        blockers.poll(SCREEN);
+        blockers.on_data(SCREEN, &list(vec![row(1, 1, "Zed", "q?")]), now);
+        blockers.open(now).unwrap();
+        typed(&mut blockers, "ok", now);
+        let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+        blockers.on_data(SCREEN, &unsupported(), now);
+        blockers.on_data(
+            SCREEN,
+            &written(&req.request_key, Ok(Default::default())),
+            now,
+        );
+        assert!(!blockers.done(), "no goodbye for an upgrade");
+        assert!(text(&blockers).contains("blockers-mine.v1"));
     }
 
     #[test]

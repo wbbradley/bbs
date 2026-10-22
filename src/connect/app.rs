@@ -6253,6 +6253,35 @@ mod tests {
     }
 
     #[test]
+    fn f2_before_the_first_reply_then_an_old_server_explains_inside_the_card() {
+        let (mut app, mut rx) = app();
+        let id = app.blockers_id;
+        assert_eq!(
+            blocker_poll(&mut app, &mut rx),
+            Some((id, BlockerScope::Mine))
+        );
+        let before = buffer(&mut app, 80);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(screen(&mut app, 80, 24).contains("Loading…"));
+        app.on_event(Event::Data(Data::Blockers {
+            id,
+            result: Err(SideError::Unsupported(
+                "required capability blockers-mine.v1 is unavailable".into(),
+            )),
+        }));
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("Blockers need a newer server (blockers-mine.v1).")
+                && !out.contains("Loading")
+                && !out.contains("Done"),
+            "{out}"
+        );
+        assert_eq!(blocker_poll(&mut app, &mut rx), None);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(buffer(&mut app, 80), before);
+    }
+
+    #[test]
     fn ctrl_c_quits_from_the_queue() {
         let (mut app, mut rx) = app();
         queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
