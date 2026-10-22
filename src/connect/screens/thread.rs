@@ -47,6 +47,8 @@ pub struct SavedView {
     kinds: Option<Kinds>,
     query: Option<String>,
     composing: bool,
+    /// Receipts were held (older mail sought): they stay held on return.
+    hold: bool,
 }
 
 /// A message opened from the launcher: shown whatever the filters, glowing
@@ -83,6 +85,8 @@ pub struct Thread {
     /// A restored place whose row has not arrived yet.
     pending_anchor: Option<Anchor<EntryKey>>,
     sought: Option<Sought>,
+    /// Receipts held by a restored place, until the view follows again.
+    receipts_held: bool,
     /// A seek set the side conversation aside on this screen: it goes on
     /// at the server, out of the way until the next `/btw` or a reopen.
     side_aside: bool,
@@ -149,6 +153,7 @@ impl Thread {
             refresh: None,
             pending_anchor: None,
             sought: None,
+            receipts_held: false,
             side_aside: false,
             req: FeedRequest {
                 backlog: BACKLOG,
@@ -324,6 +329,7 @@ impl Thread {
             kinds: self.stream.as_ref().map(|s| s.kinds),
             query: self.view.query.clone(),
             composing: self.composing,
+            hold: self.holding_receipts(),
         }
     }
 
@@ -343,6 +349,7 @@ impl Thread {
             .set_query(saved.query.as_deref().unwrap_or_default());
         self.composing = saved.composing && self.composer.is_some();
         self.pending_anchor = saved.paused;
+        self.receipts_held = saved.hold;
         self.settle_anchor();
     }
 
@@ -405,7 +412,8 @@ impl Thread {
     /// Reading older mail found by the launcher marks nothing newer read or
     /// seen until the view follows again.
     fn holding_receipts(&self) -> bool {
-        self.sought.is_some() && !self.view.following()
+        (self.sought.is_some() || self.receipts_held)
+            && (!self.view.following() || self.pending_anchor.is_some())
     }
 
     fn message_entries(&self, messages: &[Message]) -> Vec<Entry> {
@@ -1956,6 +1964,9 @@ impl Thread {
     /// The sought message's rows, highlighted while it glows. Once the view
     /// follows again, the message is no longer sought.
     fn glow(&mut self, frame: &mut Frame, area: Rect) {
+        if self.receipts_held && self.view.following() && self.pending_anchor.is_none() {
+            self.receipts_held = false;
+        }
         if self.sought.is_some() && self.view.following() {
             self.sought = None;
             // A filtered-out message leaves with it.
@@ -2396,5 +2407,69 @@ mod seek_tests {
         assert!(thread.feed_loaded);
         let out = draw(&mut thread, &ctx);
         assert!(find(&out, "cached reply").is_some() && find(&out, "live reply").is_some());
+    }
+
+    #[test]
+    fn a_place_saved_while_seeking_keeps_receipts_held_when_restored() {
+        let (_, now) = clock();
+        let ctx = ctx(now.clone());
+        let old = mail(1, "Mateo", "ada", "the one sought");
+        let mut seeking = Thread::agent("Mateo", "ada", now.clone());
+        seeking.human = Some("ada".into());
+        seeking.seed_messages(&[old.clone()]);
+        assert!(seeking.seek_message(1));
+        let saved = seeking.saved_view();
+        // Reopened by name later; newer unread mail arrives meanwhile.
+        let mut back = Thread::agent("Mateo", "ada", now);
+        back.human = Some("ada".into());
+        back.restore_view(saved);
+        // Newer mail first, before the place's own row: still held.
+        let newer = mail(50, "Mateo", "ada", "newer, unread");
+        feed(&mut back, vec![newer.clone()]);
+        assert!(back.pending_anchor.is_some());
+        assert_eq!(back.unread_mail(), None, "held while the place is pending");
+        back.seed_messages(&[old, newer.clone()]);
+        feed(&mut back, vec![newer]);
+        let Request::WatchActivity { id: activity, .. } = back.stream.as_ref().unwrap().watch()
+        else {
+            unreachable!()
+        };
+        back.on_data(&Data::Activity {
+            id: activity,
+            result: Ok(vec![proto::Activity {
+                id: 9,
+                record: r#"{"event":"text","text":"hi"}"#.into(),
+                created_at: at(60),
+                ..Default::default()
+            }]),
+        });
+        assert!(!back.view.following(), "back at the sought place");
+        draw(&mut back, &ctx);
+        assert_eq!(back.unread_mail(), None);
+        assert!(
+            !back
+                .on_view(&ctx)
+                .iter()
+                .any(|r| matches!(r, Request::MarkSeen { .. }))
+        );
+        // Following again releases it, for good: scrolling back up later
+        // reads as usual.
+        back.view.follow();
+        draw(&mut back, &ctx);
+        assert_eq!(back.unread_mail(), Some(("Mateo".into(), 50)));
+        back.view.scroll_up(1);
+        assert!(!back.view.following());
+        assert_eq!(back.unread_mail(), Some(("Mateo".into(), 50)));
+        assert!(
+            back.on_view(&ctx)
+                .iter()
+                .any(|r| matches!(r, Request::MarkSeen { through_id: 9, .. }))
+        );
+        // A place saved without a hold restores without one.
+        let mut plain = Thread::agent("Mateo", "ada", back.now.clone());
+        plain.human = Some("ada".into());
+        plain.restore_view(back.saved_view());
+        plain.seed_messages(&[mail(60, "Mateo", "ada", "unread")]);
+        assert_eq!(plain.unread_mail(), Some(("Mateo".into(), 60)));
     }
 }
