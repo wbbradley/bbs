@@ -587,6 +587,11 @@ impl Thread {
     }
 
     fn status(&self) -> Line<'static> {
+        if let Some(error) = &self.error
+            && self.sought.is_some()
+        {
+            return Line::styled(format!("{error} · F5 reloads"), theme::error());
+        }
         let notice = self.group.as_ref().and_then(|(_, admin)| admin.notice());
         let mut line = self.thread_status();
         if let Some(notice) = notice {
@@ -1921,7 +1926,11 @@ impl Thread {
         if let Some(c) = &mut self.composer {
             c.render(frame, composer, self.composing);
         }
-        if let Some(error) = &self.error {
+        // A sought cached message stays in view; the error goes to the
+        // status line instead.
+        if let Some(error) = &self.error
+            && self.sought.is_none()
+        {
             let text = vec![
                 Line::styled(error.clone(), theme::error()),
                 Line::styled(
@@ -2553,5 +2562,46 @@ mod seek_tests {
         early.seed_messages(&rows);
         assert!(!early.view.following());
         assert!(find(&draw(&mut early, &ctx), "between others, sought").is_some());
+    }
+
+    #[test]
+    fn a_failed_live_feed_leaves_a_sought_cached_message_in_view() {
+        let (_, now) = clock();
+        let ctx = ctx(now.clone());
+        let failed = |thread: &mut Thread| {
+            let id = thread.feed_id;
+            thread.on_data(&Data::Feed {
+                id,
+                result: Err("connection refused".into()),
+            });
+        };
+        // A group: the hit stays drawn, the error moves to the status line.
+        let mut group = Thread::group("crew");
+        group.now = now.clone();
+        group.seed_messages(&(1..=40).map(to_crew).collect::<Vec<_>>());
+        assert!(group.seek_message(12));
+        failed(&mut group);
+        let out = draw(&mut group, &ctx);
+        assert!(find(&out, "message 12 ").is_some(), "the cached hit stays");
+        let status = find(&out, "connection refused").expect("the error shows");
+        assert!(row(&out, status).contains("F5 reloads"));
+        assert!(find(&out, "message 12 ").unwrap() > status);
+        // An agent: the error is the bar's feed error, as always.
+        let mut agent = Thread::agent("Mateo", "ada", now.clone());
+        agent.human = Some("ada".into());
+        agent.seed_messages(&[mail(1, "Mateo", "ada", "the cached hit")]);
+        assert!(agent.seek_message(1));
+        failed(&mut agent);
+        assert!(find(&draw(&mut agent, &ctx), "the cached hit").is_some());
+        let bar = agent.bottom_status(80, &ctx, None).unwrap().to_string();
+        assert!(bar.contains("connection refused"), "{bar}");
+        // Without a seek, an error still takes the timeline's place.
+        let mut plain = Thread::group("crew");
+        plain.now = now;
+        plain.seed_messages(&(1..=40).map(to_crew).collect::<Vec<_>>());
+        failed(&mut plain);
+        let out = draw(&mut plain, &ctx);
+        assert!(find(&out, "message 12 ").is_none());
+        assert!(find(&out, "r or F5 reloads").is_some());
     }
 }
