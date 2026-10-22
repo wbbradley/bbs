@@ -1,7 +1,6 @@
-//! Agents: yours by default, everyone's on request, each with its owner.
-//! Those a human talked with come first, the longest since that talk first;
-//! ties and the rest put mail to the viewer unread first, then activity
-//! unseen, each oldest first.
+//! Agents ordered by open blockers, then the age of their latest activity.
+
+use std::cmp::Reverse;
 
 use chrono::{DateTime, Local};
 use ratatui::Frame;
@@ -53,10 +52,25 @@ impl Agents {
         self.now = Some(now);
     }
 
-    /// Agents a human has talked with first, the longest since their latest
-    /// direct message with any human first.
-    /// Ties and agents without one: unread mail, then unseen activity, each
-    /// oldest first; the rest keep the server's order.
+    /// Open blockers across the agent's groups, live from the summary stream.
+    fn blockers(&self, agent: &proto::Agent, ctx: &Ctx) -> Option<u64> {
+        ctx.inbox
+            .summaries
+            .get(&agent.name.to_ascii_lowercase())
+            .and_then(|s| s.blocker_count)
+            .or(agent.blocker_count)
+    }
+
+    fn last_sent<'a>(&self, agent: &'a proto::Agent, ctx: &'a Ctx) -> Option<&'a str> {
+        ctx.inbox
+            .summaries
+            .get(&agent.name.to_ascii_lowercase())
+            .and_then(|s| s.last_sent_at.as_deref())
+            .or(agent.last_sent_at.as_deref())
+    }
+
+    /// More blockers first, then the smallest ACTIVE age. Unknown activity
+    /// comes last within a count; names break ties without changing selection.
     fn shown<'a>(&'a self, ctx: &Ctx) -> Vec<&'a proto::Agent> {
         let Some(Ok(agents)) = &self.agents else {
             return Vec::new();
@@ -65,21 +79,18 @@ impl Agents {
             .iter()
             .filter(|a| self.all || a.owner.as_deref() == Some(ctx.me.as_str()))
             .collect();
-        let key = |a: &proto::Agent| {
-            let summary = ctx.inbox.summaries.get(&a.name.to_ascii_lowercase());
-            // Live from the summary stream when it says, otherwise the list's.
-            // Timestamps are fixed-width UTC, so they compare as text.
-            let talked = summary
-                .and_then(|s| s.last_human_conversation_at.clone())
-                .or_else(|| a.last_human_conversation_at.clone());
-            let pending = match summary {
-                Some(s) if s.unread_messages > 0 => (0, s.oldest_unread_message.clone()),
-                Some(s) if s.unseen_stream > 0 => (1, s.oldest_unseen_stream.clone()),
-                _ => (2, None),
-            };
-            (talked.is_none(), talked, pending)
-        };
-        shown.sort_by_cached_key(|a| key(a));
+        shown.sort_by_cached_key(|a| {
+            let sent = self
+                .last_sent(a, ctx)
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+            (
+                Reverse(self.blockers(a, ctx).unwrap_or(0)),
+                sent.is_none(),
+                Reverse(sent),
+                a.name.to_ascii_lowercase(),
+                a.name.clone(),
+            )
+        });
         shown
     }
 
@@ -203,31 +214,23 @@ impl Screen for Agents {
         let ages: Vec<String> = shown
             .iter()
             .map(|a| {
-                let sent = ctx
-                    .inbox
-                    .summaries
-                    .get(&a.name.to_ascii_lowercase())
-                    .and_then(|s| s.last_sent_at.as_deref())
-                    .or(a.last_sent_at.as_deref());
+                let sent = self.last_sent(a, ctx);
                 match sent.map(|s| age(s, now)) {
                     Some(s) if !s.is_empty() => s,
                     _ => "-".to_string(),
                 }
             })
             .collect();
-        // Keep both counts and a readable status at the minimum terminal width.
-        // AGENT fits the whole random name pool; OWNER fits most human names.
-        // ACTIVE fits the widest rendered age ("103d23h ago" is 11), at the
-        // header's 6 minimum and at most 14 so STATUS keeps 10 columns.
+        // Keep identity, blockers, inbox and ACTIVE readable in a 60-column
+        // pane. Groups and activity reappear when space permits.
         let active_width = ages.iter().map(|a| a.len()).max().unwrap_or(6).clamp(6, 14) as u16;
-        let groups_width = inner
-            .width
-            .saturating_sub(10 + 9 + 5 + 8 + active_width + 10 + 6)
-            .clamp(11, 16);
-        let status_width = inner
-            .width
-            .saturating_sub(10 + 9 + 5 + 8 + groups_width + active_width + 6)
-            as usize;
+        let show_groups = inner.width >= 72;
+        let show_activity = inner.width >= 96;
+        let groups_width = if show_groups { 10 } else { 0 };
+        let columns = 6 + usize::from(show_groups) + usize::from(show_activity);
+        let fixed =
+            10 + 9 + 8 + 5 + active_width + groups_width + if show_activity { 8 } else { 0 };
+        let status_width = inner.width.saturating_sub(fixed + columns as u16 - 1) as usize;
         let rows = shown.iter().zip(&ages).map(|(a, age)| {
             let owner = a.owner.as_deref().unwrap_or("?");
             let author_style = theme::style(theme::Role::Agent);
@@ -240,51 +243,68 @@ impl Screen for Agents {
                 theme::style(theme::Role::Human),
             )]);
             let summary = ctx.inbox.summaries.get(&a.name.to_ascii_lowercase());
-            Row::new(vec![
+            let mut cells = vec![
                 name,
                 owner,
+                Line::styled(
+                    self.blockers(a, ctx)
+                        .map_or_else(|| "-".into(), |n| n.to_string()),
+                    theme::style(theme::Role::Warning),
+                ),
                 Line::styled(
                     pending(summary.map_or(0, |s| s.unread_messages), '✉'),
                     theme::heading(),
                 ),
-                Line::styled(
+            ];
+            if show_activity {
+                cells.push(Line::styled(
                     pending(summary.map_or(0, |s| s.unseen_stream), '•'),
                     theme::heading(),
-                ),
-                fit_styled_list(
+                ));
+            }
+            if show_groups {
+                cells.push(fit_styled_list(
                     a.groups
                         .iter()
                         .map(|g| Line::styled(g.clone(), theme::style(theme::Role::Group)))
                         .collect(),
                     groups_width as usize,
-                ),
-                Line::styled(age.clone(), theme::style(theme::Role::Timestamp)),
-                Line::raw(fit(a.status.as_deref().unwrap_or_default(), status_width)),
-            ])
+                ));
+            }
+            cells.push(Line::styled(
+                age.clone(),
+                theme::style(theme::Role::Timestamp),
+            ));
+            cells.push(Line::raw(fit(
+                a.status.as_deref().unwrap_or_default(),
+                status_width,
+            )));
+            Row::new(cells)
         });
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(10),
-                Constraint::Length(9),
-                Constraint::Length(5),
-                Constraint::Length(8),
-                Constraint::Length(groups_width),
-                Constraint::Length(active_width),
-                Constraint::Min(10),
-            ],
-        )
-        .header(
-            Row::new([
-                "AGENT", "OWNER", "INBOX", "ACTIVITY", "GROUPS", "ACTIVE", "STATUS",
-            ])
-            .style(theme::heading()),
-        )
-        .style(theme::base())
-        .row_highlight_style(ratatui::style::Style {
-            fg: None,
-            ..theme::style(theme::Role::Selection)
-        });
+        let mut widths = vec![
+            Constraint::Length(10),
+            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Length(5),
+        ];
+        let mut headers = vec!["AGENT", "OWNER", "BLOCKERS", "INBOX"];
+        if show_activity {
+            widths.push(Constraint::Length(8));
+            headers.push("ACTIVITY");
+        }
+        if show_groups {
+            widths.push(Constraint::Length(groups_width));
+            headers.push("GROUPS");
+        }
+        widths.extend([Constraint::Length(active_width), Constraint::Min(0)]);
+        headers.extend(["ACTIVE", "STATUS"]);
+        let table = Table::new(rows, widths)
+            .header(Row::new(headers).style(theme::heading()))
+            .style(theme::base())
+            .row_highlight_style(ratatui::style::Style {
+                fg: None,
+                ..theme::style(theme::Role::Selection)
+            });
         if self.state.selected().is_none() {
             self.state.select(Some(0));
         }

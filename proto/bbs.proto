@@ -623,6 +623,8 @@ message Agent {
   // The newest direct message between the agent and any human, either way;
   // absent when there was none (or the server is too old to say).
   optional string last_human_conversation_at = 12;
+  // Open blockers across the agent's current active groups; absent on older servers.
+  optional uint64 blocker_count = 13;
 }
 
 // The window is the most recent `backlog` (1 to 1000) messages that match every
@@ -714,6 +716,8 @@ message AgentSummary {
   optional string effort_reported_at = 8;
   // As Agent.last_human_conversation_at.
   optional string last_human_conversation_at = 9;
+  // As Agent.blocker_count; updated when blockers or group membership change.
+  optional uint64 blocker_count = 10;
 }
 // Every live agent, by name.
 message AgentSummarySnapshot { repeated AgentSummary agents = 1; }

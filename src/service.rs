@@ -1896,6 +1896,7 @@ pub fn list_agents(
     with_ctx(conn, caller, |ctx| {
         let me = ctx.actor()?;
         let mut groups = db::agent_groups(ctx.conn)?;
+        let counts = db::blockers::agent_counts(ctx.conn)?;
         let mut rows = db::list_agents(ctx.conn, req.all && me.kind == db::Kind::Human)?;
         if me.kind == db::Kind::Agent {
             let mine: HashSet<&String> = groups.get(&me.id).into_iter().flatten().collect();
@@ -1919,6 +1920,7 @@ pub fn list_agents(
         let agents = rows
             .into_iter()
             .map(|a| proto::Agent {
+                blocker_count: Some(counts.get(&a.name).copied().unwrap_or(0)),
                 groups: groups.remove(&a.id).unwrap_or_default(),
                 name: a.name,
                 status: a.status,
@@ -2453,9 +2455,11 @@ pub fn agent_summary(
 ) -> Result<proto::AgentSummarySnapshot> {
     with_ctx(conn, caller, |ctx| {
         let me = ctx.human()?;
+        let counts = db::blockers::agent_counts(ctx.conn)?;
         let agents = db::agent_summaries(ctx.conn, me.id)?
             .into_iter()
             .map(|s| proto::AgentSummary {
+                blocker_count: Some(counts.get(&s.agent).copied().unwrap_or(0)),
                 agent: s.agent,
                 unread_messages: s.unread_messages,
                 oldest_unread_message: s.oldest_unread_message,

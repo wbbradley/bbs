@@ -2723,160 +2723,153 @@ mod tests {
     }
 
     #[test]
-    fn agents_with_unread_mail_then_unseen_activity_come_first() {
+    fn agents_order_by_blockers_then_activity_and_keep_selection_across_updates() {
         let (mut app, mut rx) = app();
-        key(&mut app, 'a');
-        assert!(matches!(rx.try_recv().unwrap(), Request::AgentsAt { .. }));
+        open_agents(&mut app, &mut rx);
         let id = app.ctx.inbox.id;
         let names = ["Ana", "Bo", "Cy", "Di", "Ed"];
+        let mut agents: Vec<_> = names.iter().map(|n| agent(n, "ada", &["crew"])).collect();
+        let at = |hour: u32| format!("2026-10-18T{hour:02}:00:00Z");
+        agents[0].blocker_count = Some(2);
+        agents[0].last_sent_at = Some(at(10));
+        agents[1].blocker_count = Some(2);
+        agents[1].last_sent_at = Some(at(11));
+        agents[2].blocker_count = Some(3);
+        agents[2].last_sent_at = None;
+        agents[3].blocker_count = Some(0);
+        agents[3].last_sent_at = Some(at(12));
+        agents[4].blocker_count = Some(2);
+        agents[4].last_sent_at = None;
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
-            humans: Vec::new(),
-            agents: names.iter().map(|n| agent(n, "ada", &["crew"])).collect(),
+            humans: vec![],
+            agents,
         }))));
-        let summary =
-            |agent: &str, mail: u32, mail_at: &str, seen: u32, seen_at: &str| proto::AgentSummary {
-                agent: agent.into(),
-                unread_messages: mail,
-                oldest_unread_message: (mail > 0).then(|| format!("2026-10-16T18:00:{mail_at}Z")),
-                unseen_stream: seen,
-                oldest_unseen_stream: (seen > 0).then(|| format!("2026-10-16T18:00:{seen_at}Z")),
-                last_sent_at: None,
-                effort: None,
-                effort_reported_at: None,
-                last_human_conversation_at: None,
-            };
-        // Selecting Bo, who then moves; the selection moves with it.
+        set_agents_now(&mut app, "2026-10-18T12:00:00Z");
+        let out = screen(&mut app, 100, 24);
+        assert_eq!(
+            order(&out, &names),
+            ["Cy", "Bo", "Ana", "Ed", "Di"],
+            "{out}"
+        );
+        // Select Bo. A live count update moves it, but keeps it selected.
         key(&mut app, 'j');
         app.on_event(Event::Data(Data::Summary {
             id,
             result: Ok(vec![
-                summary("di", 0, "", 150, "01"),
-                summary("Cy", 2, "05", 0, ""),
-                summary("Ed", 1, "03", 4, "00"),
-                summary("Bo", 0, "", 3, "02"),
+                proto::AgentSummary {
+                    agent: "bo".into(),
+                    blocker_count: Some(0),
+                    last_sent_at: Some(at(12)),
+                    unread_messages: 99,
+                    last_human_conversation_at: Some(at(1)),
+                    ..Default::default()
+                },
+                proto::AgentSummary {
+                    agent: "Ana".into(),
+                    blocker_count: Some(2),
+                    last_sent_at: Some(at(11)),
+                    ..Default::default()
+                },
             ]),
         }));
         let out = screen(&mut app, 100, 24);
-        let rows = order(&out, &["Ana", "Bo", "Cy", "Di", "Ed"]);
-        assert_eq!(rows, ["Ed", "Cy", "Di", "Bo", "Ana"], "{out}");
-        assert!(
-            out.contains("✉ 1") && out.contains("•4") && out.contains("•99"),
+        assert_eq!(
+            order(&out, &names),
+            ["Cy", "Ana", "Ed", "Bo", "Di"],
             "{out}"
         );
         enter(&mut app);
         assert_eq!(watched(&mut rx).1.with.as_deref(), Some("Bo"));
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        // Without summaries (an older server), the server's order.
-        app.on_event(Event::Data(Data::Summary {
-            id,
-            result: Err("required capability agent-summary.v1 is unavailable".into()),
-        }));
-        let out = screen(&mut app, 100, 24);
-        assert_eq!(
-            order(&out, &["Ana", "Bo", "Cy", "Di", "Ed"]),
-            ["Ana", "Bo", "Cy", "Di", "Ed"]
-        );
-        assert!(!out.contains('✉'), "{out}");
     }
 
     #[test]
-    fn agents_a_human_talked_with_longest_ago_come_first() {
+    fn older_agent_counts_are_unknown_and_inbox_does_not_change_order() {
         let (mut app, mut rx) = app();
-        key(&mut app, 'a');
-        assert!(matches!(rx.try_recv().unwrap(), Request::AgentsAt { .. }));
+        open_agents(&mut app, &mut rx);
         let id = app.ctx.inbox.id;
-        let at = |s: &str| Some(format!("2026-10-19T00:00:{s}.000000Z"));
-        // The list says when Ana last talked with a human; the rest never did.
-        let mut agents: Vec<_> = ["Ana", "Bo", "Cy", "Di", "Ed"]
+        let names = ["Ana", "Bo", "Cy"];
+        let agents = names
             .iter()
-            .map(|n| agent(n, "ada", &["crew"]))
+            .rev()
+            .map(|n| {
+                let mut a = agent(n, "ada", &["crew"]);
+                a.blocker_count = None;
+                a.last_sent_at = None;
+                a
+            })
             .collect();
-        agents[0].last_human_conversation_at = at("01");
         app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
-            humans: Vec::new(),
+            humans: vec![],
             agents,
         }))));
-        let names = ["Ana", "Bo", "Cy", "Di", "Ed"];
+        app.on_event(Event::Data(Data::Summary {
+            id,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "Cy".into(),
+                unread_messages: 10,
+                unseen_stream: 20,
+                last_human_conversation_at: Some("2020-01-01T00:00:00Z".into()),
+                ..Default::default()
+            }]),
+        }));
         let out = screen(&mut app, 100, 24);
-        assert_eq!(
-            order(&out, &names),
-            ["Ana", "Bo", "Cy", "Di", "Ed"],
-            "{out}"
-        );
-        let summary = |agent: &str, mail: u32, talked: Option<String>| proto::AgentSummary {
-            agent: agent.into(),
-            unread_messages: mail,
-            oldest_unread_message: (mail > 0).then(|| "2026-10-19T00:00:00.000000Z".into()),
-            last_human_conversation_at: talked,
-            ..Default::default()
-        };
-        // Select Ed, then the live summary reorders: Ana's list time is the
-        // oldest; Cy and Di tie, so Di's unread mail puts it first; Bo's
-        // unread mail cannot beat any conversation, and Ed, who never talked
-        // with a human, keeps the server's order.
-        for _ in 0..4 {
-            key(&mut app, 'j');
+        assert_eq!(order(&out, &names), names, "{out}");
+        let header = out.lines().find(|l| l.contains("BLOCKERS")).unwrap();
+        let blockers = header.find("BLOCKERS").unwrap();
+        for name in names {
+            let row = out.lines().find(|l| l.contains(name)).unwrap();
+            assert_eq!(
+                row.chars()
+                    .skip(blockers)
+                    .take(8)
+                    .collect::<String>()
+                    .trim(),
+                "-"
+            );
         }
-        app.on_event(Event::Data(Data::Summary {
-            id,
-            result: Ok(vec![
-                summary("Bo", 3, None),
-                summary("Cy", 0, at("05")),
-                summary("Di", 1, at("05")),
-            ]),
-        }));
-        let out = screen(&mut app, 100, 24);
-        assert_eq!(
-            order(&out, &names),
-            ["Ana", "Di", "Cy", "Bo", "Ed"],
-            "{out}"
-        );
-        // A new conversation puts Ed after the older ones; the selection
-        // follows it.
-        app.on_event(Event::Data(Data::Summary {
-            id,
-            result: Ok(vec![
-                summary("Bo", 3, None),
-                summary("Cy", 0, at("05")),
-                summary("Di", 1, at("05")),
-                summary("Ed", 0, at("09")),
-            ]),
-        }));
-        let out = screen(&mut app, 100, 24);
-        assert_eq!(
-            order(&out, &names),
-            ["Ana", "Di", "Cy", "Ed", "Bo"],
-            "{out}"
-        );
-        enter(&mut app);
-        assert_eq!(watched(&mut rx).1.with.as_deref(), Some("Ed"));
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        // Without summaries, the list's times still order; an older server
-        // with neither keeps the server's order.
-        app.on_event(Event::Data(Data::Summary {
-            id,
-            result: Err("required capability agent-summary.v1 is unavailable".into()),
-        }));
-        let out = screen(&mut app, 100, 24);
-        assert_eq!(
-            order(&out, &names),
-            ["Ana", "Bo", "Cy", "Di", "Ed"],
-            "{out}"
-        );
-        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
-            humans: Vec::new(),
-            agents: names
-                .iter()
-                .rev()
-                .map(|n| agent(n, "ada", &["crew"]))
-                .collect(),
-        }))));
-        let out = screen(&mut app, 100, 24);
-        assert_eq!(
-            order(&out, &names),
-            ["Ed", "Di", "Cy", "Bo", "Ana"],
-            "{out}"
-        );
+    }
+
+    #[test]
+    fn agents_blockers_column_precedes_inbox_in_narrow_and_wide_panes() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let (mut app, mut rx) = app();
+                open_agents(&mut app, &mut rx);
+                let mut a = agent("Mateo", "ada", &["crew"]);
+                a.blocker_count = Some(123);
+                app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+                    humans: vec![],
+                    agents: vec![a],
+                }))));
+                for width in [60, 80, 100] {
+                    let out = screen(&mut app, width, 24);
+                    let header = out.lines().find(|l| l.contains("BLOCKERS")).unwrap();
+                    let blockers = header.find("BLOCKERS").unwrap();
+                    assert!(
+                        header.find("OWNER").unwrap() < blockers
+                            && blockers < header.find("INBOX").unwrap()
+                            && header.contains("ACTIVE"),
+                        "{out}"
+                    );
+                    let row = out.lines().find(|l| l.contains("Mateo")).unwrap();
+                    assert!(row.contains("ada"), "{out}");
+                    assert_eq!(
+                        row.chars()
+                            .skip(blockers)
+                            .take(8)
+                            .collect::<String>()
+                            .trim(),
+                        "123",
+                        "{out}"
+                    );
+                    assert!(
+                        out.lines()
+                            .all(|l| unicode_width::UnicodeWidthStr::width(l) <= width as usize)
+                    );
+                }
+            });
+        }
     }
 
     #[test]
@@ -2925,7 +2918,7 @@ mod tests {
                 .collect()),
         }));
         set_agents_now(&mut app, "2026-10-18T12:00:00Z");
-        for width in [80, 100] {
+        for width in [100, 120] {
             let out = screen(&mut app, width, 24);
             let header: Vec<_> = out
                 .lines()
@@ -3031,8 +3024,8 @@ mod tests {
         }))));
         set_agents_now(&mut app, "2026-10-18T12:00:00Z");
         let out = screen(&mut app, 80, 24);
-        assert!(out.contains("crew, release +1"), "{out}");
-        assert!(out.contains("reviewing the very…"), "{out}");
+        assert!(out.contains("crew +2"), "{out}");
+        assert!(out.contains("reviewing the very long"), "{out}");
         // ACTIVE shows an age against the fixed render time.
         assert!(out.contains("14m ago"), "{out}");
     }

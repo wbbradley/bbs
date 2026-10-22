@@ -149,6 +149,24 @@ pub fn active_count(conn: &Connection, group: Option<&str>, agent: Option<i64>) 
     )? as u64)
 }
 
+/// Open blockers in each live agent's current groups, counted once per agent.
+/// One grouped query serves both the agent list and live summaries.
+pub fn agent_counts(conn: &Connection) -> Result<std::collections::HashMap<String, u64>> {
+    let mut query = conn.prepare_cached(
+        "SELECT a.name, COUNT(*) FROM blockers b
+         JOIN bbs_groups g ON g.id = b.group_id AND g.archived_at IS NULL
+         JOIN group_members m ON m.group_id = g.id
+         JOIN agents a ON a.id = m.agent_id AND a.retired_at IS NULL
+         WHERE NOT EXISTS (SELECT 1 FROM blockers s WHERE s.replaces = b.id)
+           AND NOT EXISTS (SELECT 1 FROM blocker_events e
+                           WHERE e.blocker_id = b.id AND e.kind != 'created')
+         GROUP BY a.id",
+    )?;
+    Ok(query
+        .query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn human_owns_member(conn: &Connection, group: i64, human: i64) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM group_members m

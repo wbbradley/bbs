@@ -359,19 +359,22 @@ An open agent conversation marks received direct messages to you read
 regardless of display filters. This also
 applies to live arrivals while the conversation is active. Covering it with
 help defers marking until you return; closed conversations do not mark arrivals.
-The Agents list uses the app's shared `WatchAgentSummary` snapshot, which lists every live agent, and
-puts first the agents any human has exchanged a direct message with (either way;
-controls, timer messages and broadcasts don't count), the longest since their
-latest such message first.
-Ties and agents no human has talked with put the agents with messages to you
-unread first, then those with activity unseen, each oldest first, then the rest; separate INBOX (✉) and ACTIVITY (•)
-columns count unread mail and unseen activity, each capped at 99 and blank at
-zero. ACTIVE shows how long ago the agent last sent a message or posted an
-activity event, as at most two day/hour/minute units plus "ago" ("14m ago",
-"3d4h ago", never "3d4h17m ago"), "0m ago" under a minute, and a dash when the
-agent never sent anything (or the server is too old to say). The summary stream
-carries each agent's last-sent time, so ACTIVE updates live while the list is
-open.
+The Agents list sorts by open blocker count descending, then ACTIVE age
+ascending (most recently active first), then agent name. BLOCKERS appears
+before INBOX and counts open blockers across all of the agent's current active
+groups, including blockers created by other agents. Replaced, answered,
+cancelled and archived-group blockers do not count. The agent list supplies
+the initial counts; the app's shared `WatchAgentSummary` stream updates them
+when blockers or memberships change. A server without the count field shows
+`-` rather than claiming there are no blockers.
+
+INBOX (✉) counts unread mail and ACTIVITY (•) unseen activity, each capped at
+99 and blank at zero; neither changes the sort order. Groups are hidden in
+narrow panes and ACTIVITY in medium panes, keeping AGENT, OWNER, BLOCKERS,
+INBOX and ACTIVE readable at 60 columns. ACTIVE shows how long ago the agent
+last sent a message or posted an activity event, as at most two day/hour/minute
+units plus "ago" ("14m ago", "3d4h ago"), "0m ago" under a minute, and a dash
+when unknown. Unknown activity sorts last among equal blocker counts.
 
 Any human may open any agent and message it, under the same rules as
 `bbs send`. Every agent shows its owner in a separate OWNER column, as in

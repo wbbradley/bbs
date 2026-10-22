@@ -494,6 +494,144 @@ mod tests {
     }
 
     #[test]
+    fn agent_counts_match_conversation_scope_through_the_blocker_lifecycle() {
+        let mut b = Board::memory();
+        let check = |b: &mut Board, expected: [u64; 3]| {
+            let agents = service::list_agents(
+                &mut b.conn,
+                &b.humans[0],
+                proto::ListAgentsRequest::default(),
+            )
+            .unwrap()
+            .agents;
+            let summaries =
+                service::agent_summary(&mut b.conn, &b.humans[0], proto::AgentSummaryRequest {})
+                    .unwrap()
+                    .agents;
+            for (name, expected) in ["Mateo", "Zed", "Lu"].into_iter().zip(expected) {
+                assert_eq!(
+                    agents
+                        .iter()
+                        .find(|a| a.name == name)
+                        .unwrap()
+                        .blocker_count,
+                    Some(expected),
+                    "list {name}"
+                );
+                assert_eq!(
+                    summaries
+                        .iter()
+                        .find(|a| a.agent == name)
+                        .unwrap()
+                        .blocker_count,
+                    Some(expected),
+                    "summary {name}"
+                );
+                let scope = list_blockers(
+                    &mut b.conn,
+                    &b.humans[0],
+                    proto::ListBlockersRequest {
+                        agent: Some(name.into()),
+                        limit: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(scope.active_count, expected, "conversation {name}");
+            }
+        };
+        check(&mut b, [0, 0, 0]);
+        let a = b.put(0, "a", None, "a");
+        check(&mut b, [1, 1, 0]);
+        let a = b.put(1, "updated a", Some(a.id), "a2");
+        check(&mut b, [1, 1, 0]); // one open version, not two
+        let c = b.put(0, "c", None, "c");
+        check(&mut b, [2, 2, 0]); // count all, not just the returned page
+        b.answer(0, a.id, "answer").unwrap();
+        check(&mut b, [1, 1, 0]);
+        cancel_blocker(
+            &mut b.conn,
+            &b.agents[0],
+            proto::CancelBlockerRequest {
+                id: c.id,
+                request_key: "cancel".into(),
+            },
+        )
+        .unwrap();
+        check(&mut b, [0, 0, 0]);
+        service::group_register(
+            &mut b.conn,
+            &b.humans[0],
+            proto::GroupRegisterRequest {
+                group: "other".into(),
+                description: None,
+            },
+        )
+        .unwrap();
+        for i in [0, 2] {
+            service::group_join(
+                &mut b.conn,
+                &b.agents[i],
+                proto::GroupRequest {
+                    group: "other".into(),
+                },
+            )
+            .unwrap();
+        }
+        put_blocker(
+            &mut b.conn,
+            &b.agents[2],
+            proto::PutBlockerRequest {
+                group: "other".into(),
+                body: "other issue".into(),
+                request_key: "other".into(),
+                replaces: None,
+            },
+        )
+        .unwrap();
+        b.put(0, "new crew issue", None, "crew");
+        check(&mut b, [2, 1, 1]); // includes blockers created by someone else
+        service::group_leave(
+            &mut b.conn,
+            &b.agents[0],
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        check(&mut b, [1, 1, 1]);
+        service::group_delete(
+            &mut b.conn,
+            &b.humans[1],
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        check(&mut b, [1, 0, 1]);
+        service::group_register(
+            &mut b.conn,
+            &b.humans[0],
+            proto::GroupRegisterRequest {
+                group: "crew".into(),
+                description: None,
+            },
+        )
+        .unwrap();
+        service::group_join(
+            &mut b.conn,
+            &b.agents[0],
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        check(&mut b, [1, 0, 1]); // archived identity never leaks into the new group
+        b.put(0, "new identity", None, "new-crew");
+        check(&mut b, [2, 0, 1]);
+    }
+
+    #[test]
     fn outcome_actors_carry_their_owner_like_creators_do() {
         let mut b = Board::memory();
         let owner_of = |b: &mut Board, id: i64| {
