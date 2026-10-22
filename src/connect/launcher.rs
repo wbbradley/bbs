@@ -1,6 +1,6 @@
 //! Local launcher data. Nothing here opens a backend or creates requests.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -26,28 +26,10 @@ pub enum Target {
     Message(i64),
 }
 
-impl Target {
-    fn category(&self) -> u8 {
-        match self {
-            Self::Agent(_) => 0,
-            Self::Group(_) => 1,
-            Self::Message(_) => 2,
-        }
-    }
-
-    fn message_id(&self) -> i64 {
-        match self {
-            Self::Message(id) => *id,
-            _ => 0,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Hit {
     pub target: Target,
     pub text: String,
-    rank: Rank,
 }
 
 /// Previously received data, bounded for this client session only.
@@ -55,10 +37,19 @@ pub struct Hit {
 pub struct Cache {
     agents: BTreeMap<String, String>,
     groups: BTreeMap<String, String>,
-    retired: HashSet<String>,
-    messages: BTreeMap<i64, proto::Message>,
+    messages: BTreeMap<i64, CachedMessage>,
     text_bytes: usize,
     revision: u64,
+}
+
+struct CachedMessage {
+    message: proto::Message,
+    /// Indexed once when body text arrives, never on a picker keystroke.
+    folded: String,
+}
+
+fn folded(text: &str) -> String {
+    text.chars().map(fold).collect()
 }
 
 impl Cache {
@@ -67,15 +58,7 @@ impl Cache {
             Data::Agents(Ok(list)) => {
                 self.revision = self.revision.wrapping_add(1);
                 self.agents.clear();
-                self.retired = list
-                    .agents
-                    .iter()
-                    .filter(|a| a.retired)
-                    .map(|a| a.name.to_lowercase())
-                    .collect();
-                // A retired name may have a new, live identity.
                 for agent in list.agents.iter().filter(|a| !a.retired) {
-                    self.retired.remove(&agent.name.to_lowercase());
                     self.agent(&agent.name);
                     for group in &agent.groups {
                         self.group(group);
@@ -108,12 +91,38 @@ impl Cache {
                     if row.body.len() > MAX_TEXT_BYTES {
                         continue;
                     }
-                    if self.messages.get(&row.id) == Some(row) {
-                        continue;
+                    if let Some(old) = self.messages.get_mut(&row.id) {
+                        if old.message == *row {
+                            continue;
+                        }
+                        if old.message.body == row.body
+                            && old.message.from_name == row.from_name
+                            && old.message.to_name == row.to_name
+                            && old.message.to_group == row.to_group
+                        {
+                            // Read receipts affect navigation, but not picker results.
+                            old.message = row.clone();
+                            continue;
+                        }
                     }
-                    if let Some(old) = self.messages.insert(row.id, row.clone()) {
-                        self.text_bytes -= old.body.len();
-                    }
+                    let indexed = match self.messages.remove(&row.id) {
+                        Some(old) => {
+                            self.text_bytes -= old.message.body.len();
+                            if old.message.body == row.body {
+                                old.folded
+                            } else {
+                                folded(&row.body)
+                            }
+                        }
+                        None => folded(&row.body),
+                    };
+                    self.messages.insert(
+                        row.id,
+                        CachedMessage {
+                            message: row.clone(),
+                            folded: indexed,
+                        },
+                    );
                     self.text_bytes += row.body.len();
                     self.revision = self.revision.wrapping_add(1);
                 }
@@ -131,24 +140,18 @@ impl Cache {
     }
 
     fn agent(&mut self, name: &str) {
-        let key = name.to_lowercase();
-        if !name.is_empty() && !self.retired.contains(&key) {
-            if self.agents.insert(key, name.into()).as_deref() != Some(name) {
-                self.revision = self.revision.wrapping_add(1);
-            }
+        if !name.is_empty()
+            && self.agents.insert(folded(name), name.into()).as_deref() != Some(name)
+        {
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
     fn group(&mut self, name: &str) {
-        if !name.is_empty() {
-            if self
-                .groups
-                .insert(name.to_lowercase(), name.into())
-                .as_deref()
-                != Some(name)
-            {
-                self.revision = self.revision.wrapping_add(1);
-            }
+        if !name.is_empty()
+            && self.groups.insert(folded(name), name.into()).as_deref() != Some(name)
+        {
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
@@ -157,57 +160,93 @@ impl Cache {
             let Some((_, old)) = self.messages.pop_first() else {
                 break;
             };
-            self.text_bytes -= old.body.len();
+            self.text_bytes -= old.message.body.len();
             self.revision = self.revision.wrapping_add(1);
         }
     }
 
     pub fn message(&self, id: i64) -> Option<&proto::Message> {
-        self.messages.get(&id)
+        self.messages.get(&id).map(|cached| &cached.message)
     }
 
     pub fn search(&self, query: &str) -> Vec<Hit> {
-        let query: String = query.trim().chars().map(fold).collect();
-        let mut hits = Vec::new();
+        let query = folded(query.trim());
+        // The open state is names, then recent mail: no body scan or ranking.
+        if query.is_empty() {
+            return self
+                .agents
+                .values()
+                .map(|name| Hit {
+                    target: Target::Agent(name.clone()),
+                    text: name.clone(),
+                })
+                .chain(self.groups.values().map(|name| Hit {
+                    target: Target::Group(name.clone()),
+                    text: name.clone(),
+                }))
+                .chain(self.messages.values().rev().map(|cached| Hit {
+                    target: Target::Message(cached.message.id),
+                    text: snippet(cached.message.body.lines().next().unwrap_or_default(), 0),
+                }))
+                .take(MAX_RESULTS)
+                .collect();
+        }
+        // Candidates borrow cached text. Only the returned hits allocate labels
+        // or snippets; ranking takes an already folded slice and allocates none.
+        let mut candidates = Vec::new();
         for (names, agent) in [(&self.agents, true), (&self.groups, false)] {
-            for name in names.values() {
-                if let Some(rank) = rank(&query, name) {
-                    hits.push(Hit {
-                        target: if agent {
-                            Target::Agent(name.clone())
-                        } else {
-                            Target::Group(name.clone())
-                        },
-                        text: name.clone(),
+            for (indexed, name) in names {
+                if let Some(rank) = rank(&query, indexed) {
+                    candidates.push(Candidate {
+                        kind: if agent { 0 } else { 1 },
+                        id: 0,
+                        text: name,
+                        indexed,
                         rank,
                     });
                 }
             }
         }
-        for row in self.messages.values().rev() {
-            let best = row
+        for cached in self.messages.values().rev() {
+            let best = cached
+                .message
                 .body
                 .lines()
-                .filter_map(|line| rank(&query, line).map(|rank| (rank, line)))
-                .min_by_key(|(rank, _)| *rank);
-            if let Some((rank, line)) = best {
-                hits.push(Hit {
-                    target: Target::Message(row.id),
-                    text: snippet(line, rank.start),
+                .zip(cached.folded.lines())
+                .filter_map(|(line, indexed)| {
+                    rank(&query, indexed).map(|rank| (rank, line, indexed))
+                })
+                .min_by_key(|(rank, _, _)| *rank);
+            if let Some((rank, text, indexed)) = best {
+                candidates.push(Candidate {
+                    kind: 2,
+                    id: cached.message.id,
+                    text,
+                    indexed,
                     rank,
                 });
             }
         }
-        hits.sort_by(|a, b| {
-            a.rank
-                .cmp(&b.rank)
-                .then_with(|| a.target.category().cmp(&b.target.category()))
-                .then_with(|| b.target.message_id().cmp(&a.target.message_id()))
-                .then_with(|| a.text.to_lowercase().cmp(&b.text.to_lowercase()))
-                .then_with(|| a.text.cmp(&b.text))
-        });
-        hits.truncate(MAX_RESULTS);
-        hits
+        if candidates.len() > MAX_RESULTS {
+            candidates.select_nth_unstable_by(MAX_RESULTS, Candidate::compare);
+            candidates.truncate(MAX_RESULTS);
+        }
+        candidates.sort_by(Candidate::compare);
+        candidates
+            .into_iter()
+            .map(|hit| Hit {
+                target: match hit.kind {
+                    0 => Target::Agent(hit.text.into()),
+                    1 => Target::Group(hit.text.into()),
+                    _ => Target::Message(hit.id),
+                },
+                text: if hit.kind == 2 {
+                    snippet(hit.text, hit.rank.start)
+                } else {
+                    hit.text.into()
+                },
+            })
+            .collect()
     }
 }
 
@@ -408,7 +447,12 @@ impl Picker {
             );
         }
         let footer = format!(
-            "↑/↓ select · Enter opens · Esc back · {} results",
+            "↑/↓ select · Enter opens · Esc back · {}{} results",
+            if self.hits.len() == MAX_RESULTS {
+                "top "
+            } else {
+                ""
+            },
             self.hits.len()
         );
         frame.render_widget(
@@ -416,6 +460,26 @@ impl Picker {
                 .style(theme::on_surface(surface, theme::style(Role::Muted))),
             Rect::new(inner.x, panel.bottom() - 2, inner.width, 1),
         );
+    }
+}
+
+/// Borrowed candidates keep search work independent of snippet allocations.
+struct Candidate<'a> {
+    kind: u8,
+    id: i64,
+    text: &'a str,
+    indexed: &'a str,
+    rank: Rank,
+}
+
+impl Candidate<'_> {
+    fn compare(a: &Self, b: &Self) -> std::cmp::Ordering {
+        a.rank
+            .cmp(&b.rank)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| b.id.cmp(&a.id))
+            .then_with(|| a.indexed.cmp(b.indexed))
+            .then_with(|| a.text.cmp(b.text))
     }
 }
 
@@ -428,8 +492,7 @@ struct Rank {
     length: usize,
 }
 
-fn rank(query: &str, text: &str) -> Option<Rank> {
-    let folded: String = text.chars().map(fold).collect();
+fn rank(query: &str, folded: &str) -> Option<Rank> {
     let length = folded.chars().count();
     let base = Rank {
         tier: 0,
@@ -527,7 +590,7 @@ mod tests {
         cache.agent("Équipe");
         assert_eq!(cache.search("éq")[0].text, "Équipe");
         assert!(cache.search("eq").is_empty(), "accents remain significant");
-        assert!(rank("thoe", "Theo").is_none(), "letters stay in order");
+        assert!(rank("thoe", "theo").is_none(), "letters stay in order");
     }
 
     #[test]
@@ -550,6 +613,77 @@ mod tests {
         cache.prune(1, 1);
         assert_eq!(cache.text_bytes, 0);
         assert!(cache.messages.is_empty());
+    }
+
+    #[test]
+    fn indexing_keeps_original_unicode_lines_and_receipts_do_not_rerank() {
+        let mut cache = Cache::default();
+        let mut data = feed(12, "irrelevant\r\nİΣ ÉQUIPE\r\nlast");
+        cache.observe(&data);
+        assert_eq!(cache.search("İσ éq")[0].text, "İΣ ÉQUIPE");
+        let revision = cache.revision;
+        let index = cache.messages[&12].folded.as_ptr();
+        if let Data::Feed {
+            result: Ok(rows), ..
+        } = &mut data
+        {
+            rows[0].read_at = Some("2026-10-22T19:00:00Z".into());
+        }
+        cache.observe(&data);
+        assert_eq!(cache.revision, revision);
+        assert_eq!(cache.messages[&12].folded.as_ptr(), index);
+        assert!(cache.message(12).unwrap().read_at.is_some());
+        cache.observe(&feed(12, "a different line\n界 ÉQUIPE"));
+        assert!(cache.search("İσ").is_empty());
+        assert_eq!(cache.search("界 éq")[0].text, "界 ÉQUIPE");
+        assert!(cache.revision > revision);
+    }
+
+    #[test]
+    fn searching_the_full_cache_indexes_once_and_materializes_only_top_hits() {
+        use std::time::Instant;
+        let mut cache = Cache::default();
+        // 10,000 × 1,600 bytes: close to the text budget with every slot used.
+        let body = "A long line of cached message text.\n".repeat(45);
+        let body = format!("{}\nneedle", &body[..1593]);
+        assert_eq!(body.len(), 1600);
+        let rows = (1..=MAX_MESSAGES as i64)
+            .map(|id| proto::Message {
+                id,
+                body: body.clone(),
+                ..Default::default()
+            })
+            .collect();
+        cache.observe(&Data::Feed {
+            id: 1,
+            result: Ok(rows),
+        });
+        assert_eq!(cache.messages.len(), MAX_MESSAGES);
+        assert_eq!(cache.text_bytes, 16_000_000);
+        let index = cache.messages[&1].folded.as_ptr();
+        let opened = Instant::now();
+        let mut picker = Picker::new(&cache);
+        let opening = opened.elapsed();
+        assert_eq!(picker.hits.len(), MAX_RESULTS);
+        assert_eq!(picker.hits[0].target, Target::Message(MAX_MESSAGES as i64));
+        picker.paste("needl", &cache);
+        let started = Instant::now();
+        key(&mut picker, &cache, KeyCode::Char('e'));
+        let typing = started.elapsed();
+        assert_eq!(picker.hits.len(), MAX_RESULTS);
+        assert!(picker.hits.iter().all(|hit| hit.text == "needle"));
+        assert_eq!(picker.hits[0].target, Target::Message(MAX_MESSAGES as i64));
+        assert_eq!(
+            picker.hits[MAX_RESULTS - 1].target,
+            Target::Message((MAX_MESSAGES - MAX_RESULTS + 1) as i64)
+        );
+        assert_eq!(cache.messages[&1].folded.as_ptr(), index);
+        let started = Instant::now();
+        assert!(cache.search("zzzz").is_empty());
+        eprintln!(
+            "full cache: open={opening:?}, one key={typing:?}, no match={:?}",
+            started.elapsed()
+        );
     }
 
     fn key(picker: &mut Picker, cache: &Cache, code: KeyCode) -> Outcome {
