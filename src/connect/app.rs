@@ -622,9 +622,14 @@ impl App {
             if let Some(id) = hit {
                 let rows = self.launcher_cache.context(destination.as_ref(), hit);
                 self.top().seed_messages(&rows);
-                self.top().seek_message(id);
+                if self.top().seek_message(id) {
+                    return;
+                }
+                // Activity can fill the current timeline's row cap even when
+                // the message is still cached. A fresh seeded view can show it.
+            } else {
+                return;
             }
-            return;
         }
         let screen = match destination {
             Some(Conversation::Agent(name)) => {
@@ -6770,6 +6775,19 @@ mod tests {
             shown.contains("unique launcher needle"),
             "glow expiry preserves the anchor: {shown}"
         );
+        app.on_event(Event::Data(Data::Feed {
+            id: new_feed,
+            result: Err("offline".into()),
+        }));
+        let shown = screen(&mut app, 80, 24);
+        assert!(
+            shown.contains("unique launcher needle"),
+            "a failed live connection must not hide the cached result: {shown}"
+        );
+        assert!(
+            shown.contains("offline"),
+            "the live error stays visible: {shown}"
+        );
         app.on_event(Event::Data(Data::Summary {
             id: app.ctx.inbox.id,
             result: Ok(vec![proto::AgentSummary {
@@ -6833,6 +6851,55 @@ mod tests {
             rx.try_recv().is_err(),
             "seeking in the current group keeps the existing subscription"
         );
+    }
+
+    #[test]
+    fn a_cached_hit_outside_a_full_activity_timeline_opens_a_fresh_seeded_view() {
+        let (mut app, mut rx) = app();
+        let (_, now) = test_clock();
+        app.ctx.now = now;
+        let (feed, act) = mateo_streams(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok((1..=crate::ui::thread::MAX_ROWS as i64)
+                .map(|id| {
+                    message(
+                        id,
+                        "Mateo",
+                        "Zed",
+                        if id == 1 {
+                            "oldest cached needle"
+                        } else {
+                            "later mail"
+                        },
+                    )
+                })
+                .collect()),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok((1..=crate::connect::timeline::MAX_RECORDS as i64)
+                .map(|id| activity(id, "00", r#"{"event":"text","text":"later activity"}"#))
+                .collect()),
+        }));
+        assert!(
+            !app.top().seek_message(1),
+            "the row cap excludes this cached message from the current timeline"
+        );
+        while rx.try_recv().is_ok() {}
+        ctrl(&mut app, 'p');
+        typed(&mut app, "oldest cached needle");
+        enter(&mut app);
+        let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(requests.contains(&Request::Unwatch(feed)));
+        assert!(requests.contains(&Request::Unwatch(act)));
+        assert!(requests.iter().any(|r| matches!(r, Request::Watch { id, req } if *id != feed && req.with.as_deref() == Some("Mateo") && req.backlog == 200)));
+        let shown = screen(&mut app, 80, 24);
+        assert!(
+            shown.contains("oldest cached needle"),
+            "the chosen cached hit remains reachable at the row cap: {shown}"
+        );
+        assert!(!editor_focused(&mut app));
     }
 
     #[test]
