@@ -2426,6 +2426,19 @@ fn blocker_tools_and_cli_keep_versions_retries_and_answer_delivery(mode: Mode) {
     .unwrap();
     assert_eq!(list["active_count"], 0);
     assert_eq!(list["blockers"][0]["id"], third_id);
+    let mine: Value =
+        serde_json::from_str(&bbs.ok(&["blocker", "list", "--mine", "--include-closed", "--json"]))
+            .unwrap();
+    assert_eq!(mine["blockers"][0]["id"], third_id);
+    assert_eq!(mine["active_count"], 0);
+    assert!(
+        bbs.err(&["blocker", "list", "--mine", "--group", "crew"])
+            .contains("cannot be used")
+    );
+    assert!(
+        bbs.err(&["--token", &token, "blocker", "list", "--mine"])
+            .contains("human")
+    );
     assert!(
         bbs.ok(&["blocker", "get", &id.to_string()])
             .contains("History (newest first)")

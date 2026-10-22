@@ -424,6 +424,14 @@ agent in one server transaction; another answer or replacement wins only once. A
 nonblank and at most 8 KiB. A stale submission is refused, never silently
 attached to a different version. No agent tool answers on a human's behalf.
 
+The human CLI can use `bbs blocker list --mine` for a personal queue across
+all current active groups containing one of the human's live agents. It includes
+other owners' blockers and counts each open version once. `--mine` is mutually
+exclusive with `--group` and `--agent`, is refused for agent callers, and requires
+`blockers-mine.v1` so an older server cannot ignore it. Even with
+`--include-closed`, this scope excludes archived groups and groups the human's
+agents have all left or retired from. The unscoped board-wide list is unchanged.
+
 The human CLI exposes `bbs blocker list`, `get`, `answer` and `cancel`; agents
 can also use `put` with `--token`. Add `--json` for polling and
 `--include-closed` when listing history. Put and answer accept their text as an

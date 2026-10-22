@@ -505,6 +505,216 @@ mod tests {
     }
 
     #[test]
+    fn personal_queue_filters_before_paging_and_tracks_current_owned_groups() {
+        let mut b = Board::memory();
+        let join = |b: &mut Board, who: &Caller, group: &str| {
+            service::group_join(
+                &mut b.conn,
+                who,
+                proto::GroupRequest {
+                    group: group.into(),
+                },
+            )
+            .unwrap();
+        };
+        let put = |b: &mut Board, who: &Caller, group: &str, key: &str| {
+            put_blocker(
+                &mut b.conn,
+                who,
+                proto::PutBlockerRequest {
+                    group: group.into(),
+                    body: key.into(),
+                    request_key: key.into(),
+                    replaces: None,
+                },
+            )
+            .unwrap()
+            .blocker
+            .unwrap()
+        };
+        let list = |b: &mut Board, who: &Caller, after: Option<i64>, closed: bool| {
+            list_blockers(
+                &mut b.conn,
+                who,
+                proto::ListBlockersRequest {
+                    mine: true,
+                    limit: Some(1),
+                    after_root_id: after,
+                    include_closed: closed,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let will = b.humans[0].clone();
+        let ada = b.humans[1].clone();
+        let mateo = b.agents[0].clone();
+        let zed = b.agents[1].clone();
+        let lu = b.agents[2].clone();
+        for name in ["unrelated", "release"] {
+            service::group_register(
+                &mut b.conn,
+                &will,
+                proto::GroupRegisterRequest {
+                    group: name.into(),
+                    description: None,
+                },
+            )
+            .unwrap();
+            join(&mut b, &lu, name);
+        }
+        let unrelated = put(&mut b, &lu, "unrelated", "oldest but not mine");
+        let crew = put(&mut b, &zed, "crew", "another owner's blocker");
+        let release = put(&mut b, &lu, "release", "release approval");
+        let extra = service::register(
+            &mut b.conn,
+            &will,
+            proto::RegisterRequest {
+                name: Some("Helper".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let helper = Caller {
+            token: Some(extra.token),
+            ..Default::default()
+        };
+        join(&mut b, &helper, "crew");
+        join(&mut b, &helper, "release");
+        // Two owned members in crew, and a second group, never duplicate rows.
+        let first = list(&mut b, &will, None, false);
+        assert_eq!(first.active_count, 2);
+        assert_eq!(
+            first.blockers.iter().map(|b| b.id).collect::<Vec<_>>(),
+            [crew.id]
+        );
+        assert_ne!(first.blockers[0].id, unrelated.id);
+        assert!(first.has_more);
+        assert!(first.blockers[0].can_answer && first.blockers[0].can_cancel);
+        let second = list(&mut b, &will, first.next_after_root_id, false);
+        assert_eq!(second.active_count, 2);
+        assert_eq!(second.blockers[0].id, release.id);
+        assert!(!second.has_more);
+        // Replace in place: only the open head is returned at its original age.
+        let current = b.put(1, "updated question", Some(crew.id), "replace-personal");
+        let first = list(&mut b, &will, None, false);
+        assert_eq!(first.active_count, 2);
+        assert_eq!(first.blockers[0].id, current.id);
+        assert_eq!(first.blockers[0].root_id, crew.root_id);
+        // A retired creator still needs cancellation by another group's owner.
+        service::bye(&mut b.conn, &zed).unwrap();
+        let first = list(&mut b, &will, None, false);
+        assert_eq!(first.active_count, 2);
+        assert!(!first.blockers[0].can_answer && first.blockers[0].can_cancel);
+        assert_eq!(list(&mut b, &ada, None, false).active_count, 0);
+        // Leave removes only groups with no remaining live owned member.
+        service::group_leave(
+            &mut b.conn,
+            &mateo,
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(list(&mut b, &will, None, false).active_count, 2);
+        service::bye(&mut b.conn, &helper).unwrap();
+        assert_eq!(list(&mut b, &will, None, false).active_count, 0);
+        join(&mut b, &mateo, "crew");
+        assert_eq!(list(&mut b, &will, None, false).active_count, 1);
+        cancel_blocker(
+            &mut b.conn,
+            &will,
+            proto::CancelBlockerRequest {
+                id: current.id,
+                request_key: "cancel-personal".into(),
+            },
+        )
+        .unwrap();
+        let closed = list(&mut b, &will, None, true);
+        assert_eq!(closed.active_count, 0);
+        assert_eq!(
+            closed.blockers[0].status(),
+            proto::BlockerStatus::BlockerCancelled
+        );
+        service::group_delete(
+            &mut b.conn,
+            &will,
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        // Archived history is outside a queue based on current active groups.
+        assert!(list(&mut b, &will, None, true).blockers.is_empty());
+        service::group_register(
+            &mut b.conn,
+            &will,
+            proto::GroupRegisterRequest {
+                group: "crew".into(),
+                description: None,
+            },
+        )
+        .unwrap();
+        join(&mut b, &mateo, "crew");
+        assert!(list(&mut b, &will, None, true).blockers.is_empty());
+        let fresh = put(&mut b, &mateo, "crew", "new group identity");
+        assert_eq!(list(&mut b, &will, None, false).blockers[0].id, fresh.id);
+        // Existing board-wide reads remain board-wide.
+        assert_eq!(b.list().active_count, 3);
+    }
+
+    #[test]
+    fn personal_queue_is_human_only_and_exclusive_with_other_scopes() {
+        let mut b = Board::memory();
+        b.put(0, "help", None, "personal-validation");
+        for req in [
+            proto::ListBlockersRequest {
+                mine: true,
+                group: Some("crew".into()),
+                ..Default::default()
+            },
+            proto::ListBlockersRequest {
+                mine: true,
+                agent: Some("Mateo".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                list_blockers(&mut b.conn, &b.humans[0], req)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("mutually exclusive")
+            );
+        }
+        assert!(
+            list_blockers(
+                &mut b.conn,
+                &b.agents[0],
+                proto::ListBlockersRequest {
+                    mine: true,
+                    ..Default::default()
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("human")
+        );
+        // A human without an owned group gets an empty personal queue, not the board.
+        let empty = list_blockers(
+            &mut b.conn,
+            &b.humans[2],
+            proto::ListBlockersRequest {
+                mine: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(empty.active_count, 0);
+        assert!(empty.blockers.is_empty());
+        assert_eq!(b.list().active_count, 1);
+    }
+
+    #[test]
     fn agent_counts_match_conversation_scope_through_the_blocker_lifecycle() {
         let mut b = Board::memory();
         let check = |b: &mut Board, expected: [u64; 3]| {

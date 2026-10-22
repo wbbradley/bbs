@@ -1284,8 +1284,9 @@ mod tests {
 
     #[tokio::test]
     async fn blockers_round_trip_and_old_capability_refusal_preserve_atomicity() {
-        use crate::backend::{BLOCKERS, Backend, Remote};
-        for supported in [false, true] {
+        use crate::backend::{BLOCKERS, BLOCKERS_MINE, Backend, Remote};
+        for withheld in [Some(BLOCKERS), Some(BLOCKERS_MINE), None] {
+            let supported = withheld.is_none();
             let mut conn = Connection::open_in_memory().unwrap();
             db::migrate(&mut conn).unwrap();
             service::ensure_human(
@@ -1351,11 +1352,8 @@ mod tests {
                 waiters: Mutex::new(HashSet::new()),
                 shutdown: watch::Sender::new(false),
                 require_human_token: false,
-                protocol: if supported {
-                    Policy::default()
-                } else {
-                    Policy::default().without(BLOCKERS)
-                },
+                protocol: withheld
+                    .map_or_else(Policy::default, |cap| Policy::default().without(cap)),
                 auth_failures: Mutex::new(HashMap::new()),
                 timer_limits: TimerLimits::default(),
                 clock: Arc::new(Utc::now),
@@ -1393,6 +1391,33 @@ mod tests {
                 id: first,
                 request_key: "cancel".into(),
             };
+            if withheld == Some(BLOCKERS_MINE) {
+                let before = snapshot();
+                let error = human
+                    .list_blockers(proto::ListBlockersRequest {
+                        mine: true,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<Status>().unwrap().code(),
+                    tonic::Code::FailedPrecondition
+                );
+                assert!(format!("{error:#}").contains(BLOCKERS_MINE));
+                assert_eq!(snapshot(), before);
+                // A pre-extension server still supports ordinary blocker reads.
+                assert_eq!(
+                    human
+                        .list_blockers(proto::ListBlockersRequest::default())
+                        .await
+                        .unwrap()
+                        .active_count,
+                    1
+                );
+                server.abort();
+                continue;
+            }
             if !supported {
                 let before = snapshot();
                 let errors = [

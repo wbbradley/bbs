@@ -1203,6 +1203,15 @@ mod tests {
         );
         assert!(
             backend
+                .list_blockers(proto::ListBlockersRequest {
+                    mine: true,
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
                 .get_blocker(proto::GetBlockerRequest::default())
                 .await
                 .is_err()
@@ -1260,6 +1269,7 @@ mod tests {
             ("ReportSide", Some("side-questions.v1")),
             ("ReportSide", Some("side-conversations.v1")),
             ("ListBlockers", Some("blockers.v1")),
+            ("ListBlockers", Some("blockers-mine.v1")),
             ("GetBlocker", Some("blockers.v1")),
             ("PutBlocker", Some("blockers.v1")),
             ("AnswerBlocker", Some("blockers.v1")),
