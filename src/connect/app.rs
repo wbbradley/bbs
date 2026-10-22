@@ -9983,21 +9983,28 @@ mod tests {
     fn conversation_tables_follow_the_live_pane_width_and_preserve_the_draft() {
         let (mut app, mut rx) = app();
         let feed = mateo(&mut app, &mut rx);
-        let body = format!(
-            "| Choice | Detail |\n| --- | --- |\n| marker | {} tailtoken |",
-            "pane width words ".repeat(12)
-        );
+        let body = r#"| Resource | What it is | If it's never released |
+|-|-|-|
+| **Rate-limit slot** | One entry in the customer's concurrent-request count, which enforces "at most N requests in flight" | The customer looks busier than they are, so they hit 429s too soon, until the entry expires after about an hour |
+| **Prefill and "cold" entries** | Mark that a backend is processing a new prompt. The cold one is released at the first token, the rest at the end. Routing uses them to avoid overloading a backend | The backend looks busier than it is, so routing steers traffic away from it until the entry expires |
+| **Admission entries** | Membership in limited lanes on a backend, such as the lane for giant prompts and the flex tier's home backend | That lane looks full |
+| **Standard-tier backend leases** (`standard_inflight:server:*`) | Reserve room on a specific backend for a standard-tier request. Renewed while the request runs | That capacity stays reserved until the lease lapses |
+| **Token-pool entry** | Tracks this request's tokens in the per-backend token pool. Renewed every 60 seconds, and removed after 240 seconds if not renewed | The pool overstates load until it's removed |
+| **Energy start record** | Captures the backend's energy reading when the request starts, so energy billing can be worked out at the end | Its energy can't be attributed, so the request falls back to an estimate |"#;
         app.on_event(Event::Data(Data::Feed {
             id: feed,
-            result: Ok(vec![message(1, "Mateo", "ada", &body)]),
+            result: Ok(vec![message(1, "Mateo", "ada", body)]),
         }));
         for c in "unfinished draft".chars() {
             key(&mut app, c);
         }
         let mut heights = Vec::new();
         for width in [60, 100, 72, 60] {
-            let out = screen(&mut app, width, 80);
-            assert!(out.contains("tailtoken"), "{out}");
+            let out = screen(&mut app, width, 200);
+            assert!(
+                out.contains("estimate"),
+                "the final table cell remains visible: {out}"
+            );
             assert!(out.contains("unfinished draft"));
             let grid: Vec<_> = out.lines().filter(|l| l.contains('│')).collect();
             assert!(!grid.is_empty(), "table rendered: {out}");
