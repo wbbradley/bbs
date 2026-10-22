@@ -31,6 +31,7 @@ pub const CAPABILITIES: &[&str] = &[
     "side-conversations.v1",
     "message-search.v1",
     "blockers.v1",
+    "blockers-mine.v1",
 ];
 const MAX_METADATA_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;

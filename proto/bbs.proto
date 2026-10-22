@@ -169,13 +169,16 @@ message Blocker {
 }
 
 message ListBlockersRequest {
-  // Optional mutually exclusive scopes. Neither means the whole board.
+  // Mutually exclusive group, agent and mine scopes. None means the whole board.
   optional string group = 1;
   optional string agent = 2;
   bool include_closed = 3;
   optional uint32 limit = 4;
   // Exclusive stable-root cursor; oldest roots first, including replacements.
   optional int64 after_root_id = 5;
+  // Human only: current active groups containing a live agent the caller owns.
+  // Requires blockers-mine.v1, so an older server cannot silently ignore it.
+  bool mine = 6;
 }
 
 message ListBlockersResponse {

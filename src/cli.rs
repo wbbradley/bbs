@@ -287,6 +287,9 @@ pub enum BlockerCommand {
         /// All current groups of this live agent.
         #[arg(long)]
         agent: Option<String>,
+        /// Human only: blockers in your current groups, across all your agents.
+        #[arg(long, conflicts_with_all = ["group", "agent"])]
+        mine: bool,
         /// Include answered/cancelled chains and archived groups.
         #[arg(long)]
         include_closed: bool,

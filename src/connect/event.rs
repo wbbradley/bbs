@@ -116,6 +116,7 @@ pub enum Request {
 /// Whose blockers a screen shows: a group's, or every group of a live agent.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BlockerScope {
+    Mine,
     Group(String),
     Agent(String),
 }
@@ -242,19 +243,19 @@ fn side_error(local: bool, error: anyhow::Error) -> SideError {
 /// agent, no such group) with the same code as a missing capability, so a
 /// failed precondition asks once what the server offers; only a server
 /// without blockers.v1, or without the RPC at all, is an old server.
-async fn blocker_poll_error(backend: &mut Backend, local: bool, error: anyhow::Error) -> SideError {
+async fn blocker_poll_error(
+    backend: &mut Backend,
+    local: bool,
+    error: anyhow::Error,
+    capability: &str,
+) -> SideError {
     let precondition = error
         .downcast_ref::<tonic::Status>()
         .is_some_and(|s| s.code() == tonic::Code::FailedPrecondition);
     match side_error(local, error) {
         SideError::Unsupported(text) if precondition => {
             match bounded(backend.server_info(), local).await {
-                Ok(info)
-                    if info
-                        .capabilities
-                        .iter()
-                        .any(|c| c == crate::backend::BLOCKERS) =>
-                {
+                Ok(info) if info.capabilities.iter().any(|c| c == capability) => {
                     SideError::Refused(text)
                 }
                 Ok(_) => SideError::Unsupported(text),
@@ -536,20 +537,29 @@ pub async fn serve(
             }
             Request::Blockers { id, scope } => {
                 let local = matches!(backend, Backend::Local(_));
-                let (group, agent) = match scope {
-                    BlockerScope::Group(group) => (Some(group), None),
-                    BlockerScope::Agent(agent) => (None, Some(agent)),
+                let (group, agent, mine) = match scope {
+                    BlockerScope::Mine => (None, None, true),
+                    BlockerScope::Group(group) => (Some(group), None, false),
+                    BlockerScope::Agent(agent) => (None, Some(agent), false),
+                };
+                let capability = if mine {
+                    crate::backend::BLOCKERS_MINE
+                } else {
+                    crate::backend::BLOCKERS
                 };
                 let req = proto::ListBlockersRequest {
                     group,
                     agent,
+                    mine,
                     ..Default::default()
                 };
                 let result =
                     match tokio::time::timeout(SIDE_CALL_TIMEOUT, backend.list_blockers(req)).await
                     {
                         Ok(Ok(list)) => Ok(Box::new(list)),
-                        Ok(Err(e)) => Err(blocker_poll_error(&mut backend, local, e).await),
+                        Ok(Err(e)) => {
+                            Err(blocker_poll_error(&mut backend, local, e, capability).await)
+                        }
                         Err(_) => Err(SideError::Transient(format!(
                             "no reply within {} seconds",
                             SIDE_CALL_TIMEOUT.as_secs()

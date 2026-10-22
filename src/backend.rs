@@ -37,6 +37,7 @@ pub const SIDE_QUESTIONS: &str = "side-questions.v1";
 pub const SIDE_CONVERSATIONS: &str = "side-conversations.v1";
 pub const MESSAGE_SEARCH: &str = "message-search.v1";
 pub const BLOCKERS: &str = "blockers.v1";
+pub const BLOCKERS_MINE: &str = "blockers-mine.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -379,7 +380,8 @@ impl Backend {
         match self {
             Backend::Local(l) => service::list_blockers(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => {
-                rpc!(r, list_blockers, req, &[BLOCKERS]).map_err(|e| missing_rpc(e, BLOCKERS))
+                let capability = if req.mine { BLOCKERS_MINE } else { BLOCKERS };
+                rpc!(r, list_blockers, req, &[capability]).map_err(|e| missing_rpc(e, capability))
             }
         }
     }

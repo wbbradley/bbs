@@ -110,14 +110,24 @@ pub fn list_blockers(
     req: proto::ListBlockersRequest,
 ) -> Result<proto::ListBlockersResponse> {
     let limit = page(req.limit, 50)?;
-    if req.group.is_some() && req.agent.is_some() {
-        bail!("blocker group and agent scopes are mutually exclusive");
+    if [req.group.is_some(), req.agent.is_some(), req.mine]
+        .into_iter()
+        .filter(|s| *s)
+        .count()
+        > 1
+    {
+        bail!("blocker group, agent and mine scopes are mutually exclusive");
     }
     if let Some(id) = req.after_root_id {
         positive(id, "root cursor")?;
     }
     with_ctx(conn, caller, |ctx| {
         let actor = ctx.actor()?;
+        let human = if req.mine {
+            Some(ctx.human()?.id)
+        } else {
+            None
+        };
         let group = req.group.as_deref().map(group_name);
         if let Some(name) = group
             && db::group_ids_named(ctx.conn, name)?.is_empty()
@@ -137,6 +147,7 @@ pub fn list_blockers(
             ctx.conn,
             group,
             agent,
+            human,
             req.include_closed,
             req.after_root_id.unwrap_or(0),
             limit + 1,
@@ -149,7 +160,7 @@ pub fn list_blockers(
                 .into_iter()
                 .map(|r| as_proto(ctx, &actor, r))
                 .collect::<Result<_>>()?,
-            active_count: store::active_count(ctx.conn, group, agent)?,
+            active_count: store::active_count(ctx.conn, group, agent, human)?,
             has_more,
             next_after_root_id,
         })

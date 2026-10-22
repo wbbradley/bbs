@@ -120,31 +120,42 @@ pub fn list(
     conn: &Connection,
     group: Option<&str>,
     agent: Option<i64>,
+    human: Option<i64>,
     closed: bool,
     after: i64,
     limit: usize,
 ) -> Result<Vec<Row>> {
     let mut query = conn.prepare(&format!(
-        "{SELECT} WHERE {SCOPE} AND successor.id IS NULL
-         AND (?3 OR (e.id IS NULL AND g.archived_at IS NULL))
-         AND COALESCE(b.root_id, b.id) > ?4
-         ORDER BY COALESCE(b.root_id, b.id) LIMIT ?5"
+        "{SELECT} WHERE {} AND successor.id IS NULL
+         AND (?4 OR (e.id IS NULL AND g.archived_at IS NULL))
+         AND COALESCE(b.root_id, b.id) > ?5
+         ORDER BY COALESCE(b.root_id, b.id) LIMIT ?6",
+        scope()
     ))?;
     Ok(query
-        .query_map(params![group, agent, closed, after, limit as i64], read_row)?
+        .query_map(
+            params![group, agent, human, closed, after, limit as i64],
+            read_row,
+        )?
         .collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn active_count(conn: &Connection, group: Option<&str>, agent: Option<i64>) -> Result<u64> {
+pub fn active_count(
+    conn: &Connection,
+    group: Option<&str>,
+    agent: Option<i64>,
+    human: Option<i64>,
+) -> Result<u64> {
     Ok(conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM blockers b JOIN bbs_groups g ON g.id = b.group_id
-             WHERE {SCOPE} AND g.archived_at IS NULL
+             WHERE {} AND g.archived_at IS NULL
              AND NOT EXISTS (SELECT 1 FROM blockers s WHERE s.replaces = b.id)
              AND NOT EXISTS (SELECT 1 FROM blocker_events e
-                             WHERE e.blocker_id = b.id AND e.kind != 'created')"
+                             WHERE e.blocker_id = b.id AND e.kind != 'created')",
+            scope()
         ),
-        params![group, agent],
+        params![group, agent, human],
         |r| r.get::<_, i64>(0),
     )? as u64)
 }
@@ -167,14 +178,29 @@ pub fn agent_counts(conn: &Connection) -> Result<std::collections::HashMap<i64, 
         .collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn human_owns_member(conn: &Connection, group: i64, human: i64) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM group_members m
+/// One membership predicate for both the personal queue and write eligibility.
+/// The expressions are SQL parameters/columns chosen by these callers.
+fn human_membership(group: &str, human: &str) -> String {
+    format!(
+        "EXISTS(SELECT 1 FROM group_members m
          JOIN agents a ON a.id = m.agent_id
          JOIN agent_owners o ON o.agent_id = a.id
-         JOIN bbs_groups g ON g.id = m.group_id
-         WHERE m.group_id = ?1 AND o.human_id = ?2
-         AND a.retired_at IS NULL AND g.archived_at IS NULL)",
+         JOIN bbs_groups member_group ON member_group.id = m.group_id
+         WHERE m.group_id = {group} AND o.human_id = {human}
+         AND a.retired_at IS NULL AND member_group.archived_at IS NULL)"
+    )
+}
+
+fn scope() -> String {
+    format!(
+        "{SCOPE} AND (?3 IS NULL OR {})",
+        human_membership("b.group_id", "?3")
+    )
+}
+
+pub fn human_owns_member(conn: &Connection, group: i64, human: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        &format!("SELECT {}", human_membership("?1", "?2")),
         params![group, human],
         |r| r.get(0),
     )?)

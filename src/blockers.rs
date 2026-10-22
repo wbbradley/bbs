@@ -79,6 +79,7 @@ pub fn list_request(args: &Value) -> Result<proto::ListBlockersRequest> {
         include_closed: args.include_closed,
         limit: args.limit,
         after_root_id: args.after_root_id,
+        mine: false,
     })
 }
 
@@ -160,6 +161,7 @@ pub async fn run(
         BlockerCommand::List {
             group,
             agent,
+            mine,
             include_closed,
             limit,
             after_root_id,
@@ -168,6 +170,7 @@ pub async fn run(
                 .list_blockers(proto::ListBlockersRequest {
                     group,
                     agent,
+                    mine,
                     include_closed,
                     limit,
                     after_root_id,
