@@ -6,6 +6,13 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Added
+
+- Ctrl-J moves down and Ctrl-K moves up through Ctrl-P launcher results,
+  alongside the arrow keys.
+
 ## 0.15.3 - 2026-10-22
 
 Client-only Ctrl-P launcher ranking. Protocol v2, database schema 21, config

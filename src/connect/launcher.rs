@@ -395,12 +395,12 @@ impl Picker {
                     .get(self.selected)
                     .map_or(Outcome::Stay, |h| Outcome::Choose(h.target.clone()));
             }
-            // Enter's control aliases must not create a second query line.
-            KeyCode::Char('m' | 'j') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
-            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+            // Ctrl-M must not create a second query line.
+            KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+            KeyCode::Char('p' | 'k') if key.modifiers == KeyModifiers::CONTROL => {
                 self.selected = self.selected.saturating_sub(1)
             }
-            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+            KeyCode::Char('n' | 'j') if key.modifiers == KeyModifiers::CONTROL => {
                 self.selected = (self.selected + 1).min(self.hits.len().saturating_sub(1))
             }
             KeyCode::Char('\n' | '\r') => {}
@@ -518,7 +518,7 @@ impl Picker {
             );
         }
         let footer = format!(
-            "↑/↓ select · Enter opens · Esc back · {}{} results",
+            "↑/↓ Ctrl-K/J · Enter opens · Esc back · {}{} results",
             if self.hits.len() == MAX_RESULTS {
                 "top "
             } else {
@@ -913,6 +913,22 @@ mod tests {
             key(&mut picker, &cache, KeyCode::Enter),
             Outcome::Choose(Target::Group("matters".into()))
         );
+        picker.key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &cache,
+        );
+        assert_eq!(
+            key(&mut picker, &cache, KeyCode::Enter),
+            Outcome::Choose(Target::Agent("Mateo".into()))
+        );
+        picker.key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &cache,
+        );
+        assert_eq!(
+            key(&mut picker, &cache, KeyCode::Enter),
+            Outcome::Choose(Target::Group("matters".into()))
+        );
         for _ in 0..100 {
             key(&mut picker, &cache, KeyCode::Down);
         }
@@ -920,6 +936,25 @@ mod tests {
             key(&mut picker, &cache, KeyCode::Enter),
             Outcome::Choose(Target::Message(8))
         );
+        picker.key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &cache,
+        );
+        assert_eq!(
+            key(&mut picker, &cache, KeyCode::Enter),
+            Outcome::Choose(Target::Message(8))
+        );
+        for _ in 0..100 {
+            picker.key(
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                &cache,
+            );
+        }
+        assert_eq!(
+            key(&mut picker, &cache, KeyCode::Enter),
+            Outcome::Choose(Target::Agent("Mat".into()))
+        );
+        assert_eq!(picker.query.lines(), ["mat"], "navigation keeps the query");
         picker.paste("zzzz", &cache);
         assert_eq!(key(&mut picker, &cache, KeyCode::Enter), Outcome::Stay);
         assert_eq!(key(&mut picker, &cache, KeyCode::Esc), Outcome::Cancel);
