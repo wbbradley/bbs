@@ -166,6 +166,8 @@ pub struct App {
     /// The human's own blocker queue, on every screen, and its F2 modal.
     blockers: Blockers,
     blockers_id: u64,
+    /// Data already delivered to this app; the launcher never fetches it.
+    launcher_cache: super::launcher::Cache,
 }
 
 /// `[1 blocker · F2]`, `[3 blockers · F2]`: the human's open blockers.
@@ -190,6 +192,7 @@ impl App {
             known_groups: None,
             blockers: Blockers::new(),
             blockers_id: next_id(),
+            launcher_cache: super::launcher::Cache::default(),
         };
         app.send(vec![Request::WatchSummary(app.ctx.inbox.id)]);
         app.push(Box::new(Menu::default()));
@@ -399,6 +402,9 @@ impl App {
                 };
                 match &data {
                     Data::Summary { id, result } if *id == self.ctx.inbox.id => {
+                        if let Ok(rows) = result {
+                            self.launcher_cache.summaries(rows);
+                        }
                         // Only ListAgents establishes absence. Sparse summary servers
                         // omit agents with zero counts; positive rows can also describe
                         // agents created after the last list.
@@ -450,6 +456,7 @@ impl App {
                     }
                     _ => {}
                 }
+                self.launcher_cache.observe(&data);
                 self.blockers
                     .on_data(self.blockers_id, &data, (self.ctx.now)());
                 if let Data::Sent { id, result } = &data {

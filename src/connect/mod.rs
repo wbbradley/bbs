@@ -10,6 +10,7 @@ mod drafts;
 mod effort;
 mod event;
 mod keys;
+mod launcher;
 mod navigation;
 mod owner;
 mod preferences;
