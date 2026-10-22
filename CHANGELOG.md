@@ -8,6 +8,12 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- `bbs connect`'s blocker panel is a card on the colour scheme's warning
+  surface under a warning title bar naming the blocker being answered; its
+  cancel action reads `[Cancel]`.
+
 ### Fixed
 
 - Blocker outcomes (replacement, cancellation, answer) name the acting

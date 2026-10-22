@@ -177,7 +177,11 @@ F2` while any are open. F2, from writing or navigation, replaces the composer
 with the blocker panel, which grows to at most two thirds of the height so the
 timeline stays in view; owner question and context cards hide until it closes.
 An open dialog, the search prompt or an owner form keeps F2, and an open
-`/btw` panel must close first.
+`/btw` panel must close first. The panel is a card on the scheme's warning
+surface under a warning title bar that names the blocker's creator and group,
+`Answering a blocker from CREATOR @group` when the box below can answer it, and
+the position in the queue; the answer box keeps the composer's surface. Without
+colour, the title bar is reversed and bold.
 
 The panel lists blockers oldest first, the first 50 of the scope with a count
 of any more; each refresh fills in rows as others resolve. Alt-↑/↓ selects;
@@ -189,7 +193,7 @@ conversation may be another agent of its groups. Blockers you cannot answer are 
 of yours in the group, or the creating agent is gone, in which case Tab still
 reaches Cancel. Each blocker keeps its own answer draft for this session.
 Enter sends; the answer shows darkened with a spinner until the server
-confirms. Tab reaches `[Cancel blocker]`, whose Enter asks once more (Enter
+confirms. Tab reaches `[Cancel]`, whose Enter asks once more (Enter
 confirms, Esc returns to the answer); cancelling sends no mail. The panel owns
 Tab and Shift-Tab, so they do not change effort while it is open.
 

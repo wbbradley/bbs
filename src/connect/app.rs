@@ -5770,6 +5770,59 @@ mod tests {
     }
 
     #[test]
+    fn the_blocker_card_has_a_warning_title_bar_and_surface_in_every_scheme() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let (mut app, mut rx) = app();
+                mateo_blockers(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "first?")]);
+                typed(&mut app, "parent");
+                press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+                typed(&mut app, "an answer");
+                let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let buffer = terminal.backend().buffer();
+                crate::ui::theme::testing::assert_buffer(buffer);
+                let row = |y: u16| (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+                let at = |text: &str| (0..24).find(|y| row(*y).contains(text)).unwrap();
+                let title = at("Answering a blocker from Zed @crew");
+                let label = at("answer → Zed @crew");
+                let answer = at("an answer");
+                let action = at("[Cancel]");
+                let bar = theme::style(theme::Role::WarningTitle);
+                let card = theme::base().patch(theme::style(theme::Role::WarningSurface));
+                let human = theme::base().patch(theme::style(theme::Role::HumanSurface));
+                for x in 0..60 {
+                    // The bar spans the row; the card fills the rest.
+                    let cell = &buffer[(x, title)];
+                    if scheme == crate::ui::theme::Scheme::NoColor {
+                        assert!(cell.modifier.contains(
+                            ratatui::style::Modifier::REVERSED | ratatui::style::Modifier::BOLD
+                        ));
+                    } else {
+                        assert_eq!(cell.bg, bar.bg.unwrap(), "{scheme:?} title {x}");
+                        assert_eq!(cell.fg, bar.fg.unwrap(), "{scheme:?} title {x}");
+                    }
+                    assert_eq!(buffer[(59, label)].bg, card.bg.unwrap(), "{scheme:?}");
+                    assert_eq!(buffer[(x, action)].bg, card.bg.unwrap(), "{scheme:?}");
+                }
+                // The answer box keeps its own surface inside the card (its
+                // edges: the caret has its own colour).
+                for x in [0, 59] {
+                    assert_eq!(buffer[(x, answer)].bg, human.bg.unwrap(), "{scheme:?}");
+                }
+                if scheme != crate::ui::theme::Scheme::NoColor {
+                    assert_ne!(card.bg, human.bg);
+                    assert_ne!(card.bg, theme::base().bg);
+                }
+                // The parent draft is untouched behind the card.
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                assert_eq!(draft_text(&mut app), "parent");
+            });
+        }
+    }
+
+    #[test]
     fn the_blocker_panel_draws_in_every_scheme_at_sixty_columns() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {
@@ -5787,14 +5840,14 @@ mod tests {
                 typed(&mut app, "an answer");
                 let out = screen(&mut app, 60, 24);
                 assert!(
-                    out.contains("an answer") && out.contains("[Cancel blocker]"),
+                    out.contains("an answer") && out.contains("[Cancel]"),
                     "{out}"
                 );
                 press(&mut app, KeyCode::Down, KeyModifiers::ALT);
                 let out = screen(&mut app, 60, 24);
                 assert!(out.contains("Read only:"), "{scheme:?}: {out}");
                 // A long blocker still leaves the timeline a third.
-                let panel = out.lines().position(|l| l.starts_with("Blockers ·"));
+                let panel = out.lines().position(|l| l.contains("Blocker from"));
                 assert!(panel >= Some(8), "{out}");
                 assert!(out.lines().next().unwrap().contains("No messages yet"));
             });

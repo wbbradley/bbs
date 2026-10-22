@@ -13,6 +13,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use super::composer::Composer;
 use super::event::{BlockerScope, Data, Request, SideError};
@@ -625,6 +626,46 @@ impl Blockers {
         lines
     }
 
+    /// The card's title bar: whose blocker this is and whether the box below
+    /// answers it, with the keys at the right when they fit.
+    fn title(&self, width: usize) -> Line<'static> {
+        let panel = self.panel.as_ref();
+        let done = panel.is_some_and(|p| p.done_at.is_some());
+        let left = match self.selected() {
+            Some(row) if !done => {
+                let at = self
+                    .rows
+                    .iter()
+                    .position(|b| b.root_id == row.root_id)
+                    .map_or(0, |i| i + 1);
+                let what = if row.can_answer && !self.held.contains(&row.root_id) {
+                    "Answering a blocker from"
+                } else {
+                    "Blocker from"
+                };
+                format!(
+                    " {what} {} @{} · {at} of {} open",
+                    creator(row),
+                    row.group,
+                    self.active.max(self.rows.len() as u64)
+                )
+            }
+            _ => " Blockers".to_string(),
+        };
+        // The keys at the right, shortened to the way out when narrow.
+        let keys = [" Alt-↑/↓ · Tab · Esc ", " Esc "]
+            .into_iter()
+            .find(|keys| left.width() + keys.width() < width);
+        let text = match keys {
+            Some(keys) if !done => {
+                let gap = width - left.width() - keys.width();
+                format!("{left}{}{keys}", " ".repeat(gap))
+            }
+            _ => left,
+        };
+        theme::clip_line(Line::raw(text), width).style(theme::style(Role::WarningTitle))
+    }
+
     /// The header and list; the selected blocker's text, which gets what
     /// room is left; and the line naming who an answer goes to.
     fn parts(
@@ -641,18 +682,9 @@ impl Blockers {
         };
         if panel.done_at.is_some() {
             let done = Line::styled("Done with blockers.", theme::style(Role::Success));
-            return (vec![done], Vec::new(), None);
+            return (vec![self.title(width), done], Vec::new(), None);
         }
-        let mut lines = vec![theme::clip_line(
-            Line::from(vec![
-                Span::styled("Blockers", theme::style(Role::Heading)),
-                Span::styled(
-                    format!(" · {} open · Alt-↑/↓ select · Tab · Esc back", self.active),
-                    theme::dim(),
-                ),
-            ]),
-            width,
-        )];
+        let mut lines = vec![self.title(width)];
         if !self.loaded {
             lines.push(Line::styled("Loading…", theme::dim()));
             return (lines, Vec::new(), None);
@@ -754,7 +786,7 @@ impl Blockers {
                     theme::dim()
                 };
                 Line::from(vec![
-                    Span::styled("[Cancel blocker]", style),
+                    Span::styled("[Cancel]", style),
                     Span::styled(" Tab", theme::dim()),
                 ])
             }
@@ -809,7 +841,27 @@ impl Blockers {
             Constraint::Length(below.len() as u16),
         ])
         .areas(area);
-        frame.render_widget(Paragraph::new(head), head_area);
+        // A warning card under a full-width title bar; the answer box keeps
+        // its own surface inside it.
+        frame.render_widget(
+            ratatui::widgets::Block::new().style(theme::style(Role::WarningSurface)),
+            area,
+        );
+        let mut head = head.into_iter();
+        if let Some(title) = head.next() {
+            let bar = Rect {
+                height: head_area.height.min(1),
+                ..head_area
+            };
+            let style = title.style;
+            frame.render_widget(Paragraph::new(title).style(style), bar);
+        }
+        let rest = Rect {
+            y: head_area.y + head_area.height.min(1),
+            height: head_area.height.saturating_sub(1),
+            ..head_area
+        };
+        frame.render_widget(Paragraph::new(head.collect::<Vec<_>>()), rest);
         let body = Paragraph::new(body).wrap(Wrap { trim: false });
         let rows = body.line_count(area.width) as u16;
         self.text_rows = (rows, body_area.height);
@@ -1520,6 +1572,38 @@ mod tests {
     }
 
     #[test]
+    fn the_title_names_the_blocker_and_whether_the_box_answers_it() {
+        let now = Instant::now();
+        let mut blockers = open(now);
+        let title = |b: &Blockers, width| b.title(width).to_string();
+        let wide = title(&blockers, 100);
+        assert!(wide.starts_with(" Answering a blocker from Zed @crew · 1 of 2 open "));
+        assert!(wide.ends_with(" Alt-↑/↓ · Tab · Esc "), "{wide:?}");
+        assert_eq!(wide.width(), 100);
+        // Narrow: the way out still shows; narrower still, only the title.
+        assert!(title(&blockers, 60).ends_with(" Esc "));
+        assert!(title(&blockers, 60).starts_with(" Answering a blocker from Zed"));
+        assert!(title(&blockers, 40).width() <= 40);
+        assert_eq!(
+            blockers.title(80).style,
+            theme::style(Role::WarningTitle),
+            "the whole bar"
+        );
+        // A row the box cannot answer is only "from".
+        blockers.key(SCREEN, alt(KeyCode::Down), now);
+        let mut second = row(2, 2, "Mateo", "second?");
+        second.can_answer = false;
+        blockers.on_data(SCREEN, &list(vec![row(1, 1, "Zed", "first?"), second]), now);
+        assert!(title(&blockers, 80).starts_with(" Blocker from Mateo @crew · 2 of 2 open"));
+        // The goodbye keeps the bar.
+        let mut done = Blockers::new(BlockerScope::Group("crew".into()));
+        done.poll(SCREEN);
+        done.on_data(SCREEN, &list(vec![]), now);
+        done.open(now).unwrap();
+        assert_eq!(title(&done, 80), " Blockers");
+    }
+
+    #[test]
     fn read_only_says_whether_the_creator_or_ownership_is_missing() {
         let now = Instant::now();
         let mut blockers = Blockers::new(BlockerScope::Group("crew".into()));
@@ -1660,7 +1744,7 @@ mod tests {
         assert_eq!(blockers.active, 0);
         assert_eq!(blockers.panel.as_ref().unwrap().done_at, Some(now + DONE));
         assert_eq!(
-            blockers.lines_above(80)[0].to_string(),
+            blockers.lines_above(80)[1].to_string(),
             "Done with blockers."
         );
         assert!(matches!(
@@ -1698,7 +1782,7 @@ mod tests {
         blockers.on_data(SCREEN, &list(vec![]), now);
         blockers.open(now).unwrap();
         assert_eq!(
-            blockers.lines_above(80)[0].to_string(),
+            blockers.lines_above(80)[1].to_string(),
             "Done with blockers."
         );
         assert!(blockers.settle(now + DONE));

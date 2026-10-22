@@ -39,6 +39,9 @@ pub enum Role {
     TitleBar,
     StatusBar,
     Logo,
+    /// A card that needs the human: a background and its title bar.
+    WarningSurface,
+    WarningTitle,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -131,6 +134,7 @@ impl Scheme {
                     Style::new().bold()
                 }
                 Selection | Cursor | TitleBar | StatusBar => Style::new().reversed(),
+                WarningTitle => Style::new().reversed().bold(),
                 _ => Style::new(),
             };
         }
@@ -230,6 +234,12 @@ impl Scheme {
                 Style::new().fg(text).bg(selection).bold()
             }
             TitleBar | StatusBar => Style::new().fg(bg).bg(accent).bold(),
+            WarningSurface => Style::new().fg(text).bg(match self {
+                Self::Gruvbox => tint(bg, warning, 18),
+                Self::Terminal => Color::Indexed(58),
+                Self::NoColor => unreachable!(),
+            }),
+            WarningTitle => Style::new().fg(bg).bg(warning).bold(),
         }
     }
 }
@@ -308,6 +318,8 @@ mod tests {
                         Role::Selection,
                         Role::TitleBar,
                         Role::StatusBar,
+                        Role::WarningSurface,
+                        Role::WarningTitle,
                     ] {
                         let bar = style(surface);
                         let combined = on_surface(bar, category);
@@ -334,6 +346,42 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn the_warning_card_stands_apart_from_every_other_surface() {
+        for scheme in [Scheme::Gruvbox, Scheme::Terminal] {
+            let card = scheme.style(Role::WarningSurface).bg.unwrap();
+            let title = scheme.style(Role::WarningTitle);
+            for other in [
+                Role::Screen,
+                Role::HumanSurface,
+                Role::OtherConversation,
+                Role::GroupConversation,
+                Role::Selection,
+                Role::TitleBar,
+            ] {
+                assert_ne!(Some(card), scheme.style(other).bg, "{scheme:?} {other:?}");
+                assert_ne!(title.bg, scheme.style(other).bg, "{scheme:?} {other:?}");
+            }
+            assert_ne!(title.bg, Some(card));
+            // The title reads in the warning colour itself, text in the
+            // background's: the scheme's own warning, no new palette entry.
+            assert_eq!(title.bg, scheme.style(Role::Warning).fg);
+            assert_eq!(title.fg, scheme.style(Role::Screen).bg);
+            assert!(title.add_modifier.contains(ratatui::style::Modifier::BOLD));
+            assert_eq!(
+                scheme.style(Role::WarningSurface).fg,
+                scheme.style(Role::Text).fg
+            );
+        }
+        let plain = Scheme::NoColor.style(Role::WarningTitle);
+        assert!(
+            plain
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED | ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(Scheme::NoColor.style(Role::WarningSurface), Style::new());
     }
 
     #[test]
@@ -453,6 +501,8 @@ pub(crate) mod testing {
             TitleBar,
             StatusBar,
             Logo,
+            WarningSurface,
+            WarningTitle,
         ];
         let colors: Vec<_> = roles
             .into_iter()
