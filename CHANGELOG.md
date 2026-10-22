@@ -6,6 +6,14 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Changed
+
+- Ctrl-P results put agents first, then groups, then messages. Within each
+  section, exact matches come first, then matches at two, one or no word
+  boundaries, then fuzzy matches. Messages in the same tier show newest first.
+
 ## 0.15.2 - 2026-10-22
 
 A client-only Ctrl-P launcher and an Agents page refresh fix. Protocol v2,
@@ -18,8 +26,6 @@ Upgrade the client to use them; no server or runner change is needed.
   cached message text without search requests. Enter opens normal live
   conversations, restores their session view state, or pauses at a cached
   message with a brief highlight; Esc restores the original screen.
-  Results put agents and groups before messages, prefer whole-word matches
-  over partial matches, and show newer messages first within a match tier.
 
 ### Fixed
 
