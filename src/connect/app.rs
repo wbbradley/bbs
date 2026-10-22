@@ -131,6 +131,11 @@ pub trait Screen {
     fn composer_text(&self) -> Option<String> {
         None
     }
+    /// A short marker kept at the right end of the bottom bar, whatever else
+    /// the bar says.
+    fn status_marker(&self) -> Option<String> {
+        None
+    }
     /// Optional screen feedback for the shared bottom bar, after layout.
     fn bottom_status(
         &self,
@@ -569,6 +574,20 @@ impl App {
             frame.render_widget(
                 Paragraph::new(bar).style(theme::style(theme::Role::StatusBar)),
                 status,
+            );
+        }
+        // The marker owns the bar's right end; screens leave it room.
+        if let Some(marker) = screen.status_marker() {
+            let width =
+                (unicode_width::UnicodeWidthStr::width(marker.as_str()) as u16).min(status.width);
+            let at = Rect {
+                x: status.right() - width,
+                width,
+                ..status
+            };
+            frame.render_widget(
+                Paragraph::new(marker).style(theme::style(theme::Role::WarningTitle)),
+                at,
             );
         }
     }
@@ -5818,6 +5837,97 @@ mod tests {
                 // The parent draft is untouched behind the card.
                 press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
                 assert_eq!(draft_text(&mut app), "parent");
+            });
+        }
+    }
+
+    #[test]
+    fn the_blocker_marker_holds_the_right_end_of_the_status_bar() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        let marker = |b: &ratatui::buffer::Buffer, width: u16, text: &str| {
+            let at = width - text.chars().count() as u16;
+            let shown: String = (at..width).map(|x| b[(x, 23)].symbol()).collect();
+            assert_eq!(shown, text, "{width}");
+            let badge = theme::style(theme::Role::WarningTitle);
+            for x in at..width {
+                if let Some(bg) = badge.bg {
+                    assert_eq!(b[(x, 23)].bg, bg);
+                }
+            }
+            at
+        };
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                // An agent conversation with everything competing for room:
+                // a long error, the mailbox and the activity spinner.
+                let (mut app, mut rx) = self::app();
+                let (_, now) = test_clock();
+                app.ctx.now = now;
+                let (feed, act) = mateo_streams(&mut app, &mut rx);
+                inbox_rows(&mut app, &[("Zed", 1, "2026-10-18T12:00:01Z")]);
+                app.on_event(Event::Data(Data::ActivityBaseline {
+                    id: act,
+                    through_id: 0,
+                    record: None,
+                }));
+                app.on_event(Event::Data(Data::Activity {
+                    id: act,
+                    result: Ok(vec![activity(1, "00", r#"{"event":"text"}"#)]),
+                }));
+                assert!(blocker_poll(&mut app, &mut rx).is_some());
+                blockers_listed(
+                    &mut app,
+                    feed,
+                    vec![blocker(1, 1, "Zed", "a?"), blocker(2, 2, "Zed", "b?")],
+                );
+                app.ctx.preferences.error = Some("a very long preference error ".repeat(4));
+                for width in [60, 80] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                    terminal.draw(|f| app.draw(f)).unwrap();
+                    let b = terminal.backend().buffer();
+                    let at = marker(b, width, "[2 blockers · F2]");
+                    // Mailbox and spinner sit just left of it, after a gap.
+                    assert_eq!(b[(at - 1, 23)].symbol(), " ");
+                    assert_eq!(b[(at - 2, 23)].symbol(), "⠋");
+                    assert_eq!(b[(at - 4, 23)].symbol(), "✉");
+                    let left: String = (0..at).map(|x| b[(x, 23)].symbol()).collect();
+                    // The error keeps its place at the left, clipped.
+                    assert!(left.contains("a v"), "{left}");
+                }
+                app.ctx.preferences.error = None;
+                // A long search prompt does not push it off either.
+                press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+                key(&mut app, '/');
+                typed(&mut app, &"needle ".repeat(12));
+                let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+                terminal.draw(|f| app.draw(f)).unwrap();
+                marker(terminal.backend().buffer(), 60, "[2 blockers · F2]");
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                // One open blocker; none, or an old server, shows nothing.
+                blockers_listed(&mut app, feed, vec![blocker(1, 1, "Zed", "a?")]);
+                let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+                terminal.draw(|f| app.draw(f)).unwrap();
+                marker(terminal.backend().buffer(), 60, "[1 blocker · F2]");
+                blockers_listed(&mut app, feed, vec![]);
+                assert!(!bottom(&mut app).contains("blocker"));
+                // A group thread's bar keeps the human and gains the marker.
+                let (mut app, mut rx) = self::app();
+                crew_list(&mut app, &mut rx);
+                enter(&mut app);
+                let (id, _) = watched(&mut rx);
+                assert!(blocker_poll(&mut app, &mut rx).is_some());
+                blockers_listed(&mut app, id, vec![blocker(1, 1, "Zed", "q?")]);
+                let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let b = terminal.backend().buffer();
+                marker(b, 60, "[1 blocker · F2]");
+                let left: String = (0..10).map(|x| b[(x, 23)].symbol()).collect();
+                assert!(left.contains("ada"), "{left}");
+                app.on_event(Event::Data(Data::Blockers {
+                    id,
+                    result: Err(SideError::Unsupported("old".into())),
+                }));
+                assert!(!bottom(&mut app).contains("blocker"));
             });
         }
     }

@@ -398,9 +398,6 @@ impl Thread {
         if let Some((query, hits)) = self.view.search_status() {
             text.push_str(&format!(" · /{query}: {hits} matches · n/N"));
         }
-        if let Some(count) = self.blockers.as_ref().and_then(Blockers::count) {
-            text.push_str(&format!(" · {} · F2", blocker_count(count)));
-        }
         if let Some(notice) = &self.effort_notice {
             text.push_str(&format!(" · {notice}"));
         }
@@ -428,9 +425,7 @@ impl Thread {
                 mode.push_str(" · G follows");
             }
         }
-        if let Some(count) = self.blockers.as_ref().and_then(Blockers::count) {
-            mode.push_str(&format!(" · {} · F2", blocker_count(count)));
-        }
+
         let issue = draft_error
             .map(|e| ("draft error", e.to_string()))
             .or_else(|| {
@@ -605,9 +600,12 @@ pub(crate) fn running_pane(
     pane
 }
 
-/// "1 blocker", "3 blockers".
-fn blocker_count(count: u64) -> String {
-    format!("{count} blocker{}", if count == 1 { "" } else { "s" })
+/// `[1 blocker · F2]`, `[3 blockers · F2]`: open blockers this human can see.
+fn blocker_marker(count: u64) -> String {
+    format!(
+        "[{count} blocker{} · F2]",
+        if count == 1 { "" } else { "s" }
+    )
 }
 
 /// Clip feedback by display columns without splitting emoji or combining marks.
@@ -973,6 +971,13 @@ impl Screen for Thread {
         }
     }
 
+    fn status_marker(&self) -> Option<String> {
+        self.blockers
+            .as_ref()
+            .and_then(Blockers::count)
+            .map(blocker_marker)
+    }
+
     fn bottom_status(
         &self,
         width: u16,
@@ -1003,11 +1008,17 @@ impl Screen for Thread {
             .agent
             .as_ref()
             .is_some_and(|agent| ctx.inbox.other_mail(agent));
-        let reserved = if indicator.is_some() {
-            if mailbox { 4 } else { 2 }
-        } else {
-            0
-        };
+        // The blocker marker, drawn over the right end, and its gap.
+        let marker = self
+            .status_marker()
+            .map_or(0, |m| m.width() as u16 + 1)
+            .min(width);
+        let reserved = marker
+            + if indicator.is_some() {
+                if mailbox { 4 } else { 2 }
+            } else {
+                0
+            };
         let text_width = width.saturating_sub(reserved);
         // The conversation's title, at the left: agent threads have no title
         // row. A long name keeps at most a third of the bar.
@@ -1043,12 +1054,15 @@ impl Screen for Thread {
                 ratatui::style::Style::reset().patch(theme::style(theme::Role::StatusBar));
             line = theme::clip_line(line, usize::from(text_width));
             let suffix = if mailbox && width >= 4 { "✉ " } else { "" };
-            let padding = usize::from(width - 1).saturating_sub(line.width() + suffix.width());
+            let padding = usize::from(width.saturating_sub(1 + marker))
+                .saturating_sub(line.width() + suffix.width());
             line.spans.push(Span::raw(" ".repeat(padding)));
             if !suffix.is_empty() {
                 line.spans.push(Span::styled(suffix, indicator.style));
             }
             line.spans.push(indicator);
+        } else {
+            line = theme::clip_line(line, usize::from(text_width));
         }
         Some(line)
     }

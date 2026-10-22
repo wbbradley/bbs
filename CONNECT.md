@@ -172,8 +172,9 @@ available to the child, as described in [HEADLESS.md](HEADLESS.md#side-questions
 
 Agent and group conversations poll their open blockers (`blockers.v1`) about
 once a second: a group thread its group's, an agent conversation every group
-of that agent, each labelled with its group. The status bar shows `N blockers ·
-F2` while any are open. F2, from writing or navigation, replaces the composer
+of that agent, each labelled with its group. While any are open, the right end
+of the status bar shows `[N blockers · F2]` on the warning colour, ahead of the
+mail and activity marks, however long the rest of the bar. F2, from writing or navigation, replaces the composer
 with the blocker panel, which grows to at most two thirds of the height so the
 timeline stays in view; owner question and context cards hide until it closes.
 An open dialog, the search prompt or an owner form keeps F2, and an open

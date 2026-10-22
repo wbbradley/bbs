@@ -12,7 +12,8 @@ under the new package version and its publication date.
 
 - `bbs connect`'s blocker panel is a card on the colour scheme's warning
   surface under a warning title bar naming the blocker being answered; its
-  cancel action reads `[Cancel]`.
+  cancel action reads `[Cancel]`. Open blockers show as `[N blockers · F2]` at
+  the right end of the status bar.
 
 ### Fixed
 
