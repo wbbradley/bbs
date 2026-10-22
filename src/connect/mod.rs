@@ -116,6 +116,7 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
         inbox: Default::default(),
         efforts: Default::default(),
         navigation_notice: None,
+        blocker_marker: None,
     };
     let (events, mut rx) = unbounded_channel();
     let (requests, requests_rx) = unbounded_channel();

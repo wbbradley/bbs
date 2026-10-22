@@ -6,6 +6,17 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Changed
+
+- `bbs connect` keeps one queue of your blockers, from every group with a live
+  agent of yours, polled on every screen. `[N blockers · F2]` shows in every
+  status bar, and F2 opens the queue from any screen as a card over the whole
+  terminal; closing it returns to exactly where you were, and nothing beneath
+  is marked read meanwhile. Needs a server with `blockers-mine.v1`; conversations
+  no longer keep their own blocker panels.
+
 ## 0.14.2 - 2026-10-22
 
 Agents page blocker counts. Protocol v2, database schema 21, config format 4

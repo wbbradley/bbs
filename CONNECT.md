@@ -170,32 +170,38 @@ available to the child, as described in [HEADLESS.md](HEADLESS.md#side-questions
 
 ### Blockers
 
-Agent and group conversations poll their open blockers (`blockers.v1`) about
-once a second: a group thread its group's, an agent conversation every group
-of that agent, each labelled with its group. While any are open, the right end
-of the status bar shows `[N blockers · F2]` on the warning colour, ahead of the
-mail and activity marks, however long the rest of the bar. F2, from writing or navigation, replaces the composer
-with the blocker panel, which grows to at most two thirds of the height so the
-timeline stays in view; owner question and context cards hide until it closes.
-An open dialog, the search prompt or an owner form keeps F2, and an open
-`/btw` panel must close first. The panel is a card on the scheme's warning
-surface under a warning title bar that names the blocker's creator and group,
-`Answering a blocker from CREATOR @group` when the box below can answer it, and
-the position in the queue; the answer box keeps the composer's surface. Without
-colour, the title bar is reversed and bold.
+`bbs connect` keeps one queue of your blockers (`blockers-mine.v1`): every open
+blocker in a current group that has a live agent of yours, whoever created it,
+each listed once and labelled with its group. The app polls it about once a
+second, one request at a time, whichever screen is up, splash included. While
+any are open, the right end of the status bar shows `[N blockers · F2]` on the
+warning colour, on every screen, ahead of a conversation's mail and activity
+marks, however long the rest of the bar.
 
-The panel lists blockers oldest first, the first 50 of the scope with a count
+F2 opens the queue from any screen, over dialogs, forms, the search prompt and
+the `/btw` panel too, as a card covering the whole terminal: the scheme's
+warning surface under a warning title bar that names the blocker's creator and
+group, `Answering a blocker from CREATOR @group` when the box below can answer
+it, and the position among open blockers; the answer box keeps the composer's
+surface. Without colour, the title bar is reversed and bold. The screen beneath
+is left exactly as it was: its draft, cursor, selection, scroll, mode and side
+panel come back when the card closes. It keeps receiving mail and activity and
+its side state is still polled, but nothing is marked read or seen until the
+card closes. Ctrl-C still quits.
+
+The card lists blockers oldest first, the first 50 of the scope with a count
 of any more; each refresh fills in rows as others resolve. Alt-↑/↓ selects;
 plain arrows edit the answer; PgUp/PgDn page through a selected text too long
-for the panel, which shows how far you have read. The selected blocker's text
+for the card, which shows how far you have read. The selected blocker's text
 sits above an answer box labelled `answer → CREATOR @group`: the answer goes as
-mail to the agent that wrote the current version, which in an agent
-conversation may be another agent of its groups. Blockers you cannot answer are read only and say why: no agent
+mail to the agent that wrote the current version, which may be another
+owner's agent. Blockers you cannot answer are read only and say why: no agent
 of yours in the group, or the creating agent is gone, in which case Tab still
-reaches Cancel. Each blocker keeps its own answer draft for this session.
+reaches Cancel. Each blocker keeps its own answer draft for this session, across
+visits and screens; the card's input never mixes with a screen's.
 Enter sends; the answer shows darkened with a spinner until the server
 confirms. Tab reaches `[Cancel]`, whose Enter asks once more (Enter
-confirms, Esc returns to the answer); cancelling sends no mail. The panel owns
+confirms, Esc returns to the answer); cancelling sends no mail. The card owns
 Tab and Shift-Tab, so they do not change effort while it is open.
 
 One write per blocker is out at a time, and other blockers stay usable
@@ -204,17 +210,16 @@ repeats the same request, which the server applies at most once. A refusal,
 such as another person answering first, shows its reason and keeps the draft;
 once the blocker is no longer open it stays listed, read only, with its draft
 and reason until Tab then Enter dismisses it (the newest 20 are kept).
-When another agent replaces a blocker's text, the panel shows the new text in
+When another agent replaces a blocker's text, the card shows the new text in
 place from its top, keeps the draft, withdraws any pending cancel
 confirmation, and ignores Enter for one second. Other changes show `Blockers
 updated.` for five seconds. When no blocker in scope is open, past the first
-page too, and nothing needs attention, `Done with blockers.` shows for 750 ms
-in the composer's own box, where its text would start and without the chevron,
-swallowing keys; then the composer returns with its draft in the same place,
-so the conversation does not move. A new blocker meanwhile keeps the panel.
-Esc returns to the composer at any time; answers still out finish on their
-own. A server without `blockers.v1` is asked once per conversation: the count
-stays hidden, F2 says a newer server is needed, and `r` asks again.
+page too, and nothing needs attention, `Done with blockers.` shows for 750 ms,
+swallowing keys, then the card closes onto the screen it covered. A new blocker
+meanwhile keeps the card. Esc closes it at any time; answers still out finish
+on their own. A server without `blockers-mine.v1` is asked once: the marker
+stays hidden, F2 says a newer server is needed, and `r` asks again. The queue is
+never replaced by the whole board's.
 
 ### Agent effort
 

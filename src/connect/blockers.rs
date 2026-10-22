@@ -176,7 +176,7 @@ impl Blockers {
     /// F2: open the panel, or say why not.
     pub fn open(&mut self, now: Instant) -> Result<(), String> {
         if self.support == Support::Unsupported {
-            return Err("Blockers need a newer server (blockers.v1); r retries.".into());
+            return Err("Blockers need a newer server (blockers-mine.v1); r retries.".into());
         }
         self.panel = Some(Panel {
             selected: self.rows.first().map(|b| b.root_id),
@@ -599,15 +599,6 @@ impl Blockers {
         }
     }
 
-    /// The panel's height for this width, before the caller's cap.
-    pub fn height(&self, width: u16) -> u16 {
-        let (head, body, label) = self.parts(width);
-        let body = Paragraph::new(body)
-            .wrap(Wrap { trim: false })
-            .line_count(width);
-        (head.len() + body + label.iter().count()) as u16 + self.answer_height(width) + 2
-    }
-
     fn answer_height(&self, width: u16) -> u16 {
         match (self.selected(), self.selected_chain()) {
             // A draft written before the row became read only still shows.
@@ -694,6 +685,14 @@ impl Blockers {
             return Default::default();
         };
         let mut lines = vec![self.title(width)];
+        if self.done() {
+            lines.push(Line::default());
+            lines.push(Line::styled(
+                "  Done with blockers.",
+                theme::style(Role::Success),
+            ));
+            return (lines, Vec::new(), None);
+        }
         if !self.loaded {
             lines.push(Line::styled("Loading…", theme::dim()));
             return (lines, Vec::new(), None);
@@ -878,14 +877,15 @@ impl Blockers {
         if let Some(panel) = &mut self.panel {
             panel.scroll = panel.scroll.min(rows.saturating_sub(body_area.height));
             if rows > body_area.height
-                && let Some(label) = &mut label
+                && let Some(line) = label.take()
             {
-                // The rest is a page key away.
+                // The rest is a page key away; the hint keeps its room.
                 let last = (panel.scroll + body_area.height).min(rows);
-                label.spans.push(Span::styled(
-                    format!("  PgUp/PgDn text {last}/{rows}"),
-                    theme::dim(),
-                ));
+                let hint = format!("  PgUp/PgDn text {last}/{rows}");
+                let room = usize::from(area.width).saturating_sub(hint.width());
+                let mut line = theme::clip_line(line, room);
+                line.spans.push(Span::styled(hint, theme::dim()));
+                label = Some(line);
             }
             frame.render_widget(body.scroll((panel.scroll, 0)), body_area);
         }
@@ -1107,7 +1107,7 @@ mod tests {
         };
         blockers.on_data(SCREEN, &old, now);
         assert_eq!(blockers.poll(SCREEN), None);
-        assert!(blockers.open(now).unwrap_err().contains("blockers.v1"));
+        assert!(blockers.open(now).unwrap_err().contains("blockers-mine.v1"));
         assert!(!blockers.is_open());
         blockers.reload();
         assert!(blockers.poll(SCREEN).is_some());

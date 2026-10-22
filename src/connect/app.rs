@@ -10,9 +10,10 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::blockers::{self, Blockers};
 use super::composer::Composer;
 use super::drafts::{Draft, DraftStore};
-use super::event::{Data, Event, Request};
+use super::event::{BlockerScope, Data, Event, Request};
 use super::keys::{Action, Keymap};
 use super::navigation::{Conversation, Feedback, History, Inbox};
 use super::preferences::Preferences;
@@ -44,6 +45,9 @@ pub struct Ctx {
     pub inbox: Inbox,
     pub efforts: super::effort::Efforts,
     pub navigation_notice: Option<Feedback>,
+    /// The blocker marker the app draws at the bar's right end, if any, so a
+    /// screen's own bar can leave it room.
+    pub blocker_marker: Option<String>,
 }
 
 pub enum Transition {
@@ -131,11 +135,6 @@ pub trait Screen {
     fn composer_text(&self) -> Option<String> {
         None
     }
-    /// A short marker kept at the right end of the bottom bar, whatever else
-    /// the bar says.
-    fn status_marker(&self) -> Option<String> {
-        None
-    }
     /// Optional screen feedback for the shared bottom bar, after layout.
     fn bottom_status(
         &self,
@@ -164,6 +163,17 @@ pub struct App {
     history: History,
     known_agents: Option<HashSet<String>>,
     known_groups: Option<HashSet<String>>,
+    /// The human's own blocker queue, on every screen, and its F2 modal.
+    blockers: Blockers,
+    blockers_id: u64,
+}
+
+/// `[1 blocker · F2]`, `[3 blockers · F2]`: the human's open blockers.
+fn blocker_marker(count: u64) -> String {
+    format!(
+        "[{count} blocker{} · F2]",
+        if count == 1 { "" } else { "s" }
+    )
 }
 
 impl App {
@@ -178,6 +188,8 @@ impl App {
             history: History::default(),
             known_agents: None,
             known_groups: None,
+            blockers: Blockers::new(BlockerScope::Mine),
+            blockers_id: next_id(),
         };
         app.send(vec![Request::WatchSummary(app.ctx.inbox.id)]);
         app.push(Box::new(Menu::default()));
@@ -225,9 +237,13 @@ impl App {
 
     /// When the top screen's animation frame next changes, if it animates.
     pub fn next_animation_frame(&self) -> Option<Instant> {
+        let now = (self.ctx.now)();
         self.stack
             .last()
             .and_then(|screen| screen.next_animation_frame())
+            .into_iter()
+            .chain(self.blockers.next_frame(now))
+            .min()
     }
 
     fn pop(&mut self) {
@@ -239,6 +255,10 @@ impl App {
     }
 
     fn viewed(&mut self) {
+        // The blocker modal covers the screen: nothing under it is viewed.
+        if self.blockers.is_open() {
+            return;
+        }
         let screen = self.stack.last_mut().expect("the menu is never popped");
         let unread = screen.unread_mail();
         let mut requests = screen.on_view(&self.ctx);
@@ -318,6 +338,9 @@ impl App {
     pub fn on_event(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) => {
+                if let Some(quit) = self.blocker_key(key) {
+                    return quit;
+                }
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('g' | 'o'))
                 {
@@ -358,6 +381,10 @@ impl App {
             Event::Paste(text) => {
                 self.keymap = Keymap::default();
                 self.ctx.navigation_notice = None;
+                if self.blockers.is_open() {
+                    self.blockers.paste(&text);
+                    return false;
+                }
                 self.top().paste(&text);
                 self.viewed();
                 false
@@ -423,6 +450,8 @@ impl App {
                     }
                     _ => {}
                 }
+                self.blockers
+                    .on_data(self.blockers_id, &data, (self.ctx.now)());
                 if let Data::Sent { id, result } = &data {
                     for draft in self.drafts.values_mut() {
                         draft.sent(*id, result.clone());
@@ -440,12 +469,51 @@ impl App {
             Event::Tick => {
                 self.flush_drafts();
                 let screen = self.stack.last_mut().expect("the menu is never popped");
-                let requests = screen.on_tick(&self.ctx);
+                // One personal blocker poll at a time, whatever is on top.
+                let mut requests: Vec<Request> =
+                    self.blockers.poll(self.blockers_id).into_iter().collect();
+                requests.extend(screen.on_tick(&self.ctx));
                 self.send(requests);
                 false
             }
             Event::Resize => false,
         }
+    }
+
+    /// F2 and the open blocker modal, ahead of every screen: `Some(quit)`
+    /// when the key was theirs.
+    fn blocker_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let now = (self.ctx.now)();
+        if self.blockers.is_open() {
+            if self.blockers.settle(now) {
+                // The goodbye has shown: the key belongs to the screen again.
+                self.viewed();
+                return None;
+            }
+            self.keymap = Keymap::default();
+            return Some(match self.blockers.key(self.blockers_id, key, now) {
+                blockers::Outcome::Stay => false,
+                blockers::Outcome::Request(request) => {
+                    self.send(vec![request]);
+                    false
+                }
+                blockers::Outcome::Close => {
+                    self.viewed();
+                    false
+                }
+                // Ctrl-C quits from anywhere.
+                blockers::Outcome::Pass => true,
+            });
+        }
+        if key.code != KeyCode::F(2) || !key.modifiers.is_empty() {
+            return None;
+        }
+        self.keymap = Keymap::default();
+        self.ctx.navigation_notice = None;
+        if let Err(why) = self.blockers.open(now) {
+            self.ctx.navigation_notice = Some(Feedback::Other(why));
+        }
+        Some(false)
     }
 
     fn flush_drafts(&mut self) {
@@ -480,6 +548,7 @@ impl App {
                 return false;
             }
             Action::Reload => {
+                self.blockers.reload();
                 let mut screen = self.stack.pop().expect("the menu is never popped");
                 self.send(screen.reload());
                 self.fetch(screen.as_ref());
@@ -534,6 +603,12 @@ impl App {
             theme::render_too_small(frame);
             return;
         }
+        let now = (self.ctx.now)();
+        if self.blockers.settle(now) {
+            // The goodbye has shown: back to the screen it covered.
+            self.viewed();
+        }
+        self.ctx.blocker_marker = self.blockers.count().map(blocker_marker);
         let [title, mut body, status] = theme::frame_areas(frame.area());
         let screen = self.stack.last_mut().expect("the menu is never popped");
         // An agent conversation's title is at the left of its bottom bar, so
@@ -577,7 +652,7 @@ impl App {
             );
         }
         // The marker owns the bar's right end; screens leave it room.
-        if let Some(marker) = screen.status_marker() {
+        if let Some(marker) = &self.ctx.blocker_marker {
             let width =
                 (unicode_width::UnicodeWidthStr::width(marker.as_str()) as u16).min(status.width);
             let at = Rect {
@@ -586,9 +661,16 @@ impl App {
                 ..status
             };
             frame.render_widget(
-                Paragraph::new(marker).style(theme::style(theme::Role::WarningTitle)),
+                Paragraph::new(marker.clone()).style(theme::style(theme::Role::WarningTitle)),
                 at,
             );
+        }
+        // The blocker modal covers the whole terminal; the screen beneath is
+        // drawn as it is, untouched.
+        if self.blockers.is_open() {
+            // Clear first: styling alone would leave the screen's text.
+            frame.render_widget(ratatui::widgets::Clear, frame.area());
+            self.blockers.render(frame, frame.area(), now);
         }
     }
 }
@@ -1457,6 +1539,7 @@ mod tests {
             inbox: Default::default(),
             efforts: Default::default(),
             navigation_notice: None,
+            blocker_marker: None,
         };
         let mut app = App::new(ctx, tx);
         assert_eq!(
@@ -2357,6 +2440,7 @@ mod tests {
             inbox: Default::default(),
             efforts: Default::default(),
             navigation_notice: None,
+            blocker_marker: None,
         };
         let mut app = App::new(ctx, tx);
         let out = screen(&mut app, 80, 24);
@@ -2387,6 +2471,7 @@ mod tests {
             inbox: Default::default(),
             efforts: Default::default(),
             navigation_notice: None,
+            blocker_marker: None,
         };
         let mut app = App::new(ctx, tx);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -5632,17 +5717,16 @@ mod tests {
         })
     }
 
-    /// Mateo's conversation, its first blocker poll answered with `rows`.
+    /// Mateo's conversation, with the app's personal queue polled and
+    /// answered with `rows`; the queue's request id.
     fn mateo_blockers(
         app: &mut App,
         rx: &mut UnboundedReceiver<Request>,
         rows: Vec<proto::Blocker>,
     ) -> u64 {
-        let id = mateo(app, rx);
-        assert_eq!(
-            blocker_poll(app, rx),
-            Some((id, BlockerScope::Agent("Mateo".into())))
-        );
+        mateo(app, rx);
+        let id = app.blockers_id;
+        assert_eq!(blocker_poll(app, rx), Some((id, BlockerScope::Mine)));
         blockers_listed(app, id, rows);
         id
     }
@@ -5654,151 +5738,6 @@ mod tests {
                 _ => None,
             })
             .expect("an answer")
-    }
-
-    #[test]
-    fn f2_answers_blockers_in_the_composers_place_keeping_the_parent_draft() {
-        let (mut app, mut rx) = app();
-        let id = mateo_blockers(
-            &mut app,
-            &mut rx,
-            vec![
-                blocker(1, 1, "Zed", "first?"),
-                blocker(2, 2, "Mateo", "second?"),
-            ],
-        );
-        typed(&mut app, "parent");
-        assert!(bottom(&mut app).contains("2 blockers · F2"));
-        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-        let out = screen(&mut app, 60, 24);
-        assert!(
-            out.contains("answer → Zed @crew") && out.contains("first?"),
-            "{out}"
-        );
-        assert!(!out.contains("parent"), "the composer gives way: {out}");
-        // Typing is the answer's; Tab is the panel's, never effort: it
-        // reaches Cancel, which asks first, and Esc steps back.
-        typed(&mut app, "yes");
-        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-        enter(&mut app);
-        assert!(screen(&mut app, 60, 24).contains("Cancel this blocker?"));
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(draft_text(&mut app), "parent");
-        enter(&mut app);
-        let req = answered(&mut rx);
-        assert_eq!((req.id, req.answer.as_str()), (1, "yes"));
-        // Alt-↓ moves to the next blocker, whose recipient the box names.
-        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
-        assert!(screen(&mut app, 60, 24).contains("answer → Mateo @crew"));
-        // Esc returns to writing the parent draft, the answer still out.
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(editor_focused(&mut app));
-        assert_eq!(draft_text(&mut app), "parent");
-        assert!(screen(&mut app, 60, 24).contains("parent"));
-        // A late reply settles it without touching the parent.
-        app.on_event(Event::Data(Data::BlockerWritten {
-            id,
-            key: req.request_key,
-            result: Ok(Default::default()),
-        }));
-        assert!(bottom(&mut app).contains("1 blocker · F2"));
-        assert_eq!(draft_text(&mut app), "parent");
-    }
-
-    #[test]
-    fn the_last_answer_says_done_then_writing_resumes_with_the_parent_draft() {
-        let (mut app, mut rx) = app();
-        let (clock, now) = test_clock();
-        app.ctx.now = now;
-        let id = mateo_blockers(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "only?")]);
-        typed(&mut app, "parent");
-        // Opened from navigation, it still returns to writing.
-        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
-        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-        typed(&mut app, "ok");
-        enter(&mut app);
-        let req = answered(&mut rx);
-        app.on_event(Event::Data(Data::BlockerWritten {
-            id,
-            key: req.request_key,
-            result: Ok(Default::default()),
-        }));
-        assert!(screen(&mut app, 80, 24).contains("Done with blockers."));
-        assert!(app.next_animation_frame().is_some());
-        // Typing during the goodbye is swallowed, never parent mail.
-        typed(&mut app, "x");
-        enter(&mut app);
-        assert!(
-            !std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, Request::Send { .. }))
-        );
-        clock.advance(Duration::from_millis(749));
-        assert!(screen(&mut app, 80, 24).contains("Done with blockers."));
-        clock.advance(Duration::from_millis(1));
-        let out = screen(&mut app, 80, 24);
-        assert!(
-            out.contains("parent") && !out.contains("Done with"),
-            "{out}"
-        );
-        assert!(editor_focused(&mut app));
-        typed(&mut app, "!");
-        assert_eq!(draft_text(&mut app), "parent!");
-    }
-
-    #[test]
-    fn f2_waits_for_modals_side_conversations_and_a_newer_server() {
-        // The search prompt keeps its keys.
-        let (mut app, mut rx) = self::app();
-        mateo_blockers(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
-        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
-        key(&mut app, '/');
-        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-        assert!(!screen(&mut app, 80, 24).contains("answer →"));
-        // A side conversation must end first, and says so.
-        let (mut app, mut rx) = self::app();
-        mateo_streams(&mut app, &mut rx);
-        answered_btw(&mut app, &mut rx);
-        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-        let out = screen(&mut app, 100, 24);
-        assert!(out.contains("Leave the side conversation (Esc)"), "{out}");
-        assert!(!out.contains("answer →"));
-        // An old server is asked once; F2 explains, and reload asks again.
-        let (mut app, mut rx) = self::app();
-        let id = mateo(&mut app, &mut rx);
-        assert!(blocker_poll(&mut app, &mut rx).is_some());
-        app.on_event(Event::Data(Data::Blockers {
-            id,
-            result: Err(SideError::Unsupported(
-                "required capability blockers.v1 is unavailable".into(),
-            )),
-        }));
-        for _ in 0..3 {
-            assert_eq!(blocker_poll(&mut app, &mut rx), None);
-        }
-        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-        assert!(bottom(&mut app).contains("newer server (blockers.v1)"));
-        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
-        key(&mut app, 'r');
-        assert!(blocker_poll(&mut app, &mut rx).is_some());
-    }
-
-    #[test]
-    fn a_group_thread_polls_its_group_and_shows_the_count() {
-        let (mut app, mut rx) = app();
-        crew_list(&mut app, &mut rx);
-        enter(&mut app);
-        let (id, _) = watched(&mut rx);
-        assert_eq!(
-            blocker_poll(&mut app, &mut rx),
-            Some((id, BlockerScope::Group("crew".into())))
-        );
-        blockers_listed(&mut app, id, vec![blocker(1, 1, "Zed", "q?")]);
-        assert!(screen(&mut app, 80, 24).contains("1 blocker · F2"));
-        // F2 from the group's navigation; Esc returns to its composer.
-        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-        assert!(screen(&mut app, 80, 24).contains("answer → Zed @crew"));
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        typed(&mut app, "hi");
-        assert_eq!(draft_text(&mut app), "hi");
     }
 
     #[test]
@@ -5908,7 +5847,8 @@ mod tests {
                 let (mut app, mut rx) = self::app();
                 let (_, now) = test_clock();
                 app.ctx.now = now;
-                let (feed, act) = mateo_streams(&mut app, &mut rx);
+                let (_, act) = mateo_streams(&mut app, &mut rx);
+                let queue = app.blockers_id;
                 inbox_rows(&mut app, &[("Zed", 1, "2026-10-18T12:00:01Z")]);
                 app.on_event(Event::Data(Data::ActivityBaseline {
                     id: act,
@@ -5922,7 +5862,7 @@ mod tests {
                 assert!(blocker_poll(&mut app, &mut rx).is_some());
                 blockers_listed(
                     &mut app,
-                    feed,
+                    queue,
                     vec![blocker(1, 1, "Zed", "a?"), blocker(2, 2, "Zed", "b?")],
                 );
                 app.ctx.preferences.error = Some("a very long preference error ".repeat(4));
@@ -5949,18 +5889,22 @@ mod tests {
                 marker(terminal.backend().buffer(), 60, "[2 blockers · F2]");
                 press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
                 // One open blocker; none, or an old server, shows nothing.
-                blockers_listed(&mut app, feed, vec![blocker(1, 1, "Zed", "a?")]);
+                blockers_listed(&mut app, queue, vec![blocker(1, 1, "Zed", "a?")]);
                 let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
                 terminal.draw(|f| app.draw(f)).unwrap();
                 marker(terminal.backend().buffer(), 60, "[1 blocker · F2]");
-                blockers_listed(&mut app, feed, vec![]);
+                blockers_listed(&mut app, queue, vec![]);
                 assert!(!bottom(&mut app).contains("blocker"));
                 // A group thread's bar keeps the human and gains the marker.
                 let (mut app, mut rx) = self::app();
                 crew_list(&mut app, &mut rx);
                 enter(&mut app);
-                let (id, _) = watched(&mut rx);
-                assert!(blocker_poll(&mut app, &mut rx).is_some());
+                watched(&mut rx);
+                let id = app.blockers_id;
+                assert_eq!(
+                    blocker_poll(&mut app, &mut rx),
+                    Some((id, BlockerScope::Mine))
+                );
                 blockers_listed(&mut app, id, vec![blocker(1, 1, "Zed", "q?")]);
                 let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
                 terminal.draw(|f| app.draw(f)).unwrap();
@@ -5977,112 +5921,360 @@ mod tests {
         }
     }
 
+    /// The app still on its splash screen.
+    fn splash_app() -> (App, UnboundedReceiver<Request>) {
+        let (tx, mut rx) = unbounded_channel();
+        let (app, _) = self::app();
+        let app = App::new(
+            Ctx {
+                inbox: Default::default(),
+                efforts: Default::default(),
+                ..app.ctx
+            },
+            tx,
+        );
+        rx.try_recv().unwrap(); // the summary watch
+        (app, rx)
+    }
+
+    /// The app's personal queue, polled (or already out) and answered.
+    fn queue(app: &mut App, rx: &mut UnboundedReceiver<Request>, rows: Vec<proto::Blocker>) -> u64 {
+        let id = app.blockers_id;
+        if let Some(poll) = blocker_poll(app, rx) {
+            assert_eq!(poll, (id, BlockerScope::Mine));
+        }
+        blockers_listed(app, id, rows);
+        id
+    }
+
+    fn buffer(app: &mut App, width: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
     #[test]
-    fn done_with_blockers_shows_in_the_composers_own_box() {
+    fn the_personal_queue_polls_once_per_tick_on_every_screen() {
+        // The splash: one personal poll, then none while it is out.
+        let (mut app, mut rx) = splash_app();
+        let id = app.blockers_id;
+        assert_eq!(
+            blocker_poll(&mut app, &mut rx),
+            Some((id, BlockerScope::Mine))
+        );
+        assert_eq!(blocker_poll(&mut app, &mut rx), None, "one in flight");
+        blockers_listed(&mut app, id, vec![blocker(1, 1, "Zed", "q?")]);
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("press any key") && out.contains("[1 blocker · F2]"),
+            "{out}"
+        );
+        // The menu, then a group thread: still one app poll per tick, never
+        // a thread's own.
+        key(&mut app, ' ');
+        assert!(bottom(&mut app).contains("[1 blocker · F2]"));
+        crew_list(&mut app, &mut rx);
+        enter(&mut app);
+        watched(&mut rx);
+        for _ in 0..3 {
+            app.on_event(Event::Tick);
+            let polls: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|r| match r {
+                    Request::Blockers { id, scope } => Some((id, scope)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(polls, [(id, BlockerScope::Mine)]);
+            blockers_listed(&mut app, id, vec![blocker(1, 1, "Zed", "q?")]);
+        }
+        assert!(bottom(&mut app).contains("[1 blocker · F2]"));
+        // A server without blockers-mine.v1: no polls, no marker, and F2 says
+        // why; a reload asks again.
+        app.on_event(Event::Data(Data::Blockers {
+            id,
+            result: Err(SideError::Unsupported(
+                "required capability blockers-mine.v1 is unavailable".into(),
+            )),
+        }));
+        for _ in 0..3 {
+            assert_eq!(blocker_poll(&mut app, &mut rx), None);
+        }
+        assert!(!bottom(&mut app).contains("blocker"));
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(bottom(&mut app).contains("blockers-mine.v1"));
+        assert!(!screen(&mut app, 80, 24).contains("Answering"));
+        key(&mut app, 'r');
+        assert!(blocker_poll(&mut app, &mut rx).is_some());
+    }
+
+    #[test]
+    fn f2_opens_over_any_screen_and_esc_restores_it_exactly() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        type Setup = fn(&mut App, &mut UnboundedReceiver<Request>);
+        let origins: [(&str, Setup); 8] = [
+            ("menu", |_, _| {}),
+            ("agents, a row selected", |app, rx| {
+                open_agents(app, rx);
+                app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+                    humans: vec![],
+                    agents: vec![
+                        agent("Mateo", "ada", &["crew"]),
+                        agent("Zed", "ada", &["crew"]),
+                    ],
+                }))));
+                key(app, 'j');
+            }),
+            ("a draft, cursor moved", |app, rx| {
+                mateo_with(app, rx, 40);
+                typed(app, "parent draft");
+                press(app, KeyCode::Left, KeyModifiers::NONE);
+                press(app, KeyCode::Left, KeyModifiers::NONE);
+            }),
+            ("history, paused", |app, rx| {
+                mateo_with(app, rx, 60);
+                typed(app, "kept");
+                press(app, KeyCode::PageUp, KeyModifiers::NONE);
+                press(app, KeyCode::Up, KeyModifiers::NONE);
+            }),
+            ("the search prompt", |app, rx| {
+                mateo_with(app, rx, 10);
+                press(app, KeyCode::PageUp, KeyModifiers::NONE);
+                key(app, '/');
+                typed(app, "needle");
+            }),
+            ("a group dialog", |app, rx| {
+                crew_list(app, rx);
+                key(app, 'c');
+                typed(app, "ops");
+            }),
+            ("a side conversation", |app, rx| {
+                mateo_streams(app, rx);
+                answered_btw(app, rx);
+                typed(app, "follow-up draft");
+            }),
+            ("help", |app, _| {
+                key(app, '?');
+            }),
+        ];
         for scheme in SCHEMES {
-            for width in [60u16, 80] {
-                for draft in ["", "two", "wrapped"] {
-                    with_scheme(scheme, || {
-                        let (mut app, mut rx) = self::app();
-                        let (clock, now) = test_clock();
-                        app.ctx.now = now;
-                        let feed =
-                            mateo_blockers(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
-                        match draft {
-                            "two" => {
-                                typed(&mut app, "line one");
-                                press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
-                                typed(&mut app, "line two");
-                            }
-                            // One logical line wrapping onto several rows.
-                            "wrapped" => typed(&mut app, &"wrapping words ".repeat(9)),
-                            _ => {}
-                        }
-                        let draw = |app: &mut App| {
-                            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
-                            terminal.draw(|f| app.draw(f)).unwrap();
-                            terminal.backend().buffer().clone()
-                        };
-                        // The normal composer, and where its first text row is.
-                        let before = draw(&mut app);
-                        let text_row = (0..23)
-                            .find(|y| before[(0, *y)].symbol() == "›")
-                            .expect("the chevron marks the first text row");
-                        let gap = text_row - 2;
-                        // Answer the only blocker: the goodbye starts.
+            with_scheme(scheme, || {
+                for (origin, setup) in origins {
+                    let (mut app, mut rx) = self::app();
+                    let (_, now) = test_clock();
+                    app.ctx.now = now;
+                    setup(&mut app, &mut rx);
+                    queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+                    while rx.try_recv().is_ok() {}
+                    for width in [60, 80] {
+                        let before = buffer(&mut app, width);
                         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-                        typed(&mut app, "ok");
-                        enter(&mut app);
-                        let req = answered(&mut rx);
-                        app.on_event(Event::Data(Data::BlockerWritten {
-                            id: feed,
-                            key: req.request_key,
-                            result: Ok(Default::default()),
-                        }));
-                        let done = draw(&mut app);
-                        crate::ui::theme::testing::assert_buffer(&done);
-                        let screen_bg = theme::base().bg;
-                        let human = theme::base().patch(theme::style(theme::Role::HumanSurface));
-                        let row = |b: &ratatui::buffer::Buffer, y: u16| {
-                            (0..width).map(|x| b[(x, y)].symbol()).collect::<String>()
-                        };
-                        // The timeline above does not move.
-                        for y in 0..gap {
-                            assert_eq!(row(&done, y), row(&before, y), "{scheme:?} {width} {y}");
-                        }
-                        // The same box: a dark gap row, then the input surface
-                        // down to the status bar, with no chevron or warning card.
-                        let warning = theme::style(theme::Role::WarningTitle).bg;
-                        for x in 0..width {
-                            assert_eq!(done[(x, gap)].bg, screen_bg.unwrap(), "{scheme:?} gap");
-                            assert_eq!(done[(x, gap)].bg, before[(x, gap)].bg);
-                            for y in gap + 1..23 {
-                                let cell = &done[(x, y)];
-                                assert_eq!(
-                                    cell.bg,
-                                    human.bg.unwrap(),
-                                    "{scheme:?} {width} {x},{y}"
-                                );
-                                if warning.is_some() {
-                                    assert_ne!(Some(cell.bg), warning);
-                                }
-                                assert_ne!(cell.symbol(), "›");
-                            }
-                        }
-                        // The note starts where the draft's text starts.
-                        let note = row(&done, text_row);
-                        assert_eq!(&note[..2], "  ", "{note:?}");
-                        assert!(note[2..].starts_with("Done with blockers."), "{note:?}");
+                        let open = buffer(&mut app, width);
+                        crate::ui::theme::testing::assert_buffer(&open);
+                        let top: String = (0..width).map(|x| open[(x, 0)].symbol()).collect();
                         assert!(
-                            (gap..23).all(|y| y == text_row || !row(&done, y).contains("Done"))
+                            top.starts_with(" Answering a blocker from Zed @crew"),
+                            "{origin}: {top}"
                         );
-                        // Typing during the goodbye is swallowed.
+                        // Keys and paste are the answer's, never the screen's.
                         typed(&mut app, "x");
-                        // Then the composer, with its draft, in the same place.
-                        clock.advance(crate::connect::blockers::DONE);
-                        let after = draw(&mut app);
-                        for y in 0..23 {
+                        app.on_event(Event::Paste("y".into()));
+                        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                        let after = buffer(&mut app, width);
+                        for y in 0..24 {
                             for x in 0..width {
                                 assert_eq!(
                                     after[(x, y)],
                                     before[(x, y)],
-                                    "{scheme:?} {width} {x},{y}"
+                                    "{scheme:?} {origin} {width}: {x},{y}"
                                 );
                             }
                         }
-                    });
+                    }
+                    // Nothing was sent on the screen's behalf.
+                    assert!(
+                        std::iter::from_fn(|| rx.try_recv().ok()).all(|r| matches!(
+                            r,
+                            Request::SideReport { .. } | Request::Blockers { .. }
+                        )),
+                        "{origin}"
+                    );
                 }
-            }
+            });
         }
     }
 
     #[test]
-    fn the_blocker_panel_draws_in_every_scheme_at_sixty_columns() {
+    fn the_splash_opens_the_queue_and_comes_back_unchanged() {
+        let (mut app, mut rx) = splash_app();
+        queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+        let before = buffer(&mut app, 80);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(screen(&mut app, 80, 24).contains("Answering a blocker from Zed"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(buffer(&mut app, 80), before);
+        assert!(screen(&mut app, 80, 24).contains("press any key"));
+    }
+
+    #[test]
+    fn answer_drafts_stay_across_visits_and_screens() {
+        let (mut app, mut rx) = app();
+        let id = queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        typed(&mut app, "half an answer");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        // Another screen, then back to the queue: the answer is still there.
+        mateo(&mut app, &mut rx);
+        typed(&mut app, "parent");
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(screen(&mut app, 80, 24).contains("half an answer"));
+        typed(&mut app, ", finished");
+        enter(&mut app);
+        let req = answered(&mut rx);
+        assert_eq!(
+            (req.id, req.answer.as_str()),
+            (1, "half an answer, finished")
+        );
+        app.on_event(Event::Data(Data::BlockerWritten {
+            id,
+            key: req.request_key,
+            result: Ok(Default::default()),
+        }));
+        assert_eq!(draft_text(&mut app), "parent", "the inputs never mix");
+    }
+
+    #[test]
+    fn done_returns_to_the_exact_origin_after_its_goodbye() {
+        for width in [60, 80] {
+            let (mut app, mut rx) = app();
+            let (clock, now) = test_clock();
+            app.ctx.now = now;
+            let id = mateo_blockers(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "only?")]);
+            typed(&mut app, "parent");
+            // Opened from navigation, it returns to navigation.
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+            let before = buffer(&mut app, width);
+            press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+            typed(&mut app, "ok");
+            enter(&mut app);
+            let req = answered(&mut rx);
+            app.on_event(Event::Data(Data::BlockerWritten {
+                id,
+                key: req.request_key,
+                result: Ok(Default::default()),
+            }));
+            assert!(screen(&mut app, width, 24).contains("Done with blockers."));
+            assert!(app.next_animation_frame().is_some());
+            // The goodbye swallows typing, Esc and Enter: never parent mail.
+            typed(&mut app, "x");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            enter(&mut app);
+            assert!(
+                !std::iter::from_fn(|| rx.try_recv().ok())
+                    .any(|r| matches!(r, Request::Send { .. }))
+            );
+            clock.advance(crate::connect::blockers::DONE - Duration::from_millis(1));
+            assert!(screen(&mut app, width, 24).contains("Done with blockers."));
+            clock.advance(Duration::from_millis(1));
+            let after = buffer(&mut app, width);
+            for y in 0..23 {
+                for x in 0..width {
+                    assert_eq!(after[(x, y)], before[(x, y)], "{width}: {x},{y}");
+                }
+            }
+            // The bar is the same less the marker for the answered blocker.
+            let bar: String = (0..width).map(|x| after[(x, 23)].symbol()).collect();
+            assert!(!bar.contains("blocker"), "{bar}");
+            assert!(!editor_focused(&mut app), "back in navigation");
+            assert_eq!(draft_text(&mut app), "parent");
+        }
+    }
+
+    #[test]
+    fn a_covered_conversation_keeps_its_data_but_reads_nothing_until_closed() {
+        let (mut app, mut rx) = app();
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+        // The side poll from that tick is answered, so the next one asks again.
+        let side = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|r| match r {
+                Request::SideReport { id, .. } => Some(id),
+                _ => None,
+            })
+            .expect("the owner's side poll");
+        reply_to(&mut app, side, conv_report(1, None));
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        while rx.try_recv().is_ok() {}
+        // Mail to the human arrives while covered: kept, not marked read.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(1, "Mateo", "ada", "arrived while covered")]),
+        }));
+        // Its side state is still polled.
+        app.on_event(Event::Tick);
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::SideReport { .. })),
+            "{sent:?}"
+        );
+        // Closing uncovers it: read now, and shown.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(rx.try_recv().unwrap(), Request::MarkRead("Mateo".into()));
+        assert!(screen(&mut app, 80, 24).contains("arrived while covered"));
+    }
+
+    #[test]
+    fn the_goodbye_closing_by_itself_resumes_reading() {
+        let (mut app, mut rx) = app();
+        let (clock, now) = test_clock();
+        app.ctx.now = now;
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        let id = queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(1, "Mateo", "ada", "arrived while covered")]),
+        }));
+        typed(&mut app, "ok");
+        enter(&mut app);
+        let req = answered(&mut rx);
+        app.on_event(Event::Data(Data::BlockerWritten {
+            id,
+            key: req.request_key,
+            result: Ok(Default::default()),
+        }));
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, Request::MarkRead(_))),
+            "covered through the goodbye"
+        );
+        clock.advance(crate::connect::blockers::DONE);
+        // The next frame closes the card and reads what it covered.
+        screen(&mut app, 80, 24);
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|r| r == Request::MarkRead("Mateo".into()))
+        );
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_queue() {
+        let (mut app, mut rx) = app();
+        queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn the_queue_covers_the_terminal_in_every_scheme_at_sixty_columns() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {
             with_scheme(scheme, || {
-                let (mut app, mut rx) = app();
+                let (mut app, mut rx) = self::app();
                 let mut theirs = blocker(2, 2, "Zed", &"a long question ".repeat(60));
                 theirs.can_answer = false;
                 theirs.can_cancel = false;
@@ -6091,20 +6283,29 @@ mod tests {
                     &mut rx,
                     vec![blocker(1, 1, "Zed", "first?"), theirs],
                 );
+                typed(&mut app, "parent");
                 press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
                 typed(&mut app, "an answer");
                 let out = screen(&mut app, 60, 24);
+                let lines: Vec<&str> = out.lines().collect();
+                assert!(
+                    lines[0].starts_with(" Answering a blocker from Zed @crew"),
+                    "{out}"
+                );
                 assert!(
                     out.contains("an answer") && out.contains("[Cancel]"),
                     "{out}"
                 );
+                assert!(
+                    !out.contains("parent") && !out.contains("BBS v"),
+                    "covers all: {out}"
+                );
                 press(&mut app, KeyCode::Down, KeyModifiers::ALT);
                 let out = screen(&mut app, 60, 24);
-                assert!(out.contains("Read only:"), "{scheme:?}: {out}");
-                // A long blocker still leaves the timeline a third.
-                let panel = out.lines().position(|l| l.contains("Blocker from"));
-                assert!(panel >= Some(8), "{out}");
-                assert!(out.lines().next().unwrap().contains("No messages yet"));
+                assert!(
+                    out.contains("Read only:") && out.contains("PgUp/PgDn text"),
+                    "{scheme:?}: {out}"
+                );
             });
         }
     }

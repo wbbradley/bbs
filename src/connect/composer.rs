@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
+use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 use ratatui_textarea::{CursorMove, DataCursor, TextArea, WrapMode};
 
@@ -323,26 +323,6 @@ impl Composer {
             usize::from(text_area.height),
         );
         frame.render_widget(Paragraph::new(text).style(surface), text_area);
-    }
-}
-
-impl Composer {
-    /// A one-line note where the draft's first row would start, in the same
-    /// box, without the chevron or a caret; the draft is untouched.
-    pub fn render_note(&self, frame: &mut Frame, area: Rect, note: Line<'static>) {
-        let (_, text) = draw_box(frame, area);
-        // The top padding row, as an unscrolled draft has.
-        let padding = text.height.min(1);
-        if text.height > padding {
-            frame.render_widget(
-                Paragraph::new(note).style(theme::style(theme::Role::HumanSurface)),
-                Rect {
-                    y: text.y + padding,
-                    height: 1,
-                    ..text
-                },
-            );
-        }
     }
 }
 
