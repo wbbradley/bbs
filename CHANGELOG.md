@@ -10,6 +10,9 @@ under the new package version and its publication date.
 
 ### Fixed
 
+- F5 reloads a conversation while its composer is focused; refresh feedback
+  has a separate animated status-bar indicator until new mail and activity
+  arrive or fail. Network-error hints name a key that works while writing.
 - Sending from paused conversation history preserves the scroll position and
   returns to navigation instead of jumping to the newest messages.
 

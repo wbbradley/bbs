@@ -172,7 +172,7 @@ impl Blockers {
     /// F2: open the panel, or say why not.
     pub fn open(&mut self, now: Instant) -> Result<(), String> {
         if self.support == Support::Unsupported {
-            return Err(format!("{UNSUPPORTED} r retries."));
+            return Err("F5 retries · server needs blockers-mine.v1".into());
         }
         self.panel = Some(Panel {
             selected: self.rows.first().map(|b| b.root_id),

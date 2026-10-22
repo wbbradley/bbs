@@ -2772,7 +2772,8 @@ mod tests {
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         key(&mut app, 'r');
         assert!(matches!(rx.try_recv().unwrap(), Request::Unwatch(_)));
-        assert_eq!(watched(&mut rx).0, id);
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
+        assert_ne!(watched(&mut rx).0, id);
     }
 
     #[test]
@@ -5463,6 +5464,288 @@ mod tests {
         }
     }
 
+    /// The feed and optional activity subscriptions started by one reload.
+    fn refresh_requests(
+        app: &mut App,
+        rx: &mut UnboundedReceiver<Request>,
+        code: KeyCode,
+    ) -> (u64, Option<u64>) {
+        while rx.try_recv().is_ok() {}
+        press(app, code, KeyModifiers::NONE);
+        let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let feeds: Vec<_> = requests
+            .iter()
+            .filter_map(|r| match r {
+                Request::Watch { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let activities: Vec<_> = requests
+            .iter()
+            .filter_map(|r| match r {
+                Request::WatchActivity { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(feeds.len(), 1, "{requests:?}");
+        assert!(activities.len() <= 1, "{requests:?}");
+        (feeds[0], activities.first().copied())
+    }
+
+    #[test]
+    fn f5_refreshes_while_writing_and_waits_for_both_current_subscriptions() {
+        for feed_first in [true, false] {
+            for success in [true, false] {
+                let (mut app, mut rx) = app();
+                let (clock, now) = test_clock();
+                app.ctx.now = now;
+                let (old_feed, old_act) = mateo_streams(&mut app, &mut rx);
+                typed(&mut app, "parent");
+                key(&mut app, 'r');
+                assert_eq!(draft_text(&mut app), "parentr", "r remains text");
+                press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+                let draft = app.top().draft().unwrap().1;
+                app.on_event(Event::Data(Data::Feed {
+                    id: old_feed,
+                    result: Err("network offline".into()),
+                }));
+                assert!(screen(&mut app, 80, 24).contains("F5 reloads"));
+                let (feed, act) = refresh_requests(&mut app, &mut rx, KeyCode::F(5));
+                let act = act.unwrap();
+                assert_ne!(feed, old_feed);
+                assert_ne!(act, old_act);
+                assert!(bottom(&mut app).contains("⠋ refreshing"));
+                assert!(editor_focused(&mut app));
+                assert_eq!(app.top().draft().unwrap().1, draft);
+                clock.advance(Duration::from_millis(100));
+                assert!(bottom(&mut app).contains("⠙ refreshing"));
+                // Old subscriptions and unrelated replies cannot finish it.
+                app.on_event(Event::Data(Data::Feed {
+                    id: old_feed,
+                    result: Ok(vec![message(99, "Mateo", "ada", "STALE FEED")]),
+                }));
+                app.on_event(Event::Data(Data::Activity {
+                    id: old_act,
+                    result: Err("STALE ACTIVITY".into()),
+                }));
+                assert!(bottom(&mut app).contains("refreshing"));
+                let out = screen(&mut app, 80, 24);
+                assert!(!out.contains("STALE"), "{out}");
+                app.on_event(Event::Data(Data::ActivityBaseline {
+                    id: act,
+                    through_id: 0,
+                    record: None,
+                }));
+                assert!(
+                    bottom(&mut app).contains("refreshing"),
+                    "a baseline isn't completion"
+                );
+                let feed_result = if success {
+                    Ok(vec![])
+                } else {
+                    Err("new feed failure".into())
+                };
+                let act_result = if success {
+                    Ok(vec![])
+                } else {
+                    Err("new activity failure".into())
+                };
+                let feed_data = Data::Feed {
+                    id: feed,
+                    result: feed_result,
+                };
+                let act_data = Data::Activity {
+                    id: act,
+                    result: act_result,
+                };
+                let (first, last) = if feed_first {
+                    (feed_data, act_data)
+                } else {
+                    (act_data, feed_data)
+                };
+                app.on_event(Event::Data(first));
+                assert!(
+                    bottom(&mut app).contains("refreshing"),
+                    "one subscription still pending"
+                );
+                app.on_event(Event::Data(last));
+                assert!(!bottom(&mut app).contains("refreshing"));
+                assert!(
+                    app.next_animation_frame().is_none(),
+                    "no refresh redraw loop remains"
+                );
+                assert_eq!(app.top().draft().unwrap().1, draft);
+                assert!(editor_focused(&mut app));
+                if !success {
+                    assert!(screen(&mut app, 80, 24).contains("new feed failure"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_waits_for_activity_replay_and_a_repeated_refresh_fences_both_old_streams() {
+        let (mut app, mut rx) = app();
+        let (_, now) = test_clock();
+        app.ctx.now = now;
+        mateo_streams(&mut app, &mut rx);
+        let (old_feed, old_act) = refresh_requests(&mut app, &mut rx, KeyCode::F(5));
+        let (feed, act) = refresh_requests(&mut app, &mut rx, KeyCode::F(5));
+        let act = act.unwrap();
+        assert_ne!(feed, old_feed);
+        assert_ne!(Some(act), old_act);
+        app.on_event(Event::Data(Data::Feed {
+            id: old_feed,
+            result: Ok(vec![]),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: old_act.unwrap(),
+            result: Ok(vec![]),
+        }));
+        assert!(bottom(&mut app).contains("refreshing"));
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![]),
+        }));
+        app.on_event(Event::Data(Data::ActivityBaseline {
+            id: act,
+            through_id: 201,
+            record: Some(r#"{"event":"turn_end"}"#.into()),
+        }));
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok((1..=200)
+                .map(|id| activity(id, "01", r#"{"event":"thought","text":"replay"}"#))
+                .collect()),
+        }));
+        assert!(
+            bottom(&mut app).contains("refreshing"),
+            "replay has not reached its baseline"
+        );
+        app.on_event(Event::Data(Data::Activity {
+            id: act,
+            result: Ok(vec![activity(201, "02", r#"{"event":"turn_end"}"#)]),
+        }));
+        let status = bottom(&mut app);
+        assert!(
+            !status.contains("refreshing") && status.trim_end().ends_with('✓'),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn refreshing_keeps_its_own_status_space_beside_blockers_and_agent_progress() {
+        use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let (mut app, mut rx) = app();
+                let (_, now) = test_clock();
+                app.ctx.now = now;
+                mateo_streams(&mut app, &mut rx);
+                queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "question")]);
+                app.ctx.preferences.error = Some("a long preference failure ".repeat(10));
+                typed(&mut app, "kept draft");
+                refresh_requests(&mut app, &mut rx, KeyCode::F(5));
+                for width in [60, 80] {
+                    let buf = buffer(&mut app, width);
+                    assert_buffer(&buf);
+                    let line: String = (0..width).map(|x| buf[(x, 23)].symbol()).collect();
+                    assert!(line.contains("refreshing"), "{scheme:?}: {line}");
+                    assert!(line.ends_with("[1 blocker · F2]"), "{line}");
+                    assert!(
+                        line.contains(" · "),
+                        "the agent progress is separate: {line}"
+                    );
+                    // At 60 columns, title/mode and the three indicators
+                    // leave no room for long feedback. At 80 it stays visible.
+                    if width == 80 {
+                        assert!(line.contains("a long"), "error still visible: {line}");
+                    }
+                }
+                assert_eq!(draft_text(&mut app), "kept draft");
+            });
+        }
+    }
+
+    #[test]
+    fn the_blocker_retry_hint_works_with_a_conversation_draft_focused() {
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        let id = app.blockers_id;
+        blocker_poll(&mut app, &mut rx);
+        app.on_event(Event::Data(Data::Blockers {
+            id,
+            result: Err(SideError::Unsupported("blockers-mine.v1".into())),
+        }));
+        typed(&mut app, "kept draft");
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(bottom(&mut app).contains("F5 retries"));
+        let narrow = screen(&mut app, 60, 24);
+        assert!(
+            narrow.lines().last().unwrap().contains("F5 retries"),
+            "{narrow}"
+        );
+        refresh_requests(&mut app, &mut rx, KeyCode::F(5));
+        assert_eq!(blocker_poll(&mut app, &mut rx), Some(id));
+        assert_eq!(draft_text(&mut app), "kept draft");
+        assert!(editor_focused(&mut app));
+    }
+
+    #[test]
+    fn group_and_feed_refresh_use_one_current_snapshot_and_protect_modal_input() {
+        for group in [true, false] {
+            let (mut app, mut rx) = app();
+            let (clock, now) = test_clock();
+            app.ctx.now = now;
+            if group {
+                crew_list(&mut app, &mut rx);
+                enter(&mut app);
+            } else {
+                key(&mut app, 'f');
+            }
+            let (old, _) = watched(&mut rx);
+            if group {
+                key(&mut app, 'i');
+                typed(&mut app, "group draft");
+            }
+            let (feed, act) = refresh_requests(&mut app, &mut rx, KeyCode::F(5));
+            assert_ne!(feed, old);
+            assert!(act.is_none());
+            assert!(bottom(&mut app).contains("⠋ refreshing"));
+            clock.advance(Duration::from_millis(100));
+            assert!(bottom(&mut app).contains("⠙ refreshing"));
+            app.on_event(Event::Data(Data::Feed {
+                id: old,
+                result: Ok(vec![]),
+            }));
+            assert!(bottom(&mut app).contains("refreshing"));
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(vec![]),
+            }));
+            assert!(!bottom(&mut app).contains("refreshing"));
+            if group {
+                assert_eq!(draft_text(&mut app), "group draft");
+            }
+        }
+        let (mut app, mut rx) = app();
+        mateo_streams(&mut app, &mut rx);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        key(&mut app, '/');
+        typed(&mut app, "search text");
+        while rx.try_recv().is_ok() {}
+        press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        assert!(rx.try_recv().is_err(), "search owns its keys");
+        assert!(bottom(&mut app).contains("/search text█"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "question")]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        while rx.try_recv().is_ok() {}
+        press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        assert!(rx.try_recv().is_err(), "blocker modal owns its keys");
+        assert!(screen(&mut app, 80, 24).contains("Answering a blocker"));
+    }
+
     #[test]
     fn initial_display_hold_expires_even_when_the_feed_stalls_and_resets_on_reload() {
         let (mut app, mut rx) = app();
@@ -5490,7 +5773,10 @@ mod tests {
         while rx.try_recv().is_ok() {}
         key(&mut app, 'r');
         assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(act));
-        assert_eq!(watched(&mut rx).0, feed);
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(feed));
+        let old_feed = feed;
+        let (feed, _) = watched(&mut rx);
+        assert_ne!(feed, old_feed);
         let Request::WatchActivity { id: fresh, .. } = rx.try_recv().unwrap() else {
             panic!("activity watch")
         };
@@ -8035,7 +8321,10 @@ mod tests {
         while rx.try_recv().is_ok() {}
         key(&mut app, 'r');
         assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(act));
-        assert_eq!(watched(&mut rx).0, feed);
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(feed));
+        let old_feed = feed;
+        let (feed, _) = watched(&mut rx);
+        assert_ne!(feed, old_feed);
         let Request::WatchActivity { id: new_act, .. } = rx.try_recv().unwrap() else {
             panic!("expected replacement activity watch");
         };
@@ -9491,7 +9780,7 @@ mod tests {
     #[test]
     fn e_cycles_the_kinds_of_activity_shown() {
         let (mut app, mut rx) = app();
-        let (_, act) = mateo_streams(&mut app, &mut rx);
+        let (feed, act) = mateo_streams(&mut app, &mut rx);
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         app.on_event(Event::Data(Data::Activity {
             id: act,
@@ -9534,6 +9823,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
         key(&mut app, 'r');
         assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(act));
+        assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(feed));
         let (feed, _) = watched(&mut rx);
         app.on_event(Event::Data(Data::Feed {
             id: feed,

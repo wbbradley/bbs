@@ -165,9 +165,9 @@ pub const BINDINGS: &[Binding] = &[
         help: "this help",
     },
     Binding {
-        keys: &[Key::Char('r')],
+        keys: &[Key::Char('r'), Key::Code(KeyCode::F(5))],
         action: Action::Reload,
-        help: "reload",
+        help: "reload (F5 also while writing)",
     },
     Binding {
         keys: &[Key::Char('c')],

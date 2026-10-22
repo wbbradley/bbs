@@ -33,9 +33,30 @@ const BACKLOG: u32 = 200;
 /// Bound the initial display hold without timing out either subscription.
 const INITIAL_LOAD_GRACE: Duration = Duration::from_secs(2);
 
+/// One explicit refresh: settle each replacement subscription, independently
+/// of the agent's turn progress.
+struct Refresh {
+    started: Instant,
+    feed_pending: bool,
+    activity_pending: bool,
+}
+
+impl Refresh {
+    fn indicator(&self, now: Instant) -> Span<'static> {
+        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+        let frame = (now.saturating_duration_since(self.started).as_millis() / 100) as usize;
+        Span::styled(
+            format!("{} refreshing", frames[frame % frames.len()]),
+            theme::style(theme::Role::Accent),
+        )
+    }
+}
+
 pub struct Thread {
     title: String,
     id: u64,
+    feed_id: u64,
+    refresh: Option<Refresh>,
     req: FeedRequest,
     view: ThreadView<Entry>,
     /// Every message received, so another `show` can rebuild the view.
@@ -91,9 +112,12 @@ pub struct Thread {
 
 impl Thread {
     fn new(title: String, req: FeedRequest, to: Option<&str>) -> Thread {
+        let id = next_id();
         Thread {
             title,
-            id: next_id(),
+            id,
+            feed_id: id,
+            refresh: None,
             req: FeedRequest {
                 backlog: BACKLOG,
                 ..req
@@ -893,6 +917,29 @@ fn compacted(side: Option<&HashSet<i64>>, thoughts: bool, mut entries: Vec<Entry
     entries
 }
 
+/// Keep the explicit refresh visible beside the app's blocker badge.
+fn refresh_status(
+    mut line: Line<'static>,
+    mut refresh: Span<'static>,
+    width: u16,
+    ctx: &Ctx,
+) -> Line<'static> {
+    let marker = ctx
+        .blocker_marker
+        .as_ref()
+        .map_or(0, |s| s.width() as u16 + 1)
+        .min(width);
+    let available = usize::from(width.saturating_sub(marker));
+    let text = available.saturating_sub(refresh.width() + 1);
+    line = theme::clip_line(line, text);
+    line.spans.push(Span::raw(
+        " ".repeat(available.saturating_sub(line.width() + refresh.width())),
+    ));
+    refresh.style = theme::style(theme::Role::StatusBar).patch(refresh.style);
+    line.spans.push(refresh);
+    line
+}
+
 /// A stream error as the window shows it.
 fn describe(error: &str) -> String {
     if error.contains("feed-with.v1") {
@@ -967,21 +1014,34 @@ impl Screen for Thread {
         ctx: &Ctx,
         draft_error: Option<&str>,
     ) -> Option<Line<'static>> {
+        let refresh = self.refresh.as_ref().map(|r| r.indicator((self.now)()));
         if self.agent.is_none() {
-            if draft_error.is_some() {
-                return None;
-            }
-            let composer = self.composer.as_ref()?;
-            return if let Some(error) = composer.error() {
-                Some(Line::styled(
-                    fit_status(&format!("Not sent: {error}"), usize::from(width), false),
-                    theme::error(),
-                ))
-            } else if composer.sending() {
-                Some(Line::from("Sending…"))
-            } else {
-                None
+            let feedback = draft_error
+                .map(|e| Line::styled(e.to_string(), theme::error()))
+                .or_else(|| {
+                    self.composer.as_ref().and_then(|c| {
+                        c.error()
+                            .map(|e| Line::styled(format!("Not sent: {e}"), theme::error()))
+                            .or_else(|| c.sending().then(|| Line::from("Sending…")))
+                    })
+                });
+            let Some(refresh) = refresh else {
+                return if draft_error.is_some() {
+                    None
+                } else {
+                    feedback
+                };
             };
+            let line = feedback.unwrap_or_else(|| {
+                if let Some(error) = &ctx.inbox.error {
+                    Line::raw(format!("Inbox unavailable: {error}"))
+                } else if let Some(notice) = &ctx.navigation_notice {
+                    Line::raw(notice.text().to_string())
+                } else {
+                    theme::status_bar(&ctx.me)
+                }
+            });
+            return Some(refresh_status(line, refresh, width, ctx));
         }
         let indicator = self
             .stream
@@ -997,7 +1057,9 @@ impl Screen for Thread {
             .as_ref()
             .map_or(0, |m| m.width() as u16 + 1)
             .min(width);
+        let refresh_width = refresh.as_ref().map_or(0, |s| s.width() as u16 + 1);
         let reserved = marker
+            + refresh_width
             + if indicator.is_some() {
                 if mailbox { 4 } else { 2 }
             } else {
@@ -1039,8 +1101,13 @@ impl Screen for Thread {
             line = theme::clip_line(line, usize::from(text_width));
             let suffix = if mailbox && width >= 4 { "✉ " } else { "" };
             let padding = usize::from(width.saturating_sub(1 + marker))
-                .saturating_sub(line.width() + suffix.width());
+                .saturating_sub(line.width() + suffix.width() + usize::from(refresh_width));
             line.spans.push(Span::raw(" ".repeat(padding)));
+            if let Some(mut refresh) = refresh {
+                refresh.style = theme::style(theme::Role::StatusBar).patch(refresh.style);
+                line.spans.push(refresh);
+                line.spans.push(Span::raw(" "));
+            }
             if !suffix.is_empty() {
                 line.spans.push(Span::styled(suffix, indicator.style));
             }
@@ -1053,7 +1120,7 @@ impl Screen for Thread {
 
     fn requests(&self) -> Vec<Request> {
         let mut requests = vec![Request::Watch {
-            id: self.id,
+            id: self.feed_id,
             req: self.req.clone(),
         }];
         // The group's description, for the describe dialog.
@@ -1065,21 +1132,29 @@ impl Screen for Thread {
     }
 
     fn reload(&mut self) -> Vec<Request> {
+        let mut cancel = Vec::new();
+        self.refresh = Some(Refresh {
+            started: (self.now)(),
+            feed_pending: true,
+            activity_pending: self.stream.is_some(),
+        });
+        self.error = None;
+        self.feed_loaded = false;
         // The stream starts over from its oldest record.
         if let Some(stream) = &mut self.stream {
-            let cancel = stream.unwatch();
+            cancel.push(stream.unwatch());
             stream.reset();
             self.seen = 0;
-            self.feed_loaded = false;
             self.opening_until = Some((self.now)() + INITIAL_LOAD_GRACE);
             self.rebuild();
-            return vec![cancel];
         }
-        Vec::new()
+        cancel.push(Request::Unwatch(self.feed_id));
+        self.feed_id = next_id();
+        cancel
     }
 
     fn on_close(&self) -> Vec<Request> {
-        let mut requests = vec![Request::Unwatch(self.id)];
+        let mut requests = vec![Request::Unwatch(self.feed_id)];
         requests.extend(self.stream.as_ref().map(Stream::unwatch));
         requests
     }
@@ -1092,6 +1167,11 @@ impl Screen for Thread {
         animation
             .into_iter()
             .chain(self.opening_until.filter(|deadline| *deadline > now))
+            .chain(
+                self.refresh
+                    .as_ref()
+                    .map(|_| now + Duration::from_millis(100)),
+            )
             .min()
     }
 
@@ -1165,33 +1245,38 @@ impl Screen for Thread {
             }
         }
         match data {
-            Data::Feed { id, result } if *id == self.id => match result {
-                Ok(messages) => {
-                    self.feed_loaded = true;
-                    self.error = None;
-                    let held: HashSet<i64> = self.messages.iter().map(|m| m.id).collect();
-                    let mut changed: Vec<i64> = messages
-                        .iter()
-                        .map(|m| m.id)
-                        .filter(|id| !held.contains(id))
-                        .collect();
-                    changed.extend(self.keep(messages));
-                    if self
-                        .stream
-                        .as_ref()
-                        .is_some_and(|s| self.show.stream() && s.references(&changed))
-                    {
-                        // Records drawn before this mail arrived give way to
-                        // it, and records for evicted mail draw again.
-                        self.reconcile();
-                    } else if self.show.messages() {
-                        let entries = self.message_entries(messages);
-                        self.view
-                            .ingest(compacted(side.as_ref(), thoughts, entries));
-                    }
+            Data::Feed { id, result } if *id == self.feed_id => {
+                if let Some(refresh) = &mut self.refresh {
+                    refresh.feed_pending = false;
                 }
-                Err(e) => self.error = Some(describe(e)),
-            },
+                match result {
+                    Ok(messages) => {
+                        self.feed_loaded = true;
+                        self.error = None;
+                        let held: HashSet<i64> = self.messages.iter().map(|m| m.id).collect();
+                        let mut changed: Vec<i64> = messages
+                            .iter()
+                            .map(|m| m.id)
+                            .filter(|id| !held.contains(id))
+                            .collect();
+                        changed.extend(self.keep(messages));
+                        if self
+                            .stream
+                            .as_ref()
+                            .is_some_and(|s| self.show.stream() && s.references(&changed))
+                        {
+                            // Records drawn before this mail arrived give way to
+                            // it, and records for evicted mail draw again.
+                            self.reconcile();
+                        } else if self.show.messages() {
+                            let entries = self.message_entries(messages);
+                            self.view
+                                .ingest(compacted(side.as_ref(), thoughts, entries));
+                        }
+                    }
+                    Err(e) => self.error = Some(describe(e)),
+                }
+            }
             Data::Groups(Ok(list)) => {
                 if let Some((group, _)) = &mut self.group
                     && let Some(listed) = list
@@ -1221,6 +1306,14 @@ impl Screen for Thread {
             }
             _ => {}
         }
+        if let Some(refresh) = &mut self.refresh {
+            if self.stream.as_ref().is_none_or(Stream::history_ready) {
+                refresh.activity_pending = false;
+            }
+            if !refresh.feed_pending && !refresh.activity_pending {
+                self.refresh = None;
+            }
+        }
         if self.error.is_some()
             || (self.feed_loaded && self.stream.as_ref().is_some_and(Stream::history_ready))
         {
@@ -1233,6 +1326,8 @@ impl Screen for Thread {
     /// An open conversation marks received mail read and activity seen,
     /// independently of the display filters.
     fn on_view(&mut self, ctx: &Ctx) -> Vec<Request> {
+        // Every thread uses the app's clock, including groups and the feed.
+        self.now = ctx.now.clone();
         // Before the next key, even while the terminal is too small to draw.
         self.follow_compact(ctx);
         if let Some(picker) = &mut self.effort_picker
@@ -1324,6 +1419,10 @@ impl Screen for Thread {
                 });
             }
             self.effort_notice = None;
+            // Let the shared reload action handle F5 even with a draft focused.
+            if key.code == KeyCode::F(5) && key.modifiers.is_empty() && !self.navigation_blocked() {
+                return None;
+            }
             // Compact and verbose views, while writing or navigating.
             if self.agent.is_some()
                 && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1592,10 +1691,10 @@ impl Thread {
             let text = vec![
                 Line::styled(error.clone(), theme::error()),
                 Line::styled(
-                    if self.agent.is_some() {
-                        "PgUp navigates · r reloads"
+                    if self.composing {
+                        "F5 reloads"
                     } else {
-                        "r reloads"
+                        "r or F5 reloads"
                     },
                     theme::dim(),
                 ),
@@ -1651,7 +1750,7 @@ impl Thread {
         }
         let agent = self.agent.as_deref().unwrap_or_default();
         Some(if let Some(error) = &stream.error {
-            Line::styled(format!("{error} r retries."), theme::error())
+            Line::styled(format!("{error} F5 reloads."), theme::error())
         } else if !stream.loaded {
             Line::styled("Loading…", theme::dim())
         } else if stream.is_empty() {

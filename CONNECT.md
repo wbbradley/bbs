@@ -43,7 +43,7 @@ several separate `bbs group` commands.
   shown even if a subscription is slow, and later updates appear normally.
   Older-history reads stop after thirty seconds or a connection failure,
   keeping recent and live activity usable; a history error remains visible
-  until `r` reloads the conversation and retries.
+  until `F5` (or `r` in navigation) reloads the conversation and retries.
   Remote subscriptions reconnect after temporary connection failures, retaining
   drafts and timeline data. Activity resumes from its last received record;
   message and summary snapshots refresh. Retries back off from one to thirty
@@ -218,7 +218,7 @@ page too, and nothing needs attention, `Done with blockers.` shows for 750 ms,
 swallowing keys, then the card closes onto the screen it covered. A new blocker
 meanwhile keeps the card. Esc closes it at any time; answers still out finish
 on their own. A server without `blockers-mine.v1` is asked once: the marker
-stays hidden, F2 says a newer server is needed, and `r` asks again. The queue is
+stays hidden, F2 says a newer server is needed, and `F5` (or `r` in navigation) asks again. The queue is
 never replaced by the whole board's.
 
 ### Agent effort
@@ -409,7 +409,13 @@ These keys work on normal screens and in Insert mode. Search prompts, group
 admin dialogs, Help, Config and the splash do not navigate on these keys.
 The app owns one shared summary subscription, including while discussions are
 closed. Summary failure hides the mailbox, displays unavailable feedback, and
-`r` reloads the subscription with a new generation; it does not poll for recovery.
+`F5` reloads it even while the conversation composer is focused; `r` still
+reloads from navigation. The app does not poll for recovery. An explicit thread
+refresh shows its own animated `refreshing` indicator in the bottom bar,
+beside the agent's activity indicator and the global blocker count. It stays
+until the fresh message snapshot and current activity replay arrive, or their
+requests fail; drafts and cursor positions are preserved. Search, forms and
+other modal input keep their keys.
 In agent conversations, a mailbox immediately left of the spinner
 indicates unread direct mail from another agent. Both glyphs retain the status
 bar style and reserve their cells from clipped feedback.
