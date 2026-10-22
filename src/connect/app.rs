@@ -5937,17 +5937,22 @@ mod tests {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {
             for width in [60u16, 80] {
-                for two_lines in [false, true] {
+                for draft in ["", "two", "wrapped"] {
                     with_scheme(scheme, || {
                         let (mut app, mut rx) = self::app();
                         let (clock, now) = test_clock();
                         app.ctx.now = now;
                         let feed =
                             mateo_blockers(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
-                        if two_lines {
-                            typed(&mut app, "line one");
-                            press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
-                            typed(&mut app, "line two");
+                        match draft {
+                            "two" => {
+                                typed(&mut app, "line one");
+                                press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+                                typed(&mut app, "line two");
+                            }
+                            // One logical line wrapping onto several rows.
+                            "wrapped" => typed(&mut app, &"wrapping words ".repeat(9)),
+                            _ => {}
                         }
                         let draw = |app: &mut App| {
                             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
