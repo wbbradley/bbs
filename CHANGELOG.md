@@ -6,6 +6,13 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Fixed
+
+- Sending from paused conversation history preserves the scroll position and
+  returns to navigation instead of jumping to the newest messages.
+
 ## 0.15.0 - 2026-10-22
 
 A personal blocker queue on every screen adds the `blockers-mine.v1`

@@ -5550,6 +5550,7 @@ mod tests {
         assert!(editor_focused(&mut app), "{out}");
         assert!(out.contains("quick") && out.contains("note"), "{out}");
         enter(&mut app);
+        assert!(editor_focused(&mut app));
         let Request::Send { id: sent, req } = rx.try_recv().unwrap() else {
             panic!("expected a send");
         };
@@ -5564,10 +5565,91 @@ mod tests {
         }));
         let out = screen(&mut app, 80, 24);
         assert!(!out.contains("quick"), "{out}");
+        assert!(
+            editor_focused(&mut app) && out.contains("following"),
+            "{out}"
+        );
         // Esc closes the agent conversation directly.
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(screen(&mut app, 80, 24).contains("Your agents"));
         assert_eq!(rx.try_recv().unwrap(), Request::Unwatch(id));
+    }
+
+    #[test]
+    fn sending_from_paused_history_keeps_its_place_and_returns_to_navigation() {
+        let top = |s: &str| s.lines().take(10).map(str::to_owned).collect::<Vec<_>>();
+        for success in [true, false] {
+            let (mut app, mut rx) = app();
+            let feed = mateo(&mut app, &mut rx);
+            let rows = |count| {
+                (1..=count)
+                    .map(|id| message(id, "Zed", "Mateo", &format!("message {id}")))
+                    .collect()
+            };
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(rows(60)),
+            }));
+            screen(&mut app, 80, 24);
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+            screen(&mut app, 80, 24);
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(editor_focused(&mut app));
+            typed(&mut app, "note about this history");
+            let before = screen(&mut app, 80, 24);
+            assert!(before.contains("paused"), "{before}");
+            enter(&mut app);
+            let sent = without_polls(&mut rx);
+            let [Request::Send { id, req }] = sent.as_slice() else {
+                panic!("{sent:?}");
+            };
+            assert_eq!(req.body, "note about this history");
+            let sending = screen(&mut app, 80, 24);
+            assert!(
+                !editor_focused(&mut app),
+                "submission returns to navigation"
+            );
+            assert_eq!(top(&sending), top(&before));
+            // Cursor keys work immediately, before the server reply.
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            let navigated = screen(&mut app, 80, 24);
+            assert_eq!(top(&navigated)[1..], top(&before)[..9]);
+            assert_eq!(draft_text(&mut app), "note about this history");
+            // Feed arrivals and the ACK must both preserve the chosen place.
+            app.on_event(Event::Data(Data::Feed {
+                id: feed,
+                result: Ok(rows(61)),
+            }));
+            app.on_event(Event::Data(Data::Sent {
+                id: *id,
+                result: if success {
+                    Ok(())
+                } else {
+                    Err("offline".into())
+                },
+            }));
+            let after = screen(&mut app, 80, 24);
+            assert_eq!(top(&after), top(&navigated));
+            assert!(
+                !editor_focused(&mut app) && after.contains("paused"),
+                "{after}"
+            );
+            assert!(after.contains("1 new"), "{after}");
+            assert_eq!(
+                draft_text(&mut app),
+                if success {
+                    ""
+                } else {
+                    "note about this history"
+                }
+            );
+            if !success {
+                assert!(after.contains("Not sent: offline"), "{after}");
+            }
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(editor_focused(&mut app));
+        }
     }
 
     #[test]

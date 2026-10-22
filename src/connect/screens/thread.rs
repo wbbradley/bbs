@@ -726,14 +726,19 @@ impl Thread {
         };
         let composer = self.composer.as_mut()?;
         Some(match composer.key(key, send_id) {
-            Some(body) => Transition::Request(Request::Send {
-                id: send_id,
-                req: SendRequest {
-                    to: composer.to().to_string(),
-                    body: literal.unwrap_or(body),
-                    control: None,
-                },
-            }),
+            Some(body) => {
+                if self.agent.is_some() && !self.view.following() {
+                    self.composing = false;
+                }
+                Transition::Request(Request::Send {
+                    id: send_id,
+                    req: SendRequest {
+                        to: composer.to().to_string(),
+                        body: literal.unwrap_or(body),
+                        control: None,
+                    },
+                })
+            }
             None => Transition::Stay,
         })
     }
@@ -1207,7 +1212,9 @@ impl Screen for Thread {
                     && composer.sent(*id, result.clone())
                 {
                     // A saved draft can finish a send from an earlier screen.
-                    if result.is_ok() {
+                    // Agent conversations retain the reader's current
+                    // scroll/follow state when an asynchronous send finishes.
+                    if result.is_ok() && self.agent.is_none() {
                         self.view.follow();
                     }
                 }
