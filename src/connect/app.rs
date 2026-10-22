@@ -6669,7 +6669,6 @@ mod tests {
                 name: "crew".into(),
                 ..Default::default()
             }],
-            ..Default::default()
         }))));
         ctrl(&mut app, 'p');
         typed(&mut app, "crew");
@@ -6761,6 +6760,69 @@ mod tests {
         assert!(
             shown.contains("unique launcher needle"),
             "glow expiry preserves the anchor: {shown}"
+        );
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "Grove".into(),
+                ..Default::default()
+            }]),
+        }));
+        ctrl(&mut app, 'p');
+        typed(&mut app, "grove");
+        enter(&mut app);
+        while rx.try_recv().is_ok() {}
+        ctrl(&mut app, 'p');
+        typed(&mut app, "mateo");
+        enter(&mut app);
+        let restored: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !restored
+                .iter()
+                .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
+            "restoring the old result must still hold newer receipts: {restored:?}"
+        );
+        assert!(screen(&mut app, 80, 24).contains("unique launcher needle"));
+    }
+
+    #[test]
+    fn launcher_message_results_open_group_broadcasts_and_human_mail_in_the_right_views() {
+        let (mut app, mut rx) = app();
+        let mut human = message(1, "ada", "bob", "human-only-hit");
+        human.from_kind = proto::Kind::Human as i32;
+        let mut group = message(2, "Zed", "", "group-only-hit");
+        group.to_name = None;
+        group.to_group = Some("crew".into());
+        app.on_event(Event::Data(Data::Feed {
+            id: 999,
+            result: Ok(vec![human, group]),
+        }));
+        ctrl(&mut app, 'p');
+        typed(&mut app, "human-only-hit");
+        assert!(rx.try_recv().is_err());
+        enter(&mut app);
+        let (_, request) = watched(&mut rx);
+        assert!(
+            request.with.is_none() && request.group.is_none(),
+            "human mail opens Feed"
+        );
+        assert!(screen(&mut app, 80, 24).contains("human-only-hit"));
+        assert!(rx.try_recv().is_err());
+        ctrl(&mut app, 'p');
+        typed(&mut app, "group-only-hit");
+        enter(&mut app);
+        assert!(matches!(rx.try_recv(), Ok(Request::Unwatch(_))));
+        let (_, request) = watched(&mut rx);
+        assert_eq!(request.group.as_deref(), Some("crew"));
+        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+        assert!(screen(&mut app, 80, 24).contains("group-only-hit"));
+        assert!(rx.try_recv().is_err());
+        ctrl(&mut app, 'p');
+        typed(&mut app, "group-only-hit");
+        enter(&mut app);
+        assert!(
+            rx.try_recv().is_err(),
+            "seeking in the current group keeps the existing subscription"
         );
     }
 
