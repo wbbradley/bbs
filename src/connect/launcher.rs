@@ -545,16 +545,17 @@ struct Candidate<'a> {
 
 impl Candidate<'_> {
     fn compare(a: &Self, b: &Self) -> std::cmp::Ordering {
-        a.rank
-            .cmp(&b.rank)
-            .then_with(|| a.kind.cmp(&b.kind))
+        a.kind
+            .cmp(&b.kind)
+            .then_with(|| a.rank.tier.cmp(&b.rank.tier))
             .then_with(|| b.id.cmp(&a.id))
+            .then_with(|| a.rank.cmp(&b.rank))
             .then_with(|| a.indexed.cmp(b.indexed))
             .then_with(|| a.text.cmp(b.text))
     }
 }
 
-/// Exact, prefix, word-boundary substring, substring, then ordered letters.
+/// Exact, two/one/no word boundaries, then ordered letters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Rank {
     tier: u8,
@@ -577,18 +578,25 @@ fn rank(query: &str, folded: &str) -> Option<Rank> {
     if folded == query {
         return Some(base);
     }
-    if folded.starts_with(query) {
-        return Some(Rank { tier: 1, ..base });
-    }
-    if let Some(at) = folded.find(query) {
-        let prefix = &folded[..at];
-        let boundary = prefix
-            .chars()
-            .next_back()
-            .is_some_and(|c| !c.is_alphanumeric());
+    if let Some((tier, at)) = folded
+        .match_indices(query)
+        .map(|(at, _)| {
+            let prefix = &folded[..at];
+            let starts_word = prefix
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+            let ends_word = folded[at + query.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric());
+            (3 - u8::from(starts_word) - u8::from(ends_word), at)
+        })
+        .min()
+    {
         return Some(Rank {
-            tier: if boundary { 2 } else { 3 },
-            start: prefix.chars().count(),
+            tier,
+            start: folded[..at].chars().count(),
             ..base
         });
     }
@@ -651,17 +659,54 @@ mod tests {
     }
 
     #[test]
-    fn ranking_prefers_exact_then_prefix_then_words_and_keeps_unicode() {
+    fn ranking_prefers_exact_then_words_then_partial_and_keeps_unicode() {
         let mut cache = Cache::default();
         for name in ["Mateo", "Mat", "Format", "M a t", "Foo Mat"] {
             cache.agent(name);
         }
         let names: Vec<_> = cache.search("MAT").into_iter().map(|h| h.text).collect();
-        assert_eq!(names, ["Mat", "Mateo", "Foo Mat", "Format", "M a t"]);
+        assert_eq!(names, ["Mat", "Foo Mat", "Mateo", "Format", "M a t"]);
         cache.agent("Équipe");
         assert_eq!(cache.search("éq")[0].text, "Équipe");
         assert!(cache.search("eq").is_empty(), "accents remain significant");
         assert!(rank("thoe", "theo").is_none(), "letters stay in order");
+    }
+
+    #[test]
+    fn ranking_groups_names_then_prefers_whole_words_and_newer_messages() {
+        let mut cache = Cache::default();
+        cache.agent("Jefe");
+        cache.agent("Jeferson");
+        cache.group("Jefe crew");
+        cache.observe(&feed(1, "Hello Jefe, how are you?"));
+        cache.observe(&feed(2, "blah blah abcJefedefgh"));
+        cache.observe(&feed(3, "Jeferson"));
+        cache.observe(&feed(4, "a much longer message: Hello Jefe, how are you?"));
+        cache.observe(&feed(5, "abcJefedefgh, then Jefe!"));
+        cache.observe(&feed(6, "abcJefe"));
+        let hits = cache.search("Jefe");
+        assert_eq!(
+            hits.iter().map(|h| h.target.clone()).collect::<Vec<_>>(),
+            [
+                Target::Agent("Jefe".into()),
+                Target::Agent("Jeferson".into()),
+                Target::Group("Jefe crew".into()),
+                Target::Message(5),
+                Target::Message(4),
+                Target::Message(1),
+                Target::Message(6),
+                Target::Message(3),
+                Target::Message(2),
+            ]
+        );
+        assert_eq!(rank("jefe", "abcjefedefgh, then jefe!").unwrap().start, 19);
+        assert!(rank("jefe", "hello jefe!") < rank("jefe", "jeferson"));
+        assert!(rank("jefe", "hello jefe!") < rank("jefe", "hello jeferson"));
+        assert!(rank("jefe", "hello jefe!") < rank("jefe", "界jefe界"));
+        assert_eq!(rank("jefe", "«jefe»").unwrap().tier, 1);
+        assert_eq!(rank("jefe", "abcjefe").unwrap().tier, 2);
+        assert_eq!(rank("jefe", "jeferson").unwrap().tier, 2);
+        assert_eq!(rank("jefe", "abcjefedef").unwrap().tier, 3);
     }
 
     #[test]

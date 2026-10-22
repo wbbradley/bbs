@@ -449,7 +449,10 @@ cache of up to 10,000 messages and 16 MiB of body text, with an additional
 folded-text index. The cache is held in memory and disappears on exit.
 Names learned from historical messages may still appear. Matching ignores
 case, keeps accents significant, and searches each message line separately.
-At most the top 50 results are shown.
+Agents come first, then groups, then messages. Within each section, exact
+matches come first, then matches at two, one or no word boundaries, then fuzzy
+matches. Messages in the same match tier show newest first, before position
+and length break ties. At most the top 50 results are shown.
 
 Accepting a result opens the destination's ordinary live subscriptions.
 Agent and group names return to their conversations, remembering the scroll

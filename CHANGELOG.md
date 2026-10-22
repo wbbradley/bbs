@@ -18,6 +18,8 @@ Upgrade the client to use them; no server or runner change is needed.
   cached message text without search requests. Enter opens normal live
   conversations, restores their session view state, or pauses at a cached
   message with a brief highlight; Esc restores the original screen.
+  Results put agents and groups before messages, prefer whole-word matches
+  over partial matches, and show newer messages first within a match tier.
 
 ### Fixed
 
