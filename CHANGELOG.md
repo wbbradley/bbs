@@ -14,6 +14,12 @@ unchanged. Upgrade the server before or with the client: a 0.15.0 client shows
 blockers only from a server with `blockers-mine.v1`, and against an older
 server it says the server needs an upgrade instead.
 
+### Added
+
+- `bbs blocker list --mine` lists a human's personal blocker queue: open
+  blockers in every current active group with a live agent the human owns.
+  `--mine` is exclusive with `--group` and `--agent` and refused for agents.
+
 ### Changed
 
 - `bbs connect` keeps one queue of your blockers, from every group with a live
