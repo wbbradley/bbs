@@ -603,13 +603,22 @@ impl App {
                 (self.launcher_cache.destination(id), Some(id))
             }
         };
-        let current = self.stack.last().and_then(|s| s.conversation());
-        let same = match (&destination, &current) {
-            (Some(a), Some(b)) => a.same(b),
-            (None, None) => self.stack.last().is_some_and(|s| s.is_thread()),
-            _ => false,
-        };
-        if same {
+        let existing =
+            self.stack
+                .iter()
+                .rposition(|screen| match (&destination, screen.conversation()) {
+                    (Some(target), Some(current)) => target.same(&current),
+                    (None, None) => screen.is_thread(),
+                    _ => false,
+                });
+        if let Some(at) = existing {
+            let moved = at + 1 != self.stack.len();
+            while self.stack.len() > at + 1 {
+                self.pop();
+            }
+            if moved && let Some(target) = &destination {
+                self.history.visit(target.clone());
+            }
             if let Some(id) = hit {
                 let rows = self.launcher_cache.context(destination.as_ref(), hit);
                 self.top().seed_messages(&rows);
@@ -6872,6 +6881,34 @@ mod tests {
             sent.body, "parent drafXt",
             "the draft cursor is restored with the view"
         );
+    }
+
+    #[test]
+    fn launcher_reveals_an_existing_conversation_beneath_help_without_reopening_it() {
+        for width in [60, 80] {
+            let (mut app, mut rx) = app();
+            let (_, now) = test_clock();
+            app.ctx.now = now;
+            mateo_with(&mut app, &mut rx, 60);
+            typed(&mut app, "kept draft");
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+            let before = buffer(&mut app, width);
+            key(&mut app, '?');
+            assert!(screen(&mut app, width, 24).contains("Keys"));
+            while rx.try_recv().is_ok() {}
+            ctrl(&mut app, 'p');
+            typed(&mut app, "mateo");
+            enter(&mut app);
+            assert_eq!(buffer(&mut app, width), before);
+            assert_eq!(draft_text(&mut app), "kept draft");
+            assert!(!editor_focused(&mut app));
+            assert!(
+                rx.try_recv().is_err(),
+                "the existing subscriptions stay in place"
+            );
+            assert_eq!(app.stack.iter().filter(|s| s.is_thread()).count(), 1);
+        }
     }
 
     /// The app still on its splash screen.

@@ -2427,7 +2427,7 @@ mod seek_tests {
         let old = mail(1, "Mateo", "ada", "the one sought");
         let mut seeking = Thread::agent("Mateo", "ada", now.clone());
         seeking.human = Some("ada".into());
-        seeking.seed_messages(&[old.clone()]);
+        seeking.seed_messages(std::slice::from_ref(&old));
         assert!(seeking.seek_message(1));
         let saved = seeking.saved_view();
         // Reopened by name later; newer unread mail arrives meanwhile.
