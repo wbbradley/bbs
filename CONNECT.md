@@ -438,8 +438,8 @@ announced to the group.
 and fuzzy matches for agent names, group names and cached message lines.
 `Up`/`Down` or `Ctrl-k`/`Ctrl-j` select a result; `Enter` opens the selection
 (the top match by default). `Esc` closes the launcher and restores the screen
-beneath it,
-including its draft, cursor, selection, scroll position and open dialogs.
+beneath it, including its draft, cursor, selection, scroll position and open
+dialogs.
 `Ctrl-c` still quits. The blocker modal keeps `Ctrl-p` while it is open;
 likewise, the launcher keeps `F2` until it closes.
 
