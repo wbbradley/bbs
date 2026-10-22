@@ -5933,6 +5933,101 @@ mod tests {
     }
 
     #[test]
+    fn done_with_blockers_shows_in_the_composers_own_box() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            for width in [60u16, 80] {
+                for two_lines in [false, true] {
+                    with_scheme(scheme, || {
+                        let (mut app, mut rx) = self::app();
+                        let (clock, now) = test_clock();
+                        app.ctx.now = now;
+                        let feed =
+                            mateo_blockers(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+                        if two_lines {
+                            typed(&mut app, "line one");
+                            press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+                            typed(&mut app, "line two");
+                        }
+                        let draw = |app: &mut App| {
+                            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                            terminal.draw(|f| app.draw(f)).unwrap();
+                            terminal.backend().buffer().clone()
+                        };
+                        // The normal composer, and where its first text row is.
+                        let before = draw(&mut app);
+                        let text_row = (0..23)
+                            .find(|y| before[(0, *y)].symbol() == "›")
+                            .expect("the chevron marks the first text row");
+                        let gap = text_row - 2;
+                        // Answer the only blocker: the goodbye starts.
+                        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+                        typed(&mut app, "ok");
+                        enter(&mut app);
+                        let req = answered(&mut rx);
+                        app.on_event(Event::Data(Data::BlockerWritten {
+                            id: feed,
+                            key: req.request_key,
+                            result: Ok(Default::default()),
+                        }));
+                        let done = draw(&mut app);
+                        crate::ui::theme::testing::assert_buffer(&done);
+                        let screen_bg = theme::base().bg;
+                        let human = theme::base().patch(theme::style(theme::Role::HumanSurface));
+                        let row = |b: &ratatui::buffer::Buffer, y: u16| {
+                            (0..width).map(|x| b[(x, y)].symbol()).collect::<String>()
+                        };
+                        // The timeline above does not move.
+                        for y in 0..gap {
+                            assert_eq!(row(&done, y), row(&before, y), "{scheme:?} {width} {y}");
+                        }
+                        // The same box: a dark gap row, then the input surface
+                        // down to the status bar, with no chevron or warning card.
+                        let warning = theme::style(theme::Role::WarningTitle).bg;
+                        for x in 0..width {
+                            assert_eq!(done[(x, gap)].bg, screen_bg.unwrap(), "{scheme:?} gap");
+                            assert_eq!(done[(x, gap)].bg, before[(x, gap)].bg);
+                            for y in gap + 1..23 {
+                                let cell = &done[(x, y)];
+                                assert_eq!(
+                                    cell.bg,
+                                    human.bg.unwrap(),
+                                    "{scheme:?} {width} {x},{y}"
+                                );
+                                if warning.is_some() {
+                                    assert_ne!(Some(cell.bg), warning);
+                                }
+                                assert_ne!(cell.symbol(), "›");
+                            }
+                        }
+                        // The note starts where the draft's text starts.
+                        let note = row(&done, text_row);
+                        assert_eq!(&note[..2], "  ", "{note:?}");
+                        assert!(note[2..].starts_with("Done with blockers."), "{note:?}");
+                        assert!(
+                            (gap..23).all(|y| y == text_row || !row(&done, y).contains("Done"))
+                        );
+                        // Typing during the goodbye is swallowed.
+                        typed(&mut app, "x");
+                        // Then the composer, with its draft, in the same place.
+                        clock.advance(crate::connect::blockers::DONE);
+                        let after = draw(&mut app);
+                        for y in 0..23 {
+                            for x in 0..width {
+                                assert_eq!(
+                                    after[(x, y)],
+                                    before[(x, y)],
+                                    "{scheme:?} {width} {x},{y}"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_blocker_panel_draws_in_every_scheme_at_sixty_columns() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {

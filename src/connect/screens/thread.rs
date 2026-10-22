@@ -1604,10 +1604,13 @@ impl Thread {
             self.composing = self.composer.is_some();
         }
         let panel = self.blockers.as_ref().is_some_and(Blockers::is_open);
+        // Its goodbye shows in the composer's own box, so nothing moves when
+        // the composer comes back.
+        let done = self.blockers.as_ref().is_some_and(Blockers::done);
         let max_lines = frame.area().height * u16::from(ctx.composer_max_height_percent) / 100;
         // The blocker panel takes the composer's place, growing to two
         // thirds of the height so the timeline stays in view.
-        let composer_height = if panel {
+        let composer_height = if panel && !done {
             self.blockers
                 .as_ref()
                 .map_or(0, |b| b.height(inner.width))
@@ -1674,7 +1677,15 @@ impl Thread {
                 self.btw_hidden(),
             );
         }
-        if panel {
+        if done {
+            if let Some(c) = &self.composer {
+                c.render_note(
+                    frame,
+                    composer,
+                    Line::styled("Done with blockers.", theme::style(theme::Role::Success)),
+                );
+            }
+        } else if panel {
             if let Some(blockers) = &mut self.blockers {
                 blockers.render(frame, composer, now);
             }

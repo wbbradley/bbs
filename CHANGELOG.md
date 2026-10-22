@@ -17,6 +17,8 @@ under the new package version and its publication date.
 
 ### Fixed
 
+- `Done with blockers.` shows in the composer's own box, on its first text row,
+  so the conversation no longer shifts when the panel closes.
 - Blocker outcomes (replacement, cancellation, answer) name the acting
   agent's owner, as the creator field does; the owner was always empty.
 

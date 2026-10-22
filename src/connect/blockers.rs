@@ -168,6 +168,11 @@ impl Blockers {
         self.panel.is_some()
     }
 
+    /// Showing `Done with blockers.` before the composer returns.
+    pub fn done(&self) -> bool {
+        self.panel.as_ref().is_some_and(|p| p.done_at.is_some())
+    }
+
     /// F2: open the panel, or say why not.
     pub fn open(&mut self, now: Instant) -> Result<(), String> {
         if self.support == Support::Unsupported {
@@ -629,18 +634,16 @@ impl Blockers {
     /// The card's title bar: whose blocker this is and whether the box below
     /// answers it, with the keys at the right when they fit.
     fn title(&self, width: usize) -> Line<'static> {
-        let panel = self.panel.as_ref();
-        let done = panel.is_some_and(|p| p.done_at.is_some());
         let left = match self.selected() {
             // A kept refusal is closed: it has no place in the open queue.
-            Some(row) if !done && self.held.contains(&row.root_id) => {
+            Some(row) if self.held.contains(&row.root_id) => {
                 format!(
                     " Blocker from {} @{} · no longer open",
                     creator(row),
                     row.group
                 )
             }
-            Some(row) if !done => {
+            Some(row) => {
                 // The place among open rows, of the server's open count.
                 let at = self
                     .rows
@@ -667,7 +670,7 @@ impl Blockers {
             .into_iter()
             .find(|keys| left.width() + keys.width() < width);
         let text = match keys {
-            Some(keys) if !done => {
+            Some(keys) => {
                 let gap = width - left.width() - keys.width();
                 format!("{left}{}{keys}", " ".repeat(gap))
             }
@@ -690,10 +693,6 @@ impl Blockers {
         let Some(panel) = &self.panel else {
             return Default::default();
         };
-        if panel.done_at.is_some() {
-            let done = Line::styled("Done with blockers.", theme::style(Role::Success));
-            return (vec![self.title(width), done], Vec::new(), None);
-        }
         let mut lines = vec![self.title(width)];
         if !self.loaded {
             lines.push(Line::styled("Loading…", theme::dim()));
@@ -1605,12 +1604,6 @@ mod tests {
         second.can_answer = false;
         blockers.on_data(SCREEN, &list(vec![row(1, 1, "Zed", "first?"), second]), now);
         assert!(title(&blockers, 80).starts_with(" Blocker from Mateo @crew · 2 of 2 open"));
-        // The goodbye keeps the bar.
-        let mut done = Blockers::new(BlockerScope::Group("crew".into()));
-        done.poll(SCREEN);
-        done.on_data(SCREEN, &list(vec![]), now);
-        done.open(now).unwrap();
-        assert_eq!(title(&done, 80), " Blockers");
     }
 
     #[test]
@@ -1787,10 +1780,7 @@ mod tests {
         );
         assert_eq!(blockers.active, 0);
         assert_eq!(blockers.panel.as_ref().unwrap().done_at, Some(now + DONE));
-        assert_eq!(
-            blockers.lines_above(80)[1].to_string(),
-            "Done with blockers."
-        );
+        assert!(blockers.done());
         assert!(matches!(
             blockers.key(SCREEN, press(KeyCode::Char('x')), now),
             Outcome::Stay
@@ -1825,10 +1815,7 @@ mod tests {
         blockers.poll(SCREEN);
         blockers.on_data(SCREEN, &list(vec![]), now);
         blockers.open(now).unwrap();
-        assert_eq!(
-            blockers.lines_above(80)[1].to_string(),
-            "Done with blockers."
-        );
+        assert!(blockers.done());
         assert!(blockers.settle(now + DONE));
     }
 

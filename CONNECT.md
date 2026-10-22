@@ -208,9 +208,10 @@ When another agent replaces a blocker's text, the panel shows the new text in
 place from its top, keeps the draft, withdraws any pending cancel
 confirmation, and ignores Enter for one second. Other changes show `Blockers
 updated.` for five seconds. When no blocker in scope is open, past the first
-page too, and nothing needs attention, `Done with blockers.` shows for 750 ms,
-swallowing keys, then the composer returns with its draft; a new blocker
-meanwhile keeps the panel.
+page too, and nothing needs attention, `Done with blockers.` shows for 750 ms
+in the composer's own box, where its text would start and without the chevron,
+swallowing keys; then the composer returns with its draft in the same place,
+so the conversation does not move. A new blocker meanwhile keeps the panel.
 Esc returns to the composer at any time; answers still out finish on their
 own. A server without `blockers.v1` is asked once per conversation: the count
 stays hidden, F2 says a newer server is needed, and `r` asks again.

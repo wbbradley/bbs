@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui_textarea::{CursorMove, DataCursor, TextArea, WrapMode};
 
@@ -287,23 +287,9 @@ impl Composer {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         let surface = theme::style(theme::Role::HumanSurface);
-        frame.render_widget(Block::new().style(theme::style(theme::Role::Screen)), area);
-        let gap = area.height.min(1);
-        let input = Rect {
-            y: area.y + gap,
-            height: area.height - gap,
-            ..area
-        };
-        frame.render_widget(Block::new().style(surface), input);
-        let gutter = gutter_width(input.width);
-        // Keep a caret row when a tiny rectangle cannot fit the bottom pad too.
-        let bottom = u16::from(input.height > 1);
-        self.area = Rect {
-            x: input.x + gutter,
-            width: input.width - gutter,
-            height: input.height - bottom,
-            ..input
-        };
+        let (input, text) = draw_box(frame, area);
+        let gutter = text.x - input.x;
+        self.area = text;
         let layout = self.layout(self.area.width);
         let caret = layout.point(self.text.cursor()).row.saturating_add(1);
         let height = usize::from(self.area.height);
@@ -338,6 +324,53 @@ impl Composer {
         );
         frame.render_widget(Paragraph::new(text).style(surface), text_area);
     }
+}
+
+impl Composer {
+    /// A one-line note where the draft's first row would start, in the same
+    /// box, without the chevron or a caret; the draft is untouched.
+    pub fn render_note(&self, frame: &mut Frame, area: Rect, note: Line<'static>) {
+        let (_, text) = draw_box(frame, area);
+        // The top padding row, as an unscrolled draft has.
+        let padding = text.height.min(1);
+        if text.height > padding {
+            frame.render_widget(
+                Paragraph::new(note).style(theme::style(theme::Role::HumanSurface)),
+                Rect {
+                    y: text.y + padding,
+                    height: 1,
+                    ..text
+                },
+            );
+        }
+    }
+}
+
+/// The box: a screen-coloured gap row, then the human surface. Returns the
+/// surface and, inside it, the text area: past the gutter, above the
+/// bottom pad.
+fn draw_box(frame: &mut Frame, area: Rect) -> (Rect, Rect) {
+    frame.render_widget(Block::new().style(theme::style(theme::Role::Screen)), area);
+    let gap = area.height.min(1);
+    let input = Rect {
+        y: area.y + gap,
+        height: area.height - gap,
+        ..area
+    };
+    frame.render_widget(
+        Block::new().style(theme::style(theme::Role::HumanSurface)),
+        input,
+    );
+    let gutter = gutter_width(input.width);
+    // Keep a caret row when a tiny rectangle cannot fit the bottom pad too.
+    let bottom = u16::from(input.height > 1);
+    let text = Rect {
+        x: input.x + gutter,
+        width: input.width - gutter,
+        height: input.height - bottom,
+        ..input
+    };
+    (input, text)
 }
 
 /// Preserve one source column on narrow displays.
