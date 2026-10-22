@@ -26,6 +26,12 @@ use super::theme;
 
 const MAX_SAVED_VIEWS: usize = 128;
 
+enum Opening {
+    Fresh,
+    Restore,
+    Seek(i64),
+}
+
 /// A fresh id for a screen, stream or send request.
 pub fn next_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,17 +84,6 @@ pub trait Screen {
     }
     fn conversation(&self) -> Option<Conversation> {
         None
-    }
-    fn feed_scope(&self, _id: u64) -> Option<Conversation> {
-        None
-    }
-    fn saved_view(&self) -> Option<super::screens::thread::SavedView> {
-        None
-    }
-    fn restore_view(&mut self, _view: super::screens::thread::SavedView) {}
-    fn seed_messages(&mut self, _rows: &[crate::proto::Message]) {}
-    fn seek_message(&mut self, _id: i64) -> bool {
-        false
     }
     fn is_thread(&self) -> bool {
         false
@@ -239,10 +234,11 @@ impl App {
     }
 
     fn open(&mut self, screen: Box<dyn Screen>, record: bool) {
-        self.open_at(screen, record, None);
+        self.open_at(screen, record, Opening::Fresh);
     }
 
-    fn open_at(&mut self, mut screen: Box<dyn Screen>, record: bool, hit: Option<i64>) {
+    fn open_at(&mut self, mut screen: Box<dyn Screen>, record: bool, opening: Opening) {
+        let hit = match opening { Opening::Seek(id) => Some(id), _ => None };
         if let Some(target) = screen.conversation() {
             if let Conversation::Agent(agent) = &target {
                 self.ctx.inbox.retry_failed(agent);
@@ -253,14 +249,17 @@ impl App {
             if record {
                 self.history.visit(target.clone());
             }
-            screen.seed_messages(&self.launcher_cache.context(Some(&target), hit));
-            if let Some(at) = self.saved_views.iter().position(|(c, _)| c.same(&target)) {
-                screen.restore_view(self.saved_views.remove(at).1);
-            }
-        } else if hit.is_some() {
-            screen.seed_messages(&self.launcher_cache.context(None, hit));
         }
         screen.restore_draft(&mut self.drafts, &mut self.draft_store);
+        if !matches!(opening, Opening::Fresh) {
+            let destination = screen.conversation();
+            screen.seed_messages(&self.launcher_cache.context(destination.as_ref(), hit));
+            if let Some(target) = destination
+                && let Some(at) = self.saved_views.iter().position(|(c, _)| c.same(&target))
+            {
+                screen.restore_view(self.saved_views.remove(at).1);
+            }
+        }
         if let Some(id) = hit {
             screen.seek_message(id);
         }
@@ -622,7 +621,7 @@ impl App {
             Some(Conversation::Group(name)) => Thread::group(&name),
             None => Thread::feed(),
         };
-        self.open_at(Box::new(screen), true, hit);
+        self.open_at(Box::new(screen), true, hit.map_or(Opening::Restore, Opening::Seek));
     }
 
     /// F2 and the open blocker modal, ahead of every screen: `Some(quit)`
