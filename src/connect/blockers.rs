@@ -1828,7 +1828,7 @@ mod tests {
                 .join("\n")
         };
         // Opened before the first reply: Loading, then the reason.
-        let mut blockers = Blockers::new(BlockerScope::Mine);
+        let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         blockers.open(now).unwrap();
         assert!(text(&blockers).contains("Loading…"));
@@ -1854,7 +1854,7 @@ mod tests {
         assert!(!blockers.settle(now + DONE));
         assert_eq!(blockers.count(), None);
         // A goodbye already showing gives way to the reason.
-        let mut blockers = Blockers::new(BlockerScope::Mine);
+        let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         blockers.on_data(SCREEN, &list(vec![]), now);
         blockers.open(now).unwrap();
@@ -1863,7 +1863,7 @@ mod tests {
         assert!(!blockers.done() && text(&blockers).contains("blockers-mine.v1"));
         assert!(!blockers.settle(now + DONE));
         // An answer confirmed after support went away does not say Done.
-        let mut blockers = Blockers::new(BlockerScope::Mine);
+        let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         blockers.on_data(SCREEN, &list(vec![row(1, 1, "Zed", "q?")]), now);
         blockers.open(now).unwrap();

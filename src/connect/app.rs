@@ -6256,10 +6256,7 @@ mod tests {
     fn f2_before_the_first_reply_then_an_old_server_explains_inside_the_card() {
         let (mut app, mut rx) = app();
         let id = app.blockers_id;
-        assert_eq!(
-            blocker_poll(&mut app, &mut rx),
-            Some((id, BlockerScope::Mine))
-        );
+        assert_eq!(blocker_poll(&mut app, &mut rx), Some(id));
         let before = buffer(&mut app, 80);
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
         assert!(screen(&mut app, 80, 24).contains("Loading…"));
