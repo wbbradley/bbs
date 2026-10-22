@@ -8,6 +8,11 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- The blocker queue shows each current blocker number in its list and title.
+  Detail text leaves a blank line for each newline for easier reading.
+
 ### Fixed
 
 - Markdown table cells wrap to the available conversation width and reflow on

@@ -6106,6 +6106,43 @@ mod tests {
     }
 
     #[test]
+    fn blocker_numbers_and_detail_spacing_follow_the_current_version() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                for width in [60, 80] {
+                    let (mut app, mut rx) = app();
+                    let body = "first detail\r\nsecond detail\n\n  indented detail\nlast detail\n";
+                    let id = mateo_blockers(
+                        &mut app,
+                        &mut rx,
+                        vec![blocker(5, 1, "Zed", body), blocker(12, 2, "Mateo", "other")],
+                    );
+                    typed(&mut app, "parent draft");
+                    press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+                    let out = screen(&mut app, width, 30);
+                    assert!(out.starts_with(" #5 · Answering a blocker"), "{out}");
+                    assert!(out.contains("▸ #5 @crew Zed"), "{out}");
+                    assert!(out.contains("  #12 @crew Mateo"), "{out}");
+                    let lines: Vec<_> = out.lines().collect();
+                    let at = |text: &str| lines.iter().position(|s| s.trim() == text).unwrap();
+                    assert_eq!(at("second detail"), at("first detail") + 2);
+                    assert_eq!(at("indented detail"), at("second detail") + 4);
+                    assert_eq!(at("last detail"), at("indented detail") + 2);
+                    assert!(lines[at("indented detail")].starts_with("    indented detail"));
+                    assert!(lines[at("first detail") + 1].trim().is_empty());
+                    blockers_listed(&mut app, id, vec![blocker(8, 1, "Zed", "changed\nmore")]);
+                    let out = screen(&mut app, width, 30);
+                    assert!(out.starts_with(" #8 · Answering a blocker"), "{out}");
+                    assert!(out.contains("▸ #8 @crew Zed") && !out.contains("#5"));
+                    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                    assert_eq!(draft_text(&mut app), "parent draft");
+                }
+            });
+        }
+    }
+
+    #[test]
     fn a_long_blocker_reads_to_its_end_with_page_keys_at_sixty_by_twenty_four() {
         let (mut app, mut rx) = app();
         let mut body = String::from("START of the question\n");
@@ -6431,7 +6468,7 @@ mod tests {
                         crate::ui::theme::testing::assert_buffer(&open);
                         let top: String = (0..width).map(|x| open[(x, 0)].symbol()).collect();
                         assert!(
-                            top.starts_with(" Answering a blocker from Zed @crew"),
+                            top.starts_with(" #1 · Answering a blocker from Zed @crew"),
                             "{origin}: {top}"
                         );
                         // Keys and paste are the answer's, never the screen's.
@@ -6674,7 +6711,7 @@ mod tests {
                 let out = screen(&mut app, 60, 24);
                 let lines: Vec<&str> = out.lines().collect();
                 assert!(
-                    lines[0].starts_with(" Answering a blocker from Zed @crew"),
+                    lines[0].starts_with(" #1 · Answering a blocker from Zed @crew"),
                     "{out}"
                 );
                 assert!(

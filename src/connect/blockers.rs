@@ -630,7 +630,8 @@ impl Blockers {
             // A kept refusal is closed: it has no place in the open queue.
             Some(row) if self.held.contains(&row.root_id) => {
                 format!(
-                    " Blocker from {} @{} · no longer open",
+                    " #{} · Blocker from {} @{} · no longer open",
+                    row.id,
                     creator(row),
                     row.group
                 )
@@ -649,7 +650,8 @@ impl Blockers {
                     "Blocker from"
                 };
                 format!(
-                    " {what} {} @{} · {at} of {} open",
+                    " #{} · {what} {} @{} · {at} of {} open",
+                    row.id,
                     creator(row),
                     row.group,
                     self.active
@@ -715,6 +717,7 @@ impl Blockers {
             let chosen = panel.selected == Some(row.root_id);
             let mut line = Line::from(vec![
                 Span::raw(if chosen { "▸ " } else { "  " }),
+                Span::raw(format!("#{} ", row.id)),
                 Span::styled(format!("@{}", row.group), theme::style(Role::Group)),
                 Span::raw(" "),
                 Span::styled(creator(row), theme::style(Role::Agent)),
@@ -740,7 +743,15 @@ impl Blockers {
             return (lines, Vec::new(), None);
         };
         let mut body = vec![Line::default()];
-        body.extend(row.body.lines().map(|text| Line::raw(format!("  {text}"))));
+        for (i, text) in row.body.split('\n').enumerate() {
+            if i > 0 {
+                body.push(Line::default());
+            }
+            body.push(Line::raw(format!(
+                "  {}",
+                text.strip_suffix('\r').unwrap_or(text)
+            )));
+        }
         let label = if self.held.contains(&row.root_id) {
             Line::styled("No longer open: your draft is kept below.", theme::dim())
         } else if row.can_answer {
@@ -1591,12 +1602,12 @@ mod tests {
         let mut blockers = open(now);
         let title = |b: &Blockers, width| b.title(width).to_string();
         let wide = title(&blockers, 100);
-        assert!(wide.starts_with(" Answering a blocker from Zed @crew · 1 of 2 open "));
+        assert!(wide.starts_with(" #1 · Answering a blocker from Zed @crew · 1 of 2 open "));
         assert!(wide.ends_with(" Alt-↑/↓ · Tab · Esc "), "{wide:?}");
         assert_eq!(wide.width(), 100);
         // Narrow: the way out still shows; narrower still, only the title.
         assert!(title(&blockers, 60).ends_with(" Esc "));
-        assert!(title(&blockers, 60).starts_with(" Answering a blocker from Zed"));
+        assert!(title(&blockers, 60).starts_with(" #1 · Answering a blocker from Zed"));
         assert!(title(&blockers, 40).width() <= 40);
         assert_eq!(
             blockers.title(80).style,
@@ -1608,7 +1619,7 @@ mod tests {
         let mut second = row(2, 2, "Mateo", "second?");
         second.can_answer = false;
         blockers.on_data(SCREEN, &list(vec![row(1, 1, "Zed", "first?"), second]), now);
-        assert!(title(&blockers, 80).starts_with(" Blocker from Mateo @crew · 2 of 2 open"));
+        assert!(title(&blockers, 80).starts_with(" #2 · Blocker from Mateo @crew · 2 of 2 open"));
     }
 
     #[test]
@@ -1626,14 +1637,15 @@ mod tests {
         );
         let title = |b: &Blockers| b.title(100).to_string();
         assert!(
-            title(&blockers).starts_with(" Blocker from Zed @crew · no longer open"),
+            title(&blockers).starts_with(" #1 · Blocker from Zed @crew · no longer open"),
             "{}",
             title(&blockers)
         );
         // The open one counts from the server, without the kept refusal.
         blockers.key(SCREEN, alt(KeyCode::Down), now);
         assert!(
-            title(&blockers).starts_with(" Answering a blocker from Mateo @crew · 1 of 1 open"),
+            title(&blockers)
+                .starts_with(" #2 · Answering a blocker from Mateo @crew · 1 of 1 open"),
             "{}",
             title(&blockers)
         );
@@ -1641,7 +1653,7 @@ mod tests {
         blockers.on_data(SCREEN, &list(vec![]), now);
         assert_eq!(blockers.count(), None);
         assert_eq!(blockers.selected().unwrap().root_id, 1);
-        assert!(title(&blockers).starts_with(" Blocker from Zed @crew · no longer open"));
+        assert!(title(&blockers).starts_with(" #1 · Blocker from Zed @crew · no longer open"));
         assert!(!title(&blockers).contains(" of "));
     }
 
