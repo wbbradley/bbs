@@ -174,17 +174,16 @@ available to the child, as described in [HEADLESS.md](HEADLESS.md#side-questions
 blocker in a current group that has a live agent of yours, whoever created it,
 each listed once and labelled with its current version number and group. The
 app polls it about once a second, one request at a time, whichever screen is
-up, splash included. While
-any are open, the right end of the status bar shows `[N blockers · F2]` on the
-warning colour, on every screen, ahead of a conversation's mail and activity
-marks, however long the rest of the bar.
+up, splash included. While any are open, the right end of the status bar shows
+`[N blockers · F2]` on the warning colour, on every screen, ahead of a
+conversation's mail and activity marks, however long the rest of the bar.
 
 F2 opens the queue from any screen, over dialogs, forms, the search prompt and
 the `/btw` panel too, as a card covering the whole terminal: the scheme's
 warning surface under a warning title bar that names the blocker's creator and
 group, `#ID · Answering a blocker from CREATOR @group` when the box below can
-answer it, and the position among open blockers; the answer box keeps the composer's
-surface. Without colour, the title bar is reversed and bold. The screen beneath
+answer it, and the position among open blockers; the answer box keeps the
+composer's surface. Without colour, the title bar is reversed and bold. The screen beneath
 is left exactly as it was: its draft, cursor, selection, scroll, mode and side
 panel come back when the card closes. It keeps receiving mail and activity and
 its side state is still polled, but nothing is marked read or seen until the
@@ -195,8 +194,9 @@ of any more; each refresh fills in rows as others resolve. Alt-↑/↓ selects;
 plain arrows edit the answer; PgUp/PgDn page through a selected text too long
 for the card, which shows how far you have read. Each newline in the details
 is displayed as two, leaving a blank line between source lines. The selected
-blocker's text sits above an answer box labelled `answer → CREATOR @group`: the answer goes as
-mail to the agent that wrote the current version, which may be another
+blocker's text sits above an answer box labelled `answer → CREATOR @group`:
+the answer goes as mail to the agent that wrote the current version, which
+may be another
 owner's agent. Blockers you cannot answer are read only and say why: no agent
 of yours in the group, or the creating agent is gone, in which case Tab still
 reaches Cancel. Each blocker keeps its own answer draft for this session, across
