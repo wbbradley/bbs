@@ -632,6 +632,84 @@ mod tests {
     }
 
     #[test]
+    fn retired_agent_counts_do_not_inherit_a_reused_names_blockers() {
+        let mut b = Board::memory();
+        b.put(0, "original agent", None, "old");
+        service::bye(&mut b.conn, &b.agents[0]).unwrap();
+        let registered = service::register(
+            &mut b.conn,
+            &b.humans[0],
+            proto::RegisterRequest {
+                name: Some("Mateo".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mateo = Caller {
+            token: Some(registered.token),
+            ..Default::default()
+        };
+        service::group_register(
+            &mut b.conn,
+            &b.humans[0],
+            proto::GroupRegisterRequest {
+                group: "new-group".into(),
+                description: None,
+            },
+        )
+        .unwrap();
+        service::group_join(
+            &mut b.conn,
+            &mateo,
+            proto::GroupRequest {
+                group: "new-group".into(),
+            },
+        )
+        .unwrap();
+        put_blocker(
+            &mut b.conn,
+            &mateo,
+            proto::PutBlockerRequest {
+                group: "new-group".into(),
+                body: "new agent".into(),
+                request_key: "new".into(),
+                replaces: None,
+            },
+        )
+        .unwrap();
+        let agents = service::list_agents(
+            &mut b.conn,
+            &b.humans[0],
+            proto::ListAgentsRequest { all: true },
+        )
+        .unwrap()
+        .agents;
+        let reused: Vec<_> = agents.iter().filter(|a| a.name == "Mateo").collect();
+        assert_eq!(reused.len(), 2);
+        assert_eq!(
+            reused.iter().find(|a| a.retired).unwrap().blocker_count,
+            Some(0)
+        );
+        assert_eq!(
+            reused.iter().find(|a| !a.retired).unwrap().blocker_count,
+            Some(1)
+        );
+        let summaries =
+            service::agent_summary(&mut b.conn, &b.humans[0], proto::AgentSummaryRequest {})
+                .unwrap()
+                .agents;
+        assert_eq!(summaries.iter().filter(|s| s.agent == "Mateo").count(), 1);
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|s| s.agent == "Mateo")
+                .unwrap()
+                .blocker_count,
+            Some(1)
+        );
+    }
+
+    #[test]
     fn outcome_actors_carry_their_owner_like_creators_do() {
         let mut b = Board::memory();
         let owner_of = |b: &mut Board, id: i64| {

@@ -151,9 +151,9 @@ pub fn active_count(conn: &Connection, group: Option<&str>, agent: Option<i64>) 
 
 /// Open blockers in each live agent's current groups, counted once per agent.
 /// One grouped query serves both the agent list and live summaries.
-pub fn agent_counts(conn: &Connection) -> Result<std::collections::HashMap<String, u64>> {
+pub fn agent_counts(conn: &Connection) -> Result<std::collections::HashMap<i64, u64>> {
     let mut query = conn.prepare_cached(
-        "SELECT a.name, COUNT(*) FROM blockers b
+        "SELECT a.id, COUNT(*) FROM blockers b
          JOIN bbs_groups g ON g.id = b.group_id AND g.archived_at IS NULL
          JOIN group_members m ON m.group_id = g.id
          JOIN agents a ON a.id = m.agent_id AND a.retired_at IS NULL

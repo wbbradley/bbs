@@ -1920,7 +1920,7 @@ pub fn list_agents(
         let agents = rows
             .into_iter()
             .map(|a| proto::Agent {
-                blocker_count: Some(counts.get(&a.name).copied().unwrap_or(0)),
+                blocker_count: Some(counts.get(&a.id).copied().unwrap_or(0)),
                 groups: groups.remove(&a.id).unwrap_or_default(),
                 name: a.name,
                 status: a.status,
@@ -2459,7 +2459,7 @@ pub fn agent_summary(
         let agents = db::agent_summaries(ctx.conn, me.id)?
             .into_iter()
             .map(|s| proto::AgentSummary {
-                blocker_count: Some(counts.get(&s.agent).copied().unwrap_or(0)),
+                blocker_count: Some(counts.get(&s.agent_id).copied().unwrap_or(0)),
                 agent: s.agent,
                 unread_messages: s.unread_messages,
                 oldest_unread_message: s.oldest_unread_message,

@@ -57,6 +57,7 @@ impl Agents {
         ctx.inbox
             .summaries
             .get(&agent.name.to_ascii_lowercase())
+            .filter(|_| !agent.retired)
             .and_then(|s| s.blocker_count)
             .or(agent.blocker_count)
     }
@@ -65,6 +66,7 @@ impl Agents {
         ctx.inbox
             .summaries
             .get(&agent.name.to_ascii_lowercase())
+            .filter(|_| !agent.retired)
             .and_then(|s| s.last_sent_at.as_deref())
             .or(agent.last_sent_at.as_deref())
     }
@@ -249,7 +251,11 @@ impl Screen for Agents {
                 Line::styled(
                     self.blockers(a, ctx)
                         .map_or_else(|| "-".into(), |n| n.to_string()),
-                    theme::style(theme::Role::Warning),
+                    if self.blockers(a, ctx).is_some_and(|n| n > 0) {
+                        theme::style(theme::Role::Warning)
+                    } else {
+                        theme::dim()
+                    },
                 ),
                 Line::styled(
                     pending(summary.map_or(0, |s| s.unread_messages), '✉'),

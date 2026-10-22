@@ -2783,6 +2783,58 @@ mod tests {
     }
 
     #[test]
+    fn retired_agent_rows_ignore_a_live_same_name_summary() {
+        let (mut app, mut rx) = app();
+        open_agents(&mut app, &mut rx);
+        let mut retired = agent("Mateo", "ada", &["crew"]);
+        retired.retired = true;
+        retired.blocker_count = Some(0);
+        retired.status = Some("retired identity".into());
+        retired.last_sent_at = None;
+        let mut live = agent("Mateo", "ada", &["new-group"]);
+        live.blocker_count = Some(1);
+        live.status = Some("live identity".into());
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: vec![],
+            agents: vec![retired, live],
+        }))));
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "Mateo".into(),
+                blocker_count: Some(5),
+                last_sent_at: Some("2026-10-18T12:00:00Z".into()),
+                ..Default::default()
+            }]),
+        }));
+        set_agents_now(&mut app, "2026-10-18T12:00:00Z");
+        let out = screen(&mut app, 100, 24);
+        let header = out.lines().find(|l| l.contains("BLOCKERS")).unwrap();
+        let count = header.find("BLOCKERS").unwrap();
+        let active = header.find("ACTIVE").unwrap();
+        let old = out
+            .lines()
+            .find(|l| l.contains("retired identity"))
+            .unwrap();
+        let new = out.lines().find(|l| l.contains("live identity")).unwrap();
+        assert_eq!(
+            old.chars().skip(count).take(8).collect::<String>().trim(),
+            "0",
+            "{out}"
+        );
+        assert_eq!(
+            new.chars().skip(count).take(8).collect::<String>().trim(),
+            "5",
+            "{out}"
+        );
+        assert_eq!(
+            old.chars().skip(active).take(6).collect::<String>().trim(),
+            "-",
+            "{out}"
+        );
+    }
+
+    #[test]
     fn older_agent_counts_are_unknown_and_inbox_does_not_change_order() {
         let (mut app, mut rx) = app();
         open_agents(&mut app, &mut rx);

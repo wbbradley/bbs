@@ -1386,6 +1386,7 @@ pub fn mark_read_from(
 /// What a human has yet to look at from one agent, and when it last sent.
 #[derive(Debug, PartialEq)]
 pub struct AgentSummary {
+    pub agent_id: i64,
     pub agent: String,
     pub unread_messages: u32,
     pub oldest_unread_message: Option<String>,
@@ -1412,7 +1413,7 @@ const AGENT_SUMMARIES: &str = "
           AND d.archived_at IS NULL AND d.direct = 1 AND m.from_kind = 'agent'
         GROUP BY m.from_id),
     summaries AS MATERIALIZED (
-        SELECT g.name, coalesce(u.n, 0) AS unread, u.oldest AS unread_oldest,
+        SELECT g.id AS agent_id, g.name, coalesce(u.n, 0) AS unread, u.oldest AS unread_oldest,
                g.effort, g.effort_reported_at,
                (SELECT count(*) FROM activity act
                 WHERE act.agent_id = g.id AND act.id > coalesce(s.seen_id, 0)) AS unseen,
@@ -1437,7 +1438,7 @@ const AGENT_SUMMARIES: &str = "
         LEFT JOIN unread u ON u.agent_id = g.id
         WHERE g.retired_at IS NULL)
     SELECT name, unread, unread_oldest, unseen, unseen_oldest, last_sent, effort,
-           effort_reported_at, human_conversation FROM summaries
+           effort_reported_at, human_conversation, agent_id FROM summaries
     ORDER BY lower(name)";
 
 /// For each live agent, the direct messages it sent `human` that are unread,
@@ -1448,6 +1449,7 @@ pub fn agent_summaries(conn: &Connection, human: i64) -> Result<Vec<AgentSummary
     let rows = stmt
         .query_map([human], |r| {
             Ok(AgentSummary {
+                agent_id: r.get(9)?,
                 agent: r.get(0)?,
                 unread_messages: r.get(1)?,
                 oldest_unread_message: r.get(2)?,
