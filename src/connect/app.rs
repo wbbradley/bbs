@@ -149,6 +149,21 @@ pub trait Screen {
     fn composer_text(&self) -> Option<String> {
         None
     }
+    /// A conversation's place, kept while it is closed.
+    fn saved_view(&self) -> Option<super::screens::thread::SavedView> {
+        None
+    }
+    fn restore_view(&mut self, _view: super::screens::thread::SavedView) {}
+    /// Show cached messages before the live feed's first snapshot.
+    fn seed_messages(&mut self, _rows: &[crate::proto::Message]) {}
+    /// Pause at a held message; false when it is not held.
+    fn seek_message(&mut self, _id: i64) -> bool {
+        false
+    }
+    /// The conversation a feed stream `id` of this screen belongs to.
+    fn feed_scope(&self, _id: u64) -> Option<Conversation> {
+        None
+    }
     /// Optional screen feedback for the shared bottom bar, after layout.
     fn bottom_status(
         &self,

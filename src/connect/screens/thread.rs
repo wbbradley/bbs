@@ -83,6 +83,9 @@ pub struct Thread {
     /// A restored place whose row has not arrived yet.
     pending_anchor: Option<Anchor<EntryKey>>,
     sought: Option<Sought>,
+    /// A seek set the side conversation aside on this screen: it goes on
+    /// at the server, out of the way until the next `/btw` or a reopen.
+    side_aside: bool,
     req: FeedRequest,
     view: ThreadView<Entry>,
     /// Every message received, so another `show` can rebuild the view.
@@ -146,6 +149,7 @@ impl Thread {
             refresh: None,
             pending_anchor: None,
             sought: None,
+            side_aside: false,
             req: FeedRequest {
                 backlog: BACKLOG,
                 ..req
@@ -374,6 +378,20 @@ impl Thread {
         self.view.new_count = 0;
         self.pending_anchor = None;
         self.composing = false;
+        // Whatever stood over the timeline steps aside, as Esc would, with
+        // nothing sent: the search prompt, the effort picker, an owner form,
+        // the context panel, and the side conversation.
+        self.prompt = None;
+        self.effort_picker = None;
+        if let Some(owner) = &mut self.owner {
+            owner.form = None;
+            owner.context_open = false;
+            if owner.side.is_some() {
+                self.side_aside = true;
+            }
+        }
+        // The parent draft comes back from behind a side panel.
+        self.sync_side();
         // The hit is the thing to show; nothing waits on the first snapshot.
         self.opening_until = None;
         true
@@ -879,9 +897,11 @@ impl Thread {
                 }
             }
             let draft = composer.draft().text;
-            let panel = self.owner.as_ref().is_some_and(|o| o.side.is_some());
+            let panel = self.side_present();
             match crate::connect::owner::side_draft(&draft) {
                 crate::connect::owner::SideDraft::Ask(question) => {
+                    // Asking again brings a set-aside side conversation back.
+                    self.side_aside = false;
                     return Some(self.ask_side(&agent, &draft, question, false));
                 }
                 // While the side panel is up, typing goes to the side
@@ -985,7 +1005,12 @@ impl Thread {
 
     /// btw mode: the side conversation holds the view and the input.
     fn btw_mode(&self) -> bool {
-        self.owner.as_ref().is_some_and(|o| o.btw_mode())
+        !self.side_aside && self.owner.as_ref().is_some_and(|o| o.btw_mode())
+    }
+
+    /// The side panel is up on this screen.
+    fn side_present(&self) -> bool {
+        !self.side_aside && self.owner.as_ref().is_some_and(|o| o.side.is_some())
     }
 
     /// Mail held while btw mode hides the parent view is counted from here.
@@ -998,7 +1023,7 @@ impl Thread {
     /// Keep the parent and side drafts apart as the side panel opens and
     /// closes, and count mail hidden behind btw mode.
     fn sync_side(&mut self) {
-        let open = self.owner.as_ref().is_some_and(|o| o.side.is_some());
+        let open = self.side_present();
         if open != self.side_open {
             self.side_open = open;
             if let Some(composer) = &mut self.composer {
@@ -1169,6 +1194,26 @@ impl Screen for Thread {
         } else {
             Line::raw(self.title.clone())
         }
+    }
+
+    fn saved_view(&self) -> Option<SavedView> {
+        Some(Thread::saved_view(self))
+    }
+
+    fn restore_view(&mut self, view: SavedView) {
+        Thread::restore_view(self, view);
+    }
+
+    fn seed_messages(&mut self, rows: &[Message]) {
+        Thread::seed_messages(self, rows);
+    }
+
+    fn seek_message(&mut self, id: i64) -> bool {
+        Thread::seek_message(self, id)
+    }
+
+    fn feed_scope(&self, id: u64) -> Option<crate::connect::navigation::Conversation> {
+        (id == self.feed_id).then(|| self.conversation()).flatten()
     }
 
     fn bottom_status(
@@ -1537,6 +1582,7 @@ impl Screen for Thread {
             }
             if self.effort_picker.is_none()
                 && self.prompt.is_none()
+                && !self.side_aside
                 && let Some(owner) = &mut self.owner
                 && let Some(side) = &owner.side
             {
@@ -1797,6 +1843,7 @@ impl Thread {
         let btw = self
             .owner
             .as_ref()
+            .filter(|_| !self.side_aside)
             .and_then(|o| Some((o.side.as_ref()?, o.side_view()?)));
         let side_height = (side.len() as u16).min(if btw.is_some() { room / 2 } else { room });
         // btw mode: the side conversation takes the timeline's place, which
@@ -2241,5 +2288,89 @@ mod seek_tests {
         back.restore_view(following);
         feed(&mut back, rows);
         assert!(back.view.following());
+    }
+
+    #[test]
+    fn a_feed_scope_names_only_this_threads_current_stream() {
+        let (_, now) = clock();
+        let mut thread = Thread::agent("Mateo", "ada", now);
+        let old = thread.feed_id;
+        assert_eq!(
+            Screen::feed_scope(&thread, old),
+            Some(crate::connect::navigation::Conversation::Agent(
+                "Mateo".into()
+            ))
+        );
+        assert_eq!(Screen::feed_scope(&thread, old + 1000), None);
+        thread.reload();
+        assert_eq!(Screen::feed_scope(&thread, old), None, "a replaced stream");
+        assert!(Screen::feed_scope(&thread, thread.feed_id).is_some());
+        assert_eq!(Screen::feed_scope(&Thread::feed(), 1), None);
+    }
+
+    #[test]
+    fn seeking_sets_overlays_and_the_side_conversation_aside_sending_nothing() {
+        let (_, now) = clock();
+        let ctx = ctx(now.clone());
+        let mut thread = Thread::agent("Mateo", "ada", now);
+        thread.human = Some("ada".into());
+        thread.seed_messages(&[
+            mail(1, "Mateo", "ada", "the one sought"),
+            mail(2, "Mateo", "ada", "later"),
+        ]);
+        thread.composer.as_mut().unwrap().paste("parent text");
+        // A continuing side conversation takes the view and the composer.
+        let mut owner = crate::connect::owner::Session::new();
+        let Some(Request::SideReport { id, .. }) = owner.poll("Mateo") else {
+            unreachable!()
+        };
+        thread.owner = Some(owner);
+        thread.on_data(&Data::SideReport {
+            id,
+            result: Ok(Box::new(proto::SideReportResponse {
+                side_supported: Some(true),
+                side_followups: Some(true),
+                side: Some(proto::SideRequest {
+                    id: 5,
+                    question: "aside?".into(),
+                    status: proto::SideStatus::SideCompleted.into(),
+                    answer: Some("an answer".into()),
+                    updated_at: "2026-10-20T02:31:00Z".into(),
+                    follows: None,
+                    ended: false,
+                    conversation: Some(5),
+                }),
+                ..Default::default()
+            })),
+        });
+        assert!(thread.btw_mode(), "set up in btw mode");
+        assert_eq!(thread.composer_text().as_deref(), Some(""));
+        thread.prompt = Some("draft search".into());
+        thread.owner.as_mut().unwrap().context_open = true;
+        assert!(thread.seek_message(1));
+        assert!(!thread.btw_mode() && !thread.side_present());
+        assert!(thread.prompt.is_none());
+        assert!(!thread.owner.as_ref().unwrap().context_open);
+        assert!(thread.owner.as_ref().unwrap().side.is_some(), "it goes on");
+        assert_eq!(thread.composer_text().as_deref(), Some("parent text"));
+        let out = draw(&mut thread, &ctx);
+        assert!(find(&out, "the one sought").is_some());
+        assert!(find(&out, "aside?").is_none(), "the panel stepped aside");
+        // Esc now belongs to the conversation, not to cancelling the side.
+        assert!(matches!(
+            thread.raw_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(Transition::Stay)
+        ));
+        assert!(thread.composing, "Esc returned to writing");
+        // Asking again brings the side conversation back.
+        let composer = thread.composer.as_mut().unwrap();
+        composer.restore(Draft::default());
+        composer.paste("/btw again?");
+        let asked = thread.raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(asked, Some(Transition::Request(Request::AskSide { .. }))),
+            "a new side question"
+        );
+        assert!(!thread.side_aside);
     }
 }
