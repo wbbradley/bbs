@@ -1,7 +1,6 @@
-//! Blockers (blockers.v1) for a conversation: the scope's open blockers,
-//! polled once a second, and the F2 panel that answers or cancels them in
-//! the composer's place. Answer drafts live only in this session; each chain
-//! has at most one write in flight, retried only with its own key.
+//! The human's personal blocker queue (blockers-mine.v1), polled once a
+//! second, and its full-terminal F2 modal. Answer drafts live only in this
+//! session; each chain has at most one write in flight, retried with its own key.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +15,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use super::composer::Composer;
-use super::event::{BlockerScope, Data, Request, SideError};
+use super::event::{Data, Request, SideError};
 use super::theme::{self, Role};
 use crate::proto;
 
@@ -35,7 +34,7 @@ const KEPT_REFUSALS: usize = 20;
 enum Support {
     Unknown,
     Supported,
-    /// The server lacks blockers.v1; never asked again on this screen.
+    /// The server lacks blockers-mine.v1; polling stops until reload.
     Unsupported,
 }
 
@@ -104,7 +103,6 @@ pub enum Outcome {
 }
 
 pub struct Blockers {
-    scope: BlockerScope,
     support: Support,
     polling: bool,
     loaded: bool,
@@ -122,9 +120,8 @@ pub struct Blockers {
 }
 
 impl Blockers {
-    pub fn new(scope: BlockerScope) -> Blockers {
+    pub fn new() -> Blockers {
         Blockers {
-            scope,
             support: Support::Unknown,
             polling: false,
             loaded: false,
@@ -139,17 +136,14 @@ impl Blockers {
         }
     }
 
-    /// The next poll for the screen `id`: one at a time, never once the
+    /// The next poll for app `id`: one at a time, never once the
     /// server has refused the capability.
     pub fn poll(&mut self, id: u64) -> Option<Request> {
         if self.support == Support::Unsupported || self.polling {
             return None;
         }
         self.polling = true;
-        Some(Request::Blockers {
-            id,
-            scope: self.scope.clone(),
-        })
+        Some(Request::Blockers { id })
     }
 
     /// A reload may ask a server that refused again.
@@ -988,7 +982,6 @@ fn request(id: u64, key: &str, write: &Write) -> Request {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connect::event::BlockerScope;
 
     const SCREEN: u64 = 7;
 
@@ -1041,7 +1034,7 @@ mod tests {
 
     /// Two open blockers, polled once, with the panel open.
     fn open(now: Instant) -> Blockers {
-        let mut blockers = Blockers::new(BlockerScope::Agent("Mateo".into()));
+        let mut blockers = Blockers::new();
         assert!(blockers.poll(SCREEN).is_some());
         blockers.on_data(
             SCREEN,
@@ -1076,13 +1069,10 @@ mod tests {
     #[test]
     fn polls_one_at_a_time_for_its_own_screen_and_stop_on_an_old_server() {
         let now = Instant::now();
-        let mut blockers = Blockers::new(BlockerScope::Group("crew".into()));
+        let mut blockers = Blockers::new();
         assert_eq!(
             blockers.poll(SCREEN),
-            Some(Request::Blockers {
-                id: SCREEN,
-                scope: BlockerScope::Group("crew".into()),
-            })
+            Some(Request::Blockers { id: SCREEN })
         );
         assert_eq!(blockers.poll(SCREEN), None, "one in flight");
         // Another screen's answer is not this poll's.
@@ -1116,7 +1106,7 @@ mod tests {
     #[test]
     fn counts_the_whole_scope_and_notices_only_real_changes_while_open() {
         let now = Instant::now();
-        let mut blockers = Blockers::new(BlockerScope::Agent("Mateo".into()));
+        let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         // The first page of 50, of 60 open: the count is the scope's.
         let page: Vec<_> = (1..=50).map(|i| row(i, i, "Zed", "q")).collect();
@@ -1529,7 +1519,7 @@ mod tests {
     #[test]
     fn only_so_many_refusals_are_kept() {
         let now = Instant::now();
-        let mut blockers = Blockers::new(BlockerScope::Group("crew".into()));
+        let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         let all: Vec<_> = (1..=25).map(|i| row(i, i, "Zed", "q?")).collect();
         blockers.on_data(SCREEN, &list(all), now);
@@ -1643,7 +1633,7 @@ mod tests {
     #[test]
     fn read_only_says_whether_the_creator_or_ownership_is_missing() {
         let now = Instant::now();
-        let mut blockers = Blockers::new(BlockerScope::Group("crew".into()));
+        let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         let mut retired = row(1, 1, "Zed", "q?");
         retired.can_answer = false;
@@ -1734,7 +1724,7 @@ mod tests {
     #[test]
     fn read_only_rows_say_why_and_take_no_answer() {
         let now = Instant::now();
-        let mut blockers = Blockers::new(BlockerScope::Group("crew".into()));
+        let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         let mut theirs = row(1, 1, "Zed", "q?");
         theirs.can_answer = false;
@@ -1760,7 +1750,7 @@ mod tests {
     #[test]
     fn the_last_answer_says_done_swallows_keys_and_a_new_blocker_keeps_the_panel() {
         let now = Instant::now();
-        let mut blockers = Blockers::new(BlockerScope::Agent("Mateo".into()));
+        let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         blockers.on_data(SCREEN, &list(vec![row(1, 1, "Zed", "q?")]), now);
         blockers.open(now).unwrap();
@@ -1811,7 +1801,7 @@ mod tests {
     #[test]
     fn an_empty_queue_says_done_on_entry() {
         let now = Instant::now();
-        let mut blockers = Blockers::new(BlockerScope::Agent("Mateo".into()));
+        let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         blockers.on_data(SCREEN, &list(vec![]), now);
         blockers.open(now).unwrap();

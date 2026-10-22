@@ -96,10 +96,9 @@ pub enum Request {
     },
     /// Stream per-agent summaries, replacing any stream with the same id.
     WatchSummary(u64),
-    /// The open blockers in a screen's scope (blockers.v1), for the screen `id`.
+    /// The human's personal blocker queue (blockers-mine.v1), for app `id`.
     Blockers {
         id: u64,
-        scope: BlockerScope,
     },
     /// A human's answer to one exact blocker version, for the screen `id`.
     AnswerBlocker {
@@ -111,14 +110,6 @@ pub enum Request {
         id: u64,
         req: proto::CancelBlockerRequest,
     },
-}
-
-/// The authenticated human's groups, one group, or a live agent's groups.
-#[derive(Clone, Debug, PartialEq)]
-pub enum BlockerScope {
-    Mine,
-    Group(String),
-    Agent(String),
 }
 
 /// One group change, as the CLI's `bbs group` commands make it.
@@ -535,22 +526,11 @@ pub async fn serve(
                 }
                 Data::Groups(backend.group_list().await.map_err(error))
             }
-            Request::Blockers { id, scope } => {
+            Request::Blockers { id } => {
                 let local = matches!(backend, Backend::Local(_));
-                let (group, agent, mine) = match scope {
-                    BlockerScope::Mine => (None, None, true),
-                    BlockerScope::Group(group) => (Some(group), None, false),
-                    BlockerScope::Agent(agent) => (None, Some(agent), false),
-                };
-                let capability = if mine {
-                    crate::backend::BLOCKERS_MINE
-                } else {
-                    crate::backend::BLOCKERS
-                };
+                let capability = crate::backend::BLOCKERS_MINE;
                 let req = proto::ListBlockersRequest {
-                    group,
-                    agent,
-                    mine,
+                    mine: true,
                     ..Default::default()
                 };
                 let result =
@@ -1065,15 +1045,19 @@ mod tests {
     #[tokio::test]
     async fn a_refused_blocker_answer_leaves_polling_working() {
         let (_dir, conn, opener, _) = board();
+        // A board-wide poll would expose this unrelated group's blocker.
+        conn.execute_batch(
+            "INSERT INTO bbs_groups (id, name, created_at) VALUES (1, 'elsewhere', 't');
+             INSERT INTO blockers (group_id, creator_id, body, created_at, request_key)
+             VALUES (1, 1, 'not in the personal queue', 't', 'unrelated')",
+        )
+        .unwrap();
         let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
             .await
             .unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
-        let poll = || Request::Blockers {
-            id: 60,
-            scope: BlockerScope::Agent("Mateo".into()),
-        };
+        let poll = || Request::Blockers { id: 60 };
         tx.send(poll()).unwrap();
         tx.send(Request::AnswerBlocker {
             id: 60,
@@ -1321,50 +1305,42 @@ mod tests {
 
         #[tokio::test]
         async fn a_failed_poll_is_an_old_server_only_when_it_lacks_the_capability() {
-            for (scope, capability) in [
-                (BlockerScope::Group("crew".into()), crate::backend::BLOCKERS),
-                (BlockerScope::Mine, crate::backend::BLOCKERS_MINE),
-            ] {
-                for offers in [true, false] {
-                    let (_dir, _conn, mut opener, _) = board();
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    opener.config.server = Some(listener.local_addr().unwrap().to_string());
-                    let serving = tokio::spawn(
-                        tonic::transport::Server::builder()
-                            .add_service(Server { offers, capability })
-                            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
-                                listener,
-                            )),
-                    );
-                    let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
-                        .await
-                        .unwrap();
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                    let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
-                    tx.send(Request::Blockers {
-                        id: 61,
-                        scope: scope.clone(),
-                    })
+            let capability = crate::backend::BLOCKERS_MINE;
+            for offers in [true, false] {
+                let (_dir, _conn, mut opener, _) = board();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                opener.config.server = Some(listener.local_addr().unwrap().to_string());
+                let serving = tokio::spawn(
+                    tonic::transport::Server::builder()
+                        .add_service(Server { offers, capability })
+                        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                            listener,
+                        )),
+                );
+                let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
+                    .await
                     .unwrap();
-                    drop(tx);
-                    serve(backend, opener, rx, events).await;
-                    let Some(Event::Data(Data::Blockers { id: 61, result })) = replies.recv().await
-                    else {
-                        panic!("a poll reply")
-                    };
-                    if offers {
-                        assert!(
-                            matches!(result, Err(SideError::Refused(_))),
-                            "{capability}: {result:?}"
-                        );
-                    } else {
-                        assert!(
-                            matches!(result, Err(SideError::Unsupported(_))),
-                            "{capability}: {result:?}"
-                        );
-                    }
-                    serving.abort();
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
+                tx.send(Request::Blockers { id: 61 }).unwrap();
+                drop(tx);
+                serve(backend, opener, rx, events).await;
+                let Some(Event::Data(Data::Blockers { id: 61, result })) = replies.recv().await
+                else {
+                    panic!("a poll reply")
+                };
+                if offers {
+                    assert!(
+                        matches!(result, Err(SideError::Refused(_))),
+                        "{capability}: {result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(SideError::Unsupported(_))),
+                        "{capability}: {result:?}"
+                    );
                 }
+                serving.abort();
             }
         }
     }

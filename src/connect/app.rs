@@ -13,7 +13,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::blockers::{self, Blockers};
 use super::composer::Composer;
 use super::drafts::{Draft, DraftStore};
-use super::event::{BlockerScope, Data, Event, Request};
+use super::event::{Data, Event, Request};
 use super::keys::{Action, Keymap};
 use super::navigation::{Conversation, Feedback, History, Inbox};
 use super::preferences::Preferences;
@@ -188,7 +188,7 @@ impl App {
             history: History::default(),
             known_agents: None,
             known_groups: None,
-            blockers: Blockers::new(BlockerScope::Mine),
+            blockers: Blockers::new(),
             blockers_id: next_id(),
         };
         app.send(vec![Request::WatchSummary(app.ctx.inbox.id)]);
@@ -678,7 +678,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connect::event::{Admin, BlockerScope, SideError};
+    use crate::connect::event::{Admin, SideError};
     use crate::proto;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -5705,14 +5705,11 @@ mod tests {
         }));
     }
 
-    /// The tick's blocker poll, with its screen and scope.
-    fn blocker_poll(
-        app: &mut App,
-        rx: &mut UnboundedReceiver<Request>,
-    ) -> Option<(u64, BlockerScope)> {
+    /// The tick's personal blocker poll, with its app request id.
+    fn blocker_poll(app: &mut App, rx: &mut UnboundedReceiver<Request>) -> Option<u64> {
         app.on_event(Event::Tick);
         std::iter::from_fn(|| rx.try_recv().ok()).find_map(|r| match r {
-            Request::Blockers { id, scope } => Some((id, scope)),
+            Request::Blockers { id } => Some(id),
             _ => None,
         })
     }
@@ -5726,7 +5723,7 @@ mod tests {
     ) -> u64 {
         mateo(app, rx);
         let id = app.blockers_id;
-        assert_eq!(blocker_poll(app, rx), Some((id, BlockerScope::Mine)));
+        assert_eq!(blocker_poll(app, rx), Some(id));
         blockers_listed(app, id, rows);
         id
     }
@@ -5901,10 +5898,7 @@ mod tests {
                 enter(&mut app);
                 watched(&mut rx);
                 let id = app.blockers_id;
-                assert_eq!(
-                    blocker_poll(&mut app, &mut rx),
-                    Some((id, BlockerScope::Mine))
-                );
+                assert_eq!(blocker_poll(&mut app, &mut rx), Some(id));
                 blockers_listed(&mut app, id, vec![blocker(1, 1, "Zed", "q?")]);
                 let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
                 terminal.draw(|f| app.draw(f)).unwrap();
@@ -5941,7 +5935,7 @@ mod tests {
     fn queue(app: &mut App, rx: &mut UnboundedReceiver<Request>, rows: Vec<proto::Blocker>) -> u64 {
         let id = app.blockers_id;
         if let Some(poll) = blocker_poll(app, rx) {
-            assert_eq!(poll, (id, BlockerScope::Mine));
+            assert_eq!(poll, id);
         }
         blockers_listed(app, id, rows);
         id
@@ -5958,10 +5952,7 @@ mod tests {
         // The splash: one personal poll, then none while it is out.
         let (mut app, mut rx) = splash_app();
         let id = app.blockers_id;
-        assert_eq!(
-            blocker_poll(&mut app, &mut rx),
-            Some((id, BlockerScope::Mine))
-        );
+        assert_eq!(blocker_poll(&mut app, &mut rx), Some(id));
         assert_eq!(blocker_poll(&mut app, &mut rx), None, "one in flight");
         blockers_listed(&mut app, id, vec![blocker(1, 1, "Zed", "q?")]);
         let out = screen(&mut app, 80, 24);
@@ -5980,11 +5971,11 @@ mod tests {
             app.on_event(Event::Tick);
             let polls: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
                 .filter_map(|r| match r {
-                    Request::Blockers { id, scope } => Some((id, scope)),
+                    Request::Blockers { id } => Some(id),
                     _ => None,
                 })
                 .collect();
-            assert_eq!(polls, [(id, BlockerScope::Mine)]);
+            assert_eq!(polls, [id]);
             blockers_listed(&mut app, id, vec![blocker(1, 1, "Zed", "q?")]);
         }
         assert!(bottom(&mut app).contains("[1 blocker · F2]"));
