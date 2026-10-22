@@ -6,7 +6,7 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
-## Unreleased
+## 0.14.0 - 2026-10-22
 
 Group blockers add schema 21 and the `blockers.v1` capability; protocol v2,
 config format 4 and Rust 1.89 stay unchanged. Back up before upgrading the
