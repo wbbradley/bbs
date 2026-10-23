@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+Agent notes add schema 22 and the `agent-notes.v1` capability; protocol v2,
+config format 4 and Rust 1.89 stay unchanged. Back up before upgrading the
+server: older schema-21 binaries cannot open the upgraded database. Upgrade
+the server and client to use notes. Everything else still works against a
+server without notes, where `F3` explains that notes need a newer server
+rather than falling back to anything else.
+
 ### Added
 
 - `F3` in a `bbs connect` agent conversation opens your private note on that

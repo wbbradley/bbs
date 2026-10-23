@@ -597,9 +597,13 @@ fn result_line(
         }
         Target::Note { agent_id, .. } => {
             let agent = cache.note_agent(*agent_id).unwrap_or_default();
-            spans.extend(marked(agent, query, on(Role::Agent), row));
-            spans.push(Span::styled("  note  ", on(Role::Muted)));
-            spans.extend(marked(&hit.text, query, on(Role::Text), row));
+            let gap = "  note  ";
+            let budget = width.saturating_sub(1);
+            let (room, text) = fit_match(agent, gap.width(), &hit.text, query, budget);
+            let name = Line::from(marked(agent, query, on(Role::Agent), row));
+            spans.extend(theme::clip_line(name, room).spans);
+            spans.push(Span::styled(gap, on(Role::Muted)));
+            spans.extend(marked(&text, query, on(Role::Text), row));
         }
         Target::Message(id) => {
             let mut text = hit.text.clone();
@@ -619,32 +623,41 @@ fn result_line(
                     .or_else(|| m.to_name.clone())
                     .unwrap_or_default();
                 let who = format!("{} → {to}", m.from_name);
-                let mut names = who.width() + 2;
-                // Keep the first match in view: crop the line before it,
-                // then shorten the names if that is still not enough.
-                let first = |text: &str| {
-                    crate::ui::message::find_matches(text, query)
-                        .first()
-                        .cloned()
-                };
-                if let Some(found) = first(&text)
-                    && names + text[..found.end].width() > budget
-                {
-                    text = crop_before(&text, found.start);
-                }
-                if let Some(found) = first(&text) {
-                    let floor = names.min(MIN_NAMES);
-                    names = names
-                        .min(budget.saturating_sub(text[..found.end].width()))
-                        .max(floor);
-                }
-                spans.extend(theme::clip_line(Line::styled(who, on(Role::Text)), names - 2).spans);
+                let room;
+                (room, text) = fit_match(&who, 2, &text, query, budget);
+                spans.extend(theme::clip_line(Line::styled(who, on(Role::Text)), room).spans);
                 spans.push(Span::styled("  ", on(Role::Text)));
             }
             spans.extend(marked(&text, query, on(Role::Text), row));
         }
     }
     Line::from(spans)
+}
+
+/// Keep the first match of `query` in view after `who` and a `gap` within
+/// `budget` columns: crop `text` before the match, then shorten `who` if
+/// that is still not enough, never below `MIN_NAMES` columns with its gap.
+/// The columns `who` may take, and the text to show.
+fn fit_match(who: &str, gap: usize, text: &str, query: &str, budget: usize) -> (usize, String) {
+    let first = |text: &str| {
+        crate::ui::message::find_matches(text, query)
+            .first()
+            .cloned()
+    };
+    let mut names = who.width() + gap;
+    let mut text = text.to_string();
+    if let Some(found) = first(&text)
+        && names + text[..found.end].width() > budget
+    {
+        text = crop_before(&text, found.start);
+    }
+    if let Some(found) = first(&text) {
+        let floor = names.min(MIN_NAMES);
+        names = names
+            .min(budget.saturating_sub(text[..found.end].width()))
+            .max(floor);
+    }
+    (names - gap, text)
 }
 
 /// `text` in `style`, with what matches `query` bold in the search-hit
@@ -1461,6 +1474,29 @@ mod tests {
         assert_eq!(long.1, "needle", "{text}");
         assert!(long.0.contains("… "), "the names are shortened: {text}");
         assert!(!long.0.contains("Maximiliana-of-the-crew"), "{text}");
+    }
+
+    #[test]
+    fn a_late_match_in_a_note_stays_in_view_beside_a_long_name() {
+        let body = "an ordinary note that goes on for a good while before the needle shows up";
+        let mut cache = Cache::default();
+        let long = "Bartholomew-the-long-named-agent-of-the-crew";
+        cache.notes([(1, "Mateo", body), (2, long, body)].into_iter());
+        let rows = marked_rows(&cache, "NEEDLE", 60);
+        let text = rows
+            .iter()
+            .map(|(row, _)| row.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for name in ["Mateo  note  …", "Bartholomew"] {
+            let (row, hit) = rows
+                .iter()
+                .find(|(row, _)| row.contains(name))
+                .expect(&text);
+            assert_eq!(hit, "needle", "{name}: {text}");
+            assert!(row.contains("needle"), "{text}");
+        }
+        assert!(!text.contains(long), "the long name is shortened: {text}");
     }
 
     #[test]
