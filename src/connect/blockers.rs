@@ -308,14 +308,15 @@ impl Blockers {
                 }
             }
             panel.selected = selected;
-            // Cancelling is offered only while allowed.
+            // Cancelling and discussing are offered only while possible.
             let gone = selected.is_some_and(|r| self.held.contains(&r));
-            let can_cancel = self
-                .rows
-                .iter()
-                .find(|b| Some(b.root_id) == selected)
-                .is_some_and(|b| b.can_cancel);
-            if !gone && !can_cancel && panel.focus != Focus::Answer {
+            let row = self.rows.iter().find(|b| Some(b.root_id) == selected);
+            let lost = match panel.focus {
+                Focus::Cancel | Focus::Confirm => !gone && !row.is_some_and(|b| b.can_cancel),
+                Focus::Discuss => row.and_then(agent_creator).is_none(),
+                Focus::Answer => false,
+            };
+            if lost {
                 panel.focus = Focus::Answer;
             }
             if !self.rows.is_empty() {
@@ -1461,6 +1462,34 @@ mod tests {
                 vec![Focus::Discuss, Focus::Answer, Focus::Discuss]
             )
         );
+    }
+
+    #[test]
+    fn a_refresh_keeps_discuss_focused_while_the_creator_is_an_agent() {
+        let now = Instant::now();
+        let mut blockers = Blockers::new();
+        blockers.poll(SCREEN);
+        let mut first = row(1, 1, "Zed", "q?");
+        first.can_cancel = false;
+        blockers.on_data(SCREEN, &list(vec![first.clone()]), now);
+        blockers.open(now).unwrap();
+        typed(&mut blockers, "draft", now);
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        assert_eq!(focus(&blockers), Focus::Discuss);
+        // The same rows again: still discussing, and Enter discusses.
+        blockers.on_data(SCREEN, &list(vec![first.clone()]), now);
+        assert_eq!(focus(&blockers), Focus::Discuss);
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Enter), now),
+            Outcome::Discuss(agent) if agent == "Zed"
+        ));
+        assert!(blockers.chains[&1].pending.is_none(), "no answer sent");
+        // A creator that is no longer an agent takes the focus back.
+        blockers.open(now).unwrap();
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        first.creator.as_mut().unwrap().kind = proto::Kind::Human.into();
+        blockers.on_data(SCREEN, &list(vec![first]), now);
+        assert_eq!(focus(&blockers), Focus::Answer);
     }
 
     #[test]
