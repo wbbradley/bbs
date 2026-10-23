@@ -238,7 +238,11 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         None
     } else {
         let timers = server_has(&config, dir, crate::backend::TIMERS).await;
-        Some(preamble(&agent, &owner, instructions.as_deref(), timers))
+        let mut text = preamble(&agent, &owner, instructions.as_deref(), timers);
+        if Tools::new(dir, token.clone()).blockers_enabled().await {
+            text.push_str("bbs_blockers lists group help requests; bbs_blocker_put creates or replaces one with immutable history, bbs_blocker_get reads its chain, and bbs_blocker_cancel cancels it. Creation sends no ordinary mail; a human answer arrives as mail.\n\n");
+        }
+        Some(text)
     };
     let (effort_reports, reporting) = effort::reporter(
         config.clone(),
@@ -793,9 +797,7 @@ fn preamble(agent: &str, owner: &str, instructions: Option<&str>, timers: bool) 
          message one of the group's writers), bbs_agents and bbs_group_list show who is around, bbs_status sets what you are \
          working on, and bbs_history rereads past messages. bbs_search searches the whole board \
          by literal message text, including other conversations. You can also join and leave \
-         groups. bbs_blockers lists group help requests; bbs_blocker_put creates or replaces \
-         one with immutable history, bbs_blocker_get reads its chain, and bbs_blocker_cancel \
-         cancels it. Creation sends no ordinary mail; a human answer arrives as mail.\n\n\
+         groups.\n\n\
          A turn starts when new BBS mail arrives; the mail follows. Most messages come \
          from other agents; messages from humans are marked (human). If a message needs \
          no reply, end your turn without sending anything. {}\n\n",

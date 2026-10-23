@@ -2252,6 +2252,48 @@ fn blocker_tools_and_cli_keep_versions_retries_and_answer_delivery(mode: Mode) {
     use serde_json::{Value, json};
     let bbs = Bbs::with_mode("blockers-tools", mode);
     let (agent, token) = bbs.register();
+    let (sibling, sibling_token) = bbs.register();
+    bbs.ok(&["human", "add", "ada"]);
+    let (_, other_token) = bbs.register_with(&["--as", "ada", "register", "--note", "testing"]);
+    let catalog_for = |token: &str| -> Value {
+        let out = bbs.run_with_env(
+            &["headless", "mcp"],
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
+            &[("BBS_HEADLESS_TOKEN", token)],
+        );
+        assert!(out.status.success());
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let has_blockers = |catalog: Value| {
+        catalog["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"].as_str().unwrap().starts_with("bbs_blocker"))
+    };
+    assert!(!has_blockers(catalog_for(&token)));
+    assert!(
+        bbs.err(&["--token", &token, "blocker", "enable"])
+            .contains("humans only")
+    );
+    let disabled_call = bbs.run_with_env(
+        &["headless", "mcp"],
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"bbs_blockers\",\"arguments\":{}}}\n",
+        &[("BBS_HEADLESS_TOKEN", &token)],
+    );
+    let disabled_call: Value = serde_json::from_slice(&disabled_call.stdout).unwrap();
+    assert_eq!(disabled_call["result"]["isError"], true);
+    bbs.ok(&["blocker", "enable"]);
+    assert!(has_blockers(catalog_for(&token)));
+    assert!(
+        has_blockers(catalog_for(&sibling_token)),
+        "sibling {sibling}"
+    );
+    assert!(!has_blockers(catalog_for(&other_token)));
+    bbs.ok(&["blocker", "disable"]);
+    assert!(!has_blockers(catalog_for(&token)));
+    assert!(!has_blockers(catalog_for(&sibling_token)));
+    bbs.ok(&["blocker", "enable"]);
     bbs.ok(&["group", "register", "crew"]);
     bbs.ok(&["--token", &token, "group", "join", "crew"]);
     bbs.ok(&["--token", &token, "read"]);
@@ -3707,6 +3749,31 @@ fn headless_codex_adopts_an_acp_thread_and_never_starts_one_in_its_place(mode: M
     assert_eq!(first["method"], "thread/start");
     assert!(first["params"]["dynamicTools"].is_array());
     assert_eq!(headless_state(&bbs, "Zed")["dynamic_tools"], true);
+    assert!(
+        !first["params"]["dynamicTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"].as_str().unwrap().starts_with("bbs_blocker"))
+    );
+    bbs.ok(&["blocker", "enable"]);
+    let enabled = opened(&session(&["--new-session"]));
+    assert!(
+        enabled["params"]["dynamicTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "bbs_blocker_put")
+    );
+    bbs.ok(&["blocker", "disable"]);
+    let disabled = opened(&session(&["--new-session"]));
+    assert!(
+        !disabled["params"]["dynamicTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"].as_str().unwrap().starts_with("bbs_blocker"))
+    );
     // Resuming it sends no MCP server: the thread keeps its tools.
     let again = opened(&session(&[]));
     assert_eq!(again["method"], "thread/resume");

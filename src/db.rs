@@ -35,6 +35,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0019_side_questions.sql"),
     include_str!("../migrations/0020_side_conversations.sql"),
     include_str!("../migrations/0021_blockers.sql"),
+    include_str!("../migrations/0022_blocker_opt_in.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3104,4 +3105,28 @@ mod tests {
             Some("2026-10-09T01:00:00.000000Z")
         );
     }
+}
+
+/// Missing ownership never enables blocker tools.
+pub fn blockers_enabled(conn: &Connection, actor: &Principal) -> Result<bool> {
+    let human = match actor.kind {
+        Kind::Human => Some(actor.id),
+        Kind::Agent => agent_owner_id(conn, actor.id)?,
+    };
+    match human {
+        Some(id) => Ok(conn.query_row(
+            "SELECT blockers_enabled FROM humans WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )?),
+        None => Ok(false),
+    }
+}
+
+pub fn set_blockers_enabled(conn: &Connection, human_id: i64, enabled: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE humans SET blockers_enabled = ?1 WHERE id = ?2",
+        params![enabled, human_id],
+    )?;
+    Ok(())
 }

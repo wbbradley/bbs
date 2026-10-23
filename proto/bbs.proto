@@ -123,6 +123,9 @@ service Bbs {
 
   // Immutable group blockers; all require blockers.v1. Reads are board-wide
   // for authenticated callers. Writes enforce current group relationships.
+  // Read caller's blocker tool preference (agents inherit their owner's).
+  // Only humans may set it; absent enabled leaves the preference unchanged.
+  rpc BlockerPreference(BlockerPreferenceRequest) returns (BlockerPreferenceResponse);
   rpc ListBlockers(ListBlockersRequest) returns (ListBlockersResponse);
   rpc GetBlocker(GetBlockerRequest) returns (GetBlockerResponse);
   // Agent group members create a new version, optionally replacing the head
@@ -134,6 +137,9 @@ service Bbs {
   // Current member agents and humans owning a member may cancel; no mail.
   rpc CancelBlocker(CancelBlockerRequest) returns (BlockerMutationResponse);
 }
+
+message BlockerPreferenceRequest { optional bool enabled = 1; }
+message BlockerPreferenceResponse { bool enabled = 1; }
 
 enum BlockerStatus {
   BLOCKER_STATUS_UNSPECIFIED = 0;

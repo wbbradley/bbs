@@ -223,6 +223,17 @@ impl Backend {
         }
     }
 
+    pub async fn blocker_preference(
+        &mut self,
+        enabled: Option<bool>,
+    ) -> Result<proto::BlockerPreferenceResponse> {
+        let req = proto::BlockerPreferenceRequest { enabled };
+        match self {
+            Backend::Local(l) => service::blocker_preference(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => rpc!(r, blocker_preference, req, &["blocker-opt-in.v1"]),
+        }
+    }
+
     pub async fn whoami(&mut self) -> Result<proto::Principal> {
         match self {
             Backend::Local(l) => service::whoami(&mut l.conn, &l.caller),
