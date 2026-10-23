@@ -12,6 +12,7 @@ mod event;
 mod keys;
 mod launcher;
 mod navigation;
+mod notes;
 mod owner;
 mod preferences;
 mod progress;

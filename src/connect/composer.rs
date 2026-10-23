@@ -261,6 +261,16 @@ impl Composer {
         self.error.as_deref()
     }
 
+    /// The whole draft.
+    pub fn text(&self) -> String {
+        self.text.lines().join("\n")
+    }
+
+    /// Take back the last edit.
+    pub fn undo(&mut self) {
+        self.text.undo();
+    }
+
     pub fn sending(&self) -> bool {
         self.sending.is_some()
     }
