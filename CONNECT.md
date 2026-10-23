@@ -196,8 +196,9 @@ any more; each refresh fills in rows as others resolve. The list stays at the
 top. The selected blocker sits at the bottom, just above its answer: a row
 restating its number, group and creator, then its details, one blank row, who
 an answer goes to, one blank row and the answer box; any spare rows fall
-between the list and that block. Alt-↑/↓ selects; plain arrows edit the answer; PgUp/PgDn page through a selected text too long for the
-card, which shows how far you have read. Details render as Markdown, as messages
+between the list and that block. Alt-↑/↓ selects; plain arrows edit the
+answer; PgUp/PgDn page through a selected text too long for the card, which
+shows how far you have read. Details render as Markdown, as messages
 do: headings, emphasis, lists, code and tables. Every display line keeps a
 two-column left margin, including wrapped lines and while paging; tables fit
 the remaining width. The selected blocker's text sits above an answer box
