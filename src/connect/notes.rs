@@ -12,8 +12,7 @@ use super::composer::Composer;
 use super::drafts::Draft;
 use super::theme::{self, Role};
 
-/// The most a note may hold, in UTF-8 bytes.
-pub const MAX_NOTE_BYTES: usize = 32 * 1024;
+pub use crate::service::MAX_NOTE_BYTES;
 
 /// Whether the note can be edited yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,14 +49,18 @@ pub struct NoteEditor {
     saving: Option<(u64, String)>,
     /// `Esc` asked to close once the text is stored.
     closing: bool,
+    /// The line the cursor starts on once the note arrives.
+    line: usize,
+    /// The notes are paging in again after a reload: no edits or saves.
+    paused: bool,
     /// Why the last save failed, or why an edit was refused.
     error: Option<String>,
 }
 
 impl NoteEditor {
     /// An editor for the agent `agent_id`, named `agent`, that waits for the
-    /// stored note before it can be edited.
-    pub fn new(agent_id: i64, agent: &str) -> NoteEditor {
+    /// stored note before it can be edited, then starts on `line`.
+    pub fn new(agent_id: i64, agent: &str, line: usize) -> NoteEditor {
         NoteEditor {
             agent_id,
             agent: agent.to_string(),
@@ -66,6 +69,8 @@ impl NoteEditor {
             saved: String::new(),
             saving: None,
             closing: false,
+            line,
+            paused: false,
             error: None,
         }
     }
@@ -91,9 +96,8 @@ impl NoteEditor {
         self.saving.is_some()
     }
 
-    /// The stored note has arrived (`None`: there is none yet), with the
-    /// cursor on `line`.
-    pub fn loaded(&mut self, body: Option<&str>, line: usize) {
+    /// The stored note has arrived (`None`: there is none yet).
+    pub fn loaded(&mut self, body: Option<&str>) {
         if self.access != Access::Loading {
             return;
         }
@@ -101,9 +105,19 @@ impl NoteEditor {
         self.saved = body.to_string();
         self.text.restore(Draft {
             text: body.to_string(),
-            cursor: (line, 0),
+            cursor: (self.line, 0),
         });
         self.access = Access::Editable;
+    }
+
+    /// The notes are paging in again; until `resumed`, nothing is edited or
+    /// saved, and the text stays as it is.
+    pub fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    pub fn resume(&mut self) {
+        self.paused = false;
     }
 
     /// The server keeps no notes; nothing can be edited.
@@ -124,7 +138,7 @@ impl NoteEditor {
             self.closing = false;
             return;
         }
-        if !self.dirty() && self.saving.is_none() {
+        if !self.dirty() && self.saving.is_none() && self.text.text() != body {
             let cursor = self.text.draft().cursor;
             self.text.restore(Draft {
                 text: body.to_string(),
@@ -169,6 +183,7 @@ impl NoteEditor {
             return;
         }
         let refused = match self.access {
+            Access::Editable if self.paused => Some("the notes are reloading".to_string()),
             Access::Editable if after.len() > MAX_NOTE_BYTES => Some(format!(
                 "a note holds at most {MAX_NOTE_BYTES} bytes; that would make {}",
                 after.len()
@@ -189,6 +204,10 @@ impl NoteEditor {
     /// `Ctrl-s`: store a changed note, one save at a time.
     fn save(&mut self, save_id: u64) -> Outcome {
         if self.access != Access::Editable || self.saving.is_some() || !self.dirty() {
+            return Outcome::Stay;
+        }
+        if self.paused {
+            self.error = Some("the notes are reloading; save again in a moment".into());
             return Outcome::Stay;
         }
         let body = self.text.text();
@@ -263,6 +282,7 @@ impl NoteEditor {
                 "the agent retired; its note is read-only".into(),
                 Role::Muted,
             ),
+            (None, Access::Editable) if self.paused => ("reloading notes…".into(), Role::Muted),
             (None, Access::Editable) if self.saving.is_some() => ("saving…".into(), Role::Muted),
             (None, Access::Editable) if self.dirty() => ("unsaved".into(), Role::Muted),
             (None, Access::Editable) => ("saved".into(), Role::Muted),
@@ -413,9 +433,29 @@ impl NoteStore {
         self.unsupported
     }
 
-    /// A live agent's note, if any.
-    pub fn note(&self, agent_id: i64) -> Option<&StoredNote> {
-        self.notes.get(&agent_id).filter(|note| !note.retired)
+    /// The stored row for an agent, retired or not.
+    pub fn row(&self, agent_id: i64) -> Option<&StoredNote> {
+        self.notes.get(&agent_id)
+    }
+
+    /// The subscription the pages belong to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The summary of `generation` comes from a server without notes.
+    pub fn unavailable(&mut self, generation: u64) {
+        self.generation = generation;
+        self.fetching = None;
+        self.unsupported = true;
+    }
+
+    /// Ask again after a failed page, while this generation is behind.
+    pub fn retry(&mut self, id: u64) -> Option<Fetch> {
+        if self.generation == 0 || self.unsupported {
+            return None;
+        }
+        self.next(id)
     }
 
     /// Notes to search: live and not empty.
@@ -452,8 +492,8 @@ mod tests {
     }
 
     fn loaded(body: &str) -> NoteEditor {
-        let mut editor = NoteEditor::new(7, "Mateo");
-        editor.loaded(Some(body), 0);
+        let mut editor = NoteEditor::new(7, "Mateo", 0);
+        editor.loaded(Some(body));
         editor
     }
 
@@ -466,24 +506,24 @@ mod tests {
 
     #[test]
     fn nothing_is_editable_or_saved_until_the_stored_note_arrives() {
-        let mut editor = NoteEditor::new(7, "Mateo");
+        let mut editor = NoteEditor::new(7, "Mateo", 0);
         typed(&mut editor, "x");
         editor.paste("pasted");
         assert_eq!(editor.draft().text, "");
         assert_eq!(ctrl_s(&mut editor, 1), Outcome::Stay);
         assert_eq!(esc(&mut editor, 1), Outcome::Close, "nothing to keep");
         // Arriving later, the stored note is what shows, not a blank.
-        let mut editor = NoteEditor::new(7, "Mateo");
-        editor.loaded(Some("kept\nsecond"), 1);
+        let mut editor = NoteEditor::new(7, "Mateo", 1);
+        editor.loaded(Some("kept\nsecond"));
         assert_eq!(editor.draft().text, "kept\nsecond");
         assert_eq!(editor.draft().cursor.0, 1);
         assert!(!editor.dirty());
-        editor.loaded(Some("late"), 0);
+        editor.loaded(Some("late"));
         assert_eq!(editor.draft().text, "kept\nsecond", "loads once");
         // An old server: never editable.
-        let mut editor = NoteEditor::new(7, "Mateo");
+        let mut editor = NoteEditor::new(7, "Mateo", 0);
         editor.unsupported();
-        editor.loaded(Some("x"), 0);
+        editor.loaded(Some("x"));
         typed(&mut editor, "y");
         assert_eq!(editor.access(), Access::Unsupported);
         assert_eq!(editor.draft().text, "");
@@ -655,6 +695,31 @@ mod tests {
     }
 
     #[test]
+    fn a_reload_pauses_edits_and_saves_but_keeps_the_text() {
+        let mut editor = loaded("kept");
+        press(&mut editor, KeyCode::End, KeyModifiers::NONE, 0);
+        typed(&mut editor, "!");
+        editor.pause();
+        typed(&mut editor, "?");
+        assert_eq!(editor.draft().text, "kept!");
+        assert_eq!(ctrl_s(&mut editor, 1), Outcome::Stay);
+        assert_eq!(esc(&mut editor, 2), Outcome::Stay, "never closes unsaved");
+        editor.resume();
+        assert_eq!(ctrl_s(&mut editor, 3), save(3, "kept!"));
+    }
+
+    #[test]
+    fn the_same_stored_text_keeps_the_undo_history() {
+        let mut editor = loaded("");
+        typed(&mut editor, "ab");
+        assert_eq!(ctrl_s(&mut editor, 1), save(1, "ab"));
+        editor.saved(1, Ok("ab".into()), 2);
+        editor.stored("ab", false);
+        press(&mut editor, KeyCode::Char('_'), KeyModifiers::CONTROL, 0);
+        assert_eq!(editor.draft().text, "a");
+    }
+
+    #[test]
     fn notes_stored_elsewhere_replace_only_a_clean_editor() {
         let mut editor = loaded("old");
         editor.stored("from elsewhere", false);
@@ -675,7 +740,7 @@ mod tests {
         for scheme in SCHEMES {
             with_scheme(scheme, || {
                 for (width, height) in [(60u16, 24u16), (80, 24)] {
-                    let mut editor = NoteEditor::new(7, "Mateo");
+                    let mut editor = NoteEditor::new(7, "Mateo", 0);
                     let draw = |editor: &mut NoteEditor| {
                         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                         terminal.draw(|f| editor.render(f, f.area())).unwrap();
@@ -693,7 +758,7 @@ mod tests {
                     assert!(rows[0].contains("Notes · Mateo"), "{rows:?}");
                     assert!(rows[usize::from(height) - 1].contains("loading the note…"));
                     assert!(rows[usize::from(height) - 1].contains("Esc close"));
-                    editor.loaded(Some("remember the crew"), 0);
+                    editor.loaded(Some("remember the crew"));
                     typed(&mut editor, "Do ");
                     let rows = draw(&mut editor);
                     assert!(
@@ -753,7 +818,7 @@ mod tests {
             store.page(14, page(vec![note(1, "a2", 5)], false, 5), 15),
             None
         );
-        assert_eq!(store.note(1).unwrap().body, "a2");
+        assert_eq!(store.row(1).unwrap().body, "a2");
         // No notes at all is complete too.
         let mut empty = NoteStore::default();
         empty.restart(1, 1);
@@ -769,7 +834,7 @@ mod tests {
         store.page(1, page(vec![note(1, "a", 100)], false, 100), 2);
         // A save answered at 500 must not skip whatever changed in between.
         store.stored(note(1, "mine", 500));
-        assert_eq!(store.note(1).unwrap().body, "mine");
+        assert_eq!(store.row(1).unwrap().body, "mine");
         assert_eq!(
             store.announced(1, 500, 3),
             Some(Fetch { id: 3, after: 100 })
@@ -784,10 +849,10 @@ mod tests {
             4,
         );
         assert_eq!(next, None);
-        assert_eq!(store.note(2).unwrap().body, "elsewhere");
+        assert_eq!(store.row(2).unwrap().body, "elsewhere");
         // An older row never replaces a newer one.
         store.stored(note(1, "stale", 300));
-        assert_eq!(store.note(1).unwrap().body, "mine");
+        assert_eq!(store.row(1).unwrap().body, "mine");
     }
 
     #[test]
@@ -806,7 +871,7 @@ mod tests {
             store.page(4, page(vec![note(65, "y", 65)], false, 65), 5),
             None
         );
-        assert_eq!(store.note(65).unwrap().body, "y");
+        assert_eq!(store.row(65).unwrap().body, "y");
     }
 
     #[test]
@@ -824,7 +889,7 @@ mod tests {
             store.page(1, page(vec![note(1, "old", 1)], false, 1), 5),
             None
         );
-        assert_eq!(store.note(1), None);
+        assert_eq!(store.row(1), None);
         // A failed page leaves the cursor; the next announcement asks again.
         assert_eq!(store.page(fetch.id, Err("offline".into()), 6), None);
         assert!(!store.ready());
@@ -851,8 +916,8 @@ mod tests {
             retired: true,
             ..note(3, "gone", 4)
         });
-        assert_eq!(store.note(3), None);
-        assert_eq!(store.note(2).map(|n| n.body.as_str()), Some(""));
+        assert_eq!(store.row(3).map(|n| n.retired), Some(true));
+        assert_eq!(store.row(2).map(|n| n.body.as_str()), Some(""));
         let found: Vec<i64> = store.searchable().map(|n| n.agent_id).collect();
         assert_eq!(found, [1]);
     }

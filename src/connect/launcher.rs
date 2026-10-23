@@ -31,6 +31,11 @@ const MIN_NAMES: usize = 16;
 pub enum Target {
     Agent(String),
     Group(String),
+    /// The human's note on an agent, by its stable id, at a matching line.
+    Note {
+        agent_id: i64,
+        line: usize,
+    },
     Message(i64),
 }
 
@@ -46,6 +51,9 @@ pub struct Cache {
     agents: BTreeMap<String, String>,
     groups: BTreeMap<String, String>,
     messages: BTreeMap<i64, CachedMessage>,
+    /// The human's live, non-empty notes by agent id: the agent's name, the
+    /// body and its folded index.
+    notes: BTreeMap<i64, (String, String, String)>,
     text_bytes: usize,
     revision: u64,
 }
@@ -160,6 +168,30 @@ impl Cache {
         }
     }
 
+    /// The human's searchable notes, replacing the last set: each agent's
+    /// id, name and body.
+    pub fn notes<'a>(&mut self, notes: impl Iterator<Item = (i64, &'a str, &'a str)>) {
+        let next: BTreeMap<_, _> = notes
+            .map(|(id, agent, body)| {
+                // Fold only text that changed.
+                let indexed = match self.notes.get(&id) {
+                    Some((_, old, indexed)) if old == body => indexed.clone(),
+                    _ => folded(body),
+                };
+                (id, (agent.to_string(), body.to_string(), indexed))
+            })
+            .collect();
+        if next != self.notes {
+            self.notes = next;
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    /// The name of the agent a cached note is about.
+    pub fn note_agent(&self, agent_id: i64) -> Option<&str> {
+        self.notes.get(&agent_id).map(|(agent, ..)| agent.as_str())
+    }
+
     fn agent(&mut self, name: &str) {
         if !name.is_empty()
             && self.agents.insert(folded(name), name.into()).as_deref() != Some(name)
@@ -262,6 +294,13 @@ impl Cache {
                     target: Target::Group(name.clone()),
                     text: name.clone(),
                 }))
+                .chain(self.notes.iter().map(|(id, (_, body, _))| Hit {
+                    target: Target::Note {
+                        agent_id: *id,
+                        line: 0,
+                    },
+                    text: snippet(body.lines().next().unwrap_or_default(), 0),
+                }))
                 .chain(self.messages.values().rev().map(|cached| Hit {
                     target: Target::Message(cached.message.id),
                     text: snippet(cached.message.body.lines().next().unwrap_or_default(), 0),
@@ -278,11 +317,32 @@ impl Cache {
                     candidates.push(Candidate {
                         kind: if agent { 0 } else { 1 },
                         id: 0,
+                        line: 0,
                         text: name,
                         indexed,
                         rank,
                     });
                 }
+            }
+        }
+        for (id, (_, body, indexed)) in &self.notes {
+            let best = body
+                .lines()
+                .zip(indexed.lines())
+                .enumerate()
+                .filter_map(|(line, (text, indexed))| {
+                    rank(&query, indexed).map(|rank| (rank, line, text, indexed))
+                })
+                .min_by_key(|(rank, line, ..)| (*rank, *line));
+            if let Some((rank, line, text, indexed)) = best {
+                candidates.push(Candidate {
+                    kind: 2,
+                    id: *id,
+                    line,
+                    text,
+                    indexed,
+                    rank,
+                });
             }
         }
         for cached in self.messages.values().rev() {
@@ -297,8 +357,9 @@ impl Cache {
                 .min_by_key(|(rank, _, _)| *rank);
             if let Some((rank, text, indexed)) = best {
                 candidates.push(Candidate {
-                    kind: 2,
+                    kind: 3,
                     id: cached.message.id,
+                    line: 0,
                     text,
                     indexed,
                     rank,
@@ -316,9 +377,13 @@ impl Cache {
                 target: match hit.kind {
                     0 => Target::Agent(hit.text.into()),
                     1 => Target::Group(hit.text.into()),
+                    2 => Target::Note {
+                        agent_id: hit.id,
+                        line: hit.line,
+                    },
                     _ => Target::Message(hit.id),
                 },
-                text: if hit.kind == 2 {
+                text: if hit.kind >= 2 {
                     snippet(hit.text, hit.rank.start)
                 } else {
                     hit.text.into()
@@ -347,7 +412,7 @@ pub struct Picker {
 impl Picker {
     pub fn new(cache: &Cache) -> Picker {
         let mut query = TextArea::default();
-        query.set_placeholder_text("Search agents, groups and messages");
+        query.set_placeholder_text("Search agents, groups, notes and messages");
         Picker {
             query,
             hits: cache.search(""),
@@ -530,6 +595,12 @@ fn result_line(
             spans.extend(marked(name, query, on(Role::Group), row));
             spans.push(Span::styled("  group", on(Role::Muted)));
         }
+        Target::Note { agent_id, .. } => {
+            let agent = cache.note_agent(*agent_id).unwrap_or_default();
+            spans.extend(marked(agent, query, on(Role::Agent), row));
+            spans.push(Span::styled("  note  ", on(Role::Muted)));
+            spans.extend(marked(&hit.text, query, on(Role::Text), row));
+        }
         Target::Message(id) => {
             let mut text = hit.text.clone();
             if let Some(m) = cache.message(*id) {
@@ -603,6 +674,8 @@ fn marked(text: &str, query: &str, style: Style, row: Style) -> Vec<Span<'static
 struct Candidate<'a> {
     kind: u8,
     id: i64,
+    /// A note's matching line.
+    line: usize,
     text: &'a str,
     indexed: &'a str,
     rank: Rank,

@@ -17,6 +17,7 @@ use super::event::{Data, Event, Request};
 use super::keys::{Action, Keymap};
 use super::launcher::{self, Picker, Target};
 use super::navigation::{Conversation, Feedback, History, Inbox};
+use super::notes::{self, NoteEditor, NoteStore};
 use super::preferences::Preferences;
 use super::screens::help::Help;
 use super::screens::menu::Menu;
@@ -194,6 +195,42 @@ pub struct App {
     picker: Option<Picker>,
     /// Lightweight session state; subscriptions and activity are never retained.
     saved_views: Vec<(Conversation, super::screens::thread::SavedView)>,
+    /// The human's agent notes, in step with the summary subscription.
+    notes: NoteStore,
+    /// The F3 note editor, over the screen and under F2 and Ctrl-P.
+    note_editor: Option<NoteEditor>,
+    /// Live agents' stable ids by folded name, from summaries and lists.
+    agent_ids: HashMap<String, i64>,
+    /// Unsaved text from editors whose agents retired, for this session only.
+    retired_drafts: HashMap<i64, Draft>,
+    /// A launcher choice waiting for the open note to be stored.
+    pending_launch: Option<Target>,
+}
+
+/// Why a call failed; a timeout may still have landed.
+fn side_text(error: &super::event::SideError) -> String {
+    use super::event::SideError;
+    match error {
+        SideError::Unsupported(text) | SideError::Refused(text) => text.clone(),
+        SideError::Transient(text) => format!("may not have saved: {text}"),
+    }
+}
+
+fn list_notes(fetch: notes::Fetch) -> Request {
+    Request::ListNotes {
+        id: fetch.id,
+        after: fetch.after,
+    }
+}
+
+fn stored_note(note: &crate::proto::AgentNote) -> notes::StoredNote {
+    notes::StoredNote {
+        agent_id: note.agent_id,
+        agent: note.agent.clone(),
+        body: note.body.clone(),
+        revision: note.revision,
+        retired: note.retired,
+    }
 }
 
 /// `[1 blocker · F2]`, `[3 blockers · F2]`: the human's open blockers.
@@ -221,6 +258,11 @@ impl App {
             launcher_cache: super::launcher::Cache::default(),
             picker: None,
             saved_views: Vec::new(),
+            notes: NoteStore::default(),
+            note_editor: None,
+            agent_ids: HashMap::new(),
+            retired_drafts: HashMap::new(),
+            pending_launch: None,
         };
         app.send(vec![Request::WatchSummary(app.ctx.inbox.id)]);
         app.push(Box::new(Menu::default()));
@@ -312,8 +354,9 @@ impl App {
     }
 
     fn viewed(&mut self) {
-        // Covered screens still receive data, but nothing under a modal is viewed.
-        if self.blockers.is_open() || self.picker.is_some() {
+        // Covered screens still receive data, but nothing under a modal or
+        // the note editor is viewed.
+        if self.blockers.is_open() || self.picker.is_some() || self.note_editor.is_some() {
             return;
         }
         let screen = self.stack.last_mut().expect("the menu is never popped");
@@ -401,6 +444,9 @@ impl App {
                 if let Some(quit) = self.blocker_key(key) {
                     return quit;
                 }
+                if let Some(quit) = self.note_key(key) {
+                    return quit;
+                }
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('g' | 'o'))
                 {
@@ -449,6 +495,10 @@ impl App {
                     self.blockers.paste(&text);
                     return false;
                 }
+                if let Some(editor) = &mut self.note_editor {
+                    editor.paste(&text);
+                    return false;
+                }
                 self.top().paste(&text);
                 self.viewed();
                 false
@@ -465,6 +515,9 @@ impl App {
                     Data::Summary { id, result } if *id == self.ctx.inbox.id => {
                         if let Ok(rows) = result {
                             self.launcher_cache.summaries(rows);
+                            self.agent_ids.extend(rows.iter().filter_map(|row| {
+                                Some((row.agent.to_ascii_lowercase(), row.agent_id?))
+                            }));
                         }
                         // Only ListAgents establishes absence. Sparse summary servers
                         // omit agents with zero counts; positive rows can also describe
@@ -486,6 +539,11 @@ impl App {
                         self.ctx.efforts.sent(agent, *id, result);
                     }
                     Data::Agents(Ok(list)) => {
+                        self.agent_ids
+                            .extend(list.agents.iter().filter_map(|agent| {
+                                (!agent.retired)
+                                    .then_some((agent.name.to_ascii_lowercase(), agent.id?))
+                            }));
                         self.ctx.efforts.listed(&list.agents, list_revision);
                         self.known_agents = Some(
                             list.agents
@@ -502,6 +560,11 @@ impl App {
                                 .collect(),
                         );
                     }
+                    Data::NotesRevision { id, revision } if *id == self.ctx.inbox.id => {
+                        self.notes_announced(*id, *revision);
+                    }
+                    Data::NotesListed { id, result } => self.notes_listed(*id, result),
+                    Data::NoteSaved { id, result } => self.note_saved(*id, result),
                     Data::MarkedRead { agent, result } => {
                         self.ctx.inbox.acknowledged(agent, result);
                         if let Err(error) = result {
@@ -548,6 +611,7 @@ impl App {
                 // One personal blocker poll at a time, whatever is on top.
                 let mut requests: Vec<Request> =
                     self.blockers.poll(self.blockers_id).into_iter().collect();
+                requests.extend(self.notes.retry(next_id()).map(list_notes));
                 requests.extend(screen.on_tick(&self.ctx));
                 self.send(requests);
                 false
@@ -570,7 +634,15 @@ impl App {
                 }
                 launcher::Outcome::Choose(target) => {
                     self.picker = None;
-                    self.launch(target);
+                    if let Some(editor) = &mut self.note_editor {
+                        // As Esc would: store a changed note before leaving it.
+                        self.pending_launch = Some(target);
+                        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+                        let outcome = editor.key(esc, next_id());
+                        self.note_outcome(outcome);
+                    } else {
+                        self.launch(target);
+                    }
                     self.viewed();
                     false
                 }
@@ -592,6 +664,17 @@ impl App {
         let (destination, hit) = match target {
             Target::Agent(name) => (Some(Conversation::Agent(name)), None),
             Target::Group(name) => (Some(Conversation::Group(name)), None),
+            Target::Note { agent_id, line } => {
+                let Some(agent) = self.launcher_cache.note_agent(agent_id) else {
+                    self.ctx.navigation_notice =
+                        Some(Feedback::Other("That note is no longer available.".into()));
+                    return;
+                };
+                let agent = agent.to_string();
+                self.launch(Target::Agent(agent.clone()));
+                self.open_note(agent_id, &agent, line);
+                return;
+            }
             Target::Message(id) => {
                 if self.launcher_cache.message(id).is_none() {
                     self.ctx.navigation_notice =
@@ -680,6 +763,171 @@ impl App {
             self.ctx.navigation_notice = Some(Feedback::Other(why));
         }
         Some(false)
+    }
+
+    /// F3 and the open note editor, ahead of every screen: `Some(quit)`
+    /// when the key was theirs.
+    fn note_key(&mut self, key: KeyEvent) -> Option<bool> {
+        if let Some(editor) = &mut self.note_editor {
+            self.keymap = Keymap::default();
+            // Ctrl-C quits from anywhere; nothing is saved unasked.
+            if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+                return Some(true);
+            }
+            let outcome = editor.key(key, next_id());
+            self.note_outcome(outcome);
+            return Some(false);
+        }
+        if key.code != KeyCode::F(3) || !key.modifiers.is_empty() {
+            return None;
+        }
+        let Some(Conversation::Agent(agent)) = self.top().conversation() else {
+            return None;
+        };
+        if self.top().navigation_blocked() {
+            return None;
+        }
+        self.keymap = Keymap::default();
+        match self.agent_ids.get(&agent.to_ascii_lowercase()) {
+            _ if self.notes.is_unsupported() => {
+                self.ctx.navigation_notice =
+                    Some(Feedback::Other("Agent notes need a newer server.".into()));
+            }
+            Some(&id) => self.open_note(id, &agent, 0),
+            None => {
+                self.ctx.navigation_notice =
+                    Some(Feedback::Other(format!("Notes for {agent} are loading.")));
+            }
+        }
+        Some(false)
+    }
+
+    /// Open the note on the agent `agent_id` over the screen, at `line`.
+    fn open_note(&mut self, agent_id: i64, agent: &str, line: usize) {
+        self.ctx.navigation_notice = None;
+        self.note_editor = Some(NoteEditor::new(agent_id, agent, line));
+        self.sync_notes();
+    }
+
+    fn note_outcome(&mut self, outcome: notes::Outcome) {
+        let Some(editor) = &self.note_editor else {
+            return;
+        };
+        match outcome {
+            notes::Outcome::Stay => {}
+            notes::Outcome::Save { id, body } => self.send(vec![Request::PutNote {
+                id,
+                agent_id: editor.agent_id(),
+                body,
+            }]),
+            notes::Outcome::Close => {
+                let editor = self.note_editor.take().expect("checked above");
+                if editor.access() == notes::Access::Retired && editor.dirty() {
+                    self.retired_drafts
+                        .insert(editor.agent_id(), editor.draft());
+                }
+                if let Some(target) = self.pending_launch.take() {
+                    self.launch(target);
+                }
+                self.viewed();
+            }
+        }
+    }
+
+    /// A summary announced the newest note revision; a new subscription
+    /// pages every note in again.
+    fn notes_announced(&mut self, generation: u64, revision: Option<u64>) {
+        let Some(revision) = revision else {
+            self.notes.unavailable(generation);
+            self.sync_notes();
+            return;
+        };
+        let mut fetches = Vec::new();
+        if self.notes.generation() != generation {
+            fetches.push(self.notes.restart(generation, next_id()));
+            if let Some(editor) = &mut self.note_editor {
+                editor.pause();
+            }
+        }
+        fetches.extend(self.notes.announced(generation, revision, next_id()));
+        self.send(fetches.into_iter().map(list_notes).collect());
+    }
+
+    fn notes_listed(
+        &mut self,
+        id: u64,
+        result: &Result<crate::proto::ListAgentNotesResponse, super::event::SideError>,
+    ) {
+        let next = match result {
+            Ok(list) => self.notes.page(
+                id,
+                Ok(notes::Page {
+                    notes: list.notes.iter().map(stored_note).collect(),
+                    has_more: list.has_more,
+                    next_after_revision: list.next_after_revision,
+                }),
+                next_id(),
+            ),
+            Err(super::event::SideError::Unsupported(_)) => {
+                self.notes.unsupported(id);
+                None
+            }
+            Err(error) => self.notes.page(id, Err(side_text(error)), next_id()),
+        };
+        self.send(next.into_iter().map(list_notes).collect());
+        self.sync_notes();
+    }
+
+    fn note_saved(
+        &mut self,
+        id: u64,
+        result: &Result<crate::proto::AgentNote, super::event::SideError>,
+    ) {
+        if let Ok(note) = result {
+            self.notes.stored(stored_note(note));
+        }
+        if let Some(editor) = &mut self.note_editor {
+            let answer = result
+                .as_ref()
+                .map(|note| note.body.clone())
+                .map_err(side_text);
+            let outcome = editor.saved(id, answer, next_id());
+            if result.is_err() && !editor.saving() {
+                // The note stays open with its text: no navigation after all.
+                self.pending_launch = None;
+            }
+            self.note_outcome(outcome);
+        }
+        self.sync_notes();
+    }
+
+    /// Bring the launcher and an open editor up to date with the store.
+    fn sync_notes(&mut self) {
+        self.launcher_cache.notes(
+            self.notes
+                .searchable()
+                .map(|note| (note.agent_id, note.agent.as_str(), note.body.as_str())),
+        );
+        let Some(editor) = &mut self.note_editor else {
+            return;
+        };
+        let row = self.notes.row(editor.agent_id());
+        match editor.access() {
+            notes::Access::Loading if self.notes.is_unsupported() => editor.unsupported(),
+            notes::Access::Loading if self.notes.ready() => {
+                editor.loaded(row.map(|note| note.body.as_str()));
+                if let Some(note) = row.filter(|note| note.retired) {
+                    editor.stored(&note.body, true);
+                }
+            }
+            notes::Access::Editable if self.notes.ready() => {
+                editor.resume();
+                if let Some(note) = row {
+                    editor.stored(&note.body, note.retired);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn flush_drafts(&mut self) {
@@ -830,6 +1078,10 @@ impl App {
                 Paragraph::new(marker.clone()).style(theme::style(theme::Role::WarningTitle)),
                 at,
             );
+        }
+        if let Some(editor) = &mut self.note_editor {
+            frame.render_widget(ratatui::widgets::Clear, frame.area());
+            editor.render(frame, frame.area());
         }
         // The blocker modal covers the whole terminal; the screen beneath is
         // drawn as it is, untouched.

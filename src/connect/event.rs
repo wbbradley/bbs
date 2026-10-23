@@ -110,6 +110,17 @@ pub enum Request {
         id: u64,
         req: proto::CancelBlockerRequest,
     },
+    /// A page of the human's agent notes changed after a revision (agent-notes.v1).
+    ListNotes {
+        id: u64,
+        after: u64,
+    },
+    /// Store the human's note on an agent; never retried here.
+    PutNote {
+        id: u64,
+        agent_id: i64,
+        body: String,
+    },
 }
 
 /// One group change, as the CLI's `bbs group` commands make it.
@@ -377,6 +388,22 @@ pub enum Data {
         key: String,
         result: Result<Box<proto::BlockerMutationResponse>, SideError>,
     },
+    /// The newest agent-note revision a summary stream announced; `None`
+    /// from a server without agent notes.
+    NotesRevision {
+        id: u64,
+        revision: Option<u64>,
+    },
+    /// The note page `id`.
+    NotesListed {
+        id: u64,
+        result: Result<proto::ListAgentNotesResponse, SideError>,
+    },
+    /// The note as stored by the save `id`.
+    NoteSaved {
+        id: u64,
+        result: Result<proto::AgentNote, SideError>,
+    },
 }
 
 /// What a new server connection needs: each feed stream holds one.
@@ -571,6 +598,44 @@ pub async fn serve(
                         .await
                         .map(Box::new)
                         .map_err(blocker_write_error),
+                }
+            }
+            Request::ListNotes { id, after } => {
+                let local = matches!(backend, Backend::Local(_));
+                let req = proto::ListAgentNotesRequest {
+                    after_revision: after,
+                    limit: 0,
+                };
+                let result =
+                    match tokio::time::timeout(SIDE_CALL_TIMEOUT, backend.list_agent_notes(req))
+                        .await
+                    {
+                        Ok(Ok(list)) => Ok(list),
+                        Ok(Err(e)) => Err(blocker_poll_error(
+                            &mut backend,
+                            local,
+                            e,
+                            crate::backend::AGENT_NOTES,
+                        )
+                        .await),
+                        Err(_) => Err(SideError::Transient(format!(
+                            "no reply within {} seconds",
+                            SIDE_CALL_TIMEOUT.as_secs()
+                        ))),
+                    };
+                Data::NotesListed { id, result }
+            }
+            // Bounded; a timeout leaves the save uncertain, and only the human
+            // retries it.
+            Request::PutNote { id, agent_id, body } => {
+                let local = matches!(backend, Backend::Local(_));
+                let call = backend.put_agent_note(proto::PutAgentNoteRequest { agent_id, body });
+                Data::NoteSaved {
+                    id,
+                    result: bounded(call, local).await.and_then(|r| {
+                        r.note
+                            .ok_or_else(|| SideError::Refused("the server stored no note".into()))
+                    }),
                 }
             }
             Request::MarkRead(from) => Data::MarkedRead {
@@ -807,8 +872,14 @@ async fn watch_summary(opener: Opener, id: u64, tx: UnboundedSender<Event>) {
                 Backend::open(&opener.config, &opener.dir, opener.caller.clone()).await?;
             let mut summaries = backend.watch_agent_summary().await?;
             loop {
-                let result = Ok(summaries.next().await?);
-                if tx.send(Event::Data(Data::Summary { id, result })).is_err() {
+                let snapshot = summaries.next_snapshot().await?;
+                let revision = snapshot.notes_revision;
+                let result = Ok(snapshot.agents);
+                if tx.send(Event::Data(Data::Summary { id, result })).is_err()
+                    || tx
+                        .send(Event::Data(Data::NotesRevision { id, revision }))
+                        .is_err()
+                {
                     return Ok(());
                 }
                 reconnect.received();
@@ -1748,6 +1819,7 @@ mod tests {
             let mut summaries = 0;
             let mut activity = vec![];
             let mut baselines = vec![];
+            let mut revisions = vec![];
             let mut errors = 0;
             tokio::time::timeout(Duration::from_secs(8), async {
                 while mail.len() < 2 || summaries < 2 || activity.len() < 2 {
@@ -1761,6 +1833,9 @@ mod tests {
                         }) => activity.extend(rows.into_iter().map(|m| m.id)),
                         Event::Data(Data::ActivityBaseline { through_id, .. }) => {
                             baselines.push(through_id)
+                        }
+                        Event::Data(Data::NotesRevision { id: 2, revision }) => {
+                            revisions.push(revision)
                         }
                         Event::Data(
                             Data::Feed { result: Err(_), .. }
@@ -1776,6 +1851,8 @@ mod tests {
             assert_eq!(mail, [1, 2]);
             assert_eq!(activity, [10, 11]);
             assert_eq!(baselines, [10, 11]);
+            // Each summary is followed by its notes revision; this server has none.
+            assert!(!revisions.is_empty() && revisions.iter().all(Option::is_none));
             assert_eq!(errors, 3);
             assert_eq!(
                 *state.cursors.lock().unwrap(),
