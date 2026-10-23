@@ -284,6 +284,141 @@ impl NoteEditor {
     }
 }
 
+/// A stored note as the server lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredNote {
+    pub agent_id: i64,
+    pub agent: String,
+    pub body: String,
+    pub revision: u64,
+    pub retired: bool,
+}
+
+/// One page of the human's notes changed after a revision.
+#[derive(Debug, Default)]
+pub struct Page {
+    pub notes: Vec<StoredNote>,
+    pub has_more: bool,
+    pub next_after_revision: u64,
+}
+
+/// A page to ask for: the notes changed after revision `after`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Fetch {
+    pub id: u64,
+    pub after: u64,
+}
+
+/// The human's notes, kept in step with the server: paged in from the
+/// start for each summary subscription, then again from the last page
+/// whenever the summary says a newer note exists.
+#[derive(Default)]
+pub struct NoteStore {
+    /// The summary subscription the pages belong to.
+    generation: u64,
+    /// Where the next page starts; only accepted pages move it.
+    cursor: u64,
+    /// The newest revision the summary has announced.
+    announced: u64,
+    /// The first full pass of this generation has finished.
+    complete: bool,
+    fetching: Option<u64>,
+    unsupported: bool,
+    notes: std::collections::BTreeMap<i64, StoredNote>,
+}
+
+impl NoteStore {
+    /// A new summary subscription: page everything in again.
+    pub fn restart(&mut self, generation: u64, id: u64) -> Fetch {
+        self.generation = generation;
+        self.cursor = 0;
+        self.announced = 0;
+        self.complete = false;
+        self.unsupported = false;
+        self.fetching = Some(id);
+        Fetch { id, after: 0 }
+    }
+
+    /// The summary of `generation` says notes up to `revision` exist.
+    pub fn announced(&mut self, generation: u64, revision: u64, id: u64) -> Option<Fetch> {
+        if generation != self.generation || self.unsupported {
+            return None;
+        }
+        self.announced = self.announced.max(revision);
+        self.next(id)
+    }
+
+    /// Ask for more when something newer is known and nothing is out.
+    fn next(&mut self, id: u64) -> Option<Fetch> {
+        if self.fetching.is_some() || (self.complete && self.announced <= self.cursor) {
+            return None;
+        }
+        self.fetching = Some(id);
+        Some(Fetch {
+            id,
+            after: self.cursor,
+        })
+    }
+
+    /// A page arrived, or failed; `id` names the next one it may need.
+    pub fn page(&mut self, fetch: u64, result: Result<Page, String>, id: u64) -> Option<Fetch> {
+        if self.fetching != Some(fetch) {
+            return None;
+        }
+        self.fetching = None;
+        let page = result.ok()?;
+        for note in page.notes {
+            self.stored(note);
+        }
+        self.cursor = self.cursor.max(page.next_after_revision);
+        if !page.has_more {
+            self.complete = true;
+        }
+        self.next(id)
+    }
+
+    /// The server keeps no notes.
+    pub fn unsupported(&mut self, fetch: u64) {
+        if self.fetching == Some(fetch) {
+            self.fetching = None;
+            self.unsupported = true;
+        }
+    }
+
+    /// A note as stored, from a page or a save's answer. Never moves the
+    /// cursor: other notes may have changed in between.
+    pub fn stored(&mut self, note: StoredNote) {
+        let newer = self
+            .notes
+            .get(&note.agent_id)
+            .is_none_or(|known| note.revision >= known.revision);
+        if newer {
+            self.notes.insert(note.agent_id, note);
+        }
+    }
+
+    /// Whether notes can be edited: every stored note is known.
+    pub fn ready(&self) -> bool {
+        self.complete && !self.unsupported
+    }
+
+    pub fn is_unsupported(&self) -> bool {
+        self.unsupported
+    }
+
+    /// A live agent's note, if any.
+    pub fn note(&self, agent_id: i64) -> Option<&StoredNote> {
+        self.notes.get(&agent_id).filter(|note| !note.retired)
+    }
+
+    /// Notes to search: live and not empty.
+    pub fn searchable(&self) -> impl Iterator<Item = &StoredNote> {
+        self.notes
+            .values()
+            .filter(|note| !note.retired && !note.body.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +661,132 @@ mod tests {
                 }
             });
         }
+    }
+
+    fn note(agent_id: i64, body: &str, revision: u64) -> StoredNote {
+        StoredNote {
+            agent_id,
+            agent: format!("Agent{agent_id}"),
+            body: body.into(),
+            revision,
+            retired: false,
+        }
+    }
+
+    fn page(notes: Vec<StoredNote>, has_more: bool, next: u64) -> Result<Page, String> {
+        Ok(Page {
+            notes,
+            has_more,
+            next_after_revision: next,
+        })
+    }
+
+    #[test]
+    fn the_store_pages_everything_in_before_it_is_ready() {
+        let mut store = NoteStore::default();
+        assert!(!store.ready());
+        assert_eq!(store.restart(1, 10), Fetch { id: 10, after: 0 });
+        assert_eq!(store.announced(1, 5, 11), None, "one fetch at a time");
+        let next = store.page(10, page(vec![note(1, "a", 2)], true, 2), 12);
+        assert_eq!(next, Some(Fetch { id: 12, after: 2 }));
+        assert!(!store.ready(), "more pages to come");
+        assert_eq!(
+            store.page(12, page(vec![note(2, "b", 3)], false, 3), 13),
+            Some(Fetch { id: 13, after: 3 }),
+            "5 was announced"
+        );
+        assert!(store.ready());
+        assert_eq!(
+            store.page(13, page(vec![], false, 3), 14),
+            Some(Fetch { id: 14, after: 3 }),
+            "still short of 5"
+        );
+        assert_eq!(
+            store.page(14, page(vec![note(1, "a2", 5)], false, 5), 15),
+            None
+        );
+        assert_eq!(store.note(1).unwrap().body, "a2");
+        // No notes at all is complete too.
+        let mut empty = NoteStore::default();
+        empty.restart(1, 1);
+        assert_eq!(empty.page(1, page(vec![], false, 0), 2), None);
+        assert!(empty.ready());
+        assert_eq!(empty.announced(1, 0, 3), None);
+    }
+
+    #[test]
+    fn only_pages_move_the_cursor_never_a_save_or_an_announcement() {
+        let mut store = NoteStore::default();
+        store.restart(1, 1);
+        store.page(1, page(vec![note(1, "a", 100)], false, 100), 2);
+        // A save answered at 500 must not skip whatever changed in between.
+        store.stored(note(1, "mine", 500));
+        assert_eq!(store.note(1).unwrap().body, "mine");
+        assert_eq!(
+            store.announced(1, 500, 3),
+            Some(Fetch { id: 3, after: 100 })
+        );
+        let next = store.page(
+            3,
+            page(
+                vec![note(2, "elsewhere", 250), note(1, "mine", 500)],
+                false,
+                500,
+            ),
+            4,
+        );
+        assert_eq!(next, None);
+        assert_eq!(store.note(2).unwrap().body, "elsewhere");
+        // An older row never replaces a newer one.
+        store.stored(note(1, "stale", 300));
+        assert_eq!(store.note(1).unwrap().body, "mine");
+    }
+
+    #[test]
+    fn stale_generations_failures_and_old_servers_change_nothing() {
+        let mut store = NoteStore::default();
+        store.restart(1, 1);
+        store.page(1, page(vec![], false, 0), 2);
+        let fetch = store.restart(2, 3);
+        assert!(
+            !store.ready(),
+            "read-only again until the new pass completes"
+        );
+        assert_eq!(store.announced(1, 9, 4), None, "an old subscription's news");
+        assert_eq!(
+            store.page(1, page(vec![note(1, "old", 1)], false, 1), 5),
+            None
+        );
+        assert_eq!(store.note(1), None);
+        // A failed page leaves the cursor; the next announcement asks again.
+        assert_eq!(store.page(fetch.id, Err("offline".into()), 6), None);
+        assert!(!store.ready());
+        assert_eq!(store.announced(2, 1, 7), Some(Fetch { id: 7, after: 0 }));
+        store.unsupported(7);
+        assert!(store.is_unsupported() && !store.ready());
+        assert_eq!(store.announced(2, 2, 8), None);
+    }
+
+    #[test]
+    fn retired_and_empty_notes_are_kept_but_not_offered() {
+        let mut store = NoteStore::default();
+        store.restart(1, 1);
+        store.page(
+            1,
+            page(
+                vec![note(1, "live", 1), note(2, "", 2), note(3, "gone", 3)],
+                false,
+                3,
+            ),
+            2,
+        );
+        store.stored(StoredNote {
+            retired: true,
+            ..note(3, "gone", 4)
+        });
+        assert_eq!(store.note(3), None);
+        assert_eq!(store.note(2).map(|n| n.body.as_str()), Some(""));
+        let found: Vec<i64> = store.searchable().map(|n| n.agent_id).collect();
+        assert_eq!(found, [1]);
     }
 }
