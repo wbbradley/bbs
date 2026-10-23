@@ -208,16 +208,24 @@ are read only and say why: no agent of yours in the group, or the creating agent
 is gone, in which case Tab still reaches Cancel. Each blocker keeps its own
 answer draft for this session, across visits and screens; the card's input never
 mixes with a screen's. Enter sends; the answer shows darkened with a spinner
-until the server confirms. Tab reaches `[Cancel]`, whose Enter asks once more
-(Enter confirms, Esc returns to the answer); cancelling sends no mail. The card
-owns Tab and Shift-Tab, so they do not change effort while it is open.
+until the server confirms. Tab moves from the answer to `[discuss with AGENT]`
+when an agent created the blocker, then to `[Cancel]`, and back; Shift-Tab goes
+the other way. Enter on `[discuss with AGENT]` closes the card and opens that
+agent's conversation, the existing one with its draft if it is already open,
+after saving an open note's changes first; it never answers or cancels, even
+with a write awaiting confirmation. Enter on `[Cancel]` asks once more (Enter
+confirms, Esc returns to the answer); cancelling sends no mail. The card owns
+Tab and Shift-Tab, so they do not change effort while it is open. Reopening the
+card returns to the blocker selected when it closed, through replacements, or
+to the nearest one still open.
 
 One write per blocker is out at a time, and other blockers stay usable
 meanwhile. Without a reply it reads `Not confirmed: Enter retries`, and Enter
 repeats the same request, which the server applies at most once. A refusal,
 such as another person answering first, shows its reason and keeps the draft;
 once the blocker is no longer open it stays listed, read only, with its draft
-and reason until Tab then Enter dismisses it (the newest 20 are kept).
+and reason until Enter on `[Dismiss]`, reached with Tab, dismisses it (the
+newest 20 are kept).
 When another agent replaces a blocker's text, the card shows the new text in
 place from its top, keeps the draft, withdraws any pending cancel
 confirmation, and ignores Enter for one second. Other changes show `Blockers

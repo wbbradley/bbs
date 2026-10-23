@@ -81,6 +81,8 @@ impl Chain {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Focus {
     Answer,
+    /// Open the creating agent's conversation.
+    Discuss,
     Cancel,
     Confirm,
 }
@@ -100,6 +102,8 @@ pub enum Outcome {
     /// The panel closed: back to the composer.
     Close,
     Request(Request),
+    /// The panel closed to open this agent's conversation.
+    Discuss(String),
     /// Not the panel's key (Ctrl-C): let the keymap have it.
     Pass,
 }
@@ -118,6 +122,8 @@ pub struct Blockers {
     text_rows: (u16, u16),
     chains: HashMap<i64, Chain>,
     panel: Option<Panel>,
+    /// The selection when the panel last closed, and the rows' order then.
+    remembered: Option<(i64, Vec<i64>)>,
     notice_until: Option<Instant>,
 }
 
@@ -134,6 +140,7 @@ impl Blockers {
             text_rows: (0, 0),
             chains: HashMap::new(),
             panel: None,
+            remembered: None,
             notice_until: None,
         }
     }
@@ -174,8 +181,14 @@ impl Blockers {
         if self.support == Support::Unsupported {
             return Err("F5 retries · server needs blockers-mine.v1".into());
         }
+        // Back where it was, or the nearest row still open.
+        let roots: Vec<i64> = self.rows.iter().map(|b| b.root_id).collect();
+        let selected = match &self.remembered {
+            Some((root, old)) => nearest(Some(*root), old, &roots),
+            None => roots.first().copied(),
+        };
         self.panel = Some(Panel {
-            selected: self.rows.first().map(|b| b.root_id),
+            selected,
             focus: Focus::Answer,
             scroll: 0,
             done_at: None,
@@ -414,10 +427,18 @@ impl Blockers {
             .and_then(|p| p.done_at)
             .is_some_and(|at| now >= at)
         {
-            self.panel = None;
+            self.close();
             return true;
         }
         false
+    }
+
+    /// Close the panel, remembering where it was.
+    fn close(&mut self) {
+        if let Some(panel) = self.panel.take() {
+            let roots = self.rows.iter().map(|b| b.root_id).collect();
+            self.remembered = panel.selected.map(|root| (root, roots));
+        }
     }
 
     /// Drop a kept refusal and its draft.
@@ -495,7 +516,7 @@ impl Blockers {
                 return Outcome::Stay;
             }
             KeyCode::Esc => {
-                self.panel = None;
+                self.close();
                 return Outcome::Close;
             }
             KeyCode::Up | KeyCode::Down if alt => {
@@ -530,6 +551,19 @@ impl Blockers {
         let Some(row) = self.selected().cloned() else {
             return Outcome::Stay;
         };
+        // Ahead of retries and the replacement guard: discussing never
+        // answers or cancels.
+        if key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+            && self.panel.as_ref().map(|p| p.focus) == Some(Focus::Discuss)
+        {
+            if let Some(agent) = agent_creator(&row) {
+                self.close();
+                return Outcome::Discuss(agent);
+            }
+            self.panel.as_mut().expect("open").focus = Focus::Answer;
+            return Outcome::Stay;
+        }
         let gone = self.held.contains(&row.root_id);
         if gone
             && key.code == KeyCode::Enter
@@ -547,10 +581,25 @@ impl Blockers {
         let chain = self.chains.entry(row.root_id).or_insert_with(Chain::new);
         match key.code {
             KeyCode::Tab | KeyCode::BackTab => {
-                panel.focus = match panel.focus {
-                    Focus::Answer if row.can_cancel || gone => Focus::Cancel,
-                    _ => Focus::Answer,
+                // Answer, then discuss, then cancel, skipping what is not offered.
+                let mut chain = vec![Focus::Answer];
+                if agent_creator(&row).is_some() {
+                    chain.push(Focus::Discuss);
+                }
+                if row.can_cancel || gone {
+                    chain.push(Focus::Cancel);
+                }
+                let current = match panel.focus {
+                    Focus::Confirm => Focus::Cancel,
+                    focus => focus,
                 };
+                let at = chain.iter().position(|f| *f == current).unwrap_or(0);
+                let step = if key.code == KeyCode::Tab {
+                    1
+                } else {
+                    chain.len() - 1
+                };
+                panel.focus = chain[(at + step) % chain.len()];
                 Outcome::Stay
             }
             // Just replaced: no Enter answers, cancels or confirms yet.
@@ -566,6 +615,7 @@ impl Blockers {
                     return Outcome::Request(request(id, &pending.key, &pending.write));
                 }
                 match panel.focus {
+                    Focus::Discuss => Outcome::Stay,
                     // Permission is checked at each step, not only on Tab.
                     Focus::Cancel | Focus::Confirm if !row.can_cancel || gone => {
                         panel.focus = Focus::Answer;
@@ -816,34 +866,36 @@ impl Blockers {
             return vec![Line::default(), self.status_line(None, now)];
         };
         let gone = self.held.contains(&row.root_id) && chain.pending.is_none();
-        let action = match panel.focus {
-            focus if gone => Line::from(vec![
-                Span::styled(
-                    "[Dismiss]",
-                    if focus == Focus::Cancel {
-                        theme::style(Role::Selection)
-                    } else {
-                        theme::dim()
-                    },
-                ),
-                Span::styled(" Tab", theme::dim()),
-            ]),
-            Focus::Confirm => Line::from(vec![
+        let button = |text: String, focus: Focus| {
+            let style = if panel.focus == focus {
+                theme::style(Role::Selection)
+            } else {
+                theme::dim()
+            };
+            Span::styled(text, style)
+        };
+        let action = if panel.focus == Focus::Confirm && !gone {
+            Line::from(vec![
                 Span::styled("Cancel this blocker? ", theme::style(Role::Warning)),
                 Span::styled("Enter confirms · Esc returns", theme::dim()),
-            ]),
-            focus if row.can_cancel => {
-                let style = if focus == Focus::Cancel {
-                    theme::style(Role::Selection)
-                } else {
-                    theme::dim()
-                };
-                Line::from(vec![
-                    Span::styled("[Cancel]", style),
-                    Span::styled(" Tab", theme::dim()),
-                ])
+            ])
+        } else {
+            let mut spans = Vec::new();
+            if let Some(agent) = agent_creator(row) {
+                spans.push(button(format!("[discuss with {agent}]"), Focus::Discuss));
             }
-            _ => Line::default(),
+            if gone {
+                spans.push(button("[Dismiss]".into(), Focus::Cancel));
+            } else if row.can_cancel {
+                spans.push(button("[Cancel]".into(), Focus::Cancel));
+            }
+            for at in (1..spans.len()).rev() {
+                spans.insert(at, Span::raw(" "));
+            }
+            if !spans.is_empty() {
+                spans.push(Span::styled(" Tab", theme::dim()));
+            }
+            Line::from(spans)
         };
         vec![action, self.status_line(Some(chain), now)]
     }
@@ -1030,6 +1082,14 @@ fn nearest(selected: Option<i64>, old: &[i64], new: &[i64]) -> Option<i64> {
         .or_else(|| old.iter().take(at).rev().find(|r| new.contains(r)))
         .copied()
         .or_else(|| new.first().copied())
+}
+
+/// The creator's name when it is an agent, whose conversation can open.
+fn agent_creator(row: &proto::Blocker) -> Option<String> {
+    row.creator
+        .as_ref()
+        .filter(|p| p.kind() == proto::Kind::Agent && !p.name.is_empty())
+        .map(|p| p.name.clone())
 }
 
 fn creator(row: &proto::Blocker) -> String {
@@ -1319,6 +1379,170 @@ mod tests {
         assert_eq!(at + 3, 24 - 3, "no answer box: {out}");
     }
 
+    fn focus(blockers: &Blockers) -> Focus {
+        blockers.panel.as_ref().unwrap().focus
+    }
+
+    fn action(blockers: &Blockers, now: Instant) -> String {
+        blockers.lines_below(now)[0].to_string()
+    }
+
+    #[test]
+    fn tab_offers_discussing_the_creator_before_cancel_and_backtab_reverses() {
+        let now = Instant::now();
+        let mut blockers = open(now);
+        assert_eq!(action(&blockers, now), "[discuss with Zed] [Cancel] Tab");
+        // One action row, on the card at 60 and 80 columns in every scheme.
+        for scheme in crate::ui::theme::testing::SCHEMES {
+            crate::ui::theme::testing::with_scheme(scheme, || {
+                for width in [60, 80] {
+                    let (rows, _) = drawn(&mut blockers, width, 24, now);
+                    assert!(
+                        rows[22].starts_with("[discuss with Zed] [Cancel] Tab"),
+                        "{rows:#?}"
+                    );
+                }
+            });
+        }
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            blockers.key(SCREEN, press(KeyCode::Tab), now);
+            seen.push(focus(&blockers));
+        }
+        assert_eq!(seen, [Focus::Discuss, Focus::Cancel, Focus::Answer]);
+        seen.clear();
+        for _ in 0..3 {
+            blockers.key(SCREEN, press(KeyCode::BackTab), now);
+            seen.push(focus(&blockers));
+        }
+        assert_eq!(seen, [Focus::Cancel, Focus::Discuss, Focus::Answer]);
+        // Focused, the button takes the selection colour.
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        let line = &blockers.lines_below(now)[0];
+        assert_eq!(line.spans[0].style, theme::style(Role::Selection));
+        assert_eq!(line.spans[2].style, theme::dim());
+        // A human creator has no conversation here; no cancel skips Cancel.
+        let chains = |rows: Vec<proto::Blocker>| {
+            let mut blockers = Blockers::new();
+            blockers.poll(SCREEN);
+            blockers.on_data(SCREEN, &list(rows), now);
+            blockers.open(now).unwrap();
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                blockers.key(SCREEN, press(KeyCode::Tab), now);
+                seen.push(focus(&blockers));
+            }
+            (action(&blockers, now), seen)
+        };
+        let mut human = row(1, 1, "will", "q?");
+        human.creator.as_mut().unwrap().kind = proto::Kind::Human.into();
+        assert_eq!(
+            chains(vec![human]),
+            (
+                "[Cancel] Tab".into(),
+                vec![Focus::Cancel, Focus::Answer, Focus::Cancel]
+            )
+        );
+        let mut keep = row(1, 1, "Zed", "q?");
+        keep.can_cancel = false;
+        assert_eq!(
+            chains(vec![keep]),
+            (
+                "[discuss with Zed] Tab".into(),
+                vec![Focus::Discuss, Focus::Answer, Focus::Discuss]
+            )
+        );
+    }
+
+    #[test]
+    fn discussing_opens_the_creator_and_never_answers_or_cancels() {
+        let now = Instant::now();
+        let mut blockers = open(now);
+        typed(&mut blockers, "go", now);
+        let first = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+        // Not confirmed: Enter on the answer would send it again.
+        blockers.on_data(
+            SCREEN,
+            &written(
+                &first.request_key,
+                Err(SideError::Transient("timeout".into())),
+            ),
+            now,
+        );
+        assert!(blockers.chains[&1].pending.as_ref().unwrap().uncertain);
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        match blockers.key(SCREEN, press(KeyCode::Enter), now) {
+            Outcome::Discuss(agent) => assert_eq!(agent, "Zed", "the creator, not its owner"),
+            _ => panic!("expected a discussion"),
+        }
+        assert!(!blockers.is_open());
+        assert!(
+            blockers.chains[&1].pending.as_ref().unwrap().uncertain,
+            "nothing resent"
+        );
+        // Just replaced, the guard holds answers but not a discussion.
+        blockers.open(now).unwrap();
+        blockers.on_data(
+            SCREEN,
+            &list(vec![
+                row(5, 1, "Zed", "changed?"),
+                row(2, 2, "Mateo", "second?"),
+            ]),
+            now,
+        );
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Enter), now),
+            Outcome::Discuss(_)
+        ));
+    }
+
+    #[test]
+    fn reopening_returns_to_the_same_blocker_or_the_nearest() {
+        let now = Instant::now();
+        let mut blockers = Blockers::new();
+        blockers.poll(SCREEN);
+        let rows = |ids: &[i64]| {
+            list(
+                ids.iter()
+                    .map(|&root| row(root, root, "Zed", &format!("q{root}?")))
+                    .collect(),
+            )
+        };
+        blockers.on_data(SCREEN, &rows(&[1, 2, 3]), now);
+        blockers.open(now).unwrap();
+        blockers.key(SCREEN, alt(KeyCode::Down), now);
+        typed(&mut blockers, "half", now);
+        blockers.key(SCREEN, press(KeyCode::Esc), now);
+        let selected = |blockers: &Blockers| blockers.selected().map(|b| (b.root_id, b.id));
+        blockers.open(now).unwrap();
+        assert_eq!(selected(&blockers), Some((2, 2)));
+        assert_eq!(blockers.chains[&2].answer.draft().text, "half");
+        blockers.key(SCREEN, press(KeyCode::Esc), now);
+        // A replacement keeps its place: the same root, a new version.
+        blockers.on_data(
+            SCREEN,
+            &list(vec![
+                row(1, 1, "Zed", "q1?"),
+                row(9, 2, "Zed", "q2 again?"),
+                row(3, 3, "Zed", "q3?"),
+            ]),
+            now,
+        );
+        blockers.open(now).unwrap();
+        assert_eq!(selected(&blockers), Some((2, 9)));
+        blockers.key(SCREEN, press(KeyCode::Esc), now);
+        // Gone while closed: the next one along.
+        blockers.on_data(SCREEN, &rows(&[1, 3]), now);
+        blockers.open(now).unwrap();
+        assert_eq!(selected(&blockers), Some((3, 3)));
+        blockers.key(SCREEN, press(KeyCode::Esc), now);
+        // Nothing left: done, as before.
+        blockers.on_data(SCREEN, &rows(&[]), now);
+        blockers.open(now).unwrap();
+        assert!(blockers.done());
+    }
+
     #[test]
     fn polls_one_at_a_time_for_its_own_screen_and_stop_on_an_old_server() {
         let now = Instant::now();
@@ -1540,7 +1764,7 @@ mod tests {
             let mut blockers = open(now);
             typed(&mut blockers, "go", now);
             let key = if cancel {
-                blockers.key(SCREEN, press(KeyCode::Tab), now);
+                blockers.key(SCREEN, press(KeyCode::BackTab), now);
                 blockers.key(SCREEN, press(KeyCode::Enter), now);
                 match blockers.key(SCREEN, press(KeyCode::Enter), now) {
                     Outcome::Request(Request::CancelBlocker { req, .. }) => req.request_key,
@@ -1573,7 +1797,7 @@ mod tests {
             // After the guard, a plain Enter sends nothing on the answer's
             // behalf; after a cancel it answers version 5 with the draft.
             if cancel {
-                blockers.key(SCREEN, press(KeyCode::BackTab), now + GUARD);
+                blockers.key(SCREEN, press(KeyCode::Tab), now + GUARD);
             }
             let after = blockers.key(SCREEN, press(KeyCode::Enter), now + GUARD);
             if cancel {
@@ -1589,7 +1813,7 @@ mod tests {
     fn a_replacement_withdraws_a_pending_cancel_confirmation() {
         let now = Instant::now();
         let mut blockers = open(now);
-        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        blockers.key(SCREEN, press(KeyCode::BackTab), now);
         blockers.key(SCREEN, press(KeyCode::Enter), now);
         assert_eq!(blockers.panel.as_ref().unwrap().focus, Focus::Confirm);
         // Version 1 is replaced by 5 while the question is up.
@@ -1655,7 +1879,7 @@ mod tests {
     fn losing_cancel_permission_withdraws_the_confirmation() {
         let now = Instant::now();
         let mut blockers = open(now);
-        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        blockers.key(SCREEN, press(KeyCode::BackTab), now);
         blockers.key(SCREEN, press(KeyCode::Enter), now);
         let mut first = row(1, 1, "Zed", "first?");
         first.can_cancel = false;
@@ -1674,6 +1898,8 @@ mod tests {
         }
         assert!(blockers.chains[&1].pending.is_none());
         // Tab cannot reach Cancel either, and Enter rechecks it if it did.
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        assert_eq!(blockers.panel.as_ref().unwrap().focus, Focus::Discuss);
         blockers.key(SCREEN, press(KeyCode::Tab), now);
         assert_eq!(blockers.panel.as_ref().unwrap().focus, Focus::Answer);
         blockers.panel.as_mut().unwrap().focus = Focus::Confirm;
@@ -1725,12 +1951,12 @@ mod tests {
             Outcome::Stay
         ));
         assert!(blockers.chains[&1].pending.is_none());
-        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        blockers.key(SCREEN, press(KeyCode::BackTab), now);
         assert!(
             blockers
                 .lines_below(now)
                 .iter()
-                .any(|l| l.to_string().starts_with("[Dismiss]"))
+                .any(|l| l.to_string().contains("[Dismiss]"))
         );
         blockers.key(SCREEN, press(KeyCode::Enter), now);
         assert!(!blockers.chains.contains_key(&1));
@@ -1941,7 +2167,7 @@ mod tests {
         let now = Instant::now();
         let mut blockers = open(now);
         typed(&mut blockers, "half", now);
-        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        blockers.key(SCREEN, press(KeyCode::BackTab), now);
         // Typing on the action types nothing.
         typed(&mut blockers, "zz", now);
         blockers.key(SCREEN, press(KeyCode::Enter), now);
@@ -1986,7 +2212,6 @@ mod tests {
         blockers.on_data(SCREEN, &list(vec![theirs]), now);
         blockers.open(now).unwrap();
         typed(&mut blockers, "hi", now);
-        blockers.key(SCREEN, press(KeyCode::Tab), now);
         assert!(matches!(
             blockers.key(SCREEN, press(KeyCode::Enter), now),
             Outcome::Stay

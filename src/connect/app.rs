@@ -636,16 +636,7 @@ impl App {
                 }
                 launcher::Outcome::Choose(target) => {
                     self.picker = None;
-                    if let Some(editor) = &mut self.note_editor {
-                        // As Esc would: store a changed note before leaving it.
-                        self.pending_launch = Some(target);
-                        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-                        let outcome = editor.key(esc, next_id());
-                        self.note_outcome(outcome);
-                        self.sync_notes();
-                    } else {
-                        self.launch(target);
-                    }
+                    self.navigate(target);
                     self.viewed();
                     false
                 }
@@ -660,6 +651,20 @@ impl App {
         self.keymap = Keymap::default();
         self.picker = Some(Picker::new(&self.launcher_cache));
         Some(false)
+    }
+
+    /// Go to `target` from a modal, storing an open, changed note first.
+    fn navigate(&mut self, target: Target) {
+        if let Some(editor) = &mut self.note_editor {
+            // As Esc would: store a changed note before leaving it.
+            self.pending_launch = Some(target);
+            let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+            let outcome = editor.key(esc, next_id());
+            self.note_outcome(outcome);
+            self.sync_notes();
+        } else {
+            self.launch(target);
+        }
     }
 
     fn launch(&mut self, target: Target) {
@@ -750,6 +755,11 @@ impl App {
                     false
                 }
                 blockers::Outcome::Close => {
+                    self.viewed();
+                    false
+                }
+                blockers::Outcome::Discuss(agent) => {
+                    self.navigate(Target::Agent(agent));
                     self.viewed();
                     false
                 }
@@ -12019,5 +12029,74 @@ mod tests {
             result: Ok(vec![]),
         }));
         assert!(!found(&mut app), "hidden before any note page says so");
+    }
+
+    #[test]
+    fn discussing_a_blocker_closes_the_card_and_opens_its_creators_conversation() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        typed(&mut app, "draft");
+        queue(&mut app, &mut rx, vec![blocker(1, 1, "Mateo", "q?")]);
+        while rx.try_recv().is_ok() {}
+        let discuss = |app: &mut App| {
+            press(app, KeyCode::F(2), KeyModifiers::NONE);
+            press(app, KeyCode::Tab, KeyModifiers::NONE);
+            press(app, KeyCode::Enter, KeyModifiers::NONE);
+        };
+        discuss(&mut app);
+        assert!(!app.blockers.is_open());
+        // Already open: the same conversation, its draft kept.
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        assert_eq!(draft_text(&mut app), "draft");
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !sent.iter().any(|r| matches!(
+                r,
+                Request::AnswerBlocker { .. }
+                    | Request::CancelBlocker { .. }
+                    | Request::Watch { .. }
+            )),
+            "{sent:?}"
+        );
+        // Another creator's conversation opens fresh.
+        let id = app.blockers_id;
+        blockers_listed(&mut app, id, vec![blocker(2, 2, "Grove", "q2?")]);
+        discuss(&mut app);
+        assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::Watch { .. })),
+            "{sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|r| matches!(
+                r,
+                Request::AnswerBlocker { .. } | Request::CancelBlocker { .. }
+            )),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn discussing_a_blocker_over_a_changed_note_saves_the_note_first() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![]);
+        queue(&mut app, &mut rx, vec![blocker(1, 1, "Grove", "q?")]);
+        f3(&mut app);
+        typed(&mut app, "x");
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.blockers.is_open());
+        let (save, _, body) = note_put(&mut rx).expect("the note is saved first");
+        assert_eq!(body, "x");
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        app.on_event(Event::Data(Data::NoteSaved {
+            id: save,
+            result: Ok(agent_note(7, "Mateo", "x", 1)),
+        }));
+        assert!(app.note_editor.is_none());
+        assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
     }
 }
