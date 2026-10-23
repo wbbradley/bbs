@@ -24,6 +24,10 @@ rather than falling back to anything else.
 
 ### Changed
 
+- The `bbs connect` blocker card keeps its list at the top and moves the
+  selected blocker to the bottom, just above the answer box: a row restating
+  its number, group and creator, then its details, with a single blank row
+  before the box and any spare space above.
 - `bbs connect` opens straight to the main menu, which now shows the logo,
   version and server, welcome and menu items as one block centred both ways.
   The separate splash screen, its `CONNECT 14400/ARQ` line and its "press any

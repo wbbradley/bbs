@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
@@ -617,10 +617,16 @@ impl Blockers {
     /// The header, list, and the selected blocker's text and recipient.
     #[cfg(test)]
     fn lines_above(&self, width: u16) -> Vec<Line<'static>> {
-        let (mut lines, body, label) = self.parts(width);
-        lines.extend(body);
-        lines.extend(label);
-        lines
+        let Parts {
+            mut head,
+            selected,
+            body,
+            label,
+        } = self.parts(width);
+        head.extend(selected);
+        head.extend(body);
+        head.extend(label);
+        head
     }
 
     /// The card's title bar: whose blocker this is and whether the box below
@@ -673,19 +679,12 @@ impl Blockers {
         theme::clip_line(Line::raw(text), width).style(theme::style(Role::WarningTitle))
     }
 
-    /// The header and list; the selected blocker's text, which gets what
-    /// room is left; and the line naming who an answer goes to.
-    fn parts(
-        &self,
-        width: u16,
-    ) -> (
-        Vec<Line<'static>>,
-        Vec<Line<'static>>,
-        Option<Line<'static>>,
-    ) {
+    /// The header and list; the selected blocker restated, its text, which
+    /// gets what room is left, and the line naming who an answer goes to.
+    fn parts(&self, width: u16) -> Parts {
         let width = usize::from(width);
         let Some(panel) = &self.panel else {
-            return Default::default();
+            return Parts::default();
         };
         let mut lines = vec![self.title(width)];
         if self.support == Support::Unsupported {
@@ -694,7 +693,10 @@ impl Blockers {
                 format!("  {UNSUPPORTED} Esc returns."),
                 theme::style(Role::Warning),
             ));
-            return (lines, Vec::new(), None);
+            return Parts {
+                head: lines,
+                ..Parts::default()
+            };
         }
         if self.done() {
             lines.push(Line::default());
@@ -702,11 +704,17 @@ impl Blockers {
                 "  Done with blockers.",
                 theme::style(Role::Success),
             ));
-            return (lines, Vec::new(), None);
+            return Parts {
+                head: lines,
+                ..Parts::default()
+            };
         }
         if !self.loaded {
             lines.push(Line::styled("Loading…", theme::dim()));
-            return (lines, Vec::new(), None);
+            return Parts {
+                head: lines,
+                ..Parts::default()
+            };
         }
         let at = panel
             .selected
@@ -740,10 +748,20 @@ impl Blockers {
             lines.push(Line::styled("Loading more…", theme::dim()));
         }
         let Some(row) = self.selected() else {
-            return (lines, Vec::new(), None);
+            return Parts {
+                head: lines,
+                ..Parts::default()
+            };
         };
+        let selected = Line::from(vec![
+            Span::raw(format!("  #{} ", row.id)),
+            Span::styled(format!("@{}", row.group), theme::style(Role::Group)),
+            Span::raw(" "),
+            Span::styled(creator(row), theme::style(Role::Agent)),
+        ])
+        .style(Style::new().add_modifier(Modifier::BOLD));
         // Markdown, laid out for the card less its two-column margin.
-        let mut body = vec![Line::default()];
+        let mut body = Vec::new();
         let markdown =
             crate::ui::markdown::render_at(&row.body, Some(width.saturating_sub(2) as u16));
         for line in markdown.lines {
@@ -782,7 +800,12 @@ impl Blockers {
                 theme::dim(),
             )
         };
-        (lines, body, Some(theme::clip_line(label, width)))
+        Parts {
+            head: lines,
+            selected: Some(theme::clip_line(selected, width)),
+            body,
+            label: Some(theme::clip_line(label, width)),
+        }
     }
 
     /// The Cancel action, or its confirmation, and the state line.
@@ -860,12 +883,43 @@ impl Blockers {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, now: Instant) {
-        let (head, body, label) = self.parts(area.width);
+        let Parts {
+            head,
+            selected,
+            body,
+            label,
+        } = self.parts(area.width);
         let below = self.lines_below(now);
         let answer = self.answer_height(area.width);
-        let [head_area, body_area, label_area, middle, bottom] = Layout::vertical([
+        // The list stays at the top; the selected blocker sits at the
+        // bottom, just above its answer, with the spare rows between.
+        let inset = area.width.min(2);
+        let body = Paragraph::new(body).wrap(Wrap { trim: false });
+        let rows = body.line_count(area.width - inset) as u16;
+        let fixed = [
+            head.len() as u16,
+            selected.iter().count() as u16,
+            label.iter().count() as u16,
+            answer,
+            below.len() as u16,
+        ]
+        .iter()
+        .fold(0u16, |sum, rows| sum.saturating_add(*rows));
+        let room = area.height.saturating_sub(fixed);
+        let shown = rows.min(room.saturating_sub(1));
+        let [
+            head_area,
+            _,
+            selected_area,
+            body_area,
+            label_area,
+            middle,
+            bottom,
+        ] = Layout::vertical([
             Constraint::Length(head.len() as u16),
-            Constraint::Min(0),
+            Constraint::Length(room - shown),
+            Constraint::Length(selected.iter().count() as u16),
+            Constraint::Length(shown),
             Constraint::Length(label.iter().count() as u16),
             Constraint::Length(answer),
             Constraint::Length(below.len() as u16),
@@ -892,16 +946,14 @@ impl Blockers {
             ..head_area
         };
         frame.render_widget(Paragraph::new(head.collect::<Vec<_>>()), rest);
+        frame.render_widget(Paragraph::new(Vec::from_iter(selected)), selected_area);
         // Keep the margin outside wrapping, just like conversation messages.
-        let inset = body_area.width.min(2);
         let body_area = Rect::new(
             body_area.x + inset,
             body_area.y,
             body_area.width - inset,
             body_area.height,
         );
-        let body = Paragraph::new(body).wrap(Wrap { trim: false });
-        let rows = body.line_count(body_area.width) as u16;
         self.text_rows = (rows, body_area.height);
         let mut label = label;
         if let Some(panel) = &mut self.panel {
@@ -943,6 +995,18 @@ impl Blockers {
             }
         }
     }
+}
+
+/// The card's text above the answer box.
+#[derive(Default)]
+struct Parts {
+    /// The title bar and the list.
+    head: Vec<Line<'static>>,
+    /// The selected blocker, restated above its text.
+    selected: Option<Line<'static>>,
+    body: Vec<Line<'static>>,
+    /// Who an answer goes to, or why there is none.
+    label: Option<Line<'static>>,
 }
 
 /// Where the selection goes when its row leaves: the row now at its place.
@@ -1100,6 +1164,143 @@ mod tests {
             key: key.into(),
             result,
         }
+    }
+
+    /// The card's rows at `width` x `height`, and its buffer.
+    fn drawn(
+        blockers: &mut Blockers,
+        width: u16,
+        height: u16,
+        now: Instant,
+    ) -> (Vec<String>, ratatui::buffer::Buffer) {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| blockers.render(f, f.area(), now))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        crate::ui::theme::testing::assert_buffer(&buffer);
+        let rows = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        (rows, buffer)
+    }
+
+    /// The row restating the selection: below the list, not a list row.
+    fn restated(rows: &[String], what: &str) -> usize {
+        rows.iter()
+            .rposition(|r| r.starts_with(&format!("  {what}")))
+            .unwrap_or_else(|| panic!("{what}: {rows:#?}"))
+    }
+
+    #[test]
+    fn short_details_sit_just_above_the_answer_with_spare_rows_above() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                for (width, height) in [(60u16, 24u16), (80, 24), (80, 40)] {
+                    let now = Instant::now();
+                    let mut blockers = open(now);
+                    let (rows, buffer) = drawn(&mut blockers, width, height, now);
+                    let out = rows.join("\n");
+                    // The list stays at the top.
+                    assert!(rows[1].starts_with("▸ #1 @crew Zed  first?"), "{out}");
+                    assert!(rows[2].starts_with("  #2 @crew Mateo  second?"), "{out}");
+                    // The selection restated, its text, who it answers.
+                    let at = restated(&rows, "#1 @crew Zed");
+                    assert!(at > 3, "{out}");
+                    assert_eq!(rows[at].trim_end(), "  #1 @crew Zed", "{out}");
+                    assert!(rows[at + 1].starts_with("  first?"), "{out}");
+                    assert!(rows[at + 2].starts_with("answer → Zed @crew"), "{out}");
+                    // One blank row, then the answer box.
+                    assert_eq!(rows[at + 3].trim(), "", "{out}");
+                    if let Some(bg) = theme::style(Role::HumanSurface).bg {
+                        assert_eq!(buffer[(0, at as u16 + 4)].bg, bg, "{scheme:?}");
+                        assert_ne!(buffer[(0, at as u16 + 3)].bg, bg, "{scheme:?}");
+                    }
+                    // The spare rows are all above it.
+                    assert!(rows[3..at].iter().all(|r| r.trim().is_empty()), "{out}");
+                    assert_eq!(at, usize::from(height) - 9, "{out}");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn long_details_leave_the_list_and_answer_whole_and_page_in_between() {
+        let now = Instant::now();
+        let mut blockers = Blockers::new();
+        blockers.poll(SCREEN);
+        let body = (0..60)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        blockers.on_data(
+            SCREEN,
+            &list(vec![row(1, 1, "Zed", &body), row(2, 2, "Mateo", "second?")]),
+            now,
+        );
+        blockers.open(now).unwrap();
+        let (rows, _) = drawn(&mut blockers, 60, 24, now);
+        let out = rows.join("\n");
+        assert!(
+            rows[1].starts_with("▸ #1") && rows[2].starts_with("  #2"),
+            "{out}"
+        );
+        let at = restated(&rows, "#1 @crew Zed");
+        assert_eq!(at, 4, "one blank row under the list: {out}");
+        assert!(rows[at + 1].starts_with("  line 0"), "{out}");
+        let label = rows
+            .iter()
+            .position(|r| r.starts_with("answer → Zed"))
+            .expect(&out);
+        assert!(rows[label].contains("PgUp/PgDn text"), "{out}");
+        assert_eq!(rows[label + 1].trim(), "", "{out}");
+        assert_eq!(
+            label,
+            24 - 2 - 4 - 1,
+            "the answer box keeps its rows: {out}"
+        );
+        // Paging moves only the text between.
+        blockers.key(SCREEN, press(KeyCode::PageDown), now);
+        let (paged, _) = drawn(&mut blockers, 60, 24, now);
+        assert!(!paged[at + 1].starts_with("  line 0"), "{paged:#?}");
+        assert_eq!(paged[..at + 1], rows[..at + 1]);
+        assert!(paged[label].contains("PgUp/PgDn text 23/119"), "{paged:#?}");
+        assert_eq!(paged[label + 1..], rows[label + 1..]);
+        // A taller window shows more of it, still from where it was.
+        let (tall, _) = drawn(&mut blockers, 60, 40, now);
+        assert_eq!(restated(&tall, "#1 @crew Zed"), 4);
+        // A multiline answer takes rows from the text only.
+        let shown = blockers.text_rows.1;
+        blockers.key(SCREEN, alt(KeyCode::Enter), now);
+        blockers.key(SCREEN, alt(KeyCode::Enter), now);
+        let (grown, _) = drawn(&mut blockers, 60, 40, now);
+        assert_eq!(blockers.text_rows.1, shown - 2, "{grown:#?}");
+        assert_eq!(restated(&grown, "#1 @crew Zed"), 4);
+        assert!(grown[1].starts_with("▸ #1"));
+    }
+
+    #[test]
+    fn a_read_only_row_puts_its_reason_just_above_the_actions() {
+        let now = Instant::now();
+        let mut blockers = Blockers::new();
+        blockers.poll(SCREEN);
+        let mut read_only = row(1, 1, "Zed", "watch only?");
+        read_only.can_answer = false;
+        read_only.can_cancel = false;
+        blockers.on_data(SCREEN, &list(vec![read_only]), now);
+        blockers.open(now).unwrap();
+        let (rows, _) = drawn(&mut blockers, 80, 24, now);
+        let out = rows.join("\n");
+        let at = restated(&rows, "#1 @crew Zed");
+        assert!(rows[at + 1].starts_with("  watch only?"), "{out}");
+        assert!(rows[at + 2].starts_with("Read only:"), "{out}");
+        assert_eq!(at + 2, 24 - 3, "no answer box: {out}");
     }
 
     #[test]
