@@ -56,9 +56,11 @@ several separate `bbs group` commands.
   Selection preserves categorical foregrounds. On bars, a foreground matching the
   background falls back to the bar foreground with underline.
 
-- A splash screen with a large logo, shown on connect and skipped with any key.
-  Its geometry is embedded from `assets/connect/logo.txt` and colored by the
-  scheme's Logo role. Menu items have hot keys shown in brackets, `[A]gents`.
+- Connecting opens the main menu: the large logo, the version and server, a
+  welcome and the menu items, as one block centred both ways; long names are
+  cut rather than wrapped. The logo's geometry is
+  embedded from `assets/connect/logo.txt` and colored by the scheme's Logo
+  role. Menu items have hot keys shown in brackets, `[A]gents`.
 - If the terminal is too small (below 60×24), show a centred
   "terminal too small" notice instead of a broken layout.
 
@@ -70,7 +72,7 @@ bar.
 
 | Screen | What it shows | Data |
 | --- | --- | --- |
-| Main menu | Splash art, hot-key menu, unread counts | `Whoami`, `ListAgents` |
+| Main menu | Logo, version and server, hot-key menu, unread counts | `Whoami`, `ListAgents` |
 | Agents | Your agents (or everyone's): name, owner, groups, status, last active as an age, headless or not | `ListAgents` |
 | Agent | One agent: its conversation with you, a composer, and (headless agents) its live activity | `WatchFeed`, `Send`, `WatchActivity` |
 | Groups | Groups with members, writers and descriptions | `GroupList` |
@@ -174,7 +176,7 @@ available to the child, as described in [HEADLESS.md](HEADLESS.md#side-questions
 blocker in a current group that has a live agent of yours, whoever created it,
 each listed once and labelled with its current version number and group. The
 app polls it about once a second, one request at a time, whichever screen is
-up, splash included. While any are open, the right end of the status bar shows
+up. While any are open, the right end of the status bar shows
 `[N blockers · F2]` on the warning colour, on every screen, ahead of a
 conversation's mail and activity marks, however long the rest of the bar.
 
@@ -413,7 +415,7 @@ the usual feed error display. Switching closes the previous feed/activity
 subscriptions and saves its draft/cursor, including pending-send state.
 
 These keys work on normal screens and in Insert mode. Search prompts, group
-admin dialogs, Help, Config and the splash do not navigate on these keys.
+admin dialogs, Help and Config do not navigate on these keys.
 The app owns one shared summary subscription, including while discussions are
 closed. Summary failure hides the mailbox, displays unavailable feedback, and
 `F5` reloads it even while the conversation composer is focused; `r` still
@@ -689,7 +691,7 @@ leaves `connect` usable. A release can be cut after any of them.
 2. **The app shell.** `bbs connect` with the theme, main menu, screen stack,
    event loop, resize handling, keymaps, help screen and the too-small
    notice. Agents and Groups are read-only lists that show owners.
-3. **Logo.** The splash screen and its embedded text geometry.
+3. **Logo.** The logo on the main menu and its embedded text geometry.
 4. **Server: the `with` filter.** `feed-with.v1`, followed by a deploy to
    `bbs:7777` by Logan.
 5. **Threads.** Extract `ThreadView` from `view.rs`, now that two apps use it.

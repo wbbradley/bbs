@@ -1,10 +1,10 @@
 //! The main menu: hot keys to every screen.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Paragraph};
 
 use super::agents::Agents;
 use super::config::Config;
@@ -110,10 +110,47 @@ impl Screen for Menu {
         }
     }
 
+    /// The logo, version, welcome and items as one block, centred both ways.
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
-        let inner = theme::screen(frame, area, "Main menu");
+        let items: Vec<Line> = ITEMS
+            .iter()
+            .enumerate()
+            .map(|(i, (_, key, rest, _))| {
+                let selected = i == self.selected;
+                let mut style = theme::base();
+                if selected {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                Line::from(vec![
+                    Span::styled(if selected { "▶ " } else { "  " }, theme::base()),
+                    Span::styled("[", style),
+                    Span::styled(
+                        *key,
+                        style
+                            .patch(theme::style(theme::Role::Hotkey))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("]", style),
+                    Span::styled(*rest, style),
+                ])
+            })
+            .collect();
+        // Pad the items to one width so their keys line up once centred.
+        let column = items.iter().map(Line::width).max().unwrap_or(0);
+        let items = items.into_iter().map(|mut line| {
+            let pad = column - line.width();
+            line.spans
+                .push(Span::styled(" ".repeat(pad), theme::base()));
+            line
+        });
         let mut lines = art::logo().lines;
         lines.extend([
+            Line::default(),
+            Line::styled(
+                format!("v{} · {}", crate::release::VERSION, ctx.server),
+                theme::dim(),
+            ),
+            Line::default(),
             Line::styled(
                 "a board for coding agents and the humans running them",
                 theme::dim(),
@@ -126,29 +163,17 @@ impl Screen for Menu {
             ]),
             Line::default(),
         ]);
-        for (i, (_, key, rest, _)) in ITEMS.iter().enumerate() {
-            let selected = i == self.selected;
-            let mark = if selected { "▶ " } else { "  " };
-            let mut style = theme::base();
-            if selected {
-                style = style.add_modifier(Modifier::REVERSED);
-            }
-            lines.push(Line::from(vec![
-                Span::styled(mark, theme::base()),
-                Span::styled("[", style),
-                Span::styled(
-                    *key,
-                    style
-                        .patch(theme::style(theme::Role::Hotkey))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("]", style),
-                Span::styled(*rest, style),
-            ]));
-        }
-        let [_, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-        let [_, body] = Layout::horizontal([Constraint::Length(4), Constraint::Min(0)]).areas(body);
-        frame.render_widget(Paragraph::new(lines), body);
+        lines.extend(items);
+        // Cut long names rather than wrap the block past the screen.
+        let lines: Vec<Line> = lines
+            .into_iter()
+            .map(|line| theme::clip_line(line, usize::from(area.width)))
+            .collect();
+        let [middle] = Layout::vertical([Constraint::Length(lines.len() as u16)])
+            .flex(Flex::Center)
+            .areas(area);
+        frame.render_widget(Block::new().style(theme::base()), area);
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
     }
 }
 

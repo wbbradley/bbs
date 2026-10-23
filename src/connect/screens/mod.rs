@@ -5,7 +5,6 @@ pub mod config;
 pub mod groups;
 pub mod help;
 pub mod menu;
-pub mod splash;
 pub mod thread;
 
 use ratatui::widgets::TableState;

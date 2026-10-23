@@ -20,7 +20,6 @@ use super::navigation::{Conversation, Feedback, History, Inbox};
 use super::preferences::Preferences;
 use super::screens::help::Help;
 use super::screens::menu::Menu;
-use super::screens::splash::Splash;
 use super::screens::thread::Thread;
 use super::theme;
 
@@ -95,7 +94,7 @@ pub trait Screen {
         None
     }
     /// A key press before the keymap sees it: `Some` when the screen took it,
-    /// as the splash and a search prompt do.
+    /// as a search prompt does.
     fn raw_key(&mut self, _key: KeyEvent) -> Option<Transition> {
         None
     }
@@ -225,7 +224,6 @@ impl App {
         };
         app.send(vec![Request::WatchSummary(app.ctx.inbox.id)]);
         app.push(Box::new(Menu::default()));
-        app.push(Box::new(Splash));
         app
     }
 
@@ -867,7 +865,7 @@ mod tests {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {
             with_scheme(scheme, || {
-                the_splash_comes_first_and_any_key_passes_it();
+                startup_shows_the_menu_centred_with_its_version_and_server();
                 a_small_terminal_gets_a_notice();
                 agents_load_on_open_and_show_owners();
                 errors_show_in_the_window();
@@ -1717,13 +1715,11 @@ mod tests {
             navigation_notice: None,
             blocker_marker: None,
         };
-        let mut app = App::new(ctx, tx);
+        let app = App::new(ctx, tx);
         assert_eq!(
             rx.try_recv().unwrap(),
             Request::WatchSummary(app.ctx.inbox.id)
         );
-        // Past the splash.
-        key(&mut app, ' ');
         (app, rx)
     }
 
@@ -2603,39 +2599,138 @@ mod tests {
         }
     }
 
+    /// Rows of `buffer` within `area`, as text.
+    fn rows_in(buffer: &ratatui::buffer::Buffer, area: Rect) -> Vec<String> {
+        (area.top()..area.bottom())
+            .map(|y| {
+                (area.left()..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Checks the menu block is centred in `rows` exactly as ratatui centres:
+    /// 21 rows starting half its height less half theirs, and each line, or
+    /// the padded items as one block, likewise across, with the items' keys
+    /// in one column.
+    fn assert_centred_menu(rows: &[String]) {
+        let out = rows.join("\n");
+        let (width, height) = (rows[0].chars().count(), rows.len());
+        let used: Vec<usize> = (0..height)
+            .filter(|y| !rows[*y].trim().is_empty())
+            .collect();
+        assert_eq!(used[0], height / 2 - 21 / 2, "{out}");
+        assert_eq!(*used.last().unwrap(), used[0] + 20, "{out}");
+        let keys = [
+            "[A]gents", "[G]roups", "[F]eed", "[C]onfig", "[?]", "[Q]uit",
+        ];
+        let column = |row: &str, item: &str| row[..row.find(item).unwrap()].chars().count();
+        let mut starts = Vec::new();
+        for y in used {
+            let row = &rows[y];
+            if let Some(item) = keys.iter().find(|k| row.contains(*k)) {
+                starts.push(column(row, item));
+                continue;
+            }
+            let left = row.chars().take_while(|c| *c == ' ').count();
+            let right = row.chars().rev().take_while(|c| *c == ' ').count();
+            let visible = width - left - right;
+            assert_eq!(left, width / 2 - visible / 2, "row {y}: {out}");
+        }
+        assert_eq!(starts.len(), 6, "{out}");
+        assert!(starts.iter().all(|k| *k == starts[0]), "{starts:?}: {out}");
+        // The padded items, `▶ ` included, are centred as one block.
+        let widest = rows
+            .iter()
+            .filter(|row| keys.iter().any(|k| row.contains(k)))
+            .map(|row| row.trim_end().chars().count() - (starts[0] - 2))
+            .max()
+            .unwrap();
+        assert_eq!(starts[0] - 2, width / 2 - widest / 2, "{out}");
+    }
+
     #[test]
-    fn the_splash_comes_first_and_any_key_passes_it() {
-        let (tx, _rx) = unbounded_channel();
-        let ctx = Ctx {
-            me: "ada".into(),
-            server: "bbs:7777".into(),
-            composer_max_height_percent: 20,
-            compact_hides_thoughts: false,
-            preferences: Preferences::default(),
-            now: std::sync::Arc::new(Instant::now),
-            inbox: Default::default(),
-            efforts: Default::default(),
-            navigation_notice: None,
-            blocker_marker: None,
-        };
-        let mut app = App::new(ctx, tx);
-        let out = screen(&mut app, 80, 24);
-        assert!(out.contains("██████"), "{out}");
-        assert!(out.contains("CONNECT 14400/ARQ · bbs:7777"), "{out}");
-        assert!(out.contains("press any key"), "{out}");
-        assert!(
-            out.contains(&format!("v{}", crate::release::VERSION)),
-            "{out}"
-        );
-        // `g` would start `gg` elsewhere; here it only passes the splash.
-        assert!(!key(&mut app, 'g'));
-        assert!(screen(&mut app, 80, 24).contains("[A]gents"));
+    fn startup_shows_the_menu_centred_with_its_version_and_server() {
+        let version = format!("v{} · bbs:7777", crate::release::VERSION);
+        for (width, height) in [(60u16, 24u16), (61, 25), (80, 24), (99, 41), (120, 40)] {
+            let (mut app, _rx) = app();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows = rows_in(buffer, buffer.area);
+            let out = rows.join("\n");
+            assert!(rows[0].contains("BBS · Main menu"), "{out}");
+            assert!(
+                !out.contains(" Main menu \n"),
+                "no heading of its own: {out}"
+            );
+            assert!(out.contains("██████"), "{out}");
+            assert_eq!(out.matches(&version).count(), 1, "{out}");
+            assert_eq!(out.matches(crate::release::VERSION).count(), 1, "{out}");
+            for gone in ["ARQ", "14400", "CONNECT", "press any key"] {
+                assert!(!out.contains(gone), "{gone}: {out}");
+            }
+            // Between the title and status bars.
+            assert_centred_menu(&rows[1..usize::from(height) - 1]);
+        }
+        // The first key already acts on the menu.
+        let (mut app, _rx) = app();
         assert!(!key(&mut app, 'g'));
         assert!(screen(&mut app, 80, 24).contains("BBS · Groups"));
     }
 
     #[test]
-    fn ctrl_c_quits_from_the_splash() {
+    fn the_menu_centres_within_its_own_area() {
+        let (app, _rx) = app();
+        let area = Rect::new(7, 3, 63, 23);
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|f| Menu::default().render(f, area, &app.ctx))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let outside = rows_in(buffer, buffer.area)
+            .iter()
+            .enumerate()
+            .flat_map(|(y, row)| row.chars().enumerate().map(move |(x, c)| (x, y, c)))
+            .filter(|(x, y, c)| *c != ' ' && !area.contains((*x as u16, *y as u16).into()))
+            .count();
+        assert_eq!(outside, 0);
+        assert_centred_menu(&rows_in(buffer, area));
+    }
+
+    #[test]
+    fn long_names_are_cut_and_the_menu_still_fits() {
+        let (mut app, _rx) = app();
+        app.ctx.me = "ada".repeat(40);
+        app.ctx.server = format!("{}:7777", "bbs-".repeat(30));
+        let out = screen(&mut app, 60, 24);
+        let rows: Vec<&str> = out.lines().collect();
+        let version = rows
+            .iter()
+            .find(|r| r.contains(crate::release::VERSION))
+            .expect(&out);
+        assert!(
+            version
+                .trim()
+                .starts_with(&format!("v{} · bbs-", crate::release::VERSION))
+        );
+        assert!(version.trim().ends_with('…'), "{out}");
+        let welcome = rows
+            .iter()
+            .find(|r| r.contains("Welcome, ada"))
+            .expect(&out);
+        assert!(welcome.trim().ends_with('…'), "{out}");
+        assert_centred_menu(
+            &rows[1..rows.len() - 1]
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_startup_menu() {
         let (tx, _rx) = unbounded_channel();
         let ctx = Ctx {
             me: "ada".into(),
@@ -2661,10 +2756,7 @@ mod tests {
         assert!(out.contains("BBS · Main menu"), "{out}");
         assert!(out.contains("[A]gents"), "{out}");
         assert!(out.contains("[G]roups"), "{out}");
-        assert!(
-            !out.contains("bbs:7777") && !out.contains("online"),
-            "{out}"
-        );
+        assert!(!out.contains("online"), "{out}");
         assert!(out.lines().last().unwrap().trim() == "ada", "{out}");
         assert!(!out.contains("baud"), "{out}");
     }
@@ -6723,15 +6815,14 @@ mod tests {
     }
 
     #[test]
-    fn the_launcher_covers_the_splash_and_leaves_the_blocker_modal_in_charge() {
-        let (mut app, mut rx) = splash_app();
+    fn the_launcher_covers_the_menu_and_leaves_the_blocker_modal_in_charge() {
+        let (mut app, mut rx) = app();
         let before = buffer(&mut app, 80);
         ctrl(&mut app, 'p');
         assert!(screen(&mut app, 80, 24).contains("Go to · cached data"));
         assert!(rx.try_recv().is_err());
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(buffer(&mut app, 80), before);
-        key(&mut app, ' ');
         queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
         ctrl(&mut app, 'p');
@@ -7114,22 +7205,6 @@ mod tests {
         }
     }
 
-    /// The app still on its splash screen.
-    fn splash_app() -> (App, UnboundedReceiver<Request>) {
-        let (tx, mut rx) = unbounded_channel();
-        let (app, _) = self::app();
-        let app = App::new(
-            Ctx {
-                inbox: Default::default(),
-                efforts: Default::default(),
-                ..app.ctx
-            },
-            tx,
-        );
-        rx.try_recv().unwrap(); // the summary watch
-        (app, rx)
-    }
-
     /// The app's personal queue, polled (or already out) and answered.
     fn queue(app: &mut App, rx: &mut UnboundedReceiver<Request>, rows: Vec<proto::Blocker>) -> u64 {
         let id = app.blockers_id;
@@ -7148,20 +7223,19 @@ mod tests {
 
     #[test]
     fn the_personal_queue_polls_once_per_tick_on_every_screen() {
-        // The splash: one personal poll, then none while it is out.
-        let (mut app, mut rx) = splash_app();
+        // The menu: one personal poll, then none while it is out.
+        let (mut app, mut rx) = app();
         let id = app.blockers_id;
         assert_eq!(blocker_poll(&mut app, &mut rx), Some(id));
         assert_eq!(blocker_poll(&mut app, &mut rx), None, "one in flight");
         blockers_listed(&mut app, id, vec![blocker(1, 1, "Zed", "q?")]);
         let out = screen(&mut app, 80, 24);
         assert!(
-            out.contains("press any key") && out.contains("[1 blocker · F2]"),
+            out.contains("[A]gents") && out.contains("[1 blocker · F2]"),
             "{out}"
         );
-        // The menu, then a group thread: still one app poll per tick, never
-        // a thread's own.
-        key(&mut app, ' ');
+        // Then a group thread: still one app poll per tick, never a
+        // thread's own.
         assert!(bottom(&mut app).contains("[1 blocker · F2]"));
         crew_list(&mut app, &mut rx);
         enter(&mut app);
@@ -7389,15 +7463,15 @@ mod tests {
     }
 
     #[test]
-    fn the_splash_opens_the_queue_and_comes_back_unchanged() {
-        let (mut app, mut rx) = splash_app();
+    fn the_menu_opens_the_queue_and_comes_back_unchanged() {
+        let (mut app, mut rx) = app();
         queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
         let before = buffer(&mut app, 80);
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
         assert!(screen(&mut app, 80, 24).contains("Answering a blocker from Zed"));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(buffer(&mut app, 80), before);
-        assert!(screen(&mut app, 80, 24).contains("press any key"));
+        assert!(screen(&mut app, 80, 24).contains("[A]gents"));
     }
 
     #[test]

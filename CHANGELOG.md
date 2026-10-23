@@ -6,6 +6,15 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Changed
+
+- `bbs connect` opens straight to the main menu, which now shows the logo,
+  version and server, welcome and menu items as one block centred both ways.
+  The separate splash screen, its `CONNECT 14400/ARQ` line and its "press any
+  key" step are gone, so the first key acts on the menu.
+
 ## 0.15.4 - 2026-10-23
 
 `bbs connect` launcher, card and blocker display improvements. Protocol v2,

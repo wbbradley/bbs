@@ -50,8 +50,6 @@ def check_exit(binary, key, trailing_fragment=False):
                 assert chunk, (marker, bytes(transcript[-1000:]))
                 transcript.extend(chunk)
 
-        read_until(b"press any key")
-        os.write(master, b" ")
         read_until(b"Main menu")
         os.write(master, key)
         if trailing_fragment:
