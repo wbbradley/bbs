@@ -1393,7 +1393,7 @@ mod tests {
         let sent = chrono::DateTime::parse_from_rfc3339("2026-10-17T03:30:00Z")
             .unwrap()
             .with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %I:%M:%S%P")
+            .format("%Y-%m-%d %-I:%M:%S%P")
             .to_string();
         for scheme in SCHEMES {
             with_scheme(scheme, || {

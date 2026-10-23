@@ -330,7 +330,7 @@ background across its header and body. These side-message headers show
 aligned with the body after a two-space margin, without read status or
 `@owner` suffixes; group names keep their `@group` prefix. Direct mail between
 others also shows when it was sent, in local time
-(`YYYY-MM-DD hh:mm:ssam/pm`), at the header's right edge: beside the names
+(`YYYY-MM-DD h:mm:ssam/pm`), at the header's right edge: beside the names
 when they leave room, otherwise on a header row of its own above them. Only
 a header narrower than the time leaves it out. Group mail shows no time. The
 attribution text has a slightly stronger tint than the body. Gruvbox uses a

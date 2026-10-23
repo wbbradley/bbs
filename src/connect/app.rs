@@ -9676,7 +9676,7 @@ mod tests {
                     let sent = chrono::DateTime::parse_from_rfc3339("2026-10-16T18:00:00Z")
                         .unwrap()
                         .with_timezone(&chrono::Local)
-                        .format("%Y-%m-%d %I:%M:%S%P")
+                        .format("%Y-%m-%d %-I:%M:%S%P")
                         .to_string();
                     assert!(header.starts_with("• Zed → Mateo "), "{header}");
                     assert!(header.trim_end().ends_with(&sent), "{header}");
