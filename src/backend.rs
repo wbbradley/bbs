@@ -941,10 +941,6 @@ impl ActivityWatch<'_> {
 }
 
 impl SummaryWatch<'_> {
-    pub async fn next(&mut self) -> Result<Vec<proto::AgentSummary>> {
-        Ok(self.next_snapshot().await?.agents)
-    }
-
     /// The whole snapshot, with its private notes revision.
     pub async fn next_snapshot(&mut self) -> Result<proto::AgentSummarySnapshot> {
         self.snapshot().await
