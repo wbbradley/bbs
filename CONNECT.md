@@ -473,8 +473,8 @@ saving.
 ## Local launcher
 
 `Ctrl-p` opens a full-screen launcher from any screen, with a centered query
-and fuzzy matches for agent names, group names, your notes and cached message
-lines.
+and fuzzy matches for agent names and statuses, group names, your notes and
+cached message lines.
 `Up`/`Down` or `Ctrl-k`/`Ctrl-j` select a result; `Enter` opens the selection
 (the top match by default). `Esc` closes the launcher and restores the screen
 beneath it, including its draft, cursor, selection, scroll position and open
@@ -494,7 +494,12 @@ cache of up to 10,000 messages and 16 MiB of body text, with an additional
 folded-text index. The cache is held in memory and disappears on exit.
 Names learned from historical messages may still appear. Matching ignores
 case, keeps accents significant, and searches each message line separately.
-Agents come first, then groups, then notes, then messages. Notes are your
+Agents come first, then groups, then notes, then messages. Agents match by
+name and also by status, as the last agent list this session received gave it
+(statuses are not followed live); an agent matching by name comes before those
+matching only by status, each listed once, and a status match shows the
+matching part of the status after the agent's name. Choosing one opens that
+agent. Notes are your
 live, non-empty notes as last paged in, each matched at its best line; choosing
 one opens the agent's conversation with the note over it, its cursor on that
 line, and `Esc` returns to the conversation. Choosing any result while a

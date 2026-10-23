@@ -24,6 +24,9 @@ rather than falling back to anything else.
 
 ### Changed
 
+- Ctrl-P also finds agents by their status, as the last cached agent list gave
+  it; name matches still come first, and a status match shows the matching part
+  of the status.
 - The `bbs connect` blocker card keeps its list at the top and moves the
   selected blocker to the bottom, just above the answer box: a row restating
   its number, group and creator, then its details, with a single blank row

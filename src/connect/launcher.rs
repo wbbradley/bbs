@@ -43,12 +43,17 @@ pub enum Target {
 pub struct Hit {
     pub target: Target,
     pub text: String,
+    /// An agent found by its status: the matching part of it.
+    pub detail: Option<String>,
 }
 
 /// Previously received data, bounded for this client session only.
 #[derive(Default)]
 pub struct Cache {
     agents: BTreeMap<String, String>,
+    /// Live agents' statuses from the last agent list, by folded name, with
+    /// their folded index.
+    statuses: BTreeMap<String, (String, String)>,
     groups: BTreeMap<String, String>,
     messages: BTreeMap<i64, CachedMessage>,
     /// The human's live, non-empty notes by agent id: the agent's name, the
@@ -80,12 +85,23 @@ impl Cache {
             Data::Agents(Ok(list)) => {
                 self.revision = self.revision.wrapping_add(1);
                 self.agents.clear();
+                let mut statuses = BTreeMap::new();
                 for agent in list.agents.iter().filter(|a| !a.retired) {
                     self.agent(&agent.name);
+                    if let Some(status) = agent.status.as_deref().filter(|s| !s.trim().is_empty()) {
+                        let key = folded(&agent.name);
+                        // Fold only text that changed.
+                        let indexed = match self.statuses.remove(&key) {
+                            Some((old, indexed)) if old == status => indexed,
+                            _ => folded(status),
+                        };
+                        statuses.insert(key, (status.to_string(), indexed));
+                    }
                     for group in &agent.groups {
                         self.group(group);
                     }
                 }
+                self.statuses = statuses;
             }
             Data::Groups(Ok(list)) => {
                 for group in &list.groups {
@@ -289,10 +305,12 @@ impl Cache {
                 .map(|name| Hit {
                     target: Target::Agent(name.clone()),
                     text: name.clone(),
+                    detail: None,
                 })
                 .chain(self.groups.values().map(|name| Hit {
                     target: Target::Group(name.clone()),
                     text: name.clone(),
+                    detail: None,
                 }))
                 .chain(self.notes.iter().map(|(id, (_, body, _))| Hit {
                     target: Target::Note {
@@ -300,10 +318,12 @@ impl Cache {
                         line: 0,
                     },
                     text: snippet(body.lines().next().unwrap_or_default(), 0),
+                    detail: None,
                 }))
                 .chain(self.messages.values().rev().map(|cached| Hit {
                     target: Target::Message(cached.message.id),
                     text: snippet(cached.message.body.lines().next().unwrap_or_default(), 0),
+                    detail: None,
                 }))
                 .take(MAX_RESULTS)
                 .collect();
@@ -311,18 +331,45 @@ impl Cache {
         // Candidates borrow cached text. Only the returned hits allocate labels
         // or snippets; ranking takes an already folded slice and allocates none.
         let mut candidates = Vec::new();
-        for (names, agent) in [(&self.agents, true), (&self.groups, false)] {
-            for (indexed, name) in names {
-                if let Some(rank) = rank(&query, indexed) {
-                    candidates.push(Candidate {
-                        kind: if agent { 0 } else { 1 },
-                        id: 0,
-                        line: 0,
-                        text: name,
-                        indexed,
-                        rank,
-                    });
-                }
+        for (key, name) in &self.agents {
+            // By name, or else by the best line of its status.
+            let by_status = || {
+                let (status, indexed) = self.statuses.get(key)?;
+                status
+                    .lines()
+                    .zip(indexed.lines())
+                    .filter_map(|(text, indexed)| {
+                        rank(&query, indexed).map(|rank| (rank, text, indexed))
+                    })
+                    .min_by_key(|(rank, ..)| *rank)
+            };
+            let found = match rank(&query, key) {
+                Some(rank) => Some((0, rank, name.as_str(), key.as_str())),
+                None => by_status().map(|(rank, text, indexed)| (1, rank, text, indexed)),
+            };
+            if let Some((kind, rank, text, indexed)) = found {
+                candidates.push(Candidate {
+                    kind,
+                    id: 0,
+                    line: 0,
+                    name,
+                    text,
+                    indexed,
+                    rank,
+                });
+            }
+        }
+        for (indexed, name) in &self.groups {
+            if let Some(rank) = rank(&query, indexed) {
+                candidates.push(Candidate {
+                    kind: 2,
+                    id: 0,
+                    line: 0,
+                    name,
+                    text: name,
+                    indexed,
+                    rank,
+                });
             }
         }
         for (id, (_, body, indexed)) in &self.notes {
@@ -336,9 +383,10 @@ impl Cache {
                 .min_by_key(|(rank, line, ..)| (*rank, *line));
             if let Some((rank, line, text, indexed)) = best {
                 candidates.push(Candidate {
-                    kind: 2,
+                    kind: 3,
                     id: *id,
                     line,
+                    name: "",
                     text,
                     indexed,
                     rank,
@@ -357,9 +405,10 @@ impl Cache {
                 .min_by_key(|(rank, _, _)| *rank);
             if let Some((rank, text, indexed)) = best {
                 candidates.push(Candidate {
-                    kind: 3,
+                    kind: 4,
                     id: cached.message.id,
                     line: 0,
+                    name: "",
                     text,
                     indexed,
                     rank,
@@ -375,19 +424,20 @@ impl Cache {
             .into_iter()
             .map(|hit| Hit {
                 target: match hit.kind {
-                    0 => Target::Agent(hit.text.into()),
-                    1 => Target::Group(hit.text.into()),
-                    2 => Target::Note {
+                    0 | 1 => Target::Agent(hit.name.into()),
+                    2 => Target::Group(hit.name.into()),
+                    3 => Target::Note {
                         agent_id: hit.id,
                         line: hit.line,
                     },
                     _ => Target::Message(hit.id),
                 },
-                text: if hit.kind >= 2 {
+                text: if hit.kind >= 3 {
                     snippet(hit.text, hit.rank.start)
                 } else {
-                    hit.text.into()
+                    hit.name.into()
                 },
+                detail: (hit.kind == 1).then(|| snippet(hit.text, hit.rank.start)),
             })
             .collect()
     }
@@ -586,10 +636,22 @@ fn result_line(
     let on = |role| theme::on_surface(row, theme::style(role));
     let mut spans = Vec::new();
     match &hit.target {
-        Target::Agent(name) => {
-            spans.extend(marked(name, query, on(Role::Agent), row));
-            spans.push(Span::styled("  agent", on(Role::Muted)));
-        }
+        Target::Agent(name) => match &hit.detail {
+            None => {
+                spans.extend(marked(name, query, on(Role::Agent), row));
+                spans.push(Span::styled("  agent", on(Role::Muted)));
+            }
+            // Found by its status: the matching part follows.
+            Some(status) => {
+                let gap = "  agent  ";
+                let budget = width.saturating_sub(1);
+                let (room, text) = fit_match(name, gap.width(), status, query, budget);
+                let label = Line::from(marked(name, query, on(Role::Agent), row));
+                spans.extend(theme::clip_line(label, room).spans);
+                spans.push(Span::styled(gap, on(Role::Muted)));
+                spans.extend(marked(&text, query, on(Role::Text), row));
+            }
+        },
         Target::Group(name) => {
             spans.push(Span::styled("@", on(Role::Group)));
             spans.extend(marked(name, query, on(Role::Group), row));
@@ -685,10 +747,13 @@ fn marked(text: &str, query: &str, style: Style, row: Style) -> Vec<Span<'static
 
 /// Borrowed candidates keep search work independent of snippet allocations.
 struct Candidate<'a> {
+    /// Agents by name, then by status, groups, notes and messages.
     kind: u8,
     id: i64,
     /// A note's matching line.
     line: usize,
+    /// The agent or group a hit opens.
+    name: &'a str,
     text: &'a str,
     indexed: &'a str,
     rank: Rank,
@@ -1497,6 +1562,179 @@ mod tests {
             assert!(row.contains("needle"), "{text}");
         }
         assert!(!text.contains(long), "the long name is shortened: {text}");
+    }
+
+    fn agents(rows: &[(&str, Option<&str>, bool)]) -> Data {
+        Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: rows
+                .iter()
+                .map(|(name, status, retired)| proto::Agent {
+                    name: (*name).into(),
+                    status: status.map(Into::into),
+                    retired: *retired,
+                    groups: vec!["needle crew".into()],
+                    ..Default::default()
+                })
+                .collect(),
+        }))
+    }
+
+    fn found(cache: &Cache, query: &str) -> Vec<(Target, Option<String>)> {
+        cache
+            .search(query)
+            .into_iter()
+            .map(|hit| (hit.target, hit.detail))
+            .collect()
+    }
+
+    #[test]
+    fn statuses_find_their_agents_after_name_matches_and_before_groups() {
+        let mut cache = Cache::default();
+        cache.observe(&agents(&[
+            ("Mateo", Some("reviewing the needle PR"), false),
+            ("Needle", Some("a needle too"), false),
+            ("Zed", Some("idle"), false),
+            ("Gone", Some("needle work"), true),
+        ]));
+        cache.observe(&feed(1, "thread the needle"));
+        assert_eq!(
+            found(&cache, "NEEDLE"),
+            [
+                (Target::Agent("Needle".into()), None),
+                (
+                    Target::Agent("Mateo".into()),
+                    Some("reviewing the needle PR".into())
+                ),
+                (Target::Group("needle crew".into()), None),
+                (Target::Message(1), None),
+            ],
+            "one hit per agent, by name first, never a retired one"
+        );
+        // Ranked as names are: whole words before partial and fuzzy.
+        cache.observe(&agents(&[
+            ("Ada", Some("needles everywhere"), false),
+            ("Bo", Some("the needle"), false),
+            ("Cy", Some("n e e d l e"), false),
+        ]));
+        let order: Vec<_> = found(&cache, "needle")
+            .into_iter()
+            .filter(|(_, detail)| detail.is_some())
+            .map(|(target, _)| target)
+            .collect();
+        assert_eq!(
+            order,
+            [
+                Target::Agent("Bo".into()),
+                Target::Agent("Ada".into()),
+                Target::Agent("Cy".into()),
+            ]
+        );
+        // Case and accents fold as names do; the empty query lists names only.
+        cache.observe(&agents(&[("Ül", Some("Überprüfung läuft"), false)]));
+        assert_eq!(
+            found(&cache, "ÜBERPRÜFUNG"),
+            [(Target::Agent("Ül".into()), Some("Überprüfung läuft".into()))]
+        );
+        assert!(found(&cache, "").iter().all(|(_, detail)| detail.is_none()));
+    }
+
+    #[test]
+    fn a_fresh_agent_list_replaces_statuses_and_other_news_keeps_them() {
+        let mut cache = Cache::default();
+        let has = |cache: &Cache| {
+            found(cache, "needle").iter().any(|(target, detail)| {
+                *target == Target::Agent("Mateo".into()) && detail.is_some()
+            })
+        };
+        cache.observe(&agents(&[("Mateo", Some("on the needle"), false)]));
+        assert!(has(&cache));
+        // Names learned from summaries and mail leave the status alone.
+        let revision = cache.revision;
+        cache.summaries(&[proto::AgentSummary {
+            agent: "Mateo".into(),
+            ..Default::default()
+        }]);
+        cache.observe(&Data::Feed {
+            id: 1,
+            result: Ok(vec![proto::Message {
+                id: 2,
+                from_kind: proto::Kind::Agent as i32,
+                from_name: "Mateo".into(),
+                body: "hi".into(),
+                ..Default::default()
+            }]),
+        });
+        assert!(has(&cache));
+        assert_ne!(cache.revision, revision, "the new message changes results");
+        for list in [
+            agents(&[("Mateo", None, false)]),
+            agents(&[("Mateo", Some("  "), false)]),
+            agents(&[("Zed", Some("needle"), false)]),
+            agents(&[("Mateo", Some("on the needle"), true)]),
+        ] {
+            cache.observe(&agents(&[("Mateo", Some("on the needle"), false)]));
+            assert!(has(&cache));
+            cache.observe(&list);
+            assert!(!has(&cache));
+        }
+    }
+
+    #[test]
+    fn a_status_match_stays_in_view_beside_a_long_name_in_every_scheme() {
+        use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
+        let long = "Bartholomew-the-long-named-agent-of-the-crew";
+        let status = "an ordinary status that goes on for a good while before the needle shows";
+        let mut cache = Cache::default();
+        cache.observe(&agents(&[
+            (long, Some(status), false),
+            ("Mateo", Some(status), false),
+        ]));
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let mut picker = Picker::new(&cache);
+                picker.paste("NEEDLE", &cache);
+                let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+                terminal
+                    .draw(|f| picker.render(f, f.area(), &cache, Local::now()))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                assert_buffer(buffer);
+                let rows: Vec<String> = (0..24)
+                    .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect())
+                    .collect();
+                let text = rows.join("\n");
+                for name in ["Mateo  agent  …", "Bartholomew"] {
+                    let y = rows.iter().position(|r| r.contains(name)).expect(&text);
+                    let x = rows[y].find("needle").map(|b| rows[y][..b].chars().count());
+                    let x = x.expect(&text) as u16;
+                    let cell = &buffer[(x, y as u16)];
+                    assert!(
+                        cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                        "{scheme:?}"
+                    );
+                    if let Some(fg) = theme::style(Role::SearchHit).fg {
+                        assert_eq!(cell.fg, fg, "{scheme:?}");
+                    }
+                }
+                assert!(!text.contains(long), "the long name is shortened: {text}");
+                // Name-only rows look as before.
+                assert!(!text.contains("agent  agent"));
+            });
+        }
+        let mut picker = Picker::new(&cache);
+        picker.paste("mateo", &cache);
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal
+            .draw(|f| picker.render(f, f.area(), &cache, Local::now()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..60).map(|x| buffer[(x, 4)].symbol()).collect();
+        assert_eq!(
+            row.split('│').nth(1).map(str::trim_end),
+            Some(" Mateo  agent"),
+            "{row}"
+        );
     }
 
     #[test]
