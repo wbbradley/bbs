@@ -11628,14 +11628,26 @@ mod tests {
             id: save,
             result: Err(SideError::Refused("no".into())),
         }));
-        // Still here, text and error kept; the choice is dropped.
+        // Still here, text and error kept; the choice is dropped, so a later
+        // save and Esc stay here too.
         assert_eq!(note_text(&app).as_deref(), Some("keep me"));
         assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
-        choose(&mut app);
+        ctrl(&mut app, 's');
         let (save, ..) = note_put(&mut rx).unwrap();
         app.on_event(Event::Data(Data::NoteSaved {
             id: save,
             result: Ok(agent_note(7, "Mateo", "keep me", 1)),
+        }));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.note_editor.is_none());
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        f3(&mut app);
+        typed(&mut app, "!");
+        choose(&mut app);
+        let (save, ..) = note_put(&mut rx).unwrap();
+        app.on_event(Event::Data(Data::NoteSaved {
+            id: save,
+            result: Ok(agent_note(7, "Mateo", "!keep me", 2)),
         }));
         assert!(app.note_editor.is_none());
         assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
