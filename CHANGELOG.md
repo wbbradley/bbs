@@ -24,6 +24,9 @@ rather than falling back to anything else.
 
 ### Changed
 
+- Ctrl-P lists every result that contains the query before any fuzzy match,
+  so a message or status naming the query is no longer pushed below agents
+  whose name or status only has its letters in order.
 - Blocker details leave a blank row before the answer-recipient label.
 - `bbs connect` shows `now` instead of `0m ago` for anything under a minute
   old: the Agents page's ACTIVE column and Ctrl-P message ages.

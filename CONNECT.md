@@ -504,9 +504,12 @@ live, non-empty notes as last paged in, each matched at its best line; choosing
 one opens the agent's conversation with the note over it, its cursor on that
 line, and `Esc` returns to the conversation. Choosing any result while a
 changed note is open saves the note first and goes only once it is stored.
-Within each section, exact
-matches come first, then matches at two, one or no word boundaries, then fuzzy
-matches. Messages in the same match tier show newest first, before position
+Every result that contains the query comes before any fuzzy match (its letters
+in order with others between): first the literal matches in the order above,
+then the fuzzy ones in the same order. An agent whose status contains the query
+is listed by its status even when its name also matches fuzzily. Within each
+section, exact matches come first, then matches at two, one or no word
+boundaries. Messages in the same match tier show newest first, before position
 and length break ties. At most the top 50 results are shown.
 
 Accepting a result opens the destination's ordinary live subscriptions.

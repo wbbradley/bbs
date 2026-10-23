@@ -332,7 +332,8 @@ impl Cache {
         // or snippets; ranking takes an already folded slice and allocates none.
         let mut candidates = Vec::new();
         for (key, name) in &self.agents {
-            // By name, or else by the best line of its status.
+            // By name, or else by the best line of its status; a status that
+            // holds the query beats a name that only matches fuzzily.
             let by_status = || {
                 let (status, indexed) = self.statuses.get(key)?;
                 status
@@ -343,9 +344,17 @@ impl Cache {
                     })
                     .min_by_key(|(rank, ..)| *rank)
             };
-            let found = match rank(&query, key) {
-                Some(rank) => Some((0, rank, name.as_str(), key.as_str())),
-                None => by_status().map(|(rank, text, indexed)| (1, rank, text, indexed)),
+            let by_name = rank(&query, key).map(|rank| (0, rank, name.as_str(), key.as_str()));
+            let found = match by_name {
+                Some((_, rank, ..)) if rank.tier < FUZZY => by_name,
+                _ => {
+                    let by_status =
+                        by_status().map(|(rank, text, indexed)| (1, rank, text, indexed));
+                    match by_status {
+                        Some((_, rank, ..)) if rank.tier < FUZZY => by_status,
+                        _ => by_name.or(by_status),
+                    }
+                }
             };
             if let Some((kind, rank, text, indexed)) = found {
                 candidates.push(Candidate {
@@ -760,9 +769,12 @@ struct Candidate<'a> {
 }
 
 impl Candidate<'_> {
+    /// Everything that holds the query before any fuzzy match, then by kind.
     fn compare(a: &Self, b: &Self) -> std::cmp::Ordering {
-        a.kind
-            .cmp(&b.kind)
+        let fuzzy = |c: &Self| c.rank.tier >= FUZZY;
+        fuzzy(a)
+            .cmp(&fuzzy(b))
+            .then_with(|| a.kind.cmp(&b.kind))
             .then_with(|| a.rank.tier.cmp(&b.rank.tier))
             .then_with(|| b.id.cmp(&a.id))
             .then_with(|| a.rank.cmp(&b.rank))
@@ -772,6 +784,9 @@ impl Candidate<'_> {
             .then_with(|| a.name.cmp(b.name))
     }
 }
+
+/// The tier of a match by ordered letters rather than the query itself.
+const FUZZY: u8 = 4;
 
 /// Exact, two/one/no word boundaries, then ordered letters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -830,7 +845,7 @@ fn rank(query: &str, folded: &str) -> Option<Rank> {
             Some(c) => next = c,
             None => {
                 return Some(Rank {
-                    tier: 4,
+                    tier: FUZZY,
                     gaps: i + 1 - first - query.chars().count(),
                     start: first,
                     length,
@@ -1588,6 +1603,41 @@ mod tests {
             .into_iter()
             .map(|hit| (hit.target, hit.detail))
             .collect()
+    }
+
+    #[test]
+    fn everything_holding_the_query_comes_before_any_fuzzy_match() {
+        let mut cache = Cache::default();
+        cache.observe(&agents(&[
+            ("Bernie", Some("idle"), false),
+            ("Carmen", Some("under 200 lines. Bernie reviews"), false),
+            // Its letters in order, but never the word itself.
+            ("Jessica", Some("rebase rerun, then review loop"), false),
+            // Fuzzy by name, literal by status: listed by the status.
+            ("Bernadine", Some("pairing with Bernie"), false),
+            ("Bernardie", Some("idle"), false),
+        ]));
+        cache.observe(&feed(1, "Bernie opened #9716"));
+        assert_eq!(
+            found(&cache, "bernie"),
+            [
+                (Target::Agent("Bernie".into()), None),
+                (
+                    Target::Agent("Bernadine".into()),
+                    Some("pairing with Bernie".into())
+                ),
+                (
+                    Target::Agent("Carmen".into()),
+                    Some("under 200 lines. Bernie reviews".into())
+                ),
+                (Target::Message(1), None),
+                (Target::Agent("Bernardie".into()), None),
+                (
+                    Target::Agent("Jessica".into()),
+                    Some("rebase rerun, then review loop".into())
+                ),
+            ]
+        );
     }
 
     #[test]
