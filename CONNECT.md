@@ -326,10 +326,13 @@ below the body, and a conversation-background separator above that padding.
 Until the agent reads one, its lower padding row shows `unread` at the right,
 in a color a little lighter than that background; the live feed clears it.
 Mail neither from nor addressed to the connected human has a subtle contrasting
-background across its header and body. These side-message headers show only
+background across its header and body. These side-message headers show
 `• Sender → Recipient`, with the themed bullet in column one and the names
-aligned with the body after a two-space margin, without timestamps, read status,
-or `@owner` suffixes; group names keep their `@group` prefix. The attribution text has a slightly
+aligned with the body after a two-space margin, without read status or
+`@owner` suffixes; group names keep their `@group` prefix. Direct mail between
+others also shows when it was sent, in local time (`YYYY-MM-DD HH:MM:SS`), at
+the header's right edge; when the names leave no room for it, it is left out
+rather than wrapping the header. Group mail shows no time. The attribution text has a slightly
 stronger tint than the body. Gruvbox uses a muted teal surface;
 Terminal uses a dark gray surface, and No color keeps its uncolored display.
 `A` and `E` still narrow the view to messages or activity and to kinds of

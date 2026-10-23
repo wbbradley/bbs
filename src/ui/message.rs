@@ -56,7 +56,7 @@ pub fn side_message_lines<'a>(
         row,
         gap,
         query,
-        Some(side_header(row, query, recipient)),
+        Some(side_header(row, query, recipient, width)),
         false,
         width,
     )
@@ -64,7 +64,15 @@ pub fn side_message_lines<'a>(
 
 /// Header-only rendering lets the conversation lay out its gutter without
 /// parsing the message body a second time.
-pub fn side_header(row: &Message, query: Option<&str>, recipient: Option<Kind>) -> Line<'static> {
+/// Direct mail between others shows when it was sent, in local time, at the
+/// right of a header `width` wide, when it fits beside the names; it never
+/// wraps the header. Group mail shows no time.
+pub fn side_header(
+    row: &Message,
+    query: Option<&str>,
+    recipient: Option<Kind>,
+    width: Option<u16>,
+) -> Line<'static> {
     let sender = if row.from_kind() == Kind::Unspecified && row.from_owner.is_some() {
         Kind::Agent
     } else {
@@ -91,7 +99,20 @@ pub fn side_header(row: &Message, query: Option<&str>, recipient: Option<Kind>) 
         )),
         (None, None) => spans.push(Span::raw("?")),
     }
-    Line::from(spans).style(style(conversation_roles(row).1))
+    let mut line = Line::from(spans).style(style(conversation_roles(row).1));
+    if let Some(width) = width
+        && row.to_group.is_none()
+        && let Some(sent) = local(&row.created_at)
+    {
+        let sent = sent.format("%Y-%m-%d %H:%M:%S").to_string();
+        // ASCII digits and punctuation: one column per byte.
+        let room = usize::from(width).saturating_sub(line.width() + sent.len());
+        if room >= 2 {
+            line.spans.push(Span::raw(" ".repeat(room)));
+            line.spans.push(Span::styled(sent, style(Role::Timestamp)));
+        }
+    }
+    line
 }
 
 /// Semantic surfaces for a conversation card, independent of its author.
@@ -396,6 +417,70 @@ pub fn age(stored: &str, now: DateTime<Local>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The process time zone's rendering of a stored time, as the header shows it.
+    fn local_text(stored: &str) -> String {
+        local(stored)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    #[test]
+    fn direct_side_headers_show_the_local_send_time_at_the_right_when_it_fits() {
+        let direct = |created_at: &str| Message {
+            created_at: created_at.into(),
+            from_kind: Kind::Agent.into(),
+            from_name: "Zed".into(),
+            to_name: Some("Mateo".into()),
+            ..Default::default()
+        };
+        // Late UTC on the 17th: a western zone shows the 16th, an eastern
+        // the 17th; either way the header shows the process's local time.
+        let row = direct("2026-10-17T03:30:00Z");
+        let sent = local_text(&row.created_at);
+        if Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(sent, "2026-10-17 03:30:00", "local, not UTC");
+        }
+        let header = side_header(&row, None, Some(Kind::Agent), Some(60));
+        let text = header.to_string();
+        assert_eq!(header.width(), 60);
+        assert!(text.starts_with("Zed → Mateo "), "{text}");
+        assert!(text.ends_with(&sent), "{text}");
+        let time = header.spans.last().unwrap();
+        assert_eq!(time.style.fg, style(Role::Timestamp).fg);
+        assert_eq!(header.style, style(Role::OtherConversationHeader));
+        // The names keep their colours; the header gains no extra row.
+        assert_eq!(header.spans[0].style.fg, style(Role::Agent).fg);
+        // Exactly two spaces of gap fit; one does not, and the time drops.
+        let names = "Zed → Mateo".chars().count();
+        let fits = (names + 2 + sent.len()) as u16;
+        assert!(
+            side_header(&row, None, None, Some(fits))
+                .to_string()
+                .ends_with(&sent)
+        );
+        let tight = side_header(&row, None, None, Some(fits - 1)).to_string();
+        assert_eq!(tight, "Zed → Mateo");
+        // No width, no time, a bad time, or group mail: the header as before.
+        for (row, width) in [
+            (direct("2026-10-17T03:30:00Z"), None),
+            (direct(""), Some(80)),
+            (direct("yesterday"), Some(80)),
+            (
+                Message {
+                    to_group: Some("crew".into()),
+                    to_name: None,
+                    ..direct("2026-10-17T03:30:00Z")
+                },
+                Some(80),
+            ),
+        ] {
+            let text = side_header(&row, None, None, width).to_string();
+            assert!(!text.contains("2026"), "{text}");
+            assert!(!text.ends_with(' '), "{text:?}");
+        }
+    }
 
     #[test]
     fn side_headers_hide_owner_labels_without_losing_identity_styles() {

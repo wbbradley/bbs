@@ -256,7 +256,8 @@ impl Row for Entry {
                 .line_count(width)
         };
         let prefix_height = measure(message_prefix(gap || *raw_gap));
-        let header_height = measure(vec![side_header(message, query, *recipient)]);
+        // The send time never adds a row, so the names alone set the height.
+        let header_height = measure(vec![side_header(message, query, *recipient, None)]);
         let surface = theme::style(conversation_roles(message).1);
         let mut gutter = vec![Line::default(); prefix_height];
         for index in 0..header_height {
@@ -1366,6 +1367,80 @@ mod tests {
                             .unwrap()
                     );
                     assert_eq!(buf[(2, 2)].symbol(), "s");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn direct_side_cards_show_their_local_time_in_the_header_corner() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        let card = |id, from: &str, to: &str| Entry::Message {
+            message: Message {
+                id,
+                created_at: "2026-10-17T03:30:00Z".into(),
+                from_name: from.into(),
+                from_kind: proto::Kind::Agent.into(),
+                to_name: Some(to.into()),
+                body: "side body".into(),
+                ..Default::default()
+            },
+            headerless: false,
+            recipient: Some(proto::Kind::Agent),
+            outgoing: false,
+            other_participants: true,
+            gap: false,
+        };
+        let sent = chrono::DateTime::parse_from_rfc3339("2026-10-17T03:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let long = "a-name-long-enough-to-crowd-the-time";
+                let mut view =
+                    ThreadView::new(vec![card(1, "Zed", "Mateo"), card(2, long, long)], 100);
+                for width in [60u16, 80, 60] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(Block::new().style(theme::base()), f.area());
+                            view.render(f, f.area());
+                        })
+                        .unwrap();
+                    let buf = terminal.backend().buffer();
+                    crate::ui::theme::testing::assert_buffer(buf);
+                    let row = |y: u16| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>();
+                    // The short card: names at the left, the time flush right
+                    // in its timestamp colour on the header's surface.
+                    let header = row(1);
+                    assert!(header.starts_with("• Zed → Mateo"), "{header}");
+                    assert!(header.ends_with(&sent), "{width}: {header}");
+                    let surface =
+                        theme::base().patch(theme::style(theme::Role::OtherConversationHeader));
+                    let at = width - 1;
+                    assert_eq!(buf[(at, 1)].bg, surface.bg.unwrap());
+                    assert_eq!(
+                        buf[(at, 1)].fg,
+                        surface
+                            .patch(theme::style(theme::Role::Timestamp))
+                            .fg
+                            .unwrap()
+                    );
+                    assert_eq!(row(2).trim(), "side body");
+                    // The long card has no room: no time, and the gutter
+                    // marks exactly its header's rows.
+                    let first = (3..20).find(|y| row(*y).contains("a-name-long")).unwrap();
+                    let text: String = (first..first + 3).map(row).collect();
+                    assert!(!text.contains(&sent[..10]), "{width}: {text}");
+                    let header_rows = (first..20)
+                        .take_while(|y| !row(*y).contains("side body"))
+                        .count();
+                    let long_card = card(2, long, long);
+                    // The gutter starts with the separator's blank row.
+                    let gutter = long_card.gutter(false, None, width - 2);
+                    assert_eq!(gutter.len() - 1, header_rows, "{width}");
                 }
             });
         }

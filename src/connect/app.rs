@@ -9644,7 +9644,14 @@ mod tests {
                     .map(|x| buffer[(x, first - 1)].symbol())
                     .collect::<String>();
                 if conversation {
-                    assert_eq!(header.trim(), "• Zed → Mateo");
+                    // The local send time sits at the header's right edge.
+                    let sent = chrono::DateTime::parse_from_rfc3339("2026-10-16T18:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string();
+                    assert!(header.starts_with("• Zed → Mateo "), "{header}");
+                    assert!(header.trim_end().ends_with(&sent), "{header}");
                 } else {
                     assert!(header.contains("Zed@ada → Mateo@ada"), "{header}");
                     assert!(header.contains("2026-10-16"), "{header}");
