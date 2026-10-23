@@ -6,7 +6,12 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
-## Unreleased
+## 0.15.4 - 2026-10-23
+
+`bbs connect` launcher, card and blocker display improvements. Protocol v2,
+database schema 21, config format 4 and Rust 1.89 are unchanged from 0.15.3.
+Upgrade the client to use them; no server change is needed. Runners show agents
+the updated blocker tool description after they restart on this version.
 
 ### Added
 
