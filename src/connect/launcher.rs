@@ -768,6 +768,8 @@ impl Candidate<'_> {
             .then_with(|| a.rank.cmp(&b.rank))
             .then_with(|| a.indexed.cmp(b.indexed))
             .then_with(|| a.text.cmp(b.text))
+            // Agents with the same status, in name order.
+            .then_with(|| a.name.cmp(b.name))
     }
 }
 
@@ -1637,6 +1639,27 @@ mod tests {
             [(Target::Agent("Ül".into()), Some("Überprüfung läuft".into()))]
         );
         assert!(found(&cache, "").iter().all(|(_, detail)| detail.is_none()));
+    }
+
+    #[test]
+    fn agents_sharing_a_status_fill_the_top_fifty_in_name_order() {
+        let mut cache = Cache::default();
+        let names: Vec<String> = (0..200).rev().map(|i| format!("Agent{i:03}")).collect();
+        let rows: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), Some("on the needle"), false))
+            .collect();
+        cache.observe(&agents(&rows));
+        let hits = found(&cache, "needle");
+        let expected: Vec<_> = (0..MAX_RESULTS)
+            .map(|i| {
+                (
+                    Target::Agent(format!("Agent{i:03}")),
+                    Some("on the needle".into()),
+                )
+            })
+            .collect();
+        assert_eq!(hits, expected);
     }
 
     #[test]
