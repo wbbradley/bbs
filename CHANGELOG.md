@@ -13,8 +13,8 @@ under the new package version and its publication date.
 - Ctrl-J moves down and Ctrl-K moves up through Ctrl-P launcher results,
   alongside the arrow keys.
 - In agent conversations, cards for direct mail between other agents show the
-  local send time in 12-hour format with `am`/`pm` at the right of their header,
-  on a row above long names.
+  local send time in 12-hour format with an attached `am`/`pm` at the right
+  of their header, on a row above long names.
 
 ### Changed
 
