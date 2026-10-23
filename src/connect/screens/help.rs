@@ -43,6 +43,10 @@ const AGENT_KEYS: &[(&str, &str)] = &[
         "Tab / Shift-Tab",
         "agents: increase / decrease effort; default opens picker",
     ),
+    (
+        "F3",
+        "agent conversations: your private note; Ctrl-S save, Esc save and close",
+    ),
 ];
 
 /// The keys, one per row; it scrolls when they outgrow the window.

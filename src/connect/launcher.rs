@@ -856,6 +856,30 @@ mod tests {
             ]
         );
         assert_eq!(rank("jefe", "abcjefedefgh, then jefe!").unwrap().start, 19);
+        // Notes come after groups and before messages, at their best line.
+        let revision = cache.revision;
+        cache.notes([(8, "Zed", "nothing here\nask Jefe first"), (9, "Ada", "")].into_iter());
+        assert_ne!(cache.revision, revision);
+        let revision = cache.revision;
+        cache.notes([(8, "Zed", "nothing here\nask Jefe first"), (9, "Ada", "")].into_iter());
+        assert_eq!(cache.revision, revision, "the same notes change nothing");
+        let hits = cache.search("Jefe");
+        assert_eq!(
+            hits[3].target,
+            Target::Note {
+                agent_id: 8,
+                line: 1
+            }
+        );
+        assert_eq!(hits[3].text, "ask Jefe first");
+        assert_eq!(hits[4].target, Target::Message(5));
+        cache.notes(std::iter::empty());
+        assert!(
+            cache
+                .search("Jefe")
+                .iter()
+                .all(|h| !matches!(h.target, Target::Note { .. }))
+        );
         assert!(rank("jefe", "hello jefe!") < rank("jefe", "jeferson"));
         assert!(rank("jefe", "hello jefe!") < rank("jefe", "hello jeferson"));
         assert!(rank("jefe", "hello jefe!") < rank("jefe", "界jefe界"));

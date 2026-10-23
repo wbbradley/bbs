@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- `F3` in a `bbs connect` agent conversation opens your private note on that
+  agent: plain text up to 32 KiB, saved with `Ctrl-s` or on `Esc`, kept per
+  human and stable agent id, and searchable with Ctrl-P. It needs a server with
+  `agent-notes.v1`.
+
 ### Changed
 
 - `bbs connect` opens straight to the main menu, which now shows the logo,

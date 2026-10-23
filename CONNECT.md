@@ -439,10 +439,38 @@ the existing RPCs (`GroupRegister`, `GroupDescribe`, `GroupDelete`,
 and the same rules apply as on the CLI: humans only, and every change is
 announced to the group.
 
+## Agent notes
+
+`F3` in an agent conversation opens your private note on that agent over the
+whole terminal: plain text, up to 32768 UTF-8 bytes, kept on the server for you
+alone and never shown to agents or other humans. `Enter` starts a new line and
+the composer's editing keys work as usual, so `Ctrl-n` still moves down a
+line. `Ctrl-s` saves the note if it changed and stays; `Esc` closes at once if
+nothing changed, and otherwise saves and closes only once the server has stored
+it. A failed save keeps the editor open with its text and the error, and
+`Ctrl-s` or `Esc` tries again; nothing retries by itself and nothing is
+discarded. The last save wins: there is no autosave and no conflict check. An
+edit or paste that would pass the limit is refused whole.
+
+The app pages in all your notes when its summary subscription starts, and again
+from the start after a reload; until then a note opens read-only, so an empty
+editor never replaces a stored note. Later changes, including saves from
+another session, arrive as summaries announce a newer notes revision; a note
+you have not changed shows them. A note follows its agent's stable id, not its
+name. When the agent retires, its note is kept but hidden and becomes
+read-only; an open editor keeps any unsaved text and `Esc` closes it without
+writing. Servers without `agent-notes.v1` show why `F3` does nothing.
+
+While the editor is open, the conversation beneath keeps receiving mail and
+activity but marks nothing read or seen. `F2` and `Ctrl-p` still open over it,
+and `Esc` from them returns to the note as it was. `Ctrl-c` quits without
+saving.
+
 ## Local launcher
 
 `Ctrl-p` opens a full-screen launcher from any screen, with a centered query
-and fuzzy matches for agent names, group names and cached message lines.
+and fuzzy matches for agent names, group names, your notes and cached message
+lines.
 `Up`/`Down` or `Ctrl-k`/`Ctrl-j` select a result; `Enter` opens the selection
 (the top match by default). `Esc` closes the launcher and restores the screen
 beneath it, including its draft, cursor, selection, scroll position and open
@@ -462,7 +490,12 @@ cache of up to 10,000 messages and 16 MiB of body text, with an additional
 folded-text index. The cache is held in memory and disappears on exit.
 Names learned from historical messages may still appear. Matching ignores
 case, keeps accents significant, and searches each message line separately.
-Agents come first, then groups, then messages. Within each section, exact
+Agents come first, then groups, then notes, then messages. Notes are your
+live, non-empty notes as last paged in, each matched at its best line; choosing
+one opens the agent's conversation with the note over it, its cursor on that
+line, and `Esc` returns to the conversation. Choosing any result while a
+changed note is open saves the note first and goes only once it is stored.
+Within each section, exact
 matches come first, then matches at two, one or no word boundaries, then fuzzy
 matches. Messages in the same match tier show newest first, before position
 and length break ties. At most the top 50 results are shown.
