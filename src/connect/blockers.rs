@@ -896,7 +896,9 @@ impl Blockers {
         let inset = area.width.min(2);
         let body = Paragraph::new(body).wrap(Wrap { trim: false });
         let rows = body.line_count(area.width - inset) as u16;
+        let label_gap = u16::from(label.is_some());
         let fixed = [
+            label_gap,
             head.len() as u16,
             selected.iter().count() as u16,
             label.iter().count() as u16,
@@ -912,6 +914,7 @@ impl Blockers {
             _,
             selected_area,
             body_area,
+            _,
             label_area,
             middle,
             bottom,
@@ -920,6 +923,7 @@ impl Blockers {
             Constraint::Length(room - shown),
             Constraint::Length(selected.iter().count() as u16),
             Constraint::Length(shown),
+            Constraint::Length(label_gap),
             Constraint::Length(label.iter().count() as u16),
             Constraint::Length(answer),
             Constraint::Length(below.len() as u16),
@@ -1215,16 +1219,21 @@ mod tests {
                     assert!(at > 3, "{out}");
                     assert_eq!(rows[at].trim_end(), "  #1 @crew Zed", "{out}");
                     assert!(rows[at + 1].starts_with("  first?"), "{out}");
-                    assert!(rows[at + 2].starts_with("answer → Zed @crew"), "{out}");
+                    assert_eq!(
+                        rows[at + 2].trim(),
+                        "",
+                        "one gap before the recipient: {out}"
+                    );
+                    assert!(rows[at + 3].starts_with("answer → Zed @crew"), "{out}");
                     // One blank row, then the answer box.
-                    assert_eq!(rows[at + 3].trim(), "", "{out}");
+                    assert_eq!(rows[at + 4].trim(), "", "{out}");
                     if let Some(bg) = theme::style(Role::HumanSurface).bg {
-                        assert_eq!(buffer[(0, at as u16 + 4)].bg, bg, "{scheme:?}");
-                        assert_ne!(buffer[(0, at as u16 + 3)].bg, bg, "{scheme:?}");
+                        assert_eq!(buffer[(0, at as u16 + 5)].bg, bg, "{scheme:?}");
+                        assert_ne!(buffer[(0, at as u16 + 4)].bg, bg, "{scheme:?}");
                     }
                     // The spare rows are all above it.
                     assert!(rows[3..at].iter().all(|r| r.trim().is_empty()), "{out}");
-                    assert_eq!(at, usize::from(height) - 9, "{out}");
+                    assert_eq!(at, usize::from(height) - 10, "{out}");
                 }
             });
         }
@@ -1259,6 +1268,12 @@ mod tests {
             .position(|r| r.starts_with("answer → Zed"))
             .expect(&out);
         assert!(rows[label].contains("PgUp/PgDn text"), "{out}");
+        assert_eq!(
+            rows[label - 1].trim(),
+            "",
+            "one gap before the recipient: {out}"
+        );
+        assert!(!rows[label - 2].trim().is_empty(), "{out}");
         assert_eq!(rows[label + 1].trim(), "", "{out}");
         assert_eq!(
             label,
@@ -1270,7 +1285,7 @@ mod tests {
         let (paged, _) = drawn(&mut blockers, 60, 24, now);
         assert!(!paged[at + 1].starts_with("  line 0"), "{paged:#?}");
         assert_eq!(paged[..at + 1], rows[..at + 1]);
-        assert!(paged[label].contains("PgUp/PgDn text 23/119"), "{paged:#?}");
+        assert!(paged[label].contains("PgUp/PgDn text 21/119"), "{paged:#?}");
         assert_eq!(paged[label + 1..], rows[label + 1..]);
         // A taller window shows more of it, still from where it was.
         let (tall, _) = drawn(&mut blockers, 60, 40, now);
@@ -1299,8 +1314,9 @@ mod tests {
         let out = rows.join("\n");
         let at = restated(&rows, "#1 @crew Zed");
         assert!(rows[at + 1].starts_with("  watch only?"), "{out}");
-        assert!(rows[at + 2].starts_with("Read only:"), "{out}");
-        assert_eq!(at + 2, 24 - 3, "no answer box: {out}");
+        assert_eq!(rows[at + 2].trim(), "", "{out}");
+        assert!(rows[at + 3].starts_with("Read only:"), "{out}");
+        assert_eq!(at + 3, 24 - 3, "no answer box: {out}");
     }
 
     #[test]

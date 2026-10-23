@@ -24,6 +24,7 @@ rather than falling back to anything else.
 
 ### Changed
 
+- Blocker details leave a blank row before the answer-recipient label.
 - `bbs connect` shows `now` instead of `0m ago` for anything under a minute
   old: the Agents page's ACTIVE column and Ctrl-P message ages.
 - Ctrl-P also finds agents by their status, as the last cached agent list gave
