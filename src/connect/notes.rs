@@ -53,6 +53,8 @@ pub struct NoteEditor {
     line: usize,
     /// The notes are paging in again after a reload: no edits or saves.
     paused: bool,
+    /// The stored note has arrived at least once.
+    loaded_once: bool,
     /// Why the last save failed, or why an edit was refused.
     error: Option<String>,
 }
@@ -71,6 +73,7 @@ impl NoteEditor {
             closing: false,
             line,
             paused: false,
+            loaded_once: false,
             error: None,
         }
     }
@@ -108,6 +111,24 @@ impl NoteEditor {
             cursor: (self.line, 0),
         });
         self.access = Access::Editable;
+        self.loaded_once = true;
+    }
+
+    /// The server keeps notes again: an editor that had its note goes on
+    /// with its text, one that never had it waits for it.
+    pub fn supported(&mut self) {
+        if self.access == Access::Unsupported {
+            self.access = if self.loaded_once {
+                Access::Editable
+            } else {
+                Access::Loading
+            };
+        }
+    }
+
+    /// Whether `Esc` is waiting for a save to close.
+    pub fn closing(&self) -> bool {
+        self.closing
     }
 
     /// The notes are paging in again; until `resumed`, nothing is edited or
@@ -239,11 +260,14 @@ impl NoteEditor {
         if self.access != Access::Editable || (!self.dirty() && self.saving.is_none()) {
             return Outcome::Close;
         }
-        self.closing = true;
         if self.saving.is_some() {
+            self.closing = true;
             return Outcome::Stay;
         }
-        self.save(save_id)
+        let outcome = self.save(save_id);
+        // Only a save that started closes once it lands.
+        self.closing = matches!(outcome, Outcome::Save { .. });
+        outcome
     }
 
     /// A save's result; `next_id` names a follow-up save of later edits
@@ -755,6 +779,38 @@ mod tests {
         later.keep(editor.draft());
         assert_eq!(later.draft().text, "unsaved stored");
         assert!(later.dirty());
+    }
+
+    #[test]
+    fn a_refused_esc_while_paused_does_not_close_after_a_later_save() {
+        let mut editor = loaded("");
+        typed(&mut editor, "x");
+        editor.pause();
+        assert_eq!(esc(&mut editor, 1), Outcome::Stay);
+        assert!(!editor.closing());
+        editor.resume();
+        assert_eq!(ctrl_s(&mut editor, 2), save(2, "x"));
+        assert_eq!(
+            editor.saved(2, Ok("x".into()), 3),
+            Outcome::Stay,
+            "Ctrl-S stays"
+        );
+    }
+
+    #[test]
+    fn support_coming_back_resumes_a_loaded_note_or_waits_for_one_never_loaded() {
+        let mut editor = loaded("stored");
+        typed(&mut editor, "unsaved ");
+        editor.unsupported();
+        editor.supported();
+        assert_eq!(editor.access(), Access::Editable);
+        assert_eq!(editor.draft().text, "unsaved stored");
+        let mut never = NoteEditor::new(7, "Mateo", 0);
+        never.unsupported();
+        never.supported();
+        assert_eq!(never.access(), Access::Loading);
+        never.loaded(Some("from the server"));
+        assert_eq!(never.draft().text, "from the server");
     }
 
     #[test]

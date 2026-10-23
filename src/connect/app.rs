@@ -642,6 +642,7 @@ impl App {
                         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
                         let outcome = editor.key(esc, next_id());
                         self.note_outcome(outcome);
+                        self.sync_notes();
                     } else {
                         self.launch(target);
                     }
@@ -853,7 +854,8 @@ impl App {
             return;
         };
         let mut fetches = Vec::new();
-        if self.notes.generation() != generation {
+        // A new subscription, or the server keeping notes again.
+        if self.notes.generation() != generation || self.notes.is_unsupported() {
             fetches.push(self.notes.restart(generation, next_id()));
             if let Some(editor) = &mut self.note_editor {
                 editor.pause();
@@ -902,10 +904,6 @@ impl App {
                 .map(|note| note.body.clone())
                 .map_err(side_text);
             let outcome = editor.saved(id, answer, next_id());
-            if result.is_err() && !editor.saving() {
-                // The note stays open with its text: no navigation after all.
-                self.pending_launch = None;
-            }
             self.note_outcome(outcome);
         }
         self.sync_notes();
@@ -914,22 +912,32 @@ impl App {
     /// Bring the launcher and an open editor up to date with the store and
     /// the live agents.
     fn sync_notes(&mut self) {
+        let live: HashSet<i64> = self.agent_ids.values().copied().collect();
         self.launcher_cache.notes(
             self.notes
                 .searchable()
+                .filter(|note| live.contains(&note.agent_id))
                 .map(|note| (note.agent_id, note.agent.as_str(), note.body.as_str())),
         );
+        self.settle_note(&live);
+        // A choice waits only on a save that will close the note.
+        if !self.note_editor.as_ref().is_some_and(NoteEditor::closing) {
+            self.pending_launch = None;
+        }
+    }
+
+    fn settle_note(&mut self, live: &HashSet<i64>) {
         let Some(editor) = &mut self.note_editor else {
             return;
         };
         let id = editor.agent_id();
         let row = self.notes.row(id);
-        let live =
-            self.agent_ids.values().any(|&live| live == id) && row.is_none_or(|note| !note.retired);
+        let live = live.contains(&id) && row.is_none_or(|note| !note.retired);
         if self.notes.is_unsupported() {
             editor.unsupported();
             return;
         }
+        editor.supported();
         if !self.notes.ready() {
             return;
         }
@@ -11843,7 +11851,16 @@ mod tests {
             id: feed,
             result: Ok(vec![message(1, "Mateo", "ada", "unread mail")]),
         }));
-        inbox_rows(&mut app, &[("Mateo", 1, "2026-10-16T18:00:00.000000Z")]);
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "Mateo".into(),
+                agent_id: Some(7),
+                unread_messages: 1,
+                oldest_unread_message: Some("2026-10-16T18:00:00.000000Z".into()),
+                ..Default::default()
+            }]),
+        }));
         while rx.try_recv().is_ok() {}
         ctrl(&mut app, 'p');
         app.on_event(Event::Paste("needle".into()));
@@ -11860,5 +11877,138 @@ mod tests {
                 .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
             "{sent:?}"
         );
+    }
+
+    #[test]
+    fn a_refused_esc_while_reloading_drops_the_launcher_choice() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![]);
+        f3(&mut app);
+        typed(&mut app, "x");
+        let requests = app.ctx.inbox.restart();
+        app.send(requests);
+        let (id, _) = announce(&mut app, &mut rx, &[("Mateo", 7), ("Grove", 8)], 0);
+        // Paused: the choice cannot save, so it is dropped, not kept.
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("Grove".into()));
+        enter(&mut app);
+        assert_eq!(note_put(&mut rx), None);
+        assert!(app.pending_launch.is_none());
+        listed(&mut app, id, vec![], false);
+        ctrl(&mut app, 's');
+        let (save, ..) = note_put(&mut rx).unwrap();
+        app.on_event(Event::Data(Data::NoteSaved {
+            id: save,
+            result: Ok(agent_note(7, "Mateo", "x", 1)),
+        }));
+        assert!(app.note_editor.is_some(), "Ctrl-S stays");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+    }
+
+    #[test]
+    fn retiring_during_a_save_before_leaving_drops_the_launcher_choice() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![]);
+        f3(&mut app);
+        typed(&mut app, "x");
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("Grove".into()));
+        enter(&mut app);
+        let (save, ..) = note_put(&mut rx).unwrap();
+        assert!(app.pending_launch.is_some());
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "Grove".into(),
+                agent_id: Some(8),
+                ..Default::default()
+            }]),
+        }));
+        assert!(app.pending_launch.is_none());
+        app.on_event(Event::Data(Data::NoteSaved {
+            id: save,
+            result: Err(SideError::Refused("retired".into())),
+        }));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.note_editor.is_none());
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+    }
+
+    #[test]
+    fn notes_coming_back_on_the_same_subscription_page_in_again_and_resume() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![agent_note(7, "Mateo", "stored", 1)]);
+        f3(&mut app);
+        typed(&mut app, "unsaved ");
+        let gone = |app: &mut App| {
+            app.on_event(Event::Data(Data::NotesRevision {
+                id: app.ctx.inbox.id,
+                revision: None,
+            }))
+        };
+        gone(&mut app);
+        // The server is upgraded behind the same subscription.
+        let (id, after) = announce(&mut app, &mut rx, &[("Mateo", 7)], 1);
+        assert_eq!(after, 0, "from the start");
+        typed(&mut app, "!");
+        assert_eq!(note_text(&app).as_deref(), Some("unsaved stored"), "paused");
+        listed(
+            &mut app,
+            id,
+            vec![agent_note(7, "Mateo", "stored", 1)],
+            false,
+        );
+        typed(&mut app, "more ");
+        assert_eq!(note_text(&app).as_deref(), Some("unsaved more stored"));
+        // An editor that never had its note loads it before editing: opened
+        // while a new subscription pages in, then notes go and come back.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let (save, ..) = note_put(&mut rx).unwrap();
+        app.on_event(Event::Data(Data::NoteSaved {
+            id: save,
+            result: Ok(agent_note(7, "Mateo", "unsaved more stored", 2)),
+        }));
+        assert!(app.note_editor.is_none());
+        let requests = app.ctx.inbox.restart();
+        app.send(requests);
+        announce(&mut app, &mut rx, &[("Mateo", 7)], 2);
+        f3(&mut app);
+        gone(&mut app);
+        let (id, _) = announce(&mut app, &mut rx, &[("Mateo", 7)], 3);
+        typed(&mut app, "x");
+        assert_eq!(note_text(&app).as_deref(), Some(""));
+        listed(
+            &mut app,
+            id,
+            vec![agent_note(7, "Mateo", "from the server", 3)],
+            false,
+        );
+        assert_eq!(note_text(&app).as_deref(), Some("from the server"));
+    }
+
+    #[test]
+    fn a_retired_agents_note_leaves_ctrl_p_with_the_summary() {
+        let (mut app, mut rx) = app();
+        notes_ready(
+            &mut app,
+            &mut rx,
+            vec![agent_note(7, "Mateo", "the needle", 1)],
+        );
+        let found = |app: &mut App| {
+            app.picker = None;
+            ctrl(app, 'p');
+            app.on_event(Event::Paste("needle".into()));
+            screen(app, 80, 24).contains("Mateo  note")
+        };
+        assert!(found(&mut app));
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id,
+            result: Ok(vec![]),
+        }));
+        assert!(!found(&mut app), "hidden before any note page says so");
     }
 }
