@@ -213,7 +213,11 @@ when an agent created the blocker, then to `[Cancel]`, and back; Shift-Tab goes
 the other way. Enter on `[discuss with AGENT]` closes the card and opens that
 agent's conversation, the existing one with its draft if it is already open,
 after saving an open note's changes first; it never answers or cancels, even
-with a write awaiting confirmation. Enter on `[Cancel]` asks once more (Enter
+with a write awaiting confirmation. It opens only the very agent that asked,
+matched by its stable id against the current summary: when that agent has
+retired, or its name now belongs to another agent, the bar says it is no longer
+live, and a server whose summaries carry no agent ids says discussing needs a
+newer server; the card's other actions work either way. Enter on `[Cancel]` asks once more (Enter
 confirms, Esc returns to the answer); cancelling sends no mail. The card owns
 Tab and Shift-Tab, so they do not change effort while it is open. Reopening the
 card returns to the blocker selected when it closed, through replacements, or

@@ -102,8 +102,12 @@ pub enum Outcome {
     /// The panel closed: back to the composer.
     Close,
     Request(Request),
-    /// The panel closed to open this agent's conversation.
-    Discuss(String),
+    /// The panel closed to open the conversation of the agent that created
+    /// the blocker: its stable id and name.
+    Discuss {
+        id: i64,
+        name: String,
+    },
     /// Not the panel's key (Ctrl-C): let the keymap have it.
     Pass,
 }
@@ -558,9 +562,12 @@ impl Blockers {
             && key.modifiers.is_empty()
             && self.panel.as_ref().map(|p| p.focus) == Some(Focus::Discuss)
         {
-            if let Some(agent) = agent_creator(&row) {
+            if let (Some(name), Some(creator)) = (agent_creator(&row), &row.creator) {
                 self.close();
-                return Outcome::Discuss(agent);
+                return Outcome::Discuss {
+                    id: creator.id,
+                    name,
+                };
             }
             self.panel.as_mut().expect("open").focus = Focus::Answer;
             return Outcome::Stay;
@@ -1481,7 +1488,7 @@ mod tests {
         assert_eq!(focus(&blockers), Focus::Discuss);
         assert!(matches!(
             blockers.key(SCREEN, press(KeyCode::Enter), now),
-            Outcome::Discuss(agent) if agent == "Zed"
+            Outcome::Discuss { id: 101, name } if name == "Zed"
         ));
         assert!(blockers.chains[&1].pending.is_none(), "no answer sent");
         // A creator that is no longer an agent takes the focus back.
@@ -1543,7 +1550,13 @@ mod tests {
         assert!(blockers.chains[&1].pending.as_ref().unwrap().uncertain);
         blockers.key(SCREEN, press(KeyCode::Tab), now);
         match blockers.key(SCREEN, press(KeyCode::Enter), now) {
-            Outcome::Discuss(agent) => assert_eq!(agent, "Zed", "the creator, not its owner"),
+            Outcome::Discuss { id, name } => {
+                assert_eq!(
+                    (id, name.as_str()),
+                    (101, "Zed"),
+                    "the creator, not its owner"
+                )
+            }
             _ => panic!("expected a discussion"),
         }
         assert!(!blockers.is_open());
@@ -1564,7 +1577,7 @@ mod tests {
         blockers.key(SCREEN, press(KeyCode::Tab), now);
         assert!(matches!(
             blockers.key(SCREEN, press(KeyCode::Enter), now),
-            Outcome::Discuss(_)
+            Outcome::Discuss { .. }
         ));
     }
 

@@ -19,7 +19,8 @@ rather than falling back to anything else.
 
 - The `bbs connect` blocker card offers `[discuss with AGENT]` before
   `[Cancel]` on Tab: Enter closes the card and opens the creating agent's
-  conversation, never answering or cancelling. Reopening the card returns to
+  conversation, never answering or cancelling, and only while that same agent,
+  by its stable id, is live. Reopening the card returns to
   the blocker selected when it closed, or the nearest one still open.
 - `F3` in a `bbs connect` agent conversation opens your private note on that
   agent: plain text up to 32 KiB, saved with `Ctrl-s` or on `Esc`, kept per

@@ -201,6 +201,8 @@ pub struct App {
     note_editor: Option<NoteEditor>,
     /// Live agents' stable ids by folded name, as the current summary has them.
     agent_ids: HashMap<String, i64>,
+    /// Whether summaries carry those ids; `None` until one with rows arrives.
+    summary_ids: Option<bool>,
     /// Unsaved text from editors that could no longer save, by agent id, for
     /// this session only.
     unsaved: HashMap<i64, Draft>,
@@ -262,6 +264,7 @@ impl App {
             notes: NoteStore::default(),
             note_editor: None,
             agent_ids: HashMap::new(),
+            summary_ids: None,
             unsaved: HashMap::new(),
             pending_launch: None,
         };
@@ -524,6 +527,9 @@ impl App {
                                     Some((row.agent.to_ascii_lowercase(), row.agent_id?))
                                 })
                                 .collect();
+                            if !rows.is_empty() {
+                                self.summary_ids = Some(rows.iter().any(|r| r.agent_id.is_some()));
+                            }
                             self.sync_notes();
                         }
                         // Only ListAgents establishes absence. Sparse summary servers
@@ -653,6 +659,24 @@ impl App {
         Some(false)
     }
 
+    /// Open the conversation of the agent that created a blocker, only if
+    /// that very agent, by its stable id, is still the live one of its name.
+    fn discuss(&mut self, id: i64, name: &str) {
+        let notice = match (
+            self.summary_ids,
+            self.agent_ids.get(&name.to_ascii_lowercase()),
+        ) {
+            (Some(true), Some(&live)) if live == id => {
+                self.navigate(Target::Agent(name.to_string()));
+                return;
+            }
+            (Some(true), _) => format!("{name}, who asked this, is no longer live."),
+            (Some(false), _) => "Discussing a blocker needs a newer server.".into(),
+            (None, _) => "Agents are still loading; try again in a moment.".into(),
+        };
+        self.ctx.navigation_notice = Some(Feedback::Other(notice));
+    }
+
     /// Go to `target` from a modal, storing an open, changed note first.
     fn navigate(&mut self, target: Target) {
         if let Some(editor) = &mut self.note_editor {
@@ -758,8 +782,8 @@ impl App {
                     self.viewed();
                     false
                 }
-                blockers::Outcome::Discuss(agent) => {
-                    self.navigate(Target::Agent(agent));
+                blockers::Outcome::Discuss { id, name } => {
+                    self.discuss(id, &name);
                     self.viewed();
                     false
                 }
@@ -12031,11 +12055,35 @@ mod tests {
         assert!(!found(&mut app), "hidden before any note page says so");
     }
 
+    /// A blocker from Grove, id 8 as notes_ready's summary has it.
+    fn grove_asks() -> proto::Blocker {
+        let mut row = blocker(1, 1, "Grove", "q?");
+        row.creator.as_mut().unwrap().id = 8;
+        row
+    }
+
+    /// The current summary: these live agents, with their stable ids.
+    fn live(app: &mut App, agents: &[(&str, i64)]) {
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id,
+            result: Ok(agents
+                .iter()
+                .map(|(agent, id)| proto::AgentSummary {
+                    agent: (*agent).into(),
+                    agent_id: Some(*id),
+                    ..Default::default()
+                })
+                .collect()),
+        }));
+    }
+
     #[test]
     fn discussing_a_blocker_closes_the_card_and_opens_its_creators_conversation() {
         let (mut app, mut rx) = app();
         mateo(&mut app, &mut rx);
         typed(&mut app, "draft");
+        // blocker(_, root, ..) creators have id 100 + root.
+        live(&mut app, &[("Mateo", 101), ("Grove", 102)]);
         queue(&mut app, &mut rx, vec![blocker(1, 1, "Mateo", "q?")]);
         while rx.try_recv().is_ok() {}
         let discuss = |app: &mut App| {
@@ -12082,7 +12130,7 @@ mod tests {
         let (mut app, mut rx) = app();
         mateo(&mut app, &mut rx);
         notes_ready(&mut app, &mut rx, vec![]);
-        queue(&mut app, &mut rx, vec![blocker(1, 1, "Grove", "q?")]);
+        queue(&mut app, &mut rx, vec![grove_asks()]);
         f3(&mut app);
         typed(&mut app, "x");
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
@@ -12102,7 +12150,7 @@ mod tests {
         let (mut app, mut rx) = self::app();
         mateo(&mut app, &mut rx);
         notes_ready(&mut app, &mut rx, vec![agent_note(7, "Mateo", "x", 1)]);
-        queue(&mut app, &mut rx, vec![blocker(1, 1, "Grove", "q?")]);
+        queue(&mut app, &mut rx, vec![grove_asks()]);
         f3(&mut app);
         typed(&mut app, "y");
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
@@ -12117,5 +12165,56 @@ mod tests {
         assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+    }
+
+    /// Discussing Mateo's blocker (creator id 101) after `setup` opens
+    /// nothing and sends nothing, and says `notice`.
+    fn discuss_refused(setup: impl FnOnce(&mut App), notice: &str) {
+        let (mut app, mut rx) = app();
+        setup(&mut app);
+        queue(&mut app, &mut rx, vec![blocker(1, 1, "Mateo", "q?")]);
+        assert_eq!(opened(&app), None, "on the menu");
+        while rx.try_recv().is_ok() {}
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(opened(&app), None, "{notice}");
+        let out = bottom(&mut app);
+        assert!(out.contains(notice), "{notice}: {out}");
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !sent.iter().any(|r| matches!(
+                r,
+                Request::Watch { .. }
+                    | Request::PutNote { .. }
+                    | Request::AnswerBlocker { .. }
+                    | Request::CancelBlocker { .. }
+            )),
+            "{notice}: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn discussing_opens_only_the_very_agent_that_asked() {
+        let gone = "Mateo, who asked this, is no longer live.";
+        // The name now belongs to another agent.
+        discuss_refused(|app| live(app, &[("Mateo", 999)]), gone);
+        // Retired, with no new agent of that name.
+        discuss_refused(|app| live(app, &[("Grove", 102)]), gone);
+        // An old server: summaries without ids.
+        discuss_refused(
+            |app| {
+                app.on_event(Event::Data(Data::Summary {
+                    id: app.ctx.inbox.id,
+                    result: Ok(vec![proto::AgentSummary {
+                        agent: "Mateo".into(),
+                        ..Default::default()
+                    }]),
+                }));
+            },
+            "Discussing a blocker needs a newer server.",
+        );
+        // No summary yet.
+        discuss_refused(|_| {}, "Agents are still loading; try again in a moment.");
     }
 }
