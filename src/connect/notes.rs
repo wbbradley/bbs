@@ -323,6 +323,8 @@ pub struct NoteStore {
     announced: u64,
     /// The first full pass of this generation has finished.
     complete: bool,
+    /// The last page said more follow.
+    more: bool,
     fetching: Option<u64>,
     unsupported: bool,
     notes: std::collections::BTreeMap<i64, StoredNote>,
@@ -335,6 +337,7 @@ impl NoteStore {
         self.cursor = 0;
         self.announced = 0;
         self.complete = false;
+        self.more = false;
         self.unsupported = false;
         self.fetching = Some(id);
         Fetch { id, after: 0 }
@@ -349,9 +352,11 @@ impl NoteStore {
         self.next(id)
     }
 
-    /// Ask for more when something newer is known and nothing is out.
+    /// Ask for more while pages remain or something newer is known, one
+    /// request at a time.
     fn next(&mut self, id: u64) -> Option<Fetch> {
-        if self.fetching.is_some() || (self.complete && self.announced <= self.cursor) {
+        let caught_up = self.complete && !self.more && self.announced <= self.cursor;
+        if self.fetching.is_some() || caught_up {
             return None;
         }
         self.fetching = Some(id);
@@ -372,6 +377,7 @@ impl NoteStore {
             self.stored(note);
         }
         self.cursor = self.cursor.max(page.next_after_revision);
+        self.more = page.has_more;
         if !page.has_more {
             self.complete = true;
         }
@@ -782,6 +788,25 @@ mod tests {
         // An older row never replaces a newer one.
         store.stored(note(1, "stale", 300));
         assert_eq!(store.note(1).unwrap().body, "mine");
+    }
+
+    #[test]
+    fn later_passes_follow_every_page_past_the_announced_revision() {
+        let mut store = NoteStore::default();
+        store.restart(1, 1);
+        store.page(1, page(vec![], false, 0), 2);
+        assert_eq!(store.announced(1, 2, 3), Some(Fetch { id: 3, after: 0 }));
+        // Busy elsewhere meanwhile: the first page already passes 2.
+        let rows = (1..=64).map(|r| note(r as i64, "x", r)).collect();
+        assert_eq!(
+            store.page(3, page(rows, true, 64), 4),
+            Some(Fetch { id: 4, after: 64 })
+        );
+        assert_eq!(
+            store.page(4, page(vec![note(65, "y", 65)], false, 65), 5),
+            None
+        );
+        assert_eq!(store.note(65).unwrap().body, "y");
     }
 
     #[test]
