@@ -747,12 +747,11 @@ impl Blockers {
         let markdown =
             crate::ui::markdown::render_at(&row.body, Some(width.saturating_sub(2) as u16));
         for line in markdown.lines {
-            let mut spans = vec![Span::raw("  ")];
-            spans.extend(
-                line.spans
-                    .into_iter()
-                    .map(|s| Span::styled(s.content.into_owned(), s.style)),
-            );
+            let spans = line
+                .spans
+                .into_iter()
+                .map(|s| Span::styled(s.content.into_owned(), s.style))
+                .collect::<Vec<_>>();
             body.push(Line::from(spans).style(line.style));
         }
         let label = if self.held.contains(&row.root_id) {
@@ -893,8 +892,16 @@ impl Blockers {
             ..head_area
         };
         frame.render_widget(Paragraph::new(head.collect::<Vec<_>>()), rest);
+        // Keep the margin outside wrapping, just like conversation messages.
+        let inset = body_area.width.min(2);
+        let body_area = Rect::new(
+            body_area.x + inset,
+            body_area.y,
+            body_area.width - inset,
+            body_area.height,
+        );
         let body = Paragraph::new(body).wrap(Wrap { trim: false });
-        let rows = body.line_count(area.width) as u16;
+        let rows = body.line_count(body_area.width) as u16;
         self.text_rows = (rows, body_area.height);
         let mut label = label;
         if let Some(panel) = &mut self.panel {
@@ -1205,7 +1212,7 @@ mod tests {
             blockers
                 .lines_above(80)
                 .iter()
-                .any(|l| l.to_string() == "  first, revised?")
+                .any(|l| l.to_string() == "first, revised?")
         );
         assert_eq!(blockers.next_frame(later), Some(later + GUARD));
         // Enter is swallowed, not queued; editing does not restart the wait.

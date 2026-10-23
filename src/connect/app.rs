@@ -6479,6 +6479,67 @@ mod tests {
     }
 
     #[test]
+    fn blocker_details_keep_their_inset_when_wrapping_resizing_and_paging() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let (mut app, mut rx) = app();
+                let body = format!("START {}END", "wrapping 界 café words ".repeat(120));
+                mateo_blockers(&mut app, &mut rx, vec![blocker(1, 1, "Zed", &body)]);
+                typed(&mut app, "parent draft");
+                press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+                typed(&mut app, "answer draft");
+                let draw = |app: &mut App, width: u16| {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                    terminal.draw(|f| app.draw(f)).unwrap();
+                    let buffer = terminal.backend().buffer();
+                    crate::ui::theme::testing::assert_buffer(buffer);
+                    let row = |y: u16| {
+                        (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    };
+                    let label = (0..24)
+                        .find(|y| row(*y).contains("answer → Zed @crew"))
+                        .unwrap();
+                    // The title and the single list row precede the details.
+                    // Every wrapped row keeps the gutter, even after scrolling.
+                    let details: Vec<_> = (2..label).map(row).collect();
+                    assert!(details.iter().any(|l| !l.trim().is_empty()));
+                    for line in &details {
+                        assert!(line.starts_with("  "), "{scheme:?} {width}: {line:?}");
+                    }
+                    let card = theme::base().patch(theme::style(theme::Role::WarningSurface));
+                    for y in 2..label {
+                        for x in 0..2 {
+                            assert_eq!(buffer[(x, y)].symbol(), " ");
+                            assert_eq!(buffer[(x, y)].bg, card.bg.unwrap());
+                        }
+                    }
+                    assert!((0..24).any(|y| row(y).contains("answer draft")));
+                    details.join("\n")
+                };
+                for width in [60, 80, 60] {
+                    assert!(draw(&mut app, width).contains("START"));
+                }
+                let mut pages = 0;
+                while !draw(&mut app, 60).contains("END") {
+                    press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+                    pages += 1;
+                    assert!(pages < 100, "the end stays reachable");
+                }
+                assert!(pages > 1);
+                for _ in 0..pages {
+                    press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+                }
+                assert!(draw(&mut app, 60).contains("START"));
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                assert_eq!(draft_text(&mut app), "parent draft");
+            });
+        }
+    }
+
+    #[test]
     fn a_long_blocker_reads_to_its_end_with_page_keys_at_sixty_by_twenty_four() {
         let (mut app, mut rx) = app();
         let mut body = String::from("START of the question\n");

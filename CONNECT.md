@@ -193,9 +193,10 @@ The card lists blockers oldest first, the first 50 of the scope with a count of
 any more; each refresh fills in rows as others resolve. Alt-↑/↓ selects; plain
 arrows edit the answer; PgUp/PgDn page through a selected text too long for the
 card, which shows how far you have read. Details render as Markdown, as messages
-do: headings, emphasis, lists, code and tables, wrapped to the card's width. The
-selected blocker's text sits above an answer box labelled
-`answer → CREATOR @group`: the answer goes as mail to the agent that wrote the
+do: headings, emphasis, lists, code and tables. Every display line keeps a
+two-column left margin, including wrapped lines and while paging; tables fit
+the remaining width. The selected blocker's text sits above an answer box
+labelled `answer → CREATOR @group`: the answer goes as mail to the agent that wrote the
 current version, which may be another owner's agent. Blockers you cannot answer
 are read only and say why: no agent of yours in the group, or the creating agent
 is gone, in which case Tab still reaches Cancel. Each blocker keeps its own
