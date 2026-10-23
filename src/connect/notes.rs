@@ -120,10 +120,28 @@ impl NoteEditor {
         self.paused = false;
     }
 
-    /// The server keeps no notes; nothing can be edited.
+    /// The server keeps no notes; nothing more is edited or saved, and the
+    /// text stays as it is.
     pub fn unsupported(&mut self) {
-        if self.access == Access::Loading {
+        if matches!(self.access, Access::Loading | Access::Editable) {
             self.access = Access::Unsupported;
+            self.closing = false;
+        }
+    }
+
+    /// The agent is no longer live: the note is kept but read-only, and
+    /// the text stays as it is.
+    pub fn retire(&mut self) {
+        if matches!(self.access, Access::Loading | Access::Editable) {
+            self.access = Access::Retired;
+            self.closing = false;
+        }
+    }
+
+    /// Unsaved text kept from an earlier editor, over the stored note.
+    pub fn keep(&mut self, draft: Draft) {
+        if self.access == Access::Editable {
+            self.text.restore(draft);
         }
     }
 
@@ -134,8 +152,7 @@ impl NoteEditor {
             return;
         }
         if retired {
-            self.access = Access::Retired;
-            self.closing = false;
+            self.retire();
             return;
         }
         if !self.dirty() && self.saving.is_none() && self.text.text() != body {
@@ -717,6 +734,27 @@ mod tests {
         editor.stored("ab", false);
         press(&mut editor, KeyCode::Char('_'), KeyModifiers::CONTROL, 0);
         assert_eq!(editor.draft().text, "a");
+    }
+
+    #[test]
+    fn losing_notes_support_while_editing_keeps_the_text_read_only() {
+        let mut editor = loaded("stored");
+        typed(&mut editor, "unsaved ");
+        editor.unsupported();
+        typed(&mut editor, "more ");
+        assert_eq!(editor.draft().text, "unsaved stored");
+        assert_eq!(ctrl_s(&mut editor, 1), Outcome::Stay);
+        assert!(editor.dirty());
+        assert_eq!(
+            esc(&mut editor, 2),
+            Outcome::Close,
+            "no write to a server without notes"
+        );
+        // Kept text comes back over the stored note in a later editor.
+        let mut later = loaded("stored");
+        later.keep(editor.draft());
+        assert_eq!(later.draft().text, "unsaved stored");
+        assert!(later.dirty());
     }
 
     #[test]

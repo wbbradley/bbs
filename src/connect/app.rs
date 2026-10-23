@@ -199,10 +199,11 @@ pub struct App {
     notes: NoteStore,
     /// The F3 note editor, over the screen and under F2 and Ctrl-P.
     note_editor: Option<NoteEditor>,
-    /// Live agents' stable ids by folded name, from summaries and lists.
+    /// Live agents' stable ids by folded name, as the current summary has them.
     agent_ids: HashMap<String, i64>,
-    /// Unsaved text from editors whose agents retired, for this session only.
-    retired_drafts: HashMap<i64, Draft>,
+    /// Unsaved text from editors that could no longer save, by agent id, for
+    /// this session only.
+    unsaved: HashMap<i64, Draft>,
     /// A launcher choice waiting for the open note to be stored.
     pending_launch: Option<Target>,
 }
@@ -261,7 +262,7 @@ impl App {
             notes: NoteStore::default(),
             note_editor: None,
             agent_ids: HashMap::new(),
-            retired_drafts: HashMap::new(),
+            unsaved: HashMap::new(),
             pending_launch: None,
         };
         app.send(vec![Request::WatchSummary(app.ctx.inbox.id)]);
@@ -515,9 +516,15 @@ impl App {
                     Data::Summary { id, result } if *id == self.ctx.inbox.id => {
                         if let Ok(rows) = result {
                             self.launcher_cache.summaries(rows);
-                            self.agent_ids.extend(rows.iter().filter_map(|row| {
-                                Some((row.agent.to_ascii_lowercase(), row.agent_id?))
-                            }));
+                            // Every live agent, so absence means retired; a list
+                            // from before a name was reused never overrides it.
+                            self.agent_ids = rows
+                                .iter()
+                                .filter_map(|row| {
+                                    Some((row.agent.to_ascii_lowercase(), row.agent_id?))
+                                })
+                                .collect();
+                            self.sync_notes();
                         }
                         // Only ListAgents establishes absence. Sparse summary servers
                         // omit agents with zero counts; positive rows can also describe
@@ -539,11 +546,6 @@ impl App {
                         self.ctx.efforts.sent(agent, *id, result);
                     }
                     Data::Agents(Ok(list)) => {
-                        self.agent_ids
-                            .extend(list.agents.iter().filter_map(|agent| {
-                                (!agent.retired)
-                                    .then_some((agent.name.to_ascii_lowercase(), agent.id?))
-                            }));
                         self.ctx.efforts.listed(&list.agents, list_revision);
                         self.known_agents = Some(
                             list.agents
@@ -794,6 +796,11 @@ impl App {
                     Some(Feedback::Other("Agent notes need a newer server.".into()));
             }
             Some(&id) => self.open_note(id, &agent, 0),
+            None if self.ctx.inbox.loaded => {
+                self.ctx.navigation_notice = Some(Feedback::Other(format!(
+                    "{agent} is not live and has no note."
+                )));
+            }
             None => {
                 self.ctx.navigation_notice =
                     Some(Feedback::Other(format!("Notes for {agent} are loading.")));
@@ -822,9 +829,12 @@ impl App {
             }]),
             notes::Outcome::Close => {
                 let editor = self.note_editor.take().expect("checked above");
-                if editor.access() == notes::Access::Retired && editor.dirty() {
-                    self.retired_drafts
-                        .insert(editor.agent_id(), editor.draft());
+                let stuck = matches!(
+                    editor.access(),
+                    notes::Access::Retired | notes::Access::Unsupported
+                );
+                if stuck && editor.dirty() {
+                    self.unsaved.insert(editor.agent_id(), editor.draft());
                 }
                 if let Some(target) = self.pending_launch.take() {
                     self.launch(target);
@@ -901,7 +911,8 @@ impl App {
         self.sync_notes();
     }
 
-    /// Bring the launcher and an open editor up to date with the store.
+    /// Bring the launcher and an open editor up to date with the store and
+    /// the live agents.
     fn sync_notes(&mut self) {
         self.launcher_cache.notes(
             self.notes
@@ -911,22 +922,29 @@ impl App {
         let Some(editor) = &mut self.note_editor else {
             return;
         };
-        let row = self.notes.row(editor.agent_id());
-        match editor.access() {
-            notes::Access::Loading if self.notes.is_unsupported() => editor.unsupported(),
-            notes::Access::Loading if self.notes.ready() => {
-                editor.loaded(row.map(|note| note.body.as_str()));
-                if let Some(note) = row.filter(|note| note.retired) {
-                    editor.stored(&note.body, true);
-                }
+        let id = editor.agent_id();
+        let row = self.notes.row(id);
+        let live =
+            self.agent_ids.values().any(|&live| live == id) && row.is_none_or(|note| !note.retired);
+        if self.notes.is_unsupported() {
+            editor.unsupported();
+            return;
+        }
+        if !self.notes.ready() {
+            return;
+        }
+        if editor.access() == notes::Access::Loading {
+            editor.loaded(row.map(|note| note.body.as_str()));
+            if live && let Some(draft) = self.unsaved.remove(&id) {
+                editor.keep(draft);
             }
-            notes::Access::Editable if self.notes.ready() => {
-                editor.resume();
-                if let Some(note) = row {
-                    editor.stored(&note.body, note.retired);
-                }
-            }
-            _ => {}
+        }
+        editor.resume();
+        if let Some(note) = row {
+            editor.stored(&note.body, note.retired);
+        }
+        if !live {
+            editor.retire();
         }
     }
 
@@ -11681,7 +11699,7 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.note_editor.is_none());
         assert_eq!(note_put(&mut rx), None);
-        assert_eq!(app.retired_drafts[&7].text, "unsaved stored");
+        assert_eq!(app.unsaved[&7].text, "unsaved stored");
         // Hidden from search, and a reused name is a new note.
         ctrl(&mut app, 'p');
         app.on_event(Event::Paste("stored".into()));
@@ -11728,5 +11746,119 @@ mod tests {
         }));
         app.on_event(Event::Tick);
         assert_eq!(note_list(&mut rx).map(|(_, after)| after), Some(1));
+    }
+
+    #[test]
+    fn an_agent_leaving_the_summary_makes_its_note_read_only_even_without_a_note() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![]);
+        f3(&mut app);
+        typed(&mut app, "unsaved");
+        // Retired, with no note row to say so: the summary no longer has it.
+        app.on_event(Event::Data(Data::Summary {
+            id: app.ctx.inbox.id,
+            result: Ok(vec![proto::AgentSummary {
+                agent: "Grove".into(),
+                agent_id: Some(8),
+                ..Default::default()
+            }]),
+        }));
+        typed(&mut app, "!");
+        assert_eq!(note_text(&app).as_deref(), Some("unsaved"));
+        ctrl(&mut app, 's');
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.note_editor.is_none());
+        assert_eq!(note_put(&mut rx), None);
+        assert_eq!(app.unsaved[&7].text, "unsaved");
+        // F3 no longer opens anything for the name.
+        f3(&mut app);
+        assert!(app.note_editor.is_none());
+        let out = bottom(&mut app);
+        assert!(out.contains("Mateo is not live and has no note."), "{out}");
+    }
+
+    #[test]
+    fn a_late_agent_list_never_brings_back_an_old_id_for_a_reused_name() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        let (id, _) = announce(&mut app, &mut rx, &[("Mateo", 77)], 0);
+        listed(&mut app, id, vec![], false);
+        let mut old = agent("Mateo", "ada", &["crew"]);
+        old.id = Some(7);
+        app.on_event(Event::Data(Data::Agents(Ok(proto::ListAgentsResponse {
+            humans: Vec::new(),
+            agents: vec![old],
+        }))));
+        f3(&mut app);
+        assert_eq!(app.note_editor.as_ref().map(NoteEditor::agent_id), Some(77));
+    }
+
+    #[test]
+    fn notes_going_away_while_editing_keep_the_text_read_only() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![agent_note(7, "Mateo", "stored", 1)]);
+        f3(&mut app);
+        typed(&mut app, "unsaved ");
+        app.on_event(Event::Data(Data::NotesRevision {
+            id: app.ctx.inbox.id,
+            revision: None,
+        }));
+        typed(&mut app, "more ");
+        assert_eq!(note_text(&app).as_deref(), Some("unsaved stored"));
+        assert!(screen(&mut app, 80, 24).contains("this server keeps no notes"));
+        ctrl(&mut app, 's');
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.note_editor.is_none());
+        assert_eq!(note_put(&mut rx), None);
+        assert_eq!(app.unsaved[&7].text, "unsaved stored");
+        // Back on a server with notes, the kept text is what opens.
+        let requests = app.ctx.inbox.restart();
+        app.send(requests);
+        let (id, _) = announce(&mut app, &mut rx, &[("Mateo", 7)], 1);
+        listed(
+            &mut app,
+            id,
+            vec![agent_note(7, "Mateo", "stored", 1)],
+            false,
+        );
+        f3(&mut app);
+        assert_eq!(note_text(&app).as_deref(), Some("unsaved stored"));
+        assert!(screen(&mut app, 80, 24).contains("unsaved"));
+    }
+
+    #[test]
+    fn a_note_opened_from_ctrl_p_reads_nothing_on_its_way_in() {
+        let (mut app, mut rx) = app();
+        notes_ready(
+            &mut app,
+            &mut rx,
+            vec![agent_note(7, "Mateo", "the needle", 1)],
+        );
+        // Unread mail from Mateo, cached from the feed.
+        key(&mut app, 'f');
+        let (feed, _) = watched(&mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(1, "Mateo", "ada", "unread mail")]),
+        }));
+        inbox_rows(&mut app, &[("Mateo", 1, "2026-10-16T18:00:00.000000Z")]);
+        while rx.try_recv().is_ok() {}
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("needle".into()));
+        enter(&mut app);
+        assert!(app.note_editor.is_some());
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::Watch { .. })),
+            "{sent:?}"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
+            "{sent:?}"
+        );
     }
 }
