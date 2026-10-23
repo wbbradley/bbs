@@ -105,7 +105,7 @@ pub fn side_header(
     let (Some(width), None, Some(sent)) = (width, &row.to_group, local(&row.created_at)) else {
         return vec![names];
     };
-    let sent = sent.format("%Y-%m-%d %H:%M:%S").to_string();
+    let sent = sent.format("%Y-%m-%d %I:%M:%S %P").to_string();
     let width = usize::from(width);
     // ASCII digits and punctuation: one column per byte.
     let room = width.saturating_sub(names.width() + sent.len());
@@ -432,7 +432,7 @@ mod tests {
     fn local_text(stored: &str) -> String {
         local(stored)
             .unwrap()
-            .format("%Y-%m-%d %H:%M:%S")
+            .format("%Y-%m-%d %I:%M:%S %P")
             .to_string()
     }
 
@@ -451,7 +451,22 @@ mod tests {
         let row = direct("2026-10-17T03:30:00Z");
         let sent = local_text(&row.created_at);
         if Local::now().offset().local_minus_utc() != 0 {
-            assert_ne!(sent, "2026-10-17 03:30:00", "local, not UTC");
+            assert_ne!(sent, "2026-10-17 03:30:00 am", "local, not UTC");
+        }
+        // Midnight and noon both use 12; afternoon uses a lowercase suffix.
+        for (hour, expected) in [
+            (0, "2026-10-17 12:07:08 am"),
+            (12, "2026-10-17 12:07:08 pm"),
+            (15, "2026-10-17 03:07:08 pm"),
+        ] {
+            use chrono::TimeZone;
+            let local = Local
+                .with_ymd_and_hms(2026, 10, 17, hour, 7, 8)
+                .single()
+                .unwrap();
+            let header = side_header(&direct(&local.to_rfc3339()), None, None, Some(60));
+            assert_eq!(header[0].width(), 60);
+            assert!(header[0].to_string().ends_with(expected), "{:?}", header);
         }
         let header = side_header(&row, None, Some(Kind::Agent), Some(60));
         assert_eq!(header.len(), 1, "beside the names when they leave room");
