@@ -189,22 +189,21 @@ panel come back when the card closes. It keeps receiving mail and activity and
 its side state is still polled, but nothing is marked read or seen until the
 card closes. Ctrl-C still quits.
 
-The card lists blockers oldest first, the first 50 of the scope with a count
-of any more; each refresh fills in rows as others resolve. Alt-↑/↓ selects;
-plain arrows edit the answer; PgUp/PgDn page through a selected text too long
-for the card, which shows how far you have read. Each newline in the details
-is displayed as two, leaving a blank line between source lines. The selected
-blocker's text sits above an answer box labelled `answer → CREATOR @group`:
-the answer goes as mail to the agent that wrote the current version, which
-may be another
-owner's agent. Blockers you cannot answer are read only and say why: no agent
-of yours in the group, or the creating agent is gone, in which case Tab still
-reaches Cancel. Each blocker keeps its own answer draft for this session, across
-visits and screens; the card's input never mixes with a screen's.
-Enter sends; the answer shows darkened with a spinner until the server
-confirms. Tab reaches `[Cancel]`, whose Enter asks once more (Enter
-confirms, Esc returns to the answer); cancelling sends no mail. The card owns
-Tab and Shift-Tab, so they do not change effort while it is open.
+The card lists blockers oldest first, the first 50 of the scope with a count of
+any more; each refresh fills in rows as others resolve. Alt-↑/↓ selects; plain
+arrows edit the answer; PgUp/PgDn page through a selected text too long for the
+card, which shows how far you have read. Details render as Markdown, as messages
+do: headings, emphasis, lists, code and tables, wrapped to the card's width. The
+selected blocker's text sits above an answer box labelled
+`answer → CREATOR @group`: the answer goes as mail to the agent that wrote the
+current version, which may be another owner's agent. Blockers you cannot answer
+are read only and say why: no agent of yours in the group, or the creating agent
+is gone, in which case Tab still reaches Cancel. Each blocker keeps its own
+answer draft for this session, across visits and screens; the card's input never
+mixes with a screen's. Enter sends; the answer shows darkened with a spinner
+until the server confirms. Tab reaches `[Cancel]`, whose Enter asks once more
+(Enter confirms, Esc returns to the answer); cancelling sends no mail. The card
+owns Tab and Shift-Tab, so they do not change effort while it is open.
 
 One write per blocker is out at a time, and other blockers stay usable
 meanwhile. Without a reply it reads `Not confirmed: Enter retries`, and Enter

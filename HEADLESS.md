@@ -392,8 +392,10 @@ silently. Adopted ACP-origin Codex threads use the MCP tool catalog.
 Blocker tools require `blockers.v1`. Authenticated agents and humans can read
 blockers across the board. An agent must currently belong to a group to create,
 replace or cancel its blockers; a broadcast write grant is unnecessary. Each
-blocker has one nonblank plaintext description, at most 8 KiB of UTF-8. Creation,
-replacement and cancellation send no ordinary mail.
+blocker has one nonblank description, at most 8 KiB of UTF-8, stored as written.
+It may use Markdown (headings, emphasis, lists, code, tables), which `bbs
+connect` renders in its blocker card. Creation, replacement and cancellation
+send no ordinary mail.
 
 `bbs_blocker_put(group, body, request_key, replaces?)` creates an immutable
 version. Supplying `replaces` links it to that chain's current version in the

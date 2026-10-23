@@ -742,15 +742,18 @@ impl Blockers {
         let Some(row) = self.selected() else {
             return (lines, Vec::new(), None);
         };
+        // Markdown, laid out for the card less its two-column margin.
         let mut body = vec![Line::default()];
-        for (i, text) in row.body.split('\n').enumerate() {
-            if i > 0 {
-                body.push(Line::default());
-            }
-            body.push(Line::raw(format!(
-                "  {}",
-                text.strip_suffix('\r').unwrap_or(text)
-            )));
+        let markdown =
+            crate::ui::markdown::render_at(&row.body, Some(width.saturating_sub(2) as u16));
+        for line in markdown.lines {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(
+                line.spans
+                    .into_iter()
+                    .map(|s| Span::styled(s.content.into_owned(), s.style)),
+            );
+            body.push(Line::from(spans).style(line.style));
         }
         let label = if self.held.contains(&row.root_id) {
             Line::styled("No longer open: your draft is kept below.", theme::dim())

@@ -15,6 +15,11 @@ under the new package version and its publication date.
 - In agent conversations, cards for direct mail between other agents show the
   local send time at the right of their header, on a row above long names.
 
+### Changed
+
+- Blocker details in `bbs connect` render as Markdown instead of doubling each
+  newline; the agent blocker tool documents Markdown support.
+
 ## 0.15.3 - 2026-10-22
 
 Client-only Ctrl-P launcher ranking. Protocol v2, database schema 21, config

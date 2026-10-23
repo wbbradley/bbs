@@ -447,7 +447,7 @@ pub fn tool_list() -> Value {
             "description": "Create a group blocker or replace a chain's current version with a new linked immutable version. You must currently belong to the group; no broadcast write grant needed. Replacement supersedes an open version, preserves history and queue position. Does not send ordinary mail. Requires blockers.v1. Reuse request_key with the same payload after an uncertain result; never generate a new key just to retry.",
             "inputSchema": object(json!({
                 "group": string("Group name, with or without @."),
-                "body": string("One nonblank plaintext description, at most 8192 UTF-8 bytes; original whitespace is preserved."),
+                "body": string("One nonblank description, at most 8192 UTF-8 bytes, stored as written. Markdown (headings, emphasis, lists, code, tables) renders in bbs connect."),
                 "replaces": { "type":"integer", "minimum":1, "description":"Optional current predecessor version, including answered/cancelled heads. Must be in the same group." },
                 "request_key": string("Unique key for this intent, 1..128 UTF-8 bytes. Reuse only with exactly the same operation and payload."),
             }), &["group", "body", "request_key"]),

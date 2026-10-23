@@ -6414,38 +6414,66 @@ mod tests {
     }
 
     #[test]
-    fn blocker_numbers_and_detail_spacing_follow_the_current_version() {
+    fn blocker_numbers_follow_the_current_version_and_details_render_markdown() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        let body = "# Deploy plan\n\nNeed **approval** for the *rollout*.\nStill one paragraph.\n\n- first step\n- second step\n\nRun `cargo test`:\n\n```\nfn main() {}\n```\n\n| Env | State |\n| --- | --- |\n| staging | ready for the final review later today, once it opens |\n";
         for scheme in SCHEMES {
             with_scheme(scheme, || {
-                for width in [60, 80] {
-                    let (mut app, mut rx) = app();
-                    let body = "first detail\r\nsecond detail\n\n  indented detail\nlast detail\n";
-                    let id = mateo_blockers(
-                        &mut app,
-                        &mut rx,
-                        vec![blocker(5, 1, "Zed", body), blocker(12, 2, "Mateo", "other")],
-                    );
-                    typed(&mut app, "parent draft");
-                    press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-                    let out = screen(&mut app, width, 30);
+                let (mut app, mut rx) = app();
+                let id = mateo_blockers(
+                    &mut app,
+                    &mut rx,
+                    vec![blocker(5, 1, "Zed", body), blocker(12, 2, "Mateo", "other")],
+                );
+                typed(&mut app, "parent draft");
+                press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+                let mut table_rows = Vec::new();
+                for width in [80u16, 60, 80] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                    terminal.draw(|f| app.draw(f)).unwrap();
+                    let buffer = terminal.backend().buffer();
+                    crate::ui::theme::testing::assert_buffer(buffer);
+                    let row = |y: u16| {
+                        (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    };
+                    let lines: Vec<String> = (0..40).map(row).collect();
+                    let out = lines.join("\n");
                     assert!(out.starts_with(" #5 · Answering a blocker"), "{out}");
-                    assert!(out.contains("▸ #5 @crew Zed"), "{out}");
-                    assert!(out.contains("  #12 @crew Mateo"), "{out}");
-                    let lines: Vec<_> = out.lines().collect();
-                    let at = |text: &str| lines.iter().position(|s| s.trim() == text).unwrap();
-                    assert_eq!(at("second detail"), at("first detail") + 2);
-                    assert_eq!(at("indented detail"), at("second detail") + 4);
-                    assert_eq!(at("last detail"), at("indented detail") + 2);
-                    assert!(lines[at("indented detail")].starts_with("    indented detail"));
-                    assert!(lines[at("first detail") + 1].trim().is_empty());
-                    blockers_listed(&mut app, id, vec![blocker(8, 1, "Zed", "changed\nmore")]);
-                    let out = screen(&mut app, width, 30);
-                    assert!(out.starts_with(" #8 · Answering a blocker"), "{out}");
-                    assert!(out.contains("▸ #8 @crew Zed") && !out.contains("#5"));
-                    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-                    assert_eq!(draft_text(&mut app), "parent draft");
+                    assert!(out.contains("▸ #5 @crew Zed") && out.contains("  #12 @crew Mateo"));
+                    let at = |text: &str| lines.iter().position(|l| l.trim_end().starts_with(text));
+                    assert!(at("  # Deploy plan").is_some(), "{out}");
+                    // One paragraph across a single newline; emphasis styled.
+                    let para = at("  Need approval for the rollout. Still one paragraph.")
+                        .expect("a soft break joins the paragraph");
+                    let x = lines[para].find("approval").unwrap() as u16;
+                    assert!(
+                        buffer[(x, para as u16)]
+                            .modifier
+                            .contains(ratatui::style::Modifier::BOLD)
+                    );
+                    // List items sit on adjacent rows: no doubled newlines.
+                    let first = at("  - first step").unwrap();
+                    assert_eq!(at("  - second step"), Some(first + 1), "{out}");
+                    assert!(at("  fn main() {}").is_some(), "{out}");
+                    // The table fits the card and closes at every width.
+                    let grid: Vec<&String> = lines.iter().filter(|l| l.contains('│')).collect();
+                    assert!(grid.iter().all(|l| l.trim_end().ends_with('│')), "{out}");
+                    assert!(out.contains("opens"), "{out}");
+                    table_rows.push(grid.len());
                 }
+                assert!(
+                    table_rows[1] > table_rows[0],
+                    "the table wraps at 60: {table_rows:?}"
+                );
+                assert_eq!(table_rows[0], table_rows[2], "and widens back");
+                blockers_listed(&mut app, id, vec![blocker(8, 1, "Zed", "changed\nmore")]);
+                let out = screen(&mut app, 60, 30);
+                assert!(out.starts_with(" #8 · Answering a blocker"), "{out}");
+                assert!(out.contains("▸ #8 @crew Zed") && !out.contains("#5"));
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                assert_eq!(draft_text(&mut app), "parent draft");
             });
         }
     }
