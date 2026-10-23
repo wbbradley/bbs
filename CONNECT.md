@@ -331,8 +331,9 @@ background across its header and body. These side-message headers show
 aligned with the body after a two-space margin, without read status or
 `@owner` suffixes; group names keep their `@group` prefix. Direct mail between
 others also shows when it was sent, in local time (`YYYY-MM-DD HH:MM:SS`), at
-the header's right edge; when the names leave no room for it, it is left out
-rather than wrapping the header. Group mail shows no time. The attribution text has a slightly
+the header's right edge: beside the names when they leave room, otherwise on a
+header row of its own above them. Only a header narrower than the time leaves
+it out. Group mail shows no time. The attribution text has a slightly
 stronger tint than the body. Gruvbox uses a muted teal surface;
 Terminal uses a dark gray surface, and No color keeps its uncolored display.
 `A` and `E` still narrow the view to messages or activity and to kinds of

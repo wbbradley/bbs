@@ -256,8 +256,7 @@ impl Row for Entry {
                 .line_count(width)
         };
         let prefix_height = measure(message_prefix(gap || *raw_gap));
-        // The send time never adds a row, so the names alone set the height.
-        let header_height = measure(vec![side_header(message, query, *recipient, None)]);
+        let header_height = measure(side_header(message, query, *recipient, Some(width)));
         let surface = theme::style(conversation_roles(message).1);
         let mut gutter = vec![Line::default(); prefix_height];
         for index in 0..header_height {
@@ -1429,18 +1428,31 @@ mod tests {
                             .unwrap()
                     );
                     assert_eq!(row(2).trim(), "side body");
-                    // The long card has no room: no time, and the gutter
-                    // marks exactly its header's rows.
-                    let first = (3..20).find(|y| row(*y).contains("a-name-long")).unwrap();
-                    let text: String = (first..first + 3).map(row).collect();
-                    assert!(!text.contains(&sent[..10]), "{width}: {text}");
+                    // The long card: the time on a row of its own at the
+                    // right, the whole names below it, and the gutter
+                    // marking exactly the header's rows.
+                    let first = (3..20)
+                        .find(|y| row(*y).trim_end().ends_with(&sent))
+                        .unwrap();
+                    // Only the bullet and the time on that row.
+                    assert_eq!(row(first).replacen('•', " ", 1).trim(), sent, "{width}");
+                    assert!(row(first + 1).contains("a-name-long"), "{width}");
                     let header_rows = (first..20)
                         .take_while(|y| !row(*y).contains("side body"))
                         .count();
+                    assert!(header_rows >= 2);
+                    let names: String = (first + 1..first + header_rows as u16).map(row).collect();
+                    assert_eq!(
+                        names
+                            .matches("a-name-long-enough-to-crowd-the-time")
+                            .count(),
+                        2
+                    );
                     let long_card = card(2, long, long);
                     // The gutter starts with the separator's blank row.
                     let gutter = long_card.gutter(false, None, width - 2);
                     assert_eq!(gutter.len() - 1, header_rows, "{width}");
+                    assert_eq!(gutter[1].to_string(), "• ");
                 }
             });
         }

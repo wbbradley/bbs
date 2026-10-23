@@ -13,7 +13,7 @@ under the new package version and its publication date.
 - Ctrl-J moves down and Ctrl-K moves up through Ctrl-P launcher results,
   alongside the arrow keys.
 - In agent conversations, cards for direct mail between other agents show the
-  local send time at the right of their header, when it fits beside the names.
+  local send time at the right of their header, on a row above long names.
 
 ## 0.15.3 - 2026-10-22
 

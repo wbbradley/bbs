@@ -37,7 +37,7 @@ pub fn message_lines_with_recipient_at<'a>(
         row,
         gap,
         query,
-        Some(header(row, query, recipient)),
+        vec![header(row, query, recipient)],
         true,
         width,
     )
@@ -56,7 +56,7 @@ pub fn side_message_lines<'a>(
         row,
         gap,
         query,
-        Some(side_header(row, query, recipient, width)),
+        side_header(row, query, recipient, width),
         false,
         width,
     )
@@ -64,15 +64,16 @@ pub fn side_message_lines<'a>(
 
 /// Header-only rendering lets the conversation lay out its gutter without
 /// parsing the message body a second time.
-/// Direct mail between others shows when it was sent, in local time, at the
-/// right of a header `width` wide, when it fits beside the names; it never
-/// wraps the header. Group mail shows no time.
+/// The header's rows. Direct mail between others shows when it was sent, in
+/// local time, at the right of a header `width` wide: beside the names when
+/// they leave room, else on a row of its own above them. Group mail, or a
+/// header too narrow for the time, shows none.
 pub fn side_header(
     row: &Message,
     query: Option<&str>,
     recipient: Option<Kind>,
     width: Option<u16>,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     let sender = if row.from_kind() == Kind::Unspecified && row.from_owner.is_some() {
         Kind::Agent
     } else {
@@ -99,20 +100,29 @@ pub fn side_header(
         )),
         (None, None) => spans.push(Span::raw("?")),
     }
-    let mut line = Line::from(spans).style(style(conversation_roles(row).1));
-    if let Some(width) = width
-        && row.to_group.is_none()
-        && let Some(sent) = local(&row.created_at)
-    {
-        let sent = sent.format("%Y-%m-%d %H:%M:%S").to_string();
-        // ASCII digits and punctuation: one column per byte.
-        let room = usize::from(width).saturating_sub(line.width() + sent.len());
-        if room >= 2 {
-            line.spans.push(Span::raw(" ".repeat(room)));
-            line.spans.push(Span::styled(sent, style(Role::Timestamp)));
-        }
+    let surface = style(conversation_roles(row).1);
+    let mut names = Line::from(spans).style(surface);
+    let (Some(width), None, Some(sent)) = (width, &row.to_group, local(&row.created_at)) else {
+        return vec![names];
+    };
+    let sent = sent.format("%Y-%m-%d %H:%M:%S").to_string();
+    let width = usize::from(width);
+    // ASCII digits and punctuation: one column per byte.
+    let room = width.saturating_sub(names.width() + sent.len());
+    if room >= 2 {
+        names.spans.push(Span::raw(" ".repeat(room)));
+        names.spans.push(Span::styled(sent, style(Role::Timestamp)));
+        return vec![names];
     }
-    line
+    if sent.len() > width {
+        return vec![names];
+    }
+    let time = Line::from(vec![
+        Span::raw(" ".repeat(width - sent.len())),
+        Span::styled(sent, style(Role::Timestamp)),
+    ])
+    .style(surface);
+    vec![time, names]
 }
 
 /// Semantic surfaces for a conversation card, independent of its author.
@@ -132,14 +142,14 @@ pub fn compact_message_lines<'a>(
     query: Option<&str>,
     width: Option<u16>,
 ) -> Vec<Line<'a>> {
-    with_header(row, gap, query, None, false, width)
+    with_header(row, gap, query, Vec::new(), false, width)
 }
 
 fn with_header<'a>(
     row: &'a Message,
     gap: bool,
     query: Option<&str>,
-    header: Option<Line<'static>>,
+    header: Vec<Line<'static>>,
     indent: bool,
     width: Option<u16>,
 ) -> Vec<Line<'a>> {
@@ -427,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_side_headers_show_the_local_send_time_at_the_right_when_it_fits() {
+    fn direct_side_headers_show_the_local_send_time_at_the_right() {
         let direct = |created_at: &str| Message {
             created_at: created_at.into(),
             from_kind: Kind::Agent.into(),
@@ -435,7 +445,8 @@ mod tests {
             to_name: Some("Mateo".into()),
             ..Default::default()
         };
-        // Late UTC on the 17th: a western zone shows the 16th, an eastern
+        let text = |lines: &[Line]| lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        // Early UTC on the 17th: a western zone shows the 16th, an eastern
         // the 17th; either way the header shows the process's local time.
         let row = direct("2026-10-17T03:30:00Z");
         let sent = local_text(&row.created_at);
@@ -443,26 +454,41 @@ mod tests {
             assert_ne!(sent, "2026-10-17 03:30:00", "local, not UTC");
         }
         let header = side_header(&row, None, Some(Kind::Agent), Some(60));
-        let text = header.to_string();
-        assert_eq!(header.width(), 60);
-        assert!(text.starts_with("Zed → Mateo "), "{text}");
-        assert!(text.ends_with(&sent), "{text}");
-        let time = header.spans.last().unwrap();
-        assert_eq!(time.style.fg, style(Role::Timestamp).fg);
-        assert_eq!(header.style, style(Role::OtherConversationHeader));
-        // The names keep their colours; the header gains no extra row.
-        assert_eq!(header.spans[0].style.fg, style(Role::Agent).fg);
-        // Exactly two spaces of gap fit; one does not, and the time drops.
+        assert_eq!(header.len(), 1, "beside the names when they leave room");
+        let line = &header[0];
+        assert_eq!(line.width(), 60);
+        assert!(line.to_string().starts_with("Zed → Mateo "), "{line}");
+        assert!(line.to_string().ends_with(&sent), "{line}");
+        assert_eq!(
+            line.spans.last().unwrap().style.fg,
+            style(Role::Timestamp).fg
+        );
+        assert_eq!(line.style, style(Role::OtherConversationHeader));
+        assert_eq!(line.spans[0].style.fg, style(Role::Agent).fg);
+        // Exactly two spaces of gap fit; with less, the time takes a row of
+        // its own above the whole names, both on the header's surface.
         let names = "Zed → Mateo".chars().count();
         let fits = (names + 2 + sent.len()) as u16;
-        assert!(
-            side_header(&row, None, None, Some(fits))
-                .to_string()
-                .ends_with(&sent)
+        assert_eq!(side_header(&row, None, None, Some(fits)).len(), 1);
+        let tight = side_header(&row, None, None, Some(fits - 1));
+        let width = usize::from(fits - 1);
+        assert_eq!(
+            text(&tight),
+            [
+                format!("{}{sent}", " ".repeat(width - sent.len())),
+                "Zed → Mateo".into()
+            ]
         );
-        let tight = side_header(&row, None, None, Some(fits - 1)).to_string();
-        assert_eq!(tight, "Zed → Mateo");
-        // No width, no time, a bad time, or group mail: the header as before.
+        assert!(
+            tight
+                .iter()
+                .all(|l| l.style == style(Role::OtherConversationHeader))
+        );
+        assert_eq!(tight[0].spans[1].style.fg, style(Role::Timestamp).fg);
+        // Narrower than the time itself, or no width, no time, a bad time,
+        // or group mail: the names alone, as before.
+        let tiny = side_header(&row, None, None, Some(sent.len() as u16 - 1));
+        assert_eq!(text(&tiny), ["Zed → Mateo"]);
         for (row, width) in [
             (direct("2026-10-17T03:30:00Z"), None),
             (direct(""), Some(80)),
@@ -476,9 +502,10 @@ mod tests {
                 Some(80),
             ),
         ] {
-            let text = side_header(&row, None, None, width).to_string();
-            assert!(!text.contains("2026"), "{text}");
-            assert!(!text.ends_with(' '), "{text:?}");
+            let header = side_header(&row, None, None, width);
+            assert_eq!(header.len(), 1);
+            let line = header[0].to_string();
+            assert!(!line.contains("2026") && !line.ends_with(' '), "{line:?}");
         }
     }
 
