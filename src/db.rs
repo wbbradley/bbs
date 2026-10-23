@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 
 pub mod blockers;
+pub mod notes;
 
 /// The schema every migrating open advances to.
 pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
@@ -35,6 +36,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0019_side_questions.sql"),
     include_str!("../migrations/0020_side_conversations.sql"),
     include_str!("../migrations/0021_blockers.sql"),
+    include_str!("../migrations/0022_agent_notes.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,10 +419,15 @@ pub fn stale_agent_ids(conn: &Connection, cutoff: &str) -> Result<Vec<i64>> {
 /// Retire an agent: free its name, archive its unread mail, drop its memberships
 /// and write grants.
 pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
-    conn.execute(
+    let retired = conn.execute(
         "UPDATE agents SET retired_at = ?1 WHERE id = ?2 AND retired_at IS NULL",
         params![now, id],
     )?;
+    // Notes retire with their agent, in this transaction, so every affected
+    // human's sync and summary signal see it.
+    if retired > 0 {
+        notes::retire(conn, id, now)?;
+    }
     conn.execute(
         "UPDATE deliveries SET archived_at = ?1
          WHERE recipient_kind = 'agent' AND recipient_id = ?2 AND archived_at IS NULL",

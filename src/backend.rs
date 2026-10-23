@@ -38,6 +38,7 @@ pub const SIDE_CONVERSATIONS: &str = "side-conversations.v1";
 pub const MESSAGE_SEARCH: &str = "message-search.v1";
 pub const BLOCKERS: &str = "blockers.v1";
 pub const BLOCKERS_MINE: &str = "blockers-mine.v1";
+pub const AGENT_NOTES: &str = "agent-notes.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -370,6 +371,32 @@ impl Backend {
             Backend::Remote(r) => {
                 rpc!(r, search, req, &[MESSAGE_SEARCH]).map_err(|e| missing_rpc(e, MESSAGE_SEARCH))
             }
+        }
+    }
+
+    /// The caller's private agent notes changed after a revision; requires
+    /// agent-notes.v1 and a human caller.
+    pub async fn list_agent_notes(
+        &mut self,
+        req: proto::ListAgentNotesRequest,
+    ) -> Result<proto::ListAgentNotesResponse> {
+        match self {
+            Backend::Local(l) => service::list_agent_notes(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => rpc!(r, list_agent_notes, req, &[AGENT_NOTES])
+                .map_err(|e| missing_rpc(e, AGENT_NOTES)),
+        }
+    }
+
+    /// Replace the caller's note on one live agent (last write wins);
+    /// requires agent-notes.v1 and a human caller.
+    pub async fn put_agent_note(
+        &mut self,
+        req: proto::PutAgentNoteRequest,
+    ) -> Result<proto::PutAgentNoteResponse> {
+        match self {
+            Backend::Local(l) => service::put_agent_note(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => rpc!(r, put_agent_note, req, &[AGENT_NOTES])
+                .map_err(|e| missing_rpc(e, AGENT_NOTES)),
         }
     }
 
@@ -915,7 +942,12 @@ impl ActivityWatch<'_> {
 
 impl SummaryWatch<'_> {
     pub async fn next(&mut self) -> Result<Vec<proto::AgentSummary>> {
-        Ok(self.snapshot().await?.agents)
+        Ok(self.next_snapshot().await?.agents)
+    }
+
+    /// The whole snapshot, with its private notes revision.
+    pub async fn next_snapshot(&mut self) -> Result<proto::AgentSummarySnapshot> {
+        self.snapshot().await
     }
 }
 

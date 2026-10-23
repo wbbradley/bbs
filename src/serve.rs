@@ -1058,6 +1058,32 @@ impl Bbs for Server {
             .await
     }
 
+    async fn list_agent_notes(
+        &self,
+        req: Request<proto::ListAgentNotesRequest>,
+    ) -> Result<Response<proto::ListAgentNotesResponse>, Status> {
+        self.unary(
+            "list_agent_notes",
+            req,
+            Effect::Query,
+            service::list_agent_notes,
+        )
+        .await
+    }
+
+    async fn put_agent_note(
+        &self,
+        req: Request<proto::PutAgentNoteRequest>,
+    ) -> Result<Response<proto::PutAgentNoteResponse>, Status> {
+        self.unary(
+            "put_agent_note",
+            req,
+            Effect::Write,
+            service::put_agent_note,
+        )
+        .await
+    }
+
     async fn put_blocker(
         &self,
         req: Request<proto::PutBlockerRequest>,

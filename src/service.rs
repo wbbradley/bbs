@@ -26,6 +26,8 @@ const ACTIVE_AT_DEBOUNCE: chrono::Duration = chrono::Duration::seconds(60);
 
 mod blockers;
 pub use blockers::{answer_blocker, cancel_blocker, get_blocker, list_blockers, put_blocker};
+mod notes;
+pub use notes::{MAX_NOTE_BYTES, list_agent_notes, put_agent_note};
 
 /// Who is calling: the agent owning `token`, else the human named `human`.
 #[derive(Default, Clone)]
@@ -1920,6 +1922,7 @@ pub fn list_agents(
         let agents = rows
             .into_iter()
             .map(|a| proto::Agent {
+                id: Some(a.id),
                 blocker_count: Some(counts.get(&a.id).copied().unwrap_or(0)),
                 groups: groups.remove(&a.id).unwrap_or_default(),
                 name: a.name,
@@ -2459,6 +2462,7 @@ pub fn agent_summary(
         let agents = db::agent_summaries(ctx.conn, me.id)?
             .into_iter()
             .map(|s| proto::AgentSummary {
+                agent_id: Some(s.agent_id),
                 blocker_count: Some(counts.get(&s.agent_id).copied().unwrap_or(0)),
                 agent: s.agent,
                 unread_messages: s.unread_messages,
@@ -2471,7 +2475,10 @@ pub fn agent_summary(
                 last_human_conversation_at: s.last_human_conversation_at,
             })
             .collect();
-        Ok(proto::AgentSummarySnapshot { agents })
+        Ok(proto::AgentSummarySnapshot {
+            agents,
+            notes_revision: Some(db::notes::max_revision(ctx.conn, me.id)? as u64),
+        })
     })
 }
 

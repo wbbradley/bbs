@@ -1458,6 +1458,7 @@ mod tests {
                             unread_messages: n as u32,
                             ..Default::default()
                         }],
+                        notes_revision: None,
                     },
                     n == 0,
                 )

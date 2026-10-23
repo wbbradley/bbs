@@ -133,6 +133,12 @@ service Bbs {
   rpc AnswerBlocker(AnswerBlockerRequest) returns (BlockerMutationResponse);
   // Current member agents and humans owning a member may cancel; no mail.
   rpc CancelBlocker(CancelBlockerRequest) returns (BlockerMutationResponse);
+
+  // Private per-human agent notes; both require agent-notes.v1 and a human
+  // caller. Notes never enter mail, Search, tools or agent context.
+  rpc ListAgentNotes(ListAgentNotesRequest) returns (ListAgentNotesResponse);
+  // Last-write-wins replace of the caller's note on one live agent.
+  rpc PutAgentNote(PutAgentNoteRequest) returns (PutAgentNoteResponse);
 }
 
 enum BlockerStatus {
@@ -628,6 +634,8 @@ message Agent {
   optional string last_human_conversation_at = 12;
   // Open blockers across the agent's current active groups; absent on older servers.
   optional uint64 blocker_count = 13;
+  // The stable agent id; a reused name is a different id.
+  optional int64 id = 14;
 }
 
 // The window is the most recent `backlog` (1 to 1000) messages that match every
@@ -721,9 +729,40 @@ message AgentSummary {
   optional string last_human_conversation_at = 9;
   // As Agent.blocker_count; updated when blockers or group membership change.
   optional uint64 blocker_count = 10;
+  // As Agent.id.
+  optional int64 agent_id = 11;
 }
 // Every live agent, by name.
-message AgentSummarySnapshot { repeated AgentSummary agents = 1; }
+message AgentSummarySnapshot {
+  repeated AgentSummary agents = 1;
+  // The caller's newest agent-note revision (agent-notes.v1), including
+  // retired notes; Some(0) with none. Present even with no agent rows.
+  optional uint64 notes_revision = 2;
+}
+
+// One human's private note on one agent, by stable agent id.
+message AgentNote {
+  int64 agent_id = 1;
+  string agent = 2;      // display name; the id is the identity
+  bool retired = 3;      // retired with its agent: hidden, never writable
+  string body = 4;       // plain text, at most 32768 UTF-8 bytes; may be empty
+  uint64 revision = 5;   // the caller's per-human change number
+  string updated_at = 6; // RFC 3339 UTC
+}
+message ListAgentNotesRequest {
+  uint64 after_revision = 1; // exclusive cursor; 0 lists from the start
+  uint32 limit = 2;          // 0 means 64; at most 64
+}
+message ListAgentNotesResponse {
+  repeated AgentNote notes = 1; // ascending revision, retired rows included
+  bool has_more = 2;
+  uint64 next_after_revision = 3; // the last returned revision
+}
+message PutAgentNoteRequest {
+  int64 agent_id = 1;
+  string body = 2;
+}
+message PutAgentNoteResponse { AgentNote note = 1; }
 message MarkSeenRequest {
   string agent = 1;
   int64 through_id = 2;  // the newest activity id seen
