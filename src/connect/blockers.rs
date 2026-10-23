@@ -859,7 +859,7 @@ impl Blockers {
     }
 
     /// The Cancel action, or its confirmation, and the state line.
-    fn lines_below(&self, now: Instant) -> Vec<Line<'static>> {
+    fn lines_below(&self, width: u16, now: Instant) -> Vec<Line<'static>> {
         let (Some(panel), Some(row), Some(chain)) =
             (&self.panel, self.selected(), self.selected_chain())
         else {
@@ -880,17 +880,26 @@ impl Blockers {
                 Span::styled("Enter confirms · Esc returns", theme::dim()),
             ])
         } else {
+            let cancel = if gone {
+                Some("[Dismiss]")
+            } else {
+                row.can_cancel.then_some("[Cancel]")
+            };
             let mut spans = Vec::new();
             if let Some(agent) = agent_creator(row) {
-                spans.push(button(format!("[discuss with {agent}]"), Focus::Discuss));
+                // A long name shortens; the buttons after it and Tab stay.
+                let rest = cancel.map_or(0, |c| c.width() + 1) + " Tab".width();
+                let room = usize::from(width)
+                    .saturating_sub(rest + "[discuss with ]".width())
+                    .max(1);
+                let name = theme::clip_line(Line::raw(agent), room).to_string();
+                spans.push(button(format!("[discuss with {name}]"), Focus::Discuss));
             }
-            if gone {
-                spans.push(button("[Dismiss]".into(), Focus::Cancel));
-            } else if row.can_cancel {
-                spans.push(button("[Cancel]".into(), Focus::Cancel));
-            }
-            for at in (1..spans.len()).rev() {
-                spans.insert(at, Span::raw(" "));
+            if let Some(cancel) = cancel {
+                if !spans.is_empty() {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(button(cancel.into(), Focus::Cancel));
             }
             if !spans.is_empty() {
                 spans.push(Span::styled(" Tab", theme::dim()));
@@ -941,7 +950,7 @@ impl Blockers {
             body,
             label,
         } = self.parts(area.width);
-        let below = self.lines_below(now);
+        let below = self.lines_below(area.width, now);
         let answer = self.answer_height(area.width);
         // The list stays at the top; the selected blocker sits at the
         // bottom, just above its answer, with the spare rows between.
@@ -1384,7 +1393,7 @@ mod tests {
     }
 
     fn action(blockers: &Blockers, now: Instant) -> String {
-        blockers.lines_below(now)[0].to_string()
+        blockers.lines_below(80, now)[0].to_string()
     }
 
     #[test]
@@ -1418,7 +1427,7 @@ mod tests {
         assert_eq!(seen, [Focus::Cancel, Focus::Discuss, Focus::Answer]);
         // Focused, the button takes the selection colour.
         blockers.key(SCREEN, press(KeyCode::Tab), now);
-        let line = &blockers.lines_below(now)[0];
+        let line = &blockers.lines_below(80, now)[0];
         assert_eq!(line.spans[0].style, theme::style(Role::Selection));
         assert_eq!(line.spans[2].style, theme::dim());
         // A human creator has no conversation here; no cancel skips Cancel.
@@ -1452,6 +1461,39 @@ mod tests {
                 vec![Focus::Discuss, Focus::Answer, Focus::Discuss]
             )
         );
+    }
+
+    #[test]
+    fn a_long_creator_name_shortens_and_the_other_buttons_stay() {
+        let now = Instant::now();
+        let long = "Bartholomew-the-long-named-agent-of-the-crew";
+        for held in [false, true] {
+            let mut blockers = Blockers::new();
+            blockers.poll(SCREEN);
+            blockers.on_data(SCREEN, &list(vec![row(1, 1, long, "q?")]), now);
+            blockers.open(now).unwrap();
+            if held {
+                blockers.held.push(1);
+            }
+            blockers.key(SCREEN, press(KeyCode::Tab), now);
+            for width in [60u16, 80] {
+                let (rows, buffer) = drawn(&mut blockers, width, 24, now);
+                let line = rows[22].trim_end();
+                let button = if held { "[Dismiss]" } else { "[Cancel]" };
+                assert!(line.ends_with(&format!("{button} Tab")), "{line}");
+                assert!(line.starts_with("[discuss with Bart"), "{line}");
+                assert_eq!(
+                    line.contains("…] "),
+                    width == 60,
+                    "shortened only when needed: {line}"
+                );
+                assert!(line.width() <= usize::from(width), "{line}");
+                // The focused button still shows it.
+                if let Some(bg) = theme::style(Role::Selection).bg {
+                    assert_eq!(buffer[(1, 22)].bg, bg);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1954,7 +1996,7 @@ mod tests {
         blockers.key(SCREEN, press(KeyCode::BackTab), now);
         assert!(
             blockers
-                .lines_below(now)
+                .lines_below(80, now)
                 .iter()
                 .any(|l| l.to_string().contains("[Dismiss]"))
         );
@@ -2173,7 +2215,7 @@ mod tests {
         blockers.key(SCREEN, press(KeyCode::Enter), now);
         assert!(
             blockers
-                .lines_below(now)
+                .lines_below(80, now)
                 .iter()
                 .any(|l| l.to_string().contains("Cancel this blocker?"))
         );

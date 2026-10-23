@@ -12098,5 +12098,24 @@ mod tests {
         }));
         assert!(app.note_editor.is_none());
         assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
+        // A failed save keeps the note and drops the discussion.
+        let (mut app, mut rx) = self::app();
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![agent_note(7, "Mateo", "x", 1)]);
+        queue(&mut app, &mut rx, vec![blocker(1, 1, "Grove", "q?")]);
+        f3(&mut app);
+        typed(&mut app, "y");
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let (save, ..) = note_put(&mut rx).expect("the note is saved first");
+        app.on_event(Event::Data(Data::NoteSaved {
+            id: save,
+            result: Err(SideError::Refused("no".into())),
+        }));
+        assert_eq!(note_text(&app).as_deref(), Some("yx"));
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
     }
 }
