@@ -207,7 +207,7 @@ pub struct App {
     /// this session only.
     unsaved: HashMap<i64, Draft>,
     /// A launcher choice waiting for the open note to be stored.
-    pending_launch: Option<Target>,
+    pending_navigation: Option<Navigation>,
 }
 
 /// Why a call failed; a timeout may still have landed.
@@ -234,6 +234,16 @@ fn stored_note(note: &crate::proto::AgentNote) -> notes::StoredNote {
         revision: note.revision,
         retired: note.retired,
     }
+}
+
+/// Where a modal sends the human once an open note is stored.
+enum Navigation {
+    Launch(Target),
+    /// A blocker creator's conversation, if that agent is still live.
+    Discuss {
+        id: i64,
+        name: String,
+    },
 }
 
 /// `[1 blocker · F2]`, `[3 blockers · F2]`: the human's open blockers.
@@ -266,7 +276,7 @@ impl App {
             agent_ids: HashMap::new(),
             summary_ids: None,
             unsaved: HashMap::new(),
-            pending_launch: None,
+            pending_navigation: None,
         };
         app.send(vec![Request::WatchSummary(app.ctx.inbox.id)]);
         app.push(Box::new(Menu::default()));
@@ -527,9 +537,9 @@ impl App {
                                     Some((row.agent.to_ascii_lowercase(), row.agent_id?))
                                 })
                                 .collect();
-                            if !rows.is_empty() {
-                                self.summary_ids = Some(rows.iter().any(|r| r.agent_id.is_some()));
-                            }
+                            // With no live agents there is nothing to tell apart.
+                            self.summary_ids =
+                                Some(rows.is_empty() || rows.iter().any(|r| r.agent_id.is_some()));
                             self.sync_notes();
                         }
                         // Only ListAgents establishes absence. Sparse summary servers
@@ -642,7 +652,7 @@ impl App {
                 }
                 launcher::Outcome::Choose(target) => {
                     self.picker = None;
-                    self.navigate(target);
+                    self.navigate(Navigation::Launch(target));
                     self.viewed();
                     false
                 }
@@ -662,32 +672,54 @@ impl App {
     /// Open the conversation of the agent that created a blocker, only if
     /// that very agent, by its stable id, is still the live one of its name.
     fn discuss(&mut self, id: i64, name: &str) {
-        let notice = match (
+        match self.creator_live(id, name) {
+            Ok(()) => self.navigate(Navigation::Discuss {
+                id,
+                name: name.to_string(),
+            }),
+            Err(notice) => self.ctx.navigation_notice = Some(Feedback::Other(notice)),
+        }
+    }
+
+    /// Whether the current summary has agent `id` live as `name`, or why not.
+    fn creator_live(&self, id: i64, name: &str) -> Result<(), String> {
+        // Only the current subscription's last good summary says who is live.
+        if !self.ctx.inbox.loaded {
+            return Err("Agents are still loading; try again in a moment.".into());
+        }
+        match (
             self.summary_ids,
             self.agent_ids.get(&name.to_ascii_lowercase()),
         ) {
-            (Some(true), Some(&live)) if live == id => {
-                self.navigate(Target::Agent(name.to_string()));
-                return;
-            }
-            (Some(true), _) => format!("{name}, who asked this, is no longer live."),
-            (Some(false), _) => "Discussing a blocker needs a newer server.".into(),
-            (None, _) => "Agents are still loading; try again in a moment.".into(),
-        };
-        self.ctx.navigation_notice = Some(Feedback::Other(notice));
+            (Some(true), Some(&live)) if live == id => Ok(()),
+            (Some(false), _) => Err("Discussing a blocker needs a newer server.".into()),
+            _ => Err(format!("{name}, who asked this, is no longer live.")),
+        }
     }
 
-    /// Go to `target` from a modal, storing an open, changed note first.
-    fn navigate(&mut self, target: Target) {
+    /// Go somewhere from a modal, storing an open, changed note first.
+    fn navigate(&mut self, to: Navigation) {
         if let Some(editor) = &mut self.note_editor {
             // As Esc would: store a changed note before leaving it.
-            self.pending_launch = Some(target);
+            self.pending_navigation = Some(to);
             let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
             let outcome = editor.key(esc, next_id());
             self.note_outcome(outcome);
             self.sync_notes();
         } else {
-            self.launch(target);
+            self.go(to);
+        }
+    }
+
+    /// Arrive; a discussion checks its agent again, as it may have changed
+    /// while a note was saving.
+    fn go(&mut self, to: Navigation) {
+        match to {
+            Navigation::Launch(target) => self.launch(target),
+            Navigation::Discuss { id, name } => match self.creator_live(id, &name) {
+                Ok(()) => self.launch(Target::Agent(name)),
+                Err(notice) => self.ctx.navigation_notice = Some(Feedback::Other(notice)),
+            },
         }
     }
 
@@ -871,8 +903,8 @@ impl App {
                 if stuck && editor.dirty() {
                     self.unsaved.insert(editor.agent_id(), editor.draft());
                 }
-                if let Some(target) = self.pending_launch.take() {
-                    self.launch(target);
+                if let Some(to) = self.pending_navigation.take() {
+                    self.go(to);
                 }
                 self.viewed();
             }
@@ -956,7 +988,7 @@ impl App {
         self.settle_note(&live);
         // A choice waits only on a save that will close the note.
         if !self.note_editor.as_ref().is_some_and(NoteEditor::closing) {
-            self.pending_launch = None;
+            self.pending_navigation = None;
         }
     }
 
@@ -11937,7 +11969,7 @@ mod tests {
         app.on_event(Event::Paste("Grove".into()));
         enter(&mut app);
         assert_eq!(note_put(&mut rx), None);
-        assert!(app.pending_launch.is_none());
+        assert!(app.pending_navigation.is_none());
         listed(&mut app, id, vec![], false);
         ctrl(&mut app, 's');
         let (save, ..) = note_put(&mut rx).unwrap();
@@ -11961,7 +11993,7 @@ mod tests {
         app.on_event(Event::Paste("Grove".into()));
         enter(&mut app);
         let (save, ..) = note_put(&mut rx).unwrap();
-        assert!(app.pending_launch.is_some());
+        assert!(app.pending_navigation.is_some());
         app.on_event(Event::Data(Data::Summary {
             id: app.ctx.inbox.id,
             result: Ok(vec![proto::AgentSummary {
@@ -11970,7 +12002,7 @@ mod tests {
                 ..Default::default()
             }]),
         }));
-        assert!(app.pending_launch.is_none());
+        assert!(app.pending_navigation.is_none());
         app.on_event(Event::Data(Data::NoteSaved {
             id: save,
             result: Err(SideError::Refused("retired".into())),
@@ -12216,5 +12248,71 @@ mod tests {
         );
         // No summary yet.
         discuss_refused(|_| {}, "Agents are still loading; try again in a moment.");
+    }
+
+    #[test]
+    fn discussing_needs_the_current_good_summary() {
+        // A failed summary, or a reload, leaves the old ids unconfirmed.
+        let gone_stale = |break_it: fn(&mut App)| {
+            let (mut app, mut rx) = app();
+            notes_ready(&mut app, &mut rx, vec![]);
+            queue(&mut app, &mut rx, vec![grove_asks()]);
+            break_it(&mut app);
+            while rx.try_recv().is_ok() {}
+            press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(opened(&app), None);
+            assert_eq!(
+                app.ctx
+                    .navigation_notice
+                    .as_ref()
+                    .map(|n| n.text().to_string()),
+                Some("Agents are still loading; try again in a moment.".into())
+            );
+            assert!(
+                !std::iter::from_fn(|| rx.try_recv().ok())
+                    .any(|r| matches!(r, Request::Watch { .. }))
+            );
+        };
+        gone_stale(|app| {
+            app.on_event(Event::Data(Data::Summary {
+                id: app.ctx.inbox.id,
+                result: Err("connection reset".into()),
+            }));
+        });
+        gone_stale(|app| {
+            let requests = app.ctx.inbox.restart();
+            app.send(requests);
+        });
+    }
+
+    #[test]
+    fn a_creator_replaced_while_the_note_saves_is_not_opened_after_all() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![]);
+        queue(&mut app, &mut rx, vec![grove_asks()]);
+        f3(&mut app);
+        typed(&mut app, "x");
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let (save, ..) = note_put(&mut rx).expect("the note is saved first");
+        // Grove 8 retires and a new Grove takes the name meanwhile.
+        live(&mut app, &[("Mateo", 7), ("Grove", 88)]);
+        app.on_event(Event::Data(Data::NoteSaved {
+            id: save,
+            result: Ok(agent_note(7, "Mateo", "x", 1)),
+        }));
+        assert!(app.note_editor.is_none(), "the note closed as asked");
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        assert_eq!(
+            app.ctx
+                .navigation_notice
+                .as_ref()
+                .map(|n| n.text().to_string()),
+            Some("Grove, who asked this, is no longer live.".into())
+        );
     }
 }
