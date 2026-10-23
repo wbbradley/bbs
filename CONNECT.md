@@ -331,10 +331,11 @@ aligned with the body after a two-space margin, without read status or
 `@owner` suffixes; group names keep their `@group` prefix. Direct mail between
 others also shows when it was sent, in local time
 (`YYYY-MM-DD hh:mm:ss am/pm`), at the header's right edge: beside the names
-when they leave room, otherwise on a header row of its own above them. Only a header narrower than the time leaves
-it out. Group mail shows no time. The attribution text has a slightly
-stronger tint than the body. Gruvbox uses a muted teal surface;
-Terminal uses a dark gray surface, and No color keeps its uncolored display.
+when they leave room, otherwise on a header row of its own above them. Only
+a header narrower than the time leaves it out. Group mail shows no time. The
+attribution text has a slightly stronger tint than the body. Gruvbox uses a
+muted teal surface; Terminal uses a dark gray surface, and No color keeps its
+uncolored display.
 `A` and `E` still narrow the view to messages or activity and to kinds of
 activity; their labels appear in the bottom bar only when narrowed. Group
 threads and the Feed keep their usual display.
