@@ -1276,6 +1276,21 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            backend
+                .list_agent_notes(proto::ListAgentNotesRequest::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .put_agent_note(proto::PutAgentNoteRequest {
+                    agent_id: 1,
+                    body: "x".into(),
+                })
+                .await
+                .is_err()
+        );
         let expected = [
             ("EnsureHuman", None),
             ("Register", Some("named-agents.v1")),
@@ -1307,6 +1322,8 @@ mod tests {
             ("AnswerBlocker", Some("blockers.v1")),
             ("CancelBlocker", Some("blockers.v1")),
             ("Search", Some("message-search.v1")),
+            ("ListAgentNotes", Some("agent-notes.v1")),
+            ("PutAgentNote", Some("agent-notes.v1")),
         ];
         let observed = observations.lock().unwrap();
         assert_eq!(

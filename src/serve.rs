@@ -1815,6 +1815,116 @@ mod tests {
         server.abort();
     }
 
+    /// Agent notes over a real loopback server: an older server without
+    /// agent-notes.v1 refuses both calls before any write, while a current
+    /// one returns exactly what the local service stores.
+    #[tokio::test]
+    async fn agent_notes_refuse_old_servers_and_match_local_results() {
+        use crate::backend::{AGENT_NOTES, Backend, Remote};
+        for withheld in [true, false] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            db::migrate(&mut conn).unwrap();
+            let will = Caller {
+                human: Some("will".into()),
+                ..Default::default()
+            };
+            service::ensure_human(
+                &mut conn,
+                proto::EnsureHumanRequest {
+                    name: "will".into(),
+                },
+            )
+            .unwrap();
+            let token = service::register(
+                &mut conn,
+                &will,
+                proto::RegisterRequest {
+                    name: Some("Mateo".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .token;
+            let mateo = service::whoami(
+                &mut conn,
+                &Caller {
+                    token: Some(token),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .id;
+            let state = Arc::new(State {
+                conn: Mutex::new(conn),
+                notify: watch::Sender::new(0),
+                activity: watch::Sender::new(0),
+                waiters: Mutex::new(HashSet::new()),
+                shutdown: watch::Sender::new(false),
+                require_human_token: false,
+                protocol: if withheld {
+                    Policy::default().without(AGENT_NOTES)
+                } else {
+                    Policy::default()
+                },
+                auth_failures: Mutex::new(HashMap::new()),
+                timer_limits: TimerLimits::default(),
+                clock: Arc::new(Utc::now),
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(BbsServer::new(Server(state.clone())))
+                    .serve_with_incoming(TcpListenerStream::new(listener)),
+            );
+            let rows = || -> i64 {
+                state
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM agent_notes", [], |r| r.get(0))
+                    .unwrap()
+            };
+            let mut remote =
+                Backend::Remote(Remote::connect(&address, will.clone()).await.unwrap());
+            let put = remote
+                .put_agent_note(proto::PutAgentNoteRequest {
+                    agent_id: mateo,
+                    body: "private".into(),
+                })
+                .await;
+            if withheld {
+                let error = put.unwrap_err();
+                assert!(format!("{error:#}").contains(AGENT_NOTES), "{error:#}");
+                let status = error.downcast_ref::<Status>().expect("a gRPC status");
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                assert!(
+                    remote
+                        .list_agent_notes(proto::ListAgentNotesRequest::default())
+                        .await
+                        .is_err()
+                );
+                assert_eq!(rows(), 0, "no write on an older server");
+            } else {
+                let written = put.unwrap().note.unwrap();
+                let listed = remote
+                    .list_agent_notes(proto::ListAgentNotesRequest::default())
+                    .await
+                    .unwrap();
+                let local = service::list_agent_notes(
+                    &mut state.conn.lock().unwrap(),
+                    &will,
+                    proto::ListAgentNotesRequest::default(),
+                )
+                .unwrap();
+                assert_eq!(listed, local, "remote and local agree");
+                assert_eq!(listed.notes, vec![written]);
+                assert_eq!(rows(), 1);
+            }
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn terminal_error_bypasses_full_message_buffer() {
         use tokio_stream::StreamExt;
