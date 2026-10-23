@@ -196,8 +196,8 @@ card, which shows how far you have read. Details render as Markdown, as messages
 do: headings, emphasis, lists, code and tables. Every display line keeps a
 two-column left margin, including wrapped lines and while paging; tables fit
 the remaining width. The selected blocker's text sits above an answer box
-labelled `answer → CREATOR @group`: the answer goes as mail to the agent that wrote the
-current version, which may be another owner's agent. Blockers you cannot answer
+labelled `answer → CREATOR @group`: the answer goes as mail to the agent that
+wrote the current version, which may be another owner's agent. Blockers you cannot answer
 are read only and say why: no agent of yours in the group, or the creating agent
 is gone, in which case Tab still reaches Cancel. Each blocker keeps its own
 answer draft for this session, across visits and screens; the card's input never
