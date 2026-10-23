@@ -42,6 +42,8 @@ pub enum Role {
     /// A card that needs the human: a background and its title bar.
     WarningSurface,
     WarningTitle,
+    /// Text matching what the human typed to find it.
+    SearchHit,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -135,6 +137,7 @@ impl Scheme {
                 }
                 Selection | Cursor | TitleBar | StatusBar => Style::new().reversed(),
                 WarningTitle => Style::new().reversed().bold(),
+                SearchHit => Style::new().bold().underlined(),
                 _ => Style::new(),
             };
         }
@@ -240,6 +243,14 @@ impl Scheme {
                 Self::NoColor => unreachable!(),
             }),
             WarningTitle => Style::new().fg(bg).bg(warning).bold(),
+            SearchHit => Style::new()
+                .fg(match self {
+                    // Gruvbox orange (base09).
+                    Self::Gruvbox => Color::Rgb(254, 128, 25),
+                    Self::Terminal => Color::Indexed(208),
+                    Self::NoColor => unreachable!(),
+                })
+                .bold(),
         }
     }
 }
@@ -305,6 +316,7 @@ mod tests {
                     Role::Group,
                     Role::Timestamp,
                     Role::Tool,
+                    Role::SearchHit,
                 ] {
                     let category = style(role);
                     assert!(category.bg.is_none());
@@ -503,6 +515,7 @@ pub(crate) mod testing {
             Logo,
             WarningSurface,
             WarningTitle,
+            SearchHit,
         ];
         let colors: Vec<_> = roles
             .into_iter()

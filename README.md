@@ -129,7 +129,8 @@ Ambiguous recipients and free-form prose remain ordinary text. Gruvbox uses true
 
 `Ctrl-p` opens a full-screen fuzzy launcher for known agent names, group names
 and message lines already cached in this `connect` session. Searching makes
-no fetches. `Up`/`Down` or `Ctrl-k`/`Ctrl-j` select, `Enter` opens the top or
+no fetches. Each result takes one row, messages show their age, and text
+matching the query is bold. `Up`/`Down` or `Ctrl-k`/`Ctrl-j` select, `Enter` opens the top or
 selected result with its normal live connection, and `Esc` restores the screen
 underneath.
 Conversations remember their scroll position and editing mode; message hits

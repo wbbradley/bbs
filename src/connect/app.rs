@@ -841,7 +841,12 @@ impl App {
             self.blockers.render(frame, frame.area(), now);
         }
         if let Some(picker) = &mut self.picker {
-            picker.render(frame, frame.area(), &self.launcher_cache);
+            picker.render(
+                frame,
+                frame.area(),
+                &self.launcher_cache,
+                chrono::Local::now(),
+            );
         }
     }
 }

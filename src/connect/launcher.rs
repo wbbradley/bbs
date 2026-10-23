@@ -2,9 +2,11 @@
 
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Margin, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui_textarea::TextArea;
@@ -423,21 +425,19 @@ impl Picker {
         Outcome::Stay
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, cache: &Cache) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, cache: &Cache, now: DateTime<Local>) {
         self.refresh(cache);
         frame.render_widget(Clear, area);
         frame.render_widget(Block::new().style(theme::base()), area);
         if theme::too_small(area) {
             return;
         }
-        let shown = usize::from(area.height.saturating_sub(9) / 2).clamp(1, 8);
-        let width = area.width.saturating_sub(4).min(88);
-        let height = 7 + shown as u16 * 2;
+        // Nearly the whole terminal: a margin of two columns and one row.
         let panel = Rect::new(
-            area.x + (area.width - width) / 2,
-            area.y + (area.height - height) / 3,
-            width,
-            height,
+            area.x + 2,
+            area.y + 1,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(2),
         );
         let surface = theme::style(Role::HumanSurface);
         frame.render_widget(
@@ -448,6 +448,8 @@ impl Picker {
             panel,
         );
         let inner = panel.inner(Margin::new(2, 1));
+        // The query, a blank row, the results, a blank row and the footer.
+        let shown = usize::from(inner.height.saturating_sub(4)).max(1);
         self.query.set_style(surface);
         self.query.set_cursor_line_style(surface);
         self.query.set_cursor_style(theme::style(Role::Cursor));
@@ -456,6 +458,7 @@ impl Picker {
         self.query
             .set_placeholder_style(theme::on_surface(surface, theme::style(Role::Muted)));
         frame.render_widget(&self.query, Rect::new(inner.x, inner.y, inner.width, 1));
+        let query = self.query.lines()[0].trim().to_string();
         let first = self.selected.saturating_sub(shown - 1);
         if self.hits.is_empty() {
             frame.render_widget(
@@ -465,56 +468,18 @@ impl Picker {
             );
         }
         for (at, hit) in self.hits.iter().enumerate().skip(first).take(shown) {
-            let y = inner.y + 2 + (at - first) as u16 * 2;
             let row_style = if at == self.selected {
                 theme::style(Role::Selection)
             } else {
                 surface
             };
-            let (title, detail, role) = match &hit.target {
-                Target::Agent(name) => (
-                    format!("Agent · {name}"),
-                    "Agent conversation".to_string(),
-                    Role::Agent,
-                ),
-                Target::Group(name) => (
-                    format!("Group · @{name}"),
-                    "Group conversation".to_string(),
-                    Role::Group,
-                ),
-                Target::Message(id) => {
-                    let participants = cache
-                        .message(*id)
-                        .map(|m| {
-                            let to = m
-                                .to_group
-                                .as_ref()
-                                .map(|g| format!("@{g}"))
-                                .or_else(|| m.to_name.clone())
-                                .unwrap_or_default();
-                            format!(" · {} → {to}", m.from_name)
-                        })
-                        .unwrap_or_default();
-                    (
-                        format!("Message #{id}{participants}"),
-                        hit.text.clone(),
-                        Role::Text,
-                    )
-                }
-            };
-            let lines = vec![
-                theme::clip_line(
-                    Line::from(Span::styled(
-                        title,
-                        theme::on_surface(row_style, theme::style(role)),
-                    )),
-                    inner.width as usize,
-                ),
-                theme::clip_line(Line::raw(detail), inner.width as usize),
-            ];
+            let line = theme::clip_line(
+                result_line(hit, cache, &query, row_style, now),
+                usize::from(inner.width),
+            );
             frame.render_widget(
-                Paragraph::new(lines).style(row_style),
-                Rect::new(inner.x, y, inner.width, 2),
+                Paragraph::new(line).style(row_style),
+                Rect::new(inner.x, inner.y + 2 + (at - first) as u16, inner.width, 1),
             );
         }
         let footer = format!(
@@ -527,11 +492,81 @@ impl Picker {
             self.hits.len()
         );
         frame.render_widget(
-            Paragraph::new(theme::clip_line(Line::raw(footer), inner.width as usize))
-                .style(theme::on_surface(surface, theme::style(Role::Muted))),
-            Rect::new(inner.x, panel.bottom() - 2, inner.width, 1),
+            Paragraph::new(theme::clip_line(
+                Line::raw(footer),
+                usize::from(inner.width),
+            ))
+            .style(theme::on_surface(surface, theme::style(Role::Muted))),
+            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
         );
     }
+}
+
+/// One result on one row: what it is, and for mail how long ago and between
+/// whom; the text the query matched is marked.
+fn result_line(
+    hit: &Hit,
+    cache: &Cache,
+    query: &str,
+    row: Style,
+    now: DateTime<Local>,
+) -> Line<'static> {
+    let on = |role| theme::on_surface(row, theme::style(role));
+    let mut spans = Vec::new();
+    match &hit.target {
+        Target::Agent(name) => {
+            spans.extend(marked(name, query, on(Role::Agent), row));
+            spans.push(Span::styled("  agent", on(Role::Muted)));
+        }
+        Target::Group(name) => {
+            spans.push(Span::styled("@", on(Role::Group)));
+            spans.extend(marked(name, query, on(Role::Group), row));
+            spans.push(Span::styled("  group", on(Role::Muted)));
+        }
+        Target::Message(id) => {
+            if let Some(m) = cache.message(*id) {
+                let ago = crate::ui::message::age(&m.created_at, now);
+                if !ago.is_empty() {
+                    spans.push(Span::styled(format!("{ago}  "), on(Role::Timestamp)));
+                }
+                let to = m
+                    .to_group
+                    .as_ref()
+                    .map(|g| format!("@{g}"))
+                    .or_else(|| m.to_name.clone())
+                    .unwrap_or_default();
+                spans.push(Span::styled(
+                    format!("{} → {to}  ", m.from_name),
+                    on(Role::Text),
+                ));
+            }
+            spans.extend(marked(&hit.text, query, on(Role::Text), row));
+        }
+    }
+    Line::from(spans)
+}
+
+/// `text` in `style`, with what matches `query` bold in the search-hit
+/// colour, on the row's surface.
+fn marked(text: &str, query: &str, style: Style, row: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut at = 0;
+    if !query.is_empty() {
+        for found in crate::ui::message::find_matches(text, query) {
+            if found.start > at {
+                spans.push(Span::styled(text[at..found.start].to_string(), style));
+            }
+            spans.push(Span::styled(
+                text[found.clone()].to_string(),
+                theme::on_surface(row, theme::style(Role::SearchHit)),
+            ));
+            at = found.end;
+        }
+    }
+    if at < text.len() {
+        spans.push(Span::styled(text[at..].to_string(), style));
+    }
+    spans
 }
 
 /// Borrowed candidates keep search work independent of snippet allocations.
@@ -1024,6 +1059,204 @@ mod tests {
     }
 
     #[test]
+    fn results_take_one_row_each_with_ages_and_marked_hits() {
+        use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
+        use chrono::TimeZone;
+        let now = Local
+            .with_ymd_and_hms(2026, 10, 22, 12, 0, 0)
+            .single()
+            .unwrap();
+        let ago = |minutes: i64| (now - chrono::Duration::minutes(minutes)).to_rfc3339();
+        let mail = |id: i64, created_at: String, body: &str| proto::Message {
+            id,
+            created_at,
+            from_kind: proto::Kind::Agent as i32,
+            from_name: "Zed".into(),
+            to_name: Some("Mateo".into()),
+            body: body.into(),
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        cache.agent("Jefe");
+        cache.group("jefe crew");
+        for row in [
+            mail(1, ago(34), "hello Jefe there"),
+            mail(2, ago(113), "second jefe note"),
+            mail(3, ago(3 * 24 * 60 + 4 * 60), "Ünïcode JEFE note"),
+            mail(4, ago(-10), "future jefe note"),
+            mail(5, String::new(), "undated jefe note"),
+        ] {
+            cache.observe(&Data::Feed {
+                id: 1,
+                result: Ok(vec![row]),
+            });
+        }
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                for (width, height) in [(60u16, 24u16), (80, 24), (120, 40)] {
+                    let mut picker = Picker::new(&cache);
+                    picker.paste("jefe", &cache);
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|f| picker.render(f, f.area(), &cache, now))
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    assert_buffer(buffer);
+                    let row = |y: u16| {
+                        (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    };
+                    let find = |text: &str| (0..height).find(|y| row(*y).contains(text));
+                    let text = (0..height).map(row).collect::<Vec<_>>().join("\n");
+                    assert!(!text.contains("Message #"), "{text}");
+                    // Each result on one row, in rank order.
+                    let agent = find("Jefe  agent").expect("agent row");
+                    assert_eq!(find("@jefe crew  group"), Some(agent + 1), "{text}");
+                    for (offset, expect) in [
+                        (2, "Zed → Mateo  undated jefe note"),
+                        (3, "0m ago  Zed → Mateo  future jefe note"),
+                        (4, "3d4h ago  Zed → Mateo  Ünïcode JEFE note"),
+                        (5, "1h53m ago  Zed → Mateo  second jefe note"),
+                        (6, "34m ago  Zed → Mateo  hello Jefe there"),
+                    ] {
+                        assert!(
+                            row(agent + offset).contains(expect),
+                            "{width}x{height} {expect}: {text}"
+                        );
+                    }
+                    assert!(
+                        !row(agent + 2).contains(" ago"),
+                        "an undated message has no age"
+                    );
+                    // The hit is bold in the search colour, on each row's surface.
+                    let hit = theme::style(Role::SearchHit);
+                    for (y, matched, selected) in
+                        [(agent, "Jefe", true), (agent + 4, "JEFE", false)]
+                    {
+                        let x = row(y)
+                            .find(matched)
+                            .map(|b| row(y)[..b].chars().count())
+                            .unwrap() as u16;
+                        let cell = &buffer[(x, y)];
+                        assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+                        if let Some(fg) = hit.fg {
+                            assert_eq!(cell.fg, fg, "{scheme:?}");
+                        } else {
+                            assert!(cell.modifier.contains(ratatui::style::Modifier::UNDERLINED));
+                        }
+                        let surface = if selected {
+                            Role::Selection
+                        } else {
+                            Role::HumanSurface
+                        };
+                        if let Some(bg) = theme::style(surface).bg {
+                            assert_eq!(cell.bg, bg, "{scheme:?} selected={selected}");
+                        }
+                        // The unmatched rest of the row is not marked.
+                        let after = &buffer[(x + matched.chars().count() as u16 + 1, y)];
+                        match hit.fg {
+                            Some(fg) => assert_ne!(after.fg, fg, "{scheme:?}"),
+                            None => assert!(
+                                !after
+                                    .modifier
+                                    .contains(ratatui::style::Modifier::UNDERLINED)
+                            ),
+                        }
+                    }
+                    // The panel spans the terminal less its margin.
+                    let top = row(1);
+                    assert_eq!(top.chars().nth(2), Some('┌'), "{top}");
+                    assert_eq!(top.chars().nth(usize::from(width) - 3), Some('┐'), "{top}");
+                    // The footer fits even when it has to be cut.
+                    let footer = find("Enter opens").expect("footer");
+                    assert!(row(footer).trim_end().ends_with('│'));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_hit_cut_by_the_panel_edge_keeps_its_mark_and_the_border() {
+        let mut cache = Cache::default();
+        cache.observe(&Data::Feed {
+            id: 1,
+            result: Ok(vec![proto::Message {
+                id: 1,
+                from_kind: proto::Kind::Agent as i32,
+                from_name: "Zed".into(),
+                to_name: Some("Mateo".into()),
+                body: "東京ターミナル".repeat(6),
+                ..Default::default()
+            }]),
+        });
+        let mut picker = Picker::new(&cache);
+        picker.paste(&"東京ターミナル".repeat(6), &cache);
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal
+            .draw(|f| picker.render(f, f.area(), &cache, Local::now()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        crate::ui::theme::testing::assert_buffer(buffer);
+        let y = 4;
+        let row: String = (0..60).map(|x| buffer[(x, y)].symbol()).collect();
+        assert!(row.contains("東 京"), "{row}");
+        assert_eq!(
+            row.matches("東").count(),
+            3,
+            "the hit runs past the edge: {row}"
+        );
+        assert_eq!(buffer[(57, y)].symbol(), "│", "{row}");
+        let last = (4..57)
+            .rev()
+            .find(|x| buffer[(*x, y)].symbol().trim() != "");
+        assert_eq!(last.map(|x| buffer[(x, y)].symbol()), Some("…"), "{row}");
+        let x = (0..57).find(|x| buffer[(*x, y)].symbol() == "東").unwrap();
+        let hit = theme::on_surface(theme::style(Role::Selection), theme::style(Role::SearchHit));
+        assert_eq!(buffer[(x, y)].fg, hit.fg.unwrap_or(buffer[(x, y)].fg));
+        assert!(
+            buffer[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn taller_terminals_show_more_results_and_the_last_of_fifty_scrolls_in() {
+        let now = Local::now();
+        let mut cache = Cache::default();
+        for i in 0..60 {
+            cache.agent(&format!("Agent{i:02}"));
+        }
+        let count = |picker: &mut Picker, height: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|f| picker.render(f, f.area(), &cache, now))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = (0..height)
+                .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            (
+                rows.iter().filter(|r| r.contains("  agent")).count(),
+                rows.join("\n"),
+            )
+        };
+        let mut picker = Picker::new(&cache);
+        picker.paste("agent", &cache);
+        assert_eq!(picker.hits.len(), MAX_RESULTS);
+        let (short, _) = count(&mut picker, 24);
+        let (tall, _) = count(&mut picker, 40);
+        assert_eq!((short, tall), (16, 32), "every row the panel has");
+        for _ in 0..60 {
+            key(&mut picker, &cache, KeyCode::Down);
+        }
+        let (_, text) = count(&mut picker, 24);
+        assert!(text.contains("Agent49  agent"), "{text}");
+        assert!(text.contains("top 50 results"), "{text}");
+    }
+
+    #[test]
     fn the_picker_covers_the_screen_and_keeps_input_and_selection_visible() {
         use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
         for scheme in SCHEMES {
@@ -1045,7 +1278,7 @@ mod tests {
                                 Paragraph::new(vec![Line::raw("Z".repeat(width as usize)); 24]),
                                 f.area(),
                             );
-                            picker.render(f, f.area(), &cache);
+                            picker.render(f, f.area(), &cache, Local::now());
                         })
                         .unwrap();
                     let buffer = terminal.backend().buffer();
@@ -1060,7 +1293,7 @@ mod tests {
                     );
                     assert!(text.contains("Go to · cached data"), "{text}");
                     assert!(
-                        text.contains("Agent · Agent25"),
+                        text.contains("Agent25  agent"),
                         "the selected result stays in view: {text}"
                     );
                     assert!(text.contains("Enter opens"), "{text}");

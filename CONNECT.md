@@ -445,6 +445,10 @@ and fuzzy matches for agent names, group names and cached message lines.
 (the top match by default). `Esc` closes the launcher and restores the screen
 beneath it, including its draft, cursor, selection, scroll position and open
 dialogs.
+The panel fills the terminal less a small margin. Each result takes one row:
+an agent name, `@` and a group name, or a cached message's age, sender,
+recipient and line. Text matching the query is bold in the search-hit colour,
+also on the selected row, and the list scrolls through up to 50 results.
 `Ctrl-c` still quits. The blocker modal keeps `Ctrl-p` while it is open;
 likewise, the launcher keeps `F2` until it closes.
 

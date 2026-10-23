@@ -18,6 +18,10 @@ under the new package version and its publication date.
 
 ### Changed
 
+- Ctrl-P launcher results take one row each and fill the terminal less a small
+  margin, scrolling through up to 50 results. Message results show their age
+  (such as `1h53m ago`) instead of `Message #id`, and text matching the query
+  is bold in a search-hit colour, also on the selected row.
 - Blocker details in `bbs connect` render as Markdown instead of doubling each
   newline; the agent blocker tool documents Markdown support.
 
