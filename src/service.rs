@@ -432,6 +432,26 @@ pub fn rotate_agent_token(
     })
 }
 
+pub fn blocker_preference(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::BlockerPreferenceRequest,
+) -> Result<proto::BlockerPreferenceResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let actor = if req.enabled.is_some() {
+            ctx.human()?
+        } else {
+            ctx.actor()?
+        };
+        if let Some(enabled) = req.enabled {
+            db::set_blockers_enabled(ctx.conn, actor.id, enabled)?;
+        }
+        Ok(proto::BlockerPreferenceResponse {
+            enabled: db::blockers_enabled(ctx.conn, &actor)?,
+        })
+    })
+}
+
 pub fn whoami(conn: &mut Connection, caller: &Caller) -> Result<proto::Principal> {
     with_ctx(conn, caller, |ctx| {
         let me = ctx.actor()?;

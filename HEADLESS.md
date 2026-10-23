@@ -395,6 +395,14 @@ replace or cancel its blockers; a broadcast write grant is unnecessary. Each
 blocker has one nonblank plaintext description, at most 8 KiB of UTF-8. Creation,
 replacement and cancellation send no ordinary mail.
 
+Blocker tools are disabled by default. A human can run `bbs blocker enable`
+to expose them to all headless agents they own, or `bbs blocker disable` to
+revoke access. The preference is stored on the board per human, so it applies
+across machines and harnesses. Agents cannot change it. Tool calls recheck the
+preference, including calls from sessions with cached tool declarations. New
+MCP listings and new Codex threads omit blocker tools unless the owner opted
+in; older servers without this preference also leave the tools disabled.
+
 `bbs_blocker_put(group, body, request_key, replaces?)` creates an immutable
 version. Supplying `replaces` links it to that chain's current version in the
 same group. An open predecessor becomes superseded; an answered or cancelled

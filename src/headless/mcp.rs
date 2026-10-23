@@ -112,7 +112,7 @@ impl Tools {
                 "serverInfo": { "name": "bbs", "version": env!("CARGO_PKG_VERSION") },
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tool_list() })),
+            "tools/list" => Ok(json!({ "tools": self.tool_list().await })),
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default();
                 let args = &params["arguments"];
@@ -145,8 +145,37 @@ impl Tools {
         Ok(self.backend.as_mut().unwrap())
     }
 
+    /// Resolve the owning human's preference on each listing and call.
+    /// Older/unreachable servers cannot establish opt-in.
+    pub async fn blockers_enabled(&mut self) -> bool {
+        match self.backend().await {
+            Ok(b) => b
+                .blocker_preference(None)
+                .await
+                .map(|r| r.enabled)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    pub async fn tool_list(&mut self) -> Value {
+        let mut tools = tool_list();
+        if !self.blockers_enabled().await {
+            tools
+                .as_array_mut()
+                .unwrap()
+                .retain(|t| !is_blocker_tool(t["name"].as_str().unwrap_or_default()));
+        }
+        tools
+    }
+
     /// Run tool `name`; an error is a message for the agent.
     pub async fn call(&mut self, name: &str, args: &Value) -> Result<String> {
+        if is_blocker_tool(name) && !self.blockers_enabled().await {
+            bail!(
+                "Blocker tools are disabled; your owning human must opt in with `bbs blocker enable`."
+            );
+        }
         let result = self.call_once(name, args).await;
         if result.is_err() {
             // Reconnect on the next call in case the connection was the problem.
@@ -377,6 +406,10 @@ fn format_search(
     )?)
 }
 
+fn is_blocker_tool(name: &str) -> bool {
+    name.starts_with("bbs_blocker")
+}
+
 pub fn tool_list() -> Value {
     let object = |props: Value, required: &[&str]| json!({ "type": "object", "properties": props, "required": required });
     let string = |description: &str| json!({ "type": "string", "description": description });
@@ -500,6 +533,77 @@ pub fn tool_list() -> Value {
 #[cfg(test)]
 mod search_tests {
     use super::*;
+    #[tokio::test]
+    async fn blocker_tools_recheck_owner_opt_in_on_the_same_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("bbs.db")).unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+        crate::service::ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: "will".into(),
+            },
+        )
+        .unwrap();
+        let human = Caller {
+            human: Some("will".into()),
+            ..Default::default()
+        };
+        let agent = crate::service::register(
+            &mut conn,
+            &human,
+            proto::RegisterRequest {
+                note: Some("testing".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut tools = Tools::new(dir.path(), agent.token);
+        tools.local = true;
+        let has_blockers = |catalog: Value| {
+            catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| is_blocker_tool(t["name"].as_str().unwrap()))
+        };
+        for enabled in [false, true, false] {
+            crate::service::blocker_preference(
+                &mut conn,
+                &human,
+                proto::BlockerPreferenceRequest {
+                    enabled: Some(enabled),
+                },
+            )
+            .unwrap();
+            let catalog = tools.tool_list().await;
+            assert_eq!(has_blockers(catalog.clone()), enabled);
+            assert!(
+                catalog
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["name"] == "bbs_send")
+            );
+            for name in [
+                "bbs_blockers",
+                "bbs_blocker_get",
+                "bbs_blocker_put",
+                "bbs_blocker_cancel",
+            ] {
+                let result = tools.call(name, &json!({})).await;
+                if !enabled {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("Blocker tools are disabled")
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn search_tool_preserves_literal_input_filters_and_cursor() {
         let args = json!({"query":"  É.*  ","case_sensitive":true,"limit":100,"before_id":42,

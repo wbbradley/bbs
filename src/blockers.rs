@@ -158,6 +158,22 @@ pub async fn run(
     json_output: bool,
 ) -> Result<String> {
     let value = match command {
+        BlockerCommand::Enable | BlockerCommand::Disable => {
+            let enabled = matches!(command, BlockerCommand::Enable);
+            let response = backend.blocker_preference(Some(enabled)).await?;
+            return Ok(if json_output {
+                format!("{}\n", json!({"enabled": response.enabled}))
+            } else {
+                format!(
+                    "Blocker tools {} for your agents.\n",
+                    if response.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                )
+            });
+        }
         BlockerCommand::List {
             group,
             agent,

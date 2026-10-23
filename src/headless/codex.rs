@@ -19,7 +19,9 @@ use super::effort;
 use super::harness::{
     EffortUnconfirmed, Event, MAX_INPUT_CHARS, PromptNotStarted, Resume, SETUP_TIMEOUT, truncate,
 };
-use super::mcp::{Tools, tool_list};
+use super::mcp::Tools;
+#[cfg(test)]
+use super::mcp::tool_list;
 use super::rpc::{Incoming, Process, Rpc};
 use super::settings::HarnessConfig;
 use super::{codex_btw, context, input};
@@ -294,7 +296,7 @@ impl Codex {
             }
         }
         self.effort.lock().unwrap().parent = None;
-        params["dynamicTools"] = dynamic_tools();
+        params["dynamicTools"] = dynamic_tools(self.side_tools.lock().await.tool_list().await);
         self.dynamic_tools = true;
         let result = self.rpc.request("thread/start", params).await?;
         self.thread_id = result["thread"]["id"]
@@ -586,8 +588,7 @@ fn mcp_config(mcp: &McpServer) -> Value {
 }
 
 /// The BBS tools as plain functions, which reach the model without a namespace.
-fn dynamic_tools() -> Value {
-    let mut tools = tool_list();
+fn dynamic_tools(mut tools: Value) -> Value {
     for tool in tools.as_array_mut().expect("tool list is an array") {
         tool["type"] = "function".into();
     }
@@ -1337,7 +1338,7 @@ mod tests {
 
     #[test]
     fn declares_the_bbs_tools_as_functions() {
-        let tools = dynamic_tools();
+        let tools = dynamic_tools(tool_list());
         let tools = tools.as_array().unwrap();
         assert!(tools.iter().any(|t| t["name"] == "bbs_send"));
         for name in [

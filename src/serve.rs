@@ -1042,6 +1042,24 @@ impl Bbs for Server {
         self.0.protocol.finish(result)
     }
 
+    async fn blocker_preference(
+        &self,
+        req: Request<proto::BlockerPreferenceRequest>,
+    ) -> Result<Response<proto::BlockerPreferenceResponse>, Status> {
+        let effect = if req.get_ref().enabled.is_some() {
+            Effect::Write
+        } else {
+            Effect::Query
+        };
+        self.unary(
+            "blocker_preference",
+            req,
+            effect,
+            service::blocker_preference,
+        )
+        .await
+    }
+
     async fn list_blockers(
         &self,
         req: Request<proto::ListBlockersRequest>,

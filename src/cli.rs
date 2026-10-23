@@ -280,6 +280,10 @@ pub enum TimerCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum BlockerCommand {
+    /// Enable blocker tools for all your headless agents (humans only).
+    Enable,
+    /// Disable blocker tools for all your headless agents (the default).
+    Disable,
     /// List current versions, oldest first; reads are board-wide.
     List {
         #[arg(long, conflicts_with = "agent")]
