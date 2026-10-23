@@ -400,7 +400,7 @@ fn local(stored: &str) -> Option<DateTime<Local>> {
 
 /// How long ago `stored` was, as at most two nonzero day/hour/minute units
 /// plus "ago": "14m ago", "1h53m ago", "3d4h ago" (never "3d4h17m ago").
-/// Under a minute, or in the future from clock skew, shows "0m ago". A
+/// Under a minute, or in the future from clock skew, shows "now". A
 /// missing or unparseable time stays blank.
 pub fn age(stored: &str, now: DateTime<Local>) -> String {
     let Some(t) = local(stored) else {
@@ -419,7 +419,7 @@ pub fn age(stored: &str, now: DateTime<Local>) -> String {
         .map(|(n, u)| format!("{n}{u}"))
         .collect();
     match shown.is_empty() {
-        true => "0m ago".to_string(),
+        true => "now".to_string(),
         false => format!("{} ago", shown.join("")),
     }
 }
@@ -694,9 +694,9 @@ mod tests {
             ("", ""),
             ("not a time", ""),
             // Future clock skew clamps to zero.
-            ("2026-10-18T12:00:01Z", "0m ago"),
-            ("2026-10-18T12:00:00Z", "0m ago"),
-            ("2026-10-18T11:59:01Z", "0m ago"),
+            ("2026-10-18T12:00:01Z", "now"),
+            ("2026-10-18T12:00:00Z", "now"),
+            ("2026-10-18T11:59:01Z", "now"),
             ("2026-10-18T11:59:00Z", "1m ago"),
             ("2026-10-18T11:46:00Z", "14m ago"),
             ("2026-10-18T11:00:00Z", "1h ago"),

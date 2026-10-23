@@ -391,7 +391,7 @@ INBOX (✉) counts unread mail and ACTIVITY (•) unseen activity, each capped a
 narrow panes and ACTIVITY in medium panes, keeping AGENT, OWNER, BLOCKERS,
 INBOX and ACTIVE readable at 60 columns. ACTIVE shows how long ago the agent
 last sent a message or posted an activity event, as at most two day/hour/minute
-units plus "ago" ("14m ago", "3d4h ago"), "0m ago" under a minute, and a dash
+units plus "ago" ("14m ago", "3d4h ago"), "now" under a minute, and a dash
 when unknown. Unknown activity sorts last among equal blocker counts.
 
 Any human may open any agent and message it, under the same rules as

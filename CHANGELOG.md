@@ -24,6 +24,8 @@ rather than falling back to anything else.
 
 ### Changed
 
+- `bbs connect` shows `now` instead of `0m ago` for anything under a minute
+  old: the Agents page's ACTIVE column and Ctrl-P message ages.
 - Ctrl-P also finds agents by their status, as the last cached agent list gave
   it; name matches still come first, and a status match shows the matching part
   of the status.

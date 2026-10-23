@@ -3883,6 +3883,15 @@ mod tests {
             result: Ok(vec![sum(Some("2026-10-18T11:56:00Z"))]),
         }));
         assert!(screen(&mut app, 80, 24).contains("4m ago"));
+        // Under a minute, or ahead from clock skew, is "now".
+        for sent in ["2026-10-18T11:59:01Z", "2026-10-18T12:00:30Z"] {
+            app.on_event(Event::Data(Data::Summary {
+                id,
+                result: Ok(vec![sum(Some(sent))]),
+            }));
+            let out = screen(&mut app, 80, 24);
+            assert!(out.contains(" now ") && !out.contains("0m ago"), "{out}");
+        }
         // An old server has no summaries; the list's value (none here) rules.
         app.on_event(Event::Data(Data::Summary {
             id,

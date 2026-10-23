@@ -1340,7 +1340,7 @@ mod tests {
                     assert_eq!(find("@jefe crew  group"), Some(agent + 1), "{text}");
                     for (offset, expect) in [
                         (2, "Zed → Mateo  undated jefe note"),
-                        (3, "0m ago  Zed → Mateo  future jefe note"),
+                        (3, "now  Zed → Mateo  future jefe note"),
                         (4, "3d4h ago  Zed → Mateo  Ünïcode JEFE note"),
                         (5, "1h53m ago  Zed → Mateo  second jefe note"),
                         (6, "34m ago  Zed → Mateo  hello Jefe there"),
