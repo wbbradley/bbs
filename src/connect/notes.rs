@@ -158,13 +158,14 @@ impl NoteEditor {
         self.edit(|composer| composer.paste(text));
     }
 
-    /// Apply `change`, then take it back if the note may not change or
-    /// would grow past its limit.
+    /// Apply `change`, then put the editor back exactly as it was, history
+    /// and selection included, if the note may not change or would grow
+    /// past its limit.
     fn edit(&mut self, change: impl FnOnce(&mut Composer)) {
-        let before = self.text.text();
+        let before = self.text.clone();
         change(&mut self.text);
         let after = self.text.text();
-        if after == before {
+        if after == before.text() {
             return;
         }
         let refused = match self.access {
@@ -178,7 +179,7 @@ impl NoteEditor {
             Access::Retired => Some("the agent retired; its note is read-only".to_string()),
         };
         if let Some(why) = refused {
-            self.text.undo();
+            self.text = before;
             self.error = Some(why);
         } else {
             self.error = None;
@@ -604,6 +605,47 @@ mod tests {
         assert_eq!(ctrl_s(&mut editor, 1), Outcome::Stay);
         assert_eq!(esc(&mut editor, 1), Outcome::Close, "no refused write");
         assert_eq!(editor.draft().text, "stored unsaved");
+    }
+
+    #[test]
+    fn undo_and_redo_cannot_change_a_read_only_note() {
+        let mut editor = loaded("stored");
+        press(&mut editor, KeyCode::End, KeyModifiers::NONE, 0);
+        typed(&mut editor, " one");
+        typed(&mut editor, " two");
+        editor.stored("stored", true);
+        let before = editor.draft();
+        for (code, modifiers) in [
+            (KeyCode::Char('_'), KeyModifiers::CONTROL),
+            (KeyCode::Char('/'), KeyModifiers::CONTROL),
+            (KeyCode::Char('7'), KeyModifiers::CONTROL),
+            (KeyCode::Char('z'), KeyModifiers::CONTROL),
+            (KeyCode::Char('r'), KeyModifiers::CONTROL),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL),
+            (KeyCode::Backspace, KeyModifiers::NONE),
+        ] {
+            press(&mut editor, code, modifiers, 0);
+            assert_eq!(editor.draft(), before, "{code:?}");
+        }
+        // Moving and selecting to copy still work.
+        press(&mut editor, KeyCode::Home, KeyModifiers::NONE, 0);
+        assert_eq!(editor.draft().cursor, (0, 0));
+        assert_eq!(editor.draft().text, before.text);
+    }
+
+    #[test]
+    fn a_refused_paste_keeps_the_undo_history() {
+        let mut editor = loaded(&"x".repeat(MAX_NOTE_BYTES - 10));
+        press(&mut editor, KeyCode::End, KeyModifiers::NONE, 0);
+        typed(&mut editor, "ab");
+        editor.paste(&"y".repeat(20));
+        assert_eq!(editor.draft().text.len(), MAX_NOTE_BYTES - 8);
+        press(&mut editor, KeyCode::Char('_'), KeyModifiers::CONTROL, 0);
+        assert_eq!(
+            editor.draft().text.len(),
+            MAX_NOTE_BYTES - 9,
+            "undo takes back the b"
+        );
     }
 
     #[test]

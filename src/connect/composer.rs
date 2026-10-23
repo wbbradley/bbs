@@ -16,6 +16,7 @@ use super::theme;
 /// Text lines when empty; the box grows from here.
 const MIN_LINES: u16 = 1;
 
+#[derive(Clone)]
 pub struct Composer {
     text: TextArea<'static>,
     /// Who it sends to: an agent's name or `@group`.
@@ -264,11 +265,6 @@ impl Composer {
     /// The whole draft.
     pub fn text(&self) -> String {
         self.text.lines().join("\n")
-    }
-
-    /// Take back the last edit.
-    pub fn undo(&mut self) {
-        self.text.undo();
     }
 
     pub fn sending(&self) -> bool {
