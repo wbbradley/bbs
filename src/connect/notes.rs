@@ -95,10 +95,6 @@ impl NoteEditor {
         self.text.text() != self.saved
     }
 
-    pub fn saving(&self) -> bool {
-        self.saving.is_some()
-    }
-
     /// The stored note has arrived (`None`: there is none yet).
     pub fn loaded(&mut self, body: Option<&str>) {
         if self.access != Access::Loading {
@@ -583,7 +579,7 @@ mod tests {
         assert_eq!(ctrl_s(&mut editor, 2), save(2, "one\ntwo"));
         assert_eq!(ctrl_s(&mut editor, 3), Outcome::Stay, "one save at a time");
         assert_eq!(editor.saved(2, Ok("one\ntwo".into()), 4), Outcome::Stay);
-        assert!(!editor.dirty() && !editor.saving());
+        assert!(!editor.dirty() && editor.saving.is_none());
         assert_eq!(ctrl_s(&mut editor, 5), Outcome::Stay);
     }
 
@@ -626,7 +622,7 @@ mod tests {
         typed(&mut editor, " more");
         // A stale or unknown answer changes nothing.
         assert_eq!(editor.saved(9, Ok("other".into()), 10), Outcome::Stay);
-        assert!(editor.saving());
+        assert!(editor.saving.is_some());
         assert_eq!(esc(&mut editor, 2), Outcome::Stay, "waits for the save");
         assert_eq!(
             editor.saved(1, Ok("first".into()), 3),
