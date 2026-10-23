@@ -16,11 +16,16 @@ use super::navigation::Conversation;
 use super::theme::{self, Role};
 use crate::proto;
 use crate::ui::message::fold;
+use unicode_width::UnicodeWidthStr;
 
 const MAX_MESSAGES: usize = 10_000;
 const MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESULTS: usize = 50;
 const MAX_QUERY_CHARS: usize = 256;
+/// Columns kept before a match when a result is cropped to show it.
+const CONTEXT: usize = 8;
+/// Columns the sender and recipient keep, separator included, when shortened.
+const MIN_NAMES: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -458,7 +463,7 @@ impl Picker {
         self.query
             .set_placeholder_style(theme::on_surface(surface, theme::style(Role::Muted)));
         frame.render_widget(&self.query, Rect::new(inner.x, inner.y, inner.width, 1));
-        let query = self.query.lines()[0].trim().to_string();
+        let query: String = self.query.lines()[0].trim().chars().map(fold).collect();
         let first = self.selected.saturating_sub(shown - 1);
         if self.hits.is_empty() {
             frame.render_widget(
@@ -473,9 +478,10 @@ impl Picker {
             } else {
                 surface
             };
+            let width = usize::from(inner.width);
             let line = theme::clip_line(
-                result_line(hit, cache, &query, row_style, now),
-                usize::from(inner.width),
+                result_line(hit, cache, &query, row_style, now, width),
+                width,
             );
             frame.render_widget(
                 Paragraph::new(line).style(row_style),
@@ -510,6 +516,7 @@ fn result_line(
     query: &str,
     row: Style,
     now: DateTime<Local>,
+    width: usize,
 ) -> Line<'static> {
     let on = |role| theme::on_surface(row, theme::style(role));
     let mut spans = Vec::new();
@@ -524,10 +531,15 @@ fn result_line(
             spans.push(Span::styled("  group", on(Role::Muted)));
         }
         Target::Message(id) => {
+            let mut text = hit.text.clone();
             if let Some(m) = cache.message(*id) {
                 let ago = crate::ui::message::age(&m.created_at, now);
+                // Leave the last column for the ellipsis of a clipped line.
+                let mut budget = width.saturating_sub(1);
                 if !ago.is_empty() {
-                    spans.push(Span::styled(format!("{ago}  "), on(Role::Timestamp)));
+                    let ago = format!("{ago}  ");
+                    budget = budget.saturating_sub(ago.width());
+                    spans.push(Span::styled(ago, on(Role::Timestamp)));
                 }
                 let to = m
                     .to_group
@@ -535,12 +547,30 @@ fn result_line(
                     .map(|g| format!("@{g}"))
                     .or_else(|| m.to_name.clone())
                     .unwrap_or_default();
-                spans.push(Span::styled(
-                    format!("{} → {to}  ", m.from_name),
-                    on(Role::Text),
-                ));
+                let who = format!("{} → {to}", m.from_name);
+                let mut names = who.width() + 2;
+                // Keep the first match in view: crop the line before it,
+                // then shorten the names if that is still not enough.
+                let first = |text: &str| {
+                    crate::ui::message::find_matches(text, query)
+                        .first()
+                        .cloned()
+                };
+                if let Some(found) = first(&text)
+                    && names + text[..found.end].width() > budget
+                {
+                    text = crop_before(&text, found.start);
+                }
+                if let Some(found) = first(&text) {
+                    let floor = names.min(MIN_NAMES);
+                    names = names
+                        .min(budget.saturating_sub(text[..found.end].width()))
+                        .max(floor);
+                }
+                spans.extend(theme::clip_line(Line::styled(who, on(Role::Text)), names - 2).spans);
+                spans.push(Span::styled("  ", on(Role::Text)));
             }
-            spans.extend(marked(&hit.text, query, on(Role::Text), row));
+            spans.extend(marked(&text, query, on(Role::Text), row));
         }
     }
     Line::from(spans)
@@ -656,6 +686,24 @@ fn rank(query: &str, folded: &str) -> Option<Rank> {
         }
     }
     None
+}
+
+/// `text` from a little before byte `at`, marked as cut.
+fn crop_before(text: &str, at: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut start = at;
+    let mut kept = 0;
+    for (i, part) in text[..at].grapheme_indices(true).rev() {
+        kept += part.width();
+        if kept > CONTEXT {
+            break;
+        }
+        start = i;
+    }
+    if start == 0 {
+        return text.to_string();
+    }
+    format!("…{}", &text[start..])
 }
 
 fn snippet(text: &str, at: usize) -> String {
@@ -1219,6 +1267,103 @@ mod tests {
                 .modifier
                 .contains(ratatui::style::Modifier::BOLD)
         );
+    }
+
+    /// Each row of the picker drawn at `width` x 24 for `query`, with the
+    /// text of the cells marked as search hits.
+    fn marked_rows(cache: &Cache, query: &str, width: u16) -> Vec<(String, String)> {
+        use crate::ui::theme::{Scheme, testing::with_scheme};
+        let mut rows = Vec::new();
+        with_scheme(Scheme::Gruvbox, || {
+            let mut picker = Picker::new(cache);
+            picker.paste(query, cache);
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|f| picker.render(f, f.area(), cache, Local::now()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let hit = theme::style(Role::SearchHit).fg;
+            for y in 0..24 {
+                let cells = (0..width).map(|x| &buffer[(x, y)]);
+                rows.push((
+                    cells.clone().map(|c| c.symbol()).collect(),
+                    cells
+                        .filter(|c| Some(c.fg) == hit)
+                        .map(|c| c.symbol())
+                        .collect(),
+                ));
+            }
+        });
+        rows
+    }
+
+    #[test]
+    fn queries_match_whatever_their_case_and_keep_accents_with_their_letters() {
+        let mut cache = Cache::default();
+        cache.agent("Jefe");
+        cache.agent("\u{212a}elvin");
+        cache.observe(&feed(1, "please ask Rene\u{301}e"));
+        let rows = |query| marked_rows(&cache, query, 80);
+        let jefe = rows("JEFE");
+        assert!(
+            jefe.iter()
+                .any(|(row, hit)| row.contains("Jefe  agent") && hit == "Jefe")
+        );
+        for query in ["KELVIN", "kelvin"] {
+            assert!(
+                rows(query).iter().any(|(_, hit)| hit == "\u{212a}elvin"),
+                "{query}"
+            );
+        }
+        assert!(
+            rows("RENE\u{301}")
+                .iter()
+                .any(|(_, hit)| hit == "Rene\u{301}"),
+            "{:?}",
+            rows("RENE\u{301}")
+        );
+    }
+
+    #[test]
+    fn a_late_match_stays_in_view_beside_the_age_and_names() {
+        let now = Local::now();
+        let body = "an ordinary update that goes on for a good while before the needle shows up";
+        let mut cache = Cache::default();
+        for (id, from, to) in [
+            (1, "John", "wbbradley"),
+            (2, "Bartholomew-the-long-named", "Maximiliana-of-the-crew"),
+        ] {
+            cache.observe(&Data::Feed {
+                id: 1,
+                result: Ok(vec![proto::Message {
+                    id,
+                    created_at: (now - chrono::Duration::minutes(113)).to_rfc3339(),
+                    from_kind: proto::Kind::Agent as i32,
+                    from_name: from.into(),
+                    to_name: Some(to.into()),
+                    body: body.into(),
+                    ..Default::default()
+                }]),
+            });
+        }
+        let rows = marked_rows(&cache, "NEEDLE", 60);
+        let text = rows
+            .iter()
+            .map(|(row, _)| row.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ordinary = rows
+            .iter()
+            .find(|(row, _)| row.contains("1h53m ago  John → wbbradley  …"))
+            .expect(&text);
+        assert_eq!(ordinary.1, "needle", "{text}");
+        let long = rows
+            .iter()
+            .find(|(row, _)| row.contains("1h53m ago  Bartholomew"))
+            .expect(&text);
+        assert_eq!(long.1, "needle", "{text}");
+        assert!(long.0.contains("… "), "the names are shortened: {text}");
+        assert!(!long.0.contains("Maximiliana-of-the-crew"), "{text}");
     }
 
     #[test]

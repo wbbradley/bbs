@@ -447,7 +447,8 @@ beneath it, including its draft, cursor, selection, scroll position and open
 dialogs.
 The panel fills the terminal less a small margin. Each result takes one row:
 an agent name, `@` and a group name, or a cached message's age, sender,
-recipient and line. Text matching the query is bold in the search-hit colour,
+recipient and line, cropped and with names shortened when needed to keep
+the first match in view. Text matching the query is bold in the search-hit colour,
 also on the selected row, and the list scrolls through up to 50 results.
 `Ctrl-c` still quits. The blocker modal keeps `Ctrl-p` while it is open;
 likewise, the launcher keeps `F2` until it closes.
