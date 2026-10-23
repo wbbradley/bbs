@@ -1511,6 +1511,7 @@ mod tests {
                             body: format!("mail {n}"),
                             ..Default::default()
                         }],
+                        ..Default::default()
                     },
                     n == 0,
                 )

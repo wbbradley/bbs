@@ -2064,6 +2064,9 @@ pub fn feed(
                 req.backlog
             );
         }
+        if req.sync {
+            return sync_page(ctx.conn, me.id, &req);
+        }
         if req.include_group_deliveries && req.with.is_none() {
             bail!("include_group_deliveries requires a with filter");
         }
@@ -2110,19 +2113,99 @@ pub fn feed(
             .into_iter()
             .map(|m| message(m, None))
             .collect();
-        Ok(proto::FeedSnapshot { messages })
+        Ok(proto::FeedSnapshot {
+            messages,
+            ..Default::default()
+        })
     })
 }
 
+/// Most encoded bytes in one sync snapshot: tonic's default decoder limit, so
+/// any client can read a page, and far below this client's own.
+pub const MAX_SYNC_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// One page of the caller's personal history after `after_id` (feed-sync.v1):
+/// at most `backlog` messages and `MAX_SYNC_PAGE_BYTES`, each with the
+/// caller's agents whose conversation holds it, and whether nothing further
+/// matched when it was read. A message is never cut short; one that would
+/// cross the byte budget waits for the next page.
+fn sync_page(
+    conn: &Connection,
+    human: i64,
+    req: &proto::FeedRequest,
+) -> Result<proto::FeedSnapshot> {
+    let filtered = req.group.is_some()
+        || req.from.is_some()
+        || req.from_human.is_some()
+        || req.with.is_some()
+        || req.since.is_some()
+        || req.until.is_some()
+        || req.include_group_deliveries;
+    if !req.mine || filtered {
+        bail!("feed sync is for the caller's whole personal history: mine, with no other filter");
+    }
+    let Some(after) = req.after_id.filter(|after| *after >= 0) else {
+        bail!("feed sync needs a cursor: after_id of 0 or more");
+    };
+    let filter = db::FeedFilter {
+        group_ids: None,
+        senders: None,
+        from_human: None,
+        with: None,
+        include_group_deliveries: false,
+        since: None,
+        until: None,
+        scope: Some(human),
+        after_id: Some(after),
+        before_id: None,
+    };
+    // One row past the page, in the same read, says whether more follow.
+    let rows = db::feed_messages(conn, req.backlog + 1, &filter)?;
+    let ids: Vec<i64> = rows.iter().map(|m| m.id).collect();
+    let mut scopes = db::owned_agent_scopes(conn, human, &ids)?;
+    let mut page = proto::FeedSnapshot::default();
+    let mut bytes = 0;
+    let mut caught_up = true;
+    for row in rows {
+        let scope = proto::FeedAgentScope {
+            message_id: row.id,
+            agents: scopes
+                .remove(&row.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, name)| proto::FeedAgent { id, name })
+                .collect(),
+        };
+        let message = message(row, None);
+        // Each field's tag and length prefix, generously.
+        let size =
+            prost::Message::encoded_len(&message) + prost::Message::encoded_len(&scope) + 2 * 16;
+        let full = page.messages.len() == req.backlog as usize;
+        if full || (!page.messages.is_empty() && bytes + size > MAX_SYNC_PAGE_BYTES) {
+            caught_up = false;
+            break;
+        }
+        bytes += size;
+        page.messages.push(message);
+        page.agent_scopes.push(scope);
+    }
+    page.caught_up = Some(caught_up);
+    Ok(page)
+}
+
 /// After sending a cursor-mode snapshot, move the cursor past it. Returns
-/// whether the batch was full, so more matching messages may be waiting and
-/// the feed should fetch again before waiting for the next change.
+/// whether more matching messages may be waiting, so the feed should fetch
+/// again before waiting for the next change: a full batch, or in sync mode a
+/// page that is not caught up.
 pub fn advance_feed_cursor(req: &mut proto::FeedRequest, sent: &proto::FeedSnapshot) -> bool {
     let Some(after) = &mut req.after_id else {
         return false;
     };
     if let Some(last) = sent.messages.last() {
         *after = last.id;
+    }
+    if req.sync {
+        return sent.caught_up == Some(false);
     }
     sent.messages.len() >= req.backlog as usize
 }

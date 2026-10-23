@@ -77,6 +77,7 @@ fn request(args: &ViewArgs, now: DateTime<Utc>) -> Result<FeedRequest> {
         after_id: None,
         with: args.with.clone(),
         include_group_deliveries: false,
+        sync: false,
     })
 }
 

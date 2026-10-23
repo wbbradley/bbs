@@ -39,6 +39,8 @@ pub const MESSAGE_SEARCH: &str = "message-search.v1";
 pub const BLOCKERS: &str = "blockers.v1";
 pub const BLOCKERS_MINE: &str = "blockers-mine.v1";
 pub const AGENT_NOTES: &str = "agent-notes.v1";
+/// Replicating the caller's whole personal history with `FeedRequest.sync`.
+pub const FEED_SYNC: &str = "feed-sync.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -767,7 +769,9 @@ impl Backend {
         Ok(match self {
             Backend::Local(local) => Watch::local(local, req),
             Backend::Remote(r) => {
-                let capabilities: &[&str] = if req.with.is_some() {
+                let capabilities: &[&str] = if req.sync {
+                    &["owner-attribution.v1", "feed-filter.v1", FEED_SYNC]
+                } else if req.with.is_some() {
                     &["owner-attribution.v1", "feed-filter.v1", "feed-with.v1"]
                 } else if require_filter || feed_filtered(&req) {
                     &["owner-attribution.v1", "feed-filter.v1"]
@@ -930,7 +934,13 @@ impl<'a, R: Watched> Watch<'a, R> {
 
 impl FeedWatch<'_> {
     pub async fn next(&mut self) -> Result<Vec<proto::Message>> {
-        Ok(self.snapshot().await?.messages)
+        Ok(self.next_snapshot().await?.messages)
+    }
+
+    /// The whole snapshot: in sync mode, with whether it is caught up and
+    /// each message's agents.
+    pub async fn next_snapshot(&mut self) -> Result<proto::FeedSnapshot> {
+        self.snapshot().await
     }
 }
 

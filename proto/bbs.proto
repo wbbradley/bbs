@@ -662,8 +662,30 @@ message FeedRequest {
   // Optional
   // presentation enrichment: old servers ignore it and retain the direct-only feed.
   bool include_group_deliveries = 10;
+  // Replication of the caller's whole personal history (feed-sync.v1): only
+  // with mine, a cursor (after_id >= 0) and no other filter. Snapshots say
+  // whether they are caught up and which of the caller's agents each message
+  // belongs to; pages are bounded in bytes as well as by backlog.
+  bool sync = 11;
 }
-message FeedSnapshot { repeated Message messages = 1; }
+message FeedSnapshot {
+  repeated Message messages = 1;
+  // Sync only: no further matching message existed when this page was read.
+  optional bool caught_up = 2;
+  // Sync only: one entry per message, in the same order.
+  repeated FeedAgentScope agent_scopes = 3;
+}
+// The caller's own agents, live or retired, whose conversation holds a
+// message: they sent it, or it was delivered to them when sent (directly or
+// to a group they were then in).
+message FeedAgentScope {
+  int64 message_id = 1;
+  repeated FeedAgent agents = 2;  // by id, each once; empty when none
+}
+message FeedAgent {
+  int64 id = 1;
+  string name = 2;
+}
 
 // Literal substring search of stored message bodies, newest id first. Filters
 // have the same meaning as FeedRequest. No inbox or caller-owner restriction.

@@ -1652,6 +1652,54 @@ fn owned_agents(conn: &Connection, human: i64) -> Result<Vec<i64>> {
         .collect::<Result<_, _>>()?)
 }
 
+/// For each of `messages`, the agents this human owns, live or retired, whose
+/// conversation holds it: the sender, or a recipient when it was sent. Each
+/// agent once, by id, with its current name; messages with none are absent.
+pub fn owned_agent_scopes(
+    conn: &Connection,
+    human: i64,
+    messages: &[i64],
+) -> Result<HashMap<i64, Vec<(i64, String)>>> {
+    let mut scopes: HashMap<i64, Vec<(i64, String)>> = HashMap::new();
+    if messages.is_empty() {
+        return Ok(scopes);
+    }
+    let ids = vec!["?"; messages.len()].join(", ");
+    let sql = format!(
+        "SELECT m.id, a.id, a.name FROM messages m
+         JOIN agent_owners o ON o.agent_id = m.from_id AND o.human_id = ?1
+         JOIN agents a ON a.id = m.from_id
+         WHERE m.from_kind = 'agent' AND m.id IN ({ids})
+         UNION
+         SELECT d.message_id, a.id, a.name FROM deliveries d
+         JOIN agent_owners o ON o.agent_id = d.recipient_id AND o.human_id = ?1
+         JOIN agents a ON a.id = d.recipient_id
+         WHERE d.recipient_kind = 'agent' AND d.message_id IN ({ids})
+         ORDER BY 1, 2"
+    );
+    let mut args = vec![rusqlite::types::Value::Integer(human)];
+    for _ in 0..2 {
+        args.extend(
+            messages
+                .iter()
+                .map(|&id| rusqlite::types::Value::Integer(id)),
+        );
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (message, agent, name) = row?;
+        scopes.entry(message).or_default().push((agent, name));
+    }
+    Ok(scopes)
+}
+
 type Args = Vec<rusqlite::types::Value>;
 
 /// One way a message can match an any-of filter, walked through its own index
