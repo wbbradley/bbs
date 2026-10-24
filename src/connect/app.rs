@@ -13183,4 +13183,18 @@ mod tests {
             Some("Agent notes need the server.".into())
         );
     }
+
+    #[test]
+    fn a_reset_clears_stored_rows_from_open_conversations() {
+        use crate::connect::event::HistoryState;
+        let dir = tempfile::tempdir().unwrap();
+        stored_history(dir.path(), 30, &[(30, "from the old history")]);
+        let (mut app, mut rx) = app();
+        let mut found = with_stored(&mut app, dir.path());
+        mateo_streams(&mut app, &mut rx);
+        pump(&mut app, &mut found);
+        assert!(screen(&mut app, 80, 24).contains("from the old history"));
+        app.on_event(history_state(&app, HistoryState::Reset));
+        assert!(!screen(&mut app, 80, 24).contains("from the old history"));
+    }
 }
