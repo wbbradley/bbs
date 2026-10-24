@@ -128,6 +128,9 @@ pub trait Screen {
     fn forget_stored(&mut self) -> Vec<Request> {
         Vec::new()
     }
+    /// The server stopped answering: what is held may be stale until the
+    /// screen's own data comes again.
+    fn went_offline(&mut self) {}
     /// Reset before re-fetching; return any obsolete subscriptions to cancel.
     fn reload(&mut self) -> Vec<Request> {
         Vec::new()
@@ -956,6 +959,9 @@ impl App {
     /// from being edited until it is back.
     fn go_offline(&mut self) {
         self.offline = true;
+        for screen in &mut self.stack {
+            screen.went_offline();
+        }
         if let Some(editor) = &mut self.note_editor {
             editor.pause();
         }
@@ -1325,6 +1331,7 @@ impl App {
     }
 
     fn settle_note(&mut self, live: &HashSet<i64>) {
+        let offline = self.offline;
         let Some(editor) = &mut self.note_editor else {
             return;
         };
@@ -1345,7 +1352,10 @@ impl App {
                 editor.keep(draft);
             }
         }
-        editor.resume();
+        // Only the server coming back resumes an editor paused offline.
+        if !offline {
+            editor.resume();
+        }
         if let Some(note) = row {
             editor.stored(&note.body, note.retired);
         }
@@ -13223,5 +13233,68 @@ mod tests {
             !screen(&mut app, 80, 24).contains("an ancient needle"),
             "a late answer opens nothing"
         );
+    }
+
+    #[test]
+    fn coming_back_reads_nothing_before_the_conversation_is_fresh_again() {
+        use crate::connect::event::HistoryState;
+        let (mut app, mut rx) = app();
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(7, "Mateo", "ada", "unread")]),
+        }));
+        app.on_event(history_state(
+            &app,
+            HistoryState::Reconnecting("reset".into()),
+        ));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        // The server answers summaries again, but this conversation has not.
+        inbox_rows(&mut app, &[("Mateo", 1, "2026-10-16T18:00:00.000000Z")]);
+        assert!(!app.offline);
+        typed(&mut app, "x");
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
+            "{sent:?}"
+        );
+        // Its feed shows it again: now it reads.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(7, "Mateo", "ada", "unread")]),
+        }));
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|r| r == Request::MarkRead("Mateo".into()))
+        );
+    }
+
+    #[test]
+    fn a_note_paused_offline_stays_paused_whatever_arrives_late() {
+        use crate::connect::event::HistoryState;
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![]);
+        f3(&mut app);
+        typed(&mut app, "a");
+        app.on_event(history_state(
+            &app,
+            HistoryState::Reconnecting("reset".into()),
+        ));
+        // A late, stale note page arrives and settles the editor.
+        app.on_event(Event::Data(Data::NotesListed {
+            id: 999_999,
+            result: Err(SideError::Transient("late".into())),
+        }));
+        typed(&mut app, "b");
+        assert_eq!(note_text(&app).as_deref(), Some("a"), "still paused");
+        // The server is back: editing resumes.
+        live(&mut app, &[("Mateo", 7), ("Grove", 8)]);
+        assert!(!app.offline);
+        typed(&mut app, "b");
+        assert_eq!(note_text(&app).as_deref(), Some("ab"));
     }
 }

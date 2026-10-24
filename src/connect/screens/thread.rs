@@ -1373,6 +1373,11 @@ impl Screen for Thread {
         requests
     }
 
+    fn went_offline(&mut self) {
+        // Read nothing until the feed shows the conversation again.
+        self.feed_loaded = false;
+    }
+
     fn forget_stored(&mut self) -> Vec<Request> {
         self.messages.clear();
         self.message_gaps.clear();
