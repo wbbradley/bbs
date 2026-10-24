@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui_textarea::TextArea;
 
 use super::event::Data;
+use super::history::Found;
 use super::navigation::Conversation;
 use super::theme::{self, Role};
 use crate::proto;
@@ -238,6 +239,40 @@ impl Cache {
         self.messages.get(&id).map(|cached| &cached.message)
     }
 
+    /// Stored messages, each with the human's agents whose conversations
+    /// hold it, to open as if received: a chosen search hit and its context.
+    pub fn adopt(&mut self, rows: impl IntoIterator<Item = (proto::Message, Vec<String>)>) {
+        for (message, agents) in rows {
+            if message.body.len() > MAX_TEXT_BYTES {
+                continue;
+            }
+            let sources = agents.into_iter().map(Conversation::Agent).collect();
+            match self.messages.get_mut(&message.id) {
+                Some(held) => {
+                    for source in sources {
+                        if !held.sources.iter().any(|s: &Conversation| s.same(&source)) {
+                            held.sources.push(source);
+                        }
+                    }
+                }
+                None => {
+                    self.text_bytes += message.body.len();
+                    let folded = folded(&message.body);
+                    self.messages.insert(
+                        message.id,
+                        CachedMessage {
+                            message,
+                            sources,
+                            folded,
+                        },
+                    );
+                }
+            }
+            self.revision = self.revision.wrapping_add(1);
+        }
+        self.prune(MAX_MESSAGES, MAX_TEXT_BYTES);
+    }
+
     /// A broadcast opens its group; direct mail opens its agent's conversation.
     /// Mail without an agent participant belongs in Feed.
     pub fn destination(&self, id: i64) -> Option<Conversation> {
@@ -296,6 +331,12 @@ impl Cache {
     }
 
     pub fn search(&self, query: &str) -> Vec<Hit> {
+        self.search_with(query, &[])
+    }
+
+    /// As `search`, with messages the stored history found for `query`
+    /// ranked among the held ones.
+    pub fn search_with(&self, query: &str, stored: &[Found]) -> Vec<Hit> {
         let query = folded(query.trim());
         // The open state is names, then recent mail: no body scan or ranking.
         if query.is_empty() {
@@ -424,6 +465,20 @@ impl Cache {
                 });
             }
         }
+        for found in stored {
+            if self.messages.contains_key(&found.message.id) {
+                continue;
+            }
+            candidates.push(Candidate {
+                kind: 4,
+                id: found.message.id,
+                line: 0,
+                name: "",
+                text: &found.text,
+                indexed: &found.indexed,
+                rank: found.rank,
+            });
+        }
         if candidates.len() > MAX_RESULTS {
             candidates.select_nth_unstable_by(MAX_RESULTS, Candidate::compare);
             candidates.truncate(MAX_RESULTS);
@@ -466,6 +521,8 @@ pub struct Picker {
     hits: Vec<Hit>,
     selected: usize,
     revision: u64,
+    /// What the stored history found for the query.
+    stored: Vec<Found>,
 }
 
 impl Picker {
@@ -477,7 +534,27 @@ impl Picker {
             hits: cache.search(""),
             selected: 0,
             revision: cache.revision,
+            stored: Vec::new(),
         }
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query.lines()[0]
+    }
+
+    /// The stored history's results for `query`, if it is still the query.
+    pub fn stored(&mut self, query: &str, found: Vec<Found>, cache: &Cache) {
+        if query != self.query() {
+            return;
+        }
+        self.stored = found;
+        self.revision = cache.revision.wrapping_sub(1);
+        self.refresh(cache);
+    }
+
+    /// A stored message among the results, not held in the cache.
+    pub fn found(&self, id: i64) -> Option<&Found> {
+        self.stored.iter().find(|f| f.message.id == id)
     }
 
     pub fn refresh(&mut self, cache: &Cache) {
@@ -485,7 +562,7 @@ impl Picker {
             return;
         }
         let selected = self.hits.get(self.selected).map(|h| h.target.clone());
-        self.hits = cache.search(&self.query.lines()[0]);
+        self.hits = cache.search_with(&self.query.lines()[0], &self.stored);
         self.selected = selected
             .and_then(|target| self.hits.iter().position(|h| h.target == target))
             .unwrap_or(0);
@@ -493,6 +570,8 @@ impl Picker {
     }
 
     fn edited(&mut self, cache: &Cache) {
+        // The stored results for the old query no longer apply.
+        self.stored.clear();
         self.hits = cache.search(&self.query.lines()[0]);
         self.selected = 0;
         self.revision = cache.revision;
@@ -604,7 +683,7 @@ impl Picker {
             };
             let width = usize::from(inner.width);
             let line = theme::clip_line(
-                result_line(hit, cache, &query, row_style, now, width),
+                result_line(hit, cache, &self.stored, &query, row_style, now, width),
                 width,
             );
             frame.render_widget(
@@ -637,6 +716,7 @@ impl Picker {
 fn result_line(
     hit: &Hit,
     cache: &Cache,
+    stored: &[Found],
     query: &str,
     row: Style,
     now: DateTime<Local>,
@@ -678,7 +758,13 @@ fn result_line(
         }
         Target::Message(id) => {
             let mut text = hit.text.clone();
-            if let Some(m) = cache.message(*id) {
+            let message = cache.message(*id).or_else(|| {
+                stored
+                    .iter()
+                    .find(|f| f.message.id == *id)
+                    .map(|f| &f.message)
+            });
+            if let Some(m) = message {
                 let ago = crate::ui::message::age(&m.created_at, now);
                 // Leave the last column for the ellipsis of a clipped line.
                 let mut budget = width.saturating_sub(1);
@@ -1808,6 +1894,86 @@ mod tests {
             Some(" Mateo  agent"),
             "{row}"
         );
+    }
+
+    #[test]
+    fn stored_history_hits_rank_among_held_messages_and_open_with_their_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::connect::history::Store::open(dir.path()).unwrap();
+        let row = |id: i64, body: &str| proto::Message {
+            id,
+            created_at: "2026-10-01T12:00:00Z".into(),
+            from_kind: proto::Kind::Agent as i32,
+            from_name: "Zed".into(),
+            to_name: Some("ada".into()),
+            body: body.into(),
+            ..Default::default()
+        };
+        store
+            .apply(
+                &crate::connect::history::Batch {
+                    messages: vec![
+                        row(1, "an old needle"),
+                        row(2, "older context"),
+                        row(3, "a held needle too"),
+                    ],
+                    scopes: (1..=3).map(|id| (id, vec![(7, "Zed".into())])).collect(),
+                    caught_up: true,
+                },
+                false,
+            )
+            .unwrap();
+        let mut cache = Cache::default();
+        cache.observe(&feed(3, "a held needle too"));
+        cache.observe(&feed(9, "the newest needle"));
+        let found = store.search("needle", 50, &|| false).unwrap().unwrap();
+        // Held messages are not listed twice; the stored one ranks by age.
+        let hits = cache.search_with("needle", &found);
+        let targets: Vec<_> = hits.iter().map(|h| h.target.clone()).collect();
+        assert_eq!(
+            targets,
+            [Target::Message(9), Target::Message(3), Target::Message(1)]
+        );
+        // The picker shows it, with its sender, while the query stands.
+        let mut picker = Picker::new(&cache);
+        picker.paste("needle", &cache);
+        picker.stored("other", found.clone(), &cache);
+        assert!(picker.found(1).is_none(), "results for another query");
+        picker.stored("needle", found, &cache);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| picker.render(f, f.area(), &cache, Local::now()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Zed → ada  an old needle"), "{text}");
+        // Chosen, it and its context join the cache with the agent's scope.
+        let chosen = picker.found(1).unwrap().clone();
+        let context = store
+            .context(crate::connect::history::Place::Agent("Zed"), Some(1), 200)
+            .unwrap();
+        cache.adopt(
+            std::iter::once((chosen.message, chosen.agents))
+                .chain(context.into_iter().map(|m| (m, vec!["Zed".to_string()]))),
+        );
+        assert_eq!(
+            cache.destination(1),
+            Some(Conversation::Agent("Zed".into()))
+        );
+        let around: Vec<i64> = cache
+            .context(Some(&Conversation::Agent("Zed".into())), Some(1))
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(around.starts_with(&[1, 2, 3]), "{around:?}");
+        // Editing the query drops results that no longer apply.
+        picker.paste("x", &cache);
+        assert!(picker.found(1).is_none());
     }
 
     #[test]

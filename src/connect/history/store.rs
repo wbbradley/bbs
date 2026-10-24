@@ -71,6 +71,8 @@ pub struct Batch {
 #[derive(Clone, Debug)]
 pub struct Found {
     pub message: proto::Message,
+    /// The human's agents whose conversations hold it.
+    pub agents: Vec<String>,
     pub line: usize,
     pub text: String,
     pub indexed: String,
@@ -326,7 +328,13 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             let message = decode(&row)?;
+            let agents = self
+                .conn
+                .prepare_cached("SELECT agent_name FROM scopes WHERE message_id = ?1")?
+                .query_map([id], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
             found.push(Found {
+                agents,
                 text: message
                     .body
                     .lines()
@@ -669,6 +677,7 @@ mod tests {
         assert_eq!(ids(&found), [3, 1, 2, 4]);
         assert_eq!((found[0].line, found[0].text.as_str()), (1, "then Jefe!"));
         assert_eq!(found[0].indexed, "then jefe!");
+        assert_eq!(found[0].agents, ["Zed"]);
         assert_eq!(
             ids(&store.search("jefe", 2, &never).unwrap().unwrap()),
             [3, 1]
