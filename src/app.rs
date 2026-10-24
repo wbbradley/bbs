@@ -108,21 +108,32 @@ pub async fn run(cli: Cli) -> Result<()> {
         human: config.human(as_human.as_deref()),
         ..Default::default()
     };
+    if matches!(command, Command::Connect) {
+        let opener = crate::connect::Opener {
+            config: config.clone(),
+            dir: dir.clone(),
+            caller: caller.clone(),
+        };
+        let start = match Backend::open(&config, &dir, caller).await {
+            Ok(backend) => crate::connect::Start::Online(backend),
+            // Unreachable: the history saved for this board, if any.
+            Err(e) => match opener
+                .caller
+                .human
+                .as_deref()
+                .filter(|_| config.server.is_some())
+                .and_then(|human| crate::connect::offline_start(&opener, human))
+            {
+                Some(start) => start,
+                None => return Err(e),
+            },
+        };
+        return crate::connect::run(start, opener, theme_explicit).await;
+    }
     let mut backend = Backend::open(&config, &dir, caller).await?;
     match command {
         Command::View(args) => crate::view::run(&mut backend, args).await,
-        Command::Connect => {
-            let opener = crate::connect::Opener {
-                config: config.clone(),
-                dir: dir.clone(),
-                caller: Caller {
-                    token: token.clone(),
-                    human: config.human(as_human.as_deref()),
-                    ..Default::default()
-                },
-            };
-            crate::connect::run(backend, opener, theme_explicit).await
-        }
+        Command::Connect => unreachable!("connect starts above"),
         Command::Read {
             limit,
             wait: true,

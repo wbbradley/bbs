@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -447,15 +447,43 @@ pub fn spawn_ticks(tx: UnboundedSender<Event>) {
 
 /// Answer requests one at a time with one server connection, and run each
 /// feed stream as a task with a connection of its own.
+/// Requests fail at once while unconnected, between connection attempts
+/// this far apart.
+const RECONNECT_EVERY: Duration = Duration::from_secs(5);
+
+const OFFLINE: &str = "offline: the server cannot be reached";
+
 pub async fn serve(
-    mut backend: Backend,
+    mut backend: Option<Backend>,
     opener: Opener,
     mut requests: UnboundedReceiver<Request>,
     tx: UnboundedSender<Event>,
 ) {
     let mut streams: HashMap<u64, JoinHandle<()>> = HashMap::new();
+    let mut tried: Option<Instant> = None;
     while let Some(request) = requests.recv().await {
         let error = |e: anyhow::Error| format!("{e:#}");
+        // Streams keep their own connections and reconnect by themselves.
+        let Some(request) = stream(request, &mut streams, &opener, &tx) else {
+            continue;
+        };
+        if backend.is_none() && tried.is_none_or(|at| at.elapsed() >= RECONNECT_EVERY) {
+            tried = Some(Instant::now());
+            let open = Backend::open(&opener.config, &opener.dir, opener.caller.clone());
+            backend = tokio::time::timeout(SIDE_CALL_TIMEOUT, open)
+                .await
+                .ok()
+                .and_then(Result::ok);
+        }
+        let Some(mut backend) = backend.as_mut() else {
+            // Nothing waits to be sent later: each request fails now.
+            if let Some(data) = offline(request)
+                && tx.send(Event::Data(data)).is_err()
+            {
+                break;
+            }
+            continue;
+        };
         let data = match request {
             Request::Agents => Data::Agents(
                 backend
@@ -653,33 +681,10 @@ pub async fn serve(
                 }
                 continue;
             }
-            Request::WatchSummary(id) => {
-                let task = tokio::spawn(watch_summary(opener.clone(), id, tx.clone()));
-                if let Some(old) = streams.insert(id, task) {
-                    old.abort();
-                }
-                continue;
-            }
-            Request::Watch { id, req } => {
-                let task = tokio::spawn(watch(opener.clone(), id, req, tx.clone()));
-                if let Some(old) = streams.insert(id, task) {
-                    old.abort();
-                }
-                continue;
-            }
-            Request::WatchActivity { id, req } => {
-                let task = tokio::spawn(watch_activity(opener.clone(), id, req, tx.clone()));
-                if let Some(old) = streams.insert(id, task) {
-                    old.abort();
-                }
-                continue;
-            }
-            Request::Unwatch(id) => {
-                if let Some(task) = streams.remove(&id) {
-                    task.abort();
-                }
-                continue;
-            }
+            Request::WatchSummary(_)
+            | Request::Watch { .. }
+            | Request::WatchActivity { .. }
+            | Request::Unwatch(_) => unreachable!("streams are handled above"),
         };
         if tx.send(Event::Data(data)).is_err() {
             break;
@@ -688,6 +693,117 @@ pub async fn serve(
     for task in streams.into_values() {
         task.abort();
     }
+}
+
+/// Start or stop a stream; `Some` gives back any other request.
+fn stream(
+    request: Request,
+    streams: &mut HashMap<u64, JoinHandle<()>>,
+    opener: &Opener,
+    tx: &UnboundedSender<Event>,
+) -> Option<Request> {
+    let (id, task) = match request {
+        Request::WatchSummary(id) => (
+            id,
+            tokio::spawn(watch_summary(opener.clone(), id, tx.clone())),
+        ),
+        Request::Watch { id, req } => {
+            (id, tokio::spawn(watch(opener.clone(), id, req, tx.clone())))
+        }
+        Request::WatchActivity { id, req } => (
+            id,
+            tokio::spawn(watch_activity(opener.clone(), id, req, tx.clone())),
+        ),
+        Request::Unwatch(id) => {
+            if let Some(task) = streams.remove(&id) {
+                task.abort();
+            }
+            return None;
+        }
+        other => return Some(other),
+    };
+    if let Some(old) = streams.insert(id, task) {
+        old.abort();
+    }
+    None
+}
+
+/// What a request gets while the server cannot be reached: writes say they
+/// were not sent, reads that they failed, and seen marks are dropped.
+fn offline(request: Request) -> Option<Data> {
+    let failed = || OFFLINE.to_string();
+    let refused = || SideError::Refused(OFFLINE.into());
+    let transient = || SideError::Transient(OFFLINE.into());
+    Some(match request {
+        Request::Agents => Data::Agents(Err(failed())),
+        Request::AgentsAt { effort_revision } => Data::AgentsAt {
+            effort_revision,
+            result: Err(failed()),
+        },
+        Request::Groups => Data::Groups(Err(failed())),
+        Request::Send { id, .. } => Data::Sent {
+            id,
+            result: Err(format!("{OFFLINE}; not sent")),
+        },
+        Request::SetEffort { id, agent, .. } => Data::EffortSent {
+            id,
+            agent,
+            result: Err(EffortSendError::Rejected(failed())),
+        },
+        Request::SideReport { id, .. } => Data::SideReport {
+            id,
+            result: Err(transient()),
+        },
+        Request::AskSide { id, .. } => Data::SideAsked {
+            id,
+            result: Err(refused()),
+        },
+        Request::CancelSide { id, side, .. } => Data::SideCancelled {
+            id,
+            side,
+            result: Err(refused()),
+        },
+        Request::AnswerOwnerInput { id, req } => Data::OwnerAnswered {
+            id,
+            request_id: req.request_id,
+            result: Err(refused()),
+        },
+        Request::Admin { id, .. } => Data::Admin {
+            id,
+            result: Err(failed()),
+        },
+        Request::MarkRead(agent) => Data::MarkedRead {
+            agent,
+            result: Err(failed()),
+        },
+        Request::MarkSeen { .. } => return None,
+        Request::Blockers { id } => Data::Blockers {
+            id,
+            result: Err(transient()),
+        },
+        Request::AnswerBlocker { id, req } => Data::BlockerWritten {
+            id,
+            key: req.request_key,
+            result: Err(refused()),
+        },
+        Request::CancelBlocker { id, req } => Data::BlockerWritten {
+            id,
+            key: req.request_key,
+            result: Err(refused()),
+        },
+        Request::ListNotes { id, .. } => Data::NotesListed {
+            id,
+            result: Err(transient()),
+        },
+        Request::PutNote { id, .. } => Data::NoteSaved {
+            id,
+            result: Err(refused()),
+        },
+        Request::WatchSummary(_)
+        | Request::Watch { .. }
+        | Request::WatchActivity { .. }
+        | Request::Unwatch(_) => return None,
+    })
 }
 
 /// Make a group change and describe what it did.
@@ -1141,7 +1257,7 @@ mod tests {
         .unwrap();
         tx.send(poll()).unwrap();
         drop(tx);
-        serve(backend, opener, rx, events).await;
+        serve(Some(backend), opener, rx, events).await;
         let mut next = || match replies.try_recv() {
             Ok(Event::Data(data)) => data,
             _ => panic!("expected data"),
@@ -1395,7 +1511,7 @@ mod tests {
                 let (events, mut replies) = tokio::sync::mpsc::unbounded_channel();
                 tx.send(Request::Blockers { id: 61 }).unwrap();
                 drop(tx);
-                serve(backend, opener, rx, events).await;
+                serve(Some(backend), opener, rx, events).await;
                 let Some(Event::Data(Data::Blockers { id: 61, result })) = replies.recv().await
                 else {
                     panic!("a poll reply")
@@ -1880,7 +1996,7 @@ mod tests {
                 .unwrap();
             let (tx, rx) = unbounded_channel();
             let (events, mut replies) = unbounded_channel();
-            let worker = tokio::spawn(serve(backend, opener, rx, events));
+            let worker = tokio::spawn(serve(Some(backend), opener, rx, events));
             tx.send(Request::SideReport {
                 id: 1,
                 agent: "Mateo".into(),
@@ -2096,7 +2212,7 @@ mod tests {
         })
         .unwrap();
         drop(tx);
-        serve(backend, opener, rx, events).await;
+        serve(Some(backend), opener, rx, events).await;
         assert!(matches!(
             replies.recv().await,
             Some(Event::Data(Data::EffortSent {
@@ -2136,7 +2252,7 @@ mod tests {
         // One open question at a time: the second ask is refused.
         tx.send(ask(51)).unwrap();
         drop(tx);
-        serve(backend, opener.clone(), rx, events).await;
+        serve(Some(backend), opener.clone(), rx, events).await;
         let Some(Event::Data(Data::SideAsked {
             id: 50,
             result: Ok(side),
@@ -2169,7 +2285,7 @@ mod tests {
         })
         .unwrap();
         drop(tx);
-        serve(backend, opener, rx, events).await;
+        serve(Some(backend), opener, rx, events).await;
         assert!(matches!(
             replies.recv().await,
             Some(Event::Data(Data::SideCancelled { id: 52, side: s, result: Ok(()) })) if s == side
@@ -2218,7 +2334,7 @@ mod tests {
         })
         .unwrap();
         drop(tx);
-        serve(backend, opener, rx, events).await;
+        serve(Some(backend), opener, rx, events).await;
         let Some(Event::Data(Data::EffortSent {
             id: 44,
             agent,
@@ -2253,7 +2369,7 @@ mod tests {
         requests.send(Request::MarkRead("Mateo".into())).unwrap();
         requests.send(Request::MarkRead("missing".into())).unwrap();
         drop(requests);
-        serve(backend, opener, rx, events).await;
+        serve(Some(backend), opener, rx, events).await;
         let Some(Event::Data(Data::MarkedRead { agent, result })) = replies.recv().await else {
             panic!("read acknowledgement")
         };
@@ -2592,5 +2708,80 @@ mod tests {
             rx.recv().await.is_none(),
             "no baseline or replay emitted after failure"
         );
+    }
+
+    #[tokio::test]
+    async fn without_a_server_requests_fail_at_once_and_nothing_waits_to_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server = Some("localhost:1".into());
+        let opener = Opener {
+            config,
+            dir: dir.path().into(),
+            caller: Caller {
+                human: Some("ada".into()),
+                ..Default::default()
+            },
+        };
+        let (requests, rx) = unbounded_channel();
+        let (events, mut out) = unbounded_channel();
+        let worker = tokio::spawn(serve(None, opener, rx, events));
+        let started = std::time::Instant::now();
+        requests
+            .send(Request::Send {
+                id: 1,
+                req: proto::SendRequest {
+                    to: "Mateo".into(),
+                    body: "hi".into(),
+                    control: None,
+                },
+            })
+            .unwrap();
+        requests
+            .send(Request::MarkSeen {
+                agent: "Mateo".into(),
+                through_id: 5,
+            })
+            .unwrap();
+        requests.send(Request::Agents).unwrap();
+        requests
+            .send(Request::PutNote {
+                id: 2,
+                agent_id: 7,
+                body: "x".into(),
+            })
+            .unwrap();
+        // Streams still start, retrying on their own.
+        requests.send(Request::WatchSummary(3)).unwrap();
+        let mut seen = Vec::new();
+        while seen.len() < 3 {
+            match tokio::time::timeout(Duration::from_secs(10), out.recv()).await {
+                Ok(Some(Event::Data(Data::Sent { id, result }))) => {
+                    assert_eq!(id, 1);
+                    assert!(result.unwrap_err().ends_with("not sent"));
+                    seen.push("sent");
+                }
+                Ok(Some(Event::Data(Data::Agents(result)))) => {
+                    assert!(result.unwrap_err().starts_with("offline"));
+                    seen.push("agents");
+                }
+                Ok(Some(Event::Data(Data::NoteSaved { id, result }))) => {
+                    assert_eq!(id, 2);
+                    assert!(matches!(result, Err(SideError::Refused(_))));
+                    seen.push("note");
+                }
+                Ok(Some(Event::Data(Data::Summary { .. }))) => {}
+                other => panic!("unexpected {:?}", other.map(|e| e.map(|_| ()))),
+            }
+        }
+        assert_eq!(seen, ["sent", "agents", "note"], "in order; no seen mark");
+        // One failed connection attempt, then no more waiting for one.
+        assert!(
+            started.elapsed() < RECONNECT_EVERY,
+            "{:?}",
+            started.elapsed()
+        );
+        drop(requests);
+        worker.await.unwrap();
     }
 }

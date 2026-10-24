@@ -88,11 +88,54 @@ impl Drop for BracketedPaste {
     }
 }
 
-pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> Result<()> {
-    let me = backend.whoami().await?;
-    if me.kind() != Kind::Human {
-        bail!("bbs connect is for humans; agents use the other bbs commands");
+/// How `connect` starts: with a server, or from the history saved for the
+/// human last signed in to this board.
+pub enum Start {
+    Online(Backend),
+    Offline { human: String },
+}
+
+/// Where a board's and human's history lives.
+fn history_dir(opener: &Opener, human: &str) -> Result<std::path::PathBuf> {
+    let board = match &opener.config.server {
+        Some(server) => format!("remote:{}", server.to_ascii_lowercase()),
+        None => format!("local:{}", opener.dir.canonicalize()?.display()),
+    };
+    Ok(history::dir_for(
+        &crate::app::state_dir()?.join("connect-history"),
+        &board,
+        human,
+    ))
+}
+
+/// The human `connect` may start offline as: the one last signed in to this
+/// board as `configured`, if their history was saved.
+pub fn offline_start(opener: &Opener, configured: &str) -> Option<Start> {
+    let dir = history_dir(opener, configured).ok()?;
+    if !dir.exists() {
+        return None;
     }
+    let human = history::Store::open(&dir).ok()?.identity().ok()??;
+    Some(Start::Offline { human })
+}
+
+pub async fn run(start: Start, opener: Opener, theme_explicit: bool) -> Result<()> {
+    let (backend, me) = match start {
+        Start::Online(mut backend) => {
+            let me = backend.whoami().await?;
+            if me.kind() != Kind::Human {
+                bail!("bbs connect is for humans; agents use the other bbs commands");
+            }
+            // Remembered so a later start without the server can open it.
+            if let Ok(dir) = history_dir(&opener, &me.name)
+                && let Err(e) = history::Store::open(&dir).and_then(|s| s.set_identity(&me.name))
+            {
+                tracing::warn!("saving the history identity: {e}");
+            }
+            (Some(backend), me.name)
+        }
+        Start::Offline { human } => (None, human),
+    };
     if !std::io::stdout().is_terminal() {
         bail!("bbs connect needs a terminal");
     }
@@ -103,10 +146,10 @@ pub async fn run(mut backend: Backend, opener: Opener, theme_explicit: bool) -> 
         &crate::app::state_dir()?.join("connect-drafts"),
         opener.config.server.as_deref(),
         &opener.dir,
-        &me.name,
+        &me,
     )?;
     let ctx = app::Ctx {
-        me: me.name,
+        me,
         server: opener
             .config
             .server
