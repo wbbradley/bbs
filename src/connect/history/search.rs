@@ -5,10 +5,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 
-use super::store::{Found, Store};
+use super::store::{Found, Place, Store};
 
 /// Results kept per query, as many as the launcher shows.
 const LIMIT: usize = 50;
+/// Stored messages read for a conversation, as many as a window holds.
+const CONTEXT: usize = 200;
 
 pub struct Searcher {
     queries: mpsc::Sender<(u64, String)>,
@@ -70,6 +72,70 @@ impl Searcher {
     pub fn search(&self, query: &str) -> u64 {
         let generation = self.latest.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.queries.send((generation, query.to_string()));
+        generation
+    }
+}
+
+/// Where stored messages are read for, owned so it can cross to a worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Where {
+    Agent(String),
+    Group(String),
+    Feed,
+}
+
+/// Reading a conversation's stored messages off the UI thread.
+pub struct Contexts {
+    jobs: mpsc::Sender<(u64, Where, Option<i64>)>,
+    next: AtomicU64,
+}
+
+impl Contexts {
+    /// A worker reading the history in `dir`; `done` gets each read's
+    /// generation and its messages, oldest first, or why it failed.
+    pub fn spawn(
+        dir: PathBuf,
+        done: impl Fn(u64, Result<Vec<crate::proto::Message>, String>) + Send + 'static,
+    ) -> Contexts {
+        let (jobs, rx) = mpsc::channel::<(u64, Where, Option<i64>)>();
+        std::thread::spawn(move || {
+            let mut store: Option<Store> = None;
+            while let Ok((generation, place, around)) = rx.recv() {
+                if store.is_none() {
+                    match Store::open(&dir) {
+                        Ok(opened) => store = Some(opened),
+                        Err(e) => {
+                            done(generation, Err(e.to_string()));
+                            continue;
+                        }
+                    }
+                }
+                let place = match &place {
+                    Where::Agent(name) => Place::Agent(name),
+                    Where::Group(name) => Place::Group(name),
+                    Where::Feed => Place::Feed,
+                };
+                let opened = store.as_ref().expect("opened above");
+                match opened.context(place, around, CONTEXT) {
+                    Ok(rows) => done(generation, Ok(rows)),
+                    Err(e) => {
+                        store = None;
+                        done(generation, Err(e.to_string()));
+                    }
+                }
+            }
+        });
+        Contexts {
+            jobs,
+            next: AtomicU64::new(0),
+        }
+    }
+
+    /// Read `place`'s stored messages around `around`, or the newest; they
+    /// arrive with the returned generation.
+    pub fn fetch(&self, place: Where, around: Option<i64>) -> u64 {
+        let generation = self.next.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.jobs.send((generation, place, around));
         generation
     }
 }

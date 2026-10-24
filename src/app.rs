@@ -115,14 +115,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             caller: caller.clone(),
         };
         let start = match Backend::open(&config, &dir, caller).await {
-            Ok(backend) => crate::connect::Start::Online(backend),
-            // Unreachable: the history saved for this board, if any.
-            Err(e) => match opener
-                .caller
-                .human
-                .as_deref()
-                .filter(|_| config.server.is_some())
-                .and_then(|human| crate::connect::offline_start(&opener, human))
+            Ok(backend) => crate::connect::Start::Online(Box::new(backend)),
+            // Unreachable, not refused: the history saved for this board.
+            Err(e) => match crate::connect::unreachable(&e)
+                .then(|| crate::connect::offline_start(&opener))
+                .flatten()
             {
                 Some(start) => start,
                 None => return Err(e),

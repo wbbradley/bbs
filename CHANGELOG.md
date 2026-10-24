@@ -17,6 +17,12 @@ rather than falling back to anything else.
 
 ### Added
 
+- `bbs connect` keeps your whole personal message history in a local SQLite
+  file per server and human, paged in and followed live from servers offering
+  `feed-sync.v1`. Ctrl-P searches all of it, conversations open with it, and
+  `connect` starts from it when the server cannot be reached, browsing and
+  searching offline without queuing anything. Mail sent just before leaving its
+  conversation is now found too.
 - The `bbs connect` blocker card offers `[discuss with AGENT]` before
   `[Cancel]` on Tab: Enter closes the card and opens the creating agent's
   conversation, never answering or cancelling, and only while that same agent,

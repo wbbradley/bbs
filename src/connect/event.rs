@@ -115,6 +115,12 @@ pub enum Request {
         id: u64,
         after: u64,
     },
+    /// Keep the human's personal history stored in `dir`, page by page,
+    /// then follow it live (feed-sync.v1); one stream for the app.
+    WatchHistory {
+        id: u64,
+        dir: std::path::PathBuf,
+    },
     /// Store the human's note on an agent; never retried here.
     PutNote {
         id: u64,
@@ -404,11 +410,46 @@ pub enum Data {
         id: u64,
         result: Result<proto::AgentNote, SideError>,
     },
+    /// A page of the human's history the stream `id` has stored: each
+    /// message with the human's agents whose conversations hold it.
+    History {
+        id: u64,
+        messages: Vec<(proto::Message, Vec<String>)>,
+    },
+    /// What the history stream `id` is doing.
+    HistoryState {
+        id: u64,
+        state: HistoryState,
+    },
+    /// The stored messages read for the context request `generation`.
+    StoredContext {
+        generation: u64,
+        result: Result<Vec<proto::Message>, String>,
+    },
     /// What the stored history found for the search `generation`.
     StoredFound {
         generation: u64,
         result: Result<Vec<super::history::Found>, String>,
     },
+}
+
+/// What the history stream is doing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HistoryState {
+    /// Paging the human's history in.
+    Syncing,
+    /// Everything so far is stored; new mail follows.
+    CaughtUp,
+    /// The connection dropped; trying again.
+    Reconnecting(String),
+    /// Stopped until F5: the history could not be stored, or the server
+    /// sent what cannot be.
+    Paused(String),
+    /// The server has no sync feed (feed-sync.v1).
+    Unsupported,
+    /// The server's history changed: storing starts again, and what came
+    /// from the old history no longer applies.
+    Reset,
 }
 
 /// What a new server connection needs: each feed stream holds one.
@@ -480,7 +521,7 @@ pub async fn serve(
                 .ok()
                 .and_then(Result::ok);
         }
-        let Some(mut backend) = backend.as_mut() else {
+        let Some(backend) = backend.as_mut() else {
             // Nothing waits to be sent later: each request fails now.
             if let Some(data) = offline(request)
                 && tx.send(Event::Data(data)).is_err()
@@ -576,7 +617,7 @@ pub async fn serve(
                 }
             }
             Request::Admin { id, op } => {
-                let result = admin(&mut backend, op).await.map_err(error);
+                let result = admin(backend, op).await.map_err(error);
                 let changed = result.is_ok();
                 if tx.send(Event::Data(Data::Admin { id, result })).is_err() {
                     break;
@@ -597,9 +638,7 @@ pub async fn serve(
                     match tokio::time::timeout(SIDE_CALL_TIMEOUT, backend.list_blockers(req)).await
                     {
                         Ok(Ok(list)) => Ok(Box::new(list)),
-                        Ok(Err(e)) => {
-                            Err(blocker_poll_error(&mut backend, local, e, capability).await)
-                        }
+                        Ok(Err(e)) => Err(blocker_poll_error(backend, local, e, capability).await),
                         Err(_) => Err(SideError::Transient(format!(
                             "no reply within {} seconds",
                             SIDE_CALL_TIMEOUT.as_secs()
@@ -644,13 +683,12 @@ pub async fn serve(
                         .await
                     {
                         Ok(Ok(list)) => Ok(list),
-                        Ok(Err(e)) => Err(blocker_poll_error(
-                            &mut backend,
-                            local,
-                            e,
-                            crate::backend::AGENT_NOTES,
-                        )
-                        .await),
+                        Ok(Err(e)) => {
+                            Err(
+                                blocker_poll_error(backend, local, e, crate::backend::AGENT_NOTES)
+                                    .await,
+                            )
+                        }
                         Err(_) => Err(SideError::Transient(format!(
                             "no reply within {} seconds",
                             SIDE_CALL_TIMEOUT.as_secs()
@@ -689,6 +727,7 @@ pub async fn serve(
             Request::WatchSummary(_)
             | Request::Watch { .. }
             | Request::WatchActivity { .. }
+            | Request::WatchHistory { .. }
             | Request::Unwatch(_) => unreachable!("streams are handled above"),
         };
         if tx.send(Event::Data(data)).is_err() {
@@ -718,6 +757,10 @@ fn stream(
         Request::WatchActivity { id, req } => (
             id,
             tokio::spawn(watch_activity(opener.clone(), id, req, tx.clone())),
+        ),
+        Request::WatchHistory { id, dir } => (
+            id,
+            tokio::spawn(watch_history(opener.clone(), id, dir, tx.clone())),
         ),
         Request::Unwatch(id) => {
             if let Some(task) = streams.remove(&id) {
@@ -807,6 +850,7 @@ fn offline(request: Request) -> Option<Data> {
         Request::WatchSummary(_)
         | Request::Watch { .. }
         | Request::WatchActivity { .. }
+        | Request::WatchHistory { .. }
         | Request::Unwatch(_) => return None,
     })
 }
@@ -888,6 +932,19 @@ struct Reconnect {
     delay: Duration,
 }
 
+/// Whether the server simply could not be reached, as opposed to refusing:
+/// a transport failure, or a server unavailable or too slow to answer.
+pub fn unreachable(error: &anyhow::Error) -> bool {
+    use tonic::Code;
+    if let Some(status) = error.downcast_ref::<tonic::Status>() {
+        return matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded);
+    }
+    error.downcast_ref::<tonic::transport::Error>().is_some()
+        && !error
+            .chain()
+            .any(|cause| cause.is::<tonic::codegen::http::uri::InvalidUri>())
+}
+
 fn transient_connection(error: &anyhow::Error) -> bool {
     use tonic::Code;
     if let Some(status) = error.downcast_ref::<tonic::Status>() {
@@ -940,6 +997,220 @@ impl Reconnect {
             () = tokio::time::sleep(delay) => true,
         }
     }
+}
+
+/// Messages per history page: the server bounds pages in bytes too.
+const HISTORY_PAGE: u32 = 500;
+
+/// Why a history stream ended.
+enum HistoryStop {
+    /// The app is gone.
+    Gone,
+    /// Connection trouble: try again after a pause.
+    Retry(anyhow::Error),
+    /// A new generation, or another session's: start over at once.
+    Restart,
+    /// Stop until asked again, in this state.
+    Halt(HistoryState),
+}
+
+/// The app's one replication stream: the human's personal history, stored
+/// page by page and then followed live. A page is stored before the app
+/// sees it, and nothing moves past what is stored.
+async fn watch_history(
+    opener: Opener,
+    id: u64,
+    dir: std::path::PathBuf,
+    tx: UnboundedSender<Event>,
+) {
+    let mut reconnect = Reconnect::new(&opener);
+    loop {
+        let state = match sync_history(&opener, id, &dir, &tx, &mut reconnect).await {
+            HistoryStop::Gone => return,
+            HistoryStop::Restart => continue,
+            HistoryStop::Halt(state) => state,
+            HistoryStop::Retry(error) if opener.config.server.is_some() => {
+                if reconnect
+                    .after_error(error, &tx, |text| Data::HistoryState {
+                        id,
+                        state: HistoryState::Reconnecting(text),
+                    })
+                    .await
+                {
+                    continue;
+                }
+                return;
+            }
+            HistoryStop::Retry(error) => HistoryState::Paused(format!("{error:#}")),
+        };
+        let _ = tx.send(Event::Data(Data::HistoryState { id, state }));
+        return;
+    }
+}
+
+async fn sync_history(
+    opener: &Opener,
+    id: u64,
+    dir: &std::path::Path,
+    tx: &UnboundedSender<Event>,
+    reconnect: &mut Reconnect,
+) -> HistoryStop {
+    use super::history::{Batch, Store, StoreError};
+    let paused = |e: &dyn std::fmt::Display| HistoryStop::Halt(HistoryState::Paused(e.to_string()));
+    let opened = {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || Store::open(&dir).and_then(|s| Ok((s.resume()?, s))))
+            .await
+    };
+    let ((after, anchor), mut store) = match opened {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(e)) => return paused(&e),
+        Err(e) => return paused(&e),
+    };
+    let mut backend = match Backend::open(&opener.config, &opener.dir, opener.caller.clone()).await
+    {
+        Ok(backend) => backend,
+        Err(e) => return HistoryStop::Retry(e),
+    };
+    let req = proto::FeedRequest {
+        mine: true,
+        after_id: Some(after),
+        backlog: HISTORY_PAGE,
+        sync: true,
+        ..Default::default()
+    };
+    let mut feed = match backend.watch_feed(req, false).await {
+        Ok(feed) => feed,
+        Err(e) => return history_error(&mut backend, e).await,
+    };
+    let mut expected = anchor;
+    let mut caught_up = None;
+    loop {
+        let snapshot = match feed.next_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                drop(feed);
+                return history_error(&mut backend, e).await;
+            }
+        };
+        // One scope per message, in order: anything else cannot be stored.
+        let shaped = snapshot.agent_scopes.len() == snapshot.messages.len()
+            && snapshot
+                .agent_scopes
+                .iter()
+                .zip(&snapshot.messages)
+                .all(|(scope, m)| scope.message_id == m.id);
+        if !shaped {
+            return paused(&"the server sent a history page without its agents");
+        }
+        let batch = Batch {
+            scopes: snapshot
+                .agent_scopes
+                .iter()
+                .map(|s| {
+                    (
+                        s.message_id,
+                        s.agents.iter().map(|a| (a.id, a.name.clone())).collect(),
+                    )
+                })
+                .collect(),
+            caught_up: snapshot.caught_up.unwrap_or(false),
+            messages: snapshot.messages,
+        };
+        let applied = tokio::task::spawn_blocking(move || {
+            let result = store
+                .apply(&batch, expected.as_ref())
+                .and_then(|()| store.is_current());
+            (store, batch, result)
+        })
+        .await;
+        let (back, batch, result) = match applied {
+            Ok(applied) => applied,
+            Err(e) => return paused(&e),
+        };
+        store = back;
+        match result {
+            Ok(true) => {}
+            // Another session started a new generation: follow it.
+            Ok(false) => {
+                let _ = tx.send(Event::Data(Data::HistoryState {
+                    id,
+                    state: HistoryState::Reset,
+                }));
+                return HistoryStop::Restart;
+            }
+            Err(StoreError::Mismatch(_)) => {
+                let rotated = tokio::task::spawn_blocking(move || store.next_generation()).await;
+                return match rotated {
+                    Ok(Ok(_)) => {
+                        let _ = tx.send(Event::Data(Data::HistoryState {
+                            id,
+                            state: HistoryState::Reset,
+                        }));
+                        HistoryStop::Restart
+                    }
+                    Ok(Err(e)) => paused(&e),
+                    Err(e) => paused(&e),
+                };
+            }
+            Err(e) => return paused(&e),
+        }
+        expected = None;
+        reconnect.received();
+        let messages = batch
+            .messages
+            .into_iter()
+            .zip(batch.scopes)
+            .map(|(m, (_, agents))| (m, agents.into_iter().map(|(_, name)| name).collect()))
+            .collect();
+        if tx
+            .send(Event::Data(Data::History { id, messages }))
+            .is_err()
+        {
+            return HistoryStop::Gone;
+        }
+        if caught_up != Some(batch.caught_up) {
+            caught_up = Some(batch.caught_up);
+            let state = if batch.caught_up {
+                HistoryState::CaughtUp
+            } else {
+                HistoryState::Syncing
+            };
+            if tx
+                .send(Event::Data(Data::HistoryState { id, state }))
+                .is_err()
+            {
+                return HistoryStop::Gone;
+            }
+        }
+    }
+}
+
+/// What a history stream does about a server error: retry connection
+/// trouble, say an old server has no sync feed, and pause on anything else,
+/// such as a message too large to send.
+async fn history_error(backend: &mut Backend, error: anyhow::Error) -> HistoryStop {
+    let precondition = error.downcast_ref::<tonic::Status>().is_some_and(|s| {
+        matches!(
+            s.code(),
+            tonic::Code::FailedPrecondition | tonic::Code::Unimplemented
+        )
+    });
+    if precondition {
+        let offered = tokio::time::timeout(SIDE_CALL_TIMEOUT, backend.server_info()).await;
+        if let Ok(Ok(info)) = offered
+            && !info
+                .capabilities
+                .iter()
+                .any(|c| c == crate::backend::FEED_SYNC)
+        {
+            return HistoryStop::Halt(HistoryState::Unsupported);
+        }
+    }
+    if transient_connection(&error) {
+        return HistoryStop::Retry(error);
+    }
+    HistoryStop::Halt(HistoryState::Paused(format!("{error:#}")))
 }
 
 /// Refresh feed snapshots after a remote interruption, until closed or refused.
@@ -2718,10 +2989,11 @@ mod tests {
     #[tokio::test]
     async fn without_a_server_requests_fail_at_once_and_nothing_waits_to_send() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.server = Some("localhost:1".into());
         let opener = Opener {
-            config,
+            config: Config {
+                server: Some("localhost:1".into()),
+                ..Default::default()
+            },
             dir: dir.path().into(),
             caller: Caller {
                 human: Some("ada".into()),
@@ -2785,6 +3057,237 @@ mod tests {
             started.elapsed() < RECONNECT_EVERY,
             "{:?}",
             started.elapsed()
+        );
+        drop(requests);
+        worker.await.unwrap();
+    }
+
+    /// A local board where ada owns Mateo, who has sent her `n` messages;
+    /// the opener connects as ada.
+    fn history_board(n: usize) -> (tempfile::TempDir, Opener, Caller) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("bbs.db")).unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        crate::service::ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() })
+            .unwrap();
+        let token = crate::service::register(
+            &mut conn,
+            &ada,
+            proto::RegisterRequest {
+                name: Some("Mateo".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .token;
+        let mateo = Caller {
+            token: Some(token),
+            ..Default::default()
+        };
+        for i in 0..n {
+            say(&mut conn, &mateo, &format!("mail {i}"));
+        }
+        let opener = Opener {
+            config: Config::default(),
+            dir: dir.path().into(),
+            caller: ada,
+        };
+        (dir, opener, mateo)
+    }
+
+    fn say(conn: &mut rusqlite::Connection, from: &Caller, body: &str) {
+        crate::service::send(
+            conn,
+            from,
+            proto::SendRequest {
+                to: "ada".into(),
+                body: body.into(),
+                control: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Events from the history stream until `until` says stop.
+    async fn history_events(
+        out: &mut UnboundedReceiver<Event>,
+        mut until: impl FnMut(&Data) -> bool,
+    ) -> Vec<Data> {
+        let mut seen = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(20), out.recv())
+                .await
+                .expect("history events")
+                .expect("open");
+            if let Event::Data(data @ (Data::History { .. } | Data::HistoryState { .. })) = event {
+                let stop = until(&data);
+                seen.push(data);
+                if stop {
+                    return seen;
+                }
+            }
+        }
+    }
+
+    fn stored(seen: &[Data]) -> Vec<i64> {
+        seen.iter()
+            .filter_map(|d| match d {
+                Data::History { messages, .. } => Some(messages.iter().map(|(m, _)| m.id)),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_history_stream_stores_every_page_then_follows_new_mail() {
+        let (board, opener, mateo) = history_board(1200);
+        let history = tempfile::tempdir().unwrap();
+        let (requests, rx) = unbounded_channel();
+        let (events, mut out) = unbounded_channel();
+        let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())
+            .await
+            .unwrap();
+        let worker = tokio::spawn(serve(Some(backend), opener, rx, events));
+        requests
+            .send(Request::WatchHistory {
+                id: 9,
+                dir: history.path().into(),
+            })
+            .unwrap();
+        let seen = history_events(&mut out, |d| {
+            matches!(
+                d,
+                Data::HistoryState {
+                    state: HistoryState::CaughtUp,
+                    ..
+                }
+            )
+        })
+        .await;
+        let ids = stored(&seen);
+        assert_eq!(ids.len(), 1200);
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "in order, once each");
+        assert!(matches!(
+            seen.iter().find(|d| matches!(d, Data::HistoryState { .. })),
+            Some(Data::HistoryState {
+                state: HistoryState::Syncing,
+                ..
+            })
+        ));
+        // Each message names the agent whose conversation holds it.
+        assert!(seen.iter().all(|d| match d {
+            Data::History { messages, .. } => messages.iter().all(|(_, a)| a == &["Mateo"]),
+            _ => true,
+        }));
+        // Stored before the app heard of it.
+        let store = crate::connect::history::Store::open(history.path()).unwrap();
+        assert_eq!(store.cursor().unwrap(), *ids.last().unwrap());
+        assert!(store.caught_up().unwrap());
+        // New mail follows live.
+        let mut conn = crate::db::open(&board.path().join("bbs.db")).unwrap();
+        say(&mut conn, &mateo, "one more");
+        let more = history_events(&mut out, |d| matches!(d, Data::History { .. })).await;
+        let Some(Data::History { messages, .. }) = more.last() else {
+            panic!("a page");
+        };
+        assert_eq!(messages[0].0.body, "one more");
+        drop(requests);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_changed_server_history_starts_a_new_generation_and_keeps_the_old() {
+        let (_board, opener, _) = history_board(3);
+        let history = tempfile::tempdir().unwrap();
+        // What was stored says message 1 was something else.
+        {
+            let mut store = crate::connect::history::Store::open(history.path()).unwrap();
+            store
+                .apply(
+                    &crate::connect::history::Batch {
+                        messages: vec![proto::Message {
+                            id: 1,
+                            body: "not what the server has".into(),
+                            ..Default::default()
+                        }],
+                        scopes: vec![(1, Vec::new())],
+                        caught_up: true,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        let (requests, rx) = unbounded_channel();
+        let (events, mut out) = unbounded_channel();
+        let worker = tokio::spawn(serve(None, opener, rx, events));
+        requests
+            .send(Request::WatchHistory {
+                id: 9,
+                dir: history.path().into(),
+            })
+            .unwrap();
+        let seen = history_events(&mut out, |d| {
+            matches!(
+                d,
+                Data::HistoryState {
+                    state: HistoryState::CaughtUp,
+                    ..
+                }
+            )
+        })
+        .await;
+        let reset = seen
+            .iter()
+            .position(|d| {
+                matches!(
+                    d,
+                    Data::HistoryState {
+                        state: HistoryState::Reset,
+                        ..
+                    }
+                )
+            })
+            .expect("a reset");
+        assert_eq!(stored(&seen[reset..]), [1, 2, 3], "all of it again");
+        assert!(
+            stored(&seen[..reset]).is_empty(),
+            "nothing from the refused page"
+        );
+        let now = crate::connect::history::Store::open(history.path()).unwrap();
+        assert_eq!((now.generation(), now.cursor().unwrap()), (2, 3));
+        drop(requests);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_history_stream_pauses_when_it_cannot_store() {
+        let (_board, opener, _) = history_board(1);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (requests, rx) = unbounded_channel();
+        let (events, mut out) = unbounded_channel();
+        let worker = tokio::spawn(serve(None, opener, rx, events));
+        // A file where the history's directory should be.
+        requests
+            .send(Request::WatchHistory {
+                id: 9,
+                dir: file.path().join("history"),
+            })
+            .unwrap();
+        let seen = history_events(&mut out, |d| matches!(d, Data::HistoryState { .. })).await;
+        assert!(
+            matches!(
+                seen.as_slice(),
+                [Data::HistoryState {
+                    state: HistoryState::Paused(_),
+                    ..
+                }]
+            ),
+            "paused, not retried"
         );
         drop(requests);
         worker.await.unwrap();

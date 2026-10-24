@@ -4,5 +4,7 @@
 mod search;
 mod store;
 
-pub use search::Searcher;
-pub use store::{Batch, Found, Mismatch, Place, Store, StoreError, dir_for};
+pub use search::{Contexts, Searcher, Where};
+#[cfg(test)]
+pub use store::Place;
+pub use store::{Batch, Found, Store, StoreError, dir_for};

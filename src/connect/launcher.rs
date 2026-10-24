@@ -239,6 +239,14 @@ impl Cache {
         self.messages.get(&id).map(|cached| &cached.message)
     }
 
+    /// Drop every held message: they came from a history that no longer
+    /// matches the server's.
+    pub fn forget_messages(&mut self) {
+        self.messages.clear();
+        self.text_bytes = 0;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     /// Stored messages, each with the human's agents whose conversations
     /// hold it, to open as if received: a chosen search hit and its context.
     pub fn adopt(&mut self, rows: impl IntoIterator<Item = (proto::Message, Vec<String>)>) {
@@ -276,20 +284,27 @@ impl Cache {
     /// A broadcast opens its group; direct mail opens its agent's conversation.
     /// Mail without an agent participant belongs in Feed.
     pub fn destination(&self, id: i64) -> Option<Conversation> {
-        let row = self.message(id)?;
-        if let Some(group) = &row.to_group {
-            Some(Conversation::Group(group.clone()))
-        } else if row.from_kind() == proto::Kind::Agent {
-            Some(Conversation::Agent(row.from_name.clone()))
-        } else if row.to_owner.is_some() {
-            row.to_name
-                .as_ref()
-                .map(|name| Conversation::Agent(name.clone()))
-        } else {
-            None
-        }
+        destination_of(self.message(id)?)
     }
+}
 
+/// Where a message opens: a broadcast in its group, direct mail in its
+/// agent's conversation, and mail without an agent in Feed.
+pub fn destination_of(row: &proto::Message) -> Option<Conversation> {
+    if let Some(group) = &row.to_group {
+        Some(Conversation::Group(group.clone()))
+    } else if row.from_kind() == proto::Kind::Agent {
+        Some(Conversation::Agent(row.from_name.clone()))
+    } else if row.to_owner.is_some() {
+        row.to_name
+            .as_ref()
+            .map(|name| Conversation::Agent(name.clone()))
+    } else {
+        None
+    }
+}
+
+impl Cache {
     /// Only already received rows. A selected hit gets a bounded window around
     /// it, rather than the latest window, without fetching older history.
     pub fn context(
@@ -548,6 +563,13 @@ impl Picker {
             return;
         }
         self.stored = found;
+        self.revision = cache.revision.wrapping_sub(1);
+        self.refresh(cache);
+    }
+
+    /// Drop the stored history's results: they came from an old history.
+    pub fn forget_stored(&mut self, cache: &Cache) {
+        self.stored.clear();
         self.revision = cache.revision.wrapping_sub(1);
         self.refresh(cache);
     }
@@ -1958,7 +1980,7 @@ mod tests {
             .context(crate::connect::history::Place::Agent("Zed"), Some(1), 200)
             .unwrap();
         cache.adopt(
-            std::iter::once((chosen.message, chosen.agents))
+            std::iter::once((chosen.message, vec!["Zed".to_string()]))
                 .chain(context.into_iter().map(|m| (m, vec!["Zed".to_string()]))),
         );
         assert_eq!(

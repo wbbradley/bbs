@@ -30,6 +30,8 @@ enum Opening {
     Fresh,
     Restore,
     Seek(i64),
+    /// Seek a stored message, with its stored context in hand.
+    SeekWith(i64, Vec<crate::proto::Message>),
 }
 
 /// A fresh id for a screen, stream or send request.
@@ -208,6 +210,17 @@ pub struct App {
     unsaved: HashMap<i64, Draft>,
     /// The human's message history on disk, when it opened.
     pub stored: Option<Stored>,
+    /// Stored context reads under way, for the conversations asking.
+    pending_contexts: HashMap<u64, Option<Conversation>>,
+    /// A stored Ctrl-P result waiting for its context; nothing is read or
+    /// seen meanwhile.
+    pending_hit: Option<PendingHit>,
+    /// The one stream keeping the stored history up to date, and what it
+    /// last said.
+    history_id: u64,
+    history_state: Option<super::event::HistoryState>,
+    /// Started without the server: true until something arrives from it.
+    pub offline: bool,
     /// A launcher choice waiting for the open note to be stored.
     pending_navigation: Option<Navigation>,
 }
@@ -241,53 +254,59 @@ fn stored_note(note: &crate::proto::AgentNote) -> notes::StoredNote {
 /// The human's message history on disk: read here for a conversation's
 /// context, searched on a worker for Ctrl-P.
 pub struct Stored {
-    store: super::history::Store,
+    dir: std::path::PathBuf,
     searcher: super::history::Searcher,
+    contexts: super::history::Contexts,
     /// The search Ctrl-P waits for: its generation and query.
     awaiting: Option<(u64, String)>,
 }
 
 impl Stored {
-    pub fn open(
-        dir: &std::path::Path,
-        events: UnboundedSender<Event>,
-    ) -> Result<Stored, super::history::StoreError> {
-        let store = super::history::Store::open(dir)?;
+    /// Workers reading the history in `dir`; each opens it when first asked.
+    pub fn open(dir: &std::path::Path, events: UnboundedSender<Event>) -> Stored {
+        let found = events.clone();
         let searcher =
             super::history::Searcher::spawn(dir.to_path_buf(), move |generation, result| {
-                let _ = events.send(Event::Data(Data::StoredFound { generation, result }));
+                let _ = found.send(Event::Data(Data::StoredFound { generation, result }));
             });
-        Ok(Stored {
-            store,
+        let contexts =
+            super::history::Contexts::spawn(dir.to_path_buf(), move |generation, result| {
+                let _ = events.send(Event::Data(Data::StoredContext { generation, result }));
+            });
+        Stored {
+            dir: dir.to_path_buf(),
             searcher,
+            contexts,
             awaiting: None,
-        })
-    }
-
-    /// Stored messages of `target`, with the conversations holding them,
-    /// around `hit` or the newest.
-    fn context(
-        &self,
-        target: &Conversation,
-        hit: Option<i64>,
-    ) -> Vec<(crate::proto::Message, Vec<String>)> {
-        let (place, agents) = match target {
-            Conversation::Agent(name) => (super::history::Place::Agent(name), vec![name.clone()]),
-            Conversation::Group(name) => (super::history::Place::Group(name), Vec::new()),
-        };
-        match self.store.context(place, hit, 200) {
-            Ok(rows) => rows.into_iter().map(|m| (m, agents.clone())).collect(),
-            Err(e) => {
-                tracing::warn!("reading stored history: {e}");
-                Vec::new()
-            }
         }
     }
+}
+
+/// Where a destination's stored messages are.
+fn place_of(target: Option<&Conversation>) -> super::history::Where {
+    match target {
+        Some(Conversation::Agent(name)) => super::history::Where::Agent(name.clone()),
+        Some(Conversation::Group(name)) => super::history::Where::Group(name.clone()),
+        None => super::history::Where::Feed,
+    }
+}
+
+/// A stored message chosen in Ctrl-P, opening once its context is read.
+struct PendingHit {
+    generation: u64,
+    message: crate::proto::Message,
+    destination: Option<Conversation>,
 }
 
 /// Where a modal sends the human once an open note is stored.
 enum Navigation {
     Launch(Target),
+    /// A stored message, with its stored context.
+    Stored {
+        id: i64,
+        destination: Option<Conversation>,
+        rows: Vec<crate::proto::Message>,
+    },
     /// A blocker creator's conversation, if that agent is still live.
     Discuss {
         id: i64,
@@ -327,6 +346,11 @@ impl App {
             unsaved: HashMap::new(),
             pending_navigation: None,
             stored: None,
+            pending_contexts: HashMap::new(),
+            pending_hit: None,
+            history_id: next_id(),
+            history_state: None,
+            offline: false,
         };
         app.send(vec![Request::WatchSummary(app.ctx.inbox.id)]);
         app.push(Box::new(Menu::default()));
@@ -342,8 +366,8 @@ impl App {
     }
 
     fn open_at(&mut self, mut screen: Box<dyn Screen>, record: bool, opening: Opening) {
-        let hit = match opening {
-            Opening::Seek(id) => Some(id),
+        let hit = match &opening {
+            Opening::Seek(id) | Opening::SeekWith(id, _) => Some(*id),
             _ => None,
         };
         if let Some(target) = screen.conversation() {
@@ -358,14 +382,19 @@ impl App {
             }
         }
         screen.restore_draft(&mut self.drafts, &mut self.draft_store);
-        // Stored history fills the conversation in, offline too.
-        let stored = match (&self.stored, screen.conversation()) {
-            (Some(stored), Some(target)) => stored.context(&target, hit),
-            _ => Vec::new(),
-        };
-        let seeded = !stored.is_empty();
-        self.launcher_cache.adopt(stored);
-        if seeded || !matches!(opening, Opening::Fresh) {
+        // Stored history fills the conversation in when it is read, offline
+        // too.
+        if let Some(stored) = &self.stored
+            && screen.is_thread()
+        {
+            let target = screen.conversation();
+            let generation = stored.contexts.fetch(place_of(target.as_ref()), hit);
+            self.pending_contexts.insert(generation, target);
+        }
+        if let Opening::SeekWith(_, rows) = &opening {
+            screen.seed_messages(rows);
+        }
+        if !matches!(opening, Opening::Fresh) {
             let destination = screen.conversation();
             screen.seed_messages(&self.launcher_cache.context(destination.as_ref(), hit));
             if let Some(target) = destination
@@ -427,7 +456,11 @@ impl App {
     fn viewed(&mut self) {
         // Covered screens still receive data, but nothing under a modal or
         // the note editor is viewed.
-        if self.blockers.is_open() || self.picker.is_some() || self.note_editor.is_some() {
+        if self.blockers.is_open()
+            || self.picker.is_some()
+            || self.note_editor.is_some()
+            || self.pending_hit.is_some()
+        {
             return;
         }
         let screen = self.stack.last_mut().expect("the menu is never popped");
@@ -585,6 +618,9 @@ impl App {
                 };
                 match &data {
                     Data::Summary { id, result } if *id == self.ctx.inbox.id => {
+                        if result.is_ok() {
+                            self.offline = false;
+                        }
                         if let Ok(rows) = result {
                             self.launcher_cache.summaries(rows);
                             // Every live agent, so absence means retired; a list
@@ -640,6 +676,22 @@ impl App {
                         self.notes_announced(*id, *revision);
                     }
                     Data::NotesListed { id, result } => self.notes_listed(*id, result),
+                    Data::History { id, messages } if *id == self.history_id => {
+                        self.offline = false;
+                        self.launcher_cache.adopt(messages.iter().cloned());
+                    }
+                    Data::HistoryState { id, state } if *id == self.history_id => {
+                        if let super::event::HistoryState::Paused(why) = state {
+                            tracing::warn!("history paused: {why}");
+                        }
+                        if *state == super::event::HistoryState::Reset {
+                            self.forget_history();
+                        }
+                        self.history_state = Some(state.clone());
+                    }
+                    Data::StoredContext { generation, result } => {
+                        self.stored_context(*generation, result);
+                    }
                     Data::StoredFound { generation, result } => {
                         if let (Some(stored), Some(picker)) = (&self.stored, &mut self.picker)
                             && let Some((awaited, query)) = &stored.awaiting
@@ -725,19 +777,24 @@ impl App {
                 }
                 launcher::Outcome::Choose(target) => {
                     let picker = self.picker.take().expect("open");
-                    // A stored message opens with its stored context.
+                    // A stored message opens once its stored context is read,
+                    // handed straight to its conversation.
                     if let Target::Message(id) = &target
                         && self.launcher_cache.message(*id).is_none()
-                        && let Some(found) = picker.found(*id)
+                        && let (Some(found), Some(stored)) = (picker.found(*id), &self.stored)
                     {
-                        self.launcher_cache
-                            .adopt([(found.message.clone(), found.agents.clone())]);
-                        if let (Some(stored), Some(place)) =
-                            (&self.stored, self.launcher_cache.destination(*id))
-                        {
-                            let rows = stored.context(&place, Some(*id));
-                            self.launcher_cache.adopt(rows);
-                        }
+                        let destination = launcher::destination_of(&found.message);
+                        let generation = stored
+                            .contexts
+                            .fetch(place_of(destination.as_ref()), Some(*id));
+                        self.pending_hit = Some(PendingHit {
+                            generation,
+                            message: found.message.clone(),
+                            destination,
+                        });
+                        self.ctx.navigation_notice =
+                            Some(Feedback::Other("Opening a stored message…".into()));
+                        return Some(false);
                     }
                     self.navigate(Navigation::Launch(target));
                     self.viewed();
@@ -754,6 +811,132 @@ impl App {
             stored.awaiting = None;
         }
         Some(false)
+    }
+
+    /// Stored messages read for a conversation, or for a chosen result.
+    fn stored_context(
+        &mut self,
+        generation: u64,
+        result: &Result<Vec<crate::proto::Message>, String>,
+    ) {
+        let rows = result.as_ref().map(Vec::as_slice).unwrap_or_default();
+        if let Err(e) = result {
+            tracing::warn!("reading stored history: {e}");
+        }
+        if let Some(target) = self.pending_contexts.remove(&generation) {
+            for screen in &mut self.stack {
+                if screen.is_thread()
+                    && screen
+                        .conversation()
+                        .as_ref()
+                        .map(Conversation::to_owned)
+                        .zip(target.as_ref())
+                        .map_or(
+                            target.is_none() && screen.conversation().is_none(),
+                            |(a, b)| a.same(b),
+                        )
+                {
+                    screen.seed_messages(rows);
+                }
+            }
+            return;
+        }
+        let Some(hit) = self.pending_hit.take_if(|hit| hit.generation == generation) else {
+            return;
+        };
+        let mut rows = rows.to_vec();
+        if !rows.iter().any(|m| m.id == hit.message.id) {
+            rows.push(hit.message.clone());
+            rows.sort_by_key(|m| m.id);
+        }
+        self.ctx.navigation_notice = None;
+        self.navigate(Navigation::Stored {
+            id: hit.message.id,
+            destination: hit.destination,
+            rows,
+        });
+        self.viewed();
+    }
+
+    /// Open a stored message in its conversation with the rows in hand,
+    /// whatever the session cache still holds.
+    fn open_stored(
+        &mut self,
+        id: i64,
+        destination: Option<Conversation>,
+        rows: Vec<crate::proto::Message>,
+    ) {
+        self.ctx.navigation_notice = None;
+        let existing =
+            self.stack
+                .iter()
+                .rposition(|screen| match (&destination, screen.conversation()) {
+                    (Some(target), Some(current)) => target.same(&current),
+                    (None, None) => screen.is_thread(),
+                    _ => false,
+                });
+        if let Some(at) = existing {
+            while self.stack.len() > at + 1 {
+                self.pop();
+            }
+            if let Some(target) = &destination {
+                self.history.visit(target.clone());
+            }
+            self.top().seed_messages(&rows);
+            if self.top().seek_message(id) {
+                return;
+            }
+            // A full timeline may not keep an old message: a fresh one can.
+            self.pop();
+        }
+        let screen = match destination {
+            Some(Conversation::Agent(name)) => {
+                Thread::agent(&name, &self.ctx.me, self.ctx.now.clone())
+            }
+            Some(Conversation::Group(name)) => Thread::group(&name),
+            None => Thread::feed(),
+        };
+        self.open_at(Box::new(screen), true, Opening::SeekWith(id, rows));
+    }
+
+    /// Keep the stored history up to date, from where it stopped.
+    pub fn start_history(&mut self) {
+        if let Some(stored) = &self.stored {
+            self.history_state = None;
+            self.send(vec![Request::WatchHistory {
+                id: self.history_id,
+                dir: stored.dir.clone(),
+            }]);
+        }
+    }
+
+    /// The server's history changed: nothing from the old one stays mixed
+    /// in with the new one.
+    fn forget_history(&mut self) {
+        self.launcher_cache.forget_messages();
+        if let Some(stored) = &mut self.stored {
+            stored.awaiting = None;
+        }
+        self.pending_contexts.clear();
+        self.pending_hit = None;
+        if let Some(picker) = &mut self.picker {
+            picker.forget_stored(&self.launcher_cache);
+        }
+    }
+
+    /// The bar's note on the stored history, when there is one to make.
+    fn history_marker(&self) -> Option<String> {
+        use super::event::HistoryState;
+        if self.offline {
+            return Some("[offline · stored history]".into());
+        }
+        match self.history_state.as_ref()? {
+            HistoryState::Syncing | HistoryState::Reset => Some("[storing history…]".into()),
+            HistoryState::CaughtUp => None,
+            HistoryState::Reconnecting(_) => Some("[history reconnecting]".into()),
+            HistoryState::Paused(_) => Some("[history paused · F5]".into()),
+            HistoryState::Unsupported => Some("[history needs a newer server]".into()),
+        }
     }
 
     /// Search the stored history for Ctrl-P's query when it changed.
@@ -819,6 +1002,11 @@ impl App {
     fn go(&mut self, to: Navigation) {
         match to {
             Navigation::Launch(target) => self.launch(target),
+            Navigation::Stored {
+                id,
+                destination,
+                rows,
+            } => self.open_stored(id, destination, rows),
             Navigation::Discuss { id, name } => match self.creator_live(id, &name) {
                 Ok(()) => self.launch(Target::Agent(name)),
                 Err(notice) => self.ctx.navigation_notice = Some(Feedback::Other(notice)),
@@ -1158,6 +1346,16 @@ impl App {
             }
             Action::Reload => {
                 self.blockers.reload();
+                // F5 also tries a stopped history again.
+                if matches!(
+                    self.history_state,
+                    Some(
+                        super::event::HistoryState::Paused(_)
+                            | super::event::HistoryState::Unsupported
+                    )
+                ) {
+                    self.start_history();
+                }
                 let mut screen = self.stack.pop().expect("the menu is never popped");
                 self.send(screen.reload());
                 self.fetch(screen.as_ref());
@@ -1260,18 +1458,26 @@ impl App {
                 status,
             );
         }
-        // The marker owns the bar's right end; screens leave it room.
-        if let Some(marker) = &self.ctx.blocker_marker {
-            let width =
-                (unicode_width::UnicodeWidthStr::width(marker.as_str()) as u16).min(status.width);
-            let at = Rect {
-                x: status.right() - width,
-                width,
-                ..status
-            };
+        // The markers own the bar's right end; screens leave them room.
+        let mut right = status.right();
+        let markers = [
+            self.ctx
+                .blocker_marker
+                .clone()
+                .map(|m| (m, theme::Role::WarningTitle)),
+            self.history_marker().map(|m| (m, theme::Role::StatusBar)),
+        ];
+        for (marker, role) in markers.into_iter().flatten() {
+            let width = (unicode_width::UnicodeWidthStr::width(marker.as_str()) as u16)
+                .min(right - status.x);
+            right -= width;
             frame.render_widget(
-                Paragraph::new(marker.clone()).style(theme::style(theme::Role::WarningTitle)),
-                at,
+                Paragraph::new(marker).style(theme::style(role)),
+                Rect {
+                    x: right,
+                    width,
+                    ..status
+                },
             );
         }
         if let Some(editor) = &mut self.note_editor {
@@ -12555,8 +12761,24 @@ mod tests {
     /// through the returned receiver.
     fn with_stored(app: &mut App, dir: &std::path::Path) -> UnboundedReceiver<Event> {
         let (tx, rx) = unbounded_channel();
-        app.stored = Some(Stored::open(dir, tx).unwrap());
+        app.stored = Some(Stored::open(dir, tx));
         rx
+    }
+
+    /// Deliver the stored history workers' next answer to the app.
+    fn pump(app: &mut App, workers: &mut UnboundedReceiver<Event>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let event = loop {
+            if let Ok(event) = workers.try_recv() {
+                break event;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no answer from the workers"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        app.on_event(event);
     }
 
     #[test]
@@ -12567,20 +12789,15 @@ mod tests {
         let mut found = with_stored(&mut app, dir.path());
         ctrl(&mut app, 'p');
         app.on_event(Event::Paste("needle".into()));
-        // The search runs on its worker thread.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let event = loop {
-            if let Ok(event) = found.try_recv() {
-                break event;
-            }
-            assert!(std::time::Instant::now() < deadline, "no search answer");
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        app.on_event(event);
+        pump(&mut app, &mut found);
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("Mateo → ada  an ancient needle"), "{out}");
         while rx.try_recv().is_ok() {}
         enter(&mut app);
+        // Opening waits for its stored context, reading nothing meanwhile.
+        assert_eq!(opened(&app), None);
+        assert!(bottom(&mut app).contains("Opening a stored message…"));
+        pump(&mut app, &mut found);
         assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("an ancient needle"), "{out}");
@@ -12601,9 +12818,152 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         stored_history(dir.path(), 30, &[(30, "the last stored word")]);
         let (mut app, mut rx) = app();
-        let _found = with_stored(&mut app, dir.path());
+        let mut found = with_stored(&mut app, dir.path());
         mateo_loading_streams(&mut app, &mut rx);
+        pump(&mut app, &mut found);
         let out = screen(&mut app, 80, 24);
         assert!(out.contains("the last stored word"), "{out}");
+    }
+
+    fn history_page(app: &App, rows: Vec<proto::Message>) -> Event {
+        Event::Data(Data::History {
+            id: app.history_id,
+            messages: rows
+                .into_iter()
+                .map(|m| (m, vec!["Mateo".to_string()]))
+                .collect(),
+        })
+    }
+
+    fn history_state(app: &App, state: crate::connect::event::HistoryState) -> Event {
+        Event::Data(Data::HistoryState {
+            id: app.history_id,
+            state,
+        })
+    }
+
+    fn found_in_ctrl_p(app: &mut App, query: &str) -> String {
+        app.picker = None;
+        ctrl(app, 'p');
+        app.on_event(Event::Paste(query.into()));
+        let out = screen(app, 80, 24);
+        press(app, KeyCode::Esc, KeyModifiers::NONE);
+        out
+    }
+
+    #[test]
+    fn mail_sent_then_left_reaches_ctrl_p_through_the_history_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, mut rx) = app();
+        let _found = with_stored(&mut app, dir.path());
+        app.start_history();
+        assert!(matches!(
+            std::iter::from_fn(|| rx.try_recv().ok()).find(|r| matches!(r, Request::WatchHistory { .. })),
+            Some(Request::WatchHistory { id, .. }) if id == app.history_id
+        ));
+        mateo(&mut app, &mut rx);
+        typed(&mut app, "run 40017648886");
+        enter(&mut app);
+        // Gone before the conversation's own feed shows it.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let before = found_in_ctrl_p(&mut app, "40017648886");
+        assert!(!before.contains("ada → Mateo  run 40017648886"), "{before}");
+        while rx.try_recv().is_ok() {}
+        let mut sent = message(23880, "ada", "Mateo", "run 40017648886");
+        sent.from_kind = proto::Kind::Human.into();
+        sent.to_owner = Some("ada".into());
+        let page = history_page(
+            &app,
+            vec![sent, message(23881, "Mateo", "ada", "unread to me")],
+        );
+        app.on_event(page);
+        let out = found_in_ctrl_p(&mut app, "40017648886");
+        assert!(out.contains("ada → Mateo  run 40017648886"), "{out}");
+        // Storing history marks nothing read or seen.
+        let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
+            "{requests:?}"
+        );
+    }
+
+    #[test]
+    fn the_bar_says_how_the_history_is_and_f5_retries_a_paused_one() {
+        use crate::connect::event::HistoryState;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, mut rx) = app();
+        let _found = with_stored(&mut app, dir.path());
+        app.offline = true;
+        assert!(bottom(&mut app).contains("[offline · stored history]"));
+        // The server answers: no longer offline.
+        app.on_event(history_state(&app, HistoryState::Syncing));
+        app.on_event(history_page(&app, vec![message(1, "Mateo", "ada", "hi")]));
+        assert!(bottom(&mut app).contains("[storing history…]"));
+        app.on_event(history_state(&app, HistoryState::CaughtUp));
+        assert!(!bottom(&mut app).contains("history"));
+        app.on_event(history_state(
+            &app,
+            HistoryState::Paused("disk full".into()),
+        ));
+        assert!(bottom(&mut app).contains("[history paused · F5]"));
+        while rx.try_recv().is_ok() {}
+        press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|r| matches!(r, Request::WatchHistory { id, .. } if id == app.history_id))
+        );
+        assert!(!bottom(&mut app).contains("paused"));
+        app.on_event(history_state(&app, HistoryState::Unsupported));
+        assert!(bottom(&mut app).contains("[history needs a newer server]"));
+    }
+
+    #[test]
+    fn a_reset_history_leaves_nothing_of_the_old_one_in_ctrl_p() {
+        use crate::connect::event::HistoryState;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _rx) = app();
+        let _found = with_stored(&mut app, dir.path());
+        app.on_event(history_page(
+            &app,
+            vec![message(5, "Mateo", "ada", "an old needle")],
+        ));
+        assert!(found_in_ctrl_p(&mut app, "needle").contains("an old needle"));
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("needle".into()));
+        app.on_event(history_state(&app, HistoryState::Reset));
+        assert!(!screen(&mut app, 80, 24).contains("an old needle"));
+        assert!(app.launcher_cache.message(5).is_none());
+        assert!(app.stored.as_ref().unwrap().awaiting.is_none());
+    }
+
+    #[test]
+    fn a_stored_result_opens_even_when_the_session_cache_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        stored_history(dir.path(), 300, &[(5, "an ancient needle")]);
+        let (mut app, mut rx) = app();
+        let mut found = with_stored(&mut app, dir.path());
+        // Ten thousand newer messages fill the session cache.
+        app.launcher_cache.observe(&Data::Feed {
+            id: 1,
+            result: Ok((10_000..20_000)
+                .map(|id| message(id, "Bernie", "ada", "filler"))
+                .collect()),
+        });
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("needle".into()));
+        pump(&mut app, &mut found);
+        while rx.try_recv().is_ok() {}
+        enter(&mut app);
+        pump(&mut app, &mut found);
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("an ancient needle"), "seeked to it: {out}");
+        assert!(
+            app.launcher_cache.message(5).is_none(),
+            "the cache was not needed"
+        );
     }
 }

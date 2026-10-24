@@ -73,9 +73,6 @@ pub struct Batch {
 #[derive(Clone, Debug)]
 pub struct Found {
     pub message: proto::Message,
-    /// The human's agents whose conversations hold it.
-    pub agents: Vec<String>,
-    pub line: usize,
     pub text: String,
     pub indexed: String,
     pub rank: Rank,
@@ -230,6 +227,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -261,17 +259,14 @@ impl Store {
     }
 
     /// The newest message the sync feed has delivered and stored.
+    #[cfg(test)]
     pub fn cursor(&self) -> Result<i64, StoreError> {
         Ok(self.meta("cursor")?.unwrap_or(0))
     }
 
+    #[cfg(test)]
     pub fn caught_up(&self) -> Result<bool, StoreError> {
         Ok(self.meta::<i64>("caught_up")?.unwrap_or(0) != 0)
-    }
-
-    /// When the last page was stored, RFC 3339.
-    pub fn synced_at(&self) -> Result<Option<String>, StoreError> {
-        self.meta("synced_at")
     }
 
     /// Where the sync feed resumes, and the message its first page must
@@ -405,13 +400,7 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             let message = decode(&row)?;
-            let agents = self
-                .conn
-                .prepare_cached("SELECT agent_name FROM scopes WHERE message_id = ?1")?
-                .query_map([id], |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
             found.push(Found {
-                agents,
                 text: message
                     .body
                     .lines()
@@ -420,7 +409,6 @@ impl Store {
                     .to_string(),
                 indexed: indexed.lines().nth(line).unwrap_or_default().to_string(),
                 message,
-                line,
                 rank,
             });
         }
@@ -551,7 +539,6 @@ fn apply(tx: &Transaction, batch: &Batch) -> Result<(), StoreError> {
     if current {
         set("caught_up", &i64::from(batch.caught_up))?;
     }
-    set("synced_at", &chrono::Utc::now().to_rfc3339())?;
     Ok(())
 }
 
@@ -605,7 +592,6 @@ mod tests {
         assert_eq!(store.resume().unwrap().0, 4, "re-deliver the anchor");
         assert!(store.caught_up().unwrap());
         assert_eq!(store.identity().unwrap().as_deref(), Some("ada"));
-        assert!(store.synced_at().unwrap().is_some());
         let rows = store.context(Place::Agent("zed"), None, 10).unwrap();
         assert_eq!(rows.iter().map(|m| m.id).collect::<Vec<_>>(), [1, 2, 5]);
     }
@@ -838,9 +824,8 @@ mod tests {
         let found = store.search("JEFE", 10, never).unwrap().unwrap();
         // Whole words, newest first; then partial; then ordered letters.
         assert_eq!(ids(&found), [3, 1, 2, 4]);
-        assert_eq!((found[0].line, found[0].text.as_str()), (1, "then Jefe!"));
+        assert_eq!(found[0].text, "then Jefe!");
         assert_eq!(found[0].indexed, "then jefe!");
-        assert_eq!(found[0].agents, ["Zed"]);
         assert_eq!(
             ids(&store.search("jefe", 2, never).unwrap().unwrap()),
             [3, 1]

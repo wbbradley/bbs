@@ -484,6 +484,41 @@ activity but marks nothing read or seen. `F2` and `Ctrl-p` still open over it,
 and `Esc` from them returns to the note as it was. `Ctrl-c` quits without
 saving.
 
+## Stored history
+
+`bbs connect` keeps your whole personal message history on disk: the mail you
+sent and received, and everything your agents sent or were delivered, retired
+agents included, as the server's `feed-sync.v1` feed gives it. One stream per
+session, independent of the screens open, pages it in from where the last
+session stopped and then follows new mail; a message is stored before the app
+sees it, so mail sent just before leaving its conversation is still found.
+Storing it never marks anything read or seen. Activity is not stored, nor is
+other people's mail you only happened to see.
+
+The history lives in SQLite under the state directory, one file per server and
+human, kept until you remove it: there is no size limit and nothing is evicted.
+Each page and the point the stream reached are saved together, so an
+interrupted session resumes without gaps or repeats, and several sessions can
+share one history. Resuming first checks that the server still has the last
+stored message unchanged; if the server's history was reset or restored, the
+old file is kept as it is and a new one is filled from the start, and nothing
+from the old history stays in the session's results. Credentials are never
+stored.
+
+The status bar says when history is still being stored, reconnecting, paused
+or needs a newer server; `F5` retries a paused one. A failure to store pauses
+storing without stopping anything else, and nothing moves past what was
+stored. Servers without `feed-sync.v1` leave the stored history as it was,
+still searchable.
+
+When the server cannot be reached at all, `connect` starts from the stored
+history of the human last signed in to that server under the configured name,
+with `[offline · stored history]` in the status bar until the server answers.
+Conversations, Ctrl-P and search work from what is stored; drafts are kept.
+Nothing is queued: sends say they were not sent, other changes fail, and
+nothing is marked read later on your behalf. Agent notes stay online-only. An
+agent's token or a refused sign-in never starts offline.
+
 ## Local launcher
 
 `Ctrl-p` opens a full-screen launcher from any screen, with a centered query
@@ -501,11 +536,14 @@ also on the selected row, and the list scrolls through up to 50 results.
 `Ctrl-c` still quits. The blocker modal keeps `Ctrl-p` while it is open;
 likewise, the launcher keeps `F2` until it closes.
 
-Search uses only data this `connect` process has already received. It does
-not list agents or groups, call message search, or fetch older history.
-Messages remain searchable after leaving a conversation, within a session
-cache of up to 10,000 messages and 16 MiB of body text, with an additional
-folded-text index. The cache is held in memory and disappears on exit.
+Search uses only data already on this machine. It does not list agents or
+groups, call message search, or fetch older history. Messages this session
+received stay in a memory cache of up to 10,000 messages and 16 MiB of body
+text, with an additional folded-text index; the stored history is searched as
+well, in full, on a worker so typing stays responsive, and a newer query stops
+an older one. Stored results rank among the session's own, each message once.
+Choosing one waits for its stored context, then opens its conversation paused
+at it, offline too.
 Names learned from historical messages may still appear. Matching ignores
 case, keeps accents significant, and searches each message line separately.
 Agents come first, then groups, then notes, then messages. Agents match by

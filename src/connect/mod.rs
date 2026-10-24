@@ -91,38 +91,75 @@ impl Drop for BracketedPaste {
 /// How `connect` starts: with a server, or from the history saved for the
 /// human last signed in to this board.
 pub enum Start {
-    Online(Backend),
+    Online(Box<Backend>),
     Offline { human: String },
 }
 
 /// Where a board's and human's history lives.
 fn history_dir(opener: &Opener, human: &str) -> Result<std::path::PathBuf> {
+    history_dir_in(
+        &crate::app::state_dir()?.join("connect-history"),
+        opener,
+        human,
+    )
+}
+
+fn history_dir_in(
+    root: &std::path::Path,
+    opener: &Opener,
+    human: &str,
+) -> Result<std::path::PathBuf> {
     let board = match &opener.config.server {
         Some(server) => format!("remote:{}", server.to_ascii_lowercase()),
         None => format!("local:{}", opener.dir.canonicalize()?.display()),
     };
-    Ok(history::dir_for(
-        &crate::app::state_dir()?.join("connect-history"),
-        &board,
-        human,
-    ))
+    Ok(history::dir_for(root, &board, human))
 }
 
-/// The human `connect` may start offline as: the one last signed in to this
-/// board as `configured`, if their history was saved.
-pub fn offline_start(opener: &Opener, configured: &str) -> Option<Start> {
-    let dir = history_dir(opener, configured).ok()?;
+pub use event::unreachable;
+
+/// The human `connect` may start offline as: the configured human, if the
+/// history saved for this board says they last signed in as that name.
+/// Agents, signing in with tokens, never start offline.
+pub fn offline_start(opener: &Opener) -> Option<Start> {
+    offline_start_in(
+        &crate::app::state_dir().ok()?.join("connect-history"),
+        opener,
+    )
+}
+
+fn offline_start_in(root: &std::path::Path, opener: &Opener) -> Option<Start> {
+    if opener.caller.token.is_some() || opener.config.server.is_none() {
+        return None;
+    }
+    let configured = opener.caller.human.as_deref()?;
+    let dir = history_dir_in(root, opener, configured).ok()?;
     if !dir.exists() {
         return None;
     }
     let human = history::Store::open(&dir).ok()?.identity().ok()??;
-    Some(Start::Offline { human })
+    human
+        .eq_ignore_ascii_case(configured)
+        .then_some(Start::Offline { human })
 }
 
 pub async fn run(start: Start, opener: Opener, theme_explicit: bool) -> Result<()> {
+    let offline = matches!(start, Start::Offline { .. });
     let (backend, me) = match start {
-        Start::Online(mut backend) => {
-            let me = backend.whoami().await?;
+        Start::Online(backend) => {
+            let mut backend = *backend;
+            let me = match backend.whoami().await {
+                Ok(me) => me,
+                // Connected, then lost: as if it never answered.
+                Err(e) if unreachable(&e) => match offline_start(&opener) {
+                    Some(Start::Offline { human }) => {
+                        return Box::pin(run(Start::Offline { human }, opener, theme_explicit))
+                            .await;
+                    }
+                    _ => return Err(e),
+                },
+                Err(e) => return Err(e),
+            };
             if me.kind() != Kind::Human {
                 bail!("bbs connect is for humans; agents use the other bbs commands");
             }
@@ -174,11 +211,9 @@ pub async fn run(start: Start, opener: Opener, theme_explicit: bool) -> Result<(
     app.stored = history
         .map_err(|e| tracing::warn!("finding the history: {e:#}"))
         .ok()
-        .and_then(|dir| {
-            app::Stored::open(&dir, events.clone())
-                .map_err(|e| tracing::warn!("opening the history: {e}"))
-                .ok()
-        });
+        .map(|dir| app::Stored::open(&dir, events.clone()));
+    app.offline = offline;
+    app.start_history();
     let mut terminal = ratatui::init();
     let _paste = match BracketedPaste::enable() {
         Ok(paste) => paste,
@@ -256,5 +291,77 @@ mod tests {
         // The channel closing ends the loop.
         drop(tx);
         assert!(wait(&mut rx, None, || Ok(None)).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod offline_tests {
+    use super::*;
+    use crate::service::Caller;
+
+    fn opener(human: Option<&str>, token: Option<&str>) -> Opener {
+        Opener {
+            config: crate::config::Config {
+                server: Some("bbs:7777".into()),
+                ..Default::default()
+            },
+            dir: std::env::temp_dir(),
+            caller: Caller {
+                human: human.map(Into::into),
+                token: token.map(Into::into),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn only_the_configured_human_starts_offline_from_their_saved_history() {
+        let root = tempfile::tempdir().unwrap();
+        let ada = opener(Some("ada"), None);
+        assert!(
+            offline_start_in(root.path(), &ada).is_none(),
+            "nothing saved"
+        );
+        let dir = history_dir_in(root.path(), &ada, "ada").unwrap();
+        history::Store::open(&dir)
+            .unwrap()
+            .set_identity("Ada")
+            .unwrap();
+        assert!(matches!(
+            offline_start_in(root.path(), &ada),
+            Some(Start::Offline { human }) if human == "Ada"
+        ));
+        // An agent's token never starts offline, even as a configured human.
+        assert!(offline_start_in(root.path(), &opener(Some("ada"), Some("t"))).is_none());
+        // Nor does another human's history.
+        assert!(offline_start_in(root.path(), &opener(Some("bo"), None)).is_none());
+        let bo = history_dir_in(root.path(), &opener(Some("bo"), None), "bo").unwrap();
+        history::Store::open(&bo)
+            .unwrap()
+            .set_identity("ada")
+            .unwrap();
+        assert!(offline_start_in(root.path(), &opener(Some("bo"), None)).is_none());
+        // A local board is never unreachable.
+        let mut local = opener(Some("ada"), None);
+        local.config.server = None;
+        assert!(offline_start_in(root.path(), &local).is_none());
+    }
+
+    #[test]
+    fn only_an_unreachable_server_counts_as_offline() {
+        use tonic::{Code, Status};
+        let status = |code| anyhow::Error::new(Status::new(code, "x"));
+        assert!(unreachable(&status(Code::Unavailable)));
+        assert!(unreachable(&status(Code::DeadlineExceeded)));
+        for code in [
+            Code::Unauthenticated,
+            Code::PermissionDenied,
+            Code::FailedPrecondition,
+            Code::ResourceExhausted,
+            Code::Internal,
+        ] {
+            assert!(!unreachable(&status(code)), "{code:?}");
+        }
+        assert!(!unreachable(&anyhow::anyhow!("not a transport error")));
     }
 }
