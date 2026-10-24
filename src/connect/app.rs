@@ -12966,4 +12966,45 @@ mod tests {
             "the cache was not needed"
         );
     }
+
+    #[test]
+    fn nothing_is_read_while_a_stored_result_is_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        stored_history(dir.path(), 30, &[(5, "an ancient needle")]);
+        let (mut app, mut rx) = app();
+        let mut found = with_stored(&mut app, dir.path());
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        // The conversation's own stored context, read as it is shown.
+        pump(&mut app, &mut found);
+        while rx.try_recv().is_ok() {}
+        app.on_event(Event::Data(Data::MarkedRead {
+            agent: "Mateo".into(),
+            result: Ok(()),
+        }));
+        ctrl(&mut app, 'p');
+        // New mail arrives under the launcher: not read yet.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(100, "Mateo", "ada", "fresh and unread")]),
+        }));
+        app.on_event(Event::Paste("needle".into()));
+        pump(&mut app, &mut found);
+        while rx.try_recv().is_ok() {}
+        enter(&mut app);
+        assert!(app.pending_hit.is_some(), "waiting for its context");
+        // More arrives while the stored context is read.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(101, "Mateo", "ada", "and more")]),
+        }));
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
+            "nothing read while it opens: {sent:?}"
+        );
+        pump(&mut app, &mut found);
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+    }
 }
