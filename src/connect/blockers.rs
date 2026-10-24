@@ -960,8 +960,8 @@ impl Blockers {
         } = self.parts(area.width);
         let below = self.lines_below(area.width, now);
         let answer = self.answer_height(area.width);
-        // The list stays at the top; the selected blocker sits at the
-        // bottom, just above its answer, with the spare rows between.
+        // Keep the title, list and selected blocker together above the
+        // answer, with all spare rows above the card.
         let inset = area.width.min(2);
         let body = Paragraph::new(body).wrap(Wrap { trim: false });
         let rows = body.line_count(area.width - inset) as u16;
@@ -979,8 +979,8 @@ impl Blockers {
         let room = area.height.saturating_sub(fixed);
         let shown = rows.min(room.saturating_sub(1));
         let [
-            head_area,
             _,
+            head_area,
             selected_area,
             body_area,
             _,
@@ -988,8 +988,8 @@ impl Blockers {
             middle,
             bottom,
         ] = Layout::vertical([
-            Constraint::Length(head.len() as u16),
             Constraint::Length(room - shown),
+            Constraint::Length(head.len() as u16),
             Constraint::Length(selected.iter().count() as u16),
             Constraint::Length(shown),
             Constraint::Length(label_gap),
@@ -998,11 +998,12 @@ impl Blockers {
             Constraint::Length(below.len() as u16),
         ])
         .areas(area);
-        // A warning card under a full-width title bar; the answer box keeps
-        // its own surface inside it.
+        frame.render_widget(ratatui::widgets::Block::new().style(theme::base()), area);
+        // Only the card gets the warning surface; spare rows keep the
+        // standard background. The answer box keeps its own surface.
         frame.render_widget(
             ratatui::widgets::Block::new().style(theme::style(Role::WarningSurface)),
-            area,
+            Rect::new(area.x, head_area.y, area.width, area.bottom() - head_area.y),
         );
         let mut head = head.into_iter();
         if let Some(title) = head.next() {
@@ -1288,12 +1289,16 @@ mod tests {
                     let mut blockers = open(now);
                     let (rows, buffer) = drawn(&mut blockers, width, height, now);
                     let out = rows.join("\n");
-                    // The list stays at the top.
-                    assert!(rows[1].starts_with("▸ #1 @crew Zed  first?"), "{out}");
-                    assert!(rows[2].starts_with("  #2 @crew Mateo  second?"), "{out}");
                     // The selection restated, its text, who it answers.
                     let at = restated(&rows, "#1 @crew Zed");
                     assert!(at > 3, "{out}");
+                    let title = at - 3;
+                    assert!(rows[title].starts_with(" #1 · Answering"), "{out}");
+                    assert!(rows[at - 2].starts_with("▸ #1 @crew Zed  first?"), "{out}");
+                    assert!(
+                        rows[at - 1].starts_with("  #2 @crew Mateo  second?"),
+                        "{out}"
+                    );
                     assert_eq!(rows[at].trim_end(), "  #1 @crew Zed", "{out}");
                     assert!(rows[at + 1].starts_with("  first?"), "{out}");
                     assert_eq!(
@@ -1309,7 +1314,12 @@ mod tests {
                         assert_ne!(buffer[(0, at as u16 + 4)].bg, bg, "{scheme:?}");
                     }
                     // The spare rows are all above it.
-                    assert!(rows[3..at].iter().all(|r| r.trim().is_empty()), "{out}");
+                    assert!(rows[..title].iter().all(|r| r.trim().is_empty()), "{out}");
+                    for y in 0..title as u16 {
+                        for x in 0..width {
+                            assert_eq!(Some(buffer[(x, y)].bg), theme::base().bg, "{scheme:?}");
+                        }
+                    }
                     assert_eq!(at, usize::from(height) - 10, "{out}");
                 }
             });
@@ -1334,11 +1344,11 @@ mod tests {
         let (rows, _) = drawn(&mut blockers, 60, 24, now);
         let out = rows.join("\n");
         assert!(
-            rows[1].starts_with("▸ #1") && rows[2].starts_with("  #2"),
+            rows[2].starts_with("▸ #1") && rows[3].starts_with("  #2"),
             "{out}"
         );
         let at = restated(&rows, "#1 @crew Zed");
-        assert_eq!(at, 4, "one blank row under the list: {out}");
+        assert_eq!(at, 4, "the list directly precedes the details: {out}");
         assert!(rows[at + 1].starts_with("  line 0"), "{out}");
         let label = rows
             .iter()
@@ -1374,7 +1384,7 @@ mod tests {
         let (grown, _) = drawn(&mut blockers, 60, 40, now);
         assert_eq!(blockers.text_rows.1, shown - 2, "{grown:#?}");
         assert_eq!(restated(&grown, "#1 @crew Zed"), 4);
-        assert!(grown[1].starts_with("▸ #1"));
+        assert!(grown[2].starts_with("▸ #1"));
     }
 
     #[test]
