@@ -1062,7 +1062,7 @@ async fn sync_history(
         tokio::task::spawn_blocking(move || Store::open(&dir).and_then(|s| Ok((s.resume()?, s))))
             .await
     };
-    let ((after, anchor), mut store) = match opened {
+    let ((mut after, anchor), mut store) = match opened {
         Ok(Ok(opened)) => opened,
         Ok(Err(e)) => return paused(&e),
         Err(e) => return paused(&e),
@@ -1093,16 +1093,10 @@ async fn sync_history(
                 return history_error(&mut backend, e).await;
             }
         };
-        // One scope per message, in order: anything else cannot be stored.
-        let shaped = snapshot.agent_scopes.len() == snapshot.messages.len()
-            && snapshot
-                .agent_scopes
-                .iter()
-                .zip(&snapshot.messages)
-                .all(|(scope, m)| scope.message_id == m.id);
-        if !shaped {
-            return paused(&"the server sent a history page without its agents");
-        }
+        let caught = match history_page(after, &snapshot) {
+            Ok(caught) => caught,
+            Err(why) => return paused(&why),
+        };
         let batch = Batch {
             scopes: snapshot
                 .agent_scopes
@@ -1114,9 +1108,12 @@ async fn sync_history(
                     )
                 })
                 .collect(),
-            caught_up: snapshot.caught_up.unwrap_or(false),
+            caught_up: caught,
             messages: snapshot.messages,
         };
+        if let Some(last) = batch.messages.last() {
+            after = last.id;
+        }
         let applied = tokio::task::spawn_blocking(move || {
             let result = store
                 .apply(&batch, expected.as_ref())
@@ -1184,6 +1181,39 @@ async fn sync_history(
             }
         }
     }
+}
+
+/// Whether a sync page can be stored after `after`, and if so whether it is
+/// caught up: it must say so, hold new messages in order, and name each
+/// message's agents; an empty page is the end. Anything else is refused
+/// whole.
+fn history_page(after: i64, page: &proto::FeedSnapshot) -> Result<bool, String> {
+    let caught_up = page
+        .caught_up
+        .ok_or("the server sent a history page without saying whether more follows")?;
+    let mut last = after;
+    for m in &page.messages {
+        if m.id <= last.max(0) {
+            return Err(format!(
+                "the server sent history out of order at message {}",
+                m.id
+            ));
+        }
+        last = m.id;
+    }
+    if page.messages.is_empty() && !caught_up {
+        return Err("the server sent an empty history page with more to follow".into());
+    }
+    let shaped = page.agent_scopes.len() == page.messages.len()
+        && page
+            .agent_scopes
+            .iter()
+            .zip(&page.messages)
+            .all(|(scope, m)| scope.message_id == m.id);
+    if !shaped {
+        return Err("the server sent a history page without its agents".into());
+    }
+    Ok(caught_up)
 }
 
 /// What a history stream does about a server error: retry connection
@@ -1836,6 +1866,10 @@ mod tests {
             cursors: Mutex<Vec<Option<i64>>>,
             refusal: Option<tonic::Code>,
             history: Option<Arc<History>>,
+            /// Pages a sync feed sends, then nothing more.
+            sync: Vec<proto::FeedSnapshot>,
+            /// A capability this server lacks, as one from before it would.
+            withheld: Option<&'static str>,
         }
         #[derive(Clone, Default)]
         struct Server(Arc<State>);
@@ -1891,10 +1925,18 @@ mod tests {
             type Response = proto::FeedSnapshot;
             type ResponseStream = Replies<Self::Response>;
             type Future = Reply<Self::Response>;
-            fn call(&mut self, _: tonic::Request<proto::FeedRequest>) -> Self::Future {
+            fn call(&mut self, request: tonic::Request<proto::FeedRequest>) -> Self::Future {
                 let n = self.0.feeds.fetch_add(1, Ordering::SeqCst);
                 if let Some(code) = self.0.refusal {
                     return Box::pin(async move { Err(Status::new(code, "refused")) });
+                }
+                if request.get_ref().sync {
+                    let pages: Vec<_> = self.0.sync.iter().cloned().map(Ok).collect();
+                    return Box::pin(async move {
+                        let replies: Replies<proto::FeedSnapshot> =
+                            Box::pin(tokio_stream::iter(pages).chain(tokio_stream::pending()));
+                        Ok(Response::new(replies))
+                    });
                 }
                 reply(
                     proto::FeedSnapshot {
@@ -1990,6 +2032,18 @@ mod tests {
                 Box::pin(async { Ok(Response::new(proto::ListAgentsResponse::default())) })
             }
         }
+        impl tonic::server::UnaryService<proto::Empty> for Server {
+            type Response = proto::ServerInfoResponse;
+            type Future = BoxFuture<Response<proto::ServerInfoResponse>, Status>;
+            fn call(&mut self, _: tonic::Request<proto::Empty>) -> Self::Future {
+                let mut policy = crate::protocol::Policy::default();
+                if let Some(capability) = self.0.withheld {
+                    policy = policy.without(capability);
+                }
+                let info = policy.info(false);
+                Box::pin(async move { Ok(Response::new(info)) })
+            }
+        }
         impl tonic::server::NamedService for Server {
             const NAME: &'static str = "bbs.v2.Bbs";
         }
@@ -2011,6 +2065,14 @@ mod tests {
                             tonic::server::Grpc::new(tonic_prost::ProstCodec::<
                                 proto::ListAgentsResponse,
                                 proto::ListAgentsRequest,
+                            >::default())
+                            .unary(server, req)
+                            .await
+                        }
+                        "/bbs.v2.Bbs/ServerInfo" => {
+                            tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+                                proto::ServerInfoResponse,
+                                proto::Empty,
                             >::default())
                             .unary(server, req)
                             .await
@@ -2043,6 +2105,118 @@ mod tests {
                     };
                     Ok(response)
                 })
+            }
+        }
+
+        /// The history stream against a fake server in `state`, until its
+        /// first state other than storing.
+        async fn history_against(state: State) -> (Vec<Data>, Arc<State>, tempfile::TempDir) {
+            let (_dir, _conn, mut opener, _) = board();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            opener.config.server = Some(listener.local_addr().unwrap().to_string());
+            let state = Arc::new(state);
+            let serving = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(Server(state.clone()))
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            );
+            let history = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = unbounded_channel();
+            let worker = tokio::spawn(watch_history(opener, 9, history.path().into(), tx));
+            let mut seen = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let Event::Data(data) = rx.recv().await.unwrap() else {
+                        continue;
+                    };
+                    let done = matches!(
+                        &data,
+                        Data::HistoryState { state, .. }
+                            if !matches!(state, HistoryState::Syncing)
+                    );
+                    seen.push(data);
+                    if done {
+                        return;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            worker.abort();
+            serving.abort();
+            (seen, state, history)
+        }
+
+        fn sync_row(id: i64) -> proto::Message {
+            proto::Message {
+                id,
+                body: format!("mail {id}"),
+                ..Default::default()
+            }
+        }
+
+        fn scoped(ids: &[i64]) -> Vec<proto::FeedAgentScope> {
+            ids.iter()
+                .map(|&message_id| proto::FeedAgentScope {
+                    message_id,
+                    agents: Vec::new(),
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn an_old_server_says_it_has_no_sync_feed_and_is_not_asked_again() {
+            let (seen, state, _history) = history_against(State {
+                refusal: Some(tonic::Code::FailedPrecondition),
+                withheld: Some(crate::backend::FEED_SYNC),
+                ..Default::default()
+            })
+            .await;
+            let states: Vec<_> = seen
+                .iter()
+                .map(|d| match d {
+                    Data::HistoryState { state, .. } => format!("{state:?}"),
+                    _ => "page".into(),
+                })
+                .collect();
+            assert_eq!(states, ["Unsupported"]);
+            assert_eq!(state.feeds.load(Ordering::SeqCst), 1, "not retried");
+        }
+
+        #[tokio::test]
+        async fn a_malformed_history_page_pauses_and_stores_nothing() {
+            let good = proto::FeedSnapshot {
+                messages: vec![sync_row(1), sync_row(2)],
+                caught_up: Some(false),
+                agent_scopes: scoped(&[1, 2]),
+            };
+            let page = |ids: &[i64], caught_up, scopes: &[i64]| proto::FeedSnapshot {
+                messages: ids.iter().map(|&id| sync_row(id)).collect(),
+                caught_up,
+                agent_scopes: scoped(scopes),
+            };
+            for (bad, why) in [
+                (page(&[3], None, &[3]), "whether more follows"),
+                (page(&[4, 3], Some(true), &[4, 3]), "out of order"),
+                (page(&[2], Some(true), &[2]), "out of order"),
+                (page(&[], Some(false), &[]), "empty history page"),
+                (page(&[3], Some(true), &[]), "without its agents"),
+            ] {
+                let (seen, _, history) = history_against(State {
+                    sync: vec![good.clone(), bad],
+                    ..Default::default()
+                })
+                .await;
+                match seen.last() {
+                    Some(Data::HistoryState {
+                        state: HistoryState::Paused(text),
+                        ..
+                    }) => assert!(text.contains(why), "{why}: {text}"),
+                    other => panic!("{why}: {:?}", other.is_some()),
+                }
+                // The good page stands; nothing of the bad one does.
+                let store = crate::connect::history::Store::open(history.path()).unwrap();
+                assert_eq!(store.cursor().unwrap(), 2, "{why}");
             }
         }
 

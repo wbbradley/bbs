@@ -551,6 +551,10 @@ impl App {
 
     /// Apply one event; `true` quits.
     pub fn on_event(&mut self, event: Event) -> bool {
+        // The human moved on: a stored result still opening gives way.
+        if matches!(event, Event::Key(_) | Event::Paste(_)) && self.pending_hit.take().is_some() {
+            self.ctx.navigation_notice = None;
+        }
         match event {
             Event::Key(key) => {
                 if let Some(quit) = self.picker_key(key) {
@@ -13196,5 +13200,28 @@ mod tests {
         assert!(screen(&mut app, 80, 24).contains("from the old history"));
         app.on_event(history_state(&app, HistoryState::Reset));
         assert!(!screen(&mut app, 80, 24).contains("from the old history"));
+    }
+
+    #[test]
+    fn moving_on_cancels_a_stored_result_still_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        stored_history(dir.path(), 30, &[(5, "an ancient needle")]);
+        let (mut app, mut rx) = app();
+        let mut found = with_stored(&mut app, dir.path());
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("needle".into()));
+        pump(&mut app, &mut found);
+        enter(&mut app);
+        assert!(app.pending_hit.is_some());
+        // The human goes elsewhere before its context comes.
+        key(&mut app, 'g');
+        assert!(app.pending_hit.is_none());
+        assert_eq!(opened(&app), None);
+        while rx.try_recv().is_ok() {}
+        pump(&mut app, &mut found);
+        assert!(
+            !screen(&mut app, 80, 24).contains("an ancient needle"),
+            "a late answer opens nothing"
+        );
     }
 }

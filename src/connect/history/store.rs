@@ -116,6 +116,7 @@ fn file(dir: &Path, generation: u64) -> PathBuf {
 /// it changes only inside an exclusive transaction, across processes.
 fn pointer(dir: &Path) -> Result<Connection, StoreError> {
     let conn = Connection::open(dir.join("pointer.db"))?;
+    private(&dir.join("pointer.db"), 0o600)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS current (
@@ -153,6 +154,15 @@ fn interrupted(e: &rusqlite::Error) -> bool {
     )
 }
 
+/// Only the human may read their history.
+fn private(path: &Path, mode: u32) -> Result<(), StoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    if path.exists() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
 /// What makes a message the same message: never its read receipt.
 fn fingerprint(m: &proto::Message) -> Vec<u8> {
     let mut hash = Sha256::new();
@@ -175,12 +185,15 @@ impl Store {
     /// The current generation's history, created if new.
     pub fn open(dir: &Path) -> Result<Store, StoreError> {
         std::fs::create_dir_all(dir)?;
+        private(dir, 0o700)?;
         let generation = current(&pointer(dir)?)?;
         Self::open_at(dir, generation)
     }
 
     fn open_at(dir: &Path, generation: u64) -> Result<Store, StoreError> {
         let conn = Connection::open(file(dir, generation))?;
+        // Before any journal exists: SQLite gives journals the file's mode.
+        private(&file(dir, generation), 0o600)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(
@@ -832,6 +845,29 @@ mod tests {
             );
         }
         assert_eq!(Store::open(dir.path()).unwrap().cursor().unwrap(), 1000);
+    }
+
+    #[test]
+    fn only_the_human_can_read_the_history() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("history");
+        let mut store = Store::open(&dir).unwrap();
+        store.apply(&batch(&[(1, "one")], true), None).unwrap();
+        let mode = |name: &str| {
+            std::fs::metadata(dir.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for name in ["gen-1.db", "gen-1.db-wal", "pointer.db"] {
+            assert_eq!(mode(name), 0o600, "{name}");
+        }
     }
 
     #[test]
