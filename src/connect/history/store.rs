@@ -292,7 +292,11 @@ impl Store {
                 _ => return Err(StoreError::Mismatch(Mismatch { id: anchor.id })),
             }
         }
-        let tx = self.conn.transaction()?;
+        // Take the write lock first: a read upgraded to a write later can
+        // fail at once when another session writes, whatever the timeout.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = apply(&tx, batch);
         match result {
             Ok(()) => Ok(tx.commit()?),
@@ -799,6 +803,35 @@ mod tests {
             .unwrap();
         a.apply(&batch(&[(2, "two")], false), None).unwrap();
         assert_eq!((a.cursor().unwrap(), b.cursor().unwrap()), (3, 3));
+    }
+
+    #[test]
+    fn two_sessions_storing_the_same_pages_at_once_both_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        Store::open(dir.path()).unwrap();
+        let rows: Vec<(i64, String)> = (1..=1000).map(|id| (id, format!("row {id}"))).collect();
+        let rows: Vec<(i64, &str)> = rows.iter().map(|(i, b)| (*i, b.as_str())).collect();
+        let page = batch(&rows, true);
+        for round in 0..8 {
+            let start = std::sync::Barrier::new(2);
+            let results: Vec<_> = std::thread::scope(|s| {
+                let writers: Vec<_> = (0..2)
+                    .map(|_| {
+                        s.spawn(|| {
+                            let mut store = Store::open(dir.path()).unwrap();
+                            start.wait();
+                            store.apply(&page, None).map_err(|e| e.to_string())
+                        })
+                    })
+                    .collect();
+                writers.into_iter().map(|w| w.join().unwrap()).collect()
+            });
+            assert!(
+                results.iter().all(Result::is_ok),
+                "round {round}: {results:?}"
+            );
+        }
+        assert_eq!(Store::open(dir.path()).unwrap().cursor().unwrap(), 1000);
     }
 
     #[test]
