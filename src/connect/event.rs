@@ -404,6 +404,11 @@ pub enum Data {
         id: u64,
         result: Result<proto::AgentNote, SideError>,
     },
+    /// What the stored history found for the search `generation`.
+    StoredFound {
+        generation: u64,
+        result: Result<Vec<super::history::Found>, String>,
+    },
 }
 
 /// What a new server connection needs: each feed stream holds one.

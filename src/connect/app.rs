@@ -206,6 +206,8 @@ pub struct App {
     /// Unsaved text from editors that could no longer save, by agent id, for
     /// this session only.
     unsaved: HashMap<i64, Draft>,
+    /// The human's message history on disk, when it opened.
+    pub stored: Option<Stored>,
     /// A launcher choice waiting for the open note to be stored.
     pending_navigation: Option<Navigation>,
 }
@@ -233,6 +235,53 @@ fn stored_note(note: &crate::proto::AgentNote) -> notes::StoredNote {
         body: note.body.clone(),
         revision: note.revision,
         retired: note.retired,
+    }
+}
+
+/// The human's message history on disk: read here for a conversation's
+/// context, searched on a worker for Ctrl-P.
+pub struct Stored {
+    store: super::history::Store,
+    searcher: super::history::Searcher,
+    /// The search Ctrl-P waits for: its generation and query.
+    awaiting: Option<(u64, String)>,
+}
+
+impl Stored {
+    pub fn open(
+        dir: &std::path::Path,
+        events: UnboundedSender<Event>,
+    ) -> Result<Stored, super::history::StoreError> {
+        let store = super::history::Store::open(dir)?;
+        let searcher =
+            super::history::Searcher::spawn(dir.to_path_buf(), move |generation, result| {
+                let _ = events.send(Event::Data(Data::StoredFound { generation, result }));
+            });
+        Ok(Stored {
+            store,
+            searcher,
+            awaiting: None,
+        })
+    }
+
+    /// Stored messages of `target`, with the conversations holding them,
+    /// around `hit` or the newest.
+    fn context(
+        &self,
+        target: &Conversation,
+        hit: Option<i64>,
+    ) -> Vec<(crate::proto::Message, Vec<String>)> {
+        let (place, agents) = match target {
+            Conversation::Agent(name) => (super::history::Place::Agent(name), vec![name.clone()]),
+            Conversation::Group(name) => (super::history::Place::Group(name), Vec::new()),
+        };
+        match self.store.context(place, hit, 200) {
+            Ok(rows) => rows.into_iter().map(|m| (m, agents.clone())).collect(),
+            Err(e) => {
+                tracing::warn!("reading stored history: {e}");
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -277,6 +326,7 @@ impl App {
             summary_ids: None,
             unsaved: HashMap::new(),
             pending_navigation: None,
+            stored: None,
         };
         app.send(vec![Request::WatchSummary(app.ctx.inbox.id)]);
         app.push(Box::new(Menu::default()));
@@ -308,7 +358,14 @@ impl App {
             }
         }
         screen.restore_draft(&mut self.drafts, &mut self.draft_store);
-        if !matches!(opening, Opening::Fresh) {
+        // Stored history fills the conversation in, offline too.
+        let stored = match (&self.stored, screen.conversation()) {
+            (Some(stored), Some(target)) => stored.context(&target, hit),
+            _ => Vec::new(),
+        };
+        let seeded = !stored.is_empty();
+        self.launcher_cache.adopt(stored);
+        if seeded || !matches!(opening, Opening::Fresh) {
             let destination = screen.conversation();
             screen.seed_messages(&self.launcher_cache.context(destination.as_ref(), hit));
             if let Some(target) = destination
@@ -502,6 +559,7 @@ impl App {
                 self.keymap = Keymap::default();
                 if let Some(picker) = &mut self.picker {
                     picker.paste(&text, &self.launcher_cache);
+                    self.search_stored();
                     return false;
                 }
                 self.ctx.navigation_notice = None;
@@ -582,6 +640,19 @@ impl App {
                         self.notes_announced(*id, *revision);
                     }
                     Data::NotesListed { id, result } => self.notes_listed(*id, result),
+                    Data::StoredFound { generation, result } => {
+                        if let (Some(stored), Some(picker)) = (&self.stored, &mut self.picker)
+                            && let Some((awaited, query)) = &stored.awaiting
+                            && awaited == generation
+                        {
+                            match result {
+                                Ok(found) => {
+                                    picker.stored(query, found.clone(), &self.launcher_cache)
+                                }
+                                Err(e) => tracing::warn!("searching stored history: {e}"),
+                            }
+                        }
+                    }
                     Data::NoteSaved { id, result } => self.note_saved(*id, result),
                     Data::MarkedRead { agent, result } => {
                         self.ctx.inbox.acknowledged(agent, result);
@@ -642,7 +713,9 @@ impl App {
     fn picker_key(&mut self, key: KeyEvent) -> Option<bool> {
         if let Some(picker) = &mut self.picker {
             self.keymap = Keymap::default();
-            return Some(match picker.key(key, &self.launcher_cache) {
+            let outcome = picker.key(key, &self.launcher_cache);
+            self.search_stored();
+            return Some(match outcome {
                 launcher::Outcome::Stay => false,
                 launcher::Outcome::Quit => true,
                 launcher::Outcome::Cancel => {
@@ -651,7 +724,21 @@ impl App {
                     false
                 }
                 launcher::Outcome::Choose(target) => {
-                    self.picker = None;
+                    let picker = self.picker.take().expect("open");
+                    // A stored message opens with its stored context.
+                    if let Target::Message(id) = &target
+                        && self.launcher_cache.message(*id).is_none()
+                        && let Some(found) = picker.found(*id)
+                    {
+                        self.launcher_cache
+                            .adopt([(found.message.clone(), found.agents.clone())]);
+                        if let (Some(stored), Some(place)) =
+                            (&self.stored, self.launcher_cache.destination(*id))
+                        {
+                            let rows = stored.context(&place, Some(*id));
+                            self.launcher_cache.adopt(rows);
+                        }
+                    }
                     self.navigate(Navigation::Launch(target));
                     self.viewed();
                     false
@@ -663,7 +750,23 @@ impl App {
         }
         self.keymap = Keymap::default();
         self.picker = Some(Picker::new(&self.launcher_cache));
+        if let Some(stored) = &mut self.stored {
+            stored.awaiting = None;
+        }
         Some(false)
+    }
+
+    /// Search the stored history for Ctrl-P's query when it changed.
+    fn search_stored(&mut self) {
+        let (Some(picker), Some(stored)) = (&self.picker, &mut self.stored) else {
+            return;
+        };
+        let query = picker.query();
+        if stored.awaiting.as_ref().is_some_and(|(_, q)| q == query) {
+            return;
+        }
+        let generation = stored.searcher.search(query);
+        stored.awaiting = Some((generation, query.to_string()));
     }
 
     /// Open the conversation of the agent that created a blocker, only if
@@ -12416,5 +12519,91 @@ mod tests {
                 .map(|n| n.text().to_string()),
             Some("Grove, who asked this, is no longer live.".into())
         );
+    }
+
+    /// A stored history in `dir`: messages 1..=n between Mateo (7) and ada,
+    /// with `bodies` overriding some.
+    fn stored_history(dir: &std::path::Path, n: i64, bodies: &[(i64, &str)]) {
+        let mut store = crate::connect::history::Store::open(dir).unwrap();
+        let messages = (1..=n)
+            .map(|id| proto::Message {
+                id,
+                created_at: "2026-10-01T12:00:00.000000Z".into(),
+                from_kind: proto::Kind::Agent.into(),
+                from_name: "Mateo".into(),
+                to_name: Some("ada".into()),
+                body: bodies
+                    .iter()
+                    .find(|(i, _)| *i == id)
+                    .map_or(format!("stored {id}"), |(_, b)| b.to_string()),
+                ..Default::default()
+            })
+            .collect();
+        store
+            .apply(
+                &crate::connect::history::Batch {
+                    messages,
+                    scopes: (1..=n).map(|id| (id, vec![(7, "Mateo".into())])).collect(),
+                    caught_up: true,
+                },
+                false,
+            )
+            .unwrap();
+    }
+
+    /// The app with the stored history in `dir`; its search answers come
+    /// through the returned receiver.
+    fn with_stored(app: &mut App, dir: &std::path::Path) -> UnboundedReceiver<Event> {
+        let (tx, rx) = unbounded_channel();
+        app.stored = Some(Stored::open(dir, tx).unwrap());
+        rx
+    }
+
+    #[test]
+    fn ctrl_p_finds_stored_messages_and_opens_them_with_their_context() {
+        let dir = tempfile::tempdir().unwrap();
+        stored_history(dir.path(), 300, &[(5, "an ancient needle")]);
+        let (mut app, mut rx) = app();
+        let mut found = with_stored(&mut app, dir.path());
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("needle".into()));
+        // The search runs on its worker thread.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let event = loop {
+            if let Ok(event) = found.try_recv() {
+                break event;
+            }
+            assert!(std::time::Instant::now() < deadline, "no search answer");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        app.on_event(event);
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("Mateo → ada  an ancient needle"), "{out}");
+        while rx.try_recv().is_ok() {}
+        enter(&mut app);
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("an ancient needle"), "{out}");
+        assert!(out.contains("stored 6"), "its stored context: {out}");
+        // Searching asked the server for nothing.
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            sent.iter().all(|r| matches!(
+                r,
+                Request::Watch { .. } | Request::WatchActivity { .. } | Request::SideReport { .. }
+            )),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_conversation_opens_with_its_stored_history_before_its_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        stored_history(dir.path(), 30, &[(30, "the last stored word")]);
+        let (mut app, mut rx) = app();
+        let _found = with_stored(&mut app, dir.path());
+        mateo_loading_streams(&mut app, &mut rx);
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("the last stored word"), "{out}");
     }
 }

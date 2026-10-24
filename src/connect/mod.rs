@@ -148,6 +148,7 @@ pub async fn run(start: Start, opener: Opener, theme_explicit: bool) -> Result<(
         &opener.dir,
         &me,
     )?;
+    let history = history_dir(&opener, &me);
     let ctx = app::Ctx {
         me,
         server: opener
@@ -169,6 +170,15 @@ pub async fn run(start: Start, opener: Opener, theme_explicit: bool) -> Result<(
     tokio::spawn(event::serve(backend, opener, requests_rx, events.clone()));
     let mut app = app::App::new(ctx, requests);
     app.draft_store = draft_store;
+    // Without it, connect works as before, from what it receives.
+    app.stored = history
+        .map_err(|e| tracing::warn!("finding the history: {e:#}"))
+        .ok()
+        .and_then(|dir| {
+            app::Stored::open(&dir, events.clone())
+                .map_err(|e| tracing::warn!("opening the history: {e}"))
+                .ok()
+        });
     let mut terminal = ratatui::init();
     let _paste = match BracketedPaste::enable() {
         Ok(paste) => paste,
