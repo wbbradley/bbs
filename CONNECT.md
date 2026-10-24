@@ -181,22 +181,23 @@ up. While any are open, the right end of the status bar shows
 conversation's mail and activity marks, however long the rest of the bar.
 
 F2 opens the queue from any screen, over dialogs, forms, the search prompt and
-the `/btw` panel too, as a card covering the whole terminal: the scheme's
-warning surface under a warning title bar that names the blocker's creator and
+the `/btw` panel too, over the whole terminal, as a card at its bottom: the
+scheme's warning surface under a warning title bar that names the blocker's creator and
 group, `#ID · Answering a blocker from CREATOR @group` when the box below can
 answer it, and the position among open blockers; the answer box keeps the
 composer's surface. Without colour, the title bar is reversed and bold. The screen beneath
 is left exactly as it was: its draft, cursor, selection, scroll, mode and side
 panel come back when the card closes. It keeps receiving mail and activity and
 its side state is still polled, but nothing is marked read or seen until the
-card closes. Ctrl-C still quits.
+card closes. `F2` again closes it, keeping the answer draft; from a cancel
+confirmation it first returns to the card. Ctrl-C still quits.
 
 The card lists blockers oldest first, the first 50 of the scope with a count of
-any more; each refresh fills in rows as others resolve. The list stays at the
-top. The selected blocker sits at the bottom, just above its answer: a row
-restating its number, group and creator, then its details, one blank row, who
-an answer goes to, one blank row and the answer box; any spare rows fall
-between the list and that block. Alt-↑/↓ selects; plain arrows edit the
+any more; each refresh fills in rows as others resolve. From the top, the card
+holds its title bar, the list, then the selected blocker: a row restating its
+number, group and creator, its details, one blank row, who an answer goes to,
+one blank row and the answer box. Any spare rows sit above the card on the
+standard background. Alt-↑/↓ selects; plain arrows edit the
 answer; PgUp/PgDn page through a selected text too long for the card, which
 shows how far you have read. Details render as Markdown, as messages
 do: headings, emphasis, lists, code and tables. Every display line keeps a
@@ -317,10 +318,13 @@ send, feed and activity errors. Connection details use any remaining space.
 
 The timeline merges, in time order, the agent's messages with its live
 activity: thoughts, tool calls and errors, rendered by the same code as
-`bbs headless logs -f --pretty`, with calls still running shown below. Turn
-markers (the separator before a turn and `turn end`) are left out, since the
-progress mark in the bottom bar shows turn state; a turn's prompt still shows
-any mail not otherwise in the thread. Each run of tool calls has one blank
+`bbs headless logs -f --pretty`, with calls still running shown below. The
+activity log's own turn separators and `turn end` lines are left out. Instead,
+a `•` in the go colour in the left gutter marks the first line of what a turn
+began with, and a `•` in the stop colour after the last line marks where it
+ended; they add no rows, and a window beginning mid-turn shows only the end.
+Your mail shows where a prompt or steer first included it, keeping its send
+time, and a turn's prompt still shows any mail not otherwise in the thread. Each run of tool calls has one blank
 line above and one below, at the top and bottom of the timeline too, sharing a
 blank line already there; calls within a run sit on consecutive lines, and so
 do calls still running. Each call takes one line of the width: a long or multi-line command is
@@ -465,8 +469,8 @@ alone and never shown to agents or other humans. `Enter` starts a new line and
 the composer's editing keys work as usual, so `Ctrl-n` still moves down a
 line. `Ctrl-s` saves the note if it changed and stays; `Esc` closes at once if
 nothing changed, and otherwise saves and closes only once the server has stored
-it. A failed save keeps the editor open with its text and the error, and
-`Ctrl-s` or `Esc` tries again; nothing retries by itself and nothing is
+it. `F3` again closes it as `Esc` does. A failed save keeps the editor open
+with its text and the error, and `Ctrl-s` or `Esc` tries again; nothing retries by itself and nothing is
 discarded. The last save wins: there is no autosave and no conflict check. An
 edit or paste that would pass the limit is refused whole.
 
