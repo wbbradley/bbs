@@ -263,8 +263,26 @@ impl Thread {
     /// mail in the same frame.
     fn reconcile(&mut self) {
         let (paused, new_count) = (self.view.paused, self.view.new_count);
+        let anchor_message = paused.and_then(|anchor| {
+            self.view
+                .rows
+                .iter()
+                .find(|row| row.key() == anchor.id)
+                .and_then(Entry::message_id)
+        });
         self.rebuild();
-        self.view.paused = paused;
+        self.view.paused = paused.map(|mut anchor| {
+            if let Some(id) = anchor_message
+                && let Some(row) = self
+                    .view
+                    .rows
+                    .iter()
+                    .find(|row| row.message_id() == Some(id))
+            {
+                anchor.id = row.key();
+            }
+            anchor
+        });
         self.view.new_count = new_count;
     }
 
@@ -314,9 +332,12 @@ impl Thread {
 
     /// Apply a restored place once its row is held.
     fn settle_anchor(&mut self) {
-        if let Some(anchor) = self.pending_anchor
-            && self.view.rows.iter().any(|r| r.key() == anchor.id)
+        if let Some(mut anchor) = self.pending_anchor
+            && let Some(row) = self.view.rows.iter().find(|r| {
+                r.key() == anchor.id || (anchor.id.1 == 0 && r.message_id() == Some(anchor.id.2))
+            })
         {
+            anchor.id = row.key();
             self.view.paused = Some(anchor);
             self.view.new_count = 0;
             self.pending_anchor = None;
@@ -431,10 +452,19 @@ impl Thread {
     }
 
     fn message_entries(&self, messages: &[Message]) -> Vec<Entry> {
+        let seen = self
+            .stream
+            .as_ref()
+            .map(Stream::first_appearances)
+            .unwrap_or_default();
         messages
             .iter()
             .cloned()
             .map(|m| Entry::Message {
+                appeared_at: self
+                    .direct_from_human(&m)
+                    .then(|| seen.get(&m.id).cloned())
+                    .flatten(),
                 headerless: self.direct_to_human(&m) || self.direct_from_human(&m),
                 recipient: if m.to_owner.is_some()
                     || self.agent.as_ref().is_some_and(|a| {
@@ -2197,6 +2227,127 @@ mod seek_tests {
             id,
             result: Ok(rows),
         });
+    }
+
+    #[test]
+    fn sent_mail_moves_to_its_first_prompt_or_steer_and_keeps_its_identity() {
+        for event in ["prompt", "steer"] {
+            for activity_first in [true, false] {
+                let (_, now) = clock();
+                let ctx = ctx(now.clone());
+                let mut thread = Thread::agent("Mateo", "ada", now);
+                thread.human = Some("ada".into());
+                let Request::WatchActivity { id, .. } = thread.stream.as_ref().unwrap().watch()
+                else {
+                    unreachable!()
+                };
+                let activity = |id, time, value: serde_json::Value| proto::Activity {
+                    id,
+                    created_at: at(time),
+                    record: value.to_string(),
+                    ..Default::default()
+                };
+                // The human sends while a prior turn is still running.
+                let sent = mail(3, "ada", "Mateo", "next request");
+                let initial = vec![
+                    activity(1, 1, serde_json::json!({"event":"prompt","text":""})),
+                    activity(2, 2, serde_json::json!({"event":"text","text":"working"})),
+                    activity(
+                        3,
+                        4,
+                        serde_json::json!({"event":"text","text":"prior reply"}),
+                    ),
+                    activity(4, 5, serde_json::json!({"event":"turn_end"})),
+                    activity(
+                        5,
+                        6,
+                        serde_json::json!({"event":"mail","queued":true,"mail_ids":[3]}),
+                    ),
+                ];
+                thread.on_data(&Data::Activity {
+                    id,
+                    result: Ok(initial),
+                });
+                if !activity_first {
+                    feed(&mut thread, vec![sent.clone()]);
+                    let buffer = draw(&mut thread, &ctx);
+                    assert!(
+                        find(&buffer, "next request").unwrap()
+                            < find(&buffer, "prior reply").unwrap()
+                    );
+                    assert!(thread.seek_message(3));
+                }
+                thread.on_data(&Data::Activity {
+                    id,
+                    result: Ok(vec![
+                        activity(
+                            6,
+                            8,
+                            serde_json::json!({"event":event,"text":"","mail_ids":[3]}),
+                        ),
+                        activity(
+                            7,
+                            9,
+                            serde_json::json!({"event":"text","text":"new turn reply"}),
+                        ),
+                    ]),
+                });
+                if activity_first {
+                    feed(&mut thread, vec![sent.clone()]);
+                }
+                let buffer = draw(&mut thread, &ctx);
+                let request = find(&buffer, "next request").unwrap();
+                assert!(find(&buffer, "prior reply").unwrap() < request);
+                assert!(request < find(&buffer, "new turn reply").unwrap());
+                let row = thread
+                    .view
+                    .rows
+                    .iter()
+                    .find(|row| row.message_id() == Some(3))
+                    .unwrap();
+                let appeared_key = row.key();
+                if let Entry::Message { message, .. } = row {
+                    assert_eq!(message.created_at, sent.created_at);
+                }
+                if !activity_first {
+                    assert_eq!(
+                        thread.view.paused.unwrap().id,
+                        appeared_key,
+                        "the paused anchor moves with its message"
+                    );
+                }
+                // A repeated inclusion and subsequent feed updates never move
+                // the original message again or leave a duplicate behind.
+                thread.on_data(&Data::Activity {
+                    id,
+                    result: Ok(vec![activity(
+                        8,
+                        10,
+                        serde_json::json!({"event":"steer","text":"","mail_ids":[3]}),
+                    )]),
+                });
+                feed(&mut thread, vec![sent]);
+                let entries: Vec<_> = thread
+                    .view
+                    .rows
+                    .iter()
+                    .filter(|row| row.message_id() == Some(3))
+                    .collect();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].key(), appeared_key);
+                thread.reconcile();
+                assert_eq!(
+                    thread
+                        .view
+                        .rows
+                        .iter()
+                        .find(|row| row.message_id() == Some(3))
+                        .unwrap()
+                        .key(),
+                    appeared_key
+                );
+            }
+        }
     }
 
     #[test]

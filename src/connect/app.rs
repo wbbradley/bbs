@@ -10738,7 +10738,7 @@ mod tests {
                         app.on_event(activity_event);
                     }
                     let out = screen(&mut app, 80, 40);
-                    assert_eq!(out.matches("▪ Zoe → @nw-api").count(), 1, "{out}");
+                    assert_eq!(out.matches("▀ Zoe → @nw-api").count(), 1, "{out}");
                     assert_eq!(out.matches("Joined").count(), 1, "{out}");
                     assert!(
                         !out.contains("mail from")
@@ -10763,7 +10763,7 @@ mod tests {
                         };
                         let header = row("Zoe → @nw-api");
                         let end = row("final-tail");
-                        assert_eq!(buf[(0, header)].symbol(), "▪");
+                        assert_eq!(buf[(0, header)].symbol(), "▀");
                         assert_eq!(
                             Some(buf[(0, header)].fg),
                             theme::style(theme::Role::Go).fg.or(theme::base().fg)
@@ -11077,6 +11077,73 @@ mod tests {
     }
 
     #[test]
+    fn compact_turn_squares_follow_delivered_mail_before_the_activity_timestamps() {
+        for scheme in crate::ui::theme::testing::SCHEMES {
+            crate::ui::theme::testing::with_scheme(scheme, || {
+                for activity_first in [true, false] {
+                    let (mut app, mut rx) = app();
+                    let (feed, act) = mateo_streams(&mut app, &mut rx);
+                    app.ctx.compact_hides_thoughts = true;
+                    app.ctx.preferences.set_compact(true);
+                    let mail = Event::Data(Data::Feed {
+                        id: feed,
+                        result: Ok(vec![proto::Message {
+                            auto_reply: Some(true),
+                            ..at(42, "01", "Mateo", "ada", "the answer")
+                        }]),
+                    });
+                    let records = [
+                        ("02", serde_json::json!({"event":"prompt","text":""})),
+                        (
+                            "03",
+                            serde_json::json!({"event":"thought","text":"thinking"}),
+                        ),
+                        (
+                            "04",
+                            serde_json::json!({"event":"text","text":"the answer","mail_id":42}),
+                        ),
+                        ("05", serde_json::json!({"event":"turn_end"})),
+                    ];
+                    let activity = Event::Data(Data::Activity {
+                        id: act,
+                        result: Ok(records
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (ts, record))| {
+                                activity(i as i64 + 1, ts, &record.to_string())
+                            })
+                            .collect()),
+                    });
+                    if activity_first {
+                        app.on_event(activity);
+                        screen(&mut app, 80, 24);
+                        app.on_event(mail);
+                    } else {
+                        app.on_event(mail);
+                        screen(&mut app, 80, 24);
+                        app.on_event(activity);
+                    }
+                    // Switching modes and resizing keeps the squares on the
+                    // delivered reply, including when reasoning is hidden.
+                    for (compact, width) in [(true, 60), (false, 80), (true, 80)] {
+                        app.ctx.preferences.set_compact(compact);
+                        let out = screen(&mut app, width, 24);
+                        let answer = out
+                            .lines()
+                            .find(|line| line.contains("the answer"))
+                            .expect(&out);
+                        assert!(answer.starts_with("▀ the answer"), "{out}");
+                        if compact {
+                            assert!(answer.trim_end().ends_with(" ▄"), "{out}");
+                            assert!(!out.contains("thinking"), "{out}");
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
     fn turn_squares_survive_rebuilds_and_tool_runs_keep_one_blank() {
         let rec = |id: i64, s: &str, body: &str| {
             activity(
@@ -11137,9 +11204,9 @@ mod tests {
             "  ✓ Read b.rs completed (1.0s)",
             "",
             "  Done.",
-            "▪ group note",
+            "▀ group note",
             "",
-            "  ✓ Read c.rs completed (1.0s) ▪",
+            "  ✓ Read c.rs completed (1.0s) ▄",
             "",
         ];
         let start = |app: &mut App, rx: &mut UnboundedReceiver<Request>| {
@@ -11170,7 +11237,7 @@ mod tests {
             }));
         }
         let streamed = screen(&mut app, 80, 30);
-        assert!(streamed.contains("▪ please build"), "{streamed}");
+        assert!(streamed.contains("▀ please build"), "{streamed}");
         assert_eq!(
             span(&streamed, "Looking.", "Read c.rs"),
             expected,

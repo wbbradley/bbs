@@ -32,6 +32,9 @@ pub(crate) const MAX_RECORDS: usize = 5000;
 pub enum Entry {
     Message {
         message: Message,
+        /// Display a human's sent mail where a prompt or steer first included
+        /// it, keeping the message's actual send timestamp intact.
+        appeared_at: Option<String>,
         /// Mail between the viewer and the agent omits its header; everyone
         /// else's keeps it, so the sender stays identified.
         headerless: bool,
@@ -111,6 +114,7 @@ impl Entry {
                 outgoing,
                 other_participants,
                 gap: raw_gap,
+                ..
             } => {
                 let mut lines = if *headerless {
                     compact_message_lines(message, gap || *raw_gap, query, width)
@@ -197,7 +201,15 @@ impl Row for Entry {
 
     fn key(&self) -> Self::Key {
         match self {
-            Entry::Message { message: m, .. } => (micros(&m.created_at), 0, m.id),
+            Entry::Message {
+                message: m,
+                appeared_at,
+                ..
+            } => (
+                micros(appeared_at.as_deref().unwrap_or(&m.created_at)),
+                0,
+                m.id,
+            ),
             Entry::Stream { id, created_at, .. } => (micros(created_at), 1, *id),
         }
     }
@@ -432,6 +444,7 @@ struct Kept {
     mail_id: Option<i64>,
     mail_ids: Vec<i64>,
     boundary: Option<Boundary>,
+    input: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -447,6 +460,7 @@ impl Kept {
         Kept {
             activity: activity.clone(),
             mail_id: value["mail_id"].as_i64(),
+            input: matches!(value["event"].as_str(), Some("prompt" | "steer")),
             boundary: match value["event"].as_str() {
                 Some("prompt") => Some(Boundary::Start),
                 Some("turn_end" | "turn_error" | "cancel" | "stop") => Some(Boundary::End),
@@ -464,6 +478,19 @@ impl Kept {
 }
 
 impl Stream {
+    /// Receipt/queued-mail events do not imply the agent has seen a message.
+    /// Keep only its first actual inclusion in a prompt or live steer.
+    pub fn first_appearances(&self) -> HashMap<i64, String> {
+        let mut seen = HashMap::new();
+        for record in self.records.iter().filter(|record| record.input) {
+            for id in &record.mail_ids {
+                seen.entry(*id)
+                    .or_insert_with(|| record.activity.created_at.clone());
+            }
+        }
+        seen
+    }
+
     /// Project recorded turn boundaries onto the content the current filters
     /// actually show. Echoed prompts can be displayed as their original mail;
     /// delivered replies can likewise replace activity without losing a mark.
@@ -474,61 +501,79 @@ impl Stream {
             .enumerate()
             .filter_map(|(i, row)| row.message_id().map(|id| (id, i)))
             .collect();
-        let mut start: Option<&Kept> = None;
+        let mut start = None;
         let mut partial = true;
-        let mut mark = |start: &Kept, end: Option<&Kept>, began: bool, ended: bool| {
-            let low = (micros(&start.activity.created_at), 1, start.activity.id);
-            let high = end.map(|end| (micros(&end.activity.created_at), 1, end.activity.id));
-            let from = rows.partition_point(|row| row.key() < low);
-            let from = start
-                .mail_ids
-                .iter()
-                .filter_map(|id| messages.get(id))
-                .copied()
-                .min()
-                .map_or(from, |echoed| from.min(echoed));
-            let until = high.map_or(rows.len(), |high| {
-                rows.partition_point(|row| row.key() < high || (ended && row.key() == high))
-            });
-            if from >= until {
-                return;
-            }
-            let mut candidates = rows[from..until].iter().filter(|row| {
-                (row.key() >= low
-                    || row
-                        .message_id()
-                        .is_some_and(|id| start.mail_ids.contains(&id)))
-                    && !row.lines(false, None).iter().all(blank)
-            });
-            if let Some(first) = candidates.next() {
-                if began {
-                    marks.entry(first.key()).or_default().start = true;
+        let mut mark =
+            |first_record: usize, last_record: Option<usize>, began: bool, ended: bool| {
+                let start = &self.records[first_record];
+                let end = last_record.map(|i| &self.records[i]);
+                let low = (micros(&start.activity.created_at), 1, start.activity.id);
+                let high = end.map(|end| (micros(&end.activity.created_at), 1, end.activity.id));
+                // Activity is queued separately from mail delivery. Use explicit
+                // message links even when the mail's timestamp falls outside the
+                // activity interval; compact view may show only that delivered mail.
+                let linked: HashSet<_> = self
+                    .records
+                    .range(first_record..last_record.unwrap_or(self.records.len()))
+                    .flat_map(|record| record.mail_ids.iter().copied().chain(record.mail_id))
+                    .collect();
+                let linked_rows: Vec<_> = linked
+                    .iter()
+                    .filter_map(|id| messages.get(id))
+                    .copied()
+                    .collect();
+                let from = rows.partition_point(|row| row.key() < low);
+                let from = linked_rows
+                    .iter()
+                    .copied()
+                    .min()
+                    .map_or(from, |linked| from.min(linked));
+                let until = high.map_or(rows.len(), |high| {
+                    rows.partition_point(|row| row.key() < high || (ended && row.key() == high))
+                });
+                let until = linked_rows
+                    .iter()
+                    .copied()
+                    .max()
+                    .map_or(until, |linked| until.max(linked + 1));
+                if from >= until {
+                    return;
                 }
-                if ended {
-                    let last = candidates.next_back().unwrap_or(first);
-                    marks.entry(last.key()).or_default().end = true;
+                let mut candidates = rows[from..until].iter().filter(|row| {
+                    let in_turn = row.key() >= low
+                        && high.is_none_or(|high| row.key() < high || (ended && row.key() == high));
+                    (in_turn || row.message_id().is_some_and(|id| linked.contains(&id)))
+                        && !row.lines(false, None).iter().all(blank)
+                });
+                if let Some(first) = candidates.next() {
+                    if began {
+                        marks.entry(first.key()).or_default().start = true;
+                    }
+                    if ended {
+                        let last = candidates.next_back().unwrap_or(first);
+                        marks.entry(last.key()).or_default().end = true;
+                    }
                 }
-            }
-        };
-        for kept in &self.records {
+            };
+        for (index, kept) in self.records.iter().enumerate() {
             match kept.boundary {
                 Some(Boundary::Start) => {
-                    if let Some(previous) = start.replace(kept) {
+                    if let Some(previous) = start.replace(index) {
                         // A missing end never invents a stop marker.
-                        mark(previous, Some(kept), true, false);
+                        mark(previous, Some(index), true, false);
                     }
                 }
                 Some(Boundary::End) => {
                     if let Some(start) = start.take() {
-                        mark(start, Some(kept), true, true);
-                    } else if partial && let Some(first) = self.records.front() {
+                        mark(start, Some(index), true, true);
+                    } else if partial {
                         // The retained window may begin halfway through a turn.
-                        mark(first, Some(kept), false, true);
+                        mark(0, Some(index), false, true);
                     }
                 }
                 Some(Boundary::Reset) => {
                     if let Some(start) = start.take() {
-                        mark(start, Some(kept), true, false);
+                        mark(start, Some(index), true, false);
                     }
                 }
                 None => {}
@@ -758,6 +803,11 @@ impl Stream {
                         .is_some_and(|row| row.id >= self.history_end.unwrap_or(0));
                 self.error = None;
                 let kept: Vec<_> = events.iter().map(Kept::new).collect();
+                // A prompt/steer can move already displayed human mail, even
+                // when the prompt's own echoed text is hidden.
+                self.redraw |= kept
+                    .iter()
+                    .any(|record| record.input && !record.mail_ids.is_empty());
                 let entries = kept.iter().filter_map(|k| self.entry(k, loaded)).collect();
                 self.records.extend(kept);
                 let over = self.records.len().saturating_sub(MAX_RECORDS);
@@ -868,9 +918,12 @@ mod tests {
         let mut rows = stream.entries(&Loaded::from([(42, true)]));
         rows.retain(|row| !row.is_thought());
         let delivered = Entry::Message {
+            appeared_at: None,
             message: Message {
                 id: 42,
-                created_at: "2026-10-24T12:00:03Z".into(),
+                // Mail can arrive before the queued activity records that
+                // describe the turn, including its prompt.
+                created_at: "2026-10-24T12:00:00Z".into(),
                 from_name: "Mateo".into(),
                 from_kind: proto::Kind::Agent.into(),
                 body: "answer".into(),
@@ -1355,6 +1408,7 @@ mod tests {
                     ..Default::default()
                 };
                 let entry = Entry::Message {
+                    appeared_at: None,
                     message: message.clone(),
                     headerless: true,
                     recipient: Some(proto::Kind::Agent),
@@ -1438,6 +1492,7 @@ mod tests {
                         theme::Role::Accent
                     };
                     let side = Entry::Message {
+                        appeared_at: None,
                         message: Message {
                             from_name: "Theo長い名前".repeat(4),
                             to_group: group.then(|| "long-group-name".repeat(3)),
@@ -1521,6 +1576,7 @@ mod tests {
         for scheme in SCHEMES {
             with_scheme(scheme, || {
                 let side = Entry::Message {
+                    appeared_at: None,
                     message: Message {
                         id: 1,
                         from_name: "Jefe".into(),
@@ -1579,6 +1635,7 @@ mod tests {
     fn direct_side_cards_show_their_local_time_in_the_header_corner() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         let card = |id, from: &str, to: &str| Entry::Message {
+            appeared_at: None,
             message: Message {
                 id,
                 created_at: "2026-10-17T03:30:00Z".into(),
@@ -1916,6 +1973,7 @@ mod tests {
             with_scheme(scheme, || {
                 let human = theme::base().patch(theme::style(theme::Role::HumanSurface));
                 let make = |id, outgoing, body: &str| Entry::Message {
+                    appeared_at: None,
                     recipient: None,
                     message: Message {
                         id,
@@ -2094,6 +2152,7 @@ mod tests {
                     (false, false, true),
                 ] {
                     rows.push(Entry::Message {
+                        appeared_at: None,
                         message: Message {
                             id: rows.len() as i64 + 1,
                             body: source.clone(),
