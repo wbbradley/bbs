@@ -1920,13 +1920,13 @@ mod tests {
                     scopes: (1..=3).map(|id| (id, vec![(7, "Zed".into())])).collect(),
                     caught_up: true,
                 },
-                false,
+                None,
             )
             .unwrap();
         let mut cache = Cache::default();
         cache.observe(&feed(3, "a held needle too"));
         cache.observe(&feed(9, "the newest needle"));
-        let found = store.search("needle", 50, &|| false).unwrap().unwrap();
+        let found = store.search("needle", 50, || false).unwrap().unwrap();
         // Held messages are not listed twice; the stored one ranks by age.
         let hits = cache.search_with("needle", &found);
         let targets: Vec<_> = hits.iter().map(|h| h.target.clone()).collect();

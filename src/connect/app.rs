@@ -12546,7 +12546,7 @@ mod tests {
                     scopes: (1..=n).map(|id| (id, vec![(7, "Mateo".into())])).collect(),
                     caught_up: true,
                 },
-                false,
+                None,
             )
             .unwrap();
     }

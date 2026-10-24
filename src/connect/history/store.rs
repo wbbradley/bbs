@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use prost::Message as _;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use super::super::launcher::{Rank, folded, rank};
@@ -13,6 +13,8 @@ use crate::proto;
 const SCHEMA: i64 = 1;
 /// Candidate rows ranked between checks for a newer query.
 const CHECK_EVERY: usize = 512;
+/// SQLite steps between checks, so a scan finding nothing stops too.
+const STEPS_PER_CHECK: i32 = 10_000;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -79,12 +81,22 @@ pub struct Found {
     pub rank: Rank,
 }
 
-/// Where stored messages belong.
+/// Where stored messages belong, as the launcher opens them.
 #[derive(Clone, Copy, Debug)]
 pub enum Place<'a> {
-    /// Messages in the conversation of the human's agent of this name.
+    /// The conversation with the agent of this name: its direct mail, and
+    /// anything delivered to it when it was one of the human's agents.
     Agent(&'a str),
     Group(&'a str),
+    /// Everything: the feed.
+    Feed,
+}
+
+/// The stored message a stream opened to resume must begin with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    id: i64,
+    fp: Vec<u8>,
 }
 
 pub struct Store {
@@ -103,25 +115,45 @@ fn file(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("gen-{generation}.db"))
 }
 
-/// The generation the board's sessions currently write.
-fn current(dir: &Path) -> Result<u64, StoreError> {
-    match std::fs::read_to_string(dir.join("current")) {
-        Ok(text) => text
-            .trim()
-            .parse()
-            .map_err(|_| StoreError::Unknown(format!("bad generation {text:?}"))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(1),
-        Err(e) => Err(e.into()),
+/// The small database saying which generation the board's sessions write;
+/// it changes only inside an exclusive transaction, across processes.
+fn pointer(dir: &Path) -> Result<Connection, StoreError> {
+    let conn = Connection::open(dir.join("pointer.db"))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS current (
+             one INTEGER PRIMARY KEY CHECK (one = 1),
+             generation INTEGER NOT NULL
+         );
+         INSERT OR IGNORE INTO current (one, generation) VALUES (1, 1);",
+    )?;
+    Ok(conn)
+}
+
+fn current(conn: &Connection) -> Result<u64, StoreError> {
+    let generation: i64 = conn.query_row("SELECT generation FROM current", [], |r| r.get(0))?;
+    Ok(generation as u64)
+}
+
+/// Where a direct message opens: the agent it came from, or the agent it
+/// went to when that agent has an owner; mail between humans has none.
+fn route(m: &proto::Message) -> Option<&str> {
+    if m.to_group.is_some() {
+        None
+    } else if m.from_kind() == proto::Kind::Agent {
+        Some(&m.from_name)
+    } else if m.to_owner.is_some() {
+        m.to_name.as_deref()
+    } else {
+        None
     }
 }
 
-/// Point sessions at `generation` by replacing the small pointer file,
-/// never a database.
-fn point(dir: &Path, generation: u64) -> Result<(), StoreError> {
-    let temp = tempfile::NamedTempFile::new_in(dir)?;
-    std::fs::write(temp.path(), generation.to_string())?;
-    temp.persist(dir.join("current")).map_err(|e| e.error)?;
-    Ok(())
+fn interrupted(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::OperationInterrupted
+    )
 }
 
 /// What makes a message the same message: never its read receipt.
@@ -146,7 +178,7 @@ impl Store {
     /// The current generation's history, created if new.
     pub fn open(dir: &Path) -> Result<Store, StoreError> {
         std::fs::create_dir_all(dir)?;
-        let generation = current(dir)?;
+        let generation = current(&pointer(dir)?)?;
         Self::open_at(dir, generation)
     }
 
@@ -159,11 +191,13 @@ impl Store {
              CREATE TABLE IF NOT EXISTS messages (
                  id INTEGER PRIMARY KEY,
                  to_group TEXT COLLATE NOCASE,
+                 route TEXT COLLATE NOCASE,
                  folded TEXT NOT NULL,
                  fp BLOB NOT NULL,
                  row BLOB NOT NULL
              );
              CREATE INDEX IF NOT EXISTS messages_group ON messages (to_group, id);
+             CREATE INDEX IF NOT EXISTS messages_route ON messages (route, id);
              CREATE TABLE IF NOT EXISTS scopes (
                  message_id INTEGER NOT NULL,
                  agent_id INTEGER NOT NULL,
@@ -200,6 +234,12 @@ impl Store {
         self.generation
     }
 
+    /// Whether sessions still write this generation; a worker on an old one
+    /// stops and opens the current one.
+    pub fn is_current(&self) -> Result<bool, StoreError> {
+        Ok(current(&pointer(&self.dir)?)? == self.generation)
+    }
+
     fn meta<T: rusqlite::types::FromSql>(&self, key: &str) -> Result<Option<T>, StoreError> {
         Ok(self
             .conn
@@ -234,17 +274,31 @@ impl Store {
         self.meta("synced_at")
     }
 
-    /// Where the sync feed resumes: just before the last stored message, so
-    /// the first page shows the server still has it.
-    pub fn resume_from(&self) -> Result<i64, StoreError> {
-        Ok(self.meta::<i64>("anchor")?.map_or(0, |id| id - 1))
+    /// Where the sync feed resumes, and the message its first page must
+    /// begin with: just before the last stored one, so the server shows it
+    /// still has it.
+    pub fn resume(&self) -> Result<(i64, Option<Anchor>), StoreError> {
+        let Some(id) = self.meta::<i64>("anchor")? else {
+            return Ok((0, None));
+        };
+        let fp = self
+            .conn
+            .query_row("SELECT fp FROM messages WHERE id = ?1", [id], |r| r.get(0))?;
+        Ok((id - 1, Some(Anchor { id, fp })))
     }
 
     /// Store a page and move the cursor past it, all or nothing. The first
-    /// page after connecting (`resumed`) must begin with the anchor.
-    pub fn apply(&mut self, batch: &Batch, resumed: bool) -> Result<(), StoreError> {
+    /// page of a stream opened to resume must begin with its `expected`
+    /// anchor, whatever other sessions have stored since.
+    pub fn apply(&mut self, batch: &Batch, expected: Option<&Anchor>) -> Result<(), StoreError> {
+        if let Some(anchor) = expected {
+            match batch.messages.first() {
+                Some(m) if m.id == anchor.id && fingerprint(m) == anchor.fp => {}
+                _ => return Err(StoreError::Mismatch(Mismatch { id: anchor.id })),
+            }
+        }
         let tx = self.conn.transaction()?;
-        let result = apply(&tx, batch, resumed);
+        let result = apply(&tx, batch);
         match result {
             Ok(()) => Ok(tx.commit()?),
             // Dropping the transaction rolls it back.
@@ -257,15 +311,18 @@ impl Store {
     pub fn next_generation(self) -> Result<Store, StoreError> {
         let identity = self.identity()?;
         let dir = self.dir.clone();
-        let on_disk = current(&dir)?;
-        let next = if on_disk > self.generation {
-            on_disk
+        let mut pointer = pointer(&dir)?;
+        let tx = pointer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let on_disk = current(&tx)?;
+        let next = if on_disk == self.generation {
+            tx.execute("UPDATE current SET generation = ?1", [on_disk as i64 + 1])?;
+            on_disk + 1
         } else {
-            self.generation + 1
+            on_disk
         };
+        tx.commit()?;
         drop(self);
         let store = Self::open_at(&dir, next)?;
-        point(&dir, next)?;
         if let Some(human) = identity {
             store.set_identity(&human)?;
         }
@@ -275,6 +332,19 @@ impl Store {
     /// The best `limit` stored messages for `query`, ranked as the launcher
     /// ranks message lines; `None` once `stale` says a newer query came.
     pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        stale: impl Fn() -> bool + Clone + Send + std::panic::RefUnwindSafe + 'static,
+    ) -> Result<Option<Vec<Found>>, StoreError> {
+        self.conn
+            .progress_handler(STEPS_PER_CHECK, Some(stale.clone()))?;
+        let result = self.ranked(query, limit, &stale);
+        self.conn.progress_handler(0, None::<fn() -> bool>)?;
+        result
+    }
+
+    fn ranked(
         &self,
         query: &str,
         limit: usize,
@@ -300,7 +370,14 @@ impl Store {
         // Ranked on the folded text alone; only the winners are decoded.
         let mut best: Vec<(Rank, i64, usize)> = Vec::new();
         let mut seen = 0usize;
-        while let Some(row) = rows.next()? {
+        loop {
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                // A newer query stopped the scan.
+                Err(e) if interrupted(&e) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
             seen += 1;
             if seen.is_multiple_of(CHECK_EVERY) && stale() {
                 return Ok(None);
@@ -360,10 +437,11 @@ impl Store {
     ) -> Result<Vec<proto::Message>, StoreError> {
         let (filter, name) = match place {
             Place::Agent(name) => (
-                "id IN (SELECT message_id FROM scopes WHERE agent_name = ?1)",
+                "(route = ?1 OR id IN (SELECT message_id FROM scopes WHERE agent_name = ?1))",
                 name,
             ),
             Place::Group(name) => ("to_group = ?1", name),
+            Place::Feed => ("?1 = ?1", ""),
         };
         let pivot = around.unwrap_or(i64::MAX);
         let half = if around.is_some() { limit / 2 } else { limit };
@@ -407,24 +485,7 @@ fn trim(best: &mut Vec<(Rank, i64, usize)>, limit: usize) {
     best.truncate(limit);
 }
 
-fn apply(tx: &Transaction, batch: &Batch, resumed: bool) -> Result<(), StoreError> {
-    let get = |key: &str| -> Result<Option<rusqlite::types::Value>, StoreError> {
-        Ok(tx
-            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
-            .optional()?)
-    };
-    let anchor: Option<i64> = get("anchor")?.and_then(|v| match v {
-        rusqlite::types::Value::Integer(i) => Some(i),
-        _ => None,
-    });
-    if resumed && let Some(id) = anchor {
-        let stored: Vec<u8> =
-            tx.query_row("SELECT fp FROM messages WHERE id = ?1", [id], |r| r.get(0))?;
-        match batch.messages.first() {
-            Some(m) if m.id == id && fingerprint(m) == stored => {}
-            _ => return Err(StoreError::Mismatch(Mismatch { id })),
-        }
-    }
+fn apply(tx: &Transaction, batch: &Batch) -> Result<(), StoreError> {
     let cursor: i64 = tx
         .query_row("SELECT value FROM meta WHERE key = 'cursor'", [], |r| {
             r.get(0)
@@ -449,8 +510,16 @@ fn apply(tx: &Transaction, batch: &Batch, resumed: bool) -> Result<(), StoreErro
             }
             None => {
                 tx.execute(
-                    "INSERT INTO messages (id, to_group, folded, fp, row) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![m.id, m.to_group, folded(&m.body), fp, m.encode_to_vec()],
+                    "INSERT INTO messages (id, to_group, route, folded, fp, row)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        m.id,
+                        m.to_group,
+                        route(m),
+                        folded(&m.body),
+                        fp,
+                        m.encode_to_vec()
+                    ],
                 )?;
             }
         }
@@ -523,17 +592,17 @@ mod tests {
         let mut store = Store::open(dir.path()).unwrap();
         store.set_identity("ada").unwrap();
         assert_eq!(
-            (store.cursor().unwrap(), store.resume_from().unwrap()),
-            (0, 0)
+            (store.cursor().unwrap(), store.resume().unwrap()),
+            (0, (0, None))
         );
         store
-            .apply(&batch(&[(1, "one"), (2, "two")], false), false)
+            .apply(&batch(&[(1, "one"), (2, "two")], false), None)
             .unwrap();
-        store.apply(&batch(&[(5, "five")], true), false).unwrap();
+        store.apply(&batch(&[(5, "five")], true), None).unwrap();
         drop(store);
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.cursor().unwrap(), 5);
-        assert_eq!(store.resume_from().unwrap(), 4, "re-deliver the anchor");
+        assert_eq!(store.resume().unwrap().0, 4, "re-deliver the anchor");
         assert!(store.caught_up().unwrap());
         assert_eq!(store.identity().unwrap().as_deref(), Some("ada"));
         assert!(store.synced_at().unwrap().is_some());
@@ -545,10 +614,10 @@ mod tests {
     fn a_page_that_fails_part_way_stores_nothing_and_keeps_the_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path()).unwrap();
-        store.apply(&batch(&[(1, "one")], false), false).unwrap();
+        store.apply(&batch(&[(1, "one")], false), None).unwrap();
         // 3 is new, but 1 comes back different: the whole page is refused.
         let error = store
-            .apply(&batch(&[(3, "three"), (1, "changed")], false), false)
+            .apply(&batch(&[(3, "three"), (1, "changed")], false), None)
             .unwrap_err();
         assert!(
             matches!(error, StoreError::Mismatch(Mismatch { id: 1 })),
@@ -563,12 +632,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path()).unwrap();
         store
-            .apply(&batch(&[(1, "one"), (2, "two")], false), false)
+            .apply(&batch(&[(1, "one"), (2, "two")], false), None)
             .unwrap();
-        store.apply(&batch(&[(3, "three")], true), false).unwrap();
+        store.apply(&batch(&[(3, "three")], true), None).unwrap();
         // The first page again, saying more follows: nothing regresses.
         store
-            .apply(&batch(&[(1, "one"), (2, "two")], false), false)
+            .apply(&batch(&[(1, "one"), (2, "two")], false), None)
             .unwrap();
         assert_eq!(store.cursor().unwrap(), 3);
         assert!(store.caught_up().unwrap());
@@ -581,7 +650,7 @@ mod tests {
                     messages: vec![read],
                     ..Batch::default()
                 },
-                false,
+                None,
             )
             .unwrap();
         let rows = store.context(Place::Agent("Zed"), None, 10).unwrap();
@@ -593,19 +662,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path()).unwrap();
         store
-            .apply(&batch(&[(1, "one"), (2, "two")], true), false)
+            .apply(&batch(&[(1, "one"), (2, "two")], true), None)
             .unwrap();
+        let (after, anchor) = store.resume().unwrap();
+        assert_eq!(after, 1);
         // The server still has 2, as it was.
         store
-            .apply(&batch(&[(2, "two"), (3, "three")], true), true)
+            .apply(&batch(&[(2, "two"), (3, "three")], true), anchor.as_ref())
             .unwrap();
         assert_eq!(store.cursor().unwrap(), 3);
+        let (_, anchor) = store.resume().unwrap();
         for page in [
             batch(&[(4, "four")], true),
             batch(&[(3, "rewritten")], true),
             batch(&[], true),
         ] {
-            let error = store.apply(&page, true).unwrap_err();
+            let error = store.apply(&page, anchor.as_ref()).unwrap_err();
             assert!(
                 matches!(error, StoreError::Mismatch(Mismatch { id: 3 })),
                 "{error}"
@@ -614,8 +686,87 @@ mod tests {
         }
         // A fresh store has nothing to check.
         let other = tempfile::tempdir().unwrap();
-        let mut fresh = Store::open(other.path()).unwrap();
-        fresh.apply(&batch(&[], true), true).unwrap();
+        assert_eq!(
+            Store::open(other.path()).unwrap().resume().unwrap(),
+            (0, None)
+        );
+    }
+
+    #[test]
+    fn a_resume_checks_its_own_anchor_while_another_session_moves_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Store::open(dir.path()).unwrap();
+        a.apply(&batch(&[(1, "one"), (5, "five")], true), None)
+            .unwrap();
+        // A opens its stream to resume after 4, expecting 5.
+        let (after, anchor) = a.resume().unwrap();
+        assert_eq!(after, 4);
+        // Meanwhile B stores up to 10.
+        let mut b = Store::open(dir.path()).unwrap();
+        b.apply(&batch(&[(5, "five"), (10, "ten")], true), None)
+            .unwrap();
+        // A's page starts at 5 as its stream promised: valid, nothing lost.
+        a.apply(&batch(&[(5, "five"), (6, "six")], false), anchor.as_ref())
+            .unwrap();
+        assert_eq!(a.cursor().unwrap(), 10, "B's progress stands");
+        assert_eq!(a.resume().unwrap().0, 9, "with its anchor");
+        assert!(
+            a.caught_up().unwrap(),
+            "a stale page does not reopen catch-up"
+        );
+    }
+
+    #[test]
+    fn mail_with_an_unowned_agent_opens_in_its_conversation_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        // ada to another owner's agent, and that agent back: personal mail
+        // that none of ada's agents hold.
+        let out = proto::Message {
+            id: 1,
+            from_kind: proto::Kind::Human as i32,
+            from_name: "ada".into(),
+            to_name: Some("Outside".into()),
+            to_owner: Some("bo".into()),
+            body: "run 40017648886".into(),
+            ..Default::default()
+        };
+        let back = proto::Message {
+            id: 2,
+            from_kind: proto::Kind::Agent as i32,
+            from_name: "Outside".into(),
+            to_name: Some("ada".into()),
+            body: "seen it".into(),
+            ..Default::default()
+        };
+        let between_humans = proto::Message {
+            id: 3,
+            from_kind: proto::Kind::Human as i32,
+            from_name: "ada".into(),
+            to_name: Some("bo".into()),
+            body: "hi bo".into(),
+            ..Default::default()
+        };
+        store
+            .apply(
+                &Batch {
+                    messages: vec![out, back, between_humans],
+                    scopes: (1..=3).map(|id| (id, Vec::new())).collect(),
+                    caught_up: true,
+                },
+                None,
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        let found = store.search("40017648886", 50, || false).unwrap().unwrap();
+        assert_eq!(ids(&found), [1]);
+        let rows = store
+            .context(Place::Agent("outside"), Some(1), 200)
+            .unwrap();
+        assert_eq!(rows.iter().map(|m| m.id).collect::<Vec<_>>(), [1, 2]);
+        let all = store.context(Place::Feed, Some(3), 200).unwrap();
+        assert_eq!(all.iter().map(|m| m.id).collect::<Vec<_>>(), [1, 2, 3]);
     }
 
     #[test]
@@ -623,19 +774,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path()).unwrap();
         store.set_identity("ada").unwrap();
-        store.apply(&batch(&[(1, "old")], true), false).unwrap();
+        store.apply(&batch(&[(1, "old")], true), None).unwrap();
         let mut next = store.next_generation().unwrap();
         assert_eq!(next.generation(), 2);
         assert_eq!(next.cursor().unwrap(), 0);
         assert_eq!(next.identity().unwrap().as_deref(), Some("ada"));
-        next.apply(&batch(&[(1, "new")], true), false).unwrap();
+        next.apply(&batch(&[(1, "new")], true), None).unwrap();
         // New sessions open the new one; the old file is untouched.
         assert_eq!(Store::open(dir.path()).unwrap().generation(), 2);
         let old = Store::open_at(dir.path(), 1).unwrap();
         let rows = old.context(Place::Agent("zed"), None, 10).unwrap();
         assert_eq!(rows[0].body, "old");
+        assert!(!old.is_current().unwrap() && next.is_current().unwrap());
         // A session still on 1 joins 2 rather than making 3.
         assert_eq!(old.next_generation().unwrap().generation(), 2);
+        // Two rotating at once from 2 end on one new generation.
+        let (x, y) = (
+            Store::open(dir.path()).unwrap(),
+            Store::open(dir.path()).unwrap(),
+        );
+        let (x, y) = std::thread::scope(|s| {
+            let x = s.spawn(|| x.next_generation().unwrap().generation());
+            let y = s.spawn(|| y.next_generation().unwrap().generation());
+            (x.join().unwrap(), y.join().unwrap())
+        });
+        assert_eq!((x, y), (3, 3));
     }
 
     #[test]
@@ -643,12 +806,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut a = Store::open(dir.path()).unwrap();
         let mut b = Store::open(dir.path()).unwrap();
-        a.apply(&batch(&[(1, "one"), (2, "two")], false), false)
+        a.apply(&batch(&[(1, "one"), (2, "two")], false), None)
             .unwrap();
-        b.apply(&batch(&[(1, "one")], false), false).unwrap();
-        b.apply(&batch(&[(2, "two"), (3, "three")], true), false)
+        b.apply(&batch(&[(1, "one")], false), None).unwrap();
+        b.apply(&batch(&[(2, "two"), (3, "three")], true), None)
             .unwrap();
-        a.apply(&batch(&[(2, "two")], false), false).unwrap();
+        a.apply(&batch(&[(2, "two")], false), None).unwrap();
         assert_eq!((a.cursor().unwrap(), b.cursor().unwrap()), (3, 3));
     }
 
@@ -668,35 +831,32 @@ mod tests {
                     ],
                     true,
                 ),
-                false,
+                None,
             )
             .unwrap();
         let never = || false;
-        let found = store.search("JEFE", 10, &never).unwrap().unwrap();
+        let found = store.search("JEFE", 10, never).unwrap().unwrap();
         // Whole words, newest first; then partial; then ordered letters.
         assert_eq!(ids(&found), [3, 1, 2, 4]);
         assert_eq!((found[0].line, found[0].text.as_str()), (1, "then Jefe!"));
         assert_eq!(found[0].indexed, "then jefe!");
         assert_eq!(found[0].agents, ["Zed"]);
         assert_eq!(
-            ids(&store.search("jefe", 2, &never).unwrap().unwrap()),
+            ids(&store.search("jefe", 2, never).unwrap().unwrap()),
             [3, 1]
         );
-        assert!(store.search("  ", 10, &never).unwrap().unwrap().is_empty());
+        assert!(store.search("  ", 10, never).unwrap().unwrap().is_empty());
         // Wildcards are text.
         store
-            .apply(&batch(&[(6, "100% sure_thing")], true), false)
+            .apply(&batch(&[(6, "100% sure_thing")], true), None)
             .unwrap();
-        assert_eq!(
-            ids(&store.search("0% s", 10, &never).unwrap().unwrap()),
-            [6]
-        );
-        assert!(store.search("x_y", 10, &never).unwrap().unwrap().is_empty());
+        assert_eq!(ids(&store.search("0% s", 10, never).unwrap().unwrap()), [6]);
+        assert!(store.search("x_y", 10, never).unwrap().unwrap().is_empty());
         // A newer query stops a long one.
         let many: Vec<(i64, String)> = (10..2000).map(|i| (i, format!("jefe {i}"))).collect();
         let rows: Vec<(i64, &str)> = many.iter().map(|(i, b)| (*i, b.as_str())).collect();
-        store.apply(&batch(&rows, true), false).unwrap();
-        assert!(store.search("jefe", 10, &|| true).unwrap().is_none());
+        store.apply(&batch(&rows, true), None).unwrap();
+        assert!(store.search("jefe", 10, || true).unwrap().is_none());
     }
 
     #[test]
@@ -705,7 +865,7 @@ mod tests {
         let mut store = Store::open(dir.path()).unwrap();
         let rows: Vec<(i64, String)> = (1..=30).map(|i| (i, format!("m{i}"))).collect();
         let rows: Vec<(i64, &str)> = rows.iter().map(|(i, b)| (*i, b.as_str())).collect();
-        store.apply(&batch(&rows, true), false).unwrap();
+        store.apply(&batch(&rows, true), None).unwrap();
         let mut group = message(40, "to the crew");
         group.to_group = Some("Crew".into());
         store
@@ -715,7 +875,7 @@ mod tests {
                     scopes: vec![(40, Vec::new())],
                     caught_up: true,
                 },
-                false,
+                None,
             )
             .unwrap();
         let around = store.context(Place::Agent("Zed"), Some(10), 6).unwrap();
@@ -730,12 +890,33 @@ mod tests {
         );
         let crew = store.context(Place::Group("crew"), None, 10).unwrap();
         assert_eq!(crew.iter().map(|m| m.id).collect::<Vec<_>>(), [40]);
+        let feed = store.context(Place::Feed, None, 3).unwrap();
+        assert_eq!(feed.iter().map(|m| m.id).collect::<Vec<_>>(), [29, 30, 40]);
         assert!(
             store
                 .context(Place::Agent("Mateo"), None, 10)
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_newer_query_stops_a_search_that_finds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let rows: Vec<(i64, String)> = (1..=5000).map(|id| (id, format!("row {id}"))).collect();
+        let rows: Vec<(i64, &str)> = rows.iter().map(|(i, b)| (*i, b.as_str())).collect();
+        store.apply(&batch(&rows, true), None).unwrap();
+        // No row matches, so no candidate is ever ranked: only SQLite's own
+        // progress checks can notice.
+        assert!(store.search("zzzz", 50, || true).unwrap().is_none());
+        assert_eq!(
+            store.search("zzzz", 50, || false).unwrap().map(|f| f.len()),
+            Some(0)
+        );
+        // Writing works afterwards: the check went away with the search.
+        store.apply(&batch(&[(5001, "more")], true), None).unwrap();
+        assert_eq!(store.cursor().unwrap(), 5001);
     }
 
     /// `cargo test --release -- --ignored large_history`: timings and memory
@@ -773,7 +954,7 @@ mod tests {
                 })
                 .collect();
             let rows: Vec<(i64, &str)> = rows.iter().map(|(i, b)| (*i, b.as_str())).collect();
-            store.apply(&batch(&rows, false), false).unwrap();
+            store.apply(&batch(&rows, false), None).unwrap();
         }
         let size = std::fs::metadata(file(dir.path(), 1)).unwrap().len();
         println!(
@@ -784,7 +965,7 @@ mod tests {
         let before = rss_kib();
         for query in ["run 99999", "gateway ledger", "zzz", "dplyrv", "e"] {
             let started = std::time::Instant::now();
-            let found = store.search(query, 50, &|| false).unwrap().unwrap();
+            let found = store.search(query, 50, || false).unwrap().unwrap();
             println!(
                 "{query:>16}: {:>3} hits in {:?}",
                 found.len(),

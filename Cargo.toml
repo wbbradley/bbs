@@ -40,7 +40,7 @@ rand = "0.9"
 rpassword = "7.4"
 regex = "1.13.1"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
-rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup", "hooks"] }
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }

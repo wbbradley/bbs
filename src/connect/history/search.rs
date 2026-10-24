@@ -2,9 +2,8 @@
 //! last, and a query overtaken by a newer one stops early and says nothing.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use super::store::{Found, Store};
 
@@ -13,7 +12,8 @@ const LIMIT: usize = 50;
 
 pub struct Searcher {
     queries: mpsc::Sender<(u64, String)>,
-    /// The newest query asked for; older ones give way to it.
+    /// The newest query asked for; older ones give way to it, even inside
+    /// a scan that finds nothing.
     latest: Arc<AtomicU64>,
 }
 
@@ -28,26 +28,29 @@ impl Searcher {
         let latest = Arc::new(AtomicU64::new(0));
         let newest = latest.clone();
         std::thread::spawn(move || {
-            let mut store = None;
+            let mut store: Option<Store> = None;
             while let Ok(mut query) = rx.recv() {
                 // Only the newest of whatever is waiting matters.
                 while let Ok(newer) = rx.try_recv() {
                     query = newer;
                 }
                 let (generation, text) = query;
-                if newest.load(Ordering::Acquire) != generation {
+                let latest = newest.clone();
+                let stale = move || latest.load(Ordering::Acquire) != generation;
+                if stale() {
                     continue;
                 }
-                let result = match &store {
-                    Some(store) => Ok(store),
-                    None => Store::open(&dir).map(|s| &*store.insert(s)),
+                if store.is_none() {
+                    match Store::open(&dir) {
+                        Ok(opened) => store = Some(opened),
+                        Err(e) => {
+                            done(generation, Err(e.to_string()));
+                            continue;
+                        }
+                    }
                 }
-                .and_then(|store| {
-                    store.search(&text, LIMIT, &|| {
-                        newest.load(Ordering::Acquire) != generation
-                    })
-                });
-                match result {
+                let opened = store.as_ref().expect("opened above");
+                match opened.search(&text, LIMIT, stale) {
                     Ok(Some(found)) => done(generation, Ok(found)),
                     // Overtaken: the newer query answers instead.
                     Ok(None) => {}
@@ -63,6 +66,7 @@ impl Searcher {
     }
 
     /// Search for `query`; its results arrive with the returned generation.
+    /// Whatever query is running stops soon after.
     pub fn search(&self, query: &str) -> u64 {
         let generation = self.latest.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.queries.send((generation, query.to_string()));
@@ -96,7 +100,7 @@ mod tests {
                     scopes: Vec::new(),
                     caught_up: true,
                 },
-                false,
+                None,
             )
             .unwrap();
         let (tx, rx) = mpsc::channel();
