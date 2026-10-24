@@ -500,10 +500,9 @@ human, kept until you remove it: there is no size limit and nothing is evicted.
 Each page and the point the stream reached are saved together, so an
 interrupted session resumes without gaps or repeats, and several sessions can
 share one history. Resuming first checks that the server still has the last
-stored message unchanged; if the server's history was reset or restored, the
-old file is kept as it is and a new one is filled from the start, and nothing
-from the old history stays in the session's results. Credentials are never
-stored.
+stored message unchanged. If that check detects a history mismatch, the old
+file is kept as it is and a new one is filled from the start; nothing from the
+old history stays in the session's results. Credentials are never stored.
 
 The status bar says when history is still being stored, reconnecting, paused
 or needs a newer server; `F5` retries a paused one. A failure to store pauses
@@ -539,8 +538,8 @@ an agent name, `@` and a group name, or a cached message's age, sender,
 recipient and line, cropped and with names shortened when needed to keep
 the first match in view. Text matching the query is bold in the search-hit colour,
 also on the selected row, and the list scrolls through up to 50 results.
-`Ctrl-c` still quits. The blocker modal keeps `Ctrl-p` while it is open;
-likewise, the launcher keeps `F2` until it closes.
+`Ctrl-c` still quits. `Ctrl-p` can open over blockers and notes; cancelling it
+returns to the covered editor. The launcher keeps `F2` until it closes.
 
 Search uses only data already on this machine. It does not list agents or
 groups, call message search, or fetch older history. Messages this session
