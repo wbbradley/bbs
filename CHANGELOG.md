@@ -12,8 +12,8 @@ Private agent notes, a stored personal message history with offline browsing,
 and `bbs connect` refinements. This release adds database schema 22 and the
 `agent-notes.v1` and `feed-sync.v1` capabilities; protocol v2, config format 4
 and Rust 1.89 are unchanged. Upgrade the server first, after a backup: the
-server migrates its database to schema 22 on start, and 0.15 and older binaries
-cannot open it afterwards. Notes and stored history need both a 0.16.0 server
+server migrates its database to schema 22 on start, and schema-21 binaries,
+including the published 0.15.4, cannot reopen it afterwards. Notes and stored history need both a 0.16.0 server
 and a 0.16.0 client. Against an older server, `F3` explains that notes need a
 newer server, the status bar says the history needs one, and everything else
 works as before; older clients keep working against a 0.16.0 server.
@@ -46,6 +46,11 @@ works as before; older clients keep working against a 0.16.0 server.
   from a cancel confirmation first; `F3` closes an open note as `Esc` does.
   Ctrl-P opens over the blocker card and notes: `Esc` returns to them, and a
   chosen result closes them and reuses that conversation if already open.
+- A conversation marks mail read only once its own live feed has delivered
+  it: stored or cached messages alone never do, nothing is read or seen while
+  offline, and coming back reads nothing until the conversation is fresh. A
+  conversation opened from Ctrl-P therefore marks mail read a moment later
+  than before.
 - Ctrl-P lists every result that contains the query before any fuzzy match,
   so a message or status naming the query is no longer pushed below agents
   whose name or status only has its letters in order.
