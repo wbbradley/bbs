@@ -658,10 +658,7 @@ impl App {
                 }
             });
         }
-        if self.blockers.is_open()
-            || key.code != KeyCode::Char('p')
-            || key.modifiers != KeyModifiers::CONTROL
-        {
+        if key.code != KeyCode::Char('p') || key.modifiers != KeyModifiers::CONTROL {
             return None;
         }
         self.keymap = Keymap::default();
@@ -699,6 +696,9 @@ impl App {
 
     /// Go somewhere from a modal, storing an open, changed note first.
     fn navigate(&mut self, to: Navigation) {
+        // A chosen destination leaves the blocker card, including any cancel
+        // confirmation. Cancelling the picker never reaches this path.
+        self.blockers.close();
         if let Some(editor) = &mut self.note_editor {
             // As Esc would: store a changed note before leaving it.
             self.pending_navigation = Some(to);
@@ -6890,7 +6890,12 @@ mod tests {
                     };
                     let lines: Vec<String> = (0..40).map(row).collect();
                     let out = lines.join("\n");
-                    assert!(out.starts_with(" #5 · Answering a blocker"), "{out}");
+                    assert!(
+                        lines
+                            .iter()
+                            .any(|l| l.starts_with(" #5 · Answering a blocker")),
+                        "{out}"
+                    );
                     assert!(out.contains("▸ #5 @crew Zed") && out.contains("  #12 @crew Mateo"));
                     let at = |text: &str| lines.iter().position(|l| l.trim_end().starts_with(text));
                     assert!(at("  # Deploy plan").is_some(), "{out}");
@@ -6920,7 +6925,11 @@ mod tests {
                 assert_eq!(table_rows[0], table_rows[2], "and widens back");
                 blockers_listed(&mut app, id, vec![blocker(8, 1, "Zed", "changed\nmore")]);
                 let out = screen(&mut app, 60, 30);
-                assert!(out.starts_with(" #8 · Answering a blocker"), "{out}");
+                assert!(
+                    out.lines()
+                        .any(|l| l.starts_with(" #8 · Answering a blocker")),
+                    "{out}"
+                );
                 assert!(out.contains("▸ #8 @crew Zed") && !out.contains("#5"));
                 press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
                 assert_eq!(draft_text(&mut app), "parent draft");
@@ -6954,13 +6963,16 @@ mod tests {
                         .unwrap();
                     // The title and the single list row precede the details.
                     // Every wrapped row keeps the gutter, even after scrolling.
-                    let details: Vec<_> = (2..label).map(row).collect();
+                    let start = (0..label)
+                        .find(|y| row(*y).starts_with("  #1 @crew Zed"))
+                        .expect("the selected blocker is restated");
+                    let details: Vec<_> = (start..label).map(row).collect();
                     assert!(details.iter().any(|l| !l.trim().is_empty()));
                     for line in &details {
                         assert!(line.starts_with("  "), "{scheme:?} {width}: {line:?}");
                     }
                     let card = theme::base().patch(theme::style(theme::Role::WarningSurface));
-                    for y in 2..label {
+                    for y in start..label {
                         for x in 0..2 {
                             assert_eq!(buffer[(x, y)].symbol(), " ");
                             assert_eq!(buffer[(x, y)].bg, card.bg.unwrap());
@@ -7168,7 +7180,7 @@ mod tests {
     }
 
     #[test]
-    fn the_launcher_covers_the_menu_and_leaves_the_blocker_modal_in_charge() {
+    fn the_launcher_covers_the_menu_and_returns_to_the_blocker_modal_on_escape() {
         let (mut app, mut rx) = app();
         let before = buffer(&mut app, 80);
         ctrl(&mut app, 'p');
@@ -7179,9 +7191,11 @@ mod tests {
         queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
         ctrl(&mut app, 'p');
-        assert!(app.picker.is_none(), "the open blocker modal owns Ctrl-P");
+        assert!(app.picker.is_some());
         assert!(app.blockers.is_open());
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.picker.is_none());
+        assert!(app.blockers.is_open());
         ctrl(&mut app, 'p');
         assert!(press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL));
     }
@@ -7782,11 +7796,16 @@ mod tests {
                         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
                         let open = buffer(&mut app, width);
                         crate::ui::theme::testing::assert_buffer(&open);
-                        let top: String = (0..width).map(|x| open[(x, 0)].symbol()).collect();
-                        assert!(
-                            top.starts_with(" #1 · Answering a blocker from Zed @crew"),
-                            "{origin}: {top}"
-                        );
+                        let title = (0..24)
+                            .map(|y| {
+                                (0..width)
+                                    .map(|x| open[(x, y)].symbol())
+                                    .collect::<String>()
+                            })
+                            .find(|row| {
+                                row.starts_with(" #1 · Answering a blocker from Zed @crew")
+                            });
+                        assert!(title.is_some(), "{origin}: no blocker title");
                         // Keys and paste are the answer's, never the screen's.
                         typed(&mut app, "x");
                         app.on_event(Event::Paste("y".into()));
@@ -8066,7 +8085,9 @@ mod tests {
                 let out = screen(&mut app, 60, 24);
                 let lines: Vec<&str> = out.lines().collect();
                 assert!(
-                    lines[0].starts_with(" #1 · Answering a blocker from Zed @crew"),
+                    lines
+                        .iter()
+                        .any(|line| line.starts_with(" #1 · Answering a blocker from Zed @crew")),
                     "{out}"
                 );
                 assert!(
@@ -11503,6 +11524,87 @@ mod tests {
 
     fn f3(app: &mut App) -> bool {
         press(app, KeyCode::F(3), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn f2_returns_from_cancel_confirmation_then_closes_and_keeps_the_answer() {
+        let (mut app, mut rx) = app();
+        queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        typed(&mut app, "keep this answer");
+        press(&mut app, KeyCode::BackTab, KeyModifiers::NONE);
+        enter(&mut app);
+        assert!(screen(&mut app, 80, 24).contains("Cancel this blocker?"));
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(app.blockers.is_open());
+        assert!(!screen(&mut app, 80, 24).contains("Cancel this blocker?"));
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(!app.blockers.is_open());
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(screen(&mut app, 80, 24).contains("keep this answer"));
+    }
+
+    #[test]
+    fn f3_closes_a_clean_note_and_saves_a_changed_note_before_closing() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![]);
+        f3(&mut app);
+        f3(&mut app);
+        assert!(app.note_editor.is_none());
+        assert_eq!(note_put(&mut rx), None);
+        f3(&mut app);
+        typed(&mut app, "keep this note");
+        f3(&mut app);
+        let (save, agent_id, body) = note_put(&mut rx).expect("F3 saves like Esc");
+        assert_eq!((agent_id, body.as_str()), (7, "keep this note"));
+        assert!(app.note_editor.is_some());
+        app.on_event(Event::Data(Data::NoteSaved {
+            id: save,
+            result: Ok(agent_note(7, "Mateo", &body, 1)),
+        }));
+        assert!(app.note_editor.is_none());
+    }
+
+    #[test]
+    fn launcher_links_unwind_modals_and_reuse_the_destination_on_the_stack() {
+        for overlay in ["notes", "blockers", "both"] {
+            for query in ["Mateo", "needle"] {
+                let (mut app, mut rx) = app();
+                mateo(&mut app, &mut rx);
+                notes_ready(&mut app, &mut rx, vec![agent_note(7, "Mateo", "needle", 1)]);
+                let depth = app.stack.len();
+                app.push(Box::new(Help::default()));
+                app.launch(Target::Agent("Grove".into()));
+                assert_eq!(app.stack.len(), depth + 2);
+                if overlay != "blockers" {
+                    f3(&mut app);
+                }
+                if overlay != "notes" {
+                    queue(&mut app, &mut rx, vec![grove_asks()]);
+                    press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+                }
+                ctrl(&mut app, 'p');
+                assert!(app.picker.is_some(), "{overlay}");
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                assert_eq!(app.note_editor.is_some(), overlay != "blockers");
+                assert_eq!(app.blockers.is_open(), overlay != "notes");
+                ctrl(&mut app, 'p');
+                app.on_event(Event::Paste(query.into()));
+                enter(&mut app);
+                assert!(app.picker.is_none());
+                assert!(!app.blockers.is_open(), "{overlay}: {query}");
+                assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+                assert_eq!(app.stack.len(), depth, "{overlay}: {query}");
+                assert_eq!(app.note_editor.is_some(), query == "needle");
+                if query == "needle" {
+                    assert_eq!(app.note_editor.as_ref().unwrap().agent_id(), 7);
+                    f3(&mut app);
+                }
+                assert!(app.note_editor.is_none());
+                assert!(!app.blockers.is_open());
+            }
+        }
     }
 
     fn note_text(app: &App) -> Option<String> {

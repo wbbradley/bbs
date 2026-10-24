@@ -439,7 +439,7 @@ impl Blockers {
     }
 
     /// Close the panel, remembering where it was.
-    fn close(&mut self) {
+    pub(super) fn close(&mut self) {
         if let Some(panel) = self.panel.take() {
             let roots = self.rows.iter().map(|b| b.root_id).collect();
             self.remembered = panel.selected.map(|root| (root, roots));
@@ -504,6 +504,11 @@ impl Blockers {
     }
 
     pub fn key(&mut self, id: u64, key: KeyEvent, now: Instant) -> Outcome {
+        let key = if key.code == KeyCode::F(2) && key.modifiers.is_empty() {
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+        } else {
+            key
+        };
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Outcome::Pass;
         }

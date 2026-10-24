@@ -187,6 +187,7 @@ impl NoteEditor {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => return self.close(save_id),
+            KeyCode::F(3) if key.modifiers.is_empty() => return self.close(save_id),
             KeyCode::Char('s') if ctrl => return self.save(save_id),
             KeyCode::Enter if key.modifiers.is_empty() => {
                 // A new line: Enter never sends a note.
