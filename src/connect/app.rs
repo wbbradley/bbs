@@ -10738,7 +10738,7 @@ mod tests {
                         app.on_event(activity_event);
                     }
                     let out = screen(&mut app, 80, 40);
-                    assert_eq!(out.matches("▀ Zoe → @nw-api").count(), 1, "{out}");
+                    assert_eq!(out.matches("• Zoe → @nw-api").count(), 1, "{out}");
                     assert_eq!(out.matches("Joined").count(), 1, "{out}");
                     assert!(
                         !out.contains("mail from")
@@ -10763,7 +10763,7 @@ mod tests {
                         };
                         let header = row("Zoe → @nw-api");
                         let end = row("final-tail");
-                        assert_eq!(buf[(0, header)].symbol(), "▀");
+                        assert_eq!(buf[(0, header)].symbol(), "•");
                         assert_eq!(
                             Some(buf[(0, header)].fg),
                             theme::style(theme::Role::Go).fg.or(theme::base().fg)
@@ -11132,9 +11132,9 @@ mod tests {
                             .lines()
                             .find(|line| line.contains("the answer"))
                             .expect(&out);
-                        assert!(answer.starts_with("▀ the answer"), "{out}");
+                        assert!(answer.starts_with("• the answer"), "{out}");
                         if compact {
-                            assert!(answer.trim_end().ends_with(" ▄"), "{out}");
+                            assert!(answer.trim_end().ends_with(" •"), "{out}");
                             assert!(!out.contains("thinking"), "{out}");
                         }
                     }
@@ -11204,9 +11204,9 @@ mod tests {
             "  ✓ Read b.rs completed (1.0s)",
             "",
             "  Done.",
-            "▀ group note",
+            "• group note",
             "",
-            "  ✓ Read c.rs completed (1.0s) ▄",
+            "  ✓ Read c.rs completed (1.0s) •",
             "",
         ];
         let start = |app: &mut App, rx: &mut UnboundedReceiver<Request>| {
@@ -11237,7 +11237,7 @@ mod tests {
             }));
         }
         let streamed = screen(&mut app, 80, 30);
-        assert!(streamed.contains("▀ please build"), "{streamed}");
+        assert!(streamed.contains("• please build"), "{streamed}");
         assert_eq!(
             span(&streamed, "Looking.", "Read c.rs"),
             expected,

@@ -285,7 +285,7 @@ impl<R: Row> ThreadView<R> {
                 .rfind(|line| line.spans.iter().any(|s| !s.content.trim().is_empty()))
         {
             last.spans.push(Span::styled(
-                " ▄",
+                " •",
                 super::theme::style(super::theme::Role::Stop),
             ));
         }
@@ -507,7 +507,7 @@ impl<R: Row> ThreadView<R> {
                         .line_count(content_area.width);
                     gutter.resize(gutter.len().max(offset + 1), Line::default());
                     gutter[offset].spans = vec![Span::styled(
-                        "▀ ",
+                        "• ",
                         super::theme::style(super::theme::Role::Go),
                     )];
                 }
@@ -631,10 +631,10 @@ mod tests {
                         .unwrap();
                     let buffer = terminal.backend().buffer();
                     theme::testing::assert_buffer(buffer);
-                    assert_eq!(buffer[(0, 1)].symbol(), "▀", "{scheme:?} {width}");
+                    assert_eq!(buffer[(0, 1)].symbol(), "•", "{scheme:?} {width}");
                     let end_y = if width == 8 { 2 } else { 1 };
                     let end_x = if width == 8 { 5 } else { 11 };
-                    assert_eq!(buffer[(end_x, end_y)].symbol(), "▄");
+                    assert_eq!(buffer[(end_x, end_y)].symbol(), "•");
                     let base = theme::style(Role::Screen);
                     assert_eq!(
                         Some(buffer[(0, 1)].fg),
@@ -656,7 +656,7 @@ mod tests {
                         let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
                         terminal.draw(|f| view.render(f, f.area())).unwrap();
                         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
-                        assert_eq!(terminal.backend().buffer()[(5, 0)].symbol(), "▄");
+                        assert_eq!(terminal.backend().buffer()[(5, 0)].symbol(), "•");
                     }
                 }
             });
