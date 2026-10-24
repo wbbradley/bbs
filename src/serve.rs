@@ -346,6 +346,8 @@ impl State {
                     .is_some()
                 {
                     Status::unauthenticated(err.to_string())
+                } else if err.downcast_ref::<service::SyncPageTooLarge>().is_some() {
+                    Status::resource_exhausted(err.to_string())
                 } else {
                     Status::failed_precondition(format!("{err:#}"))
                 }
@@ -2073,6 +2075,32 @@ mod tests {
         );
         assert!(stream.next().await.is_none());
         assert!(tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_sync_row_is_resource_exhausted_not_a_precondition() {
+        let state = Arc::new(State {
+            conn: Mutex::new(Connection::open_in_memory().unwrap()),
+            notify: watch::Sender::new(0),
+            activity: watch::Sender::new(0),
+            waiters: Mutex::new(HashSet::new()),
+            shutdown: watch::Sender::new(false),
+            require_human_token: false,
+            protocol: Policy::default(),
+            auth_failures: Mutex::new(HashMap::new()),
+            timer_limits: TimerLimits::default(),
+            clock: Arc::new(Utc::now),
+        });
+        let status = state
+            .call(|_| -> Result<()> { Err(service::SyncPageTooLarge { message_id: 7 }.into()) })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            status.message().contains("message 7"),
+            "{}",
+            status.message()
+        );
     }
 
     #[tokio::test]

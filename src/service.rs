@@ -3,7 +3,7 @@
 //! transaction, generates `now`, and resolves the caller. It knows nothing
 //! about sockets, files or output formatting.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -2128,7 +2128,8 @@ pub const MAX_SYNC_PAGE_BYTES: usize = 4 * 1024 * 1024;
 /// at most `backlog` messages and `MAX_SYNC_PAGE_BYTES`, each with the
 /// caller's agents whose conversation holds it, and whether nothing further
 /// matched when it was read. A message is never cut short; one that would
-/// cross the byte budget waits for the next page.
+/// cross the byte budget waits for the next page, and one that cannot fit
+/// even alone is refused with `SyncPageTooLarge`.
 fn sync_page(
     conn: &Connection,
     human: i64,
@@ -2162,9 +2163,42 @@ fn sync_page(
     // One row past the page, in the same read, says whether more follow.
     let rows = db::feed_messages(conn, req.backlog + 1, &filter)?;
     let ids: Vec<i64> = rows.iter().map(|m| m.id).collect();
-    let mut scopes = db::owned_agent_scopes(conn, human, &ids)?;
+    let scopes = db::owned_agent_scopes(conn, human, &ids)?;
+    fill_sync_page(rows, scopes, req.backlog as usize, MAX_SYNC_PAGE_BYTES)
+}
+
+/// A message that, with its agents, cannot fit in a sync page by itself.
+/// Nothing is sent for it, and the cursor stays before it.
+#[derive(Debug)]
+pub struct SyncPageTooLarge {
+    pub message_id: i64,
+}
+
+impl std::fmt::Display for SyncPageTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "message {} with its agents exceeds the {MAX_SYNC_PAGE_BYTES}-byte sync page",
+            self.message_id
+        )
+    }
+}
+
+impl std::error::Error for SyncPageTooLarge {}
+
+/// The page `rows` make: in order, up to `backlog` of them, while the whole
+/// snapshot's encoding stays within `budget` bytes.
+fn fill_sync_page(
+    rows: Vec<db::MessageView>,
+    mut scopes: HashMap<i64, Vec<(i64, String)>>,
+    backlog: usize,
+    budget: usize,
+) -> Result<proto::FeedSnapshot> {
+    use prost::encoding::{bool, message};
     let mut page = proto::FeedSnapshot::default();
-    let mut bytes = 0;
+    // Exactly the snapshot's encoded length: its caught_up field, then each
+    // message and scope with its own tag and length prefix.
+    let mut bytes = bool::encoded_len(2, &true);
     let mut caught_up = true;
     for row in rows {
         let scope = proto::FeedAgentScope {
@@ -2176,20 +2210,25 @@ fn sync_page(
                 .map(|(id, name)| proto::FeedAgent { id, name })
                 .collect(),
         };
-        let message = message(row, None);
-        // Each field's tag and length prefix, generously.
-        let size =
-            prost::Message::encoded_len(&message) + prost::Message::encoded_len(&scope) + 2 * 16;
-        let full = page.messages.len() == req.backlog as usize;
-        if full || (!page.messages.is_empty() && bytes + size > MAX_SYNC_PAGE_BYTES) {
+        if page.messages.len() == backlog {
+            caught_up = false;
+            break;
+        }
+        let row = self::message(row, None);
+        let size = message::encoded_len(1, &row) + message::encoded_len(3, &scope);
+        if bytes + size > budget {
+            if page.messages.is_empty() {
+                return Err(SyncPageTooLarge { message_id: row.id }.into());
+            }
             caught_up = false;
             break;
         }
         bytes += size;
-        page.messages.push(message);
+        page.messages.push(row);
         page.agent_scopes.push(scope);
     }
     page.caught_up = Some(caught_up);
+    debug_assert_eq!(prost::Message::encoded_len(&page), bytes);
     Ok(page)
 }
 
@@ -6111,5 +6150,51 @@ mod tests {
         }
         assert_eq!(pages, 2);
         assert_eq!(seen, ids, "every row once, in order");
+    }
+
+    #[test]
+    fn sync_pages_fill_their_exact_encoded_budget_and_refuse_a_row_too_big_alone() {
+        let (mut conn, _will, [mateo, ..]) = board();
+        let base = newest(&conn);
+        let ids: Vec<i64> = (0..3)
+            .map(|n| say(&mut conn, &mateo, "will", &"y".repeat(100 * (n + 1))))
+            .collect();
+        let me = db::find_human(&conn, "will").unwrap().unwrap().id;
+        let filter = db::FeedFilter {
+            group_ids: None,
+            senders: None,
+            from_human: None,
+            with: None,
+            include_group_deliveries: false,
+            since: None,
+            until: None,
+            scope: Some(me),
+            after_id: Some(base),
+            before_id: None,
+        };
+        let page = |budget: usize| {
+            let rows = db::feed_messages(&conn, 10, &filter).unwrap();
+            let scopes = db::owned_agent_scopes(&conn, me, &ids).unwrap();
+            fill_sync_page(rows, scopes, 10, budget)
+        };
+        // The whole snapshot, caught_up and scopes included, exactly.
+        let all = page(MAX_SYNC_PAGE_BYTES).unwrap();
+        let exact = prost::Message::encoded_len(&all);
+        assert_eq!(all.messages.len(), 3);
+        assert_eq!(page(exact).unwrap(), all, "exactly the budget fits");
+        let less = page(exact - 1).unwrap();
+        assert_eq!(less.messages.len(), 2);
+        assert_eq!(less.caught_up, Some(false));
+        assert!(prost::Message::encoded_len(&less) < exact);
+        // A first row too big alone: refused, nothing partial to advance past.
+        let first = proto::FeedSnapshot {
+            messages: all.messages[..1].to_vec(),
+            caught_up: Some(true),
+            agent_scopes: all.agent_scopes[..1].to_vec(),
+        };
+        let error = page(prost::Message::encoded_len(&first) - 1).unwrap_err();
+        let too_large = error.downcast_ref::<SyncPageTooLarge>().expect("typed");
+        assert_eq!(too_large.message_id, ids[0]);
+        assert!(page(prost::Message::encoded_len(&first)).is_ok());
     }
 }
