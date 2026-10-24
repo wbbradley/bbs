@@ -1970,6 +1970,12 @@ impl Thread {
             self.opening_until = None;
         }
         // Lay out first, so the status line reflects this frame.
+        let marks = self
+            .stream
+            .as_ref()
+            .map(|stream| stream.turn_marks(&self.view.rows))
+            .unwrap_or_default();
+        self.view.set_turn_marks(marks);
         self.view.layout(body.width, body.height as usize);
         if self.agent.is_none() {
             frame.render_widget(Paragraph::new(self.status()), status);

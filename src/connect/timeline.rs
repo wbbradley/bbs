@@ -20,7 +20,7 @@ use crate::ui::message::{
     compact_message_lines, conversation_roles, find_matches, message_lines_with_recipient_at,
     message_prefix, side_header, side_message_lines,
 };
-use crate::ui::thread::Row;
+use crate::ui::thread::{Row, TurnMarks};
 
 /// Events each batch holds; the stream catches up from the start in batches.
 const BACKLOG: u32 = 200;
@@ -431,6 +431,14 @@ struct Kept {
     activity: proto::Activity,
     mail_id: Option<i64>,
     mail_ids: Vec<i64>,
+    boundary: Option<Boundary>,
+}
+
+#[derive(Clone, Copy)]
+enum Boundary {
+    Start,
+    End,
+    Reset,
 }
 
 impl Kept {
@@ -439,6 +447,12 @@ impl Kept {
         Kept {
             activity: activity.clone(),
             mail_id: value["mail_id"].as_i64(),
+            boundary: match value["event"].as_str() {
+                Some("prompt") => Some(Boundary::Start),
+                Some("turn_end" | "turn_error" | "cancel" | "stop") => Some(Boundary::End),
+                Some("start" | "session") => Some(Boundary::Reset),
+                _ => None,
+            },
             mail_ids: value["mail_ids"]
                 .as_array()
                 .into_iter()
@@ -450,6 +464,85 @@ impl Kept {
 }
 
 impl Stream {
+    /// Project recorded turn boundaries onto the content the current filters
+    /// actually show. Echoed prompts can be displayed as their original mail;
+    /// delivered replies can likewise replace activity without losing a mark.
+    pub fn turn_marks(&self, rows: &[Entry]) -> HashMap<<Entry as Row>::Key, TurnMarks> {
+        let mut marks = HashMap::<_, TurnMarks>::new();
+        let messages: HashMap<_, _> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| row.message_id().map(|id| (id, i)))
+            .collect();
+        let mut start: Option<&Kept> = None;
+        let mut partial = true;
+        let mut mark = |start: &Kept, end: Option<&Kept>, began: bool, ended: bool| {
+            let low = (micros(&start.activity.created_at), 1, start.activity.id);
+            let high = end.map(|end| (micros(&end.activity.created_at), 1, end.activity.id));
+            let from = rows.partition_point(|row| row.key() < low);
+            let from = start
+                .mail_ids
+                .iter()
+                .filter_map(|id| messages.get(id))
+                .copied()
+                .min()
+                .map_or(from, |echoed| from.min(echoed));
+            let until = high.map_or(rows.len(), |high| {
+                rows.partition_point(|row| row.key() < high || (ended && row.key() == high))
+            });
+            if from >= until {
+                return;
+            }
+            let mut candidates = rows[from..until].iter().filter(|row| {
+                (row.key() >= low
+                    || row
+                        .message_id()
+                        .is_some_and(|id| start.mail_ids.contains(&id)))
+                    && !row.lines(false, None).iter().all(blank)
+            });
+            if let Some(first) = candidates.next() {
+                if began {
+                    marks.entry(first.key()).or_default().start = true;
+                }
+                if ended {
+                    let last = candidates.next_back().unwrap_or(first);
+                    marks.entry(last.key()).or_default().end = true;
+                }
+            }
+        };
+        for kept in &self.records {
+            match kept.boundary {
+                Some(Boundary::Start) => {
+                    if let Some(previous) = start.replace(kept) {
+                        // A missing end never invents a stop marker.
+                        mark(previous, Some(kept), true, false);
+                    }
+                }
+                Some(Boundary::End) => {
+                    if let Some(start) = start.take() {
+                        mark(start, Some(kept), true, true);
+                    } else if partial && let Some(first) = self.records.front() {
+                        // The retained window may begin halfway through a turn.
+                        mark(first, Some(kept), false, true);
+                    }
+                }
+                Some(Boundary::Reset) => {
+                    if let Some(start) = start.take() {
+                        mark(start, Some(kept), true, false);
+                    }
+                }
+                None => {}
+            }
+            if kept.boundary.is_some() {
+                partial = false;
+            }
+        }
+        if let Some(start) = start {
+            mark(start, None, true, false);
+        }
+        marks
+    }
+
     pub fn new(agent: &str) -> Stream {
         Stream {
             id: next_id(),
@@ -702,6 +795,117 @@ mod tests {
         style::Modifier,
         widgets::{Block, Paragraph, Wrap},
     };
+
+    #[test]
+    fn turn_marks_follow_visible_replacements_and_do_not_cross_restarts() {
+        let mut stream = Stream::new("Mateo");
+        let record = |id, event: serde_json::Value| proto::Activity {
+            id,
+            created_at: format!("2026-10-24T12:00:{id:02}Z"),
+            record: event.to_string(),
+            ..Default::default()
+        };
+        let records = vec![
+            record(1, serde_json::json!({"event":"prompt","text":""})),
+            record(2, serde_json::json!({"event":"thought","text":"thinking"})),
+            record(
+                3,
+                serde_json::json!({"event":"text","text":"answer","mail_id":42}),
+            ),
+            record(4, serde_json::json!({"event":"turn_end"})),
+            record(5, serde_json::json!({"event":"text","text":"outside"})),
+            record(6, serde_json::json!({"event":"prompt","text":""})),
+            record(
+                7,
+                serde_json::json!({"event":"turn_error","message":"failed"}),
+            ),
+            record(8, serde_json::json!({"event":"prompt","text":""})),
+            record(9, serde_json::json!({"event":"text","text":"unfinished"})),
+            record(10, serde_json::json!({"event":"start"})),
+            record(11, serde_json::json!({"event":"text","text":"new session"})),
+        ];
+        stream.on_data(
+            &Data::Activity {
+                id: stream.id,
+                result: Ok(records),
+            },
+            Instant::now(),
+            &Loaded::new(),
+        );
+        let rows = stream.entries(&Loaded::new());
+        let key = |id| (micros(&format!("2026-10-24T12:00:{id:02}Z")), 1, id);
+        let marks = stream.turn_marks(&rows);
+        assert_eq!(
+            marks.get(&key(2)),
+            Some(&TurnMarks {
+                start: true,
+                end: false
+            })
+        );
+        assert_eq!(
+            marks.get(&key(3)),
+            Some(&TurnMarks {
+                start: false,
+                end: true
+            })
+        );
+        assert_eq!(
+            marks.get(&key(7)),
+            Some(&TurnMarks {
+                start: true,
+                end: true
+            })
+        );
+        assert_eq!(
+            marks.get(&key(9)),
+            Some(&TurnMarks {
+                start: true,
+                end: false
+            })
+        );
+        assert_eq!(marks.len(), 4);
+
+        let mut rows = stream.entries(&Loaded::from([(42, true)]));
+        rows.retain(|row| !row.is_thought());
+        let delivered = Entry::Message {
+            message: Message {
+                id: 42,
+                created_at: "2026-10-24T12:00:03Z".into(),
+                from_name: "Mateo".into(),
+                from_kind: proto::Kind::Agent.into(),
+                body: "answer".into(),
+                ..Default::default()
+            },
+            headerless: true,
+            recipient: None,
+            outgoing: false,
+            other_participants: false,
+            gap: false,
+        };
+        let delivered_key = delivered.key();
+        rows.push(delivered);
+        rows.sort_by_key(Row::key);
+        let marks = stream.turn_marks(&rows);
+        assert_eq!(
+            marks.get(&delivered_key),
+            Some(&TurnMarks {
+                start: true,
+                end: true
+            })
+        );
+        assert_eq!(marks.len(), 3);
+        // A retained window beginning inside the first turn keeps its known
+        // end, without inventing a beginning on the first retained line.
+        stream.records.pop_front();
+        let marks = stream.turn_marks(&rows);
+        assert_eq!(
+            marks.get(&delivered_key),
+            Some(&TurnMarks {
+                start: false,
+                end: true
+            })
+        );
+    }
 
     #[test]
     fn older_history_merges_once_in_order_without_reviving_tools_or_progress() {

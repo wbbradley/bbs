@@ -10738,7 +10738,7 @@ mod tests {
                         app.on_event(activity_event);
                     }
                     let out = screen(&mut app, 80, 40);
-                    assert_eq!(out.matches("• Zoe → @nw-api").count(), 1, "{out}");
+                    assert_eq!(out.matches("▪ Zoe → @nw-api").count(), 1, "{out}");
                     assert_eq!(out.matches("Joined").count(), 1, "{out}");
                     assert!(
                         !out.contains("mail from")
@@ -10763,7 +10763,11 @@ mod tests {
                         };
                         let header = row("Zoe → @nw-api");
                         let end = row("final-tail");
-                        assert_eq!(buf[(0, header)].symbol(), "•");
+                        assert_eq!(buf[(0, header)].symbol(), "▪");
+                        assert_eq!(
+                            Some(buf[(0, header)].fg),
+                            theme::style(theme::Role::Go).fg.or(theme::base().fg)
+                        );
                         assert_eq!(buf[(2, header)].symbol(), "Z");
                         let bg = |role| theme::base().patch(theme::style(role)).bg.unwrap();
                         assert!((0..width).all(
@@ -11073,7 +11077,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_markers_give_way_to_the_progress_mark_and_tool_runs_get_one_blank() {
+    fn turn_squares_survive_rebuilds_and_tool_runs_keep_one_blank() {
         let rec = |id: i64, s: &str, body: &str| {
             activity(
                 id,
@@ -11083,7 +11087,7 @@ mod tests {
         };
         let records = || {
             vec![
-                // ada's mail is loaded, so this turn's echo goes entirely.
+                // The loaded mail takes the start marker from its prompt echo.
                 rec(
                     1,
                     "02",
@@ -11103,7 +11107,7 @@ mod tests {
                 ),
                 rec(6, "07", r#""event":"tool","id":"b","status":"completed""#),
                 rec(7, "08", r#""event":"text","text":"Done.""#),
-                // Mail not in this thread keeps its body, without a marker.
+                // Mail not in this thread keeps its body and the start marker.
                 rec(
                     8,
                     "09",
@@ -11133,9 +11137,9 @@ mod tests {
             "  ✓ Read b.rs completed (1.0s)",
             "",
             "  Done.",
-            "group note",
+            "▪ group note",
             "",
-            "  ✓ Read c.rs completed (1.0s)",
+            "  ✓ Read c.rs completed (1.0s) ▪",
             "",
         ];
         let start = |app: &mut App, rx: &mut UnboundedReceiver<Request>| {
@@ -11156,7 +11160,7 @@ mod tests {
         };
 
         // Streamed one record at a time, then redrawn by a filter round trip:
-        // the same lines, no turn marker, and the progress mark at Done.
+        // the same squares and spacing, and the progress mark at Done.
         let (mut app, mut rx) = app();
         let (_, act) = start(&mut app, &mut rx);
         for record in records() {
@@ -11166,6 +11170,7 @@ mod tests {
             }));
         }
         let streamed = screen(&mut app, 80, 30);
+        assert!(streamed.contains("▪ please build"), "{streamed}");
         assert_eq!(
             span(&streamed, "Looking.", "Read c.rs"),
             expected,

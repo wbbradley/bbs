@@ -2,13 +2,13 @@
 //! `bbs view` and of every thread in `bbs connect`. Key handling, any search
 //! prompt and the title stay with each app.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Style, Styled};
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::proto::Message;
@@ -17,6 +17,13 @@ use crate::ui::message::{find_matches, fold, message_lines};
 /// Loaded history kept while the view is open; the oldest rows are dropped
 /// beyond this, never the stream.
 pub(crate) const MAX_ROWS: usize = 10_000;
+
+/// Quiet turn boundaries attached to visible content rather than extra rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnMarks {
+    pub start: bool,
+    pub end: bool,
+}
 
 /// One row of a thread: a message, or anything else drawn as lines.
 pub trait Row: PartialEq {
@@ -123,6 +130,7 @@ pub struct ThreadView<R: Row = Message> {
     /// Something drawn just below continues the last row (a pane of calls
     /// still running), so the last row keeps no closing blank of its own.
     continued: bool,
+    turn_marks: HashMap<R::Key, TurnMarks>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -162,6 +170,7 @@ impl<R: Row> ThreadView<R> {
             started: false,
             frame: Geometry::default(),
             continued: false,
+            turn_marks: HashMap::new(),
         };
         view.ingest(rows);
         view
@@ -248,11 +257,38 @@ impl<R: Row> ThreadView<R> {
         }
     }
 
+    pub fn set_turn_marks(&mut self, marks: HashMap<R::Key, TurnMarks>) {
+        for (i, row) in self.rows.iter().enumerate() {
+            if self.turn_marks.get(&row.key()) != marks.get(&row.key()) {
+                self.heights[i] = None;
+            }
+        }
+        self.turn_marks = marks;
+    }
+
+    fn inset(&self, row: &R) -> u16 {
+        if self.turn_marks.get(&row.key()).is_some_and(|m| m.start) {
+            row.inset().max(2)
+        } else {
+            row.inset()
+        }
+    }
+
     /// Row `i`'s lines, with any blank line it asks for before it: shared by
     /// measuring and drawing so the two agree.
     fn row_lines(&self, i: usize, query: Option<&str>, width: u16) -> Vec<Line<'_>> {
         let row = &self.rows[i];
         let mut lines = row.lines_at(self.gaps.contains(&row.key()), query, width);
+        if self.turn_marks.get(&row.key()).is_some_and(|m| m.end)
+            && let Some(last) = lines
+                .iter_mut()
+                .rfind(|line| line.spans.iter().any(|s| !s.content.trim().is_empty()))
+        {
+            last.spans.push(Span::styled(
+                " ▪",
+                super::theme::style(super::theme::Role::Stop),
+            ));
+        }
         if row.spaced_after(i.checked_sub(1).map(|j| &self.rows[j])) {
             lines.insert(0, Line::default());
         }
@@ -275,7 +311,7 @@ impl<R: Row> ThreadView<R> {
             total += match self.heights[i] {
                 Some((w, h)) if w == width => h,
                 _ => {
-                    let inner_width = width.saturating_sub(self.rows[i].inset());
+                    let inner_width = width.saturating_sub(self.inset(&self.rows[i]));
                     let h = Paragraph::new(Text::from(self.row_lines(i, None, inner_width)))
                         .wrap(Wrap { trim: false })
                         .line_count(inner_width);
@@ -444,7 +480,7 @@ impl<R: Row> ThreadView<R> {
                 area.width,
                 (visible_end - visible_start) as u16,
             );
-            let inset = row.inset().min(row_area.width);
+            let inset = self.inset(row).min(row_area.width);
             let content_area = Rect::new(
                 row_area.x + inset,
                 row_area.y,
@@ -459,6 +495,22 @@ impl<R: Row> ThreadView<R> {
             );
             if row.spaced_after(i.checked_sub(1).map(|j| &self.rows[j])) {
                 gutter.insert(0, Line::default());
+            }
+            if self.turn_marks.get(&row.key()).is_some_and(|m| m.start) {
+                let lines = self.row_lines(i, self.query.as_deref(), content_area.width);
+                let first = lines
+                    .iter()
+                    .position(|line| line.spans.iter().any(|s| !s.content.trim().is_empty()));
+                if let Some(first) = first {
+                    let offset = Paragraph::new(Text::from(lines[..first].to_vec()))
+                        .wrap(Wrap { trim: false })
+                        .line_count(content_area.width);
+                    gutter.resize(gutter.len().max(offset + 1), Line::default());
+                    gutter[offset].spans = vec![Span::styled(
+                        "▪ ",
+                        super::theme::style(super::theme::Role::Go),
+                    )];
+                }
             }
             let paragraph =
                 Paragraph::new(self.row_lines(i, self.query.as_deref(), content_area.width))
@@ -543,6 +595,71 @@ mod tests {
             id,
             tool,
             text: "row",
+        }
+    }
+
+    #[test]
+    fn turn_squares_follow_wrapping_and_scroll_without_extra_rows() {
+        use crate::ui::theme::{self, Role};
+        use ratatui::{Terminal, backend::TestBackend};
+        for scheme in theme::testing::SCHEMES {
+            theme::testing::with_scheme(scheme, || {
+                for width in [8, 12] {
+                    let mut view = ThreadView::new(
+                        vec![R {
+                            text: "abcdefgh",
+                            ..r(1, true)
+                        }],
+                        100,
+                    );
+                    view.set_turn_marks(HashMap::from([(
+                        1,
+                        TurnMarks {
+                            start: true,
+                            end: true,
+                        },
+                    )]));
+                    let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(
+                                Block::new().style(theme::style(Role::Screen)),
+                                f.area(),
+                            );
+                            view.render(f, f.area());
+                        })
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    theme::testing::assert_buffer(buffer);
+                    assert_eq!(buffer[(0, 1)].symbol(), "▪", "{scheme:?} {width}");
+                    let end_y = if width == 8 { 2 } else { 1 };
+                    let end_x = if width == 8 { 5 } else { 11 };
+                    assert_eq!(buffer[(end_x, end_y)].symbol(), "▪");
+                    let base = theme::style(Role::Screen);
+                    assert_eq!(
+                        Some(buffer[(0, 1)].fg),
+                        theme::style(Role::Go).fg.or(base.fg)
+                    );
+                    assert_eq!(
+                        Some(buffer[(end_x, end_y)].fg),
+                        theme::style(Role::Stop).fg.or(base.fg)
+                    );
+                    assert_eq!(
+                        view.frame.total,
+                        end_y as usize + 2,
+                        "only the run's existing blanks"
+                    );
+                    // Pausing on the wrapped continuation never repeats the go square.
+                    if width == 8 {
+                        view.layout(width, 2);
+                        view.scroll_to(2);
+                        let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
+                        terminal.draw(|f| view.render(f, f.area())).unwrap();
+                        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+                        assert_eq!(terminal.backend().buffer()[(5, 0)].symbol(), "▪");
+                    }
+                }
+            });
         }
     }
 

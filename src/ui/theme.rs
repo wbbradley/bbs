@@ -34,6 +34,9 @@ pub enum Role {
     Selection,
     Cursor,
     Success,
+    /// Turn boundaries: ready to run, and finished running.
+    Go,
+    Stop,
     Warning,
     Error,
     TitleBar,
@@ -132,9 +135,8 @@ impl Scheme {
                 Screen => Style::new().fg(Color::Reset).bg(Color::Reset),
                 Muted | Timestamp | HumanNote => Style::new().dim(),
                 KeyHint => Style::new().italic(),
-                Heading | Agent | Human | Group | Hotkey | Success | Warning | Error => {
-                    Style::new().bold()
-                }
+                Heading | Agent | Human | Group | Hotkey | Success | Warning | Error | Go
+                | Stop => Style::new().bold(),
                 Selection | Cursor | TitleBar | StatusBar => Style::new().reversed(),
                 WarningTitle => Style::new().reversed().bold(),
                 SearchHit => Style::new().bold().underlined(),
@@ -229,8 +231,8 @@ impl Scheme {
             Human => Style::new().fg(participant),
             KeyHint => Style::new().fg(participant).italic(),
             Hotkey | Warning | Group => Style::new().fg(warning),
-            Success => Style::new().fg(success),
-            Error => Style::new().fg(error),
+            Success | Go => Style::new().fg(success),
+            Error | Stop => Style::new().fg(error),
             Selection => Style::new().fg(text).bg(selection).bold(),
             Cursor => Style::new().fg(bg).bg(text),
             TitleBar | StatusBar if self == Self::Gruvbox => {
