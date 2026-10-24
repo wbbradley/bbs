@@ -1167,6 +1167,14 @@ mod tests {
             ..Default::default()
         };
         assert!(backend.watch_feed(with, false).await.is_err());
+        let sync = proto::FeedRequest {
+            backlog: 10,
+            mine: true,
+            after_id: Some(0),
+            sync: true,
+            ..Default::default()
+        };
+        assert!(backend.watch_feed(sync, false).await.is_err());
         assert!(
             backend
                 .bind_session(proto::BindSessionRequest::default())
@@ -1308,6 +1316,10 @@ mod tests {
             (
                 "WatchFeed",
                 Some("owner-attribution.v1,feed-filter.v1,feed-with.v1"),
+            ),
+            (
+                "WatchFeed",
+                Some("owner-attribution.v1,feed-filter.v1,feed-sync.v1"),
             ),
             ("BindSession", Some("human-token-sessions.v1")),
             ("SessionAgent", Some("human-token-sessions.v1")),

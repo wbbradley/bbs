@@ -5834,4 +5834,282 @@ mod tests {
             "{retired:#}"
         );
     }
+
+    fn sync_req(after: i64, backlog: u32) -> proto::FeedRequest {
+        proto::FeedRequest {
+            backlog,
+            mine: true,
+            after_id: Some(after),
+            sync: true,
+            ..Default::default()
+        }
+    }
+
+    fn say(conn: &mut Connection, from: &Caller, to: &str, body: &str) -> i64 {
+        send(
+            conn,
+            from,
+            proto::SendRequest {
+                to: to.into(),
+                body: body.into(),
+                control: None,
+            },
+        )
+        .unwrap();
+        // Broadcasts report no id; the message is the newest row.
+        newest(conn)
+    }
+
+    /// The newest message id so far: the board's own setup writes some.
+    fn newest(conn: &Connection) -> i64 {
+        conn.query_row("SELECT coalesce(max(id), 0) FROM messages", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    /// Every page from `req` on until one is caught up: (ids, caught_up) each.
+    fn sync_pages(
+        conn: &mut Connection,
+        who: &Caller,
+        mut req: proto::FeedRequest,
+    ) -> Vec<(Vec<i64>, bool)> {
+        let mut pages = Vec::new();
+        loop {
+            let page = feed(conn, who, req.clone()).unwrap();
+            let ids = page.messages.iter().map(|m| m.id).collect();
+            let more = advance_feed_cursor(&mut req, &page);
+            assert_eq!(more, page.caught_up == Some(false));
+            pages.push((ids, page.caught_up.unwrap()));
+            if !more {
+                return pages;
+            }
+        }
+    }
+
+    fn scopes(page: &proto::FeedSnapshot) -> Vec<(i64, Vec<&str>)> {
+        page.agent_scopes
+            .iter()
+            .map(|s| {
+                (
+                    s.message_id,
+                    s.agents.iter().map(|a| a.name.as_str()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sync_pages_say_when_they_are_caught_up_even_on_an_exact_final_page() {
+        let (mut conn, will, [mateo, zed, _lu]) = board();
+        let base = newest(&conn);
+        // Nothing yet: the empty first page is caught up.
+        let empty = feed(&mut conn, &will, sync_req(base, 2)).unwrap();
+        assert!(empty.messages.is_empty() && empty.agent_scopes.is_empty());
+        assert_eq!(empty.caught_up, Some(true));
+        let ids: Vec<i64> = (0..4)
+            .map(|i| {
+                say(
+                    &mut conn,
+                    if i % 2 == 0 { &mateo } else { &zed },
+                    "will",
+                    "hi",
+                )
+            })
+            .collect();
+        // Four rows in pages of two: the second is full and still caught up.
+        assert_eq!(
+            sync_pages(&mut conn, &will, sync_req(base, 2)),
+            [(ids[..2].to_vec(), false), (ids[2..].to_vec(), true)]
+        );
+        // Pages of three: a short final page.
+        assert_eq!(
+            sync_pages(&mut conn, &will, sync_req(base, 3)),
+            [(ids[..3].to_vec(), false), (ids[3..].to_vec(), true)]
+        );
+        // From the last row: nothing more, caught up.
+        let after = feed(&mut conn, &will, sync_req(ids[3], 2)).unwrap();
+        assert_eq!((after.messages.len(), after.caught_up), (0, Some(true)));
+        // A write between pages is a later page's row; nothing skips.
+        let mut req = sync_req(base, 2);
+        let first = feed(&mut conn, &will, req.clone()).unwrap();
+        assert!(advance_feed_cursor(&mut req, &first));
+        let late = say(&mut conn, &mateo, "will", "late");
+        let rest: Vec<i64> = sync_pages(&mut conn, &will, req)
+            .into_iter()
+            .flat_map(|(ids, _)| ids)
+            .collect();
+        assert_eq!(rest, [ids[2], ids[3], late]);
+        // Ordinary feeds are unchanged: no completion and no scopes.
+        let ordinary = feed(
+            &mut conn,
+            &will,
+            proto::FeedRequest {
+                sync: false,
+                ..sync_req(base, 2)
+            },
+        )
+        .unwrap();
+        assert_eq!(ordinary.caught_up, None);
+        assert!(ordinary.agent_scopes.is_empty());
+        assert_eq!(ordinary.messages.len(), 2);
+    }
+
+    #[test]
+    fn sync_scopes_are_the_callers_own_agents_as_delivered_when_sent() {
+        let (mut conn, will, [_mateo, _zed, lu]) = board();
+        let base = newest(&conn);
+        // Lu is not in @crew yet: the broadcast reaches Mateo and Zed only.
+        let crew = say(&mut conn, &will, "@crew", "to the crew");
+        group_join(
+            &mut conn,
+            &lu,
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        let dm = say(&mut conn, &lu, "Mateo", "psst");
+        let direct = say(&mut conn, &will, "Lu", "from the human");
+        // Retiring keeps the history: Zed stays in its scopes.
+        retire_agent(
+            &mut conn,
+            &will,
+            proto::RetireRequest {
+                agent: "Zed".into(),
+            },
+        )
+        .unwrap();
+        let page = feed(&mut conn, &will, sync_req(base, 10)).unwrap();
+        let ours: Vec<_> = scopes(&page)
+            .into_iter()
+            .filter(|(id, _)| [crew, dm, direct].contains(id))
+            .collect();
+        assert_eq!(
+            ours,
+            [
+                (crew, vec!["Mateo", "Zed"]),
+                (dm, vec!["Mateo", "Lu"]),
+                (direct, vec!["Lu"]),
+            ]
+        );
+        assert_eq!(page.agent_scopes.len(), page.messages.len());
+        assert!(
+            page.agent_scopes
+                .iter()
+                .zip(&page.messages)
+                .all(|(s, m)| s.message_id == m.id)
+        );
+    }
+
+    #[test]
+    fn sync_keeps_each_human_to_their_own_history_and_agents() {
+        let (mut conn, will, [mateo, _zed, _lu]) = board();
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        let eve = Caller {
+            token: Some(
+                register(
+                    &mut conn,
+                    &ada,
+                    proto::RegisterRequest {
+                        name: Some("Eve".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .token,
+            ),
+            ..Default::default()
+        };
+        let base = newest(&conn);
+        // Another human writes to will's agent: in both histories, each
+        // with only its own human's agents.
+        let shared = say(&mut conn, &ada, "Mateo", "between owners");
+        let wills = say(&mut conn, &mateo, "will", "will's only");
+        let adas = say(&mut conn, &eve, "ada", "ada's only");
+        let will_page = feed(&mut conn, &will, sync_req(base, 10)).unwrap();
+        assert_eq!(
+            scopes(&will_page),
+            [(shared, vec!["Mateo"]), (wills, vec!["Mateo"])]
+        );
+        let ada_page = feed(&mut conn, &ada, sync_req(base, 10)).unwrap();
+        assert_eq!(scopes(&ada_page), [(shared, vec![]), (adas, vec!["Eve"])]);
+        // Agents cannot replicate anyone's history.
+        let refused = feed(&mut conn, &eve, sync_req(base, 10)).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("humans only"),
+            "{refused:#}"
+        );
+    }
+
+    #[test]
+    fn sync_refuses_filters_a_missing_cursor_and_bad_windows() {
+        let (mut conn, will, _) = board();
+        let refused = |conn: &mut Connection, req: proto::FeedRequest| {
+            format!("{:#}", feed(conn, &will, req).unwrap_err())
+        };
+        for req in [
+            proto::FeedRequest {
+                mine: false,
+                ..sync_req(0, 10)
+            },
+            proto::FeedRequest {
+                group: Some("crew".into()),
+                ..sync_req(0, 10)
+            },
+            proto::FeedRequest {
+                with: Some("Mateo".into()),
+                include_group_deliveries: true,
+                ..sync_req(0, 10)
+            },
+            proto::FeedRequest {
+                since: Some("2026-01-01T00:00:00Z".into()),
+                ..sync_req(0, 10)
+            },
+        ] {
+            assert!(refused(&mut conn, req).contains("whole personal history"));
+        }
+        for after_id in [None, Some(-1)] {
+            let req = proto::FeedRequest {
+                after_id,
+                ..sync_req(0, 10)
+            };
+            assert!(refused(&mut conn, req).contains("needs a cursor"));
+        }
+        for backlog in [0, MAX_FEED_WINDOW + 1] {
+            assert!(refused(&mut conn, sync_req(0, backlog)).contains("feed window"));
+        }
+    }
+
+    #[test]
+    fn sync_pages_stay_within_their_byte_budget_without_cutting_a_message() {
+        let (mut conn, will, [mateo, ..]) = board();
+        let base = newest(&conn);
+        let body = "x".repeat(MAX_BODY_BYTES);
+        let ids: Vec<i64> = (0..80)
+            .map(|_| say(&mut conn, &mateo, "will", &body))
+            .collect();
+        let mut req = sync_req(base, MAX_FEED_WINDOW);
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = feed(&mut conn, &will, req.clone()).unwrap();
+            pages += 1;
+            assert!(prost::Message::encoded_len(&page) <= MAX_SYNC_PAGE_BYTES);
+            assert!(page.messages.iter().all(|m| m.body == body), "whole bodies");
+            seen.extend(page.messages.iter().map(|m| m.id));
+            if !advance_feed_cursor(&mut req, &page) {
+                assert_eq!(page.caught_up, Some(true));
+                break;
+            }
+            // Cut by bytes, not by the window.
+            assert!(page.messages.len() < MAX_FEED_WINDOW as usize);
+        }
+        assert_eq!(pages, 2);
+        assert_eq!(seen, ids, "every row once, in order");
+    }
 }

@@ -1925,6 +1925,135 @@ mod tests {
         }
     }
 
+    /// Sync pages until one is caught up, each arriving without a change.
+    async fn sync_pages(
+        backend: &mut crate::backend::Backend,
+        req: proto::FeedRequest,
+    ) -> Vec<proto::FeedSnapshot> {
+        let mut watch = backend.watch_feed(req, false).await.unwrap();
+        let mut pages = Vec::new();
+        loop {
+            let page =
+                tokio::time::timeout(std::time::Duration::from_secs(5), watch.next_snapshot())
+                    .await
+                    .expect("pages arrive at once")
+                    .unwrap();
+            let done = page.caught_up == Some(true);
+            pages.push(page);
+            if done {
+                return pages;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn feed_sync_refuses_old_servers_and_pages_alike_remotely_and_locally() {
+        use crate::backend::{Backend, FEED_SYNC, Local, Remote};
+        for withheld in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut conn = db::open(&dir.path().join("bbs.db")).unwrap();
+            db::migrate(&mut conn).unwrap();
+            let will = Caller {
+                human: Some("will".into()),
+                ..Default::default()
+            };
+            service::ensure_human(
+                &mut conn,
+                proto::EnsureHumanRequest {
+                    name: "will".into(),
+                },
+            )
+            .unwrap();
+            let mateo = Caller {
+                token: Some(
+                    service::register(
+                        &mut conn,
+                        &will,
+                        proto::RegisterRequest {
+                            name: Some("Mateo".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                    .token,
+                ),
+                ..Default::default()
+            };
+            for n in 0..5 {
+                service::send(
+                    &mut conn,
+                    &mateo,
+                    proto::SendRequest {
+                        to: "will".into(),
+                        body: format!("mail {n}"),
+                        control: None,
+                    },
+                )
+                .unwrap();
+            }
+            let state = Arc::new(State {
+                conn: Mutex::new(conn),
+                notify: watch::Sender::new(0),
+                activity: watch::Sender::new(0),
+                waiters: Mutex::new(HashSet::new()),
+                shutdown: watch::Sender::new(false),
+                require_human_token: false,
+                protocol: if withheld {
+                    Policy::default().without(FEED_SYNC)
+                } else {
+                    Policy::default()
+                },
+                auth_failures: Mutex::new(HashMap::new()),
+                timer_limits: TimerLimits::default(),
+                clock: Arc::new(Utc::now),
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(BbsServer::new(Server(state.clone())))
+                    .serve_with_incoming(TcpListenerStream::new(listener)),
+            );
+            let req = proto::FeedRequest {
+                backlog: 2,
+                mine: true,
+                after_id: Some(0),
+                sync: true,
+                ..Default::default()
+            };
+            let mut remote =
+                Backend::Remote(Remote::connect(&address, will.clone()).await.unwrap());
+            if withheld {
+                let error = match remote.watch_feed(req.clone(), false).await {
+                    Ok(mut watch) => watch.next_snapshot().await.unwrap_err(),
+                    Err(error) => error,
+                };
+                assert!(format!("{error:#}").contains(FEED_SYNC), "{error:#}");
+                let status = error.downcast_ref::<Status>().expect("a gRPC status");
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                server.abort();
+                continue;
+            }
+            let remotely = sync_pages(&mut remote, req.clone()).await;
+            let mut local = Backend::Local(Local::open(dir.path(), will.clone()).unwrap());
+            let locally = sync_pages(&mut local, req.clone()).await;
+            assert_eq!(remotely, locally, "remote and local agree");
+            let sizes: Vec<_> = remotely
+                .iter()
+                .map(|p| (p.messages.len(), p.caught_up))
+                .collect();
+            assert_eq!(sizes, [(2, Some(false)), (2, Some(false)), (1, Some(true))]);
+            assert!(
+                remotely.iter().flat_map(|p| &p.agent_scopes).all(|s| s
+                    .agents
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .eq(["Mateo"]))
+            );
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn terminal_error_bypasses_full_message_buffer() {
         use tokio_stream::StreamExt;
