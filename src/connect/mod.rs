@@ -9,6 +9,7 @@ mod dialog;
 mod drafts;
 mod effort;
 mod event;
+mod history;
 mod keys;
 mod launcher;
 mod navigation;

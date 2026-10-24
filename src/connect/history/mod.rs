@@ -1,0 +1,8 @@
+//! The human's personal message history, kept on disk in step with the
+//! server's sync feed so it can be searched in full and browsed offline.
+
+mod search;
+mod store;
+
+pub use search::Searcher;
+pub use store::{Batch, Found, Mismatch, Place, Store, StoreError, dir_for};

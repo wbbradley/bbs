@@ -71,7 +71,7 @@ struct CachedMessage {
     folded: String,
 }
 
-fn folded(text: &str) -> String {
+pub(super) fn folded(text: &str) -> String {
     text.chars().map(fold).collect()
 }
 
@@ -790,14 +790,14 @@ const FUZZY: u8 = 4;
 
 /// Exact, two/one/no word boundaries, then ordered letters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Rank {
-    tier: u8,
+pub(super) struct Rank {
+    pub(super) tier: u8,
     gaps: usize,
-    start: usize,
+    pub(super) start: usize,
     length: usize,
 }
 
-fn rank(query: &str, folded: &str) -> Option<Rank> {
+pub(super) fn rank(query: &str, folded: &str) -> Option<Rank> {
     let length = folded.chars().count();
     let base = Rank {
         tier: 0,
