@@ -123,6 +123,11 @@ pub trait Screen {
     fn on_tick(&mut self, _ctx: &Ctx) -> Vec<Request> {
         Vec::new()
     }
+    /// Drop every message held, as they may have come from a history the
+    /// server no longer has, and fetch again.
+    fn forget_stored(&mut self) -> Vec<Request> {
+        Vec::new()
+    }
     /// Reset before re-fetching; return any obsolete subscriptions to cancel.
     fn reload(&mut self) -> Vec<Request> {
         Vec::new()
@@ -466,6 +471,12 @@ impl App {
         let screen = self.stack.last_mut().expect("the menu is never popped");
         let unread = screen.unread_mail();
         let mut requests = screen.on_view(&self.ctx);
+        // Offline, nothing is read or seen, then or later.
+        if self.offline {
+            requests.retain(|r| !matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. }));
+            self.send(requests);
+            return;
+        }
         if let Some((agent, through)) = unread
             && self.ctx.inbox.begin_read(&agent, through)
         {
@@ -683,6 +694,9 @@ impl App {
                     Data::HistoryState { id, state } if *id == self.history_id => {
                         if let super::event::HistoryState::Paused(why) = state {
                             tracing::warn!("history paused: {why}");
+                        }
+                        if matches!(state, super::event::HistoryState::Reconnecting(_)) {
+                            self.go_offline();
                         }
                         if *state == super::event::HistoryState::Reset {
                             self.forget_history();
@@ -919,8 +933,27 @@ impl App {
         }
         self.pending_contexts.clear();
         self.pending_hit = None;
+        if matches!(self.pending_navigation, Some(Navigation::Stored { .. })) {
+            self.pending_navigation = None;
+        }
         if let Some(picker) = &mut self.picker {
             picker.forget_stored(&self.launcher_cache);
+        }
+        // Open conversations start again from the server.
+        let mut requests = Vec::new();
+        for screen in &mut self.stack {
+            requests.extend(screen.forget_stored());
+            requests.extend(screen.requests().into_iter().filter(|_| screen.is_thread()));
+        }
+        self.send(requests);
+    }
+
+    /// The server stopped answering: show it, read nothing, and keep notes
+    /// from being edited until it is back.
+    fn go_offline(&mut self) {
+        self.offline = true;
+        if let Some(editor) = &mut self.note_editor {
+            editor.pause();
         }
     }
 
@@ -1149,6 +1182,10 @@ impl App {
         }
         self.keymap = Keymap::default();
         match self.agent_ids.get(&agent.to_ascii_lowercase()) {
+            _ if self.offline => {
+                self.ctx.navigation_notice =
+                    Some(Feedback::Other("Agent notes need the server.".into()));
+            }
             _ if self.notes.is_unsupported() => {
                 self.ctx.navigation_notice =
                     Some(Feedback::Other("Agent notes need a newer server.".into()));
@@ -13006,5 +13043,144 @@ mod tests {
         );
         pump(&mut app, &mut found);
         assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+    }
+
+    #[test]
+    fn a_reset_drops_a_stored_opening_waiting_for_a_note_and_stored_rows_in_view() {
+        use crate::connect::event::HistoryState;
+        let dir = tempfile::tempdir().unwrap();
+        stored_history(dir.path(), 30, &[(5, "an ancient needle")]);
+        let (mut app, mut rx) = app();
+        let mut found = with_stored(&mut app, dir.path());
+        mateo_streams(&mut app, &mut rx);
+        pump(&mut app, &mut found);
+        assert!(
+            screen(&mut app, 80, 24).contains("stored 30"),
+            "seeded from storage"
+        );
+        notes_ready(&mut app, &mut rx, vec![]);
+        f3(&mut app);
+        typed(&mut app, "x");
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("needle".into()));
+        pump(&mut app, &mut found);
+        enter(&mut app);
+        pump(&mut app, &mut found);
+        // Its context arrived; the note's save holds the opening.
+        let (save, ..) = note_put(&mut rx).expect("the note saves first");
+        assert!(matches!(
+            app.pending_navigation,
+            Some(Navigation::Stored { .. })
+        ));
+        while rx.try_recv().is_ok() {}
+        app.on_event(history_state(&app, HistoryState::Reset));
+        assert!(app.pending_navigation.is_none());
+        // The conversation forgot its stored rows and asks the server again.
+        assert!(!screen(&mut app, 80, 24).contains("stored 30"));
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, Request::Watch { .. }))
+        );
+        app.on_event(Event::Data(Data::NoteSaved {
+            id: save,
+            result: Ok(agent_note(7, "Mateo", "x", 1)),
+        }));
+        assert!(!screen(&mut app, 80, 24).contains("an ancient needle"));
+    }
+
+    #[test]
+    fn stored_mail_is_not_read_offline_nor_on_reconnecting_before_fresh_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        stored_history(dir.path(), 3, &[(3, "unread and stored")]);
+        let (mut app, mut rx) = app();
+        let mut found = with_stored(&mut app, dir.path());
+        app.offline = true;
+        let (feed, _) = mateo_loading_streams(&mut app, &mut rx);
+        pump(&mut app, &mut found);
+        assert!(screen(&mut app, 80, 24).contains("unread and stored"));
+        let no_reads = |rx: &mut UnboundedReceiver<Request>| {
+            let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert!(
+                !sent
+                    .iter()
+                    .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
+                "{sent:?}"
+            );
+        };
+        no_reads(&mut rx);
+        // The server is back: summaries alone read nothing.
+        inbox_rows(&mut app, &[("Mateo", 1, "2026-10-16T18:00:00.000000Z")]);
+        assert!(!app.offline);
+        typed(&mut app, "x");
+        no_reads(&mut rx);
+        // The conversation's own fresh feed: now it reads as usual.
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(3, "Mateo", "ada", "unread and stored")]),
+        }));
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|r| r == Request::MarkRead("Mateo".into()))
+        );
+    }
+
+    #[test]
+    fn losing_the_server_shows_offline_and_keeps_notes_from_being_edited() {
+        use crate::connect::event::HistoryState;
+        let dir = tempfile::tempdir().unwrap();
+        let lost = |app: &mut App| {
+            app.on_event(history_state(
+                app,
+                HistoryState::Reconnecting("reset".into()),
+            ));
+        };
+        // An open note stops taking edits.
+        let (mut app, mut rx) = app();
+        let _found = with_stored(&mut app, dir.path());
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![]);
+        f3(&mut app);
+        typed(&mut app, "a");
+        lost(&mut app);
+        assert!(app.offline);
+        typed(&mut app, "b");
+        assert_eq!(
+            note_text(&app).as_deref(),
+            Some("a"),
+            "paused while offline"
+        );
+        // Mail already shown live is not read after the server is lost.
+        let (mut app, mut rx) = self::app();
+        let (feed, _) = mateo_streams(&mut app, &mut rx);
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![message(7, "Mateo", "ada", "unread")]),
+        }));
+        lost(&mut app);
+        while rx.try_recv().is_ok() {}
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
+            "{sent:?}"
+        );
+        // F3 opens no note, and the bar says why the history is stale.
+        let (mut app, mut rx) = self::app();
+        let _found = with_stored(&mut app, dir.path());
+        mateo(&mut app, &mut rx);
+        notes_ready(&mut app, &mut rx, vec![]);
+        lost(&mut app);
+        assert!(bottom(&mut app).contains("[offline · stored history]"));
+        f3(&mut app);
+        assert!(app.note_editor.is_none());
+        assert_eq!(
+            app.ctx
+                .navigation_notice
+                .as_ref()
+                .map(|n| n.text().to_string()),
+            Some("Agent notes need the server.".into())
+        );
     }
 }

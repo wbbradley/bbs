@@ -1198,7 +1198,9 @@ impl Screen for Thread {
     fn unread_mail(&self) -> Option<(String, i64)> {
         // Mail hidden behind btw mode is not read yet, nor newer mail while
         // a sought older message holds the view.
-        if self.btw_mode() || self.holding_receipts() {
+        // Nor stored or cached mail alone: only once this subscription's own
+        // feed shows the conversation as it is now.
+        if self.btw_mode() || self.holding_receipts() || !self.feed_loaded {
             return None;
         }
         let agent = self.agent.as_ref()?;
@@ -1369,6 +1371,14 @@ impl Screen for Thread {
         }
         requests.extend(self.stream.as_ref().map(Stream::watch));
         requests
+    }
+
+    fn forget_stored(&mut self) -> Vec<Request> {
+        self.messages.clear();
+        self.message_gaps.clear();
+        self.sought = None;
+        self.rebuild();
+        self.reload()
     }
 
     fn reload(&mut self) -> Vec<Request> {
@@ -2257,6 +2267,11 @@ mod seek_tests {
             mail(1, "Mateo", "ada", "old"),
             mail(50, "Mateo", "ada", "new, unread"),
         ]);
+        // The live feed has shown the conversation.
+        thread.on_data(&Data::Feed {
+            id: thread.feed_id,
+            result: Ok(Vec::new()),
+        });
         let Request::WatchActivity { id: activity, .. } = thread.stream.as_ref().unwrap().watch()
         else {
             unreachable!()
@@ -2451,6 +2466,11 @@ mod seek_tests {
         let mut seeking = Thread::agent("Mateo", "ada", now.clone());
         seeking.human = Some("ada".into());
         seeking.seed_messages(std::slice::from_ref(&old));
+        // The live feed has shown the conversation.
+        seeking.on_data(&Data::Feed {
+            id: seeking.feed_id,
+            result: Ok(Vec::new()),
+        });
         assert!(seeking.seek_message(1));
         let saved = seeking.saved_view();
         // Reopened by name later; newer unread mail arrives meanwhile.
@@ -2504,6 +2524,7 @@ mod seek_tests {
         plain.human = Some("ada".into());
         plain.restore_view(back.saved_view());
         plain.seed_messages(&[mail(60, "Mateo", "ada", "unread")]);
+        feed(&mut plain, Vec::new());
         assert_eq!(plain.unread_mail(), Some(("Mateo".into(), 60)));
     }
 
@@ -2524,6 +2545,11 @@ mod seek_tests {
                 seeking.show = Show::Stream;
             }
             seeking.seed_messages(&rows);
+            // The live feed has shown the conversation.
+            seeking.on_data(&Data::Feed {
+                id: seeking.feed_id,
+                result: Ok(Vec::new()),
+            });
             assert!(seeking.seek_message(1));
             let saved = seeking.saved_view();
             // Reopened: the cache seeds it, the place comes back filtered as it was.
@@ -2532,6 +2558,7 @@ mod seek_tests {
             back.follow_compact(&ctx);
             back.seed_messages(&rows);
             back.restore_view(saved);
+            feed(&mut back, Vec::new());
             assert!(
                 !back.view.following(),
                 "compact={compact}: the place is held"

@@ -42,14 +42,9 @@ impl Searcher {
                 if stale() {
                     continue;
                 }
-                if store.is_none() {
-                    match Store::open(&dir) {
-                        Ok(opened) => store = Some(opened),
-                        Err(e) => {
-                            done(generation, Err(e.to_string()));
-                            continue;
-                        }
-                    }
+                if let Err(e) = current(&dir, &mut store) {
+                    done(generation, Err(e.to_string()));
+                    continue;
                 }
                 let opened = store.as_ref().expect("opened above");
                 match opened.search(&text, LIMIT, stale) {
@@ -74,6 +69,21 @@ impl Searcher {
         let _ = self.queries.send((generation, query.to_string()));
         generation
     }
+}
+
+/// Open the history in `dir`, or reopen it when sessions moved on to a new
+/// generation: an old one's messages never answer a new question.
+fn current(
+    dir: &std::path::Path,
+    store: &mut Option<Store>,
+) -> Result<(), super::store::StoreError> {
+    if let Some(open) = store
+        && open.is_current()?
+    {
+        return Ok(());
+    }
+    *store = Some(Store::open(dir)?);
+    Ok(())
 }
 
 /// Where stored messages are read for, owned so it can cross to a worker.
@@ -101,14 +111,9 @@ impl Contexts {
         std::thread::spawn(move || {
             let mut store: Option<Store> = None;
             while let Ok((generation, place, around)) = rx.recv() {
-                if store.is_none() {
-                    match Store::open(&dir) {
-                        Ok(opened) => store = Some(opened),
-                        Err(e) => {
-                            done(generation, Err(e.to_string()));
-                            continue;
-                        }
-                    }
+                if let Err(e) = current(&dir, &mut store) {
+                    done(generation, Err(e.to_string()));
+                    continue;
                 }
                 let place = match &place {
                     Where::Agent(name) => Place::Agent(name),
@@ -198,5 +203,54 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             (again, Ok(50))
         );
+    }
+
+    #[test]
+    fn workers_answer_from_the_generation_sessions_now_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = |id: i64, body: &str| proto::Message {
+            id,
+            from_kind: proto::Kind::Agent as i32,
+            from_name: "Zed".into(),
+            body: body.into(),
+            ..Default::default()
+        };
+        let page = |rows: Vec<proto::Message>| Batch {
+            scopes: rows
+                .iter()
+                .map(|m| (m.id, vec![(7, "Zed".to_string())]))
+                .collect(),
+            messages: rows,
+            caught_up: true,
+        };
+        let mut old = Store::open(dir.path()).unwrap();
+        old.apply(&page(vec![row(1, "old needle")]), None).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let found = tx.clone();
+        let searcher = Searcher::spawn(dir.path().to_path_buf(), move |g, r| {
+            found
+                .send((
+                    g,
+                    r.map(|f| f.iter().map(|f| f.message.body.clone()).collect::<Vec<_>>()),
+                ))
+                .unwrap();
+        });
+        let contexts = Contexts::spawn(dir.path().to_path_buf(), move |g, r| {
+            tx.send((g, r.map(|m| m.iter().map(|m| m.body.clone()).collect())))
+                .unwrap();
+        });
+        let wait = || rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Both workers open generation 1.
+        let g = searcher.search("needle");
+        assert_eq!(wait(), (g, Ok(vec!["old needle".to_string()])));
+        let g = contexts.fetch(Where::Agent("Zed".into()), None);
+        assert_eq!(wait(), (g, Ok(vec!["old needle".to_string()])));
+        // Another session starts generation 2 with different history.
+        let mut new = old.next_generation().unwrap();
+        new.apply(&page(vec![row(1, "new needle")]), None).unwrap();
+        let g = searcher.search("needle");
+        assert_eq!(wait(), (g, Ok(vec!["new needle".to_string()])));
+        let g = contexts.fetch(Where::Agent("Zed".into()), None);
+        assert_eq!(wait(), (g, Ok(vec!["new needle".to_string()])));
     }
 }

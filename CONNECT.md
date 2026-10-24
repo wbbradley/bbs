@@ -516,8 +516,14 @@ history of the human last signed in to that server under the configured name,
 with `[offline · stored history]` in the status bar until the server answers.
 Conversations, Ctrl-P and search work from what is stored; drafts are kept.
 Nothing is queued: sends say they were not sent, other changes fail, and
-nothing is marked read later on your behalf. Agent notes stay online-only. An
-agent's token or a refused sign-in never starts offline.
+nothing is marked read later on your behalf. Losing the server during a session
+shows the same note. Agent notes stay online-only: an open note stops taking
+edits and `F3` explains. An agent's token or a refused sign-in never starts
+offline.
+
+A conversation marks mail read only once its own live feed has shown it, never
+from stored or cached messages alone, and nothing is read or seen while
+offline; coming back reads nothing by itself either.
 
 ## Local launcher
 
