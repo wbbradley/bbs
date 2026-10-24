@@ -6,14 +6,17 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
-## Unreleased
+## 0.16.0 - 2026-10-24
 
-Agent notes add schema 22 and the `agent-notes.v1` capability; protocol v2,
-config format 4 and Rust 1.89 stay unchanged. Back up before upgrading the
-server: older schema-21 binaries cannot open the upgraded database. Upgrade
-the server and client to use notes. Everything else still works against a
-server without notes, where `F3` explains that notes need a newer server
-rather than falling back to anything else.
+Private agent notes, a stored personal message history with offline browsing,
+and `bbs connect` refinements. This release adds database schema 22 and the
+`agent-notes.v1` and `feed-sync.v1` capabilities; protocol v2, config format 4
+and Rust 1.89 are unchanged. Upgrade the server first, after a backup: the
+server migrates its database to schema 22 on start, and 0.15 and older binaries
+cannot open it afterwards. Notes and stored history need both a 0.16.0 server
+and a 0.16.0 client. Against an older server, `F3` explains that notes need a
+newer server, the status bar says the history needs one, and everything else
+works as before; older clients keep working against a 0.16.0 server.
 
 ### Added
 
@@ -35,6 +38,14 @@ rather than falling back to anything else.
 
 ### Changed
 
+- Agent conversations mark where each turn starts and stops with a quiet `•`
+  on the content it belongs to, instead of leaving turn boundaries out, and
+  show your mail where a prompt or steer first included it, keeping its send
+  time.
+- `F2` closes the blocker card again, keeping the answer draft, and returns
+  from a cancel confirmation first; `F3` closes an open note as `Esc` does.
+  Ctrl-P opens over the blocker card and notes: `Esc` returns to them, and a
+  chosen result closes them and reuses that conversation if already open.
 - Ctrl-P lists every result that contains the query before any fuzzy match,
   so a message or status naming the query is no longer pushed below agents
   whose name or status only has its letters in order.
@@ -44,10 +55,11 @@ rather than falling back to anything else.
 - Ctrl-P also finds agents by their status, as the last cached agent list gave
   it; name matches still come first, and a status match shows the matching part
   of the status.
-- The `bbs connect` blocker card keeps its list at the top and moves the
-  selected blocker to the bottom, just above the answer box: a row restating
-  its number, group and creator, then its details, with a single blank row
-  before the box and any spare space above.
+- The `bbs connect` blocker card sits at the bottom of the terminal, its title,
+  list and selected blocker together just above the answer box: a row
+  restating the blocker's number, group and creator, then its details, with a
+  single blank row before the box. Spare rows stay above the card on the
+  standard background.
 - `bbs connect` opens straight to the main menu, which now shows the logo,
   version and server, welcome and menu items as one block centred both ways.
   The separate splash screen, its `CONNECT 14400/ARQ` line and its "press any
