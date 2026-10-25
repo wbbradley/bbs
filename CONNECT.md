@@ -196,8 +196,10 @@ is covered as by any page: its draft, cursor, selection, scroll, mode and side
 panel come back when the page closes. `Esc` or `F2` closes the page, keeping
 the answer draft; from a cancel confirmation either first returns to the card.
 `Ctrl-p` opens over the page: cancelling it returns to the page as it was, and
-a chosen result opens over the page, so `Esc` there comes back to it. Ctrl-C
-still quits.
+a chosen result opens over the page, so `Esc` there comes back to it. A
+conversation already open beneath the page moves over it, with its draft,
+rather than opening twice. Covered, the page keeps its selection, focus,
+scroll and drafts for when it is uncovered. Ctrl-C still quits.
 
 The card lists blockers oldest first, the first 50 of the scope with a count of
 any more; each refresh fills in rows as others resolve. From the top, the card
@@ -219,7 +221,7 @@ mixes with a screen's. Enter sends; the answer shows darkened with a spinner
 until the server confirms. Tab moves from the answer to `[discuss with AGENT]`
 when an agent created the blocker, then to `[Cancel]`, and back; Shift-Tab goes
 the other way. Enter on `[discuss with AGENT]` opens that agent's
-conversation over the page, or goes back to it if it is already open; it never
+conversation over the page, moving it there if it is already open; it never
 answers or cancels, even with a write awaiting confirmation. It opens only the
 very agent that asked, matched by its stable id against the current
 subscription's last good summary: when that agent has retired, or its name now belongs to another agent, the bar says it is no longer
@@ -242,10 +244,9 @@ When another agent replaces a blocker's text, the card shows the new text in
 place from its top, keeps the draft, withdraws any pending cancel
 confirmation, and ignores Enter for one second. Other changes show `Blockers
 updated.` for five seconds. When no blocker in scope is open, past the first
-page too, and nothing needs attention, `Done with blockers.` shows for 750 ms,
-swallowing keys, then the page closes onto the screen beneath. A new blocker
-meanwhile keeps the page. Esc closes it at any time; answers still out finish
-on their own. A server without `blockers-mine.v1` is asked once: the marker
+page too, and nothing needs attention, the page says `No open blockers.` and
+stays, like any page, until `Esc` or `F2`; a new blocker shows up in place.
+Esc closes it at any time; answers still out finish on their own. A server without `blockers-mine.v1` is asked once: the marker
 stays hidden, F2 says a newer server is needed, and `F5` (or `r` in navigation) asks again. The queue is
 never replaced by the whole board's.
 

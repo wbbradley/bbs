@@ -19,8 +19,6 @@ use super::event::{Data, Request, SideError};
 use super::theme::{self, Role};
 use crate::proto;
 
-/// After the last blocker goes, how long `Done with blockers.` shows.
-pub const DONE: Duration = Duration::from_millis(750);
 /// After a blocker's text changes under the reader, Enter waits this long.
 pub const GUARD: Duration = Duration::from_secs(1);
 /// How long an update notice stays.
@@ -92,8 +90,6 @@ struct Panel {
     focus: Focus,
     /// Rows of the selected blocker's text scrolled past.
     scroll: u16,
-    /// `Done with blockers.` until then; input is consumed meanwhile.
-    done_at: Option<Instant>,
 }
 
 /// What a key did in the open panel.
@@ -171,17 +167,28 @@ impl Blockers {
         (self.support == Support::Supported && self.active > 0).then_some(self.active)
     }
 
+    #[cfg(test)]
     pub fn is_open(&self) -> bool {
         self.panel.is_some()
     }
 
-    /// Showing `Done with blockers.` before the composer returns.
+    /// Open, with nothing left open or waiting: the page says so and stays.
+    /// Blockers past the first page are still open: the next poll lists them.
     pub fn done(&self) -> bool {
-        self.panel.as_ref().is_some_and(|p| p.done_at.is_some())
+        let busy = self
+            .chains
+            .values()
+            .any(|c| c.pending.is_some() || c.error.is_some());
+        self.panel.is_some()
+            && self.loaded
+            && self.support == Support::Supported
+            && self.rows.is_empty()
+            && self.active == 0
+            && !busy
     }
 
     /// F2: open the panel, or say why not.
-    pub fn open(&mut self, now: Instant) -> Result<(), String> {
+    pub fn open(&mut self) -> Result<(), String> {
         if self.support == Support::Unsupported {
             return Err("F5 retries · server needs blockers-mine.v1".into());
         }
@@ -195,9 +202,7 @@ impl Blockers {
             selected,
             focus: Focus::Answer,
             scroll: 0,
-            done_at: None,
         });
-        self.settle_done(now);
         Ok(())
     }
 
@@ -211,10 +216,6 @@ impl Blockers {
                         self.support = Support::Unsupported;
                         self.rows.clear();
                         self.active = 0;
-                        // An open card says why, and never says Done.
-                        if let Some(panel) = &mut self.panel {
-                            panel.done_at = None;
-                        }
                     }
                     // Background errors stay quiet; the panel shows the last.
                     Err(SideError::Refused(e) | SideError::Transient(e)) => {
@@ -226,7 +227,7 @@ impl Blockers {
                 id: to,
                 key,
                 result,
-            } if *to == id => self.written(key, result, now),
+            } if *to == id => self.written(key, result),
             _ => {}
         }
     }
@@ -323,19 +324,13 @@ impl Blockers {
             if lost {
                 panel.focus = Focus::Answer;
             }
-            if !self.rows.is_empty() {
-                // Something new or still open: stay.
-                panel.done_at = None;
-            }
         }
-        self.settle_done(now);
     }
 
     fn written(
         &mut self,
         key: &str,
         result: &Result<Box<proto::BlockerMutationResponse>, SideError>,
-        now: Instant,
     ) {
         let Some(root) = self
             .chains
@@ -384,7 +379,6 @@ impl Blockers {
                     }
                     panel.selected = nearest(panel.selected, &old, &roots);
                 }
-                self.settle_done(now);
             }
             Err(SideError::Transient(_)) => {
                 if let Some(pending) = &mut chain.pending {
@@ -405,39 +399,6 @@ impl Blockers {
         }
     }
 
-    /// With nothing left to do, start the short goodbye.
-    fn settle_done(&mut self, now: Instant) {
-        let busy = self
-            .chains
-            .values()
-            .any(|c| c.pending.is_some() || c.error.is_some());
-        // Blockers past the first page are still open: the next poll lists them.
-        if let Some(panel) = &mut self.panel
-            && self.loaded
-            && self.support == Support::Supported
-            && self.rows.is_empty()
-            && self.active == 0
-            && !busy
-            && panel.done_at.is_none()
-        {
-            panel.done_at = Some(now + DONE);
-        }
-    }
-
-    /// Close the panel once its goodbye has shown; true if it closed now.
-    pub fn settle(&mut self, now: Instant) -> bool {
-        if self
-            .panel
-            .as_ref()
-            .and_then(|p| p.done_at)
-            .is_some_and(|at| now >= at)
-        {
-            self.close();
-            return true;
-        }
-        false
-    }
-
     /// Close the panel, remembering where it was.
     pub(super) fn close(&mut self) {
         if let Some(panel) = self.panel.take() {
@@ -447,7 +408,7 @@ impl Blockers {
     }
 
     /// Drop a kept refusal and its draft.
-    fn dismiss(&mut self, root: i64, now: Instant) {
+    fn dismiss(&mut self, root: i64) {
         let old: Vec<i64> = self.rows.iter().map(|b| b.root_id).collect();
         self.rows.retain(|b| b.root_id != root);
         self.held.retain(|r| *r != root);
@@ -458,19 +419,17 @@ impl Blockers {
             panel.focus = Focus::Answer;
             panel.scroll = 0;
         }
-        self.settle_done(now);
     }
 
     /// When the panel next changes by itself.
     pub fn next_frame(&self, now: Instant) -> Option<Instant> {
-        let panel = self.panel.as_ref()?;
+        self.panel.as_ref()?;
         let guard = self.selected_chain().and_then(|c| c.guard_until);
         let spinning = self
             .chains
             .values()
             .any(|c| c.pending.as_ref().is_some_and(|p| !p.uncertain));
         [
-            panel.done_at,
             guard,
             self.notice_until,
             spinning.then(|| now + Duration::from_millis(100)),
@@ -515,10 +474,6 @@ impl Blockers {
         let Some(panel) = &mut self.panel else {
             return Outcome::Pass;
         };
-        if panel.done_at.is_some() {
-            // The goodbye swallows typing rather than leave it for mail.
-            return Outcome::Stay;
-        }
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Esc if panel.focus == Focus::Confirm => {
@@ -568,7 +523,6 @@ impl Blockers {
             && self.panel.as_ref().map(|p| p.focus) == Some(Focus::Discuss)
         {
             if let (Some(name), Some(creator)) = (agent_creator(&row), &row.creator) {
-                self.close();
                 return Outcome::Discuss {
                     id: creator.id,
                     name,
@@ -587,7 +541,7 @@ impl Blockers {
                 .is_some_and(|c| c.pending.is_none())
         {
             // Dismiss a refusal kept for reading.
-            self.dismiss(row.root_id, now);
+            self.dismiss(row.root_id);
             return Outcome::Stay;
         }
         let panel = self.panel.as_mut().expect("open");
@@ -764,7 +718,7 @@ impl Blockers {
         if self.done() {
             lines.push(Line::default());
             lines.push(Line::styled(
-                "  Done with blockers.",
+                "  No open blockers.",
                 theme::style(Role::Success),
             ));
             return Parts {
@@ -1237,7 +1191,7 @@ mod tests {
             ]),
             now,
         );
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         blockers
     }
 
@@ -1370,11 +1324,11 @@ mod tests {
                 let mut blockers = Blockers::new();
                 blockers.poll(SCREEN);
                 blockers.on_data(SCREEN, &list(Vec::new()), now);
-                blockers.open(now).unwrap();
+                blockers.open().unwrap();
                 let (rows, buffer) = drawn(&mut blockers, 60, 24, now);
                 let done = rows
                     .iter()
-                    .position(|r| r.contains("Done with blockers."))
+                    .position(|r| r.contains("No open blockers."))
                     .expect("done");
                 // Straight above the status rows: no room kept for a blocker.
                 assert_eq!(done, 24 - 3, "{rows:#?}");
@@ -1402,7 +1356,7 @@ mod tests {
             &list(vec![row(1, 1, "Zed", &body), row(2, 2, "Mateo", "second?")]),
             now,
         );
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         let (rows, _) = drawn(&mut blockers, 60, 24, now);
         let out = rows.join("\n");
         assert!(
@@ -1466,7 +1420,7 @@ mod tests {
         read_only.can_answer = false;
         read_only.can_cancel = false;
         blockers.on_data(SCREEN, &list(vec![read_only]), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         let (rows, _) = drawn(&mut blockers, 80, 24, now);
         let out = rows.join("\n");
         let at = restated(&rows, "#1 @crew Zed");
@@ -1523,7 +1477,7 @@ mod tests {
             let mut blockers = Blockers::new();
             blockers.poll(SCREEN);
             blockers.on_data(SCREEN, &list(rows), now);
-            blockers.open(now).unwrap();
+            blockers.open().unwrap();
             let mut seen = Vec::new();
             for _ in 0..3 {
                 blockers.key(SCREEN, press(KeyCode::Tab), now);
@@ -1559,7 +1513,7 @@ mod tests {
         let mut first = row(1, 1, "Zed", "q?");
         first.can_cancel = false;
         blockers.on_data(SCREEN, &list(vec![first.clone()]), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         typed(&mut blockers, "draft", now);
         blockers.key(SCREEN, press(KeyCode::Tab), now);
         assert_eq!(focus(&blockers), Focus::Discuss);
@@ -1572,7 +1526,7 @@ mod tests {
         ));
         assert!(blockers.chains[&1].pending.is_none(), "no answer sent");
         // A creator that is no longer an agent takes the focus back.
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         blockers.key(SCREEN, press(KeyCode::Tab), now);
         first.creator.as_mut().unwrap().kind = proto::Kind::Human.into();
         blockers.on_data(SCREEN, &list(vec![first]), now);
@@ -1587,7 +1541,7 @@ mod tests {
             let mut blockers = Blockers::new();
             blockers.poll(SCREEN);
             blockers.on_data(SCREEN, &list(vec![row(1, 1, long, "q?")]), now);
-            blockers.open(now).unwrap();
+            blockers.open().unwrap();
             if held {
                 blockers.held.push(1);
             }
@@ -1639,13 +1593,14 @@ mod tests {
             }
             _ => panic!("expected a discussion"),
         }
-        assert!(!blockers.is_open());
+        // The page stays, as it was, beneath the conversation.
+        assert!(blockers.is_open());
         assert!(
             blockers.chains[&1].pending.as_ref().unwrap().uncertain,
             "nothing resent"
         );
         // Just replaced, the guard holds answers but not a discussion.
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         blockers.on_data(
             SCREEN,
             &list(vec![
@@ -1674,12 +1629,12 @@ mod tests {
             )
         };
         blockers.on_data(SCREEN, &rows(&[1, 2, 3]), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         blockers.key(SCREEN, alt(KeyCode::Down), now);
         typed(&mut blockers, "half", now);
         blockers.key(SCREEN, press(KeyCode::Esc), now);
         let selected = |blockers: &Blockers| blockers.selected().map(|b| (b.root_id, b.id));
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         assert_eq!(selected(&blockers), Some((2, 2)));
         assert_eq!(blockers.chains[&2].answer.draft().text, "half");
         blockers.key(SCREEN, press(KeyCode::Esc), now);
@@ -1693,17 +1648,17 @@ mod tests {
             ]),
             now,
         );
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         assert_eq!(selected(&blockers), Some((2, 9)));
         blockers.key(SCREEN, press(KeyCode::Esc), now);
         // Gone while closed: the next one along.
         blockers.on_data(SCREEN, &rows(&[1, 3]), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         assert_eq!(selected(&blockers), Some((3, 3)));
         blockers.key(SCREEN, press(KeyCode::Esc), now);
         // Nothing left: done, as before.
         blockers.on_data(SCREEN, &rows(&[]), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         assert!(blockers.done());
     }
 
@@ -1738,7 +1693,7 @@ mod tests {
         };
         blockers.on_data(SCREEN, &old, now);
         assert_eq!(blockers.poll(SCREEN), None);
-        assert!(blockers.open(now).unwrap_err().contains("blockers-mine.v1"));
+        assert!(blockers.open().unwrap_err().contains("blockers-mine.v1"));
         assert!(!blockers.is_open());
         blockers.reload();
         assert!(blockers.poll(SCREEN).is_some());
@@ -1765,7 +1720,7 @@ mod tests {
             now,
         );
         assert_eq!(blockers.count(), Some(60));
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         let text = |b: &Blockers| {
             b.lines_above(80)
                 .iter()
@@ -1957,7 +1912,7 @@ mod tests {
             // unsent draft survives a cancel.
             let draft = if cancel { "go" } else { "" };
             assert_eq!(chain.answer.draft().text, draft, "cancel={cancel}");
-            assert!(blockers.panel.as_ref().unwrap().done_at.is_none());
+            assert!(!blockers.done());
             // After the guard, a plain Enter sends nothing on the answer's
             // behalf; after a cancel it answers version 5 with the draft.
             if cancel {
@@ -2025,8 +1980,7 @@ mod tests {
             );
         }
         assert_eq!(blockers.count(), Some(58));
-        assert!(blockers.panel.as_ref().unwrap().done_at.is_none());
-        assert!(!blockers.settle(now + DONE));
+        assert!(!blockers.done());
         let text: Vec<String> = blockers
             .lines_above(80)
             .iter()
@@ -2127,7 +2081,7 @@ mod tests {
         assert_eq!(blockers.selected().unwrap().root_id, 2);
         // With the last one gone too, the goodbye can start.
         blockers.on_data(SCREEN, &list(vec![]), now);
-        assert_eq!(blockers.panel.as_ref().unwrap().done_at, Some(now + DONE));
+        assert!(blockers.done());
     }
 
     #[test]
@@ -2166,7 +2120,7 @@ mod tests {
         blockers.poll(SCREEN);
         let all: Vec<_> = (1..=25).map(|i| row(i, i, "Zed", "q?")).collect();
         blockers.on_data(SCREEN, &list(all), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         for _ in 1..=25 {
             typed(&mut blockers, "a", now);
             let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
@@ -2285,7 +2239,7 @@ mod tests {
         theirs.can_answer = false;
         theirs.can_cancel = false;
         blockers.on_data(SCREEN, &list(vec![retired, theirs]), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         let label = |b: &Blockers| b.lines_above(200).last().unwrap().to_string();
         assert_eq!(
             label(&blockers),
@@ -2320,7 +2274,7 @@ mod tests {
             "blocker #1 is not open"
         );
         // The panel stays: an error needs attention before any goodbye.
-        assert!(blockers.panel.as_ref().unwrap().done_at.is_none());
+        assert!(!blockers.done());
         let again = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
         assert_eq!(again.answer, "go");
         assert_ne!(again.request_key, first.request_key);
@@ -2374,7 +2328,7 @@ mod tests {
         theirs.can_answer = false;
         theirs.can_cancel = false;
         blockers.on_data(SCREEN, &list(vec![theirs]), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         typed(&mut blockers, "hi", now);
         assert!(matches!(
             blockers.key(SCREEN, press(KeyCode::Enter), now),
@@ -2391,19 +2345,19 @@ mod tests {
     }
 
     #[test]
-    fn the_last_answer_says_done_swallows_keys_and_a_new_blocker_keeps_the_panel() {
+    fn the_last_answer_says_so_and_stays_until_esc() {
         let now = Instant::now();
         let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         blockers.on_data(SCREEN, &list(vec![row(1, 1, "Zed", "q?")]), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         typed(&mut blockers, "ok", now);
         let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
         // Pending: still shown and no goodbye, even when a poll no longer
         // lists it.
         blockers.poll(SCREEN);
         blockers.on_data(SCREEN, &list(vec![]), now);
-        assert!(blockers.panel.as_ref().unwrap().done_at.is_none());
+        assert!(!blockers.done());
         assert_eq!(blockers.selected().unwrap().id, 1);
         assert_eq!(blockers.active, 0, "the server's count, not counted again");
         blockers.on_data(
@@ -2412,22 +2366,17 @@ mod tests {
             now,
         );
         assert_eq!(blockers.active, 0);
-        assert_eq!(blockers.panel.as_ref().unwrap().done_at, Some(now + DONE));
         assert!(blockers.done());
+        // Nothing to answer: typing does nothing.
         assert!(matches!(
             blockers.key(SCREEN, press(KeyCode::Char('x')), now),
             Outcome::Stay
         ));
-        assert!(matches!(
-            blockers.key(SCREEN, press(KeyCode::Esc), now),
-            Outcome::Stay
-        ));
-        // A new blocker during the goodbye keeps the panel open.
+        // A new blocker is offered in place.
         blockers.on_data(SCREEN, &list(vec![row(3, 3, "Zed", "new?")]), now);
-        assert!(!blockers.settle(now + DONE));
-        assert!(blockers.is_open());
+        assert!(!blockers.done());
         assert_eq!(blockers.selected().unwrap().id, 3);
-        // Answered too: the goodbye runs its 750 ms, then the panel closes.
+        // Answered too: it says so and stays, with no timer, until Esc.
         typed(&mut blockers, "y", now);
         let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
         blockers.on_data(
@@ -2435,9 +2384,17 @@ mod tests {
             &written(&req.request_key, Ok(Default::default())),
             now,
         );
-        assert_eq!(blockers.next_frame(now), Some(now + DONE));
-        assert!(!blockers.settle(now + DONE - Duration::from_millis(1)));
-        assert!(blockers.settle(now + DONE));
+        assert!(blockers.is_open() && blockers.done());
+        assert!(
+            blockers
+                .lines_above(80)
+                .iter()
+                .any(|l| l.to_string().contains("No open blockers."))
+        );
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Esc), now),
+            Outcome::Close
+        ));
         assert!(!blockers.is_open());
     }
 
@@ -2458,7 +2415,7 @@ mod tests {
         // Opened before the first reply: Loading, then the reason.
         let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         assert!(text(&blockers).contains("Loading…"));
         blockers.on_data(SCREEN, &unsupported(), now);
         let shown = text(&blockers);
@@ -2467,7 +2424,6 @@ mod tests {
             "{shown}"
         );
         assert!(!blockers.done());
-        assert!(!blockers.settle(now + DONE), "no goodbye for an upgrade");
         assert_eq!(blockers.poll(SCREEN), None);
         assert!(matches!(
             blockers.key(SCREEN, press(KeyCode::Esc), now),
@@ -2479,22 +2435,20 @@ mod tests {
         blockers.on_data(SCREEN, &unsupported(), now);
         assert!(text(&blockers).contains("blockers-mine.v1"));
         assert!(!blockers.done());
-        assert!(!blockers.settle(now + DONE));
         assert_eq!(blockers.count(), None);
         // A goodbye already showing gives way to the reason.
         let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         blockers.on_data(SCREEN, &list(vec![]), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         assert!(blockers.done());
         blockers.on_data(SCREEN, &unsupported(), now);
         assert!(!blockers.done() && text(&blockers).contains("blockers-mine.v1"));
-        assert!(!blockers.settle(now + DONE));
         // An answer confirmed after support went away does not say Done.
         let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         blockers.on_data(SCREEN, &list(vec![row(1, 1, "Zed", "q?")]), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         typed(&mut blockers, "ok", now);
         let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
         blockers.on_data(SCREEN, &unsupported(), now);
@@ -2513,9 +2467,8 @@ mod tests {
         let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
         blockers.on_data(SCREEN, &list(vec![]), now);
-        blockers.open(now).unwrap();
+        blockers.open().unwrap();
         assert!(blockers.done());
-        assert!(blockers.settle(now + DONE));
     }
 
     #[test]

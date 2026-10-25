@@ -444,12 +444,19 @@ impl App {
             .last()
             .and_then(|screen| screen.next_animation_frame())
             .into_iter()
-            .chain(self.blockers.next_frame(now))
+            .chain(
+                self.on_blockers()
+                    .then(|| self.blockers.next_frame(now))
+                    .flatten(),
+            )
             .min()
     }
 
     fn pop(&mut self) {
         if let Some(mut screen) = self.stack.pop() {
+            if screen.is_blockers() {
+                self.blockers.close();
+            }
             if let (Some(target), Some(view)) = (screen.conversation(), screen.saved_view()) {
                 self.saved_views.retain(|(c, _)| !c.same(&target));
                 self.saved_views.push((target, view));
@@ -552,12 +559,6 @@ impl App {
 
     /// Apply one event; `true` quits.
     pub fn on_event(&mut self, event: Event) -> bool {
-        let quit = self.apply_event(event);
-        self.sync_blockers();
-        quit
-    }
-
-    fn apply_event(&mut self, event: Event) -> bool {
         // The human moved on: a stored result still opening gives way.
         if matches!(event, Event::Key(_) | Event::Paste(_)) && self.pending_hit.take().is_some() {
             self.ctx.navigation_notice = None;
@@ -901,9 +902,7 @@ impl App {
                     _ => false,
                 });
         if let Some(at) = existing {
-            while self.stack.len() > at + 1 {
-                self.pop();
-            }
+            self.raise(at);
             if let Some(target) = &destination {
                 self.history.visit(target.clone());
             }
@@ -1050,38 +1049,37 @@ impl App {
         }
     }
 
+    /// Bring the screen at `at` to the top. What is above it closes, unless
+    /// the blockers page is: then the screen moves above the page, which
+    /// stays beneath it for Esc to come back to.
+    fn raise(&mut self, at: usize) {
+        if self.stack[at + 1..].iter().any(|s| s.is_blockers()) {
+            let screen = self.stack.remove(at);
+            self.stack.push(screen);
+            return;
+        }
+        while self.stack.len() > at + 1 {
+            self.pop();
+        }
+    }
+
     fn on_blockers(&self) -> bool {
         self.stack.last().is_some_and(|s| s.is_blockers())
     }
 
-    /// The blockers page, never twice: back to it if it is open beneath.
+    /// The blockers page, never twice: back to it, as it was, if it is
+    /// open beneath.
     fn show_blockers(&mut self) {
         self.ctx.navigation_notice = None;
-        if let Err(why) = self.blockers.open((self.ctx.now)()) {
-            self.ctx.navigation_notice = Some(Feedback::Other(why));
+        if let Some(at) = self.stack.iter().rposition(|s| s.is_blockers()) {
+            while self.stack.len() > at + 1 {
+                self.pop();
+            }
             return;
         }
-        match self.stack.iter().rposition(|s| s.is_blockers()) {
-            Some(at) => {
-                while self.stack.len() > at + 1 {
-                    self.pop();
-                }
-            }
-            None => self.stack.push(Box::new(BlockersPage)),
-        }
-    }
-
-    /// The queue's panel is open exactly while its page is on top: covered,
-    /// it remembers its place and drafts; uncovered, it opens there again.
-    fn sync_blockers(&mut self) {
-        let shown = self.on_blockers();
-        if shown && !self.blockers.is_open() {
-            if let Err(why) = self.blockers.open((self.ctx.now)()) {
-                self.pop();
-                self.ctx.navigation_notice = Some(Feedback::Other(why));
-            }
-        } else if !shown && self.blockers.is_open() {
-            self.blockers.close();
+        match self.blockers.open() {
+            Ok(()) => self.stack.push(Box::new(BlockersPage)),
+            Err(why) => self.ctx.navigation_notice = Some(Feedback::Other(why)),
         }
     }
 
@@ -1120,9 +1118,7 @@ impl App {
                 });
         if let Some(at) = existing {
             let moved = at + 1 != self.stack.len();
-            while self.stack.len() > at + 1 {
-                self.pop();
-            }
+            self.raise(at);
             if moved && let Some(target) = &destination {
                 self.history.visit(target.clone());
             }
@@ -1160,12 +1156,6 @@ impl App {
     fn blocker_key(&mut self, key: KeyEvent) -> Option<bool> {
         let now = (self.ctx.now)();
         if self.on_blockers() {
-            if self.blockers.settle(now) {
-                // The goodbye has shown: the key belongs to the screen beneath.
-                self.pop();
-                self.viewed();
-                return None;
-            }
             self.keymap = Keymap::default();
             return Some(match self.blockers.key(self.blockers_id, key, now) {
                 blockers::Outcome::Stay => false,
@@ -1492,12 +1482,6 @@ impl App {
             return;
         }
         let now = (self.ctx.now)();
-        self.sync_blockers();
-        if self.blockers.settle(now) {
-            // The goodbye has shown: back to the screen beneath the page.
-            self.pop();
-            self.viewed();
-        }
         self.ctx.blocker_marker = self.blockers.count().map(blocker_marker);
         let [title, mut body, status] = theme::frame_areas(frame.area());
         let screen = self.stack.last_mut().expect("the menu is never popped");
@@ -8158,6 +8142,36 @@ mod tests {
         assert!(screen(&mut app, 80, 24).contains("half"));
     }
 
+    #[test]
+    fn ctrl_p_from_the_blockers_page_moves_the_open_group_over_it() {
+        let (mut app, mut rx) = app();
+        crew_list(&mut app, &mut rx);
+        enter(&mut app);
+        watched(&mut rx);
+        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+        typed(&mut app, "xyz");
+        queue(&mut app, &mut rx, vec![grove_asks()]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(app.on_blockers());
+        let depth = app.stack.len();
+        while rx.try_recv().is_ok() {}
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("crew".into()));
+        enter(&mut app);
+        assert_eq!(opened(&app), Some(Conversation::Group("crew".into())));
+        assert_eq!(app.stack.len(), depth, "moved, not opened twice");
+        assert!(app.stack[depth - 2].is_blockers());
+        assert_eq!(draft_text(&mut app), "xyz");
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, Request::Watch { .. })),
+            "no second watch"
+        );
+        // Esc to navigation, Esc back: to the page.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.on_blockers());
+    }
+
     fn buffer(app: &mut App, width: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
@@ -8448,7 +8462,7 @@ mod tests {
             key: req.request_key,
             result: Ok(Default::default()),
         }));
-        // The page says goodbye over the conversation beneath it.
+        // The page stays over the conversation beneath it.
         let beneath = &app.stack[app.stack.len() - 2];
         assert_eq!(
             beneath.composer_text().as_deref(),
@@ -8458,7 +8472,7 @@ mod tests {
     }
 
     #[test]
-    fn done_returns_to_the_exact_origin_after_its_goodbye() {
+    fn an_empty_page_stays_until_esc_returns_to_the_exact_origin() {
         for width in [60, 80] {
             let (mut app, mut rx) = app();
             let (clock, now) = test_clock();
@@ -8477,19 +8491,19 @@ mod tests {
                 key: req.request_key,
                 result: Ok(Default::default()),
             }));
-            assert!(screen(&mut app, width, 24).contains("Done with blockers."));
-            assert!(app.next_animation_frame().is_some());
-            // The goodbye swallows typing, Esc and Enter: never parent mail.
+            assert!(screen(&mut app, width, 24).contains("No open blockers."));
+            // Typing and Enter there are nobody's: never parent mail.
             typed(&mut app, "x");
-            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             enter(&mut app);
             assert!(
                 !std::iter::from_fn(|| rx.try_recv().ok())
                     .any(|r| matches!(r, Request::Send { .. }))
             );
-            clock.advance(crate::connect::blockers::DONE - Duration::from_millis(1));
-            assert!(screen(&mut app, width, 24).contains("Done with blockers."));
-            clock.advance(Duration::from_millis(1));
+            // A page, not a goodbye: it stays.
+            clock.advance(Duration::from_secs(5));
+            assert!(screen(&mut app, width, 24).contains("No open blockers."));
+            assert!(app.on_blockers());
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             let after = buffer(&mut app, width);
             for y in 0..23 {
                 for x in 0..width {
@@ -8579,7 +8593,7 @@ mod tests {
     }
 
     #[test]
-    fn the_goodbye_closing_by_itself_resumes_reading() {
+    fn leaving_the_empty_page_resumes_reading() {
         let (mut app, mut rx) = app();
         let (clock, now) = test_clock();
         app.ctx.now = now;
@@ -8600,11 +8614,15 @@ mod tests {
         }));
         assert!(
             !std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, Request::MarkRead(_))),
-            "covered through the goodbye"
+            "covered while the page says so"
         );
-        clock.advance(crate::connect::blockers::DONE);
-        // The next frame closes the card and reads what it covered.
+        clock.advance(Duration::from_secs(5));
         screen(&mut app, 80, 24);
+        assert!(app.on_blockers(), "no goodbye closes it");
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, Request::MarkRead(_)))
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(
             std::iter::from_fn(|| rx.try_recv().ok())
                 .any(|r| r == Request::MarkRead("Mateo".into()))
@@ -12254,16 +12272,22 @@ mod tests {
                 app.on_event(Event::Paste(query.into()));
                 enter(&mut app);
                 assert!(app.picker.is_none());
-                assert!(!app.blockers.is_open(), "{overlay}: {query}");
                 assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
-                assert_eq!(app.stack.len(), depth, "{overlay}: {query}");
+                if overlay == "notes" {
+                    assert_eq!(app.stack.len(), depth, "{query}");
+                } else {
+                    // Mateo, open beneath the page, moves over it: no
+                    // second conversation, and the page stays.
+                    assert_eq!(app.stack.len(), depth + 3, "{overlay}: {query}");
+                    assert!(app.stack[depth + 1].is_blockers(), "{overlay}: {query}");
+                }
                 assert_eq!(app.note_editor.is_some(), query == "needle");
                 if query == "needle" {
                     assert_eq!(app.note_editor.as_ref().unwrap().agent_id(), 7);
                     f3(&mut app);
                 }
                 assert!(app.note_editor.is_none());
-                assert!(!app.blockers.is_open());
+                assert_eq!(app.blockers.is_open(), overlay != "notes");
             }
         }
     }
@@ -12890,7 +12914,7 @@ mod tests {
     }
 
     #[test]
-    fn discussing_a_blocker_closes_the_card_and_opens_its_creators_conversation() {
+    fn discussing_a_blocker_opens_its_creators_conversation_over_the_page() {
         let (mut app, mut rx) = app();
         mateo(&mut app, &mut rx);
         typed(&mut app, "draft");
@@ -12898,16 +12922,19 @@ mod tests {
         live(&mut app, &[("Mateo", 101), ("Grove", 102)]);
         queue(&mut app, &mut rx, vec![blocker(1, 1, "Mateo", "q?")]);
         while rx.try_recv().is_ok() {}
+        let depth = app.stack.len();
         let discuss = |app: &mut App| {
             press(app, KeyCode::F(2), KeyModifiers::NONE);
             press(app, KeyCode::Tab, KeyModifiers::NONE);
             press(app, KeyCode::Enter, KeyModifiers::NONE);
         };
         discuss(&mut app);
-        assert!(!app.blockers.is_open());
-        // Already open: the same conversation, its draft kept.
+        // Already open beneath the page: the same conversation, its draft
+        // kept, moved over the page, which keeps its state beneath it.
         assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
         assert_eq!(draft_text(&mut app), "draft");
+        assert_eq!(app.stack.len(), depth + 1, "the page, then Mateo");
+        assert!(app.stack[depth - 1].is_blockers() && app.blockers.is_open());
         let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             !sent.iter().any(|r| matches!(
@@ -12921,7 +12948,10 @@ mod tests {
         // Another creator's conversation opens fresh.
         let id = app.blockers_id;
         blockers_listed(&mut app, id, vec![blocker(2, 2, "Grove", "q2?")]);
-        discuss(&mut app);
+        // F2 returns to the page as it was, the discuss button still focused.
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(app.on_blockers());
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
         let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
@@ -12948,7 +12978,7 @@ mod tests {
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
-        assert!(!app.blockers.is_open());
+        assert!(app.blockers.is_open(), "kept while covered");
         assert!(app.stack[app.stack.len() - 2].is_blockers());
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.on_blockers());
@@ -13127,6 +13157,39 @@ mod tests {
             )),
             "{sent:?}"
         );
+    }
+
+    #[test]
+    fn a_stored_hit_from_the_blockers_page_moves_its_open_conversation_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        stored_history(dir.path(), 300, &[(5, "an ancient needle")]);
+        let (mut app, mut rx) = app();
+        let mut found = with_stored(&mut app, dir.path());
+        mateo_streams(&mut app, &mut rx);
+        pump(&mut app, &mut found);
+        typed(&mut app, "draft");
+        queue(&mut app, &mut rx, vec![grove_asks()]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        let depth = app.stack.len();
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("needle".into()));
+        pump(&mut app, &mut found);
+        while rx.try_recv().is_ok() {}
+        enter(&mut app);
+        pump(&mut app, &mut found);
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        assert_eq!(app.stack.len(), depth, "moved, not opened twice");
+        assert!(app.stack[depth - 2].is_blockers());
+        assert_eq!(draft_text(&mut app), "draft");
+        assert!(screen(&mut app, 80, 24).contains("an ancient needle"));
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, Request::Watch { .. })),
+            "no second watch"
+        );
+        // Mateo's Esc goes back; then the page is there again.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.on_blockers());
     }
 
     #[test]
