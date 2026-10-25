@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.16.1 - 2026-10-25
+
+`bbs connect` refinements: blockers become a page of their own, and group
+threads read as conversations. Client only; the protocol, database schema 22,
+config format 4 and Rust 1.89 are unchanged, and it works with the same
+servers as 0.16.0.
+
 ### Changed
 
 - `bbs connect` blockers are a page of their own, like Agents and Groups:
@@ -23,7 +30,6 @@ under the new package version and its publication date.
 - `bbs connect` group threads open with the composer active, and lay out
   messages as agent conversations do: your own broadcasts as reply cards, and
   other members' as side cards naming the sender, with the local send time.
-
 - The `bbs connect` blocker card keeps the warning surface for its title bar and
   list only, then leaves a blank row before the selected blocker, which reads
   like a reply in a conversation: its details, recipient and actions sit on the
