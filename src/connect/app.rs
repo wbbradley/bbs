@@ -8172,6 +8172,60 @@ mod tests {
         assert!(app.on_blockers());
     }
 
+    #[test]
+    fn the_page_comes_back_from_a_conversation_with_its_focus_and_scroll() {
+        let (mut app, mut rx) = app();
+        live(&mut app, &[("Grove", 8)]);
+        let mut row = grove_asks();
+        row.body = (1..=60)
+            .map(|i| format!("detail {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        queue(&mut app, &mut rx, vec![row]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        typed(&mut app, "half");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        let top = buffer(&mut app, 80);
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        let before = buffer(&mut app, 80);
+        assert_ne!(top, before, "the details scrolled");
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("Grove".into()));
+        enter(&mut app);
+        assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.on_blockers());
+        // Selection, details scroll, focus on [Cancel] and the draft, as left.
+        assert_eq!(buffer(&mut app, 80), before);
+        while rx.try_recv().is_ok() {}
+        // Enter on the kept [Cancel] asks first, and never sends the answer.
+        enter(&mut app);
+        assert!(screen(&mut app, 80, 24).contains("Cancel this blocker?"));
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !sent.iter().any(|r| matches!(
+                r,
+                Request::AnswerBlocker { .. } | Request::CancelBlocker { .. }
+            )),
+            "{sent:?}"
+        );
+        enter(&mut app);
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            sent.iter()
+                .any(|r| matches!(r, Request::CancelBlocker { .. })),
+            "{sent:?}"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|r| matches!(r, Request::AnswerBlocker { .. })),
+            "{sent:?}"
+        );
+    }
+
     fn buffer(app: &mut App, width: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();

@@ -18,6 +18,8 @@ under the new package version and its publication date.
   With nothing left open, the page says `No open blockers.` and stays until
   `Esc` or `F2`, instead of closing itself. `F2` from a changed note stores it
   first.
+- The `bbs connect` main menu drops one blank row to fit the new `[B]lockers`
+  item in the 60×24 minimum.
 - `bbs connect` group threads open with the composer active, and lay out
   messages as agent conversations do: your own broadcasts as reply cards, and
   other members' as side cards naming the sender, with the local send time.
