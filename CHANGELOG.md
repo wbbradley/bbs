@@ -6,6 +6,15 @@ Versions are the package versions published as [GitHub releases](https://github.
 Add user-visible changes under **Unreleased**. At release time, consolidate them
 under the new package version and its publication date.
 
+## Unreleased
+
+### Changed
+
+- The `bbs connect` blocker card keeps the warning surface for its title bar and
+  list only, then leaves a blank row before the selected blocker, which reads
+  like a reply in a conversation: its details, recipient and actions sit on the
+  standard background.
+
 ## 0.16.0 - 2026-10-24
 
 Private agent notes, a stored personal message history with offline browsing,

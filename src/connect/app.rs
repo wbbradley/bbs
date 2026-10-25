@@ -7331,11 +7331,12 @@ mod tests {
                     for line in &details {
                         assert!(line.starts_with("  "), "{scheme:?} {width}: {line:?}");
                     }
-                    let card = theme::base().patch(theme::style(theme::Role::WarningSurface));
+                    // The details read like a reply, on the standard surface.
+                    let reply = theme::base();
                     for y in start..label {
                         for x in 0..2 {
                             assert_eq!(buffer[(x, y)].symbol(), " ");
-                            assert_eq!(buffer[(x, y)].bg, card.bg.unwrap());
+                            assert_eq!(buffer[(x, y)].bg, reply.bg.unwrap());
                         }
                     }
                     assert!((0..24).any(|y| row(y).contains("answer draft")));
@@ -7427,11 +7428,22 @@ mod tests {
                         assert_eq!(cell.bg, bar.bg.unwrap(), "{scheme:?} title {x}");
                         assert_eq!(cell.fg, bar.fg.unwrap(), "{scheme:?} title {x}");
                     }
-                    assert_eq!(buffer[(59, label)].bg, card.bg.unwrap(), "{scheme:?}");
-                    assert_eq!(buffer[(x, action)].bg, card.bg.unwrap(), "{scheme:?}");
+                    // Below the list, the blocker reads like a reply.
+                    let reply = theme::base();
+                    assert_eq!(buffer[(59, label)].bg, reply.bg.unwrap(), "{scheme:?}");
+                    assert_eq!(buffer[(x, action)].bg, reply.bg.unwrap(), "{scheme:?}");
                 }
-                // The answer box keeps its own surface inside the card (its
-                // edges: the caret has its own colour).
+                // Only the title bar and the list are on the card surface.
+                let list = at("▸ #1 @crew Zed");
+                assert_eq!(buffer[(59, list)].bg, card.bg.unwrap(), "{scheme:?}");
+                assert_eq!(row(list + 1).trim(), "", "a blank row after the list");
+                assert_eq!(
+                    buffer[(0, list + 1)].bg,
+                    theme::base().bg.unwrap(),
+                    "{scheme:?}"
+                );
+                // The answer box keeps its own surface (its edges: the caret
+                // has its own colour).
                 for x in [0, 59] {
                     assert_eq!(buffer[(x, answer)].bg, human.bg.unwrap(), "{scheme:?}");
                 }

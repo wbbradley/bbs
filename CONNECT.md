@@ -181,11 +181,12 @@ up. While any are open, the right end of the status bar shows
 conversation's mail and activity marks, however long the rest of the bar.
 
 F2 opens the queue from any screen, over dialogs, forms, the search prompt and
-the `/btw` panel too, over the whole terminal, as a card at its bottom: the
-scheme's warning surface under a warning title bar that names the blocker's creator and
-group, `#ID · Answering a blocker from CREATOR @group` when the box below can
-answer it, and the position among open blockers; the answer box keeps the
-composer's surface. Without colour, the title bar is reversed and bold. The screen beneath
+the `/btw` panel too, over the whole terminal, as a card at its bottom: a
+warning title bar that names the blocker's creator and group, `#ID · Answering
+a blocker from CREATOR @group` when the box below can answer it, and the
+position among open blockers, over the list on the scheme's warning surface;
+the selected blocker below reads like a reply in a conversation, on the
+standard background, and the answer box keeps the composer's surface. Without colour, the title bar is reversed and bold. The screen beneath
 is left exactly as it was: its draft, cursor, selection, scroll, mode and side
 panel come back when the card closes. It keeps receiving mail and activity and
 its side state is still polled, but nothing is marked read or seen until the
@@ -194,9 +195,9 @@ confirmation it first returns to the card. Ctrl-C still quits.
 
 The card lists blockers oldest first, the first 50 of the scope with a count of
 any more; each refresh fills in rows as others resolve. From the top, the card
-holds its title bar, the list, then the selected blocker: a row restating its
-number, group and creator, its details, one blank row, who an answer goes to,
-one blank row and the answer box. Any spare rows sit above the card on the
+holds its title bar, the list, one blank row, then the selected blocker: a row
+restating its number, group and creator, its details, one blank row, who an
+answer goes to, one blank row and the answer box. Any spare rows sit above the card on the
 standard background. Alt-↑/↓ selects; plain arrows edit the
 answer; PgUp/PgDn page through a selected text too long for the card, which
 shows how far you have read. Details render as Markdown, as messages

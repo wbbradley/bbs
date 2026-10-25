@@ -971,8 +971,11 @@ impl Blockers {
         let body = Paragraph::new(body).wrap(Wrap { trim: false });
         let rows = body.line_count(area.width - inset) as u16;
         let label_gap = u16::from(label.is_some());
+        // A blank row parts the list from the blocker restated below it.
+        let list_gap = u16::from(selected.is_some());
         let fixed = [
             label_gap,
+            list_gap,
             head.len() as u16,
             selected.iter().count() as u16,
             label.iter().count() as u16,
@@ -986,6 +989,7 @@ impl Blockers {
         let [
             _,
             head_area,
+            _,
             selected_area,
             body_area,
             _,
@@ -995,6 +999,7 @@ impl Blockers {
         ] = Layout::vertical([
             Constraint::Length(room - shown),
             Constraint::Length(head.len() as u16),
+            Constraint::Length(list_gap),
             Constraint::Length(selected.iter().count() as u16),
             Constraint::Length(shown),
             Constraint::Length(label_gap),
@@ -1003,12 +1008,13 @@ impl Blockers {
             Constraint::Length(below.len() as u16),
         ])
         .areas(area);
+        // The selected blocker reads like a reply in a conversation, on the
+        // standard background; only the title bar and list carry the
+        // warning surface. The answer box keeps its own surface.
         frame.render_widget(ratatui::widgets::Block::new().style(theme::base()), area);
-        // Only the card gets the warning surface; spare rows keep the
-        // standard background. The answer box keeps its own surface.
         frame.render_widget(
             ratatui::widgets::Block::new().style(theme::style(Role::WarningSurface)),
-            Rect::new(area.x, head_area.y, area.width, area.bottom() - head_area.y),
+            head_area,
         );
         let mut head = head.into_iter();
         if let Some(title) = head.next() {
@@ -1296,14 +1302,15 @@ mod tests {
                     let out = rows.join("\n");
                     // The selection restated, its text, who it answers.
                     let at = restated(&rows, "#1 @crew Zed");
-                    assert!(at > 3, "{out}");
-                    let title = at - 3;
+                    assert!(at > 4, "{out}");
+                    let title = at - 4;
                     assert!(rows[title].starts_with(" #1 · Answering"), "{out}");
-                    assert!(rows[at - 2].starts_with("▸ #1 @crew Zed  first?"), "{out}");
+                    assert!(rows[at - 3].starts_with("▸ #1 @crew Zed  first?"), "{out}");
                     assert!(
-                        rows[at - 1].starts_with("  #2 @crew Mateo  second?"),
+                        rows[at - 2].starts_with("  #2 @crew Mateo  second?"),
                         "{out}"
                     );
+                    assert_eq!(rows[at - 1].trim(), "", "a blank row after the list: {out}");
                     assert_eq!(rows[at].trim_end(), "  #1 @crew Zed", "{out}");
                     assert!(rows[at + 1].starts_with("  first?"), "{out}");
                     assert_eq!(
@@ -1318,6 +1325,29 @@ mod tests {
                         assert_eq!(buffer[(0, at as u16 + 5)].bg, bg, "{scheme:?}");
                         assert_ne!(buffer[(0, at as u16 + 4)].bg, bg, "{scheme:?}");
                     }
+                    // Only the title bar and the list are on the warning
+                    // surface; the blocker below reads like a reply.
+                    let row_bg = |y: usize| {
+                        let bgs: std::collections::HashSet<_> =
+                            (0..width).map(|x| buffer[(x, y as u16)].bg).collect();
+                        bgs
+                    };
+                    let warning = theme::style(Role::WarningSurface).bg;
+                    for y in title + 1..at - 1 {
+                        // Past the selection highlight, the card's own surface.
+                        assert_eq!(
+                            buffer[(width - 1, y as u16)].bg,
+                            warning.unwrap_or_default(),
+                            "{scheme:?} row {y}"
+                        );
+                    }
+                    for y in at - 1..=at + 4 {
+                        assert_eq!(
+                            row_bg(y),
+                            [theme::base().bg.unwrap_or_default()].into(),
+                            "{scheme:?} row {y}"
+                        );
+                    }
                     // The spare rows are all above it.
                     assert!(rows[..title].iter().all(|r| r.trim().is_empty()), "{out}");
                     for y in 0..title as u16 {
@@ -1326,6 +1356,33 @@ mod tests {
                         }
                     }
                     assert_eq!(at, usize::from(height) - 10, "{out}");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn an_empty_queue_has_no_gap_and_only_its_head_on_the_card() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                let now = Instant::now();
+                let mut blockers = Blockers::new();
+                blockers.poll(SCREEN);
+                blockers.on_data(SCREEN, &list(Vec::new()), now);
+                blockers.open(now).unwrap();
+                let (rows, buffer) = drawn(&mut blockers, 60, 24, now);
+                let done = rows
+                    .iter()
+                    .position(|r| r.contains("Done with blockers."))
+                    .expect("done");
+                // Straight above the status rows: no room kept for a blocker.
+                assert_eq!(done, 24 - 3, "{rows:#?}");
+                let card = theme::style(Role::WarningSurface).bg.unwrap_or_default();
+                let base = theme::base().bg.unwrap_or_default();
+                assert_eq!(buffer[(59, done as u16)].bg, card, "{scheme:?}");
+                for y in done + 1..24 {
+                    assert_eq!(buffer[(59, y as u16)].bg, base, "{scheme:?} row {y}");
                 }
             });
         }
@@ -1353,7 +1410,10 @@ mod tests {
             "{out}"
         );
         let at = restated(&rows, "#1 @crew Zed");
-        assert_eq!(at, 4, "the list directly precedes the details: {out}");
+        assert_eq!(
+            at, 5,
+            "one blank row between the list and the details: {out}"
+        );
         assert!(rows[at + 1].starts_with("  line 0"), "{out}");
         let label = rows
             .iter()
@@ -1365,7 +1425,12 @@ mod tests {
             "",
             "one gap before the recipient: {out}"
         );
-        assert!(!rows[label - 2].trim().is_empty(), "{out}");
+        // The text runs down to the gap (its paragraphs alternate with
+        // blank rows).
+        assert!(
+            !rows[label - 2].trim().is_empty() || !rows[label - 3].trim().is_empty(),
+            "{out}"
+        );
         assert_eq!(rows[label + 1].trim(), "", "{out}");
         assert_eq!(
             label,
@@ -1377,18 +1442,18 @@ mod tests {
         let (paged, _) = drawn(&mut blockers, 60, 24, now);
         assert!(!paged[at + 1].starts_with("  line 0"), "{paged:#?}");
         assert_eq!(paged[..at + 1], rows[..at + 1]);
-        assert!(paged[label].contains("PgUp/PgDn text 21/119"), "{paged:#?}");
+        assert!(paged[label].contains("PgUp/PgDn text 19/119"), "{paged:#?}");
         assert_eq!(paged[label + 1..], rows[label + 1..]);
         // A taller window shows more of it, still from where it was.
         let (tall, _) = drawn(&mut blockers, 60, 40, now);
-        assert_eq!(restated(&tall, "#1 @crew Zed"), 4);
+        assert_eq!(restated(&tall, "#1 @crew Zed"), 5);
         // A multiline answer takes rows from the text only.
         let shown = blockers.text_rows.1;
         blockers.key(SCREEN, alt(KeyCode::Enter), now);
         blockers.key(SCREEN, alt(KeyCode::Enter), now);
         let (grown, _) = drawn(&mut blockers, 60, 40, now);
         assert_eq!(blockers.text_rows.1, shown - 2, "{grown:#?}");
-        assert_eq!(restated(&grown, "#1 @crew Zed"), 4);
+        assert_eq!(restated(&grown, "#1 @crew Zed"), 5);
         assert!(grown[2].starts_with("▸ #1"));
     }
 
