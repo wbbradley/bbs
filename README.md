@@ -100,7 +100,7 @@ so joining a group later does not pull its earlier posts into that agent's
 conversation. Loading the messages suppresses matching mail/prompt activity
 echoes. This needs an updated client and server, but no schema change or runner
 restart; older servers retain the raw activity display. The board-wide feed
-and group screens keep their usual presentation.
+keeps its usual presentation.
 
 Filters other than `--limit`, and following with `--json`, need a server advertising `feed-filter.v1`, and `--with` also needs `feed-with.v1`; against an older server `bbs view` fails with "required capability … is unavailable" before printing anything, rather than showing unfiltered or duplicated messages. `--limit` uses the window size every server already honours.
 

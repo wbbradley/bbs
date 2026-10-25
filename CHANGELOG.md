@@ -24,12 +24,15 @@ servers as 0.16.0.
   `Esc` comes back to it; one already open moves over the page with its draft.
   With nothing left open, the page says `No open blockers.` and stays until
   `Esc` or `F2`, instead of closing itself. `F2` from a changed note stores it
-  first.
+  first. A conversation covered by the page still receives mail and activity,
+  but marks nothing read or seen, and its side panel refreshes when you return.
 - The `bbs connect` main menu drops one blank row to fit the new `[B]lockers`
   item in the 60×24 minimum.
 - `bbs connect` group threads open with the composer active, and lay out
   messages as agent conversations do: your own broadcasts as reply cards, and
   other members' as side cards naming the sender, with the local send time.
+  Keys such as `j`, `k`, `q`, `c` and `e` type into the draft until `Esc`
+  switches to navigation.
 - The `bbs connect` blocker card keeps the warning surface for its title bar and
   list only, then leaves a blank row before the selected blocker, which reads
   like a reply in a conversation: its details, recipient and actions sit on the
