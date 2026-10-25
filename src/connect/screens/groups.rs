@@ -105,7 +105,7 @@ impl Screen for Groups {
         self.admin.paste(text);
     }
 
-    fn handle(&mut self, action: Action, _ctx: &Ctx) -> Transition {
+    fn handle(&mut self, action: Action, ctx: &Ctx) -> Transition {
         let len = match &self.groups {
             Some(Ok(groups)) => groups.len(),
             _ => 0,
@@ -121,7 +121,7 @@ impl Screen for Groups {
             }
             Action::Open => match (&self.groups, self.state.selected()) {
                 (Some(Ok(groups)), Some(i)) if i < groups.len() => {
-                    Transition::Push(Box::new(Thread::group(&groups[i].name)))
+                    Transition::Push(Box::new(Thread::group(&groups[i].name, &ctx.me)))
                 }
                 _ => Transition::Stay,
             },

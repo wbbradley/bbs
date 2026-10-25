@@ -51,12 +51,13 @@ pub fn side_message_lines<'a>(
     query: Option<&str>,
     recipient: Option<Kind>,
     width: Option<u16>,
+    timed: bool,
 ) -> Vec<Line<'a>> {
     with_header(
         row,
         gap,
         query,
-        side_header(row, query, recipient, width),
+        side_header(row, query, recipient, width, timed),
         false,
         width,
     )
@@ -66,13 +67,15 @@ pub fn side_message_lines<'a>(
 /// parsing the message body a second time.
 /// The header's rows. Direct mail between others shows when it was sent, in
 /// local time, at the right of a header `width` wide: beside the names when
-/// they leave room, else on a row of its own above them. Group mail, or a
-/// header too narrow for the time, shows none.
+/// they leave room, else on a row of its own above them. Group mail shows
+/// it only when `timed`, as in the group's own thread; a header too narrow
+/// for the time shows none.
 pub fn side_header(
     row: &Message,
     query: Option<&str>,
     recipient: Option<Kind>,
     width: Option<u16>,
+    timed: bool,
 ) -> Vec<Line<'static>> {
     let sender = if row.from_kind() == Kind::Unspecified && row.from_owner.is_some() {
         Kind::Agent
@@ -102,7 +105,8 @@ pub fn side_header(
     }
     let surface = style(conversation_roles(row).1);
     let mut names = Line::from(spans).style(surface);
-    let (Some(width), None, Some(sent)) = (width, &row.to_group, local(&row.created_at)) else {
+    let shown = timed || row.to_group.is_none();
+    let (Some(width), true, Some(sent)) = (width, shown, local(&row.created_at)) else {
         return vec![names];
     };
     let sent = sent.format("%Y-%m-%d %-I:%M:%S%P").to_string();
@@ -464,11 +468,11 @@ mod tests {
                 .with_ymd_and_hms(2026, 10, 17, hour, 7, 8)
                 .single()
                 .unwrap();
-            let header = side_header(&direct(&local.to_rfc3339()), None, None, Some(60));
+            let header = side_header(&direct(&local.to_rfc3339()), None, None, Some(60), false);
             assert_eq!(header[0].width(), 60);
             assert!(header[0].to_string().ends_with(expected), "{:?}", header);
         }
-        let header = side_header(&row, None, Some(Kind::Agent), Some(60));
+        let header = side_header(&row, None, Some(Kind::Agent), Some(60), false);
         assert_eq!(header.len(), 1, "beside the names when they leave room");
         let line = &header[0];
         assert_eq!(line.width(), 60);
@@ -484,8 +488,8 @@ mod tests {
         // its own above the whole names, both on the header's surface.
         let names = "Zed → Mateo".chars().count();
         let fits = (names + 2 + sent.len()) as u16;
-        assert_eq!(side_header(&row, None, None, Some(fits)).len(), 1);
-        let tight = side_header(&row, None, None, Some(fits - 1));
+        assert_eq!(side_header(&row, None, None, Some(fits), false).len(), 1);
+        let tight = side_header(&row, None, None, Some(fits - 1), false);
         let width = usize::from(fits - 1);
         assert_eq!(
             text(&tight),
@@ -502,7 +506,7 @@ mod tests {
         assert_eq!(tight[0].spans[1].style.fg, style(Role::Timestamp).fg);
         // Narrower than the time itself, or no width, no time, a bad time,
         // or group mail: the names alone, as before.
-        let tiny = side_header(&row, None, None, Some(sent.len() as u16 - 1));
+        let tiny = side_header(&row, None, None, Some(sent.len() as u16 - 1), false);
         assert_eq!(text(&tiny), ["Zed → Mateo"]);
         for (row, width) in [
             (direct("2026-10-17T03:30:00Z"), None),
@@ -517,7 +521,7 @@ mod tests {
                 Some(80),
             ),
         ] {
-            let header = side_header(&row, None, None, width);
+            let header = side_header(&row, None, None, width, false);
             assert_eq!(header.len(), 1);
             let line = header[0].to_string();
             assert!(!line.contains("2026") && !line.ends_with(' '), "{line:?}");
@@ -537,7 +541,7 @@ mod tests {
                     body: "2026-10-19 Tim@ada remains in the body".into(),
                     ..Default::default()
                 };
-                let lines = side_message_lines(&row, false, Some("tim"), None, None);
+                let lines = side_message_lines(&row, false, Some("tim"), None, None, false);
                 assert_eq!(lines[1].to_string(), "Tim → Theo");
                 assert_eq!(lines[1].spans[0].style.fg, style(Role::Agent).fg);
                 assert!(
@@ -553,7 +557,7 @@ mod tests {
                 );
                 row.to_group = Some("crew".into());
                 assert_eq!(
-                    side_message_lines(&row, false, None, None, None)[1].to_string(),
+                    side_message_lines(&row, false, None, None, None, false)[1].to_string(),
                     "Tim → @crew"
                 );
             });

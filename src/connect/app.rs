@@ -543,7 +543,7 @@ impl App {
         }
         let screen = match &target {
             Conversation::Agent(agent) => Thread::agent(agent, &self.ctx.me, self.ctx.now.clone()),
-            Conversation::Group(group) => Thread::group(group),
+            Conversation::Group(group) => Thread::group(group, &self.ctx.me),
         };
         self.open(Box::new(screen), oldest);
     }
@@ -914,7 +914,7 @@ impl App {
             Some(Conversation::Agent(name)) => {
                 Thread::agent(&name, &self.ctx.me, self.ctx.now.clone())
             }
-            Some(Conversation::Group(name)) => Thread::group(&name),
+            Some(Conversation::Group(name)) => Thread::group(&name, &self.ctx.me),
             None => Thread::feed(),
         };
         self.open_at(Box::new(screen), true, Opening::SeekWith(id, rows));
@@ -1117,7 +1117,7 @@ impl App {
             Some(Conversation::Agent(name)) => {
                 Thread::agent(&name, &self.ctx.me, self.ctx.now.clone())
             }
-            Some(Conversation::Group(name)) => Thread::group(&name),
+            Some(Conversation::Group(name)) => Thread::group(&name, &self.ctx.me),
             None => Thread::feed(),
         };
         self.open_at(
@@ -1757,7 +1757,7 @@ mod tests {
         enter(&mut app);
         let (group, _) = watched(&mut rx);
         assert_eq!(rx.try_recv().unwrap(), Request::Groups);
-        key(&mut app, 'i');
+        // A group opens writing.
         typed(&mut app, "group draft");
         press(&mut app, KeyCode::Left, KeyModifiers::NONE);
         inbox_rows(&mut app, &[("Zed", 1, "2026-10-18T12:00:00Z")]);
@@ -1773,7 +1773,6 @@ mod tests {
         assert_eq!(req.group.as_deref(), Some("crew"));
         assert_eq!(rx.try_recv().unwrap(), Request::Groups);
         assert_eq!(opened(&app), Some(Conversation::Group("crew".into())));
-        key(&mut app, 'i');
         typed(&mut app, "X");
         enter(&mut app);
         let Request::Send { req, .. } = rx.try_recv().unwrap() else {
@@ -1782,6 +1781,121 @@ mod tests {
         assert_eq!(req.body, "group drafXt");
         assert_eq!(req.to, "@crew");
         assert_eq!(app.stack.len(), 3, "menu, Groups and exactly one thread");
+    }
+
+    #[test]
+    fn a_group_thread_renders_mail_as_conversation_cards() {
+        use crate::ui::theme::{Scheme, testing::with_scheme};
+        let sent = |m: &proto::Message| {
+            chrono::DateTime::parse_from_rfc3339(&m.created_at)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %-I:%M:%S%P")
+                .to_string()
+        };
+        for scheme in Scheme::ALL {
+            with_scheme(scheme, || {
+                let (mut app, mut rx) = app();
+                crew_list(&mut app, &mut rx);
+                enter(&mut app);
+                let (group, _) = watched(&mut rx);
+                assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+                let mut mine = proto::Message {
+                    to_name: None,
+                    to_group: Some("crew".into()),
+                    ..at(10, "01", "ada", "", "my-broadcast")
+                };
+                mine.from_kind = proto::Kind::Human as i32;
+                let theirs = proto::Message {
+                    from_owner: Some("ada".into()),
+                    to_name: None,
+                    to_group: Some("crew".into()),
+                    ..at(11, "02", "Zoe", "", "zoe-answer")
+                };
+                let theirs_sent = sent(&theirs);
+                app.on_event(Event::Data(Data::Feed {
+                    id: group,
+                    result: Ok(vec![mine, theirs]),
+                }));
+                for width in [60, 80] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                    terminal.draw(|f| app.draw(f)).unwrap();
+                    let buf = terminal.backend().buffer();
+                    crate::ui::theme::testing::assert_buffer(buf);
+                    let text =
+                        |y: u16| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>();
+                    let row = |needle: &str| {
+                        (0..24)
+                            .find(|&y| text(y).contains(needle))
+                            .unwrap_or_else(|| panic!("{needle}"))
+                    };
+                    let bg = |role| theme::base().patch(theme::style(role)).bg.unwrap();
+                    // The human's own broadcast: a headerless reply card,
+                    // with no one reader to call it unread.
+                    let own = row("my-broadcast");
+                    assert!(!text(own - 1).contains("ada"), "{}", text(own - 1));
+                    assert!((0..24).all(|y| !text(y).contains("unread")));
+                    assert_eq!(buf[(width - 1, own)].bg, bg(theme::Role::HumanSurface));
+                    // Another member's: a side card naming its sender, with
+                    // the local send time.
+                    let header = row("Zoe → @crew");
+                    assert_eq!(buf[(0, header)].symbol(), "•");
+                    assert!(text(header).contains(&theirs_sent), "{}", text(header));
+                    assert!(
+                        (0..width).all(
+                            |x| buf[(x, header)].bg == bg(theme::Role::GroupConversationHeader)
+                        )
+                    );
+                    let body = row("zoe-answer");
+                    assert!(
+                        (0..width).all(|x| buf[(x, body)].bg == bg(theme::Role::GroupConversation))
+                    );
+                }
+                // Searching highlights inside the side card.
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                key(&mut app, '/');
+                typed(&mut app, "zoe-answer");
+                enter(&mut app);
+                let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let buf = terminal.backend().buffer();
+                let body = (0..24u16)
+                    .find(|&y| {
+                        (0..80u16)
+                            .map(|x| buf[(x, y)].symbol())
+                            .collect::<String>()
+                            .starts_with("  zoe-answer")
+                    })
+                    .unwrap();
+                let plain = theme::base().patch(theme::style(theme::Role::GroupConversation));
+                let z = &buf[(2, body)];
+                assert_eq!(z.symbol(), "z");
+                assert!(
+                    z.modifier != plain.add_modifier || Some(z.fg) != plain.fg,
+                    "the hit stands out: {z:?}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn a_group_opens_writing_and_esc_steps_to_its_admin_keys_and_back() {
+        let (mut app, mut rx) = app();
+        crew_list(&mut app, &mut rx);
+        enter(&mut app);
+        watched(&mut rx);
+        assert_eq!(rx.try_recv().unwrap(), Request::Groups);
+        assert!(editor_focused(&mut app), "a group opens writing");
+        typed(&mut app, "c");
+        assert!(rx.try_recv().is_err(), "c is text while writing");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!editor_focused(&mut app));
+        assert_eq!(app.stack.len(), 3, "Esc leaves the composer, not the group");
+        key(&mut app, 'i');
+        assert!(editor_focused(&mut app), "i writes again");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.stack.len(), 2, "Esc again returns to Groups");
     }
 
     fn inbox_rows(app: &mut App, rows: &[(&str, u32, &str)]) {
@@ -3115,8 +3229,10 @@ mod tests {
                 "unrelated modifiers cannot set effort"
             );
         }
-        app.open(Box::new(Thread::group("crew")), true);
+        app.open(Box::new(Thread::group("crew", "ada")), true);
         while rx.try_recv().is_ok() {}
+        // From navigation, Tab writes again.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         assert!(
             editor_focused(&mut app),
@@ -3149,7 +3265,7 @@ mod tests {
         assert!(row.contains("No effort configuration"), "{row}");
         assert!(rx.try_recv().is_err());
         assert_eq!(app.top().draft().unwrap().1.text, ",.");
-        app.open(Box::new(Thread::group("crew")), true);
+        app.open(Box::new(Thread::group("crew", "ada")), true);
         while rx.try_recv().is_ok() {}
         app.on_action(Action::EffortUp);
         assert!(rx.try_recv().is_err());
@@ -3765,6 +3881,8 @@ mod tests {
         // And the group list, for the describe dialog.
         assert_eq!(rx.try_recv().unwrap(), Request::Groups);
         assert!(screen(&mut app, 80, 24).contains("@crew"));
+        assert!(editor_focused(&mut app), "a group opens writing");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         key(&mut app, 'q');
         rx.try_recv().unwrap();
         key(&mut app, 'q');
@@ -6823,7 +6941,6 @@ mod tests {
             }
             let (old, _) = watched(&mut rx);
             if group {
-                key(&mut app, 'i');
                 typed(&mut app, "group draft");
             }
             let (feed, act) = refresh_requests(&mut app, &mut rx, KeyCode::F(5));
@@ -8006,7 +8123,8 @@ mod tests {
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
         assert!(bottom(&mut app).contains("blockers-mine.v1"));
         assert!(!screen(&mut app, 80, 24).contains("Answering"));
-        key(&mut app, 'r');
+        // The group is writing: F5 reloads.
+        press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
         assert!(blocker_poll(&mut app, &mut rx).is_some());
     }
 
@@ -8821,7 +8939,6 @@ mod tests {
             enter(app);
             watched(rx);
             assert_eq!(rx.try_recv().unwrap(), Request::Groups);
-            key(app, 'i');
         };
         let (mut first, mut rx) = persistent_app(dir.path());
         open_group(&mut first, &mut rx);
@@ -8838,7 +8955,6 @@ mod tests {
         enter(&mut next);
         watched(&mut rx);
         assert_eq!(rx.try_recv().unwrap(), Request::Groups);
-        key(&mut next, 'i');
         press(&mut next, KeyCode::Char('7'), KeyModifiers::CONTROL);
         enter(&mut next);
         let Request::Send { req, .. } = rx.try_recv().unwrap() else {
@@ -9377,6 +9493,8 @@ mod tests {
                 ..Default::default()
             }],
         }))));
+        // The group opens writing; its dialogs are for navigation.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         // Creating is for the Groups list.
         key(&mut app, 'c');
         assert!(!screen(&mut app, 80, 24).contains("Create a group"));
@@ -10756,6 +10874,12 @@ mod tests {
                         !out.contains("mail from")
                             && !out.contains("thmtz")
                             && !out.contains("[2026-"),
+                        "{out}"
+                    );
+                    // Only the group's own thread dates group mail.
+                    assert!(
+                        !out.lines()
+                            .any(|l| l.contains("Zoe → @nw-api") && l.contains("2026-")),
                         "{out}"
                     );
                     for width in [80, 120] {

@@ -457,6 +457,18 @@ impl Thread {
             .as_ref()
             .map(Stream::first_appearances)
             .unwrap_or_default();
+        // A group's thread reads like a conversation: the viewer's own mail
+        // as their cards, everyone else's as side cards keeping who sent it
+        // and when.
+        let group = self.group.is_some();
+        let own = |m: &Message| {
+            group
+                && m.from_kind() == proto::Kind::Human
+                && self
+                    .human
+                    .as_ref()
+                    .is_some_and(|h| m.from_name.eq_ignore_ascii_case(h))
+        };
         messages
             .iter()
             .cloned()
@@ -465,7 +477,7 @@ impl Thread {
                     .direct_from_human(&m)
                     .then(|| seen.get(&m.id).cloned())
                     .flatten(),
-                headerless: self.direct_to_human(&m) || self.direct_from_human(&m),
+                headerless: self.direct_to_human(&m) || self.direct_from_human(&m) || own(&m),
                 recipient: if m.to_owner.is_some()
                     || self.agent.as_ref().is_some_and(|a| {
                         m.to_name
@@ -482,8 +494,9 @@ impl Thread {
                 } else {
                     None
                 },
-                outgoing: self.direct_from_human(&m),
-                other_participants: self.other_participants(&m),
+                outgoing: self.direct_from_human(&m) || own(&m),
+                other_participants: self.other_participants(&m) || (group && !own(&m)),
+                timed: group,
                 gap: self.message_gaps.contains(&m.id),
                 message: m,
             })
@@ -595,7 +608,9 @@ impl Thread {
     }
 
     /// Broadcasts to `group`.
-    pub fn group(group: &str) -> Thread {
+    /// A group's broadcasts, as `human` writes and reads them; writing
+    /// first, as an agent's conversation opens.
+    pub fn group(group: &str, human: &str) -> Thread {
         let req = FeedRequest {
             group: Some(group.to_string()),
             ..Default::default()
@@ -608,6 +623,8 @@ impl Thread {
         };
         thread.group = Some((listed, GroupAdmin::default()));
         thread.draft_key = Some(format!("group:{}", group.to_ascii_lowercase()));
+        thread.human = Some(human.to_string());
+        thread.composing = true;
         thread
     }
 
@@ -891,7 +908,7 @@ mod status_tests {
 
     #[test]
     fn group_and_feed_page_keys_keep_moving_a_whole_view() {
-        for mut thread in [super::Thread::group("ops"), super::Thread::feed()] {
+        for mut thread in [super::Thread::group("ops", "ada"), super::Thread::feed()] {
             for (height, jump) in [(30, 30), (24, 24), (2, 2), (1, 1), (0, 1)] {
                 thread.view.layout(80, height);
                 assert_eq!(thread.jump(), jump, "height {height}");
@@ -2354,7 +2371,7 @@ mod seek_tests {
     fn seeking_pauses_at_a_seeded_message_which_glows_then_fades() {
         let (millis, now) = clock();
         let ctx = ctx(now.clone());
-        let mut thread = Thread::group("crew");
+        let mut thread = Thread::group("crew", "ada");
         thread.now = now;
         thread.seed_messages(&(1..=120).map(to_crew).collect::<Vec<_>>());
         assert!(!thread.seek_message(999), "not held");
@@ -2473,7 +2490,7 @@ mod seek_tests {
         let (_, now) = clock();
         let ctx = ctx(now.clone());
         let rows: Vec<_> = (1..=100).map(to_crew).collect();
-        let mut first = Thread::group("crew");
+        let mut first = Thread::group("crew", "ada");
         first.now = now.clone();
         feed(&mut first, rows.clone());
         draw(&mut first, &ctx);
@@ -2484,7 +2501,7 @@ mod seek_tests {
         let before = draw(&mut first, &ctx);
         // Reopened: filters, search and mode now; the place once its row is
         // held, even arriving after the restore.
-        let mut again = Thread::group("crew");
+        let mut again = Thread::group("crew", "ada");
         again.now = now.clone();
         again.restore_view(saved.clone());
         assert!(again.view.following() && again.composing);
@@ -2500,18 +2517,18 @@ mod seek_tests {
         }
         assert_eq!(again.saved_view(), saved);
         // A key before the row arrives means the reader has moved on.
-        let mut moved = Thread::group("crew");
+        let mut moved = Thread::group("crew", "ada");
         moved.now = now.clone();
         moved.restore_view(saved);
         moved.raw_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         feed(&mut moved, rows.clone());
         assert!(moved.view.following());
         // A following view restores as following.
-        let mut tail = Thread::group("crew");
+        let mut tail = Thread::group("crew", "ada");
         tail.now = now;
         feed(&mut tail, rows.clone());
         let following = tail.saved_view();
-        let mut back = Thread::group("crew");
+        let mut back = Thread::group("crew", "ada");
         back.restore_view(following);
         feed(&mut back, rows);
         assert!(back.view.following());
@@ -2765,7 +2782,7 @@ mod seek_tests {
             });
         };
         // A group: the hit stays drawn, the error moves to the status line.
-        let mut group = Thread::group("crew");
+        let mut group = Thread::group("crew", "ada");
         group.now = now.clone();
         group.seed_messages(&(1..=40).map(to_crew).collect::<Vec<_>>());
         assert!(group.seek_message(12));
@@ -2785,12 +2802,13 @@ mod seek_tests {
         let bar = agent.bottom_status(80, &ctx, None).unwrap().to_string();
         assert!(bar.contains("connection refused"), "{bar}");
         // Without a seek, an error still takes the timeline's place.
-        let mut plain = Thread::group("crew");
+        let mut plain = Thread::group("crew", "ada");
         plain.now = now;
         plain.seed_messages(&(1..=40).map(to_crew).collect::<Vec<_>>());
         failed(&mut plain);
         let out = draw(&mut plain, &ctx);
         assert!(find(&out, "message 12 ").is_none());
-        assert!(find(&out, "r or F5 reloads").is_some());
+        // Writing, as a group opens: F5 reloads.
+        assert!(find(&out, "F5 reloads").is_some(), "{out:?}");
     }
 }

@@ -40,8 +40,11 @@ pub enum Entry {
         headerless: bool,
         recipient: Option<proto::Kind>,
         outgoing: bool,
-        /// Side conversations and group mail, only in an agent conversation.
+        /// Side conversations and group mail in an agent conversation, and
+        /// everyone else's mail in a group's.
         other_participants: bool,
+        /// A group's own thread shows group mail's send time too.
+        timed: bool,
         /// A possible gap in the raw feed before this visible message.
         gap: bool,
     },
@@ -113,13 +116,14 @@ impl Entry {
                 recipient,
                 outgoing,
                 other_participants,
+                timed,
                 gap: raw_gap,
                 ..
             } => {
                 let mut lines = if *headerless {
                     compact_message_lines(message, gap || *raw_gap, query, width)
                 } else if *other_participants {
-                    side_message_lines(message, gap || *raw_gap, query, *recipient, width)
+                    side_message_lines(message, gap || *raw_gap, query, *recipient, width, *timed)
                 } else {
                     message_lines_with_recipient_at(
                         message,
@@ -135,12 +139,15 @@ impl Entry {
                     }
                     // Until the agent reads it, the bottom padding says so,
                     // inset from the right as the body is from the left.
-                    lines.push(if *headerless && message.read_at.is_none() {
-                        Line::styled("unread  ", theme::style(theme::Role::HumanNote))
-                            .right_aligned()
-                    } else {
-                        Line::default()
-                    });
+                    // Group mail has no one reader to say it.
+                    lines.push(
+                        if *headerless && message.read_at.is_none() && message.to_group.is_none() {
+                            Line::styled("unread  ", theme::style(theme::Role::HumanNote))
+                                .right_aligned()
+                        } else {
+                            Line::default()
+                        },
+                    );
                     for line in &mut lines {
                         line.style = theme::style(theme::Role::HumanSurface).patch(line.style);
                     }
@@ -256,6 +263,7 @@ impl Row for Entry {
             other_participants: true,
             message,
             recipient,
+            timed,
             gap: raw_gap,
             ..
         } = self
@@ -268,7 +276,7 @@ impl Row for Entry {
                 .line_count(width)
         };
         let prefix_height = measure(message_prefix(gap || *raw_gap));
-        let header_height = measure(side_header(message, query, *recipient, Some(width)));
+        let header_height = measure(side_header(message, query, *recipient, Some(width), *timed));
         let surface = theme::style(conversation_roles(message).1);
         let mut gutter = vec![Line::default(); prefix_height];
         for index in 0..header_height {
@@ -933,6 +941,7 @@ mod tests {
             recipient: None,
             outgoing: false,
             other_participants: false,
+            timed: false,
             gap: false,
         };
         let delivered_key = delivered.key();
@@ -1414,6 +1423,7 @@ mod tests {
                     recipient: Some(proto::Kind::Agent),
                     outgoing: false,
                     other_participants: false,
+                    timed: false,
                     gap: false,
                 };
                 let mut view = ThreadView::new(vec![entry], 100);
@@ -1502,6 +1512,7 @@ mod tests {
                         recipient: Some(proto::Kind::Agent),
                         outgoing: false,
                         other_participants: true,
+                        timed: false,
                         gap: true,
                     };
                     let mut view = ThreadView::new(vec![side], 100);
@@ -1589,6 +1600,7 @@ mod tests {
                     recipient: Some(proto::Kind::Agent),
                     outgoing: false,
                     other_participants: true,
+                    timed: false,
                     gap: false,
                 };
                 let mut view = ThreadView::new(vec![side], 100);
@@ -1649,6 +1661,7 @@ mod tests {
             recipient: Some(proto::Kind::Agent),
             outgoing: false,
             other_participants: true,
+            timed: false,
             gap: false,
         };
         let sent = chrono::DateTime::parse_from_rfc3339("2026-10-17T03:30:00Z")
@@ -1991,6 +2004,7 @@ mod tests {
                     },
                     outgoing,
                     other_participants: false,
+                    timed: false,
                     headerless: compact,
                     gap: false,
                 };
@@ -2164,6 +2178,7 @@ mod tests {
                         outgoing,
                         recipient: Some(proto::Kind::Agent),
                         other_participants: side,
+                        timed: false,
                         gap: false,
                     });
                 }
