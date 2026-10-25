@@ -10,6 +10,15 @@ under the new package version and its publication date.
 
 ### Changed
 
+- `bbs connect` blockers are a page of their own, like Agents and Groups:
+  `[B]lockers` on the main menu, or `F2` from any screen, which returns to the
+  page rather than opening another. `Ctrl-p` works over it, and a conversation
+  opened from it, by Ctrl-P or `[discuss with AGENT]`, opens over the page, so
+  `Esc` comes back to it. `F2` from a changed note stores it first.
+- `bbs connect` group threads open with the composer active, and lay out
+  messages as agent conversations do: your own broadcasts as reply cards, and
+  other members' as side cards naming the sender, with the local send time.
+
 - The `bbs connect` blocker card keeps the warning surface for its title bar and
   list only, then leaves a blank row before the selected blocker, which reads
   like a reply in a conversation: its details, recipient and actions sit on the

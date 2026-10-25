@@ -19,6 +19,7 @@ use super::launcher::{self, Picker, Target};
 use super::navigation::{Conversation, Feedback, History, Inbox};
 use super::notes::{self, NoteEditor, NoteStore};
 use super::preferences::Preferences;
+use super::screens::blockers::BlockersPage;
 use super::screens::help::Help;
 use super::screens::menu::Menu;
 use super::screens::thread::Thread;
@@ -86,6 +87,10 @@ pub trait Screen {
     }
     fn conversation(&self) -> Option<Conversation> {
         None
+    }
+    /// The blockers page, which the app draws and keys itself.
+    fn is_blockers(&self) -> bool {
+        false
     }
     fn is_thread(&self) -> bool {
         false
@@ -315,11 +320,8 @@ enum Navigation {
         destination: Option<Conversation>,
         rows: Vec<crate::proto::Message>,
     },
-    /// A blocker creator's conversation, if that agent is still live.
-    Discuss {
-        id: i64,
-        name: String,
-    },
+    /// The blockers page.
+    Blockers,
 }
 
 /// `[1 blocker · F2]`, `[3 blockers · F2]`: the human's open blockers.
@@ -464,11 +466,7 @@ impl App {
     fn viewed(&mut self) {
         // Covered screens still receive data, but nothing under a modal or
         // the note editor is viewed.
-        if self.blockers.is_open()
-            || self.picker.is_some()
-            || self.note_editor.is_some()
-            || self.pending_hit.is_some()
-        {
+        if self.picker.is_some() || self.note_editor.is_some() || self.pending_hit.is_some() {
             return;
         }
         let screen = self.stack.last_mut().expect("the menu is never popped");
@@ -554,6 +552,12 @@ impl App {
 
     /// Apply one event; `true` quits.
     pub fn on_event(&mut self, event: Event) -> bool {
+        let quit = self.apply_event(event);
+        self.sync_blockers();
+        quit
+    }
+
+    fn apply_event(&mut self, event: Event) -> bool {
         // The human moved on: a stored result still opening gives way.
         if matches!(event, Event::Key(_) | Event::Paste(_)) && self.pending_hit.take().is_some() {
             self.ctx.navigation_notice = None;
@@ -614,7 +618,7 @@ impl App {
                     return false;
                 }
                 self.ctx.navigation_notice = None;
-                if self.blockers.is_open() {
+                if self.on_blockers() {
                     self.blockers.paste(&text);
                     return false;
                 }
@@ -999,10 +1003,7 @@ impl App {
     /// that very agent, by its stable id, is still the live one of its name.
     fn discuss(&mut self, id: i64, name: &str) {
         match self.creator_live(id, name) {
-            Ok(()) => self.navigate(Navigation::Discuss {
-                id,
-                name: name.to_string(),
-            }),
+            Ok(()) => self.launch(Target::Agent(name.to_string())),
             Err(notice) => self.ctx.navigation_notice = Some(Feedback::Other(notice)),
         }
     }
@@ -1025,9 +1026,6 @@ impl App {
 
     /// Go somewhere from a modal, storing an open, changed note first.
     fn navigate(&mut self, to: Navigation) {
-        // A chosen destination leaves the blocker card, including any cancel
-        // confirmation. Cancelling the picker never reaches this path.
-        self.blockers.close();
         if let Some(editor) = &mut self.note_editor {
             // As Esc would: store a changed note before leaving it.
             self.pending_navigation = Some(to);
@@ -1040,8 +1038,6 @@ impl App {
         }
     }
 
-    /// Arrive; a discussion checks its agent again, as it may have changed
-    /// while a note was saving.
     fn go(&mut self, to: Navigation) {
         match to {
             Navigation::Launch(target) => self.launch(target),
@@ -1050,10 +1046,42 @@ impl App {
                 destination,
                 rows,
             } => self.open_stored(id, destination, rows),
-            Navigation::Discuss { id, name } => match self.creator_live(id, &name) {
-                Ok(()) => self.launch(Target::Agent(name)),
-                Err(notice) => self.ctx.navigation_notice = Some(Feedback::Other(notice)),
-            },
+            Navigation::Blockers => self.show_blockers(),
+        }
+    }
+
+    fn on_blockers(&self) -> bool {
+        self.stack.last().is_some_and(|s| s.is_blockers())
+    }
+
+    /// The blockers page, never twice: back to it if it is open beneath.
+    fn show_blockers(&mut self) {
+        self.ctx.navigation_notice = None;
+        if let Err(why) = self.blockers.open((self.ctx.now)()) {
+            self.ctx.navigation_notice = Some(Feedback::Other(why));
+            return;
+        }
+        match self.stack.iter().rposition(|s| s.is_blockers()) {
+            Some(at) => {
+                while self.stack.len() > at + 1 {
+                    self.pop();
+                }
+            }
+            None => self.stack.push(Box::new(BlockersPage)),
+        }
+    }
+
+    /// The queue's panel is open exactly while its page is on top: covered,
+    /// it remembers its place and drafts; uncovered, it opens there again.
+    fn sync_blockers(&mut self) {
+        let shown = self.on_blockers();
+        if shown && !self.blockers.is_open() {
+            if let Err(why) = self.blockers.open((self.ctx.now)()) {
+                self.pop();
+                self.ctx.navigation_notice = Some(Feedback::Other(why));
+            }
+        } else if !shown && self.blockers.is_open() {
+            self.blockers.close();
         }
     }
 
@@ -1127,13 +1155,14 @@ impl App {
         );
     }
 
-    /// F2 and the open blocker modal, ahead of every screen: `Some(quit)`
-    /// when the key was theirs.
+    /// F2, and every key on the blockers page, ahead of the keymap:
+    /// `Some(quit)` when the key was theirs.
     fn blocker_key(&mut self, key: KeyEvent) -> Option<bool> {
         let now = (self.ctx.now)();
-        if self.blockers.is_open() {
+        if self.on_blockers() {
             if self.blockers.settle(now) {
-                // The goodbye has shown: the key belongs to the screen again.
+                // The goodbye has shown: the key belongs to the screen beneath.
+                self.pop();
                 self.viewed();
                 return None;
             }
@@ -1145,6 +1174,7 @@ impl App {
                     false
                 }
                 blockers::Outcome::Close => {
+                    self.pop();
                     self.viewed();
                     false
                 }
@@ -1161,10 +1191,9 @@ impl App {
             return None;
         }
         self.keymap = Keymap::default();
-        self.ctx.navigation_notice = None;
-        if let Err(why) = self.blockers.open(now) {
-            self.ctx.navigation_notice = Some(Feedback::Other(why));
-        }
+        // An open note is stored first, as for any destination.
+        self.navigate(Navigation::Blockers);
+        self.viewed();
         Some(false)
     }
 
@@ -1444,6 +1473,7 @@ impl App {
                 self.ctx.preferences.set_theme(scheme);
             }
             Transition::Compact(compact) => self.ctx.preferences.set_compact(compact),
+            Transition::Push(screen) if screen.is_blockers() => self.show_blockers(),
             Transition::Push(screen) => self.push(screen),
             Transition::Pop if self.stack.len() > 1 => self.pop(),
             Transition::Request(request) => self.send(vec![request]),
@@ -1462,8 +1492,10 @@ impl App {
             return;
         }
         let now = (self.ctx.now)();
+        self.sync_blockers();
         if self.blockers.settle(now) {
-            // The goodbye has shown: back to the screen it covered.
+            // The goodbye has shown: back to the screen beneath the page.
+            self.pop();
             self.viewed();
         }
         self.ctx.blocker_marker = self.blockers.count().map(blocker_marker);
@@ -1477,6 +1509,10 @@ impl App {
             frame.render_widget(Paragraph::new(theme::title_bar(screen.title_line())), title);
         }
         screen.render(frame, body, &self.ctx);
+        if screen.is_blockers() {
+            self.blockers.render(frame, body, now);
+        }
+        let screen = self.stack.last_mut().expect("the menu is never popped");
         let bar = theme::status_bar(&self.ctx.me);
         if let Some(line) = screen.bottom_status(status.width, &self.ctx, self.draft_store.error())
         {
@@ -1534,13 +1570,6 @@ impl App {
         if let Some(editor) = &mut self.note_editor {
             frame.render_widget(ratatui::widgets::Clear, frame.area());
             editor.render(frame, frame.area());
-        }
-        // The blocker modal covers the whole terminal; the screen beneath is
-        // drawn as it is, untouched.
-        if self.blockers.is_open() {
-            // Clear first: styling alone would leave the screen's text.
-            frame.render_widget(ratatui::widgets::Clear, frame.area());
-            self.blockers.render(frame, frame.area(), now);
         }
         if let Some(picker) = &mut self.picker {
             picker.render(
@@ -2434,7 +2463,7 @@ mod tests {
             assert!(screen(&mut app, 80, 24).contains("Main menu"));
             assert!(rx.try_recv().is_err(), "Config makes no backend requests");
             // Also open through the normal menu selection rather than its hotkey.
-            for _ in 0..3 {
+            for _ in 0..4 {
                 key(&mut app, 'j');
             }
             enter(&mut app);
@@ -3443,7 +3472,13 @@ mod tests {
         assert_eq!(used[0], height / 2 - 21 / 2, "{out}");
         assert_eq!(*used.last().unwrap(), used[0] + 20, "{out}");
         let keys = [
-            "[A]gents", "[G]roups", "[F]eed", "[C]onfig", "[?]", "[Q]uit",
+            "[A]gents",
+            "[G]roups",
+            "[B]lockers",
+            "[F]eed",
+            "[C]onfig",
+            "[?]",
+            "[Q]uit",
         ];
         let column = |row: &str, item: &str| row[..row.find(item).unwrap()].chars().count();
         let mut starts = Vec::new();
@@ -3458,7 +3493,7 @@ mod tests {
             let visible = width - left - right;
             assert_eq!(left, width / 2 - visible / 2, "row {y}: {out}");
         }
-        assert_eq!(starts.len(), 6, "{out}");
+        assert_eq!(starts.len(), 7, "{out}");
         assert!(starts.iter().all(|k| *k == starts[0]), "{starts:?}: {out}");
         // The padded items, `▶ ` included, are centred as one block.
         let widest = rows
@@ -8071,6 +8106,58 @@ mod tests {
         id
     }
 
+    #[test]
+    fn blockers_is_a_page_from_the_menu_or_f2_and_never_opens_twice() {
+        for width in [60, 80] {
+            let (mut app, mut rx) = app();
+            queue(&mut app, &mut rx, vec![grove_asks()]);
+            live(&mut app, &[("Grove", 8)]);
+            key(&mut app, 'b');
+            assert!(app.on_blockers());
+            let out = screen(&mut app, width, 24);
+            assert!(out.contains("BBS · Blockers"), "{out}");
+            assert!(out.contains("Answering a blocker from Grove"), "{out}");
+            crate::ui::theme::testing::assert_buffer(&buffer(&mut app, width));
+            // F2 on the page goes back, as Esc does.
+            press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+            assert_eq!(app.stack.len(), 1);
+            assert!(screen(&mut app, width, 24).contains("[B]lockers"));
+            // From a conversation opened over the page, F2 returns to it.
+            press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+            typed(&mut app, "draft");
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            enter(&mut app);
+            assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
+            press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+            assert!(app.on_blockers());
+            assert_eq!(app.stack.len(), 2, "menu and the one page");
+            assert!(screen(&mut app, width, 24).contains("draft"));
+        }
+    }
+
+    #[test]
+    fn ctrl_p_over_the_blockers_page_cancels_back_to_it_or_opens_over_it() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        live(&mut app, &[("Mateo", 7), ("Grove", 8)]);
+        queue(&mut app, &mut rx, vec![grove_asks()]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        typed(&mut app, "half");
+        let before = buffer(&mut app, 80);
+        ctrl(&mut app, 'p');
+        assert!(screen(&mut app, 80, 24).contains("Go to · cached data"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(buffer(&mut app, 80), before);
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("Grove".into()));
+        enter(&mut app);
+        assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
+        assert!(app.stack[app.stack.len() - 2].is_blockers());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.on_blockers());
+        assert!(screen(&mut app, 80, 24).contains("half"));
+    }
+
     fn buffer(app: &mut App, width: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
@@ -8123,6 +8210,7 @@ mod tests {
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
         assert!(bottom(&mut app).contains("blockers-mine.v1"));
         assert!(!screen(&mut app, 80, 24).contains("Answering"));
+        assert!(!app.stack.iter().any(|s| s.is_blockers()), "no page");
         // The group is writing: F5 reloads.
         press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
         assert!(blocker_poll(&mut app, &mut rx).is_some());
@@ -8360,7 +8448,13 @@ mod tests {
             key: req.request_key,
             result: Ok(Default::default()),
         }));
-        assert_eq!(draft_text(&mut app), "parent", "the inputs never mix");
+        // The page says goodbye over the conversation beneath it.
+        let beneath = &app.stack[app.stack.len() - 2];
+        assert_eq!(
+            beneath.composer_text().as_deref(),
+            Some("parent"),
+            "the inputs never mix"
+        );
     }
 
     #[test]
@@ -8469,17 +8563,13 @@ mod tests {
             id: feed,
             result: Ok(vec![message(1, "Mateo", "ada", "arrived while covered")]),
         }));
-        // Its side state is still polled.
+        // Covered by the blockers page, as by any screen: nothing is read.
         app.on_event(Event::Tick);
         let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             !sent
                 .iter()
                 .any(|r| matches!(r, Request::MarkRead(_) | Request::MarkSeen { .. })),
-            "{sent:?}"
-        );
-        assert!(
-            sent.iter().any(|r| matches!(r, Request::SideReport { .. })),
             "{sent:?}"
         );
         // Closing uncovers it: read now, and shown.
@@ -12149,13 +12239,16 @@ mod tests {
                     f3(&mut app);
                 }
                 if overlay != "notes" {
+                    // F2 closes an unchanged note and opens the page.
                     queue(&mut app, &mut rx, vec![grove_asks()]);
                     press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+                    assert!(app.on_blockers(), "{overlay}");
                 }
                 ctrl(&mut app, 'p');
                 assert!(app.picker.is_some(), "{overlay}");
                 press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-                assert_eq!(app.note_editor.is_some(), overlay != "blockers");
+                assert_eq!(app.note_editor.is_some(), overlay == "notes");
+                assert_eq!(app.on_blockers(), overlay != "notes");
                 assert_eq!(app.blockers.is_open(), overlay != "notes");
                 ctrl(&mut app, 'p');
                 app.on_event(Event::Paste(query.into()));
@@ -12332,7 +12425,7 @@ mod tests {
     }
 
     #[test]
-    fn f2_and_ctrl_p_cover_the_note_editor_and_come_back_to_it() {
+    fn ctrl_p_covers_the_note_editor_and_f2_stores_it_before_the_page() {
         let (mut app, mut rx) = app();
         mateo(&mut app, &mut rx);
         notes_ready(&mut app, &mut rx, vec![]);
@@ -12344,11 +12437,28 @@ mod tests {
         assert!(screen(&mut app, 80, 24).contains("Go to · cached data"));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(buffer(&mut app, 80), before);
+        // F2 goes to the blockers page as to any destination: a changed
+        // note is stored first, and stays open if it cannot be.
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        let (save, _, body) = note_put(&mut rx).expect("saved first");
+        assert_eq!(body, "half");
+        assert!(!app.on_blockers());
+        app.on_event(Event::Data(Data::NoteSaved {
+            id: save,
+            result: Err(SideError::Refused("no".into())),
+        }));
+        assert_eq!(note_text(&app).as_deref(), Some("half"));
+        assert!(!app.on_blockers());
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        let (save, _, body) = note_put(&mut rx).expect("saved again");
+        app.on_event(Event::Data(Data::NoteSaved {
+            id: save,
+            result: Ok(agent_note(7, "Mateo", &body, 1)),
+        }));
+        assert!(app.note_editor.is_none());
         assert!(screen(&mut app, 80, 24).contains("Answering a blocker from Zed"));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(buffer(&mut app, 80), before);
-        assert_eq!(note_text(&app).as_deref(), Some("half"));
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
     }
 
     #[test]
@@ -12828,45 +12938,21 @@ mod tests {
     }
 
     #[test]
-    fn discussing_a_blocker_over_a_changed_note_saves_the_note_first() {
+    fn discussing_a_blocker_opens_its_agent_over_the_page_and_esc_returns() {
         let (mut app, mut rx) = app();
         mateo(&mut app, &mut rx);
         notes_ready(&mut app, &mut rx, vec![]);
         queue(&mut app, &mut rx, vec![grove_asks()]);
-        f3(&mut app);
-        typed(&mut app, "x");
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        typed(&mut app, "half");
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(!app.blockers.is_open());
-        let (save, _, body) = note_put(&mut rx).expect("the note is saved first");
-        assert_eq!(body, "x");
-        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
-        app.on_event(Event::Data(Data::NoteSaved {
-            id: save,
-            result: Ok(agent_note(7, "Mateo", "x", 1)),
-        }));
-        assert!(app.note_editor.is_none());
         assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
-        // A failed save keeps the note and drops the discussion.
-        let (mut app, mut rx) = self::app();
-        mateo(&mut app, &mut rx);
-        notes_ready(&mut app, &mut rx, vec![agent_note(7, "Mateo", "x", 1)]);
-        queue(&mut app, &mut rx, vec![grove_asks()]);
-        f3(&mut app);
-        typed(&mut app, "y");
-        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        let (save, ..) = note_put(&mut rx).expect("the note is saved first");
-        app.on_event(Event::Data(Data::NoteSaved {
-            id: save,
-            result: Err(SideError::Refused("no".into())),
-        }));
-        assert_eq!(note_text(&app).as_deref(), Some("yx"));
-        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        assert!(!app.blockers.is_open());
+        assert!(app.stack[app.stack.len() - 2].is_blockers());
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        assert!(app.on_blockers());
+        assert!(screen(&mut app, 80, 24).contains("half"));
     }
 
     /// Discussing Mateo's blocker (creator id 101) after `setup` opens
@@ -12955,35 +13041,6 @@ mod tests {
             let requests = app.ctx.inbox.restart();
             app.send(requests);
         });
-    }
-
-    #[test]
-    fn a_creator_replaced_while_the_note_saves_is_not_opened_after_all() {
-        let (mut app, mut rx) = app();
-        mateo(&mut app, &mut rx);
-        notes_ready(&mut app, &mut rx, vec![]);
-        queue(&mut app, &mut rx, vec![grove_asks()]);
-        f3(&mut app);
-        typed(&mut app, "x");
-        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        let (save, ..) = note_put(&mut rx).expect("the note is saved first");
-        // Grove 8 retires and a new Grove takes the name meanwhile.
-        live(&mut app, &[("Mateo", 7), ("Grove", 88)]);
-        app.on_event(Event::Data(Data::NoteSaved {
-            id: save,
-            result: Ok(agent_note(7, "Mateo", "x", 1)),
-        }));
-        assert!(app.note_editor.is_none(), "the note closed as asked");
-        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
-        assert_eq!(
-            app.ctx
-                .navigation_notice
-                .as_ref()
-                .map(|n| n.text().to_string()),
-            Some("Grove, who asked this, is no longer live.".into())
-        );
     }
 
     /// A stored history in `dir`: messages 1..=n between Mateo (7) and ada,

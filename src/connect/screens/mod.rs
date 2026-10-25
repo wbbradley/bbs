@@ -1,6 +1,7 @@
 //! The app's screens.
 
 pub mod agents;
+pub mod blockers;
 pub mod config;
 pub mod groups;
 pub mod help;

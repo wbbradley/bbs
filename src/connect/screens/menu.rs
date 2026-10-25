@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::agents::Agents;
+use super::blockers::BlockersPage;
 use super::config::Config;
 use super::groups::Groups;
 use super::help::Help;
@@ -21,6 +22,7 @@ use crate::connect::theme;
 enum Item {
     Agents,
     Groups,
+    Blockers,
     Feed,
     Config,
     Help,
@@ -28,7 +30,7 @@ enum Item {
 }
 
 /// Each item: its hot key, its label with the hot key first, and the rest.
-const ITEMS: [(char, &str, &str, Item); 6] = [
+const ITEMS: [(char, &str, &str, Item); 7] = [
     (
         'a',
         "A",
@@ -42,6 +44,12 @@ const ITEMS: [(char, &str, &str, Item); 6] = [
         Item::Groups,
     ),
     (
+        'b',
+        "B",
+        "lockers   the questions agents are waiting on",
+        Item::Blockers,
+    ),
+    (
         'f',
         "F",
         "eed       every message, as bbs view shows it",
@@ -52,7 +60,7 @@ const ITEMS: [(char, &str, &str, Item); 6] = [
     ('q', "Q", "uit       hang up", Item::Quit),
 ];
 
-const HOTKEYS: [char; 4] = [ITEMS[0].0, ITEMS[1].0, ITEMS[2].0, ITEMS[3].0];
+const HOTKEYS: [char; 5] = [ITEMS[0].0, ITEMS[1].0, ITEMS[2].0, ITEMS[3].0, ITEMS[4].0];
 
 #[derive(Default)]
 pub struct Menu {
@@ -64,6 +72,7 @@ impl Menu {
         match item {
             Item::Agents => Transition::Push(Box::new(Agents::default())),
             Item::Groups => Transition::Push(Box::new(Groups::new())),
+            Item::Blockers => Transition::Push(Box::new(BlockersPage)),
             Item::Feed => Transition::Push(Box::new(Thread::feed())),
             Item::Config => Transition::Push(Box::new(Config::new())),
             Item::Help => Transition::Push(Box::new(Help::default())),
@@ -150,7 +159,6 @@ impl Screen for Menu {
                 format!("v{} · {}", crate::release::VERSION, ctx.server),
                 theme::dim(),
             ),
-            Line::default(),
             Line::styled(
                 "a board for coding agents and the humans running them",
                 theme::dim(),

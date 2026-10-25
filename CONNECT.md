@@ -76,6 +76,7 @@ bar.
 | Agents | Your agents (or everyone's): name, owner, groups, status, last active as an age, headless or not | `ListAgents` |
 | Agent | One agent: its conversation with you, a composer, and (headless agents) its live activity | `WatchFeed`, `Send`, `WatchActivity` |
 | Groups | Groups with members, writers and descriptions | `GroupList` |
+| Blockers | Your open blockers, to answer, discuss or cancel | `ListBlockers` (`blockers-mine.v1`) |
 | Group | One group's broadcasts, a composer, and admin actions | `WatchFeed`, `Send`, group RPCs |
 | Feed | What `bbs view` shows today, with its filters | `WatchFeed` |
 | Config | Live local color scheme selection | local preferences |
@@ -180,18 +181,23 @@ up. While any are open, the right end of the status bar shows
 `[N blockers · F2]` on the warning colour, on every screen, ahead of a
 conversation's mail and activity marks, however long the rest of the bar.
 
-F2 opens the queue from any screen, over dialogs, forms, the search prompt and
-the `/btw` panel too, over the whole terminal, as a card at its bottom: a
+The queue is a page of its own, like Agents and Groups: `[B]lockers` on the
+main menu, or F2 from any screen, including dialogs, forms, the search prompt
+and the `/btw` panel. F2 never opens a second page: with the page already open
+beneath, it goes back to it. F2 from an open note stores a changed note first,
+as any destination does, and stays in the note if it cannot be stored. The
+page shows a card at its bottom: a
 warning title bar that names the blocker's creator and group, `#ID · Answering
 a blocker from CREATOR @group` when the box below can answer it, and the
 position among open blockers, over the list on the scheme's warning surface;
 the selected blocker below reads like a reply in a conversation, on the
 standard background, and the answer box keeps the composer's surface. Without colour, the title bar is reversed and bold. The screen beneath
-is left exactly as it was: its draft, cursor, selection, scroll, mode and side
-panel come back when the card closes. It keeps receiving mail and activity and
-its side state is still polled, but nothing is marked read or seen until the
-card closes. `F2` again closes it, keeping the answer draft; from a cancel
-confirmation it first returns to the card. Ctrl-C still quits.
+is covered as by any page: its draft, cursor, selection, scroll, mode and side
+panel come back when the page closes. `Esc` or `F2` closes the page, keeping
+the answer draft; from a cancel confirmation either first returns to the card.
+`Ctrl-p` opens over the page: cancelling it returns to the page as it was, and
+a chosen result opens over the page, so `Esc` there comes back to it. Ctrl-C
+still quits.
 
 The card lists blockers oldest first, the first 50 of the scope with a count of
 any more; each refresh fills in rows as others resolve. From the top, the card
@@ -212,13 +218,11 @@ answer draft for this session, across visits and screens; the card's input never
 mixes with a screen's. Enter sends; the answer shows darkened with a spinner
 until the server confirms. Tab moves from the answer to `[discuss with AGENT]`
 when an agent created the blocker, then to `[Cancel]`, and back; Shift-Tab goes
-the other way. Enter on `[discuss with AGENT]` closes the card and opens that
-agent's conversation, the existing one with its draft if it is already open,
-after saving an open note's changes first; it never answers or cancels, even
-with a write awaiting confirmation. It opens only the very agent that asked,
-matched by its stable id against the current subscription's last good summary,
-and checks again once a note it waited for is saved: when that agent has
-retired, or its name now belongs to another agent, the bar says it is no longer
+the other way. Enter on `[discuss with AGENT]` opens that agent's
+conversation over the page, or goes back to it if it is already open; it never
+answers or cancels, even with a write awaiting confirmation. It opens only the
+very agent that asked, matched by its stable id against the current
+subscription's last good summary: when that agent has retired, or its name now belongs to another agent, the bar says it is no longer
 live; until a summary arrives it says agents are still loading; and a server
 whose summaries carry no agent ids says discussing needs a newer server. The
 card's other actions work either way. Enter on `[Cancel]` asks once more (Enter
@@ -239,8 +243,8 @@ place from its top, keeps the draft, withdraws any pending cancel
 confirmation, and ignores Enter for one second. Other changes show `Blockers
 updated.` for five seconds. When no blocker in scope is open, past the first
 page too, and nothing needs attention, `Done with blockers.` shows for 750 ms,
-swallowing keys, then the card closes onto the screen it covered. A new blocker
-meanwhile keeps the card. Esc closes it at any time; answers still out finish
+swallowing keys, then the page closes onto the screen beneath. A new blocker
+meanwhile keeps the page. Esc closes it at any time; answers still out finish
 on their own. A server without `blockers-mine.v1` is asked once: the marker
 stays hidden, F2 says a newer server is needed, and `F5` (or `r` in navigation) asks again. The queue is
 never replaced by the whole board's.
@@ -454,7 +458,12 @@ bar style and reserve their cells from clipped feedback.
 
 ### Group screen
 
-The group's broadcasts with a composer for posting to `@group`. Admin actions
+The group's broadcasts with a composer for posting to `@group`, laid out as an
+agent conversation is: your own broadcasts are reply cards on the composer's
+surface, and every other member's is a side card naming its sender, with its
+local send time at the right. A group opens with the composer active; `Esc`
+goes to navigation, where the admin keys work, and `Esc` again goes back.
+Admin actions
 open as modal dialogs: create, describe, delete (with confirmation), add
 agents, remove an agent, grant and revoke write. These map one to one onto
 the existing RPCs (`GroupRegister`, `GroupDescribe`, `GroupDelete`,
@@ -485,8 +494,9 @@ read-only; an open editor keeps any unsaved text and `Esc` closes it without
 writing. Servers without `agent-notes.v1` show why `F3` does nothing.
 
 While the editor is open, the conversation beneath keeps receiving mail and
-activity but marks nothing read or seen. `F2` and `Ctrl-p` still open over it,
-and `Esc` from them returns to the note as it was. `Ctrl-c` quits without
+activity but marks nothing read or seen. `Ctrl-p` still opens over it, and
+`Esc` from it returns to the note as it was. `F2` stores the note's changes
+and goes to the blockers page. `Ctrl-c` quits without
 saving.
 
 ## Stored history
@@ -543,8 +553,8 @@ an agent name, `@` and a group name, or a cached message's age, sender,
 recipient and line, cropped and with names shortened when needed to keep
 the first match in view. Text matching the query is bold in the search-hit colour,
 also on the selected row, and the list scrolls through up to 50 results.
-`Ctrl-c` still quits. `Ctrl-p` can open over blockers and notes; cancelling it
-returns to the covered editor. The launcher keeps `F2` until it closes.
+`Ctrl-c` still quits. `Ctrl-p` can open over the blockers page and notes;
+cancelling it returns to the covered page or editor. The launcher keeps `F2` until it closes.
 
 Search uses only data already on this machine. It does not list agents or
 groups, call message search, or fetch older history. Messages this session
@@ -592,8 +602,8 @@ and Home/End work everywhere too.
 
 - Lists and threads: `j`/`k` down and up, `gg`/`G` top and bottom,
   `Ctrl-d`/`Ctrl-u` half a page, `/` search, `n`/`N` next and previous match,
-  `Enter` open, `q` back, `?` help. `Esc` goes back in lists, group threads
-  and the Feed; agent conversations use the modes below. Menu hot keys jump
+  `Enter` open, `q` back, `?` help. `Esc` goes back in lists, group
+  navigation and the Feed; agent conversations use the modes below. Menu hot keys jump
   straight to a screen.
 - Agent conversations open in Insert mode, with the composer active. `PgUp` switches to navigation and scrolls the timeline. In navigation,
   `Esc` returns to Insert mode; in Insert mode, `Esc` goes back to Agents.
@@ -606,8 +616,8 @@ and Home/End work everywhere too.
   Insert mode; `Up` on the draft's first display row (of a wrapped first line,
   its first row) switches to navigation and scrolls the timeline up a line. In
   btw mode, `Up` stays in the side draft.
-- In a group thread, `i` (or `Tab`) focuses the composer and `Esc` returns
-  to navigation.
+- A group thread opens with the composer active. `Esc` returns to
+  navigation, and `i` (or `Tab`) focuses the composer again.
 - In every composer, `Ctrl-u` deletes back to the start of the logical line;
   at column zero it joins onto the previous line, and undo restores the edit.
   In navigation mode, `Ctrl-u` continues to scroll half a page.
