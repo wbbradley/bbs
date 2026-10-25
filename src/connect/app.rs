@@ -1050,10 +1050,15 @@ impl App {
     }
 
     /// Bring the screen at `at` to the top. What is above it closes, unless
-    /// the blockers page is: then the screen moves above the page, which
-    /// stays beneath it for Esc to come back to.
+    /// the blockers page is: then what is above the page closes, and the
+    /// screen moves just above the page, which stays for Esc to come back to.
     fn raise(&mut self, at: usize) {
-        if self.stack[at + 1..].iter().any(|s| s.is_blockers()) {
+        if let Some(page) = self.stack.iter().rposition(|s| s.is_blockers())
+            && page > at
+        {
+            while self.stack.len() > page + 1 {
+                self.pop();
+            }
             let screen = self.stack.remove(at);
             self.stack.push(screen);
             return;
@@ -8224,6 +8229,46 @@ mod tests {
                 .any(|r| matches!(r, Request::AnswerBlocker { .. })),
             "{sent:?}"
         );
+    }
+
+    #[test]
+    fn a_conversation_raised_from_beneath_the_page_replaces_one_over_it() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        live(&mut app, &[("Mateo", 7), ("Grove", 8)]);
+        typed(&mut app, "mateo draft");
+        queue(&mut app, &mut rx, vec![grove_asks()]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        let depth = app.stack.len();
+        let choose = |app: &mut App, name: &str| {
+            ctrl(app, 'p');
+            app.on_event(Event::Paste(name.into()));
+            enter(app);
+        };
+        choose(&mut app, "Grove");
+        assert_eq!(opened(&app), Some(Conversation::Agent("Grove".into())));
+        typed(&mut app, "grove draft");
+        while rx.try_recv().is_ok() {}
+        choose(&mut app, "Mateo");
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        assert_eq!(draft_text(&mut app), "mateo draft");
+        // Grove closed as a replaced conversation does, its draft saved; the
+        // page is just beneath Mateo, and nothing is watched twice.
+        assert_eq!(app.stack.len(), depth);
+        assert!(app.stack[depth - 2].is_blockers());
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            sent.iter().any(|r| matches!(r, Request::Unwatch(_))),
+            "{sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|r| matches!(r, Request::Watch { .. })),
+            "{sent:?}"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.on_blockers());
+        choose(&mut app, "Grove");
+        assert_eq!(draft_text(&mut app), "grove draft");
     }
 
     fn buffer(app: &mut App, width: u16) -> ratatui::buffer::Buffer {
