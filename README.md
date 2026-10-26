@@ -338,6 +338,13 @@ proxy (the session cookie is then `Secure`; the proxy must pass the original
 `Host`), or an `http://` address only on a network that is private and
 encrypted, such as a tailnet.
 
+Each tab shares one event stream for its live views. For many open tabs,
+use an HTTPS proxy that speaks HTTP/2 to browsers; HTTP/1.1 browsers have a
+small connection pool that long-lived streams can fill. Serve the page and
+API on the same origin, disable buffering for `/api/events`, and allow long
+stream idle times. The backend itself can remain HTTP/1.1. `/healthz`, with
+the configured `Host`, checks the web listener; gRPC health alone does not.
+
 The browser keeps unsent drafts, unsaved note text and blocker answers whose
 outcome is not yet confirmed for the signed-in human only: another human signing
 in on the same browser never sees them in the page. They stay in the browser's
