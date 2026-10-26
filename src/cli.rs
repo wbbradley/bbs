@@ -119,6 +119,11 @@ pub enum Command {
         /// Address to listen on.
         #[arg(long, default_value = "127.0.0.1:7777")]
         listen: std::net::SocketAddr,
+        /// Also serve the web UI for humans on this address (for example
+        /// 127.0.0.1:7778). Humans sign in with their name and human token.
+        /// Needs a build with the `web` feature.
+        #[arg(long, value_name = "ADDR")]
+        web: Option<std::net::SocketAddr>,
         /// Directory holding bbs.db (default: ~/.local/state/bbs).
         #[arg(long)]
         state_dir: Option<std::path::PathBuf>,

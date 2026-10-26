@@ -71,6 +71,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::Serve {
             listen,
+            web,
             state_dir,
             require_human_token,
             minimum_client_version,
@@ -80,6 +81,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         } => {
             return crate::serve::run(
                 *listen,
+                *web,
                 state_dir.as_deref().unwrap_or(&dir),
                 *require_human_token,
                 crate::protocol::Policy::new(

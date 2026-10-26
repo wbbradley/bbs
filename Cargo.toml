@@ -18,10 +18,15 @@ include = [
     "/migrations",
     "/proto",
     "/src",
+    "/web/dist",
     "/CHANGELOG.md",
     "/LICENSE",
     "/README.md",
 ]
+
+[features]
+# `bbs serve --web`: the browser UI, built with npm from web/ (see README).
+web = ["dep:axum"]
 
 [[bin]]
 name = "bbs"
@@ -29,6 +34,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"], optional = true }
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
 data-encoding = "2.11.1"

@@ -13,8 +13,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      # The web feature builds the page with npm; msrv tests the default build.
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --features web
       - name: Build container
         run: docker build --build-arg BBS_BUILD_REVISION="$GITHUB_SHA" --build-arg BBS_BUILD_DIRTY=false -t bbs:test .
       - name: Test restricted container

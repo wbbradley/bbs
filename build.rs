@@ -13,12 +13,27 @@ const INPUTS: &[&str] = &[
     "build.rs",
     "Cargo.toml",
     "Cargo.lock",
+    "web/src",
+    "web/index.html",
+    "web/package.json",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // protox compiles the proto in pure Rust, so the build needs no `protoc`.
     let fds = protox::compile(["proto/bbs.proto"], ["proto"])?;
-    tonic_prost_build::configure().compile_fds(fds)?;
+    let web = std::env::var_os("CARGO_FEATURE_WEB").is_some();
+    let mut proto = tonic_prost_build::configure();
+    if web {
+        // The web UI's JSON API carries these messages with their proto field names.
+        proto = proto.message_attribute(
+            ".",
+            "#[derive(serde::Serialize, serde::Deserialize)] #[serde(default)]",
+        );
+    }
+    proto.compile_fds(fds)?;
+    if web {
+        embed_web_assets()?;
+    }
     for path in INPUTS {
         println!("cargo:rerun-if-changed={path}");
     }
@@ -59,6 +74,125 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cargo:rustc-env=BBS_BUILD_TARGET={}",
         std::env::var("TARGET")?
     );
+    Ok(())
+}
+
+/// Embed the web UI (the `web` feature) as `(path, bytes)` pairs. From a
+/// source checkout, build it with npm into `OUT_DIR`; the build fails without
+/// npm. `BBS_WEB_DIST` names a bundle built elsewhere instead (the container
+/// build), and a published package, which ships no web sources, embeds the
+/// `web/dist` it was packaged with.
+fn embed_web_assets() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").ok_or("no manifest dir")?);
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").ok_or("no OUT_DIR")?);
+    let web = manifest.join("web");
+    println!("cargo:rerun-if-env-changed=BBS_WEB_DIST");
+    let dist = if let Some(dist) = std::env::var_os("BBS_WEB_DIST") {
+        let dist = PathBuf::from(dist);
+        println!("cargo:rerun-if-changed={}", dist.display());
+        dist
+    } else if web.join("package.json").is_file() {
+        const INPUTS: &[&str] = &[
+            "web/src",
+            "web/public",
+            "web/index.html",
+            "web/package.json",
+            "web/package-lock.json",
+            "web/vite.config.ts",
+            "web/tsconfig.json",
+            "assets/connect/logo.txt",
+        ];
+        for path in INPUTS {
+            println!("cargo:rerun-if-changed={path}");
+        }
+        // This script also reruns for Rust changes; only web changes rebuild.
+        let dist = out_dir.join("web-dist");
+        let built = newest(&dist.join("index.html"));
+        let inputs = INPUTS
+            .iter()
+            .filter_map(|p| newest(&manifest.join(p)))
+            .max();
+        if built.is_none() || built < inputs {
+            npm_build(&web, &dist)?;
+        }
+        dist
+    } else {
+        println!("cargo:rerun-if-changed=web/dist");
+        web.join("dist")
+    };
+    if !dist.join("index.html").is_file() {
+        return Err(format!("no web UI build at {}", dist.display()).into());
+    }
+    let mut files = Vec::new();
+    collect(&dist, &dist, &mut files)?;
+    files.sort();
+    let mut out = String::from("pub static ASSETS: &[(&str, &[u8])] = &[\n");
+    for (rel, path) in files {
+        out.push_str(&format!("    ({rel:?}, include_bytes!({path:?})),\n"));
+    }
+    out.push_str("];\n");
+    std::fs::write(out_dir.join("web_assets.rs"), out)?;
+    Ok(())
+}
+
+/// The newest modification time of a file or anything under a directory.
+fn newest(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_dir() {
+        return meta.modified().ok();
+    }
+    std::fs::read_dir(path)
+        .ok()?
+        .filter_map(|e| newest(&e.ok()?.path()))
+        .max()
+}
+
+/// `npm ci` when the installed packages are missing or older than the lock
+/// file, then type-check and bundle into `out`.
+fn npm_build(
+    web: &std::path::Path,
+    out: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let installed = modified(&web.join("node_modules/.package-lock.json"));
+    if installed.is_none() || installed < modified(&web.join("package-lock.json")) {
+        npm(web, &["ci", "--no-audit", "--no-fund"])?;
+    }
+    let out = out.to_str().ok_or("OUT_DIR is not UTF-8")?;
+    npm(
+        web,
+        &["run", "build", "--", "--outDir", out, "--emptyOutDir"],
+    )
+}
+
+fn npm(web: &std::path::Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new("npm")
+        .args(args)
+        .current_dir(web)
+        // Cargo reads build-script stdout as directives; keep npm's on stderr.
+        .stdout(std::process::Stdio::from(std::io::stderr()))
+        .status()
+        .map_err(|e| format!("the `web` feature needs npm (Node.js 20.19 or newer): {e}"))?;
+    if !status.success() {
+        return Err(format!("`npm {}` failed in {}", args.join(" "), web.display()).into());
+    }
+    Ok(())
+}
+
+fn collect(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    files: &mut Vec<(String, String)>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect(root, &path, files)?;
+        } else if let Ok(rel) = path.strip_prefix(root) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            files.push((rel, path.to_string_lossy().into_owned()));
+        }
+    }
     Ok(())
 }
 

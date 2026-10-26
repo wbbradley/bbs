@@ -24,6 +24,9 @@ use crate::proto::{self, Kind};
 use crate::protocol::Policy;
 use crate::service::{self, Caller, TimerLimits, Watched};
 
+#[cfg(feature = "web")]
+mod web;
+
 /// Keepalive pings let a vanished client free its waiter slot within ~30s.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -38,17 +41,24 @@ const ACTIVITY_BATCH_WAIT: Duration = Duration::from_millis(50);
 
 pub async fn run(
     listen: SocketAddr,
+    web: Option<SocketAddr>,
     dir: &Path,
     require_human_token: bool,
     protocol: Policy,
     timer_limits: TimerLimits,
 ) -> Result<()> {
+    if web.is_some() && !cfg!(feature = "web") {
+        anyhow::bail!(
+            "this bbs was built without the web UI; rebuild it with `cargo install --features web` (see README)"
+        );
+    }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut conn = db::open(&dir.join("bbs.db"))?;
     db::migrate(&mut conn)?;
     serve(
         conn,
         listen,
+        web,
         dir,
         require_human_token,
         protocol,
@@ -60,6 +70,7 @@ pub async fn run(
 async fn serve(
     conn: Connection,
     listen: SocketAddr,
+    web: Option<SocketAddr>,
     dir: &Path,
     require_human_token: bool,
     protocol: Policy,
@@ -70,6 +81,15 @@ async fn serve(
         .await
         .with_context(|| format!("binding {listen}"))?;
     let addr = listener.local_addr()?;
+    #[cfg_attr(not(feature = "web"), allow(unused_variables))]
+    let web_listener = match web {
+        Some(web) => Some(
+            tokio::net::TcpListener::bind(web)
+                .await
+                .with_context(|| format!("binding {web}"))?,
+        ),
+        None => None,
+    };
     let state = Arc::new(State {
         conn: Mutex::new(conn),
         notify: watch::Sender::new(0),
@@ -94,6 +114,20 @@ async fn serve(
     tokio::pin!(server);
     // Tests read this line to learn the port when listening on port 0.
     println!("bbs serve listening on {addr}");
+    #[cfg(feature = "web")]
+    if let Some(listener) = web_listener {
+        let web_addr = listener.local_addr()?;
+        println!("bbs serve web UI on http://{web_addr}");
+        tracing::info!(%web_addr, "serving web UI");
+        let stopping = state.clone();
+        let server = Server(state.clone());
+        tokio::spawn(async move {
+            let shutdown = async move { stopping.stopping().await };
+            if let Err(e) = web::serve(listener, server, shutdown).await {
+                tracing::error!("{e:#}");
+            }
+        });
+    }
     tracing::info!(%addr, state_dir = %dir.display(), "serving");
     tokio::select! {
         result = &mut server => result?,
@@ -465,6 +499,7 @@ impl Drop for Slot {
     }
 }
 
+#[cfg_attr(feature = "web", derive(Clone))]
 struct Server(Arc<State>);
 
 fn caller<T>(req: &Request<T>, require_human_token: bool) -> Caller {
