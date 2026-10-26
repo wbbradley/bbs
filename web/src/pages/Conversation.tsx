@@ -87,10 +87,15 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const messages = held.rows;
   // Activity is merged, never replaced: a reconnect's newest window joins
   // what is held, with a mark where records may be missing between.
+  // A reopened stream carries on after the newest record held, so nothing
+  // is missed or sent twice.
+  const newestActivity = useRef(0);
+  newestActivity.current = activityHeld.rows.at(-1)?.id ?? 0;
   const activity = useWatch<{ events: Activity[] }>(
     "activity",
     board.has("agent-activity.v1") ? { backlog: ACTIVITY_BACKLOG, agent } : null,
     (snap, fresh) => setActivityHeld((h) => mergeWindow(h, snap.events, fresh ? ACTIVITY_BACKLOG : Infinity)),
+    () => (newestActivity.current > 0 ? { backlog: ACTIVITY_BACKLOG, agent, after_id: newestActivity.current } : null),
   );
   const records = activityHeld.rows;
 

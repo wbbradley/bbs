@@ -93,6 +93,13 @@ interface Watcher {
 interface Watch {
   kind: string;
   q: unknown;
+  /**
+   * The request to reopen with, once the watch has been open: one that
+   * carries on from what is held (activity after its newest record), whose
+   * first snapshot then continues rather than starts afresh.
+   */
+  resume?: () => unknown | null;
+  opened?: boolean;
   watchers: Set<Watcher>;
   state: WatchState;
   /** The newest snapshot, for a view that joins a watch already live. */
@@ -130,8 +137,14 @@ const hub = (() => {
     for (const [, w] of active.slice(MAX_WATCHES)) tell(w, { state: "failed", error: "too many live views in this tab" });
     const subscribed = active.slice(0, MAX_WATCHES);
     if (subscribed.length === 0) return;
-    const fresh = new Set(subscribed.map(([key]) => key));
-    const s = JSON.stringify(subscribed.map(([key, w]) => ({ key, kind: w.kind, q: w.q })));
+    const fresh = new Set<string>();
+    const subs = subscribed.map(([key, w]) => {
+      const resumed = w.opened ? (w.resume?.() ?? null) : null;
+      if (resumed === null) fresh.add(key);
+      w.opened = true;
+      return { key, kind: w.kind, q: resumed ?? w.q };
+    });
+    const s = JSON.stringify(subs);
     const es = new EventSource(`/api/events?s=${encodeURIComponent(s)}`);
     source = es;
     es.onmessage = (e) => {
@@ -196,11 +209,11 @@ const hub = (() => {
   };
 
   return {
-    add(kind: string, q: unknown, watcher: Watcher): () => void {
+    add(kind: string, q: unknown, watcher: Watcher, resume?: () => unknown | null): () => void {
       const key = watchKey(kind, JSON.stringify(q));
       let w = watches.get(key);
       if (!w) {
-        w = { kind, q, watchers: new Set(), state: { state: "connecting" } };
+        w = { kind, q, resume, watchers: new Set(), state: { state: "connecting" } };
         watches.set(key, w);
         changed();
       }
@@ -228,19 +241,28 @@ export function useWatch<T>(
   kind: string,
   req: object | null,
   onSnapshot: (snapshot: T, fresh: boolean) => void,
+  /** The request to carry on with after a reopen, or null to start afresh. */
+  resume?: () => object | null,
 ): WatchState {
   const [state, setState] = useState<WatchState>({ state: "connecting" });
   const handler = useRef(onSnapshot);
   handler.current = onSnapshot;
+  const carryOn = useRef(resume);
+  carryOn.current = resume;
   const key = req === null ? null : JSON.stringify(req);
 
   useEffect(() => {
     if (key === null) return;
     setState({ state: "connecting" });
-    return hub.add(kind, JSON.parse(key), {
-      onSnapshot: (snapshot, fresh) => handler.current(snapshot as T, fresh),
-      onState: setState,
-    });
+    return hub.add(
+      kind,
+      JSON.parse(key),
+      {
+        onSnapshot: (snapshot, fresh) => handler.current(snapshot as T, fresh),
+        onState: setState,
+      },
+      () => carryOn.current?.() ?? null,
+    );
   }, [kind, key]);
 
   return state;
@@ -248,28 +270,31 @@ export function useWatch<T>(
 
 /**
  * The first snapshot of a watch, then the watch is closed: rows read once,
- * such as the context around one message. It uses its own short event
- * stream, so the page's live one is not reopened for it.
+ * such as the context around one message. It rides the page's one event
+ * stream for as long as it takes.
  */
 export function watchOnce<T>(kind: string, req: object, timeoutMs = 15000): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const key = "once";
-    const s = JSON.stringify([{ key, kind, q: req }]);
-    const source = new EventSource(`/api/events?s=${encodeURIComponent(s)}`);
+    let stop = () => {};
     const done = (f: () => void) => {
       window.clearTimeout(timer);
-      source.close();
+      stop();
       f();
     };
     const timer = window.setTimeout(() => done(() => reject(new ApiError("timed out", 0))), timeoutMs);
-    source.onmessage = (e) => done(() => resolve((JSON.parse(e.data) as { snapshot: T }).snapshot));
-    source.addEventListener("fail", (e) => {
-      const { error, status } = JSON.parse((e as MessageEvent).data);
-      done(() => {
-        if (status === 401) signedOut.forEach((f) => f());
-        reject(new ApiError(error, status));
-      });
+    let settled = false;
+    stop = hub.add(kind, req, {
+      onSnapshot: (snapshot) => {
+        if (settled) return;
+        settled = true;
+        // Leave the stream after this call returns, not while it delivers.
+        queueMicrotask(() => done(() => resolve(snapshot as T)));
+      },
+      onState: (state) => {
+        if (settled || state.state !== "failed") return;
+        settled = true;
+        queueMicrotask(() => done(() => reject(new ApiError(state.error, 400))));
+      },
     });
-    source.onerror = () => done(() => reject(new ApiError("connection lost", 0)));
   });
 }

@@ -1,6 +1,6 @@
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { onSignedOut, useWatch, watchKey, type WatchState } from "./api";
+import { onSignedOut, useWatch, watchKey, watchOnce, type WatchState } from "./api";
 
 /** EventSources the page opened, newest last. */
 class FakeSource {
@@ -36,8 +36,8 @@ interface Seen {
 }
 const seen = (): Seen => ({ snaps: [] });
 
-function View({ kind, q, seen }: { kind: string; q: object; seen: Seen }) {
-  seen.state = useWatch(kind, q, (snap, fresh) => seen.snaps.push([snap, fresh]));
+function View({ kind, q, seen, resume }: { kind: string; q: object; seen: Seen; resume?: () => object | null }) {
+  seen.state = useWatch(kind, q, (snap, fresh) => seen.snaps.push([snap, fresh]), resume);
   return null;
 }
 
@@ -131,5 +131,39 @@ describe("one event stream per tab", () => {
     expect(open()).toHaveLength(1);
     act(() => open()[0].send(watchKey("summary", "{}"), "back"));
     expect(a.snaps.at(-1)).toEqual(["back", true]);
+  });
+
+  it("carries a resumable watch on after what it holds when the stream reopens", async () => {
+    const a = seen();
+    render(<View kind="activity" q={{ agent: "Mateo", backlog: 200 }} seen={a} resume={() => ({ agent: "Mateo", backlog: 200, after_id: 41 })} />);
+    await settle();
+    expect(open()[0].subs[0].q).toEqual({ agent: "Mateo", backlog: 200 });
+    const key = open()[0].subs[0].key;
+    act(() => open()[0].send(key, "window"));
+    await act(async () => open()[0].onerror?.());
+    await act(async () => vi.advanceTimersByTime(1100));
+    expect(open()[0].subs[0].q).toEqual({ agent: "Mateo", backlog: 200, after_id: 41 });
+    act(() => open()[0].send(key, "more"));
+    // Carried on, not afresh.
+    expect(a.snaps).toEqual([
+      ["window", true],
+      ["more", false],
+    ]);
+  });
+
+  it("reads a one-shot over the same stream, then leaves it", async () => {
+    const a = seen();
+    render(<View kind="summary" q={{}} seen={a} />);
+    await settle();
+    let got: unknown;
+    void watchOnce("feed", { with: "Mateo", after_id: 49, backlog: 50 }).then((r) => (got = r));
+    await settle();
+    expect(FakeSource.all.filter((x) => !x.closed)).toHaveLength(1);
+    const once = open()[0].subs.find((x) => x.kind === "feed")!;
+    act(() => open()[0].send(once.key, { messages: [1] }));
+    await act(async () => {});
+    expect(got).toEqual({ messages: [1] });
+    await settle();
+    expect(open()[0].subs.map((x) => x.kind)).toEqual(["summary"]);
   });
 });
