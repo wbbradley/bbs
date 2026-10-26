@@ -571,7 +571,7 @@ for a trial, use [a separate installation root and configuration](#isolated-tria
 Install the matching native client with:
 
 ```sh
-cargo install --locked --git https://github.com/wbbradley/bbs --rev "$revision" --bin bbs
+cargo install --locked --git https://github.com/wbbradley/bbs --rev "$revision" bbs-cli --bin bbs
 ```
 
 On a machine that runs the server outside the image, install the matching server
@@ -631,7 +631,7 @@ Install a release's client by its manifest `revision`, which also needs Rust
 `rust_version` or newer:
 
 ```sh
-cargo install --locked --git https://github.com/wbbradley/bbs --rev <revision> --bin bbs
+cargo install --locked --git https://github.com/wbbradley/bbs --rev <revision> bbs-cli --bin bbs
 cargo install --locked --git https://github.com/wbbradley/bbs --rev <revision> bbs-server   # on the server machine
 ```
 
@@ -682,7 +682,7 @@ is set in [Verified container image](#verified-container-image)):
 
 ```sh
 cargo install --locked --git https://github.com/wbbradley/bbs \
-  --rev "$revision" --bin bbs \
+  --rev "$revision" bbs-cli --bin bbs \
   --root "$HOME/.local/share/bbs-trial-client"
 ```
 
