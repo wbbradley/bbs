@@ -18,7 +18,6 @@ def check():
     env.pop("BBS_WEB_DIST", None)
     env.pop("BBS_BUILD_REVISION", None)
     env.pop("BBS_BUILD_DIRTY", None)
-    target = Path(env.get("CARGO_TARGET_DIR", root / "target")).resolve()
     subprocess.run(
         # Cargo includes the ignored, generated bundle and therefore records
         # a dirty archive. Check source cleanliness separately above and keep
@@ -29,6 +28,7 @@ def check():
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"], cwd=root, env=env,
     ))
+    target = Path(metadata["target_directory"])
     package = next(p for p in metadata["packages"] if p["name"] == "bbs-cli")
     name = f"bbs-cli-{package['version']}"
     archive = target / "package" / f"{name}.crate"
