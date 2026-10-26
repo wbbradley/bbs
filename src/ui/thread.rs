@@ -15,8 +15,8 @@ use crate::ui::message::fold;
 
 /// Rows wrap this many columns narrower than their area, keeping text off
 /// the terminal's right edge. Ratatui's word wrap can still let a
-/// double-width character that ends a line, begun in the last column, take
-/// that column.
+/// double-width character that ends a word, begun in the last column, take
+/// that column, on any row.
 pub(crate) const RIGHT_MARGIN: u16 = 1;
 
 /// Loaded history kept while the view is open; the oldest rows are dropped
