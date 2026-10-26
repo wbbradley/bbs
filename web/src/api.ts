@@ -278,16 +278,16 @@ const hub = (() => {
   };
 })();
 
-/**
- * Follow a server watch stream (`feed`, `activity` or `summary`). Each
- * snapshot goes to `onSnapshot`, marked fresh when it is the first since
- * the stream (re)opened. All of a tab's watches share one event stream.
- */
 /** The key `kind` and `q` are watched under on this tab's stream, if any. */
 export function watchKey(kind: string, q: unknown): string | undefined {
   return hub.keyOf(kind, q);
 }
 
+/**
+ * Follow a server watch stream (`feed`, `activity` or `summary`). Each
+ * snapshot goes to `onSnapshot`, marked fresh when it is the first since
+ * the stream (re)opened. All of a tab's watches share one event stream.
+ */
 export function useWatch<T>(
   kind: string,
   req: object | null,

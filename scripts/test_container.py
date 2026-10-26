@@ -65,7 +65,7 @@ def check_web(address, token):
     with request("/api/rpc/whoami", {}, cookie) as response:
         require(json.load(response)["name"] == "webtester", "wrong HTTP identity")
     subscriptions = quote(json.dumps([{"key": "summary", "kind": "summary", "q": {}}]))
-    with request("/api/events?s=" + subscriptions, cookie=cookie) as response:
+    with request("/api/events?tab=container-test&s=" + subscriptions, cookie=cookie) as response:
         require("text/event-stream" in response.headers.get("Content-Type", ""), "missing SSE")
         require("no-store" in response.headers.get("Cache-Control", ""), "cached SSE")
         while True:
