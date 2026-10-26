@@ -1,5 +1,4 @@
 mod admin;
-// The shared core, under the names the CLI's modules have always used.
 use bbs_core::{auth, backend, db, proto, protocol, release, service};
 mod app;
 mod backup;

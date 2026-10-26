@@ -19,7 +19,9 @@ const INPUTS: &[&str] = &[
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     for path in INPUTS {
-        println!("cargo:rerun-if-changed={path}");
+        if std::path::Path::new(path).exists() {
+            println!("cargo:rerun-if-changed={path}");
+        }
     }
 
     // Builders without `.git`, such as the container build, pass the revision

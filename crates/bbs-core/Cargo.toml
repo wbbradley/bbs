@@ -29,12 +29,14 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.10"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tokio-stream = { version = "0.1.19", features = ["net", "time"] }
-tonic = "0.14.6"
+tonic = { version = "0.14.6", default-features = false, features = ["channel", "codegen"] }
 tonic-prost = "0.14.6"
 tracing = "0.1.44"
 unicode-segmentation = "1.13"
 
 [dev-dependencies]
+# Tests host fixture gRPC servers; normal client builds only need a channel.
+tonic = "0.14.6"
 http-body = "1.0"
 tempfile = "3.27"
 tokio = { version = "1.53", features = ["test-util"] }

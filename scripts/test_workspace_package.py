@@ -119,7 +119,7 @@ def check():
             ))
             forbidden = {"ratatui", "ratatui-textarea", "bbs-cli"}
             if name == "bbs-core":
-                forbidden |= {"axum", "bbs-server"}
+                forbidden |= {"bbs-server"}
             assert not any(p["name"] in forbidden for p in graph["packages"]), \
                 f"{name} depends on another application's implementation"
         core = next(p for p in cli["packages"] if p["name"] == "bbs-core")

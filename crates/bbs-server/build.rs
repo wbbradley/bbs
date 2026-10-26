@@ -8,17 +8,29 @@ mod identity;
 /// trigger rebuilds and define "dirty".
 const INPUTS: &[&str] = &[
     "src",
+    "web/dist",
     "build",
     "build.rs",
     "Cargo.toml",
     "../../Cargo.lock",
+    "../../Cargo.toml",
+    "../../web/src",
+    "../../web/public",
+    "../../web/index.html",
+    "../../web/package.json",
+    "../../web/package-lock.json",
+    "../../web/vite.config.ts",
+    "../../web/tsconfig.json",
+    "../../assets/connect/logo.txt",
     "../bbs-core",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     embed_web_assets()?;
     for path in INPUTS {
-        println!("cargo:rerun-if-changed={path}");
+        if std::path::Path::new(path).exists() {
+            println!("cargo:rerun-if-changed={path}");
+        }
     }
 
     // Builders without `.git`, such as the container build, pass the revision
