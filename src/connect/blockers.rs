@@ -25,7 +25,6 @@ pub const GUARD: Duration = Duration::from_secs(1);
 pub const NOTICE: Duration = Duration::from_secs(5);
 /// Why the queue is unavailable: the server lacks the personal scope.
 const UNSUPPORTED: &str = "Blockers need a newer server (blockers-mine.v1).";
-/// Blockers listed above the selected one's text.
 /// Refused blockers kept, with their drafts, after the server drops them.
 const KEPT_REFUSALS: usize = 20;
 
