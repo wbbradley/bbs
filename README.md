@@ -615,15 +615,17 @@ releases, so a published release's tag and manifest cannot change. Releases are
 not signed: trust rests on the repository's administrators and GitHub.
 
 The workflow publishes the crates to crates.io by trusted publishing, with no
-stored token: `bbs-core` first, then `bbs-server` and `bbs-cli`, which depend
+stored token: `bbs-core` first, then `bbs-cli` and `bbs-server`, which depend
 on it. crates.io accepts a trusted publisher only for a crate that already
-exists, so the first release that includes the new `bbs-core` and `bbs-server`
-needs a one-time bootstrap by a crate owner. Publish `bbs-core`, then
-`bbs-server`, by hand with an owner's API token from the release's qualified
-commit, then configure trusted publishing for both. Until both crates exist,
-the workflow stops before creating any tag or release, so there is never a
-half-published release. Every later release publishes all three from the
-workflow.
+exists, so the first release with the new `bbs-core` and `bbs-server` is made
+by hand, once, by a crate owner: from the release's qualified commit, publish
+all three in that order with an owner's API token, create the matching tag and
+GitHub release with its manifest at the same commit, and then configure
+trusted publishing for the two new crates. Do not run the workflow for that
+same version afterwards: its crates already exist, and nothing skips or
+retries a published crate. Before creating any tag, the workflow checks that
+both new crates exist and stops if not, and it still refuses a version already
+tagged or released. Every later version is released by the workflow.
 
 Install a release's client by its manifest `revision`, which also needs Rust
 `rust_version` or newer:
