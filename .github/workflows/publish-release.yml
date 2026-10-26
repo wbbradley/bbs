@@ -73,7 +73,13 @@ jobs:
           Source revision \`$GITHUB_SHA\`. Install this release's client with:
 
           \`\`\`sh
-          cargo install --locked --git https://github.com/wbbradley/bbs --rev $GITHUB_SHA --bin bbs
+          cargo install --locked --git https://github.com/wbbradley/bbs --rev $GITHUB_SHA bbs-cli --bin bbs
+          \`\`\`
+
+          On machines running the server outside the container, also install its matching executable:
+
+          \`\`\`sh
+          cargo install --locked --git https://github.com/wbbradley/bbs --rev $GITHUB_SHA bbs-server
           \`\`\`
 
           Over a client installed before the package was renamed \`bbs-cli\`, run \`cargo uninstall bbs\` once first.
