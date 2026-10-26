@@ -8486,6 +8486,50 @@ mod tests {
         assert!(app.on_blockers());
     }
 
+    #[test]
+    fn the_feed_names_mail_to_the_viewer_as_a_human_and_a_namesake_agent_as_an_agent() {
+        let (mut app, mut rx) = app();
+        key(&mut app, 'f');
+        let (feed, _) = watched(&mut rx);
+        app.on_event(Event::Data(Data::Feed {
+            id: feed,
+            result: Ok(vec![
+                message(1, "Mateo", "ADA", "to-the-viewer"),
+                proto::Message {
+                    to_owner: Some("will".into()),
+                    ..message(2, "Mateo", "ada", "to-a-namesake")
+                },
+            ]),
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let fg_of_recipient = |body: &str| {
+            let y = (0..24)
+                .find(|&y| {
+                    (0..80)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(body)
+                })
+                .unwrap();
+            // The first cell after "→ ", counted in cells.
+            let arrow = (0..80)
+                .find(|&x| buffer[(x, y - 1)].symbol() == "→")
+                .unwrap();
+            buffer[(arrow + 2, y - 1)].fg
+        };
+        let base = theme::base();
+        assert_eq!(
+            Some(fg_of_recipient("to-the-viewer")),
+            theme::style(theme::Role::Human).fg.or(base.fg)
+        );
+        assert_eq!(
+            Some(fg_of_recipient("to-a-namesake")),
+            theme::style(theme::Role::Agent).fg.or(base.fg)
+        );
+    }
+
     fn buffer(app: &mut App, width: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();

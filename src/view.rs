@@ -555,7 +555,31 @@ mod tests {
             Card::feed(to_me.clone(), Some("ada")).look.recipient,
             Some(Kind::Human)
         );
-        assert_eq!(Card::feed(to_me, None).look.recipient, None);
+        assert_eq!(Card::feed(to_me.clone(), None).look.recipient, None);
+        assert_eq!(
+            Card::feed(to_me.clone(), Some("ADA")).look.recipient,
+            Some(Kind::Human),
+            "case-insensitively"
+        );
+        // An agent that happens to share the name stays an agent; group mail
+        // has no one recipient.
+        let to_agent = Message {
+            to_owner: Some("will".into()),
+            ..to_me.clone()
+        };
+        assert_eq!(
+            Card::feed(to_agent.clone(), Some("ada")).look.recipient,
+            None
+        );
+        let look = Card::feed(to_agent.clone(), Some("ada")).look;
+        let agent = crate::ui::card::lines(&to_agent, look, false, None, None);
+        let name = agent[1].spans.iter().find(|s| s.content == "ada").unwrap();
+        assert_eq!(name.style.fg, theme::style(Role::Agent).fg);
+        let group = Message {
+            to_group: Some("crew".into()),
+            ..to_me
+        };
+        assert_eq!(Card::feed(group, Some("ada")).look.recipient, None);
         assert_eq!(
             Some(buffer[(69, at("hi"))].bg),
             bg(Role::OtherConversation),
