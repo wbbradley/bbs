@@ -7,17 +7,29 @@ use std::process::{Command, ExitCode};
 
 const SERVER: &str = "bbs-server";
 
+/// Whether `path` is a file this process may run.
+fn runnable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    path.is_file()
+}
+
 /// `bbs-server` beside this executable, as an install puts them, else on PATH.
 fn server() -> Option<PathBuf> {
     let name = format!("{SERVER}{}", std::env::consts::EXE_SUFFIX);
     let beside = std::env::current_exe()
         .ok()
         .and_then(|exe| Some(exe.parent()?.join(&name)))
-        .filter(|path| path.is_file());
+        .filter(|path| runnable(path));
     beside.or_else(|| {
         std::env::split_paths(&std::env::var_os("PATH")?)
             .map(|dir| dir.join(&name))
-            .find(|path| path.is_file())
+            .find(|path| runnable(path))
     })
 }
 
@@ -26,8 +38,8 @@ fn server() -> Option<PathBuf> {
 pub fn exec(args: &[OsString]) -> ExitCode {
     let Some(server) = server() else {
         eprintln!(
-            "bbs: `bbs serve` runs {SERVER}, which is not installed; install it with \
-             `cargo install {SERVER}` (add `--features web` for the web UI), beside `bbs`"
+            "bbs: `bbs serve` runs {SERVER}, which is not installed; install it beside `bbs` \
+             with `cargo install --locked {SERVER}`"
         );
         return ExitCode::FAILURE;
     };

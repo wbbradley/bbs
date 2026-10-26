@@ -1,4 +1,4 @@
-//! `bbs serve --web`: a browser UI for humans (the `web` feature). The page is
+//! `bbs serve --web`: a browser UI for humans. The page is
 //! a React app built from `web/` and embedded at build time; its JSON API calls the gRPC service
 //! in-process, so validation, authorization, the failure budget and streams
 //! are exactly the gRPC server's. Signing in checks a human name and token with

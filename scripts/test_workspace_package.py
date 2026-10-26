@@ -21,7 +21,7 @@ def check():
     check_source(root)
     expected_revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     env = dict(os.environ)
-    for key in ("BBS_WEB_DIST", "BBS_BUILD_REVISION", "BBS_BUILD_DIRTY"):
+    for key in ("BBS_BUILD_REVISION", "BBS_BUILD_DIRTY"):
         env.pop(key, None)
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"], cwd=root, env=env,

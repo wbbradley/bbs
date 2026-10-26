@@ -115,8 +115,9 @@ pub enum Command {
     /// Install the BBS hooks and skill for Claude Code and Codex.
     Setup(SetupArgs),
     /// Serve the BBS over gRPC, owning the database in the state directory.
-    /// Runs `bbs-server` (installed beside `bbs`, or on PATH) with these
-    /// arguments; `bbs serve --help` lists them.
+    /// Runs `bbs-server` (installed beside `bbs`, or on PATH) with the
+    /// arguments after `serve`; `bbs serve --help` lists them. Options given
+    /// to `bbs` itself, before `serve`, are not passed on.
     #[command(disable_help_flag = true)]
     Serve {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
