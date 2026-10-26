@@ -8,6 +8,17 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- The `bbs connect` blockers page splits into two halves that never move for
+  each other: the list at the foot of the top half, showing as many rows as
+  fit and scrolling only to keep the selection in view, and the selected
+  blocker, its answer and actions at the foot of the bottom half. The list's
+  title bar always reads `Open blockers`, and the list uses calm aqua
+  information colours instead of the warning yellow, which stays for real
+  warnings: cancel confirmations, unconfirmed writes, refusals, old servers
+  and the status bar's blocker count.
+
 ## 0.16.1 - 2026-10-25
 
 `bbs connect` refinements: blockers become a page of their own, and group

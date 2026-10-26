@@ -26,7 +26,6 @@ pub const NOTICE: Duration = Duration::from_secs(5);
 /// Why the queue is unavailable: the server lacks the personal scope.
 const UNSUPPORTED: &str = "Blockers need a newer server (blockers-mine.v1).";
 /// Blockers listed above the selected one's text.
-const LIST_ROWS: usize = 4;
 /// Refused blockers kept, with their drafts, after the server drops them.
 const KEPT_REFUSALS: usize = 20;
 
@@ -90,6 +89,9 @@ struct Panel {
     focus: Focus,
     /// Rows of the selected blocker's text scrolled past.
     scroll: u16,
+    /// The first list row in view: it moves only to keep the selection in
+    /// view, so the list stays put while the selection moves within it.
+    list_start: usize,
 }
 
 /// What a key did in the open panel.
@@ -199,6 +201,7 @@ impl Blockers {
             None => roots.first().copied(),
         };
         self.panel = Some(Panel {
+            list_start: 0,
             selected,
             focus: Focus::Answer,
             scroll: 0,
@@ -636,52 +639,24 @@ impl Blockers {
     fn lines_above(&self, width: u16) -> Vec<Line<'static>> {
         let Parts {
             mut head,
+            list,
+            more,
             selected,
             body,
             label,
         } = self.parts(width);
+        head.extend(list.into_iter().map(|(_, line)| line));
+        head.extend(more);
         head.extend(selected);
         head.extend(body);
         head.extend(label);
         head
     }
 
-    /// The card's title bar: whose blocker this is and whether the box below
-    /// answers it, with the keys at the right when they fit.
+    /// The list's title bar, the same whatever is selected, with the keys at
+    /// the right when they fit.
     fn title(&self, width: usize) -> Line<'static> {
-        let left = match self.selected() {
-            // A kept refusal is closed: it has no place in the open queue.
-            Some(row) if self.held.contains(&row.root_id) => {
-                format!(
-                    " #{} · Blocker from {} @{} · no longer open",
-                    row.id,
-                    creator(row),
-                    row.group
-                )
-            }
-            Some(row) => {
-                // The place among open rows, of the server's open count.
-                let at = self
-                    .rows
-                    .iter()
-                    .filter(|b| !self.held.contains(&b.root_id))
-                    .position(|b| b.root_id == row.root_id)
-                    .map_or(0, |i| i + 1);
-                let what = if row.can_answer {
-                    "Answering a blocker from"
-                } else {
-                    "Blocker from"
-                };
-                format!(
-                    " #{} · {what} {} @{} · {at} of {} open",
-                    row.id,
-                    creator(row),
-                    row.group,
-                    self.active
-                )
-            }
-            _ => " Blockers".to_string(),
-        };
+        let left = " Open blockers";
         // The keys at the right, shortened to the way out when narrow.
         let keys = [" Alt-↑/↓ · Tab · Esc ", " Esc "]
             .into_iter()
@@ -691,9 +666,9 @@ impl Blockers {
                 let gap = width - left.width() - keys.width();
                 format!("{left}{}{keys}", " ".repeat(gap))
             }
-            _ => left,
+            _ => left.to_string(),
         };
-        theme::clip_line(Line::raw(text), width).style(theme::style(Role::WarningTitle))
+        theme::clip_line(Line::raw(text), width).style(theme::style(Role::InfoTitle))
     }
 
     /// The header and list; the selected blocker restated, its text, which
@@ -733,12 +708,8 @@ impl Blockers {
                 ..Parts::default()
             };
         }
-        let at = panel
-            .selected
-            .and_then(|r| self.rows.iter().position(|b| b.root_id == r))
-            .unwrap_or(0);
-        let start = at.saturating_sub(LIST_ROWS - 1);
-        for row in self.rows.iter().skip(start).take(LIST_ROWS) {
+        let mut list = Vec::new();
+        for row in &self.rows {
             let chosen = panel.selected == Some(row.root_id);
             let mut line = Line::from(vec![
                 Span::raw(if chosen { "▸ " } else { "  " }),
@@ -752,21 +723,24 @@ impl Blockers {
             if chosen {
                 line = line.style(theme::style(Role::Selection));
             }
-            lines.push(theme::clip_line(line, width));
+            list.push((row.root_id, theme::clip_line(line, width)));
         }
-        let more = self.active.saturating_sub(self.rows.len() as u64);
-        if more > 0 {
-            lines.push(Line::styled(
-                format!("  + {more} more not shown"),
+        let mut more = Vec::new();
+        let unlisted = self.active.saturating_sub(self.rows.len() as u64);
+        if unlisted > 0 {
+            more.push(Line::styled(
+                format!("  + {unlisted} more not shown"),
                 theme::dim(),
             ));
         }
         if self.rows.is_empty() && self.active > 0 {
-            lines.push(Line::styled("Loading more…", theme::dim()));
+            more.push(Line::styled("Loading more…", theme::dim()));
         }
         let Some(row) = self.selected() else {
             return Parts {
                 head: lines,
+                list,
+                more,
                 ..Parts::default()
             };
         };
@@ -819,6 +793,8 @@ impl Blockers {
         };
         Parts {
             head: lines,
+            list,
+            more,
             selected: Some(theme::clip_line(selected, width)),
             body,
             label: Some(theme::clip_line(label, width)),
@@ -910,17 +886,66 @@ impl Blockers {
         Line::default()
     }
 
+    /// The list in the top half of `area`, the selected blocker and its
+    /// answer in the bottom half, each against its half's foot: neither half
+    /// moves for what the other holds.
     pub fn render(&mut self, frame: &mut Frame, area: Rect, now: Instant) {
         let Parts {
             head,
+            list,
+            more,
             selected,
             body,
             label,
         } = self.parts(area.width);
+        let [top, area] =
+            Layout::vertical([Constraint::Length(area.height / 2), Constraint::Fill(1)])
+                .areas(area);
+        frame.render_widget(ratatui::widgets::Block::new().style(theme::base()), top);
+        frame.render_widget(ratatui::widgets::Block::new().style(theme::base()), area);
+        // The top half: as many list rows as fit, the window moving only to
+        // keep the selection in view.
+        let room = usize::from(top.height).saturating_sub(head.len() + more.len());
+        let at = self
+            .panel
+            .as_ref()
+            .and_then(|p| p.selected)
+            .and_then(|r| list.iter().position(|(root, _)| *root == r))
+            .unwrap_or(0);
+        let start = match &mut self.panel {
+            Some(panel) => {
+                let mut start = panel.list_start.min(at);
+                if room > 0 && at >= start + room {
+                    start = at + 1 - room;
+                }
+                start = start.min(list.len().saturating_sub(room));
+                panel.list_start = start;
+                start
+            }
+            None => 0,
+        };
+        let shown_list = list.len().saturating_sub(start).min(room);
+        let head_rows = (head.len() + shown_list + more.len()).min(usize::from(top.height)) as u16;
+        let head_area = Rect {
+            y: top.bottom() - head_rows,
+            height: head_rows,
+            ..top
+        };
+        frame.render_widget(
+            ratatui::widgets::Block::new().style(theme::style(Role::InfoSurface)),
+            head_area,
+        );
+        let mut head: Vec<Line> = head;
+        head.extend(
+            list.into_iter()
+                .skip(start)
+                .take(shown_list)
+                .map(|(_, line)| line),
+        );
+        head.extend(more);
+        // The bottom half: the selected blocker, its text, who an answer goes
+        // to, the answer box and the actions, all against the foot.
         let below = self.lines_below(area.width, now);
-        let answer = self.answer_height(area.width);
-        // Keep the title, list and selected blocker together above the
-        // answer, with all spare rows above the card.
         let inset = area.width.min(2);
         let body = Paragraph::new(body).wrap(Wrap { trim: false });
         let rows = body.line_count(area.width - inset) as u16;
@@ -930,19 +955,20 @@ impl Blockers {
         let fixed = [
             label_gap,
             list_gap,
-            head.len() as u16,
             selected.iter().count() as u16,
             label.iter().count() as u16,
-            answer,
             below.len() as u16,
         ]
         .iter()
         .fold(0u16, |sum, rows| sum.saturating_add(*rows));
-        let room = area.height.saturating_sub(fixed);
-        let shown = rows.min(room.saturating_sub(1));
+        // A tall draft takes no more than the half has.
+        let answer = self
+            .answer_height(area.width)
+            .min(area.height.saturating_sub(fixed));
+        let room = area.height.saturating_sub(fixed + answer);
+        let shown = rows.min(room);
         let [
             _,
-            head_area,
             _,
             selected_area,
             body_area,
@@ -952,7 +978,6 @@ impl Blockers {
             bottom,
         ] = Layout::vertical([
             Constraint::Length(room - shown),
-            Constraint::Length(head.len() as u16),
             Constraint::Length(list_gap),
             Constraint::Length(selected.iter().count() as u16),
             Constraint::Length(shown),
@@ -962,14 +987,6 @@ impl Blockers {
             Constraint::Length(below.len() as u16),
         ])
         .areas(area);
-        // The selected blocker reads like a reply in a conversation, on the
-        // standard background; only the title bar and list carry the
-        // warning surface. The answer box keeps its own surface.
-        frame.render_widget(ratatui::widgets::Block::new().style(theme::base()), area);
-        frame.render_widget(
-            ratatui::widgets::Block::new().style(theme::style(Role::WarningSurface)),
-            head_area,
-        );
         let mut head = head.into_iter();
         if let Some(title) = head.next() {
             let bar = Rect {
@@ -1036,11 +1053,16 @@ impl Blockers {
     }
 }
 
-/// The card's text above the answer box.
+/// The page's text: the top half's title, notes and list, and the bottom
+/// half's selected blocker above the answer box.
 #[derive(Default)]
 struct Parts {
-    /// The title bar and the list.
+    /// The title bar, and what the list says instead of rows, if anything.
     head: Vec<Line<'static>>,
+    /// Every listed row, by root, for the view to window.
+    list: Vec<(i64, Line<'static>)>,
+    /// Under the list: rows not listed, or still loading.
+    more: Vec<Line<'static>>,
     /// The selected blocker, restated above its text.
     selected: Option<Line<'static>>,
     body: Vec<Line<'static>>,
@@ -1255,16 +1277,18 @@ mod tests {
                     let (rows, buffer) = drawn(&mut blockers, width, height, now);
                     let out = rows.join("\n");
                     // The selection restated, its text, who it answers.
-                    let at = restated(&rows, "#1 @crew Zed");
-                    assert!(at > 4, "{out}");
-                    let title = at - 4;
-                    assert!(rows[title].starts_with(" #1 · Answering"), "{out}");
-                    assert!(rows[at - 3].starts_with("▸ #1 @crew Zed  first?"), "{out}");
+                    // The list at the foot of the top half.
+                    let top = usize::from(height / 2);
+                    let title = top - 3;
+                    assert!(rows[title].starts_with(" Open blockers"), "{out}");
+                    assert!(rows[top - 2].starts_with("▸ #1 @crew Zed  first?"), "{out}");
                     assert!(
-                        rows[at - 2].starts_with("  #2 @crew Mateo  second?"),
+                        rows[top - 1].starts_with("  #2 @crew Mateo  second?"),
                         "{out}"
                     );
-                    assert_eq!(rows[at - 1].trim(), "", "a blank row after the list: {out}");
+                    let at = restated(&rows, "#1 @crew Zed");
+                    assert!(at > top, "{out}");
+                    assert_eq!(rows[at - 1].trim(), "", "a blank row before it: {out}");
                     assert_eq!(rows[at].trim_end(), "  #1 @crew Zed", "{out}");
                     assert!(rows[at + 1].starts_with("  first?"), "{out}");
                     assert_eq!(
@@ -1279,31 +1303,37 @@ mod tests {
                         assert_eq!(buffer[(0, at as u16 + 5)].bg, bg, "{scheme:?}");
                         assert_ne!(buffer[(0, at as u16 + 4)].bg, bg, "{scheme:?}");
                     }
-                    // Only the title bar and the list are on the warning
+                    // Only the title bar and the list are on the info
                     // surface; the blocker below reads like a reply.
                     let row_bg = |y: usize| {
                         let bgs: std::collections::HashSet<_> =
                             (0..width).map(|x| buffer[(x, y as u16)].bg).collect();
                         bgs
                     };
-                    let warning = theme::style(Role::WarningSurface).bg;
-                    for y in title + 1..at - 1 {
-                        // Past the selection highlight, the card's own surface.
+                    let info = theme::style(Role::InfoSurface).bg;
+                    assert_eq!(
+                        Some(buffer[(0, title as u16)].bg),
+                        theme::style(Role::InfoTitle).bg.or(theme::base().bg),
+                        "{scheme:?}"
+                    );
+                    for y in title + 1..top {
+                        // Past the selection highlight, the list's own surface.
                         assert_eq!(
                             buffer[(width - 1, y as u16)].bg,
-                            warning.unwrap_or_default(),
+                            info.unwrap_or_default(),
                             "{scheme:?} row {y}"
                         );
                     }
-                    for y in at - 1..=at + 4 {
+                    for y in top..=at + 4 {
                         assert_eq!(
                             row_bg(y),
                             [theme::base().bg.unwrap_or_default()].into(),
                             "{scheme:?} row {y}"
                         );
                     }
-                    // The spare rows are all above it.
+                    // Each half's spare rows are above its content.
                     assert!(rows[..title].iter().all(|r| r.trim().is_empty()), "{out}");
+                    assert!(rows[top..at].iter().all(|r| r.trim().is_empty()), "{out}");
                     for y in 0..title as u16 {
                         for x in 0..width {
                             assert_eq!(Some(buffer[(x, y)].bg), theme::base().bg, "{scheme:?}");
@@ -1316,7 +1346,103 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_queue_has_no_gap_and_only_its_head_on_the_card() {
+    fn the_list_stays_put_whatever_is_selected_and_however_tall_its_answer() {
+        let long = (0..60)
+            .map(|i| format!("paragraph {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        for (width, height) in [(60u16, 24u16), (80, 24), (100, 40)] {
+            let now = Instant::now();
+            let mut blockers = Blockers::new();
+            blockers.poll(SCREEN);
+            blockers.on_data(
+                SCREEN,
+                &list(vec![row(1, 1, "Zed", "short?"), row(2, 2, "Mateo", &long)]),
+                now,
+            );
+            blockers.open().unwrap();
+            let top = usize::from(height / 2);
+            // The list's rows, less the selection marker.
+            let head = |rows: &[String]| -> Vec<String> {
+                rows[..top]
+                    .iter()
+                    .map(|r| r.replacen('▸', " ", 1))
+                    .collect()
+            };
+            let (first, _) = drawn(&mut blockers, width, height, now);
+            let out = first.join("\n");
+            assert!(first[top - 3].starts_with(" Open blockers"), "{out}");
+            assert!(first[top - 2].starts_with("▸ #1 @crew Zed"), "{out}");
+            assert!(first[top - 1].starts_with("  #2 @crew Mateo"), "{out}");
+            blockers.key(SCREEN, alt(KeyCode::Down), now);
+            let (second, _) = drawn(&mut blockers, width, height, now);
+            assert!(
+                second[top - 1].starts_with("▸ #2 @crew Mateo"),
+                "{second:#?}"
+            );
+            assert_eq!(head(&second), head(&first), "{width}x{height}");
+            // A tall draft takes the details' rows, never the list's.
+            for _ in 0..8 {
+                blockers.key(SCREEN, alt(KeyCode::Enter), now);
+            }
+            let (tall, _) = drawn(&mut blockers, width, height, now);
+            assert_eq!(head(&tall), head(&first), "{tall:#?}");
+            // Each half keeps to itself: the bottom ends on the last row.
+            for rows in [&first, &second, &tall] {
+                assert!(rows[top].trim().is_empty(), "{rows:#?}");
+                let action = rows
+                    .iter()
+                    .position(|r| r.contains("[Cancel]"))
+                    .expect("actions");
+                assert_eq!(action, usize::from(height) - 2, "{rows:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_list_window_moves_only_to_keep_the_selection_in_view() {
+        let now = Instant::now();
+        let mut blockers = Blockers::new();
+        blockers.poll(SCREEN);
+        blockers.on_data(
+            SCREEN,
+            &list(
+                (1..=15)
+                    .map(|i| row(i, i, "Zed", &format!("question {i}?")))
+                    .collect(),
+            ),
+            now,
+        );
+        blockers.open().unwrap();
+        // 60x24: a 12-row top half, the title and 11 rows.
+        let listed = |rows: &[String]| -> Vec<i64> {
+            rows[..12]
+                .iter()
+                .map(|r| r.chars().skip(2).collect::<String>())
+                .filter_map(|r| r.strip_prefix('#')?.split(' ').next()?.parse().ok())
+                .collect()
+        };
+        let (rows, _) = drawn(&mut blockers, 60, 24, now);
+        assert_eq!(listed(&rows), (1..=11).collect::<Vec<_>>(), "{rows:#?}");
+        for _ in 0..10 {
+            blockers.key(SCREEN, alt(KeyCode::Down), now);
+        }
+        let (rows, _) = drawn(&mut blockers, 60, 24, now);
+        assert_eq!(listed(&rows), (1..=11).collect::<Vec<_>>(), "{rows:#?}");
+        // Past the foot: one row on.
+        blockers.key(SCREEN, alt(KeyCode::Down), now);
+        let (rows, _) = drawn(&mut blockers, 60, 24, now);
+        assert_eq!(listed(&rows), (2..=12).collect::<Vec<_>>(), "{rows:#?}");
+        // Back up inside the window: it stays.
+        for _ in 0..5 {
+            blockers.key(SCREEN, alt(KeyCode::Up), now);
+        }
+        let (rows, _) = drawn(&mut blockers, 60, 24, now);
+        assert_eq!(listed(&rows), (2..=12).collect::<Vec<_>>(), "{rows:#?}");
+    }
+
+    #[test]
+    fn an_empty_queue_says_so_at_the_foot_of_the_top_half() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {
             with_scheme(scheme, || {
@@ -1330,20 +1456,21 @@ mod tests {
                     .iter()
                     .position(|r| r.contains("No open blockers."))
                     .expect("done");
-                // Straight above the status rows: no room kept for a blocker.
-                assert_eq!(done, 24 - 3, "{rows:#?}");
-                let card = theme::style(Role::WarningSurface).bg.unwrap_or_default();
+                // Where the list would end; the bottom half stays empty.
+                assert_eq!(done, 24 / 2 - 1, "{rows:#?}");
+                let card = theme::style(Role::InfoSurface).bg.unwrap_or_default();
                 let base = theme::base().bg.unwrap_or_default();
                 assert_eq!(buffer[(59, done as u16)].bg, card, "{scheme:?}");
                 for y in done + 1..24 {
                     assert_eq!(buffer[(59, y as u16)].bg, base, "{scheme:?} row {y}");
+                    assert_eq!(rows[y].trim(), "", "{rows:#?}");
                 }
             });
         }
     }
 
     #[test]
-    fn long_details_leave_the_list_and_answer_whole_and_page_in_between() {
+    fn long_details_keep_to_the_bottom_half_and_page_in_between() {
         let now = Instant::now();
         let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
@@ -1359,31 +1486,23 @@ mod tests {
         blockers.open().unwrap();
         let (rows, _) = drawn(&mut blockers, 60, 24, now);
         let out = rows.join("\n");
+        // The list ends the top half; the bottom half starts with one gap.
         assert!(
-            rows[2].starts_with("▸ #1") && rows[3].starts_with("  #2"),
+            rows[10].starts_with("▸ #1") && rows[11].starts_with("  #2"),
             "{out}"
         );
         let at = restated(&rows, "#1 @crew Zed");
-        assert_eq!(
-            at, 5,
-            "one blank row between the list and the details: {out}"
-        );
+        assert_eq!(at, 13, "one blank row, then the details: {out}");
         assert!(rows[at + 1].starts_with("  line 0"), "{out}");
         let label = rows
             .iter()
             .position(|r| r.starts_with("answer → Zed"))
             .expect(&out);
-        assert!(rows[label].contains("PgUp/PgDn text"), "{out}");
+        assert!(rows[label].contains("PgUp/PgDn text 2/119"), "{out}");
         assert_eq!(
             rows[label - 1].trim(),
             "",
             "one gap before the recipient: {out}"
-        );
-        // The text runs down to the gap (its paragraphs alternate with
-        // blank rows).
-        assert!(
-            !rows[label - 2].trim().is_empty() || !rows[label - 3].trim().is_empty(),
-            "{out}"
         );
         assert_eq!(rows[label + 1].trim(), "", "{out}");
         assert_eq!(
@@ -1396,19 +1515,19 @@ mod tests {
         let (paged, _) = drawn(&mut blockers, 60, 24, now);
         assert!(!paged[at + 1].starts_with("  line 0"), "{paged:#?}");
         assert_eq!(paged[..at + 1], rows[..at + 1]);
-        assert!(paged[label].contains("PgUp/PgDn text 19/119"), "{paged:#?}");
+        assert!(paged[label].contains("PgUp/PgDn text 3/119"), "{paged:#?}");
         assert_eq!(paged[label + 1..], rows[label + 1..]);
         // A taller window shows more of it, still from where it was.
         let (tall, _) = drawn(&mut blockers, 60, 40, now);
-        assert_eq!(restated(&tall, "#1 @crew Zed"), 5);
+        assert_eq!(restated(&tall, "#1 @crew Zed"), 21);
         // A multiline answer takes rows from the text only.
         let shown = blockers.text_rows.1;
         blockers.key(SCREEN, alt(KeyCode::Enter), now);
         blockers.key(SCREEN, alt(KeyCode::Enter), now);
         let (grown, _) = drawn(&mut blockers, 60, 40, now);
         assert_eq!(blockers.text_rows.1, shown - 2, "{grown:#?}");
-        assert_eq!(restated(&grown, "#1 @crew Zed"), 5);
-        assert!(grown[2].starts_with("▸ #1"));
+        assert_eq!(restated(&grown, "#1 @crew Zed"), 21);
+        assert_eq!(grown[..20], tall[..20], "the top half never moves");
     }
 
     #[test]
@@ -2168,64 +2287,46 @@ mod tests {
     }
 
     #[test]
-    fn the_title_names_the_blocker_and_whether_the_box_answers_it() {
+    fn the_title_is_the_same_whatever_is_selected() {
         let now = Instant::now();
         let mut blockers = open(now);
         let title = |b: &Blockers, width| b.title(width).to_string();
         let wide = title(&blockers, 100);
-        assert!(wide.starts_with(" #1 · Answering a blocker from Zed @crew · 1 of 2 open "));
+        assert!(wide.starts_with(" Open blockers "), "{wide:?}");
         assert!(wide.ends_with(" Alt-↑/↓ · Tab · Esc "), "{wide:?}");
         assert_eq!(wide.width(), 100);
         // Narrow: the way out still shows; narrower still, only the title.
-        assert!(title(&blockers, 60).ends_with(" Esc "));
-        assert!(title(&blockers, 60).starts_with(" #1 · Answering a blocker from Zed"));
-        assert!(title(&blockers, 40).width() <= 40);
+        assert!(title(&blockers, 30).ends_with(" Esc "));
+        assert!(title(&blockers, 14).width() <= 14);
         assert_eq!(
             blockers.title(80).style,
-            theme::style(Role::WarningTitle),
+            theme::style(Role::InfoTitle),
             "the whole bar"
         );
-        // A row the box cannot answer is only "from".
+        // Another selection, a read-only row, a kept refusal: the same bar.
         blockers.key(SCREEN, alt(KeyCode::Down), now);
+        assert_eq!(title(&blockers, 100), wide);
         let mut second = row(2, 2, "Mateo", "second?");
         second.can_answer = false;
         blockers.on_data(SCREEN, &list(vec![row(1, 1, "Zed", "first?"), second]), now);
-        assert!(title(&blockers, 80).starts_with(" #2 · Blocker from Mateo @crew · 2 of 2 open"));
-    }
-
-    #[test]
-    fn a_kept_refusal_is_not_counted_open_in_the_title() {
-        let now = Instant::now();
-        let mut blockers = open(now);
+        assert_eq!(title(&blockers, 100), wide);
+        blockers.key(SCREEN, alt(KeyCode::Up), now);
         typed(&mut blockers, "go", now);
         let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
-        // The server resolved #1 elsewhere: refused, and no longer listed.
         blockers.on_data(SCREEN, &list(vec![row(2, 2, "Mateo", "second?")]), now);
         blockers.on_data(
             SCREEN,
             &written(&req.request_key, Err(SideError::Refused("taken".into()))),
             now,
         );
-        let title = |b: &Blockers| b.title(100).to_string();
+        assert_eq!(title(&blockers, 100), wide);
+        // What the title no longer says, the blocker's own rows do.
         assert!(
-            title(&blockers).starts_with(" #1 · Blocker from Zed @crew · no longer open"),
-            "{}",
-            title(&blockers)
+            blockers
+                .lines_above(100)
+                .iter()
+                .any(|l| l.to_string().starts_with("No longer open"))
         );
-        // The open one counts from the server, without the kept refusal.
-        blockers.key(SCREEN, alt(KeyCode::Down), now);
-        assert!(
-            title(&blockers)
-                .starts_with(" #2 · Answering a blocker from Mateo @crew · 1 of 1 open"),
-            "{}",
-            title(&blockers)
-        );
-        // When it resolves too, only the refusal remains: nothing is open.
-        blockers.on_data(SCREEN, &list(vec![]), now);
-        assert_eq!(blockers.count(), None);
-        assert_eq!(blockers.selected().unwrap().root_id, 1);
-        assert!(title(&blockers).starts_with(" #1 · Blocker from Zed @crew · no longer open"));
-        assert!(!title(&blockers).contains(" of "));
     }
 
     #[test]

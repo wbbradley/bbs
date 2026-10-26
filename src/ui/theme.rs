@@ -42,9 +42,12 @@ pub enum Role {
     TitleBar,
     StatusBar,
     Logo,
-    /// A card that needs the human: a background and its title bar.
-    WarningSurface,
+    /// A badge that needs the human, such as the status bar's blocker count.
     WarningTitle,
+    /// Calm information, such as the blockers page's list: a soft
+    /// background and its title bar, never a warning.
+    InfoSurface,
+    InfoTitle,
     /// Text matching what the human typed to find it.
     SearchHit,
 }
@@ -138,7 +141,7 @@ impl Scheme {
                 Heading | Agent | Human | Group | Hotkey | Success | Warning | Error | Go
                 | Stop => Style::new().bold(),
                 Selection | Cursor | TitleBar | StatusBar => Style::new().reversed(),
-                WarningTitle => Style::new().reversed().bold(),
+                WarningTitle | InfoTitle => Style::new().reversed().bold(),
                 SearchHit => Style::new().bold().underlined(),
                 _ => Style::new(),
             };
@@ -239,12 +242,24 @@ impl Scheme {
                 Style::new().fg(text).bg(selection).bold()
             }
             TitleBar | StatusBar => Style::new().fg(bg).bg(accent).bold(),
-            WarningSurface => Style::new().fg(text).bg(match self {
-                Self::Gruvbox => tint(bg, warning, 18),
-                Self::Terminal => Color::Indexed(58),
-                Self::NoColor => unreachable!(),
-            }),
             WarningTitle => Style::new().fg(bg).bg(warning).bold(),
+            InfoSurface | InfoTitle => {
+                let info = match self {
+                    // Gruvbox aqua (base0C).
+                    Self::Gruvbox => Color::Rgb(142, 192, 124),
+                    Self::Terminal => Color::Cyan,
+                    Self::NoColor => unreachable!(),
+                };
+                if role == InfoTitle {
+                    Style::new().fg(bg).bg(info).bold()
+                } else {
+                    Style::new().fg(text).bg(match self {
+                        Self::Gruvbox => tint(bg, info, 18),
+                        Self::Terminal => Color::Indexed(23),
+                        Self::NoColor => unreachable!(),
+                    })
+                }
+            }
             SearchHit => Style::new()
                 .fg(match self {
                     // Gruvbox orange (base09).
@@ -332,8 +347,9 @@ mod tests {
                         Role::Selection,
                         Role::TitleBar,
                         Role::StatusBar,
-                        Role::WarningSurface,
                         Role::WarningTitle,
+                        Role::InfoSurface,
+                        Role::InfoTitle,
                     ] {
                         let bar = style(surface);
                         let combined = on_surface(bar, category);
@@ -363,9 +379,8 @@ mod tests {
     }
 
     #[test]
-    fn the_warning_card_stands_apart_from_every_other_surface() {
+    fn the_warning_badge_reads_in_the_schemes_own_warning_colour() {
         for scheme in [Scheme::Gruvbox, Scheme::Terminal] {
-            let card = scheme.style(Role::WarningSurface).bg.unwrap();
             let title = scheme.style(Role::WarningTitle);
             for other in [
                 Role::Screen,
@@ -375,19 +390,11 @@ mod tests {
                 Role::Selection,
                 Role::TitleBar,
             ] {
-                assert_ne!(Some(card), scheme.style(other).bg, "{scheme:?} {other:?}");
                 assert_ne!(title.bg, scheme.style(other).bg, "{scheme:?} {other:?}");
             }
-            assert_ne!(title.bg, Some(card));
-            // The title reads in the warning colour itself, text in the
-            // background's: the scheme's own warning, no new palette entry.
             assert_eq!(title.bg, scheme.style(Role::Warning).fg);
             assert_eq!(title.fg, scheme.style(Role::Screen).bg);
             assert!(title.add_modifier.contains(ratatui::style::Modifier::BOLD));
-            assert_eq!(
-                scheme.style(Role::WarningSurface).fg,
-                scheme.style(Role::Text).fg
-            );
         }
         let plain = Scheme::NoColor.style(Role::WarningTitle);
         assert!(
@@ -395,7 +402,43 @@ mod tests {
                 .add_modifier
                 .contains(ratatui::style::Modifier::REVERSED | ratatui::style::Modifier::BOLD)
         );
-        assert_eq!(Scheme::NoColor.style(Role::WarningSurface), Style::new());
+    }
+
+    #[test]
+    fn the_info_card_is_calm_and_stands_apart_from_warnings_and_surfaces() {
+        for scheme in [Scheme::Gruvbox, Scheme::Terminal] {
+            let card = scheme.style(Role::InfoSurface).bg.unwrap();
+            let title = scheme.style(Role::InfoTitle);
+            for other in [
+                Role::Screen,
+                Role::HumanSurface,
+                Role::OtherConversation,
+                Role::OtherConversationHeader,
+                Role::GroupConversation,
+                Role::GroupConversationHeader,
+                Role::Selection,
+                Role::TitleBar,
+                Role::WarningTitle,
+            ] {
+                assert_ne!(Some(card), scheme.style(other).bg, "{scheme:?} {other:?}");
+                assert_ne!(title.bg, scheme.style(other).bg, "{scheme:?} {other:?}");
+            }
+            assert_ne!(title.bg, scheme.style(Role::Warning).fg);
+            assert_ne!(title.bg, scheme.style(Role::Success).fg);
+            assert_eq!(title.fg, scheme.style(Role::Screen).bg);
+            assert!(title.add_modifier.contains(ratatui::style::Modifier::BOLD));
+            assert_eq!(
+                scheme.style(Role::InfoSurface).fg,
+                scheme.style(Role::Text).fg
+            );
+        }
+        let plain = Scheme::NoColor.style(Role::InfoTitle);
+        assert!(
+            plain
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED | ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(Scheme::NoColor.style(Role::InfoSurface), Style::new());
     }
 
     #[test]
@@ -515,8 +558,9 @@ pub(crate) mod testing {
             TitleBar,
             StatusBar,
             Logo,
-            WarningSurface,
             WarningTitle,
+            InfoSurface,
+            InfoTitle,
             SearchHit,
         ];
         let colors: Vec<_> = roles

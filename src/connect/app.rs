@@ -7002,7 +7002,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
         press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
         assert!(rx.try_recv().is_err(), "blocker modal owns its keys");
-        assert!(screen(&mut app, 80, 24).contains("Answering a blocker"));
+        assert!(screen(&mut app, 80, 24).contains("Open blockers"));
     }
 
     #[test]
@@ -7379,8 +7379,9 @@ mod tests {
                 typed(&mut app, "parent draft");
                 press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
                 let mut table_rows = Vec::new();
+                // The details have the bottom half: tall enough for all of them.
                 for width in [80u16, 60, 80] {
-                    let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                    let mut terminal = Terminal::new(TestBackend::new(width, 60)).unwrap();
                     terminal.draw(|f| app.draw(f)).unwrap();
                     let buffer = terminal.backend().buffer();
                     crate::ui::theme::testing::assert_buffer(buffer);
@@ -7389,12 +7390,10 @@ mod tests {
                             .map(|x| buffer[(x, y)].symbol())
                             .collect::<String>()
                     };
-                    let lines: Vec<String> = (0..40).map(row).collect();
+                    let lines: Vec<String> = (0..60).map(row).collect();
                     let out = lines.join("\n");
                     assert!(
-                        lines
-                            .iter()
-                            .any(|l| l.starts_with(" #5 · Answering a blocker")),
+                        lines.iter().any(|l| l.starts_with(" Open blockers")),
                         "{out}"
                     );
                     assert!(out.contains("▸ #5 @crew Zed") && out.contains("  #12 @crew Mateo"));
@@ -7427,8 +7426,7 @@ mod tests {
                 blockers_listed(&mut app, id, vec![blocker(8, 1, "Zed", "changed\nmore")]);
                 let out = screen(&mut app, 60, 30);
                 assert!(
-                    out.lines()
-                        .any(|l| l.starts_with(" #8 · Answering a blocker")),
+                    out.lines().any(|l| l.starts_with(" Open blockers")),
                     "{out}"
                 );
                 assert!(out.contains("▸ #8 @crew Zed") && !out.contains("#5"));
@@ -7521,7 +7519,7 @@ mod tests {
         while !screen(&mut app, 60, 24).contains("END of the question") {
             press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
             pages += 1;
-            assert!(pages < 100, "the end is reachable");
+            assert!(pages < 400, "the end is reachable");
         }
         assert!(pages > 5, "an 8 KiB question takes several pages");
         // The answer and its recipient stay in view throughout.
@@ -7536,7 +7534,7 @@ mod tests {
     }
 
     #[test]
-    fn the_blocker_card_has_a_warning_title_bar_and_surface_in_every_scheme() {
+    fn the_blocker_list_has_an_info_title_bar_and_surface_and_warnings_stay_warnings() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {
             with_scheme(scheme, || {
@@ -7551,12 +7549,12 @@ mod tests {
                 crate::ui::theme::testing::assert_buffer(buffer);
                 let row = |y: u16| (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>();
                 let at = |text: &str| (0..24).find(|y| row(*y).contains(text)).unwrap();
-                let title = at("Answering a blocker from Zed @crew");
+                let title = at("Open blockers");
                 let label = at("answer → Zed @crew");
                 let answer = at("an answer");
                 let action = at("[Cancel]");
-                let bar = theme::style(theme::Role::WarningTitle);
-                let card = theme::base().patch(theme::style(theme::Role::WarningSurface));
+                let bar = theme::style(theme::Role::InfoTitle);
+                let card = theme::base().patch(theme::style(theme::Role::InfoSurface));
                 let human = theme::base().patch(theme::style(theme::Role::HumanSurface));
                 for x in 0..60 {
                     // The bar spans the row; the card fills the rest.
@@ -7592,6 +7590,33 @@ mod tests {
                     assert_ne!(card.bg, human.bg);
                     assert_ne!(card.bg, theme::base().bg);
                 }
+                // The marker and a cancel confirmation still warn.
+                let badge = theme::style(theme::Role::WarningTitle);
+                if let Some(bg) = badge.bg {
+                    assert_eq!(buffer[(59, 23)].bg, bg, "{scheme:?}");
+                }
+                // Tab past [discuss with Zed] to [Cancel].
+                press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+                press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+                enter(&mut app);
+                let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let confirm = (0..24)
+                    .find(|&y| {
+                        (0..60)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                            .starts_with("Cancel this blocker?")
+                    })
+                    .expect("asks first");
+                let warning = theme::style(theme::Role::Warning);
+                assert_eq!(
+                    Some(buffer[(0, confirm)].fg),
+                    warning.fg.or(theme::base().fg),
+                    "{scheme:?}"
+                );
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
                 // The parent draft is untouched behind the card.
                 press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
                 assert_eq!(draft_text(&mut app), "parent");
@@ -8105,7 +8130,7 @@ mod tests {
             assert!(app.on_blockers());
             let out = screen(&mut app, width, 24);
             assert!(out.contains("BBS · Blockers"), "{out}");
-            assert!(out.contains("Answering a blocker from Grove"), "{out}");
+            assert!(out.contains("answer → Grove"), "{out}");
             crate::ui::theme::testing::assert_buffer(&buffer(&mut app, width));
             // F2 on the page goes back, as Esc does.
             press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
@@ -8493,9 +8518,7 @@ mod tests {
                                     .map(|x| open[(x, y)].symbol())
                                     .collect::<String>()
                             })
-                            .find(|row| {
-                                row.starts_with(" #1 · Answering a blocker from Zed @crew")
-                            });
+                            .find(|row| row.starts_with(" Open blockers"));
                         assert!(title.is_some(), "{origin}: no blocker title");
                         // Keys and paste are the answer's, never the screen's.
                         typed(&mut app, "x");
@@ -8531,7 +8554,7 @@ mod tests {
         queue(&mut app, &mut rx, vec![blocker(1, 1, "Zed", "q?")]);
         let before = buffer(&mut app, 80);
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-        assert!(screen(&mut app, 80, 24).contains("Answering a blocker from Zed"));
+        assert!(screen(&mut app, 80, 24).contains("answer → Zed"));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(buffer(&mut app, 80), before);
         assert!(screen(&mut app, 80, 24).contains("[A]gents"));
@@ -8782,9 +8805,7 @@ mod tests {
                 let out = screen(&mut app, 60, 24);
                 let lines: Vec<&str> = out.lines().collect();
                 assert!(
-                    lines
-                        .iter()
-                        .any(|line| line.starts_with(" #1 · Answering a blocker from Zed @crew")),
+                    lines.iter().any(|line| line.starts_with(" Open blockers")),
                     "{out}"
                 );
                 assert!(
@@ -12579,7 +12600,7 @@ mod tests {
             result: Ok(agent_note(7, "Mateo", &body, 1)),
         }));
         assert!(app.note_editor.is_none());
-        assert!(screen(&mut app, 80, 24).contains("Answering a blocker from Zed"));
+        assert!(screen(&mut app, 80, 24).contains("answer → Zed"));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
     }

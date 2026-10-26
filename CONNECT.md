@@ -186,12 +186,16 @@ main menu, or F2 from any screen, including dialogs, forms, the search prompt
 and the `/btw` panel. F2 never opens a second page: with the page already open
 beneath, it goes back to it. F2 from an open note stores a changed note first,
 as any destination does, and stays in the note if it cannot be stored. The
-page shows a card at its bottom: a
-warning title bar that names the blocker's creator and group, `#ID · Answering
-a blocker from CREATOR @group` when the box below can answer it, and the
-position among open blockers, over the list on the scheme's warning surface;
-the selected blocker below reads like a reply in a conversation, on the
-standard background, and the answer box keeps the composer's surface. Without colour, the title bar is reversed and bold. The screen beneath
+page is split in two halves that never move for each other: the top half
+holds the list, the bottom half the selected blocker and its answer, each set
+against its half's foot. The list sits under a title bar that stays `Open
+blockers` whatever is selected, in a calm aqua (the scheme's information
+colours, not its warnings) on a matching surface; the selected blocker below
+reads like a reply in a conversation, on the standard background, and the
+answer box keeps the composer's surface. Real warnings, such as a cancel
+confirmation, an unconfirmed write, a refusal or an old server, and the status
+bar's blocker count, stay in the warning colour. Without colour, the title bar
+is reversed and bold. The screen beneath
 is covered as by any page: its draft, cursor, selection, scroll, mode and side
 panel come back when the page closes. `Esc` or `F2` closes the page, keeping
 the answer draft; from a cancel confirmation either first returns to the card.
@@ -202,11 +206,14 @@ rather than opening twice. Covered, the page keeps its selection, focus,
 scroll and drafts for when it is uncovered. Ctrl-C still quits.
 
 The card lists blockers oldest first, the first 50 of the scope with a count of
-any more; each refresh fills in rows as others resolve. From the top, the card
-holds its title bar, the list, one blank row, then the selected blocker: a row
-restating its number, group and creator, its details, one blank row, who an
-answer goes to, one blank row and the answer box. Any spare rows sit above the card on the
-standard background. Alt-↑/↓ selects; plain arrows edit the
+any more; each refresh fills in rows as others resolve. The top half shows as
+many rows as fit; the list scrolls only when the selection would leave it, by
+one row, so it stays put while the selection moves within it. The bottom half
+holds one blank row, then the selected blocker: a row restating its number,
+group and creator, its details, one blank row, who an answer goes to, one
+blank row, the answer box and its actions. Spare rows in either half sit above
+its content on the standard background; the details get only what the bottom
+half has left, and a tall answer takes rows from them, never from the list. Alt-↑/↓ selects; plain arrows edit the
 answer; PgUp/PgDn page through a selected text too long for the card, which
 shows how far you have read. Details render as Markdown, as messages
 do: headings, emphasis, lists, code and tables. Every display line keeps a
