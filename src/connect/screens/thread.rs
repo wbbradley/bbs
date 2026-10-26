@@ -2044,7 +2044,12 @@ impl Thread {
             frame.render_widget(Paragraph::new(self.status()), status);
         }
         if let Some(notice) = self.empty_activity() {
-            frame.render_widget(Paragraph::new(notice).wrap(Wrap { trim: false }), body);
+            // Wrapped short of the right edge, as the thread's text is.
+            let area = Rect {
+                width: crate::ui::thread::wrap_width(body.width),
+                ..body
+            };
+            frame.render_widget(Paragraph::new(notice).wrap(Wrap { trim: false }), area);
             return;
         }
         // Calls still running sit below the newest activity while following,

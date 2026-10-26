@@ -922,6 +922,8 @@ pub fn context_lines(agent: &str, usage: Option<&ContextUsage>) -> Vec<Line<'sta
 /// The `/btw` panel's rows: a header, the question, the answer and a
 /// footer, at most `rows`.
 pub fn side_height(agent: &str, side: &Side, view: &SideView, width: u16, rows: u16) -> u16 {
+    // Measured as drawn: short of the right edge.
+    let width = crate::ui::thread::wrap_width(width);
     let answer = Paragraph::new(side_text(agent, side, view, width))
         .wrap(Wrap { trim: false })
         .line_count(width);
@@ -1006,9 +1008,14 @@ pub fn render_side(
     frame.render_widget(Paragraph::new(header), top);
     frame.render_widget(Paragraph::new(question), middle);
     frame.render_widget(Paragraph::new(footer), bottom);
-    let answer =
-        Paragraph::new(side_text(agent, side, view, area.width)).wrap(Wrap { trim: false });
-    let total = answer.line_count(area.width);
+    // The answer wraps short of the right edge, as a thread's text does.
+    let width = crate::ui::thread::wrap_width(area.width);
+    let answer_area = Rect {
+        width,
+        ..answer_area
+    };
+    let answer = Paragraph::new(side_text(agent, side, view, width)).wrap(Wrap { trim: false });
+    let total = answer.line_count(width);
     let shown = usize::from(answer_area.height);
     let scroll = side.scroll.get().min(total.saturating_sub(shown));
     side.scroll.set(scroll);
@@ -1774,6 +1781,33 @@ mod tests {
     }
 
     #[test]
+    fn side_answers_stop_one_column_short_of_the_right_edge() {
+        use ratatui::{Terminal, backend::TestBackend};
+        for width in [60u16, 80] {
+            let answer = "x".repeat(usize::from(width));
+            let side = Side::new("", "question", 0, SideState::Tracking(1));
+            let view = SideView::Completed(answer.clone());
+            let height = side_height("Mateo", &side, &view, width, 20);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| render_side(f, f.area(), "Mateo", &side, &view, false, 0))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = (0..height)
+                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            let xs: Vec<_> = rows.iter().filter(|r| r.starts_with('x')).collect();
+            // Wrapped short of the edge, all of it shown.
+            assert_eq!(xs.len(), 2, "{rows:#?}");
+            assert!(xs.iter().all(|r| r.ends_with(' ')), "{rows:#?}");
+            assert_eq!(
+                rows.iter().map(|r| r.matches('x').count()).sum::<usize>(),
+                answer.len()
+            );
+        }
+    }
+
+    #[test]
     fn side_conversation_tables_reflow_in_the_answer_and_retained_history() {
         let source = format!(
             "| Name | Details |\n| --- | --- |\n| marker | {} tailtoken |",
@@ -1809,9 +1843,11 @@ mod tests {
                     2,
                     "history and latest remain readable"
                 );
-                let measured = Paragraph::new(text)
+                // Measured as drawn: short of the right edge.
+                let wrap = crate::ui::thread::wrap_width(width);
+                let measured = Paragraph::new(side_text("Mateo", &side, &view, wrap))
                     .wrap(Wrap { trim: false })
-                    .line_count(width)
+                    .line_count(wrap)
                     + 3;
                 assert_eq!(
                     usize::from(side_height("Mateo", &side, &view, width, 300)),

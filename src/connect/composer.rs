@@ -143,12 +143,8 @@ impl Composer {
 
     /// One text row and scrollable top padding, plus dark and bottom separators.
     pub fn height(&self, width: u16, max_lines: u16) -> u16 {
-        let lines = u16::try_from(
-            self.layout(width - gutter_width(width))
-                .height()
-                .saturating_add(1),
-        )
-        .unwrap_or(u16::MAX);
+        let lines = u16::try_from(self.layout(text_width(width)).height().saturating_add(1))
+            .unwrap_or(u16::MAX);
         lines
             .clamp(MIN_LINES + 1, max_lines.max(MIN_LINES + 1))
             .saturating_add(2)
@@ -352,11 +348,18 @@ fn draw_box(frame: &mut Frame, area: Rect) -> (Rect, Rect) {
     let bottom = u16::from(input.height > 1);
     let text = Rect {
         x: input.x + gutter,
-        width: input.width - gutter,
+        width: text_width(input.width),
         height: input.height - bottom,
         ..input
     };
     (input, text)
+}
+
+/// The columns a draft wraps to in a box `width` wide: past the gutter and
+/// short of the right edge, as every thread's text is. The surface still
+/// fills the box.
+fn text_width(width: u16) -> u16 {
+    crate::ui::thread::wrap_width(width - gutter_width(width))
 }
 
 /// Preserve one source column on narrow displays.
@@ -426,7 +429,8 @@ mod tests {
                     }
                     let first: String = (0..24).map(|x| buffer[(x, 2)].symbol()).collect();
                     assert!(first.starts_with("› a wrapped input"));
-                    assert_eq!(composer.area, Rect::new(2, 1, 22, 6));
+                    // The text stops one column short of the box's edge.
+                    assert_eq!(composer.area, Rect::new(2, 1, 21, 6));
                     assert_eq!(
                         composer.text.lines(),
                         ["a wrapped input with enough text to fill several lines"]
@@ -476,7 +480,7 @@ mod tests {
                         assert_buffer(&buffer);
                         assert_eq!(
                             c.area,
-                            Rect::new(gutter_width(width), 1, width - gutter_width(width), 3)
+                            Rect::new(gutter_width(width), 1, text_width(width), 3)
                         );
                         assert_eq!(c.draft(), before);
                         let caret = c.layout(c.area.width).point(c.text.cursor());
@@ -608,11 +612,59 @@ mod tests {
     }
 
     #[test]
+    fn drafts_stop_one_column_short_of_the_box_edge_with_the_caret_in_view() {
+        use crate::ui::theme::testing::{SCHEMES, assert_buffer, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                for width in [60u16, 80] {
+                    // Drafts that once filled the text area exactly.
+                    let old = usize::from(width - gutter_width(width));
+                    for draft in ["x".repeat(old), "界".repeat(old / 2)] {
+                        let mut c = Composer::new("Mateo");
+                        c.text.insert_str(&draft);
+                        let height = c.height(width, 6);
+                        let buffer = draw(&mut c, width, height);
+                        assert_buffer(&buffer);
+                        let surface = theme::base().patch(theme::style(theme::Role::HumanSurface));
+                        for y in 1..height {
+                            let edge = &buffer[(width - 1, y)];
+                            assert_eq!(edge.symbol(), " ", "{scheme:?} {width} row {y}: {draft}");
+                            assert_eq!(edge.bg, surface.bg.unwrap(), "{scheme:?}");
+                            assert_ne!(
+                                unicode_width::UnicodeWidthStr::width(
+                                    buffer[(width - 2, y)].symbol()
+                                ),
+                                2,
+                                "{scheme:?} {width} row {y}"
+                            );
+                        }
+                        // Nothing lost, and the caret at the end in view.
+                        assert_eq!(c.text.lines().join(""), draft);
+                        let caret = c.layout(c.area.width).point(c.text.cursor());
+                        assert!(
+                            caret.row + 1 >= c.top
+                                && caret.row + 1 < c.top + usize::from(c.area.height)
+                        );
+                        assert!(caret.col < usize::from(c.area.width) || caret.col == 0);
+                    }
+                }
+                // Too narrow for a margin: drawn, never a panic.
+                for width in [1u16, 2, 3] {
+                    let mut c = Composer::new("Mateo");
+                    c.text.insert_str("abc");
+                    draw(&mut c, width, 4);
+                }
+            });
+        }
+    }
+
+    #[test]
     fn visual_navigation_and_shift_selection_use_the_painted_rows() {
         let mut c = Composer::new("Mateo");
         c.text.insert_str("abcd  efgh ij");
         c.jump(DataCursor(0, 3));
-        draw(&mut c, 6, 5);
+        // Four text columns: past the gutter, short of the margin.
+        draw(&mut c, 7, 5);
         press(&mut c, KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(c.text.cursor(), (0, 9));
         press(&mut c, KeyCode::Char('n'), KeyModifiers::CONTROL);
@@ -621,7 +673,7 @@ mod tests {
         assert_eq!(c.text.cursor(), (0, 8));
         press(&mut c, KeyCode::Up, KeyModifiers::SHIFT);
         assert_eq!(c.text.selection_range(), Some(((0, 2), (0, 8))));
-        let buffer = draw(&mut c, 6, 5);
+        let buffer = draw(&mut c, 7, 5);
         let selected =
             theme::style(theme::Role::HumanSurface).patch(theme::style(theme::Role::Selection));
         assert_eq!(buffer[(5, 2)].fg, selected.fg.unwrap());
@@ -680,7 +732,7 @@ mod tests {
     fn exact_width_end_caret_is_reachable_in_both_directions() {
         let mut c = Composer::new("Mateo");
         c.text.insert_str("abcd");
-        draw(&mut c, 6, 5);
+        draw(&mut c, 7, 5);
         assert_eq!(c.layout(4).point(c.text.cursor()), Point { row: 1, col: 0 });
         press(&mut c, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(c.text.cursor(), (0, 0));
@@ -704,7 +756,7 @@ mod tests {
         for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
             c.text.cancel_selection();
             c.jump(DataCursor(0, 65_527));
-            draw(&mut c, 10, 5);
+            draw(&mut c, 11, 5);
             let layout = c.layout(8);
             let from = layout.point(c.text.cursor());
             assert_eq!(
@@ -753,7 +805,7 @@ mod tests {
         c.jump(DataCursor(0, 65_539));
         assert_eq!(c.text.cursor(), (0, 65_539));
         // No silent u16 truncation when a visual move lands past column 65535.
-        draw(&mut c, 10, 5);
+        draw(&mut c, 11, 5);
         press(&mut c, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(c.text.cursor(), (0, 65_531));
         c.text = TextArea::new(vec![String::new(); 65_538]);
@@ -876,14 +928,15 @@ mod tests {
                     cursor: (0, 0),
                 });
                 let snapshot = c.draft();
-                let buffer = draw(&mut c, 8, 8);
+                let buffer = draw(&mut c, 9, 8);
                 assert_buffer(&buffer);
-                let line = |y| (0..8).map(|x| buffer[(x, y)].symbol()).collect::<String>();
-                assert_eq!(line(2), "› abcdef");
+                let line = |y| (0..9).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+                // Six text columns, and the box's last column left clear.
+                assert_eq!(line(2), "› abcdef ");
                 assert!(line(3).starts_with("  ghij"));
                 let surface = theme::base().patch(theme::style(theme::Role::HumanSurface));
-                assert_eq!(line(7), "        ");
-                for x in 0..8 {
+                assert_eq!(line(7), "         ");
+                for x in 0..9 {
                     let cell = &buffer[(x, 7)];
                     assert_eq!(cell.fg, surface.fg.unwrap());
                     assert_eq!(cell.bg, surface.bg.unwrap());
@@ -892,7 +945,7 @@ mod tests {
                 assert_eq!(c.draft(), snapshot);
                 press(&mut c, KeyCode::Down, KeyModifiers::SHIFT);
                 let selected = c.text.selection_range().unwrap();
-                let buffer = draw(&mut c, 8, 8);
+                let buffer = draw(&mut c, 9, 8);
                 assert_eq!(c.text.selection_range(), Some(selected));
                 for y in 1..8 {
                     for x in 0..2 {
@@ -965,7 +1018,7 @@ mod tests {
         draw(&mut c, 22, height);
         assert_eq!(
             c.area,
-            Rect::new(2, 1, 20, 4),
+            Rect::new(2, 1, 19, 4),
             "outer padding preserves four viewport rows"
         );
         assert_eq!(c.text.cursor(), cursor);
