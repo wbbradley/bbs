@@ -16,7 +16,12 @@ under the new package version and its publication date.
   (mail, shared activity, effort, questions, side questions, private notes),
   groups and their administration, the blockers queue, the board feed and
   search. It is the optional `web` feature (`cargo install bbs-cli --features
-  web`), whose build runs npm; the container image includes it.
+  web`), whose build from a checkout runs npm; the container image includes
+  it. Drafts, unsaved notes and unconfirmed blocker answers stay in the browser
+  for the signed-in human only; a note is never written before your stored
+  notes load, and leaving stores it first; an unconfirmed blocker answer is
+  retried only as the identical request; and a message opened from search
+  shows with the messages around it.
 
 ### Changed
 

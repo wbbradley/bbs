@@ -331,11 +331,28 @@ rotating or revoking a token signs that browser out at once. Like gRPC, the
 web port speaks plain HTTP: keep it on a private network, or put a TLS proxy
 in front of it that sets `X-Forwarded-Proto: https`.
 
+The browser keeps unsent drafts, unsaved note text and blocker answers whose
+outcome is not yet confirmed for the signed-in human only: another human signing
+in on the same browser never sees them. A note cannot be edited until your
+stored notes have loaded, and closing it or leaving the page (Back included)
+stores a change first, staying put if that fails. An unconfirmed blocker answer
+is shown unchanged and sent again only when you choose Retry, as the identical
+request; a blocker whose answer is unconfirmed or refused stays listed, even
+once the server no longer lists it, until you dismiss it.
+Nothing is marked read or seen under a dialog or the search box, or while the
+page is reconnecting. A message opened from search shows with the messages
+around it, even when it is older than the conversation's live window, and the
+page marks any place where messages may be missing.
+
 The web UI is an optional `web` feature, so ordinary CLI and `bbs connect`
-installs need no Node.js. Building with it runs `npm ci` and `npm run build`
-in [web/](web/) (Node.js 20.19 or newer) and embeds the page in the binary;
-the build fails if npm is missing. Without the feature, `--web` refuses to
-start. The container image includes it.
+installs need no Node.js. Building it from a checkout runs `npm ci` and
+`npm run build` in [web/](web/) (Node.js 20.19 or newer) and embeds the page in
+the binary; the build fails if npm is missing. The package on crates.io ships
+the built page (`web/dist`), so `cargo install bbs-cli --features web` from there
+needs no Node.js. Because that page is generated, Cargo records the published
+package as dirty at its source revision; a build from a clean checkout, and the
+container image, report a clean source identity. Without the feature, `--web`
+refuses to start. The container image includes it.
 
 ```sh
 cargo install --locked bbs-cli --features web    # or: cargo build --release --features web
@@ -345,7 +362,9 @@ To embed a page built elsewhere instead of running npm, set `BBS_WEB_DIST` to
 its directory.
 
 For frontend work, `npm run dev` in `web/` serves the page with live reload and
-forwards `/api` to `http://127.0.0.1:7778` (or `BBS_WEB`).
+forwards `/api` to `http://127.0.0.1:7778` (or `BBS_WEB`). `npm test` runs the
+page's tests (Node.js 22.12 or newer), and `npm run build` type-checks and
+bundles it.
 
 ### Human enrollment and credentials
 
@@ -828,6 +847,7 @@ uv run tests/test_bubble_sets.py
 
 ```sh
 cargo test --features web     # needs npm; plain `cargo test` skips the web UI
+(cd web && npm ci && npm test && npm run build)   # the page's tests, types and bundle
 python3 -m unittest discover -s tests -p 'test_*.py'
 docker build -t bbs:test .
 python3 scripts/test_container.py bbs:test --bbs target/debug/bbs
