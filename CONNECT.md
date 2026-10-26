@@ -193,8 +193,8 @@ blockers` whatever is selected, in a calm aqua (the scheme's information
 colours, not its warnings) on a matching surface; the selected blocker below
 reads like a reply in a conversation, on the standard background, and the
 answer box keeps the composer's surface. Real warnings, such as a cancel
-confirmation, an unconfirmed write, a refusal or an old server, and the status
-bar's blocker count, stay in the warning colour. Without colour, the title bar
+confirmation, an unconfirmed write or an old server, and the status bar's
+blocker count, stay in the warning colour, and a refusal in the error colour. Without colour, the title bar
 is reversed and bold. The screen beneath
 is covered as by any page: its draft, cursor, selection, scroll, mode and side
 panel come back when the page closes. `Esc` or `F2` closes the page, keeping

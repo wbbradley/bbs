@@ -16,8 +16,8 @@ under the new package version and its publication date.
   blocker, its answer and actions at the foot of the bottom half. The list's
   title bar always reads `Open blockers`, and the list uses calm aqua
   information colours instead of the warning yellow, which stays for real
-  warnings: cancel confirmations, unconfirmed writes, refusals, old servers
-  and the status bar's blocker count.
+  warnings: cancel confirmations, unconfirmed writes, old servers and the
+  status bar's blocker count. Refusals keep the error colour.
 
 ## 0.16.1 - 2026-10-25
 
