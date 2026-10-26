@@ -213,7 +213,10 @@ holds one blank row, then the selected blocker: a row restating its number,
 group and creator, its details, one blank row, who an answer goes to, one
 blank row, the answer box and its actions. Spare rows in either half sit above
 its content on the standard background; the details get only what the bottom
-half has left, and a tall answer takes rows from them, never from the list. Alt-↑/↓ selects; plain arrows edit the
+half has left, and a tall answer takes rows from them, never from the list,
+always leaving at least one row of details and scrolling to its cursor. A
+refresh that resolves rows above the list's first row in view leaves the rows
+in view where they were. Alt-↑/↓ selects; plain arrows edit the
 answer; PgUp/PgDn page through a selected text too long for the card, which
 shows how far you have read. Details render as Markdown, as messages
 do: headings, emphasis, lists, code and tables. Every display line keeps a

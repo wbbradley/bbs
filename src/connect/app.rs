@@ -8296,6 +8296,72 @@ mod tests {
         assert_eq!(draft_text(&mut app), "grove draft");
     }
 
+    #[test]
+    fn the_page_halves_hold_in_the_apps_body_at_even_and_odd_heights() {
+        let long = (0..60)
+            .map(|i| format!("paragraph {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        for height in [24u16, 25, 27, 40] {
+            let (mut app, mut rx) = app();
+            live(&mut app, &[("Zed", 101), ("Mateo", 102)]);
+            queue(
+                &mut app,
+                &mut rx,
+                vec![
+                    blocker(1, 1, "Zed", "short?"),
+                    blocker(2, 2, "Mateo", &long),
+                ],
+            );
+            press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+            let rows = |app: &mut App| -> Vec<String> {
+                let mut terminal = Terminal::new(TestBackend::new(60, height)).unwrap();
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let buffer = terminal.backend().buffer().clone();
+                crate::ui::theme::testing::assert_buffer(&buffer);
+                (0..height)
+                    .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect())
+                    .collect()
+            };
+            // The body is all but the title and status rows; its top half
+            // ends with the list.
+            let body = usize::from(height) - 2;
+            let foot = 1 + body / 2;
+            let list = |rows: &[String]| -> Vec<String> {
+                rows[1..foot]
+                    .iter()
+                    .map(|r| r.replacen('▸', " ", 1))
+                    .collect()
+            };
+            let first = rows(&mut app);
+            assert!(first[foot - 3].starts_with(" Open blockers"), "{first:#?}");
+            assert!(
+                first[foot - 1].starts_with("  #2 @crew Mateo"),
+                "{first:#?}"
+            );
+            press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+            for i in 1..=8 {
+                typed(&mut app, &format!("draft{i}"));
+                press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+            }
+            typed(&mut app, "cursor-here");
+            let tall = rows(&mut app);
+            let out = tall.join("\n");
+            assert_eq!(list(&tall), list(&first), "{height}: {out}");
+            // Long details and a tall draft: still a row of the details, who
+            // it answers, the draft at its cursor and the actions.
+            let at = tall
+                .iter()
+                .rposition(|r| r.starts_with("  #2 @crew Mateo"))
+                .expect(&out);
+            assert!(at >= foot, "{out}");
+            assert!(tall[at + 1].starts_with("  paragraph 0"), "{out}");
+            assert!(out.contains("answer → Mateo"), "{out}");
+            assert!(out.contains("cursor-here"), "{out}");
+            assert!(tall[usize::from(height) - 3].contains("[Cancel]"), "{out}");
+        }
+    }
+
     fn buffer(app: &mut App, width: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();

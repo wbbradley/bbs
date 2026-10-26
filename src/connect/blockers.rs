@@ -89,8 +89,10 @@ struct Panel {
     focus: Focus,
     /// Rows of the selected blocker's text scrolled past.
     scroll: u16,
-    /// The first list row in view: it moves only to keep the selection in
-    /// view, so the list stays put while the selection moves within it.
+    /// The first list row in view, by root and by place: it moves only to
+    /// keep the selection in view, so the list stays put while the selection
+    /// moves within it, and while refreshes come and go above it.
+    list_top: Option<i64>,
     list_start: usize,
 }
 
@@ -201,6 +203,7 @@ impl Blockers {
             None => roots.first().copied(),
         };
         self.panel = Some(Panel {
+            list_top: None,
             list_start: 0,
             selected,
             focus: Focus::Answer,
@@ -621,6 +624,11 @@ impl Blockers {
     }
 
     fn answer_height(&self, width: u16) -> u16 {
+        self.answer_lines(width, 6)
+    }
+
+    /// The answer box's rows when its draft may show up to `lines` lines.
+    fn answer_lines(&self, width: u16, lines: u16) -> u16 {
         match (self.selected(), self.selected_chain()) {
             // A draft written before the row became read only still shows.
             (Some(row), Some(chain))
@@ -628,7 +636,7 @@ impl Blockers {
                     || chain.error.is_some()
                     || !chain.answer.draft().text.is_empty() =>
             {
-                chain.answer.height(width, 6)
+                chain.answer.height(width, lines)
             }
             _ => 0,
         }
@@ -914,12 +922,17 @@ impl Blockers {
             .unwrap_or(0);
         let start = match &mut self.panel {
             Some(panel) => {
-                let mut start = panel.list_start.min(at);
+                let mut start = panel
+                    .list_top
+                    .and_then(|top| list.iter().position(|(root, _)| *root == top))
+                    .unwrap_or(panel.list_start)
+                    .min(at);
                 if room > 0 && at >= start + room {
                     start = at + 1 - room;
                 }
                 start = start.min(list.len().saturating_sub(room));
                 panel.list_start = start;
+                panel.list_top = list.get(start).map(|(root, _)| *root);
                 start
             }
             None => 0,
@@ -961,10 +974,16 @@ impl Blockers {
         ]
         .iter()
         .fold(0u16, |sum, rows| sum.saturating_add(*rows));
-        // A tall draft takes no more than the half has.
-        let answer = self
-            .answer_height(area.width)
-            .min(area.height.saturating_sub(fixed));
+        // A tall draft takes no more than the half has, keeping a row of the
+        // details in view; never less than its one line, which scrolls to
+        // the cursor.
+        let answer = self.answer_height(area.width).min(
+            self.answer_lines(area.width, 1).max(
+                area.height
+                    .saturating_sub(fixed)
+                    .saturating_sub(rows.min(1)),
+            ),
+        );
         let room = area.height.saturating_sub(fixed + answer);
         let shown = rows.min(room);
         let [
@@ -1439,6 +1458,23 @@ mod tests {
         }
         let (rows, _) = drawn(&mut blockers, 60, 24, now);
         assert_eq!(listed(&rows), (2..=12).collect::<Vec<_>>(), "{rows:#?}");
+        let at = |rows: &[String]| rows.iter().position(|r| r.starts_with('▸')).unwrap();
+        let selected = at(&rows);
+        // A refresh that resolves rows above the window, and replaces one in
+        // it: the same rows stay where they were.
+        let mut fresh: Vec<_> = (2..=15)
+            .map(|i| row(i, i, "Zed", &format!("question {i}?")))
+            .collect();
+        fresh[3] = row(40, 5, "Zed", "question 5, replaced?");
+        blockers.poll(SCREEN);
+        blockers.on_data(SCREEN, &list(fresh), now);
+        let (rows, _) = drawn(&mut blockers, 60, 24, now);
+        assert_eq!(at(&rows), selected, "{rows:#?}");
+        assert_eq!(listed(&rows)[0], 2, "{rows:#?}");
+        // A taller window shows more, and back again, the selection in view.
+        drawn(&mut blockers, 60, 40, now);
+        let (rows, _) = drawn(&mut blockers, 60, 24, now);
+        assert!(rows[..12].iter().any(|r| r.starts_with('▸')), "{rows:#?}");
     }
 
     #[test]
