@@ -10,6 +10,10 @@ under the new package version and its publication date.
 
 ### Changed
 
+- Messages in `bbs view` and every `bbs connect` thread wrap one column
+  before the right edge of the terminal, so text never runs into it; card
+  backgrounds still reach the edge.
+
 - `bbs view` and the `bbs connect` Feed draw messages as conversation cards,
   the one renderer agent and group conversations already use: a header
   `• sender → recipient` or `→ @group` with bare names and the local send

@@ -13,6 +13,10 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::ui::message::fold;
 
+/// Columns kept clear at the right of every row, so text never runs into
+/// the edge of the terminal.
+pub(crate) const RIGHT_MARGIN: u16 = 1;
+
 /// Loaded history kept while the view is open; the oldest rows are dropped
 /// beyond this, never the stream.
 pub(crate) const MAX_ROWS: usize = 10_000;
@@ -239,6 +243,18 @@ impl<R: Row> ThreadView<R> {
         self.turn_marks = marks;
     }
 
+    /// The columns row `row` wraps to in `width`: less its left inset, and
+    /// less one column on the right so text never touches the edge, while
+    /// at least one column is left.
+    fn content_width(&self, row: &R, width: u16) -> u16 {
+        let inner = width.saturating_sub(self.inset(row));
+        if inner > RIGHT_MARGIN {
+            inner - RIGHT_MARGIN
+        } else {
+            inner
+        }
+    }
+
     fn inset(&self, row: &R) -> u16 {
         if self.turn_marks.get(&row.key()).is_some_and(|m| m.start) {
             row.inset().max(2)
@@ -284,7 +300,7 @@ impl<R: Row> ThreadView<R> {
             total += match self.heights[i] {
                 Some((w, h)) if w == width => h,
                 _ => {
-                    let inner_width = width.saturating_sub(self.inset(&self.rows[i]));
+                    let inner_width = self.content_width(&self.rows[i], width);
                     let h = Paragraph::new(Text::from(self.row_lines(i, None, inner_width)))
                         .wrap(Wrap { trim: false })
                         .line_count(inner_width);
@@ -457,9 +473,11 @@ impl<R: Row> ThreadView<R> {
             let content_area = Rect::new(
                 row_area.x + inset,
                 row_area.y,
-                row_area.width - inset,
+                self.content_width(row, row_area.width),
                 row_area.height,
             );
+            // The row's surface still reaches the right edge.
+            frame.render_widget(Block::new().style(row.style()), row_area);
             let scroll = (visible_start - start).min(u16::MAX as usize) as u16;
             let mut gutter = row.gutter(
                 self.gaps.contains(&row.key()),
@@ -577,7 +595,8 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
         for scheme in theme::testing::SCHEMES {
             theme::testing::with_scheme(scheme, || {
-                for width in [8, 12] {
+                // 13: the text and its end square fit one row short of the edge.
+                for width in [8, 13] {
                     let mut view = ThreadView::new(
                         vec![R {
                             text: "abcdefgh",
@@ -605,9 +624,14 @@ mod tests {
                     let buffer = terminal.backend().buffer();
                     theme::testing::assert_buffer(buffer);
                     assert_eq!(buffer[(0, 1)].symbol(), "•", "{scheme:?} {width}");
-                    let end_y = if width == 8 { 2 } else { 1 };
-                    let end_x = if width == 8 { 5 } else { 11 };
-                    assert_eq!(buffer[(end_x, end_y)].symbol(), "•");
+                    // The end square follows the text, wrapped at the
+                    // width less the inset and the right margin.
+                    let (end_x, end_y) = (1..8)
+                        .flat_map(|y| (2..width).map(move |x| (x, y)))
+                        .find(|&(x, y)| buffer[(x, y)].symbol() == "•")
+                        .expect("the end square");
+                    assert_eq!(end_y, if width == 8 { 2 } else { 1 }, "{width}");
+                    assert!(end_x < width - RIGHT_MARGIN, "{width}");
                     let base = theme::style(Role::Screen);
                     assert_eq!(
                         Some(buffer[(0, 1)].fg),
@@ -629,8 +653,121 @@ mod tests {
                         let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
                         terminal.draw(|f| view.render(f, f.area())).unwrap();
                         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
-                        assert_eq!(terminal.backend().buffer()[(5, 0)].symbol(), "•");
+                        assert_eq!(terminal.backend().buffer()[(end_x, 0)].symbol(), "•");
                     }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn text_stops_one_column_short_of_the_right_edge_while_cards_reach_it() {
+        use crate::proto::Message;
+        use crate::ui::card::Card;
+        use crate::ui::theme::{self, Role};
+        use ratatui::{Terminal, backend::TestBackend};
+        for scheme in theme::testing::SCHEMES {
+            theme::testing::with_scheme(scheme, || {
+                for width in [60u16, 80] {
+                    // Bodies that once filled the card exactly, to its edge.
+                    let fill = usize::from(width) - 2;
+                    let bodies = [
+                        "x".repeat(fill),
+                        "界".repeat(fill / 2),
+                        format!("| {} |\n| --- |\n| cell |", "h".repeat(fill - 4)),
+                    ];
+                    let rows: Vec<Card> = bodies
+                        .iter()
+                        .zip(1..)
+                        .map(|(body, id)| {
+                            Card::feed(
+                                Message {
+                                    id,
+                                    created_at: "2026-10-16T18:00:00Z".into(),
+                                    from_name: "Zed".into(),
+                                    to_name: Some("Mateo".into()),
+                                    to_owner: Some("ada".into()),
+                                    body: body.clone(),
+                                    ..Default::default()
+                                },
+                                None,
+                            )
+                        })
+                        .collect();
+                    let mut view = ThreadView::new(rows, 100);
+                    let draw = |view: &mut ThreadView<Card>, width: u16| {
+                        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                        terminal
+                            .draw(|f| {
+                                f.render_widget(
+                                    Block::new().style(theme::style(Role::Screen)),
+                                    f.area(),
+                                );
+                                view.render(f, f.area());
+                            })
+                            .unwrap();
+                        terminal.backend().buffer().clone()
+                    };
+                    for query in [None, Some("x")] {
+                        if let Some(query) = query {
+                            view.set_query(query);
+                        }
+                        // Drawn wider first, so this is a resize.
+                        draw(&mut view, width + 20);
+                        let buffer = draw(&mut view, width);
+                        theme::testing::assert_buffer(&buffer);
+                        let text = |y: u16| {
+                            (0..width)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                        };
+                        let out: Vec<String> = (0..40).map(text).collect();
+                        // Nothing starts in the last column. Ratatui lets a
+                        // double-width character begun in the last text
+                        // column spill one cell, which the margin now takes
+                        // instead of the terminal's edge.
+                        for y in 0..40 {
+                            let spill = unicode_width::UnicodeWidthStr::width(
+                                buffer[(width - 2, y)].symbol(),
+                            ) == 2;
+                            assert!(
+                                buffer[(width - 1, y)].symbol() == " " || spill,
+                                "{scheme:?} {width} row {y}: {out:#?}"
+                            );
+                        }
+                        // Each body now wraps rather than touch the edge.
+                        let xs = out.iter().filter(|l| l.starts_with("  x")).count();
+                        assert_eq!(xs, 2, "{out:#?}");
+                        assert!(out.iter().any(|l| l.contains('界')), "{out:#?}");
+                        // The card's surface still fills the last column.
+                        let card = theme::style(Role::Screen)
+                            .patch(theme::style(Role::OtherConversation))
+                            .bg;
+                        let body = out.iter().position(|l| l.contains("xx")).unwrap() as u16;
+                        assert_eq!(Some(buffer[(width - 1, body)].bg), card, "{scheme:?}");
+                        let header = body - 1;
+                        assert_eq!(
+                            Some(buffer[(width - 1, header)].bg),
+                            theme::style(Role::Screen)
+                                .patch(theme::style(Role::OtherConversationHeader))
+                                .bg
+                        );
+                    }
+                    // Scrolling keeps the same geometry.
+                    view.layout(width, 10);
+                    view.scroll_to(3);
+                    let buffer = {
+                        let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+                        terminal.draw(|f| view.render(f, f.area())).unwrap();
+                        terminal.backend().buffer().clone()
+                    };
+                    assert!((0..10).all(|y| buffer[(width - 1, y)].symbol() == " "));
+                }
+                // Too narrow for a margin: still drawn, never a panic.
+                let mut view = ThreadView::new(vec![r(1, false)], 100);
+                for width in [1u16, 2, 3] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 4)).unwrap();
+                    terminal.draw(|f| view.render(f, f.area())).unwrap();
                 }
             });
         }

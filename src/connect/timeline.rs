@@ -1266,7 +1266,7 @@ mod tests {
                     crate::ui::theme::testing::assert_buffer(buf);
                     let expected = Paragraph::new(entry.lines(false, None))
                         .wrap(Wrap { trim: false })
-                        .line_count(width - 2)
+                        .line_count(width - 3)
                         + 1;
                     assert_eq!(view.frame.total, expected);
                     assert!(expected > entry.lines(false, None).len() + 1);
@@ -1626,10 +1626,12 @@ mod tests {
                     // in its timestamp colour on the header's surface.
                     let header = row(1);
                     assert!(header.starts_with("• Zed → Mateo"), "{header}");
-                    assert!(header.ends_with(&sent), "{width}: {header}");
+                    // One column short of the edge, which keeps the surface.
+                    assert!(header.ends_with(&format!("{sent} ")), "{width}: {header}");
                     let surface =
                         theme::base().patch(theme::style(theme::Role::OtherConversationHeader));
-                    let at = width - 1;
+                    assert_eq!(buf[(width - 1, 1)].bg, surface.bg.unwrap());
+                    let at = width - 2;
                     assert_eq!(buf[(at, 1)].bg, surface.bg.unwrap());
                     assert_eq!(
                         buf[(at, 1)].fg,
@@ -1661,7 +1663,7 @@ mod tests {
                     );
                     let long_card = card(2, long, long);
                     // The gutter starts with the separator's blank row.
-                    let gutter = long_card.gutter(false, None, width - 2);
+                    let gutter = long_card.gutter(false, None, width - 3);
                     assert_eq!(gutter.len() - 1, header_rows, "{width}");
                     assert_eq!(gutter[1].to_string(), "• ");
                 }
@@ -2002,10 +2004,10 @@ mod tests {
                 // quiet note color; with headers, the header says so instead.
                 let bottom: String = (0..width).map(|x| buffer[(x, end - 1)].symbol()).collect();
                 if compact {
-                    assert!(bottom.ends_with("unread  "), "{bottom:?}");
+                    assert!(bottom.ends_with("unread   "), "{bottom:?}");
                     assert_eq!(bottom.trim(), "unread");
                     let note = theme::style(theme::Role::HumanNote);
-                    for x in width - 8..width - 2 {
+                    for x in width - 9..width - 3 {
                         let cell = &buffer[(x, end - 1)];
                         assert_eq!(cell.fg, note.fg.or(human.fg).unwrap(), "{scheme:?}");
                         assert_eq!(cell.bg, human.bg.unwrap());
