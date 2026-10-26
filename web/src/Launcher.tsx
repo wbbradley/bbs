@@ -4,7 +4,7 @@ import { Kind, type Message, type SearchHit } from "./types";
 import { navigate, paths } from "./router";
 import { useBoard } from "./store";
 import { useCover } from "./cover";
-import { ago, same, senderName } from "./util";
+import { ago, senderName } from "./util";
 
 interface Result {
   key: string;
@@ -38,13 +38,13 @@ function Hit({ text, query }: { text: string; query: string }) {
 }
 
 /** Where a found message belongs: its group, the agent side, or the Feed. */
-function messagePath(m: Message, me: string): string {
+function messagePath(m: Message): string {
   const q = `?m=${m.id}`;
   if (m.to_group) return paths.group(m.to_group) + q;
   if (m.from_kind === Kind.Agent) return paths.agent(m.from_name) + q;
   if (m.to_name && m.to_owner) return paths.agent(m.to_name) + q;
-  if (m.to_name && !same(m.to_name, me)) return paths.feed;
-  return paths.feed;
+  // Mail between humans lives on the Feed; it opens there at the message.
+  return paths.feed + q;
 }
 
 /**
@@ -60,21 +60,27 @@ export function Launcher({ onClose }: { onClose: () => void }) {
   const list = useRef<HTMLDivElement>(null);
   useCover();
 
+  // The server searches once per query typed; only the newest query's
+  // answer is shown, however the answers arrive.
+  const searchable = board.has("message-search.v1");
+  const latest = useRef(0);
   useEffect(() => {
     const q = query.trim();
-    if (q.length < 2 || !board.has("message-search.v1")) {
+    const mine = ++latest.current;
+    if (q.length < 2 || !searchable) {
       setHits([]);
+      setSearching(false);
       return;
     }
     setSearching(true);
     const t = window.setTimeout(() => {
       rpc<{ hits: SearchHit[] }>("search", { query: q, limit: 30 })
-        .then((r) => setHits(r.hits))
-        .catch(() => setHits([]))
-        .finally(() => setSearching(false));
+        .then((r) => mine === latest.current && setHits(r.hits))
+        .catch(() => mine === latest.current && setHits([]))
+        .finally(() => mine === latest.current && setSearching(false));
     }, 200);
     return () => window.clearTimeout(t);
-  }, [query, board]);
+  }, [query, searchable]);
 
   const results = useMemo<Result[]>(() => {
     const q = query.trim();
@@ -158,7 +164,7 @@ export function Launcher({ onClose }: { onClose: () => void }) {
           </span>
         ),
         detail: <Hit text={line.trim().slice(0, 200)} query={q} />,
-        go: go(messagePath(m, board.me.name)),
+        go: go(messagePath(m)),
       });
     }
     return found;
@@ -178,6 +184,9 @@ export function Launcher({ onClose }: { onClose: () => void }) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
+            // Its own keys go no further: Ctrl-J/K select here, while ⌘K
+            // still closes it.
+            if (e.key === "Escape" || (e.ctrlKey && !e.metaKey)) e.stopPropagation();
             if (e.key === "Escape") onClose();
             else if (e.key === "ArrowDown" || (e.ctrlKey && e.key === "j")) {
               e.preventDefault();

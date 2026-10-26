@@ -1,11 +1,12 @@
 import { useMemo, useState, type FormEvent } from "react";
-import { useWatch } from "../api";
 import type { PageProps } from "../App";
-import { MessageView } from "../components/MessageView";
+import { messageRows } from "../components/MessageView";
+import { SeekNote } from "../components/SeekNote";
+import { go, useSearch } from "../router";
+import { useMessages } from "../useMessages";
 import { PageHeader } from "../components/PageHeader";
 import { Timeline } from "../components/Timeline";
 import { useBoard } from "../store";
-import type { Message } from "../types";
 
 interface Filters {
   group: string;
@@ -22,31 +23,21 @@ export function FeedPage({ openNav }: PageProps) {
   const board = useBoard();
   const [draft, setDraft] = useState<Filters>(blank);
   const [filters, setFilters] = useState<Filters>(blank);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const req = {
-    backlog: filters.backlog,
-    group: filters.group.trim().replace(/^@/, "") || null,
-    from: filters.from.trim() || null,
-    from_human: filters.from_human.trim() || null,
-    mine: filters.mine,
-  };
-  const feed = useWatch<{ messages: Message[] }>("feed", req, (snap) => {
-    setMessages(snap.messages);
-    setLoaded(true);
-  });
-  const rows = useMemo(
-    () =>
-      messages.map((m) => ({
-        key: `m${m.id}`,
-        at: m.created_at,
-        node: <MessageView m={m} me={board.me.name} mode={{ kind: "feed" }} />,
-      })),
-    [messages, board.me.name],
+  const focus = useSearch().get("m");
+  const seekId = focus !== null && /^\d+$/.test(focus) ? Number(focus) : null;
+  const req = useMemo(
+    () => ({
+      group: filters.group.trim().replace(/^@/, "") || null,
+      from: filters.from.trim() || null,
+      from_human: filters.from_human.trim() || null,
+      mine: filters.mine,
+    }),
+    [filters],
   );
+  const { held, loaded, state: feed, seek } = useMessages(req, filters.backlog, seekId);
+  const rows = useMemo(() => messageRows(held, board.me.name, { kind: "feed" }, seekId), [held, board.me.name, seekId]);
   const apply = (e: FormEvent) => {
     e.preventDefault();
-    setLoaded(false);
     setFilters(draft);
   };
   const filtered = JSON.stringify(filters) !== JSON.stringify(blank);
@@ -108,11 +99,14 @@ export function FeedPage({ openNav }: PageProps) {
           </button>
         )}
         {feed.state === "failed" && <span className="error-text">{feed.error}</span>}
+        {seekId !== null && <SeekNote seek={seek} />}
       </form>
       <div className="conversation">
         <Timeline
           rows={rows}
           version={rows}
+          onFollowing={(f) => f && seekId !== null && go(location.pathname, true)}
+          scrollTo={seekId !== null ? `msg-${seekId}` : null}
           empty={<div className="empty">{loaded ? "No messages match." : "Loading…"}</div>}
         />
       </div>

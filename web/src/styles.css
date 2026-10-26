@@ -567,7 +567,18 @@ table.list .status {
   padding: 10px 0;
   position: relative;
 }
-.msg.mine .unread {
+.msg.own {
+  background: var(--surface);
+}
+.msg.own .msg-head {
+  background: var(--surface);
+}
+.msg.unread-mail {
+  position: relative;
+  padding-bottom: 14px;
+}
+.msg.mine .unread,
+.msg.unread-mail .unread {
   position: absolute;
   right: 12px;
   bottom: 4px;
@@ -1277,4 +1288,12 @@ mark {
   table.list .hide-narrow {
     display: none;
   }
+}
+
+/* A place in a thread where something may not have arrived. */
+.gap {
+  margin: 10px 0;
+  color: var(--warning);
+  font-family: var(--mono);
+  font-size: 12px;
 }

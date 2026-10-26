@@ -101,6 +101,11 @@ export function onSignedOut(f: () => void): () => void {
   return () => signedOut.delete(f);
 }
 
+/** A one-shot watch is a call the test answers, named `watch:<kind>`. */
+export function watchOnce<T>(kind: string, req: object): Promise<T> {
+  return rpc<T>(`watch:${kind}`, req);
+}
+
 export const login = (name: string, token: string) => rpc("login", { name, token });
 export const logout = () => rpc("logout");
 export const serverInfo = () => rpc("server_info");

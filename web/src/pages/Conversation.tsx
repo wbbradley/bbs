@@ -11,7 +11,11 @@ import { NoteDrawer, type NoteHandle } from "../components/NoteDrawer";
 import { PageHeader } from "../components/PageHeader";
 import { SidePanel } from "../components/SidePanel";
 import { Timeline } from "../components/Timeline";
-import { navigate, paths, useSearch } from "../router";
+import { go, navigate, paths, useSearch } from "../router";
+import { useCovered } from "../cover";
+import { empty, mergeWindow, type Held } from "../merge";
+import { SeekNote } from "../components/SeekNote";
+import { useMessages } from "../useMessages";
 import { useBoard, usePrefs } from "../store";
 import {
   Control,
@@ -20,16 +24,13 @@ import {
   Kind,
   SideStatus,
   type Activity,
-  type Message,
   type SideReport,
   type SideRequest,
 } from "../types";
-import { ago, same } from "../util";
+import { ago, same, sideDraft } from "../util";
 
 const FEED_BACKLOG = 300;
 const ACTIVITY_BACKLOG = 200;
-/** Activity kept in the page; older records fall off the top. */
-const ACTIVITY_KEEP = 3000;
 const SIDE_POLL_MS = 1500;
 /** Unfinished activity shows as running only this long after it arrives. */
 const RUNNING_FRESH_MS = 60000;
@@ -45,9 +46,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const search = useSearch();
   const focusMessage = search.get("m");
 
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [feedLoaded, setFeedLoaded] = useState(false);
-  const [records, setRecords] = useState<Activity[]>([]);
+  const [activityHeld, setActivityHeld] = useState<Held<Activity>>(empty);
   const [show, setShow] = useState<Show>("all");
   const [following, setFollowing] = useState(true);
   const [noteOpen, setNoteOpen] = useState(false);
@@ -77,25 +76,23 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
     };
   }, []);
 
-  const feed = useWatch<{ messages: Message[] }>(
-    "feed",
-    { backlog: FEED_BACKLOG, with: agent, include_group_deliveries: true },
-    (snap) => {
-      setMessages(snap.messages);
-      setFeedLoaded(true);
-    },
-  );
+  const seekId = focusMessage !== null && /^\d+$/.test(focusMessage) ? Number(focusMessage) : null;
+  const feedReq = useMemo(() => ({ with: agent, include_group_deliveries: true }), [agent]);
+  const {
+    held,
+    loaded: feedLoaded,
+    state: feed,
+    seek,
+  } = useMessages(feedReq, FEED_BACKLOG, seekId);
+  const messages = held.rows;
+  // Activity is merged, never replaced: a reconnect's newest window joins
+  // what is held, with a mark where records may be missing between.
   const activity = useWatch<{ events: Activity[] }>(
     "activity",
     board.has("agent-activity.v1") ? { backlog: ACTIVITY_BACKLOG, agent } : null,
-    (snap, fresh) =>
-      setRecords((old) => {
-        if (fresh) return snap.events;
-        const seen = new Set(old.map((a) => a.id));
-        const next = old.concat(snap.events.filter((a) => !seen.has(a.id)));
-        return next.length > ACTIVITY_KEEP ? next.slice(next.length - ACTIVITY_KEEP) : next;
-      }),
+    (snap, fresh) => setActivityHeld((h) => mergeWindow(h, snap.events, fresh ? ACTIVITY_BACKLOG : Infinity)),
   );
+  const records = activityHeld.rows;
 
   // The owner's side state: questions waiting on them, context and asides.
   const sideSupported = owned && board.has("agent-interactions.v1");
@@ -141,11 +138,14 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const entries = useMemo(() => buildActivity(records), [records]);
 
   // Reading: mail to you is read, and activity seen, once the live view shows
-  // it to a reader following the newest, as connect does.
-  const reading = visible && following && !noteOpen && !focusMessage;
+  // it to a reader following the newest, as connect does: not under an
+  // overlay, nor while a found message holds the view, nor before a
+  // reconnected stream has sent what is new.
+  const covered = useCovered();
+  const reading = visible && following && !covered && !noteOpen && seekId === null;
   const markedRead = useRef(0);
   useEffect(() => {
-    if (!reading || !feedLoaded) return;
+    if (!reading || !feedLoaded || feed.state !== "live") return;
     const unread = messages.filter(
       (m) => !m.read_at && !m.to_group && same(m.to_name, me) && same(m.from_name, agent),
     );
@@ -154,22 +154,25 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
       markedRead.current = newest;
       rpc("mark_read", { from: agent }).catch(() => (markedRead.current = 0));
     }
-  }, [reading, feedLoaded, messages, me, agent]);
+  }, [reading, feedLoaded, feed.state, messages, me, agent]);
   const markedSeen = useRef(0);
   useEffect(() => {
-    if (!reading || records.length === 0) return;
+    if (!reading || records.length === 0 || activity.state !== "live") return;
     const newest = records[records.length - 1].id;
     if (newest > markedSeen.current) {
       markedSeen.current = newest;
       rpc("mark_seen", { agent, through_id: newest }).catch(() => (markedSeen.current = 0));
     }
-  }, [reading, records, agent]);
+  }, [reading, records, activity.state, agent]);
 
   const compact = prefs.compact;
   const rows = useMemo(() => {
     const items = mergeTimeline(show === "activity" ? [] : messages, show === "messages" ? [] : entries);
     const out: { key: string; at: string; node: ReactNode }[] = [];
     let tools: Extract<ActivityEntry, { kind: "tool" }>[] = [];
+    const activityGaps = [...activityHeld.gaps].sort((a, b) => a - b);
+    const gap = (key: string, at: string, what: string) =>
+      out.push({ key, at, node: <div className="gap">⋯ {what} may be missing here</div> });
     const flush = () => {
       if (tools.length === 0) return;
       const run = tools;
@@ -179,6 +182,10 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
     for (const item of items) {
       if (item.type === "message") {
         const m = item.message;
+        if (held.gaps.has(m.id) && show !== "activity") {
+          flush();
+          gap(`g${m.id}`, item.at, "messages");
+        }
         const withMe =
           (same(m.from_name, me) && m.from_kind === Kind.Human) || (!m.to_group && same(m.to_name, me));
         // Compact view keeps your mail with the agent and its replies.
@@ -194,6 +201,11 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
         continue;
       }
       const e = item.entry;
+      if (activityGaps.length > 0 && e.id >= activityGaps[0]) {
+        while (activityGaps.length > 0 && e.id >= activityGaps[0]) activityGaps.shift();
+        flush();
+        gap(`ga${e.id}`, item.at, "activity");
+      }
       if (e.kind === "tool") {
         if (compact) continue;
         tools.push(e);
@@ -205,7 +217,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
     }
     flush();
     return out;
-  }, [messages, entries, show, compact, prefs.compactHidesThoughts, me, agent, focusMessage]);
+  }, [messages, entries, show, compact, prefs.compactHidesThoughts, me, agent, focusMessage, held.gaps, activityHeld.gaps]);
 
   const turn = turnState(entries);
   const pendingInput =
@@ -214,9 +226,9 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const send = useCallback(
     async (text: string) => {
       setNotice(null);
-      const btw = text.match(/^\/btw(?:\s+([\s\S]*))?$/);
-      if (owned && btw) {
-        const question = (btw[1] ?? "").trim();
+      const draft = sideDraft(text);
+      if (owned && draft.kind === "ask") {
+        const question = draft.question;
         setSideOpen(true);
         if (!question) return true;
         const report = side?.side;
@@ -234,8 +246,9 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
         setNotice(contextLabel(side) ?? "Context not reported.");
         return true;
       }
-      // `//btw` sends the literal `/btw` text as mail.
-      const body = text.startsWith("//") ? text.slice(1) : text;
+      // Only `//btw` loses a slash, to send a literal `/btw`; all else is
+      // sent as typed.
+      const body = draft.kind === "literal" ? draft.body : text;
       await rpc("send", { to: agent, body });
       return true;
     },
@@ -269,7 +282,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const noteId = info?.id ?? null;
   const context = contextLabel(side);
   const streamTrouble =
-    feed.state === "retrying" || feed.state === "failed"
+    (feed.state === "retrying" || feed.state === "failed")
       ? `messages: ${feed.error}`
       : activity.state === "retrying" || activity.state === "failed"
         ? `activity: ${activity.error}`
@@ -333,8 +346,12 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
           <Timeline
             rows={rows}
             version={rows}
-            onFollowing={setFollowing}
-            scrollTo={focusMessage ? `msg-${focusMessage}` : null}
+            onFollowing={(f) => {
+              setFollowing(f);
+              // Back at the newest, a found message lets go of the view.
+              if (f && seekId !== null) go(location.pathname, true);
+            }}
+            scrollTo={seekId !== null ? `msg-${seekId}` : null}
             empty={<div className="empty">{feedLoaded ? `No conversation with ${agent} yet.` : "Loading…"}</div>}
           />
           <Composer
@@ -380,6 +397,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
             <span className="spacer" />
             {sideError && <span className="warning-text">{sideError}</span>}
             {streamTrouble && <span className="error-text">{streamTrouble}</span>}
+            {seekId !== null && <SeekNote seek={seek} />}
             {!board.info && <span>checking what the server offers…</span>}
             {board.info && !board.has("agent-activity.v1") && <span>activity needs a newer server</span>}
           </div>

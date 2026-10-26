@@ -137,3 +137,28 @@ export function useWatch<T>(
 
   return state;
 }
+
+/**
+ * The first snapshot of a watch stream, then the stream is closed: rows
+ * read once, such as the context around one message.
+ */
+export function watchOnce<T>(kind: string, req: object, timeoutMs = 15000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const source = new EventSource(`/api/watch/${kind}?q=${encodeURIComponent(JSON.stringify(req))}`);
+    const done = (f: () => void) => {
+      window.clearTimeout(timer);
+      source.close();
+      f();
+    };
+    const timer = window.setTimeout(() => done(() => reject(new ApiError("timed out", 0))), timeoutMs);
+    source.onmessage = (e) => done(() => resolve(JSON.parse(e.data) as T));
+    source.addEventListener("fail", (e) => {
+      const { error, status } = JSON.parse((e as MessageEvent).data);
+      done(() => {
+        if (status === 401) signedOut.forEach((f) => f());
+        reject(new ApiError(error, status));
+      });
+    });
+    source.onerror = () => done(() => reject(new ApiError("connection lost", 0)));
+  });
+}

@@ -1,14 +1,15 @@
 import { useMemo, useState } from "react";
-import { rpc, useWatch } from "../api";
+import { rpc } from "../api";
 import type { PageProps } from "../App";
 import { Composer } from "../components/Composer";
 import { Dialog } from "../components/Dialog";
-import { MessageView } from "../components/MessageView";
 import { PageHeader } from "../components/PageHeader";
 import { Timeline } from "../components/Timeline";
-import { navigate, paths, useSearch } from "../router";
+import { go, navigate, paths, useSearch } from "../router";
+import { SeekNote } from "../components/SeekNote";
+import { messageRows } from "../components/MessageView";
+import { useMessages } from "../useMessages";
 import { useBoard } from "../store";
-import type { Message } from "../types";
 import { same } from "../util";
 
 const BACKLOG = 300;
@@ -16,24 +17,12 @@ const BACKLOG = 300;
 export function GroupPage({ group, openNav }: { group: string } & PageProps) {
   const board = useBoard();
   const info = board.groups.find((g) => same(g.name, group));
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [loaded, setLoaded] = useState(false);
   const [admin, setAdmin] = useState(false);
   const focus = useSearch().get("m");
-  const feed = useWatch<{ messages: Message[] }>("feed", { backlog: BACKLOG, group }, (snap) => {
-    setMessages(snap.messages);
-    setLoaded(true);
-  });
-
-  const rows = useMemo(
-    () =>
-      messages.map((m) => ({
-        key: `m${m.id}`,
-        at: m.created_at,
-        node: <MessageView m={m} me={board.me.name} mode={{ kind: "group" }} highlight={focus === String(m.id)} />,
-      })),
-    [messages, board.me.name, focus],
-  );
+  const seekId = focus !== null && /^\d+$/.test(focus) ? Number(focus) : null;
+  const req = useMemo(() => ({ group }), [group]);
+  const { held, loaded, state: feed, seek } = useMessages(req, BACKLOG, seekId);
+  const rows = useMemo(() => messageRows(held, board.me.name, { kind: "group" }, seekId), [held, board.me.name, seekId]);
 
   return (
     <>
@@ -53,7 +42,8 @@ export function GroupPage({ group, openNav }: { group: string } & PageProps) {
           <Timeline
             rows={rows}
             version={rows}
-            scrollTo={focus ? `msg-${focus}` : null}
+            onFollowing={(f) => f && seekId !== null && go(location.pathname, true)}
+            scrollTo={seekId !== null ? `msg-${seekId}` : null}
             empty={<div className="empty">{loaded ? "No broadcasts yet." : "Loading…"}</div>}
           />
           <Composer
@@ -64,7 +54,15 @@ export function GroupPage({ group, openNav }: { group: string } & PageProps) {
               await rpc("send", { to: `@${group}`, body });
               return true;
             }}
-            hint={feed.state === "retrying" || feed.state === "failed" ? <span className="error-text">{feed.error}</span> : ""}
+            hint={
+              feed.state === "retrying" || feed.state === "failed" ? (
+                <span className="error-text">{feed.error}</span>
+              ) : seekId !== null ? (
+                <SeekNote seek={seek} />
+              ) : (
+                ""
+              )
+            }
           />
         </div>
         {admin && info && <GroupAdmin group={info.name} onClose={() => setAdmin(false)} />}

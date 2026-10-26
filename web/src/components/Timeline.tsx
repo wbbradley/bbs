@@ -49,14 +49,22 @@ export function Timeline({
     return () => observer.disconnect();
   }, [toBottom]);
 
+  // A found message is brought into view once, when it first renders;
+  // later content leaves the reader where they are.
+  const scrolled = useRef<string | null>(null);
   useEffect(() => {
-    if (!scrollTo) return;
+    if (!scrollTo) {
+      scrolled.current = null;
+      return;
+    }
+    if (scrolled.current === scrollTo) return;
     const el = document.getElementById(scrollTo);
     if (!el) return;
+    scrolled.current = scrollTo;
     following.current = false;
     setPaused(true);
     report.current?.(false);
-    el.scrollIntoView({ block: "center" });
+    el.scrollIntoView?.({ block: "center" });
   }, [scrollTo, version]);
 
   const onScroll = () => {

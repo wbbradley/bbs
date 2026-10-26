@@ -140,3 +140,22 @@ export function saveDraft(key: string, text: string) {
   if (text) storage.set(k, text);
   else storage.remove(k);
 }
+
+/**
+ * What a draft means for `/btw`, as in connect: its first word, after
+ * leading space, decides. `/btw <question>` asks on the side; `//btw …` is
+ * mail starting with a literal `/btw`; anything else is mail as typed.
+ */
+export type SideDraft = { kind: "ask"; question: string } | { kind: "literal"; body: string } | { kind: "mail" };
+
+export function sideDraft(draft: string): SideDraft {
+  const text = draft.trimStart();
+  const word = (prefix: string): string | null => {
+    if (!text.startsWith(prefix)) return null;
+    const rest = text.slice(prefix.length);
+    return rest === "" || /^\s/.test(rest) ? rest : null;
+  };
+  if (word("//btw") !== null) return { kind: "literal", body: text.slice(1) };
+  const question = word("/btw");
+  return question === null ? { kind: "mail" } : { kind: "ask", question: question.trim() };
+}

@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, type ReactNode } from "react";
 import { Markdown } from "../Markdown";
 import { Kind, type Message } from "../types";
 import { clock, fullTime, same } from "../util";
@@ -11,21 +11,14 @@ export type MessageMode =
   /** The board feed: every message as a card. */
   | { kind: "feed" };
 
-function Name({ name, kind, owner }: { name: string; kind: number; owner?: string | null }) {
-  if (kind === Kind.Agent)
-    return (
-      <>
-        <span className="agent">{name}</span>
-        {owner && <span className="faint">@{owner}</span>}
-      </>
-    );
-  return <span className="human">{name}</span>;
+function Name({ name, kind }: { name: string; kind: number }) {
+  return <span className={kind === Kind.Agent ? "agent" : "human"}>{name}</span>;
 }
 
-function Recipient({ m, owners }: { m: Message; owners: boolean }) {
+function Recipient({ m }: { m: Message }) {
   if (m.to_group) return <span className="group">@{m.to_group}</span>;
   if (!m.to_name) return null;
-  return <Name name={m.to_name} kind={m.to_owner ? Kind.Agent : Kind.Human} owner={owners ? m.to_owner : null} />;
+  return <Name name={m.to_name} kind={m.to_owner ? Kind.Agent : Kind.Human} />;
 }
 
 export const MessageView = memo(function MessageView({
@@ -77,22 +70,26 @@ export const MessageView = memo(function MessageView({
     );
   }
 
-  const cls = mode.kind === "agent" ? (m.to_group ? "groupmail" : "side") : "card";
+  // Cards as connect and bbs view draw them: group mail on the group's
+  // colours, other mail on the side-card surface, and on the feed your own
+  // on yours. Names are bare: the card says who, not whose.
+  const own = mode.kind === "feed" && fromMe;
+  const cls = own ? "side own" : m.to_group ? "groupmail" : "side";
   const showTo = mode.kind !== "group";
-  // Conversation side cards name participants without owner suffixes.
-  const owners = mode.kind !== "agent";
   // Group mail in a conversation shows no time, as in connect.
   const showTime = !(mode.kind === "agent" && m.to_group);
+  // The feed marks direct mail its one reader has not read yet.
+  const unread = mode.kind === "feed" && !m.to_group && !m.read_at;
   return (
-    <div className={`msg ${cls}${hl}`} id={id}>
+    <div className={`msg ${cls}${unread ? " unread-mail" : ""}${hl}`} id={id}>
       <div className="msg-head">
         <span className="names">
           <span className="faint">• </span>
-          <Name name={m.from_name} kind={m.from_kind} owner={owners ? m.from_owner : null} />
+          <Name name={m.from_name} kind={m.from_kind} />
           {showTo && (
             <>
               <span className="faint"> → </span>
-              <Recipient m={m} owners={owners} />
+              <Recipient m={m} />
             </>
           )}
           {m.auto_reply && <span className="faint"> (auto)</span>}
@@ -106,7 +103,29 @@ export const MessageView = memo(function MessageView({
       <div className="msg-body">
         <Markdown text={m.body} />
       </div>
+      {unread && <span className="unread">unread</span>}
     </div>
   );
 });
+
+/** Rows of a message thread, with a mark where messages may be missing. */
+export function messageRows(
+  held: { rows: Message[]; gaps: Set<number> },
+  me: string,
+  mode: MessageMode,
+  focus: number | null,
+): { key: string; at: string; node: ReactNode }[] {
+  const out: { key: string; at: string; node: ReactNode }[] = [];
+  for (const m of held.rows) {
+    if (held.gaps.has(m.id)) {
+      out.push({ key: `g${m.id}`, at: m.created_at, node: <div className="gap">⋯ messages may be missing here</div> });
+    }
+    out.push({
+      key: `m${m.id}`,
+      at: m.created_at,
+      node: <MessageView m={m} me={me} mode={mode} highlight={focus === m.id} />,
+    });
+  }
+  return out;
+}
 
