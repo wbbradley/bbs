@@ -10,7 +10,7 @@ import type {
   Principal,
   ServerInfo,
 } from "./types";
-import { same } from "./util";
+import { same, storage } from "./util";
 
 /** An agent as the list gave it, with the summary stream's newer counts. */
 export interface LiveAgent extends Agent {
@@ -31,6 +31,10 @@ interface Board {
   blockers: ListBlockersResponse | null;
   blockersError: string | null;
   notes: Map<number, AgentNote>;
+  /** Every stored note has arrived once; until then none may be written. */
+  notesLoaded: boolean;
+  notesError: string | null;
+  syncNotes: () => void;
   has: (capability: string) => boolean;
   agent: (name: string) => LiveAgent | undefined;
   refreshAgents: () => void;
@@ -68,10 +72,12 @@ export function BoardProvider({
   const [blockers, setBlockers] = useState<ListBlockersResponse | null>(null);
   const [blockersError, setBlockersError] = useState<string | null>(null);
   const [notes, setNotes] = useState<Map<number, AgentNote>>(new Map());
-  const notesRevision = useRef(0);
+  const [notesLoaded, setNotesLoaded] = useState(false);
+  const [notesError, setNotesError] = useState<string | null>(null);
   const knownNames = useRef("");
 
-  const has = useCallback((c: string) => info?.capabilities.includes(c) ?? true, [info]);
+  // Until the server says what it offers, nothing that needs a capability is.
+  const has = useCallback((c: string) => info?.capabilities.includes(c) ?? false, [info]);
 
   const refreshAgents = useCallback(() => {
     rpc<{ agents: Agent[]; humans: Human[] }>("list_agents", { all: false })
@@ -105,29 +111,51 @@ export function BoardProvider({
       .finally(() => (blockersBusy.current = false));
   }, [has]);
 
-  const fetchNotes = useCallback(async (after: number) => {
-    let cursor = after;
-    const found: AgentNote[] = [];
-    for (;;) {
-      const page = await rpc<{ notes: AgentNote[]; has_more: boolean; next_after_revision: number }>(
-        "list_agent_notes",
-        { after_revision: cursor, limit: 64 },
-      );
-      found.push(...page.notes);
-      if (!page.has_more) break;
-      cursor = page.next_after_revision;
+  // Notes arrive in revision order from a cursor; one listing runs at a
+  // time, and a newer revision announced meanwhile lists again after it.
+  const notesCursor = useRef(0);
+  const notesBusy = useRef(false);
+  const notesAgain = useRef(false);
+  const syncNotes = useCallback(async () => {
+    if (notesBusy.current) {
+      notesAgain.current = true;
+      return;
     }
-    if (found.length === 0) return;
-    setNotes((old) => {
-      const next = new Map(old);
-      for (const n of found) next.set(n.agent_id, n);
-      return next;
-    });
+    notesBusy.current = true;
+    try {
+      do {
+        notesAgain.current = false;
+        let cursor = notesCursor.current;
+        const found: AgentNote[] = [];
+        for (;;) {
+          const page = await rpc<{ notes: AgentNote[]; has_more: boolean; next_after_revision: number }>(
+            "list_agent_notes",
+            { after_revision: cursor, limit: 64 },
+          );
+          found.push(...page.notes);
+          if (page.notes.length > 0) cursor = Math.max(cursor, page.next_after_revision);
+          if (!page.has_more) break;
+        }
+        notesCursor.current = cursor;
+        setNotes((old) => mergeNotes(old, found));
+        setNotesLoaded(true);
+        setNotesError(null);
+      } while (notesAgain.current);
+    } catch (e) {
+      setNotesError(e instanceof Error ? e.message : String(e));
+    } finally {
+      notesBusy.current = false;
+    }
   }, []);
 
   const setNote = useCallback((note: AgentNote) => {
-    setNotes((old) => new Map(old).set(note.agent_id, note));
+    setNotes((old) => mergeNotes(old, [note]));
   }, []);
+
+  const notesSupported = has("agent-notes.v1");
+  useEffect(() => {
+    if (notesSupported) syncNotes();
+  }, [notesSupported, syncNotes]);
 
   const summary = useWatch<{ agents: AgentSummary[]; notes_revision: number | null }>(
     "summary",
@@ -143,13 +171,7 @@ export function BoardProvider({
         refreshAgents();
       }
       const revision = snap.notes_revision ?? 0;
-      if (has("agent-notes.v1") && revision > notesRevision.current) {
-        const after = notesRevision.current;
-        notesRevision.current = revision;
-        fetchNotes(after).catch(() => {
-          notesRevision.current = after;
-        });
-      }
+      if (has("agent-notes.v1") && revision > notesCursor.current) syncNotes();
     },
   );
 
@@ -202,6 +224,9 @@ export function BoardProvider({
     blockers,
     blockersError,
     notes,
+    notesLoaded,
+    notesError,
+    syncNotes,
     has,
     agent,
     refreshAgents,
@@ -210,6 +235,17 @@ export function BoardProvider({
     setNote,
   };
   return <BoardContext.Provider value={board}>{children}</BoardContext.Provider>;
+}
+
+/** Notes by agent, keeping whichever copy of each is the newer revision. */
+export function mergeNotes(old: Map<number, AgentNote>, found: AgentNote[]): Map<number, AgentNote> {
+  if (found.length === 0) return old;
+  const next = new Map(old);
+  for (const n of found) {
+    const held = next.get(n.agent_id);
+    if (!held || n.revision >= held.revision) next.set(n.agent_id, n);
+  }
+  return next;
 }
 
 /** Agents by open blockers, then most recently active, then name. */
@@ -236,7 +272,7 @@ const defaults: Prefs = { theme: "dark", compact: false, compactHidesThoughts: f
 
 function loadPrefs(): Prefs {
   try {
-    return { ...defaults, ...JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}") };
+    return { ...defaults, ...JSON.parse(storage.get(PREFS_KEY) ?? "{}") };
   } catch {
     return defaults;
   }
@@ -248,11 +284,7 @@ export function PrefsProvider({ children }: { children: ReactNode }) {
   const [prefs, setPrefs] = useState(loadPrefs);
   useEffect(() => {
     document.documentElement.dataset.theme = prefs.theme;
-    try {
-      localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
-    } catch {
-      // Preferences then last the visit.
-    }
+    storage.set(PREFS_KEY, JSON.stringify(prefs));
   }, [prefs]);
   const update = useCallback((p: Partial<Prefs>) => setPrefs((old) => ({ ...old, ...p })), []);
   return <PrefsContext.Provider value={[prefs, update]}>{children}</PrefsContext.Provider>;

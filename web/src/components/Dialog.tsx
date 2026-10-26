@@ -1,4 +1,5 @@
 import { useEffect, type ReactNode } from "react";
+import { useCover } from "../cover";
 
 export function Dialog({
   title,
@@ -13,6 +14,7 @@ export function Dialog({
   actions?: ReactNode;
   wide?: boolean;
 }) {
+  useCover();
   useEffect(() => {
     const key = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", key);

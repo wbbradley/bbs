@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { login } from "./api";
 import type { Principal, ServerInfo } from "./types";
+import { storage } from "./util";
 // The same art `bbs connect` draws.
 import LOGO from "../../assets/connect/logo.txt?raw";
 
@@ -12,7 +13,7 @@ export function Login({
   info: ServerInfo | null;
   onSignedIn: (me: Principal) => void;
 }) {
-  const [name, setName] = useState(() => localStorage.getItem("bbs-last-human") ?? "");
+  const [name, setName] = useState(() => storage.get("bbs-last-human") ?? "");
   const [token, setToken] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -23,11 +24,7 @@ export function Login({
     setError(null);
     try {
       const me = await login(name, token);
-      try {
-        localStorage.setItem("bbs-last-human", me.name);
-      } catch {
-        // Only a convenience.
-      }
+      storage.set("bbs-last-human", me.name);
       onSignedIn(me);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

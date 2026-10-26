@@ -10,7 +10,29 @@ function subscribe(f: () => void) {
   return () => listeners.delete(f);
 }
 
-export function navigate(to: string, replace = false) {
+/**
+ * Things to settle before the page moves on, such as a changed note to
+ * store; each resolves false to stay.
+ */
+const leaveGuards = new Set<() => boolean | Promise<boolean>>();
+
+export function addLeaveGuard(guard: () => boolean | Promise<boolean>): () => void {
+  leaveGuards.add(guard);
+  return () => leaveGuards.delete(guard);
+}
+
+/** Move to `to` once every leave guard agrees; resolves whether it moved. */
+export async function navigate(to: string, replace = false): Promise<boolean> {
+  if (to === location.pathname + location.search) return true;
+  for (const guard of [...leaveGuards]) {
+    if (!(await guard())) return false;
+  }
+  go(to, replace);
+  return true;
+}
+
+/** Change the address now, with no guards: for this page's own state. */
+export function go(to: string, replace = false) {
   if (to === location.pathname + location.search) return;
   if (replace) history.replaceState(null, "", to);
   else history.pushState(null, "", to);

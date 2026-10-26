@@ -13,6 +13,7 @@ import { SettingsPage } from "./pages/Settings";
 import { navigate, paths, usePath } from "./router";
 import { BoardProvider } from "./store";
 import type { Principal, ServerInfo } from "./types";
+import { setDraftOwner } from "./util";
 
 type Session = { state: "loading" } | { state: "out" } | { state: "in"; me: Principal };
 
@@ -20,22 +21,54 @@ export function App() {
   const [session, setSession] = useState<Session>({ state: "loading" });
   const [info, setInfo] = useState<ServerInfo | null>(null);
 
+  // Drafts and kept blocker writes are the signed-in human's alone.
+  const signIn = (me: Principal) => {
+    setDraftOwner(me.name);
+    setSession({ state: "in", me });
+  };
+  const signOut = () => {
+    setDraftOwner(null);
+    setSession({ state: "out" });
+  };
+
   useEffect(() => {
-    serverInfo().then(setInfo);
     rpc<Principal>("whoami")
-      .then((me) => setSession({ state: "in", me }))
+      .then(signIn)
       .catch((e) => {
         // Anything but a refused sign-in (a restart, say) still shows sign-in,
         // which says what went wrong when it is tried.
         if (!(e instanceof ApiError) || e.status !== 401) console.warn(e);
-        setSession({ state: "out" });
+        signOut();
       });
-    return onSignedOut(() => setSession({ state: "out" }));
+    return onSignedOut(signOut);
+  }, []);
+
+  // What the server offers is asked until it answers; meanwhile nothing
+  // that needs a capability is offered.
+  useEffect(() => {
+    let stopped = false;
+    let timer: number | undefined;
+    let delay = 1000;
+    const ask = async () => {
+      const found = await serverInfo();
+      if (stopped) return;
+      if (found) {
+        setInfo(found);
+        return;
+      }
+      timer = window.setTimeout(ask, delay);
+      delay = Math.min(delay * 2, 30000);
+    };
+    ask();
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   if (session.state === "loading") return null;
   if (session.state === "out") {
-    return <Login info={info} onSignedIn={(me) => setSession({ state: "in", me })} />;
+    return <Login info={info} onSignedIn={signIn} />;
   }
   return (
     <BoardProvider me={session.me} info={info}>
@@ -96,6 +129,8 @@ function Route({ path, openNav }: { path: string } & PageProps) {
 }
 
 function Redirect({ to }: { to: string }) {
-  useEffect(() => navigate(to, true), [to]);
+  useEffect(() => {
+    navigate(to, true);
+  }, [to]);
   return null;
 }

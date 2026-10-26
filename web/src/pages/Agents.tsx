@@ -3,13 +3,13 @@ import type { PageProps } from "../App";
 import { PageHeader } from "../components/PageHeader";
 import { navigate, paths } from "../router";
 import { sortAgents, useBoard } from "../store";
-import { ago, cap99, same } from "../util";
+import { ago, cap99, same, storage } from "../util";
 import { effortLabel } from "../components/Effort";
 
 export function AgentsPage({ openNav }: PageProps) {
   const board = useBoard();
   const [scope, setScope] = useState<"mine" | "all">(() =>
-    localStorage.getItem("bbs-agents-scope") === "all" ? "all" : "mine",
+    storage.get("bbs-agents-scope") === "all" ? "all" : "mine",
   );
   const [filter, setFilter] = useState("");
   const [, tick] = useState(0);
@@ -18,11 +18,7 @@ export function AgentsPage({ openNav }: PageProps) {
     return () => window.clearInterval(t);
   }, []);
   useEffect(() => {
-    try {
-      localStorage.setItem("bbs-agents-scope", scope);
-    } catch {
-      // A convenience only.
-    }
+    storage.set("bbs-agents-scope", scope);
   }, [scope]);
 
   const needle = filter.trim().toLowerCase();

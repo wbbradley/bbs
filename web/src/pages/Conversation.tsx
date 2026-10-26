@@ -7,7 +7,7 @@ import { AnswerDialog } from "../components/AnswerDialog";
 import { Composer, type ComposerHandle } from "../components/Composer";
 import { EffortControl } from "../components/Effort";
 import { MessageView } from "../components/MessageView";
-import { NoteDrawer } from "../components/NoteDrawer";
+import { NoteDrawer, type NoteHandle } from "../components/NoteDrawer";
 import { PageHeader } from "../components/PageHeader";
 import { SidePanel } from "../components/SidePanel";
 import { Timeline } from "../components/Timeline";
@@ -60,6 +60,12 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const [visible, setVisible] = useState(document.visibilityState === "visible");
   const [, tick] = useState(0);
   const composer = useRef<ComposerHandle>(null);
+  const note = useRef<NoteHandle>(null);
+  // Closing the note stores a change first, and keeps it open if it cannot.
+  const toggleNote = async () => {
+    if (!noteOpen) return setNoteOpen(true);
+    if (!note.current || (await note.current.requestClose())) setNoteOpen(false);
+  };
 
   useEffect(() => {
     const onVisibility = () => setVisible(document.visibilityState === "visible");
@@ -302,7 +308,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
           Compact
         </button>
         {noteId !== null && board.has("agent-notes.v1") && (
-          <button className={`btn small${noteOpen ? " primary" : ""}`} onClick={() => setNoteOpen(!noteOpen)}>
+          <button className={`btn small${noteOpen ? " primary" : ""}`} onClick={toggleNote}>
             Note{board.notes.get(noteId)?.body ? " •" : ""}
           </button>
         )}
@@ -374,10 +380,13 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
             <span className="spacer" />
             {sideError && <span className="warning-text">{sideError}</span>}
             {streamTrouble && <span className="error-text">{streamTrouble}</span>}
-            {!board.has("agent-activity.v1") && <span>activity needs a newer server</span>}
+            {!board.info && <span>checking what the server offers…</span>}
+            {board.info && !board.has("agent-activity.v1") && <span>activity needs a newer server</span>}
           </div>
         </div>
-        {noteOpen && noteId !== null && <NoteDrawer agentId={noteId} agent={agent} onClose={() => setNoteOpen(false)} />}
+        {noteOpen && noteId !== null && (
+          <NoteDrawer ref={note} agentId={noteId} agent={agent} onClose={() => setNoteOpen(false)} />
+        )}
       </div>
       {answering && pendingInput && (
         <AnswerDialog agent={agent} input={pendingInput} onClose={() => setAnswering(false)} />

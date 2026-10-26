@@ -67,21 +67,72 @@ export function randomKey(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-const DRAFT_PREFIX = "bbs-draft:";
+/**
+ * This browser's storage, or memory for the visit when the browser refuses
+ * it (blocked site data, some private windows): reading never throws.
+ */
+export const storage = (() => {
+  const memory = new Map<string, string>();
+  const local = (): Storage | null => {
+    try {
+      return window.localStorage;
+    } catch {
+      return null;
+    }
+  };
+  return {
+    get(key: string): string | null {
+      try {
+        const value = local()?.getItem(key);
+        if (value !== null && value !== undefined) return value;
+      } catch {
+        // Fall back to this visit's memory.
+      }
+      return memory.get(key) ?? null;
+    },
+    set(key: string, value: string) {
+      memory.set(key, value);
+      try {
+        local()?.setItem(key, value);
+      } catch {
+        // Memory keeps it for the visit.
+      }
+    },
+    remove(key: string) {
+      memory.delete(key);
+      try {
+        local()?.removeItem(key);
+      } catch {
+        // Nothing stored to remove.
+      }
+    },
+  };
+})();
+
+/**
+ * Drafts belong to the signed-in human: their keys carry the name, so
+ * another human signing in on this browser never sees them. Without a
+ * signed-in human nothing is read or kept.
+ */
+let draftOwner: string | null = null;
+
+export function setDraftOwner(human: string | null) {
+  draftOwner = human ? human.toLowerCase() : null;
+}
+
+/** A key private to the signed-in human, or null when nobody is. */
+export function ownedKey(kind: string, key: string): string | null {
+  return draftOwner === null ? null : `bbs-${kind}:${draftOwner}:${key}`;
+}
 
 export function loadDraft(key: string): string {
-  try {
-    return localStorage.getItem(DRAFT_PREFIX + key) ?? "";
-  } catch {
-    return "";
-  }
+  const k = ownedKey("draft", key);
+  return k === null ? "" : (storage.get(k) ?? "");
 }
 
 export function saveDraft(key: string, text: string) {
-  try {
-    if (text) localStorage.setItem(DRAFT_PREFIX + key, text);
-    else localStorage.removeItem(DRAFT_PREFIX + key);
-  } catch {
-    // Storage may be unavailable (private windows); drafts then last the visit.
-  }
+  const k = ownedKey("draft", key);
+  if (k === null) return;
+  if (text) storage.set(k, text);
+  else storage.remove(k);
 }

@@ -55,7 +55,7 @@ export function BlockersPage({ openNav }: PageProps) {
     }
   };
 
-  const unsupported = !board.has("blockers-mine.v1");
+  const unsupported = board.info !== null && !board.has("blockers-mine.v1");
   return (
     <>
       <PageHeader title="Blockers" sub={`${board.blockers?.active_count ?? 0} open`} openNav={openNav} />

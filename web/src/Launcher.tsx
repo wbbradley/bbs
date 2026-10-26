@@ -3,6 +3,7 @@ import { rpc } from "./api";
 import { Kind, type Message, type SearchHit } from "./types";
 import { navigate, paths } from "./router";
 import { useBoard } from "./store";
+import { useCover } from "./cover";
 import { ago, same, senderName } from "./util";
 
 interface Result {
@@ -57,6 +58,7 @@ export function Launcher({ onClose }: { onClose: () => void }) {
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [searching, setSearching] = useState(false);
   const list = useRef<HTMLDivElement>(null);
+  useCover();
 
   useEffect(() => {
     const q = query.trim();
