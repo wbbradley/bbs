@@ -71,19 +71,11 @@ export const MAX_WATCHES = 8;
 /** How long the hub waits for the set of watches to settle before reopening. */
 const SETTLE_MS = 100;
 
-/** A short, stable key for a watch: its kind and request, hashed. */
-export function watchKey(kind: string, q: string): string {
-  // FNV-1a, twice over with different seeds, as 16 hex digits.
-  const hash = (seed: number) => {
-    let h = seed >>> 0;
-    for (let i = 0; i < q.length; i++) {
-      h ^= q.charCodeAt(i);
-      h = Math.imul(h, 0x01000193) >>> 0;
-    }
-    return h.toString(16).padStart(8, "0");
-  };
-  return `${kind}:${hash(0x811c9dc5)}${hash(0x01000193)}`;
-}
+/**
+ * This tab's id: its next event stream replaces its last one at once, so a
+ * reopen never waits for the server to notice the old one closed.
+ */
+const TAB = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
 
 interface Watcher {
   onSnapshot: (snapshot: unknown, fresh: boolean) => void;
@@ -102,8 +94,14 @@ interface Watch {
   opened?: boolean;
   watchers: Set<Watcher>;
   state: WatchState;
-  /** The newest snapshot, for a view that joins a watch already live. */
-  last?: unknown;
+  /**
+   * The newest snapshot and the stream it came from, for a view that joins
+   * a watch live on this stream; one from an earlier stream is never
+   * replayed as if current.
+   */
+  last?: { snapshot: unknown; stream: number };
+  /** Refused only for want of room on the stream: asked for again later. */
+  crowded?: boolean;
 }
 
 /**
@@ -114,7 +112,12 @@ interface Watch {
  * for again with backoff. The session ending signs out.
  */
 const hub = (() => {
+  // By key: an opaque id given each distinct request as it is first watched.
   const watches = new Map<string, Watch>();
+  const keys = new Map<string, string>();
+  let nextKey = 0;
+  // Each stream opened, so events from one already closed change nothing.
+  let stream = 0;
   let source: EventSource | null = null;
   let settle: number | undefined;
   let retry: number | undefined;
@@ -133,9 +136,17 @@ const hub = (() => {
   const open = () => {
     close();
     window.clearTimeout(retry);
-    const active = [...watches.entries()].filter(([, w]) => w.state.state !== "failed");
-    for (const [, w] of active.slice(MAX_WATCHES)) tell(w, { state: "failed", error: "too many live views in this tab" });
+    const active = [...watches.entries()].filter(([, w]) => w.state.state !== "failed" || w.crowded);
+    for (const [, w] of active.slice(MAX_WATCHES)) {
+      w.crowded = true;
+      tell(w, { state: "failed", error: "too many live views in this tab" });
+    }
     const subscribed = active.slice(0, MAX_WATCHES);
+    for (const [, w] of subscribed) {
+      if (!w.crowded) continue;
+      w.crowded = false;
+      tell(w, { state: "connecting" });
+    }
     if (subscribed.length === 0) return;
     const fresh = new Set<string>();
     const subs = subscribed.map(([key, w]) => {
@@ -145,19 +156,24 @@ const hub = (() => {
       return { key, kind: w.kind, q: resumed ?? w.q };
     });
     const s = JSON.stringify(subs);
-    const es = new EventSource(`/api/events?s=${encodeURIComponent(s)}`);
+    const es = new EventSource(`/api/events?tab=${TAB}&s=${encodeURIComponent(s)}`);
     source = es;
+    const mine = ++stream;
+    // Events still queued from a stream this tab has closed are dropped.
+    const current = () => source === es && stream === mine;
     es.onmessage = (e) => {
+      if (!current()) return;
       const { key, snapshot } = JSON.parse(e.data) as { key: string; snapshot: unknown };
       const w = watches.get(key);
       if (!w) return;
       delay = 1000;
       const first = fresh.delete(key);
-      w.last = snapshot;
+      w.last = { snapshot, stream: mine };
       tell(w, { state: "live" });
       w.watchers.forEach((x) => x.onSnapshot(snapshot, first));
     };
     es.addEventListener("fail", (e) => {
+      if (!current()) return;
       const { key, error, status } = JSON.parse((e as MessageEvent).data) as {
         key: string | null;
         error: string;
@@ -179,7 +195,7 @@ const hub = (() => {
       }
     });
     es.onerror = () => {
-      if (source !== es) return;
+      if (!current()) return;
       close();
       again("connection lost");
     };
@@ -208,26 +224,52 @@ const hub = (() => {
     settle = window.setTimeout(open, SETTLE_MS);
   };
 
+  // Signed out: the stream closes, nothing held is shown again, and the
+  // next sign-in starts afresh, without the old backoff.
+  signedOut.add(() => {
+    close();
+    stream++;
+    window.clearTimeout(retry);
+    delay = 1000;
+    for (const w of watches.values()) {
+      w.last = undefined;
+      w.opened = false;
+    }
+  });
+
   return {
     add(kind: string, q: unknown, watcher: Watcher, resume?: () => unknown | null): () => void {
-      const key = watchKey(kind, JSON.stringify(q));
-      let w = watches.get(key);
-      if (!w) {
+      const request = `${kind}\n${JSON.stringify(q)}`;
+      let key = keys.get(request);
+      let w = key === undefined ? undefined : watches.get(key);
+      if (key === undefined || !w) {
+        key = `w${++nextKey}`;
+        keys.set(request, key);
         w = { kind, q, resume, watchers: new Set(), state: { state: "connecting" } };
         watches.set(key, w);
         changed();
       }
-      w.watchers.add(watcher);
-      watcher.onState(w.state);
-      // A view joining a live watch starts from what it last sent.
-      if (w.last !== undefined) watcher.onSnapshot(w.last, true);
+      const k = key;
+      const held = w;
+      held.watchers.add(watcher);
+      watcher.onState(held.state);
+      // A view joining a watch live on this stream starts from what it last
+      // sent; anything older waits for the stream's own first snapshot.
+      if (held.last && held.last.stream === stream && held.state.state === "live") {
+        watcher.onSnapshot(held.last.snapshot, true);
+      }
       return () => {
-        w!.watchers.delete(watcher);
-        if (w!.watchers.size === 0) {
-          watches.delete(key);
+        held.watchers.delete(watcher);
+        if (held.watchers.size === 0 && watches.get(k) === held) {
+          watches.delete(k);
+          keys.delete(request);
           changed();
         }
       };
+    },
+    /** The key a request is watched under now, for tests. */
+    keyOf(kind: string, q: unknown): string | undefined {
+      return keys.get(`${kind}\n${JSON.stringify(q)}`);
     },
   };
 })();
@@ -237,6 +279,11 @@ const hub = (() => {
  * snapshot goes to `onSnapshot`, marked fresh when it is the first since
  * the stream (re)opened. All of a tab's watches share one event stream.
  */
+/** The key `kind` and `q` are watched under on this tab's stream, if any. */
+export function watchKey(kind: string, q: unknown): string | undefined {
+  return hub.keyOf(kind, q);
+}
+
 export function useWatch<T>(
   kind: string,
   req: object | null,

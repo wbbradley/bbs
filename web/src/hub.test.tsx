@@ -13,7 +13,7 @@ class FakeSource {
     FakeSource.all.push(this);
   }
   get subs(): { key: string; kind: string; q: unknown }[] {
-    return JSON.parse(decodeURIComponent(this.url.split("?s=")[1]));
+    return JSON.parse(decodeURIComponent(this.url.split("&s=")[1]));
   }
   addEventListener(_: string, f: (e: MessageEvent) => void) {
     this.fails.push(f);
@@ -62,7 +62,7 @@ describe("one event stream per tab", () => {
     const { rerender } = render(<View kind="summary" q={{}} seen={a} />);
     await settle();
     expect(open()).toHaveLength(1);
-    const ka = watchKey("summary", "{}");
+    const ka = watchKey("summary", {})!;
     expect(ka.length).toBeLessThanOrEqual(64);
     act(() => open()[0].send(ka, 1));
     act(() => open()[0].send(ka, 2));
@@ -88,7 +88,7 @@ describe("one event stream per tab", () => {
     const b = seen();
     const { rerender } = render(<View kind="summary" q={{}} seen={a} />);
     await settle();
-    act(() => open()[0].send(watchKey("summary", "{}"), "now"));
+    act(() => open()[0].send(watchKey("summary", {})!, "now"));
     rerender(
       <>
         <View kind="summary" q={{}} seen={a} />
@@ -110,7 +110,7 @@ describe("one event stream per tab", () => {
       </>,
     );
     await settle();
-    act(() => open()[0].fail(watchKey("feed", JSON.stringify({ group: "nope" })), 400, "no such group"));
+    act(() => open()[0].fail(watchKey("feed", { group: "nope" })!, 400, "no such group"));
     expect(b.state).toEqual({ state: "failed", error: "no such group" });
     expect(a.state).toEqual({ state: "connecting" });
     const out = vi.fn();
@@ -129,7 +129,7 @@ describe("one event stream per tab", () => {
     expect(a.state).toEqual({ state: "retrying", error: "connection lost" });
     await act(async () => vi.advanceTimersByTime(1100));
     expect(open()).toHaveLength(1);
-    act(() => open()[0].send(watchKey("summary", "{}"), "back"));
+    act(() => open()[0].send(watchKey("summary", {})!, "back"));
     expect(a.snaps.at(-1)).toEqual(["back", true]);
   });
 
@@ -165,5 +165,125 @@ describe("one event stream per tab", () => {
     expect(got).toEqual({ messages: [1] });
     await settle();
     expect(open()[0].subs.map((x) => x.kind)).toEqual(["summary"]);
+  });
+
+  it("names its tab on every stream, the same across reopens", async () => {
+    const a = seen();
+    const { rerender } = render(<View kind="summary" q={{}} seen={a} />);
+    await settle();
+    const tab = new URL(open()[0].url, "http://x").searchParams.get("tab");
+    expect(tab).toMatch(/^[0-9a-f]{32}$/);
+    rerender(
+      <>
+        <View kind="summary" q={{}} seen={a} />
+        <View kind="feed" q={{ with: "Zed" }} seen={seen()} />
+      </>,
+    );
+    await settle();
+    expect(new URL(open()[0].url, "http://x").searchParams.get("tab")).toBe(tab);
+  });
+
+  it("drops events still queued from a stream it has closed", async () => {
+    const a = seen();
+    const { rerender } = render(<View kind="summary" q={{}} seen={a} />);
+    await settle();
+    const old = open()[0];
+    const key = watchKey("summary", {})!;
+    rerender(
+      <>
+        <View kind="summary" q={{}} seen={a} />
+        <View kind="feed" q={{ with: "Zed" }} seen={seen()} />
+      </>,
+    );
+    await settle();
+    expect(old.closed).toBe(true);
+    const out = vi.fn();
+    const stop = onSignedOut(out);
+    act(() => {
+      old.send(key, "stale");
+      old.fail(key, 400, "stale refusal");
+      old.fail(null, 401, "stale sign-out");
+      old.onerror?.();
+    });
+    expect(a.snaps).toEqual([]);
+    expect(a.state).toEqual({ state: "connecting" });
+    expect(out).not.toHaveBeenCalled();
+    act(() => open()[0].send(key, "current"));
+    expect(a.snaps).toEqual([["current", true]]);
+    stop();
+  });
+
+  it("replays a last snapshot to a joining view only while its stream is live", async () => {
+    const a = seen();
+    const { rerender } = render(<View kind="summary" q={{ n: 1 }} seen={a} />);
+    await settle();
+    const key = watchKey("summary", { n: 1 })!;
+    act(() => open()[0].send(key, "before the drop"));
+    await act(async () => open()[0].onerror?.());
+    // Dropped: a view joining now must not take the old snapshot as fresh.
+    const b = seen();
+    rerender(
+      <>
+        <View kind="summary" q={{ n: 1 }} seen={a} />
+        <View kind="summary" q={{ n: 1 }} seen={b} />
+      </>,
+    );
+    expect(b.snaps).toEqual([]);
+    await act(async () => vi.advanceTimersByTime(1100));
+    act(() => open()[0].send(key, "after"));
+    expect(b.snaps).toEqual([["after", true]]);
+  });
+
+  it("forgets what it held when the session ends", async () => {
+    const a = seen();
+    const { rerender, unmount } = render(<View kind="summary" q={{ n: 2 }} seen={a} />);
+    await settle();
+    const key = watchKey("summary", { n: 2 })!;
+    act(() => open()[0].send(key, "private"));
+    act(() => open()[0].fail(null, 401, "session ended"));
+    expect(open()).toHaveLength(0);
+    const b = seen();
+    rerender(
+      <>
+        <View kind="summary" q={{ n: 2 }} seen={a} />
+        <View kind="summary" q={{ n: 2 }} seen={b} />
+      </>,
+    );
+    expect(b.snaps).toEqual([]);
+    unmount();
+  });
+
+  it("gives a crowded watch its place once one frees up", async () => {
+    const views = Array.from({ length: 9 }, (_, i) => ({ q: { n: 100 + i }, seen: seen() }));
+    const all = (n: number) => (
+      <>
+        {views.slice(0, n).map((v) => (
+          <View key={v.q.n} kind="summary" q={v.q} seen={v.seen} />
+        ))}
+      </>
+    );
+    const { rerender } = render(all(9));
+    await settle();
+    expect(open()[0].subs).toHaveLength(8);
+    expect(views[8].seen.state).toEqual({ state: "failed", error: "too many live views in this tab" });
+    rerender(<>{views.slice(1, 9).map((v) => <View key={v.q.n} kind="summary" q={v.q} seen={v.seen} />)}</>);
+    await settle();
+    expect(open()[0].subs).toHaveLength(8);
+    expect(open()[0].subs.map((x) => x.q)).toContainEqual({ n: 108 });
+    expect(views[8].seen.state).toEqual({ state: "connecting" });
+  });
+
+  it("keys distinct requests apart, however alike", async () => {
+    render(
+      <>
+        <View kind="feed" q={{ with: "a" }} seen={seen()} />
+        <View kind="feed" q={{ with: "b" }} seen={seen()} />
+        <View kind="summary" q={{ with: "a" }} seen={seen()} />
+      </>,
+    );
+    await settle();
+    const subs = open()[0].subs;
+    expect(new Set(subs.map((x) => x.key)).size).toBe(3);
+    for (const x of subs) expect(x.key.length).toBeLessThanOrEqual(64);
   });
 });
