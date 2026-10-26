@@ -203,6 +203,7 @@ const hub = (() => {
 
   // The stream dropped: every watch waits, and the stream is asked for again.
   const again = async (error: string) => {
+    const dropped = stream;
     for (const w of watches.values()) if (w.state.state !== "failed") tell(w, { state: "retrying", error });
     // A refused cookie looks like a dropped stream to EventSource; ask.
     try {
@@ -210,6 +211,9 @@ const hub = (() => {
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) return;
     }
+    // Meanwhile another stream opened, or the session ended: the answer is
+    // for a stream no longer wanted.
+    if (stream !== dropped || source !== null) return;
     later();
   };
 

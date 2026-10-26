@@ -286,4 +286,28 @@ describe("one event stream per tab", () => {
     expect(new Set(subs.map((x) => x.key)).size).toBe(3);
     for (const x of subs) expect(x.key.length).toBeLessThanOrEqual(64);
   });
+
+  it("ignores a reconnect probe answered after another stream has opened", async () => {
+    let answer: (r: Response) => void = () => {};
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((r) => (answer = r))));
+    const a = seen();
+    const { rerender } = render(<View kind="summary" q={{ n: 3 }} seen={a} />);
+    await settle();
+    await act(async () => open()[0].onerror?.());
+    // While the probe is out, the set changes and a new stream opens.
+    rerender(
+      <>
+        <View kind="summary" q={{ n: 3 }} seen={a} />
+        <View kind="feed" q={{ with: "Ann" }} seen={seen()} />
+      </>,
+    );
+    await settle();
+    const opened = FakeSource.all.length;
+    const live = open()[0];
+    await act(async () => answer(new Response(JSON.stringify({ name: "ada" }), { status: 200 })));
+    await act(async () => vi.advanceTimersByTime(31000));
+    // The late answer reopened nothing: the stream that opened stays.
+    expect(FakeSource.all.length).toBe(opened);
+    expect(live.closed).toBe(false);
+  });
 });
