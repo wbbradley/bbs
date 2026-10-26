@@ -11,8 +11,10 @@ under the new package version and its publication date.
 ### Changed
 
 - Messages in `bbs view` and every `bbs connect` thread wrap one column
-  before the right edge of the terminal, so text never runs into it; card
-  backgrounds still reach the edge.
+  narrower, keeping text off the right edge of the terminal; card
+  backgrounds still reach the edge. Known limitation: a double-width
+  character that ends a line exactly at the last column can still take that
+  column, through the terminal UI library's word wrap.
 
 - `bbs view` and the `bbs connect` Feed draw messages as conversation cards,
   the one renderer agent and group conversations already use: a header
