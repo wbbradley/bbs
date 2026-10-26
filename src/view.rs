@@ -539,6 +539,13 @@ mod tests {
             bg(Role::HumanSurface),
             "the viewer's own"
         );
+        // Its header and marker sit on the viewer's surface too.
+        let header = at("ada → Mateo");
+        assert!(
+            (0..70).all(|x| Some(buffer[(x, header)].bg) == bg(Role::HumanSurface)),
+            "the viewer's own header"
+        );
+        assert_eq!(buffer[(0, header)].symbol(), "•");
         assert_eq!(
             Some(buffer[(69, at("hi"))].bg),
             bg(Role::OtherConversation),

@@ -68,8 +68,11 @@ pub fn lines<'a>(
             lines.insert(1 + usize::from(gap), Line::default());
         }
         lines.push(if unread { note() } else { Line::default() });
+        // The viewer's surface throughout, its header included.
+        let surface = theme::style(Role::HumanSurface);
         for line in &mut lines {
-            line.style = theme::style(Role::HumanSurface).patch(line.style);
+            line.style = surface.patch(line.style);
+            line.style.bg = surface.bg.or(line.style.bg);
         }
     } else if unread {
         lines.push(note());
@@ -119,7 +122,11 @@ pub fn gutter(
         Some(width),
         look.timed,
     ));
-    let surface = theme::style(conversation_roles(message).1);
+    let surface = theme::style(if look.outgoing {
+        Role::HumanSurface
+    } else {
+        conversation_roles(message).1
+    });
     let mut gutter = vec![Line::default(); prefix_height];
     for index in 0..header_height {
         gutter.push(
