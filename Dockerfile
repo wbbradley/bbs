@@ -4,6 +4,7 @@ FROM rust:1-bookworm AS build
 WORKDIR /src
 ARG BBS_BUILD_REVISION
 ARG BBS_BUILD_DIRTY
+ARG CARGO_BUILD_JOBS=4
 COPY . .
 RUN cargo build --release --workspace --locked
 
