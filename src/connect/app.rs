@@ -21,7 +21,7 @@ use super::notes::{self, NoteEditor, NoteStore};
 use super::preferences::Preferences;
 use super::screens::blockers::BlockersPage;
 use super::screens::help::Help;
-use super::screens::menu::Menu;
+use super::screens::menu::{Menu, Page};
 use super::screens::thread::Thread;
 use super::theme;
 
@@ -1123,6 +1123,10 @@ impl App {
                 }
                 (self.launcher_cache.destination(id), Some(id))
             }
+            // Feed is a conversation: an open one comes back to the top.
+            Target::Page(Page::Feed) => (None, None),
+            Target::Page(Page::Blockers) => return self.show_blockers(),
+            Target::Page(page) => return self.push(page.screen(&self.ctx)),
         };
         let existing =
             self.stack
@@ -12579,6 +12583,32 @@ mod tests {
             result: Ok(agent_note(7, "Mateo", &body, 1)),
         }));
         assert!(app.note_editor.is_none());
+    }
+
+    #[test]
+    fn launcher_opens_the_menu_pages_by_name() {
+        let (mut app, _rx) = app();
+        let depth = app.stack.len();
+        for (query, title) in [("config", "Config"), ("agents", "Agents"), ("help", "Help")] {
+            ctrl(&mut app, 'p');
+            app.on_event(Event::Paste(query.into()));
+            enter(&mut app);
+            assert!(app.picker.is_none(), "{query}");
+            assert_eq!(app.top().title(), title);
+        }
+        assert_eq!(app.stack.len(), depth + 3);
+        // Feed is a conversation: an open one comes back rather than a
+        // second one opening.
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("feed".into()));
+        enter(&mut app);
+        assert!(app.top().is_thread() && app.top().conversation().is_none());
+        let feed = app.stack.len();
+        app.push(Box::new(Help::default()));
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("feed".into()));
+        enter(&mut app);
+        assert_eq!(app.stack.len(), feed);
     }
 
     #[test]

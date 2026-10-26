@@ -14,6 +14,7 @@ use ratatui_textarea::TextArea;
 use super::event::Data;
 use super::history::Found;
 use super::navigation::Conversation;
+use super::screens::menu::Page;
 use super::theme::{self, Role};
 use crate::proto;
 use crate::ui::message::fold;
@@ -38,6 +39,8 @@ pub enum Target {
         line: usize,
     },
     Message(i64),
+    /// A page the main menu opens.
+    Page(Page),
 }
 
 #[derive(Clone, Debug)]
@@ -386,7 +389,24 @@ impl Cache {
         }
         // Candidates borrow cached text. Only the returned hits allocate labels
         // or snippets; ranking takes an already folded slice and allocates none.
+        let pages: Vec<(Page, String)> = Page::ALL
+            .iter()
+            .map(|page| (*page, folded(page.name())))
+            .collect();
         let mut candidates = Vec::new();
+        for (at, (page, indexed)) in pages.iter().enumerate() {
+            if let Some(rank) = rank(&query, indexed) {
+                candidates.push(Candidate {
+                    kind: 0,
+                    id: at as i64,
+                    line: 0,
+                    name: page.name(),
+                    text: page.name(),
+                    indexed,
+                    rank,
+                });
+            }
+        }
         for (key, name) in &self.agents {
             // By name, or else by the best line of its status; a status that
             // holds the query beats a name that only matches fuzzily.
@@ -400,12 +420,12 @@ impl Cache {
                     })
                     .min_by_key(|(rank, ..)| *rank)
             };
-            let by_name = rank(&query, key).map(|rank| (0, rank, name.as_str(), key.as_str()));
+            let by_name = rank(&query, key).map(|rank| (1, rank, name.as_str(), key.as_str()));
             let found = match by_name {
                 Some((_, rank, ..)) if rank.tier < FUZZY => by_name,
                 _ => {
                     let by_status =
-                        by_status().map(|(rank, text, indexed)| (1, rank, text, indexed));
+                        by_status().map(|(rank, text, indexed)| (2, rank, text, indexed));
                     match by_status {
                         Some((_, rank, ..)) if rank.tier < FUZZY => by_status,
                         _ => by_name.or(by_status),
@@ -427,7 +447,7 @@ impl Cache {
         for (indexed, name) in &self.groups {
             if let Some(rank) = rank(&query, indexed) {
                 candidates.push(Candidate {
-                    kind: 2,
+                    kind: 3,
                     id: 0,
                     line: 0,
                     name,
@@ -448,7 +468,7 @@ impl Cache {
                 .min_by_key(|(rank, line, ..)| (*rank, *line));
             if let Some((rank, line, text, indexed)) = best {
                 candidates.push(Candidate {
-                    kind: 3,
+                    kind: 4,
                     id: *id,
                     line,
                     name: "",
@@ -470,7 +490,7 @@ impl Cache {
                 .min_by_key(|(rank, _, _)| *rank);
             if let Some((rank, text, indexed)) = best {
                 candidates.push(Candidate {
-                    kind: 4,
+                    kind: 5,
                     id: cached.message.id,
                     line: 0,
                     name: "",
@@ -485,7 +505,7 @@ impl Cache {
                 continue;
             }
             candidates.push(Candidate {
-                kind: 4,
+                kind: 5,
                 id: found.message.id,
                 line: 0,
                 name: "",
@@ -503,20 +523,21 @@ impl Cache {
             .into_iter()
             .map(|hit| Hit {
                 target: match hit.kind {
-                    0 | 1 => Target::Agent(hit.name.into()),
-                    2 => Target::Group(hit.name.into()),
-                    3 => Target::Note {
+                    0 => Target::Page(Page::ALL[hit.id as usize]),
+                    1 | 2 => Target::Agent(hit.name.into()),
+                    3 => Target::Group(hit.name.into()),
+                    4 => Target::Note {
                         agent_id: hit.id,
                         line: hit.line,
                     },
                     _ => Target::Message(hit.id),
                 },
-                text: if hit.kind >= 3 {
+                text: if hit.kind >= 4 {
                     snippet(hit.text, hit.rank.start)
                 } else {
                     hit.name.into()
                 },
-                detail: (hit.kind == 1).then(|| snippet(hit.text, hit.rank.start)),
+                detail: (hit.kind == 2).then(|| snippet(hit.text, hit.rank.start)),
             })
             .collect()
     }
@@ -543,7 +564,7 @@ pub struct Picker {
 impl Picker {
     pub fn new(cache: &Cache) -> Picker {
         let mut query = TextArea::default();
-        query.set_placeholder_text("Search agents, groups, notes and messages");
+        query.set_placeholder_text("Search pages, agents, groups, notes and messages");
         Picker {
             query,
             hits: cache.search(""),
@@ -763,6 +784,10 @@ fn result_line(
                 spans.extend(marked(&text, query, on(Role::Text), row));
             }
         },
+        Target::Page(page) => {
+            spans.extend(marked(page.name(), query, on(Role::Accent), row));
+            spans.push(Span::styled("  page", on(Role::Muted)));
+        }
         Target::Group(name) => {
             spans.push(Span::styled("@", on(Role::Group)));
             spans.extend(marked(name, query, on(Role::Group), row));
@@ -864,7 +889,7 @@ fn marked(text: &str, query: &str, style: Style, row: Style) -> Vec<Span<'static
 
 /// Borrowed candidates keep search work independent of snippet allocations.
 struct Candidate<'a> {
-    /// Agents by name, then by status, groups, notes and messages.
+    /// Pages, agents by name, then by status, groups, notes and messages.
     kind: u8,
     id: i64,
     /// A note's matching line.
@@ -1015,6 +1040,32 @@ mod tests {
                 ..Default::default()
             }]),
         }
+    }
+
+    #[test]
+    fn menu_pages_are_found_by_name_ahead_of_what_shares_it() {
+        let mut cache = Cache::default();
+        cache.agent("feeder");
+        cache.observe(&feed(1, "the feed is quiet"));
+        let hits = cache.search("FEED");
+        let targets: Vec<_> = hits.iter().map(|h| h.target.clone()).collect();
+        assert_eq!(
+            targets,
+            [
+                Target::Page(Page::Feed),
+                Target::Agent("feeder".into()),
+                Target::Message(1),
+            ]
+        );
+        assert_eq!(hits[0].text, "Feed");
+        assert_eq!(cache.search("blo")[0].target, Target::Page(Page::Blockers));
+        assert!(
+            cache
+                .search("")
+                .iter()
+                .all(|h| !matches!(h.target, Target::Page(_))),
+            "the open state stays names and recent mail"
+        );
     }
 
     #[test]
@@ -2003,7 +2054,7 @@ mod tests {
         let now = Local::now();
         let mut cache = Cache::default();
         for i in 0..60 {
-            cache.agent(&format!("Agent{i:02}"));
+            cache.agent(&format!("Bot{i:02}"));
         }
         let count = |picker: &mut Picker, height: u16| {
             let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
@@ -2020,7 +2071,7 @@ mod tests {
             )
         };
         let mut picker = Picker::new(&cache);
-        picker.paste("agent", &cache);
+        picker.paste("bot", &cache);
         assert_eq!(picker.hits.len(), MAX_RESULTS);
         let (short, _) = count(&mut picker, 24);
         let (tall, _) = count(&mut picker, 40);
@@ -2029,7 +2080,7 @@ mod tests {
             key(&mut picker, &cache, KeyCode::Down);
         }
         let (_, text) = count(&mut picker, 24);
-        assert!(text.contains("Agent49  agent"), "{text}");
+        assert!(text.contains("Bot49  agent"), "{text}");
         assert!(text.contains("top 50 results"), "{text}");
     }
 
@@ -2041,10 +2092,10 @@ mod tests {
                 for width in [60, 80] {
                     let mut cache = Cache::default();
                     for i in 0..30 {
-                        cache.agent(&format!("Agent{i:02}"));
+                        cache.agent(&format!("Bot{i:02}"));
                     }
                     let mut picker = Picker::new(&cache);
-                    picker.paste("Agent", &cache);
+                    picker.paste("Bot", &cache);
                     for _ in 0..25 {
                         key(&mut picker, &cache, KeyCode::Down);
                     }
@@ -2070,16 +2121,16 @@ mod tests {
                     );
                     assert!(text.contains("Go to · cached data"), "{text}");
                     assert!(
-                        text.contains("Agent25  agent"),
+                        text.contains("Bot25  agent"),
                         "the selected result stays in view: {text}"
                     );
                     assert!(text.contains("Enter opens"), "{text}");
                     let query = lines
                         .iter()
-                        .find(|line| line.trim_matches([' ', '│']) == "Agent")
+                        .find(|line| line.trim_matches([' ', '│']) == "Bot")
                         .expect("query has its own row");
                     assert!(
-                        query.find("Agent").unwrap() > 2,
+                        query.find("Bot").unwrap() > 2,
                         "input is inset into the centered panel"
                     );
                 }

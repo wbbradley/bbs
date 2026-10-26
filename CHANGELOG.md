@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- Ctrl-P in `bbs connect` finds the main menu's pages by name (Agents,
+  Groups, Blockers, Feed, Config and Help) and opens the chosen one, listed
+  ahead of agents, groups, notes and messages that match the same query.
+  Feed and Blockers come back to the top when already open.
+
 ### Changed
 
 - Messages in `bbs view` and every `bbs connect` thread wrap one column
