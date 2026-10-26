@@ -86,9 +86,11 @@ export function useMessages(
       const seed = found.get(seek);
       found.delete(seek);
       if (seed) {
-        // Shown at once; what came before and after are read together.
+        // Shown at once; what came before and after are read together. A
+        // search hit's body may be cut short, so the read after starts at
+        // the hit itself, and its full copy takes the hit's place.
         setHeld((h) => mergeContext(h, [seed], false));
-        const [before, after] = await Promise.all([read({ until: seed.created_at }), read({ after_id: seek })]);
+        const [before, after] = await Promise.all([read({ until: seed.created_at }), read({ after_id: seek - 1 })]);
         if (generation.current !== mine) return;
         const complete = after.messages.length < CONTEXT;
         setHeld((h) => mergeContext(h, [...before.messages, ...after.messages], complete));

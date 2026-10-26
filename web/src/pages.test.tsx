@@ -138,7 +138,21 @@ describe("a message found by search", () => {
     const reads = api.pending("watch:feed").map((c) => c.req);
     expect(reads).toHaveLength(2);
     expect(reads).toContainEqual(expect.objectContaining({ until: found.created_at, backlog: 50 }));
-    expect(reads).toContainEqual(expect.objectContaining({ after_id: 50, backlog: 50 }));
+    expect(reads).toContainEqual(expect.objectContaining({ after_id: 49, backlog: 50 }));
+  });
+
+  it("replaces a found message's cut-short search body with the full message", async () => {
+    seedFound(mail(50, "Mateo", "ada", { body: "the beginning of a long" }));
+    await conversation("?m=50");
+    await act(async () => feed().push({ messages: [mail(400, "Mateo", "ada", { read_at: "x" })] }, true));
+    expect(screen.getByText("the beginning of a long")).toBeTruthy();
+    const after = api.pending("watch:feed").find((c) => c.req.after_id === 49)!;
+    await act(async () =>
+      after.resolve({ messages: [mail(50, "Mateo", "ada", { body: "the beginning of a long message, in full" })] }),
+    );
+    await act(async () => api.take("watch:feed").resolve({ messages: [] }));
+    expect(screen.getByText("the beginning of a long message, in full")).toBeTruthy();
+    expect(screen.queryByText("the beginning of a long")).toBeNull();
   });
 
   it("opens an old found message even after a long session holds the most rows a page keeps", async () => {
