@@ -10,6 +10,11 @@ under the new package version and its publication date.
 
 ### Added
 
+- Ctrl-P in `bbs connect` finds the main menu's pages by name (Agents,
+  Groups, Blockers, Feed, Config and Help) and opens the chosen one, listed
+  ahead of agents, groups, notes and messages that match the same query.
+  Feed and Blockers come back to the top when already open.
+
 - `bbs serve --web ADDR` serves a web UI for humans alongside gRPC. Sign in
   with your human name and token. It covers what `bbs connect` does, with a left
   navigation bar in place of the main menu: agents and their live conversations

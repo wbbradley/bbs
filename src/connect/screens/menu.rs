@@ -17,15 +17,56 @@ use crate::connect::art;
 use crate::connect::keys::Action;
 use crate::connect::theme;
 
-/// What a menu item opens.
-#[derive(Clone, Copy)]
-enum Item {
+/// A page the menu opens, which Ctrl-P also finds by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
     Agents,
     Groups,
     Blockers,
     Feed,
     Config,
     Help,
+}
+
+impl Page {
+    /// In menu order.
+    pub const ALL: [Page; 6] = [
+        Page::Agents,
+        Page::Groups,
+        Page::Blockers,
+        Page::Feed,
+        Page::Config,
+        Page::Help,
+    ];
+
+    /// The page's title, as its menu item and title bar name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Page::Agents => "Agents",
+            Page::Groups => "Groups",
+            Page::Blockers => "Blockers",
+            Page::Feed => "Feed",
+            Page::Config => "Config",
+            Page::Help => "Help",
+        }
+    }
+
+    pub fn screen(self, ctx: &Ctx) -> Box<dyn Screen> {
+        match self {
+            Page::Agents => Box::new(Agents::default()),
+            Page::Groups => Box::new(Groups::new()),
+            Page::Blockers => Box::new(BlockersPage),
+            Page::Feed => Box::new(Thread::feed(&ctx.me)),
+            Page::Config => Box::new(Config::new()),
+            Page::Help => Box::new(Help::default()),
+        }
+    }
+}
+
+/// What a menu item opens.
+#[derive(Clone, Copy)]
+enum Item {
+    Page(Page),
     Quit,
 }
 
@@ -35,28 +76,28 @@ const ITEMS: [(char, &str, &str, Item); 7] = [
         'a',
         "A",
         "gents     your agents and everyone else's",
-        Item::Agents,
+        Item::Page(Page::Agents),
     ),
     (
         'g',
         "G",
         "roups     members, writers and descriptions",
-        Item::Groups,
+        Item::Page(Page::Groups),
     ),
     (
         'b',
         "B",
         "lockers   the questions agents are waiting on",
-        Item::Blockers,
+        Item::Page(Page::Blockers),
     ),
     (
         'f',
         "F",
         "eed       every message, as bbs view shows it",
-        Item::Feed,
+        Item::Page(Page::Feed),
     ),
-    ('c', "C", "onfig     color scheme", Item::Config),
-    ('?', "?", "          help: the keys", Item::Help),
+    ('c', "C", "onfig     color scheme", Item::Page(Page::Config)),
+    ('?', "?", "          help: the keys", Item::Page(Page::Help)),
     ('q', "Q", "uit       hang up", Item::Quit),
 ];
 
@@ -70,12 +111,7 @@ pub struct Menu {
 impl Menu {
     fn open(&self, item: Item, ctx: &Ctx) -> Transition {
         match item {
-            Item::Agents => Transition::Push(Box::new(Agents::default())),
-            Item::Groups => Transition::Push(Box::new(Groups::new())),
-            Item::Blockers => Transition::Push(Box::new(BlockersPage)),
-            Item::Feed => Transition::Push(Box::new(Thread::feed(&ctx.me))),
-            Item::Config => Transition::Push(Box::new(Config::new())),
-            Item::Help => Transition::Push(Box::new(Help::default())),
+            Item::Page(page) => Transition::Push(page.screen(ctx)),
             Item::Quit => Transition::Quit,
         }
     }
@@ -193,6 +229,18 @@ mod tests {
     fn every_letter_item_is_a_hot_key() {
         for (key, ..) in ITEMS {
             assert!(HOTKEYS.contains(&key) || matches!(key, '?' | 'q'), "{key}");
+        }
+    }
+
+    #[test]
+    fn every_page_is_a_menu_item() {
+        for page in Page::ALL {
+            assert!(
+                ITEMS
+                    .iter()
+                    .any(|&(.., item)| matches!(item, Item::Page(p) if p == page)),
+                "{page:?}"
+            );
         }
     }
 }
