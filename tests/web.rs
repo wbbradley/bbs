@@ -489,9 +489,11 @@ fn other_hosts_and_origins_are_refused() {
         "",
     );
     assert_eq!(r.status, 200, "{}", r.body);
-    // Readiness answers whatever the host, as probes send.
-    let r = server.raw("GET", "/healthz", "10.0.0.7:7778", &[], "");
+    // Readiness needs no session, but the same host as everything else.
+    let r = server.raw("GET", "/healthz", &server.web, &[], "");
     assert_eq!(r.status, 200, "{}", r.body);
+    let r = server.raw("GET", "/healthz", "10.0.0.7:7778", &[], "");
+    assert_eq!(r.status, 421, "{}", r.body);
     // The page forbids a base URL and foreign form posts.
     let r = server.request("GET", "/", &[], "");
     let csp = r.header("content-security-policy").unwrap();

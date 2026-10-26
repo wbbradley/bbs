@@ -22,8 +22,7 @@ under the new package version and its publication date.
   notes load, and leaving stores it first; an unconfirmed blocker answer is
   retried only as the identical request; and a message opened from search
   shows with the messages around it.
-  Sessions are
-  held by the server and end on signing out, after a day unused or a week, on
+  Sessions are held by the server and end on signing out, after a day unused or 30 days, on
   restart, and when the token is rotated; the cookie carries no credential.
   Away from loopback, `--web-origin` names the URL browsers use, and other
   hosts and origins are refused.

@@ -327,8 +327,8 @@ bbs serve --listen 100.64.0.1:7777 --require-human-token \
 
 Sign in with your human name and token, as issued by `bbs admin human add` or
 `rotate`. Signing in needs a token in either server mode. The browser holds
-only a session id; the session ends when you sign out, after a day unused or a
-week in all, when the server restarts, and as soon as your token is rotated or
+only a session id; the session ends when you sign out, after a day unused or
+30 days in all, when the server restarts, and as soon as your token is rotated or
 revoked.
 
 Like gRPC, the web port speaks plain HTTP. On a loopback address it needs

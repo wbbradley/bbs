@@ -43,7 +43,7 @@ mod assets {
 }
 
 /// A session ends this long after sign-in, however busy.
-const SESSION_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const SESSION_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// A session unused for this long ends.
 const SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Sessions held at once; past this the least recently used one ends.
@@ -77,9 +77,9 @@ pub async fn serve(
         .route("/api/rpc/{method}", post(rpc))
         .route("/api/events", get(events))
         .route("/api/watch/{kind}", get(watch))
+        .route("/healthz", get(healthz))
         .fallback(static_file)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
-        .route("/healthz", get(healthz))
         .with_state(app);
     axum::serve(
         listener,
@@ -218,8 +218,8 @@ fn parse_origin(origin: &str) -> Result<(String, bool, String)> {
     Ok((format!("{scheme}://{authority}"), secure, authority))
 }
 
-/// Every request but `/healthz` must name one of our hosts, which keeps a
-/// rebound DNS name from reaching the API; API calls must come from our own
+/// Every request must name one of our hosts, which keeps a rebound DNS name
+/// from reaching the API; API calls must come from our own
 /// pages; and API responses are never stored by browsers or proxies.
 async fn guard(State(app): State<Arc<App>>, req: axum::extract::Request, next: Next) -> Response {
     let headers = req.headers();
@@ -249,7 +249,7 @@ async fn guard(State(app): State<Arc<App>>, req: axum::extract::Request, next: N
     response
 }
 
-/// Readiness: the web listener answers.
+/// Readiness: the web listener answers, at the web UI's own host.
 async fn healthz() -> &'static str {
     "ok\n"
 }
@@ -697,14 +697,22 @@ async fn open_watch(
 }
 
 /// An agent's activity: the newest `backlog` records first, then only newer
-/// ones as they arrive, so a busy agent never resends its whole window.
+/// ones as they arrive, so a busy agent never resends its whole window. With
+/// `after_id`, a page reconnecting after records it has: only newer ones,
+/// in batches, from the first.
 async fn activity_tail(
     server: &Server,
     mut req: proto::ActivityRequest,
     session: &Session,
     peer: SocketAddr,
 ) -> Result<Snapshots, ApiError> {
-    req.after_id = None;
+    if req.after_id.is_some() {
+        let rest = server
+            .watch_activity(request(req, Some(session), peer)?)
+            .await?
+            .into_inner();
+        return Ok(snapshots(rest));
+    }
     let mut window = server
         .watch_activity(request(req.clone(), Some(session), peer)?)
         .await?
@@ -997,7 +1005,7 @@ mod tests {
         );
         let later = start + SESSION_IDLE - Duration::from_secs(1);
         assert!(sessions.get(&id, later + SESSION_IDLE).is_none(), "idle");
-        // Lifetime: used every hour, still ends after a week.
+        // Lifetime: used every hour, still ends after thirty days.
         let id = sessions.open(session(), start);
         let mut at = start;
         while at < start + SESSION_LIFETIME - Duration::from_secs(3600) {

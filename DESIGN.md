@@ -328,7 +328,7 @@ whole window.
 Signing in calls `Whoami` with a name and human token, in either server mode,
 and opens a session held in the server's memory: the `HttpOnly`,
 `SameSite=Strict` cookie carries only its random id, never the token. A
-session ends when the human signs out, after a day unused or a week in all,
+session ends when the human signs out, after a day unused or 30 days in all,
 when any call finds the token rotated or revoked (open streams end within five
 seconds), and when the server restarts. Every call still sends the token, so
 the gRPC server checks it each time.
@@ -339,7 +339,7 @@ cookie `Secure` and names it `__Host-bbs_session`, which no sibling site can
 set. Requests naming another host are refused, so a rebound DNS name cannot
 reach the API; API calls must come from that origin (by `Origin`, and
 `Sec-Fetch-Site` when sent), mutating calls also need an `x-bbs-web` header,
-and API responses are `no-store`. `/healthz` answers any host, for probes. The
+and API responses are `no-store`. `/healthz` answers without a session, at the same host, for probes. The
 web listener runs under the same shutdown as gRPC: open streams end when
 shutdown begins, and if the web UI fails, `bbs serve` exits with its error.
 The page is a React app
