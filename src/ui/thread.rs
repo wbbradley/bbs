@@ -13,8 +13,10 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::ui::message::fold;
 
-/// Columns kept clear at the right of every row, so text never runs into
-/// the edge of the terminal.
+/// Rows wrap this many columns narrower than their area, keeping text off
+/// the terminal's right edge. Ratatui's word wrap can still let a
+/// double-width character that ends a line, begun in the last column, take
+/// that column.
 pub(crate) const RIGHT_MARGIN: u16 = 1;
 
 /// Loaded history kept while the view is open; the oldest rows are dropped
@@ -244,8 +246,8 @@ impl<R: Row> ThreadView<R> {
     }
 
     /// The columns row `row` wraps to in `width`: less its left inset, and
-    /// less one column on the right so text never touches the edge, while
-    /// at least one column is left.
+    /// less the right margin. With a single inner column the margin is
+    /// dropped; when the inset takes the whole width it is 0.
     fn content_width(&self, row: &R, width: u16) -> u16 {
         let inner = width.saturating_sub(self.inset(row));
         if inner > RIGHT_MARGIN {
