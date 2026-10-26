@@ -5,6 +5,23 @@ import { useBoard } from "../store";
 import type { AgentNote } from "../types";
 import { fullTime, loadDraft, saveDraft } from "../util";
 
+/**
+ * Unsaved note text, kept with whether it differs from the stored note, so
+ * clearing a note (an empty body) is kept as a change too.
+ */
+function loadNoteDraft(key: string): string | null {
+  try {
+    const kept = JSON.parse(loadDraft(key) || "null") as { dirty: boolean; body: string } | null;
+    return kept?.dirty ? kept.body : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveNoteDraft(key: string, body: string | null) {
+  saveDraft(key, body === null ? "" : JSON.stringify({ dirty: true, body }));
+}
+
 const LIMIT = 32768;
 
 export interface NoteHandle {
@@ -34,19 +51,21 @@ export const NoteDrawer = forwardRef<NoteHandle, { agentId: number; agent: strin
     useEffect(() => {
       if (!loaded || text !== null) return;
       const body = stored?.body ?? "";
-      const draft = loadDraft(draftKey);
+      const draft = stored?.retired ? null : loadNoteDraft(draftKey);
       setBase(body);
-      setText(draft && draft !== body ? draft : body);
+      setText(draft !== null && draft !== body ? draft : body);
     }, [loaded, text, stored, draftKey]);
 
     const current = text ?? "";
-    const changed = text !== null && current !== base;
-    const readOnly = text === null || !!stored?.retired;
+    const retired = !!stored?.retired;
+    const changed = text !== null && !retired && current !== base;
+    // Still loading, retired, or being stored: the text stays as it is.
+    const readOnly = text === null || retired || busy;
     const bytes = new TextEncoder().encode(current).length;
 
     useEffect(() => {
-      if (text !== null) saveDraft(draftKey, changed ? current : "");
-    }, [draftKey, text, changed, current]);
+      if (text !== null && !retired) saveNoteDraft(draftKey, changed ? current : null);
+    }, [draftKey, text, changed, current, retired]);
 
     // A note you have not changed follows saves from elsewhere.
     useEffect(() => {
@@ -58,7 +77,7 @@ export const NoteDrawer = forwardRef<NoteHandle, { agentId: number; agent: strin
 
     // One save at a time: a later answer never lands under an earlier one.
     const save = useCallback(async (): Promise<boolean> => {
-      if (saving.current || text === null) return false;
+      if (saving.current || text === null || retired) return false;
       saving.current = true;
       setBusy(true);
       setError(null);
@@ -75,7 +94,7 @@ export const NoteDrawer = forwardRef<NoteHandle, { agentId: number; agent: strin
         saving.current = false;
         setBusy(false);
       }
-    }, [agentId, board, text]);
+    }, [agentId, board, text, retired]);
 
     const requestClose = useCallback(async () => !changed || (await save()), [changed, save]);
     useImperativeHandle(ref, () => ({ requestClose }), [requestClose]);
@@ -109,7 +128,7 @@ export const NoteDrawer = forwardRef<NoteHandle, { agentId: number; agent: strin
               Retry
             </button>
           )}
-          <button className="btn small primary" disabled={!changed || busy || bytes > LIMIT} onClick={save}>
+          <button className="btn small primary" disabled={!changed || busy || retired || bytes > LIMIT} onClick={save}>
             {busy ? "Saving…" : "Save"}
           </button>
           <button
@@ -127,11 +146,11 @@ export const NoteDrawer = forwardRef<NoteHandle, { agentId: number; agent: strin
             className="textarea"
             value={current}
             readOnly={readOnly}
-            onChange={(e) => !readOnly && setText(e.target.value)}
+            onChange={(e) => !readOnly && !saving.current && setText(e.target.value)}
             onKeyDown={(e) => {
               if ((e.metaKey || e.ctrlKey) && e.key === "s") {
                 e.preventDefault();
-                if (changed && !busy) save();
+                if (changed && !busy && !readOnly) save();
               }
             }}
             placeholder={loaded ? "Private to you. Agents and other humans never see it." : ""}

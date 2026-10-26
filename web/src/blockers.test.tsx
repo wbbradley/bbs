@@ -8,7 +8,7 @@ import { BlockersPage, REPLACED_GUARD_MS, loadKept, nearest } from "./pages/Bloc
 import { useBoard } from "./store";
 import { Board } from "./test/setup";
 import type { Blocker } from "./types";
-import { loadDraft } from "./util";
+import { loadDraft, saveDraft, setDraftOwner } from "./util";
 
 const row = (root: number, id = root, body = `question ${root}?`): Blocker => ({
   id,
@@ -120,6 +120,22 @@ describe("blockers", () => {
     fireEvent.click(screen.getByText("Dismiss"));
     expect(screen.queryByText(/question 1\?/)).toBeNull();
     expect(loadKept()).toEqual({});
+  });
+
+  it("ends a write as its own human's, though another has signed in meanwhile", async () => {
+    await page([row(1)]);
+    fireEvent.change(answerBox(), { target: { value: "ada's answer" } });
+    fireEvent.click(screen.getByText("Send answer"));
+    const out = api.take("answer_blocker");
+    // Ada is signed out, and Bob signs in and starts his own answer.
+    cleanup();
+    setDraftOwner("bob");
+    saveDraft("blocker:1", "bob's answer");
+    await act(async () => out.resolve({ blocker: row(1), replayed: false, message_id: 5 }));
+    expect(loadDraft("blocker:1")).toBe("bob's answer");
+    expect(loadKept("bob")).toEqual({});
+    expect(loadKept("ada")).toEqual({});
+    expect(loadDraft("blocker:1", "ada")).toBe("");
   });
 
   it("moves the selection to the row now at its place when its row goes", async () => {

@@ -7,7 +7,7 @@ vi.mock("./api", () => import("./test/fakeApi"));
 import * as api from "./test/fakeApi";
 import { NoteDrawer, type NoteHandle } from "./components/NoteDrawer";
 import { mergeNotes } from "./store";
-import { navigate } from "./router";
+import { go, navigate } from "./router";
 import { Board } from "./test/setup";
 import type { AgentNote } from "./types";
 import { loadDraft } from "./util";
@@ -41,6 +41,64 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("notes", () => {
+  it("keeps Back from leaving a changed note it could not store", async () => {
+    go("/feed");
+    go("/agents/Mateo");
+    drawer();
+    await act(async () => api.take("list_agent_notes").resolve({ notes: [], has_more: false, next_after_revision: 0 }));
+    fireEvent.change(area(), { target: { value: "unsaved" } });
+    // The browser moves the address back, as Back does.
+    history.replaceState(null, "", "/feed");
+    act(() => {
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(location.pathname).toBe("/agents/Mateo");
+    await act(async () => api.take("put_agent_note").reject(new Error("refused")));
+    expect(location.pathname).toBe("/agents/Mateo");
+    expect(area().value).toBe("unsaved");
+  });
+
+  it("holds the text while it is being stored, so what closes is what was stored", async () => {
+    const ref = drawer();
+    await act(async () => api.take("list_agent_notes").resolve({ notes: [], has_more: false, next_after_revision: 0 }));
+    fireEvent.change(area(), { target: { value: "first" } });
+    let closed: Promise<boolean>;
+    act(() => {
+      closed = ref.current!.requestClose();
+    });
+    expect(area().readOnly).toBe(true);
+    fireEvent.change(area(), { target: { value: "typed during the save" } });
+    expect(area().value).toBe("first");
+    await act(async () => api.take("put_agent_note").resolve({ note: note("first", 1) }));
+    expect(await closed!).toBe(true);
+  });
+
+  it("never writes a retired agent's note", async () => {
+    drawer();
+    await act(async () =>
+      api.take("list_agent_notes").resolve({ notes: [{ ...note("kept", 2), retired: true }], has_more: false, next_after_revision: 2 }),
+    );
+    expect(area().readOnly).toBe(true);
+    fireEvent.change(area(), { target: { value: "edit" } });
+    fireEvent.keyDown(area(), { key: "s", ctrlKey: true });
+    expect((screen.getByText("Save") as HTMLButtonElement).disabled).toBe(true);
+    expect(api.pending("put_agent_note")).toHaveLength(0);
+    expect(loadDraft("note:7")).toBe("");
+  });
+
+  it("keeps clearing a note as a change across leaving and returning", async () => {
+    drawer();
+    await act(async () => api.take("list_agent_notes").resolve({ notes: [note("secret", 2)], has_more: false, next_after_revision: 2 }));
+    fireEvent.change(area(), { target: { value: "" } });
+    cleanup();
+    drawer();
+    await act(async () => api.take("list_agent_notes").resolve({ notes: [note("secret", 2)], has_more: false, next_after_revision: 2 }));
+    expect(area().value).toBe("");
+    expect(screen.getByText("unsaved changes")).toBeTruthy();
+    fireEvent.click(screen.getByText("Save"));
+    expect(api.take("put_agent_note").req).toEqual({ agent_id: 7, body: "" });
+  });
+
   it("cannot be edited until every stored note has arrived, so a blank never replaces one", async () => {
     drawer();
     expect(area().readOnly).toBe(true);
@@ -79,7 +137,7 @@ describe("notes", () => {
     expect(await closed!).toBe(false);
     expect(area().value).toBe("new");
     // Unsaved text is kept in this browser, for this human only.
-    expect(loadDraft("note:7")).toBe("new");
+    expect(JSON.parse(loadDraft("note:7"))).toEqual({ dirty: true, body: "new" });
   });
 
   it("keeps navigation from leaving a changed note until it is stored", async () => {

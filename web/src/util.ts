@@ -68,11 +68,16 @@ export function randomKey(): string {
 }
 
 /**
- * This browser's storage, or memory for the visit when the browser refuses
- * it (blocked site data, some private windows): reading never throws.
+ * This browser's storage, with memory standing in key by key for the
+ * visit wherever the browser refuses a write (blocked site data, a full
+ * quota): a key written to memory is read from memory until a later write
+ * to the browser succeeds, and a refused removal leaves a tombstone, so
+ * nothing written comes back stale. Keys the browser holds are read from
+ * it, so another tab's changes show. Reading never throws.
  */
 export const storage = (() => {
-  const memory = new Map<string, string>();
+  // Keys memory answers for; null is a removal the browser refused.
+  const memory = new Map<string, string | null>();
   const local = (): Storage | null => {
     try {
       return window.localStorage;
@@ -82,60 +87,82 @@ export const storage = (() => {
   };
   return {
     get(key: string): string | null {
+      if (memory.has(key)) return memory.get(key) ?? null;
       try {
-        const store = local();
-        if (store) return store.getItem(key);
+        return local()?.getItem(key) ?? null;
       } catch {
-        // Refused: this visit's memory stands in.
+        return null;
       }
-      return memory.get(key) ?? null;
     },
     set(key: string, value: string) {
       try {
         const store = local();
         if (store) {
           store.setItem(key, value);
+          memory.delete(key);
           return;
         }
       } catch {
-        // Refused or full: keep it for the visit.
+        // Refused or full: memory keeps it for the visit.
       }
       memory.set(key, value);
     },
     remove(key: string) {
-      memory.delete(key);
       try {
-        local()?.removeItem(key);
+        const store = local();
+        if (store) {
+          store.removeItem(key);
+          memory.delete(key);
+          return;
+        }
       } catch {
-        // Nothing stored to remove.
+        // Refused: remember it is gone.
+      }
+      memory.set(key, null);
+    },
+    /** Every key the browser holds, for clearing old ones. */
+    keys(): string[] {
+      try {
+        const store = local();
+        return store ? Array.from({ length: store.length }, (_, i) => store.key(i)).filter((k): k is string => !!k) : [];
+      } catch {
+        return [];
       }
     },
   };
 })();
 
 /**
- * Drafts belong to the signed-in human: their keys carry the name, so
- * another human signing in on this browser never sees them. Without a
- * signed-in human nothing is read or kept.
+ * Drafts and kept writes belong to the signed-in human: their keys carry
+ * the name, so another human signing in on this browser never sees them.
+ * Without a signed-in human nothing is read or kept.
  */
 let draftOwner: string | null = null;
 
 export function setDraftOwner(human: string | null) {
   draftOwner = human ? human.toLowerCase() : null;
+  // Drafts from before keys carried their human cannot be told apart by
+  // whose they were: they are never read, and go.
+  for (const key of storage.keys()) if (key.startsWith("bbs-draft:")) storage.remove(key);
 }
 
-/** A key private to the signed-in human, or null when nobody is. */
-export function ownedKey(kind: string, key: string): string | null {
-  return draftOwner === null ? null : `bbs-${kind}:${draftOwner}:${key}`;
+/** Who owns drafts now: captured when work starts, so it ends as theirs. */
+export function draftOwnerNow(): string | null {
+  return draftOwner;
 }
 
-export function loadDraft(key: string): string {
-  const k = ownedKey("draft", key);
+/** A key private to `owner` (the signed-in human by default), or null. */
+export function ownedKey(kind: string, key: string, owner: string | null = draftOwner): string | null {
+  return owner === null ? null : `bbs-v2-${kind}:${owner}:${key}`;
+}
+
+export function loadDraft(key: string, owner: string | null = draftOwner): string {
+  const k = ownedKey("draft", key, owner);
   return k === null ? "" : (storage.get(k) ?? "");
 }
 
-export function saveDraft(key: string, text: string) {
-  const k = ownedKey("draft", key);
+export function saveDraft(key: string, text: string, owner: string | null = draftOwner) {
+  const k = ownedKey("draft", key, owner);
   if (k === null) return;
   if (text) storage.set(k, text);
   else storage.remove(k);

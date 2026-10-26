@@ -7,6 +7,16 @@ import type { Message } from "./types";
 export const CONTEXT = 50;
 
 /**
+ * Messages the launcher found and is opening: the page shows each at once
+ * and reads only its context, rather than read it again first.
+ */
+const found = new Map<number, Message>();
+
+export function seedFound(m: Message) {
+  found.set(m.id, m);
+}
+
+/**
  * Where a message opened from search stands: being read, in view, or not
  * found under this page's filter.
  */
@@ -66,23 +76,28 @@ export function useMessages(
     const mine = generation.current;
     const base = request.current;
     setSeekState("loading");
+    const read = (extra: Record<string, unknown>) =>
+      watchOnce<{ messages: Message[] }>("feed", { ...base, backlog: CONTEXT, ...extra });
     (async () => {
-      // The hit and what follows, then what came before it.
-      const after = await watchOnce<{ messages: Message[] }>("feed", {
-        ...base,
-        backlog: CONTEXT,
-        after_id: seek - 1,
-      });
+      const seed = found.get(seek);
+      found.delete(seek);
+      if (seed) {
+        // Shown at once; what came before and after are read together.
+        setHeld((h) => mergeContext(h, [seed], false));
+        const [before, after] = await Promise.all([read({ until: seed.created_at }), read({ after_id: seek })]);
+        if (generation.current !== mine) return;
+        const complete = after.messages.length < CONTEXT;
+        setHeld((h) => mergeContext(h, [...before.messages, ...after.messages], complete));
+        return;
+      }
+      // Only its id: the hit and what follows, then what came before it.
+      const after = await read({ after_id: seek - 1 });
       const hit = after.messages.find((m) => m.id === seek);
       if (!hit) {
         if (generation.current === mine) setSeekState("missing");
         return;
       }
-      const before = await watchOnce<{ messages: Message[] }>("feed", {
-        ...base,
-        backlog: CONTEXT,
-        until: hit.created_at,
-      });
+      const before = await read({ until: hit.created_at });
       if (generation.current !== mine) return;
       const complete = after.messages.length < CONTEXT;
       setHeld((h) => mergeContext(h, [...before.messages, ...after.messages], complete));

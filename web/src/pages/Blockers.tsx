@@ -6,7 +6,7 @@ import { PageHeader } from "../components/PageHeader";
 import { Link, paths } from "../router";
 import { useBoard } from "../store";
 import { BlockerStatus, Kind, type Blocker, type BlockerMutationResponse } from "../types";
-import { ago, fullTime, loadDraft, ownedKey, randomKey, same, saveDraft, storage } from "../util";
+import { ago, draftOwnerNow, fullTime, loadDraft, ownedKey, randomKey, same, saveDraft, storage } from "../util";
 
 /** After a blocker's text changes under the reader, its actions wait this long. */
 export const REPLACED_GUARD_MS = 1000;
@@ -29,12 +29,12 @@ export interface Kept {
   row: Blocker;
 }
 
-function keptKey(): string | null {
-  return ownedKey("blocker-writes", "all");
+function keptKey(owner: string | null): string | null {
+  return ownedKey("blocker-writes", "all", owner);
 }
 
-export function loadKept(): Record<number, Kept> {
-  const key = keptKey();
+export function loadKept(owner: string | null = draftOwnerNow()): Record<number, Kept> {
+  const key = keptKey(owner);
   if (key === null) return {};
   try {
     const kept = JSON.parse(storage.get(key) ?? "{}") as Record<number, Kept>;
@@ -46,8 +46,8 @@ export function loadKept(): Record<number, Kept> {
   }
 }
 
-function storeKept(kept: Record<number, Kept>) {
-  const key = keptKey();
+function storeKept(kept: Record<number, Kept>, owner: string | null) {
+  const key = keptKey(owner);
   if (key === null) return;
   if (Object.keys(kept).length === 0) storage.remove(key);
   else storage.set(key, JSON.stringify(kept));
@@ -63,19 +63,39 @@ export function nearest(selected: number | null, old: number[], now: number[]): 
 
 export function BlockersPage({ openNav }: PageProps) {
   const board = useBoard();
-  const [kept, setKept] = useState<Record<number, Kept>>(loadKept);
+  // The human this page is for; a write ends as theirs even if another
+  // human has signed in by the time it does.
+  const [owner] = useState(draftOwnerNow);
+  const [kept, setKept] = useState<Record<number, Kept>>(() => loadKept(owner));
+  const mounted = useRef(true);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+    },
+    [],
+  );
+  const stillTheirs = () => mounted.current && draftOwnerNow() === owner;
   const [selected, setSelected] = useState<number | null>(null);
   const [done, setDone] = useState<string | null>(null);
   const [guardUntil, setGuardUntil] = useState(0);
   const [, tick] = useState(0);
 
-  const update = useCallback((f: (k: Record<number, Kept>) => Record<number, Kept>) => {
-    setKept((old) => {
-      const next = f(old);
-      storeKept(next);
-      return next;
-    });
-  }, []);
+  // Kept writes change for this page's human only: shown if the page is
+  // still theirs, and stored under their name either way.
+  const update = useCallback(
+    (f: (k: Record<number, Kept>) => Record<number, Kept>) => {
+      if (mounted.current && draftOwnerNow() === owner) {
+        setKept((old) => {
+          const next = f(old);
+          storeKept(next, owner);
+          return next;
+        });
+      } else {
+        storeKept(f(loadKept(owner)), owner);
+      }
+    },
+    [owner],
+  );
 
   // The server's rows, then rows it no longer lists that hold a write's
   // outcome, until dismissed.
@@ -129,7 +149,8 @@ export function BlockersPage({ openNav }: PageProps) {
         delete next[op.root];
         return next;
       });
-      if (op.kind === "answer") saveDraft(`blocker:${op.root}`, "");
+      if (op.kind === "answer") saveDraft(`blocker:${op.root}`, "", owner);
+      if (!stillTheirs()) return;
       setDone(`${op.kind === "answer" ? "Answered" : "Cancelled"} #${r.blocker?.id ?? op.id} in @${op.row.group}.`);
       board.refreshBlockers();
     } catch (e) {
@@ -145,7 +166,7 @@ export function BlockersPage({ openNav }: PageProps) {
       delete next[root];
       return next;
     });
-    if (!listedRoots.has(root)) saveDraft(`blocker:${root}`, "");
+    if (!listedRoots.has(root)) saveDraft(`blocker:${root}`, "", owner);
   };
 
   const unsupported = board.info !== null && !board.has("blockers-mine.v1");

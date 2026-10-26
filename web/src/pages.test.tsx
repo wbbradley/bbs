@@ -7,6 +7,7 @@ import * as api from "./test/fakeApi";
 import { Dialog } from "./components/Dialog";
 import { MessageView } from "./components/MessageView";
 import { Launcher } from "./Launcher";
+import { seedFound } from "./useMessages";
 import { Conversation } from "./pages/Conversation";
 import { useBoard } from "./store";
 import { Board, ADA } from "./test/setup";
@@ -125,6 +126,18 @@ describe("a message found by search", () => {
     // Back at the newest, the view is the reader's again.
     await act(async () => fireEvent.scroll(document.querySelector(".timeline")!));
     expect(location.search).toBe("");
+  });
+
+  it("shows a message the launcher found at once, and reads both sides of it together", async () => {
+    const found = mail(50, "Mateo", "ada", { body: "the found one" });
+    seedFound(found);
+    await conversation("?m=50");
+    await act(async () => feed().push({ messages: [mail(400, "Mateo", "ada", { read_at: "x" })] }, true));
+    expect(screen.getByText("the found one")).toBeTruthy();
+    const reads = api.pending("watch:feed").map((c) => c.req);
+    expect(reads).toHaveLength(2);
+    expect(reads).toContainEqual(expect.objectContaining({ until: found.created_at, backlog: 50 }));
+    expect(reads).toContainEqual(expect.objectContaining({ after_id: 50, backlog: 50 }));
   });
 
   it("says when the found message is not in this view", async () => {

@@ -4,6 +4,7 @@ import { Kind, type Message, type SearchHit } from "./types";
 import { navigate, paths } from "./router";
 import { useBoard } from "./store";
 import { useCover } from "./cover";
+import { seedFound } from "./useMessages";
 import { ago, senderName } from "./util";
 
 interface Result {
@@ -164,7 +165,10 @@ export function Launcher({ onClose }: { onClose: () => void }) {
           </span>
         ),
         detail: <Hit text={line.trim().slice(0, 200)} query={q} />,
-        go: go(messagePath(m)),
+        go: () => {
+          seedFound(m);
+          go(messagePath(m))();
+        },
       });
     }
     return found;
