@@ -1,6 +1,6 @@
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { onSignedOut, useWatch, watchKey, watchOnce, type WatchState } from "./api";
+import { login, onSignedOut, rpc, useWatch, watchKey, watchOnce, type WatchState } from "./api";
 
 /** EventSources the page opened, newest last. */
 class FakeSource {
@@ -309,5 +309,53 @@ describe("one event stream per tab", () => {
     // The late answer reopened nothing: the stream that opened stays.
     expect(FakeSource.all.length).toBe(opened);
     expect(live.closed).toBe(false);
+  });
+
+  it("never lets a refusal for an earlier sign-in sign out the next one", async () => {
+    const held: ((r: Response) => void)[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        url === "/api/login"
+          ? Promise.resolve(new Response(JSON.stringify({ name: "bob" }), { status: 200 }))
+          : new Promise<Response>((r) => held.push(r)),
+      ),
+    );
+    const out = vi.fn();
+    const stop = onSignedOut(out);
+    const a = seen();
+    const { rerender } = render(<View kind="summary" q={{ n: 4 }} seen={a} />);
+    await settle();
+    // The stream drops; its whoami probe, and another call, are still out
+    // when the next human signs in and the page opens their views.
+    await act(async () => open()[0].onerror?.());
+    const old = rpc("list_agents").catch(() => {});
+    await act(async () => {
+      await login("bob", "token");
+    });
+    rerender(
+      <>
+        <View kind="summary" q={{ n: 4 }} seen={a} />
+        <View kind="feed" q={{ with: "Bob" }} seen={seen()} />
+      </>,
+    );
+    await settle();
+    const live = open()[0];
+    expect(live).toBeDefined();
+    // Both answer for the sign-in before: refused.
+    await act(async () => {
+      for (const r of held.splice(0)) r(new Response(JSON.stringify({ error: "not signed in" }), { status: 401 }));
+      await old;
+    });
+    expect(out).not.toHaveBeenCalled();
+    expect(live.closed).toBe(false);
+    // Whereas a refusal of a call made now does sign out.
+    const now = rpc("whoami").catch(() => {});
+    await act(async () => {
+      for (const r of held.splice(0)) r(new Response(JSON.stringify({ error: "not signed in" }), { status: 401 }));
+      await now;
+    });
+    expect(out).toHaveBeenCalledTimes(1);
+    stop();
   });
 });

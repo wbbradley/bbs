@@ -17,7 +17,22 @@ export function onSignedOut(f: () => void): () => void {
   return () => signedOut.delete(f);
 }
 
+/**
+ * Which sign-in requests belong to: it moves on when someone signs in, signs
+ * out, or is found signed out. A refusal of a request made under an earlier
+ * one says nothing about the sign-in now, so it signs no one out.
+ */
+let auth = 0;
+
+/** Tell the page the sign-in made under `generation` has ended, if current. */
+function endSignIn(generation: number) {
+  if (generation !== auth) return;
+  auth++;
+  signedOut.forEach((f) => f());
+}
+
 async function post<T>(path: string, body: unknown): Promise<T> {
+  const generation = auth;
   let res: Response;
   try {
     res = await fetch(path, {
@@ -32,7 +47,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   if (res.status === 204) return undefined as T;
   const json = await res.json().catch(() => ({ error: res.statusText }));
   if (!res.ok) {
-    if (res.status === 401 && path !== "/api/login") signedOut.forEach((f) => f());
+    if (res.status === 401 && path !== "/api/login") endSignIn(generation);
     throw new ApiError(json.error ?? res.statusText, res.status);
   }
   return json as T;
@@ -43,12 +58,16 @@ export function rpc<T = unknown>(method: string, req: object = {}): Promise<T> {
   return post<T>(`/api/rpc/${method}`, req);
 }
 
-export function login(name: string, token: string): Promise<Principal> {
-  return post<Principal>("/api/login", { name, token });
+export async function login(name: string, token: string): Promise<Principal> {
+  const me = await post<Principal>("/api/login", { name, token });
+  // Anything still answering for the sign-in before this one is stale.
+  auth++;
+  return me;
 }
 
-export function logout(): Promise<void> {
-  return post<void>("/api/logout", {});
+export async function logout(): Promise<void> {
+  auth++;
+  await post<void>("/api/logout", {});
 }
 
 export async function serverInfo(): Promise<ServerInfo | null> {
@@ -159,6 +178,7 @@ const hub = (() => {
     const es = new EventSource(`/api/events?tab=${TAB}&s=${encodeURIComponent(s)}`);
     source = es;
     const mine = ++stream;
+    const signedIn = auth;
     // Events still queued from a stream this tab has closed are dropped.
     const current = () => source === es && stream === mine;
     es.onmessage = (e) => {
@@ -181,7 +201,7 @@ const hub = (() => {
       };
       if (key === null) {
         close();
-        if (status === 401) signedOut.forEach((f) => f());
+        if (status === 401) endSignIn(signedIn);
         else again(error);
         return;
       }
