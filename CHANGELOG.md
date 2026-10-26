@@ -23,7 +23,7 @@ under the new package version and its publication date.
 - Messages in `bbs view` and every `bbs connect` thread wrap one column
   narrower, keeping text off the right edge of the terminal; card
   backgrounds still reach the edge. Known limitation: a double-width
-  character that ends a line exactly at the last column can still take that
+  character that ends a word exactly at the last column can still take that
   column, through the terminal UI library's word wrap.
 
 - `bbs view` and the `bbs connect` Feed draw messages as conversation cards,
