@@ -769,8 +769,7 @@ impl Blockers {
         .style(Style::new().add_modifier(Modifier::BOLD));
         // Markdown, laid out for the card less its two-column margin.
         let mut body = Vec::new();
-        let markdown =
-            crate::ui::markdown::render_at(&row.body, Some(width.saturating_sub(2) as u16));
+        let markdown = crate::ui::markdown::render_at(&row.body, Some(detail_width(width as u16)));
         for line in markdown.lines {
             let spans = line
                 .spans
@@ -969,7 +968,7 @@ impl Blockers {
         let below = self.lines_below(area.width, now);
         let inset = area.width.min(2);
         let body = Paragraph::new(body).wrap(Wrap { trim: false });
-        let rows = body.line_count(area.width - inset) as u16;
+        let rows = body.line_count(detail_width(area.width)) as u16;
         let label_gap = u16::from(label.is_some());
         // A blank row parts the list from the blocker restated below it.
         let list_gap = u16::from(selected.is_some());
@@ -1034,7 +1033,7 @@ impl Blockers {
         let body_area = Rect::new(
             body_area.x + inset,
             body_area.y,
-            body_area.width - inset,
+            detail_width(area.width),
             body_area.height,
         );
         self.text_rows = (rows, body_area.height);
@@ -1173,6 +1172,12 @@ fn request(id: u64, key: &str, write: &Write) -> Request {
             },
         },
     }
+}
+
+/// The columns a blocker's details wrap to in `width`: past their
+/// two-column inset and short of the right edge, as a thread's text is.
+fn detail_width(width: u16) -> u16 {
+    crate::ui::thread::wrap_width(width.saturating_sub(width.min(2)))
 }
 
 #[cfg(test)]
@@ -1423,6 +1428,61 @@ mod tests {
                     .expect("actions");
                 assert_eq!(action, usize::from(height) - 2, "{rows:#?}");
             }
+        }
+    }
+
+    #[test]
+    fn details_stop_one_column_short_of_the_right_edge() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                for width in [60u16, 80] {
+                    // Details that once filled the card's text exactly.
+                    let old = usize::from(width) - 2;
+                    let body = format!(
+                        "{}\n\n{}\n\n| {} |\n| --- |\n| cell |",
+                        "x".repeat(old),
+                        "界".repeat(old / 2),
+                        "h".repeat(old - 4)
+                    );
+                    let now = Instant::now();
+                    let mut blockers = Blockers::new();
+                    blockers.poll(SCREEN);
+                    blockers.on_data(SCREEN, &list(vec![row(1, 1, "Zed", &body)]), now);
+                    blockers.open().unwrap();
+                    let (rows, buffer) = drawn(&mut blockers, width, 60, now);
+                    let out = rows.join("\n");
+                    assert!(out.contains("xxxx") && out.contains('界'), "{out}");
+                    // The details: from the blocker restated to who answers it.
+                    let from = rows
+                        .iter()
+                        .rposition(|r| r.starts_with("  #1 @crew Zed"))
+                        .unwrap() as u16;
+                    let to = rows.iter().position(|r| r.starts_with("answer →")).unwrap() as u16;
+                    for y in from..to {
+                        // ratatui's word wrap can still spill a double-width
+                        // character into the last column: a known limit.
+                        let spill =
+                            unicode_width::UnicodeWidthStr::width(buffer[(width - 2, y)].symbol())
+                                == 2;
+                        assert!(
+                            buffer[(width - 1, y)].symbol() == " " || spill,
+                            "{scheme:?} {width} row {y}: {out}"
+                        );
+                    }
+                    // The x's wrap rather than reach the edge.
+                    assert_eq!(
+                        rows.iter().filter(|r| r.starts_with("  x")).count(),
+                        2,
+                        "{out}"
+                    );
+                    // Paging measures what is drawn.
+                    let measured = ratatui::widgets::Paragraph::new(blockers.parts(width).body)
+                        .wrap(ratatui::widgets::Wrap { trim: false })
+                        .line_count(detail_width(width)) as u16;
+                    assert_eq!(blockers.text_rows.0, measured);
+                }
+            });
         }
     }
 

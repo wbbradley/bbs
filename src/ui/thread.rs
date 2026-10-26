@@ -19,6 +19,17 @@ use crate::ui::message::fold;
 /// that column, on any row.
 pub(crate) const RIGHT_MARGIN: u16 = 1;
 
+/// The columns text wraps to in `width`: one fewer, keeping it off the
+/// terminal's right edge, unless only one is left. Whatever wraps text,
+/// measuring or drawing it, takes this width.
+pub fn wrap_width(width: u16) -> u16 {
+    if width > RIGHT_MARGIN {
+        width - RIGHT_MARGIN
+    } else {
+        width
+    }
+}
+
 /// Loaded history kept while the view is open; the oldest rows are dropped
 /// beyond this, never the stream.
 pub(crate) const MAX_ROWS: usize = 10_000;
@@ -249,12 +260,7 @@ impl<R: Row> ThreadView<R> {
     /// less the right margin. With a single inner column the margin is
     /// dropped; when the inset takes the whole width it is 0.
     fn content_width(&self, row: &R, width: u16) -> u16 {
-        let inner = width.saturating_sub(self.inset(row));
-        if inner > RIGHT_MARGIN {
-            inner - RIGHT_MARGIN
-        } else {
-            inner
-        }
+        wrap_width(width.saturating_sub(self.inset(row)))
     }
 
     fn inset(&self, row: &R) -> u16 {

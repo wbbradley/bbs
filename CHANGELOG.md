@@ -19,7 +19,9 @@ under the new package version and its publication date.
 
 - Messages in `bbs view` and every `bbs connect` thread wrap one column
   narrower, keeping text off the right edge of the terminal; card
-  backgrounds still reach the edge. Known limitation: a double-width
+  backgrounds still reach the edge. So do the text you type (message boxes,
+  notes, blocker answers), blocker details and `/btw` answers. Known
+  limitation outside the text boxes, which wrap on their own: a double-width
   character that ends a word exactly at the last column can still take that
   column, through the terminal UI library's word wrap.
 
