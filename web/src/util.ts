@@ -83,20 +83,24 @@ export const storage = (() => {
   return {
     get(key: string): string | null {
       try {
-        const value = local()?.getItem(key);
-        if (value !== null && value !== undefined) return value;
+        const store = local();
+        if (store) return store.getItem(key);
       } catch {
-        // Fall back to this visit's memory.
+        // Refused: this visit's memory stands in.
       }
       return memory.get(key) ?? null;
     },
     set(key: string, value: string) {
-      memory.set(key, value);
       try {
-        local()?.setItem(key, value);
+        const store = local();
+        if (store) {
+          store.setItem(key, value);
+          return;
+        }
       } catch {
-        // Memory keeps it for the visit.
+        // Refused or full: keep it for the visit.
       }
+      memory.set(key, value);
     },
     remove(key: string) {
       memory.delete(key);

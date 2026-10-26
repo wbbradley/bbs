@@ -18,19 +18,20 @@ export function AnswerDialog({
   input: OwnerInput;
   onClose: () => void;
 }) {
-  const [answers, setAnswers] = useState<Record<string, string>>({});
-  const [free, setFree] = useState<Record<string, boolean>>({});
+  // By question id, which may be any string, "constructor" included.
+  const [answers, setAnswers] = useState<Map<string, string>>(() => new Map());
+  const [free, setFree] = useState<Map<string, boolean>>(() => new Map());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const missing = input.questions.filter((q) => q.required && !answers[q.id]?.trim());
+  const missing = input.questions.filter((q) => q.required && !answers.get(q.id)?.trim());
   const reply = async (action: number) => {
     setBusy(true);
     setError(null);
     try {
       const list =
         action === AnswerAction.Submit
-          ? Object.entries(answers)
+          ? [...answers.entries()]
               .filter(([, v]) => v.trim())
               .map(([question_id, value]) => ({ question_id, value }))
           : [];
@@ -78,10 +79,10 @@ export function AnswerDialog({
         </div>
       )}
       {input.questions.map((q) => {
-        const value = answers[q.id] ?? "";
+        const value = answers.get(q.id) ?? "";
         const chosen = q.options.some((o) => o.value === value);
-        const typing = free[q.id] || (q.options.length === 0 && q.allow_free_text) || (value && !chosen);
-        const set = (v: string) => setAnswers((a) => ({ ...a, [q.id]: v }));
+        const typing = free.get(q.id) || (q.options.length === 0 && q.allow_free_text) || (value && !chosen);
+        const set = (v: string) => setAnswers((a) => new Map(a).set(q.id, v));
         return (
           <div className="question" key={q.id}>
             <div className="qhead">
@@ -94,7 +95,7 @@ export function AnswerDialog({
                 key={o.value}
                 className={`choice${value === o.value ? " on" : ""}`}
                 onClick={() => {
-                  setFree((f) => ({ ...f, [q.id]: false }));
+                  setFree((f) => new Map(f).set(q.id, false));
                   // Choosing an optional answer again clears it.
                   set(value === o.value && !q.required ? "" : o.value);
                 }}
@@ -107,7 +108,7 @@ export function AnswerDialog({
               </button>
             ))}
             {q.allow_free_text && q.options.length > 0 && !typing && (
-              <button className="choice" onClick={() => (setFree((f) => ({ ...f, [q.id]: true })), set(""))}>
+              <button className="choice" onClick={() => (setFree((f) => new Map(f).set(q.id, true)), set(""))}>
                 <span>○</span>
                 <span className="muted">Other…</span>
               </button>

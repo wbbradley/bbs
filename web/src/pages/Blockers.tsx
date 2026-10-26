@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { rpc } from "../api";
 import type { PageProps } from "../App";
 import { Markdown } from "../Markdown";
@@ -6,53 +6,146 @@ import { PageHeader } from "../components/PageHeader";
 import { Link, paths } from "../router";
 import { useBoard } from "../store";
 import { BlockerStatus, Kind, type Blocker, type BlockerMutationResponse } from "../types";
-import { ago, fullTime, loadDraft, randomKey, same, saveDraft } from "../util";
+import { ago, fullTime, loadDraft, ownedKey, randomKey, same, saveDraft, storage } from "../util";
 
-/** One write per blocker at a time; a retry repeats the same request key. */
-interface Write {
+/** After a blocker's text changes under the reader, its actions wait this long. */
+export const REPLACED_GUARD_MS = 1000;
+
+/**
+ * One write per blocker (by root) at a time, kept in this browser for its
+ * human until it is settled or dismissed. An unconfirmed write repeats the
+ * exact request, its key, version and answer, never an edited one.
+ */
+export interface Kept {
+  root: number;
+  /** The version written to. */
+  id: number;
   kind: "answer" | "cancel";
   key: string;
+  answer?: string;
   state: "sending" | "unconfirmed" | "refused";
   error?: string;
+  /** The row as it was, to show if the server stops listing it. */
+  row: Blocker;
+}
+
+function keptKey(): string | null {
+  return ownedKey("blocker-writes", "all");
+}
+
+export function loadKept(): Record<number, Kept> {
+  const key = keptKey();
+  if (key === null) return {};
+  try {
+    const kept = JSON.parse(storage.get(key) ?? "{}") as Record<number, Kept>;
+    // A write cut off mid-flight is unconfirmed: only a repeat can tell.
+    for (const k of Object.values(kept)) if (k.state === "sending") k.state = "unconfirmed";
+    return kept;
+  } catch {
+    return {};
+  }
+}
+
+function storeKept(kept: Record<number, Kept>) {
+  const key = keptKey();
+  if (key === null) return;
+  if (Object.keys(kept).length === 0) storage.remove(key);
+  else storage.set(key, JSON.stringify(kept));
+}
+
+/** Where the selection goes when its row leaves: the row now at its place. */
+export function nearest(selected: number | null, old: number[], now: number[]): number | null {
+  if (now.length === 0) return null;
+  if (selected !== null && now.includes(selected)) return selected;
+  const at = selected === null ? 0 : Math.max(0, old.indexOf(selected));
+  return now[Math.min(at, now.length - 1)];
 }
 
 export function BlockersPage({ openNav }: PageProps) {
   const board = useBoard();
-  const list = board.blockers?.blockers ?? [];
+  const [kept, setKept] = useState<Record<number, Kept>>(loadKept);
   const [selected, setSelected] = useState<number | null>(null);
-  const [writes, setWrites] = useState<Record<number, Write>>({});
   const [done, setDone] = useState<string | null>(null);
+  const [guardUntil, setGuardUntil] = useState(0);
+  const [, tick] = useState(0);
 
-  // Keep the selection on the same queue position through replacements.
-  const current =
-    list.find((b) => b.root_id === selected) ?? (list.length > 0 && selected === null ? list[0] : null) ?? list[0] ?? null;
+  const update = useCallback((f: (k: Record<number, Kept>) => Record<number, Kept>) => {
+    setKept((old) => {
+      const next = f(old);
+      storeKept(next);
+      return next;
+    });
+  }, []);
+
+  // The server's rows, then rows it no longer lists that hold a write's
+  // outcome, until dismissed.
+  const listed = board.blockers?.blockers ?? [];
+  const listedRoots = new Set(listed.map((b) => b.root_id));
+  const held = Object.values(kept)
+    .filter((k) => !listedRoots.has(k.root))
+    .map((k) => k.row);
+  const rows = [...listed, ...held];
+  const roots = rows.map((b) => b.root_id);
+
+  const order = useRef<number[]>([]);
+  const target = nearest(selected, order.current, roots);
+  const current = rows.find((b) => b.root_id === target) ?? null;
   useEffect(() => {
-    if (current && current.root_id !== selected) setSelected(current.root_id);
-  }, [current, selected]);
+    order.current = roots;
+    if (target !== selected) setSelected(target);
+  });
 
-  const write = async (b: Blocker, kind: Write["kind"], answer?: string) => {
-    const prior = writes[b.id];
-    const key = prior && prior.kind === kind && prior.state === "unconfirmed" ? prior.key : randomKey();
-    setWrites((w) => ({ ...w, [b.id]: { kind, key, state: "sending" } }));
+  // A replaced or reworded blocker holds its actions briefly.
+  const seen = useRef<{ root: number; id: number; body: string } | null>(null);
+  useEffect(() => {
+    if (!current) return;
+    const was = seen.current;
+    seen.current = { root: current.root_id, id: current.id, body: current.body };
+    if (was && was.root === current.root_id && (was.id !== current.id || was.body !== current.body)) {
+      setGuardUntil(Date.now() + REPLACED_GUARD_MS);
+      setDone("Blocker updated.");
+      const t = window.setTimeout(() => tick((n) => n + 1), REPLACED_GUARD_MS);
+      return () => window.clearTimeout(t);
+    }
+  }, [current]);
+  const guarded = Date.now() < guardUntil;
+
+  const write = async (b: Blocker, kind: Kept["kind"], answer?: string) => {
+    const prior = kept[b.root_id];
+    // A repeat is the very request that went unconfirmed.
+    const op: Kept =
+      prior && prior.state === "unconfirmed"
+        ? { ...prior, state: "sending", error: undefined }
+        : { root: b.root_id, id: b.id, kind, key: randomKey(), answer, state: "sending", row: b };
+    update((k) => ({ ...k, [b.root_id]: op }));
     setDone(null);
     try {
       const r =
-        kind === "answer"
-          ? await rpc<BlockerMutationResponse>("answer_blocker", { id: b.id, answer, request_key: key })
-          : await rpc<BlockerMutationResponse>("cancel_blocker", { id: b.id, request_key: key });
-      setWrites((w) => {
-        const next = { ...w };
-        delete next[b.id];
+        op.kind === "answer"
+          ? await rpc<BlockerMutationResponse>("answer_blocker", { id: op.id, answer: op.answer, request_key: op.key })
+          : await rpc<BlockerMutationResponse>("cancel_blocker", { id: op.id, request_key: op.key });
+      update((k) => {
+        const next = { ...k };
+        delete next[op.root];
         return next;
       });
-      if (kind === "answer") saveDraft(`blocker:${b.root_id}`, "");
-      setDone(`${kind === "answer" ? "Answered" : "Cancelled"} #${r.blocker?.id ?? b.id} in @${b.group}.`);
+      if (op.kind === "answer") saveDraft(`blocker:${op.root}`, "");
+      setDone(`${op.kind === "answer" ? "Answered" : "Cancelled"} #${r.blocker?.id ?? op.id} in @${op.row.group}.`);
       board.refreshBlockers();
     } catch (e) {
       const err = e as { status?: number; message?: string };
-      const state = !err.status || err.status >= 500 ? "unconfirmed" : "refused";
-      setWrites((w) => ({ ...w, [b.id]: { kind, key, state, error: err.message } }));
+      const state = !err.status || err.status >= 500 || err.status === 429 ? "unconfirmed" : "refused";
+      update((k) => ({ ...k, [op.root]: { ...op, state, error: err.message } }));
     }
+  };
+
+  const dismiss = (root: number) => {
+    update((k) => {
+      const next = { ...k };
+      delete next[root];
+      return next;
+    });
+    if (!listedRoots.has(root)) saveDraft(`blocker:${root}`, "");
   };
 
   const unsupported = board.info !== null && !board.has("blockers-mine.v1");
@@ -67,17 +160,21 @@ export function BlockersPage({ openNav }: PageProps) {
         <div className="blockers">
           <div className="blocker-list">
             <div className="blocker-list-title">Open blockers</div>
-            {list.length === 0 && (
+            {rows.length === 0 && (
               <div className="empty">{board.blockers ? "No open blockers." : board.blockersError ?? "Loading…"}</div>
             )}
-            {list.map((b) => (
+            {rows.map((b) => (
               <div
                 key={b.root_id}
                 className={`blocker-row${current?.root_id === b.root_id ? " sel" : ""}`}
-                onClick={() => setSelected(b.root_id)}
+                onClick={() => {
+                  setSelected(b.root_id);
+                  setDone(null);
+                }}
               >
                 <div className="meta">
                   #{b.id} <span className="group">@{b.group}</span> · <Creator b={b} /> · {ago(b.created_at)}
+                  {!listedRoots.has(b.root_id) && <span className="faint"> · no longer open</span>}
                 </div>
                 <div className="preview">{b.body.split("\n")[0].replace(/[*_`#>]/g, "")}</div>
               </div>
@@ -87,7 +184,15 @@ export function BlockersPage({ openNav }: PageProps) {
           <div className="blocker-detail">
             {done && <div className="notice info">{done}</div>}
             {current ? (
-              <BlockerCard key={current.id} b={current} write={writes[current.id]} onWrite={write} />
+              <BlockerCard
+                key={current.id}
+                b={current}
+                held={!listedRoots.has(current.root_id)}
+                kept={kept[current.root_id]}
+                guarded={guarded}
+                onWrite={write}
+                onDismiss={dismiss}
+              />
             ) : (
               <div className="empty">Nothing needs you.</div>
             )}
@@ -105,26 +210,45 @@ function Creator({ b }: { b: Blocker }) {
 
 function BlockerCard({
   b,
-  write,
+  held,
+  kept,
+  guarded,
   onWrite,
+  onDismiss,
 }: {
   b: Blocker;
-  write?: Write;
-  onWrite: (b: Blocker, kind: Write["kind"], answer?: string) => void;
+  /** Listed only for its write's outcome: read only until dismissed. */
+  held: boolean;
+  kept?: Kept;
+  guarded: boolean;
+  onWrite: (b: Blocker, kind: Kept["kind"], answer?: string) => void;
+  onDismiss: (root: number) => void;
 }) {
   const board = useBoard();
   const draftKey = `blocker:${b.root_id}`;
   const [answer, setAnswer] = useState(() => loadDraft(draftKey));
   const [confirmCancel, setConfirmCancel] = useState(false);
   useEffect(() => saveDraft(draftKey, answer), [draftKey, answer]);
-  const sending = write?.state === "sending";
+  useEffect(() => {
+    if (guarded) setConfirmCancel(false);
+  }, [guarded]);
+  const sending = kept?.state === "sending";
+  const unconfirmed = kept?.state === "unconfirmed";
+  // While a write is out or unsettled, its answer is the one shown, unchanged.
+  const frozen = sending || unconfirmed;
+  const shown = frozen && kept?.kind === "answer" ? (kept.answer ?? "") : answer;
   const creatorAgent = b.creator?.kind === Kind.Agent ? b.creator : null;
   const live = creatorAgent && board.agents.some((a) => a.id === creatorAgent.id && same(a.name, creatorAgent.name));
+  const open = !held && b.status === BlockerStatus.Open;
   const reason = !b.can_answer
     ? creatorAgent && !live
       ? "The agent that asked is gone, so it cannot be answered."
       : "You have no agent in this group, so you cannot answer it."
     : null;
+  const canAnswer = open && b.can_answer && !frozen;
+  const send = () => {
+    if (canAnswer && !guarded && answer.trim()) onWrite(b, "answer", answer);
+  };
 
   return (
     <div>
@@ -135,45 +259,49 @@ function BlockerCard({
       </div>
       <Markdown text={b.body} />
       <div style={{ marginTop: 18 }}>
-        {b.status !== BlockerStatus.Open && <div className="notice warning">No longer open.</div>}
-        {reason && <div className="notice info">{reason}</div>}
-        {b.can_answer && (
+        {!open && <div className="notice warning">No longer open.</div>}
+        {open && reason && <div className="notice info">{reason}</div>}
+        {(b.can_answer || shown) && (
           <>
             <div className="mono muted" style={{ fontSize: 12, marginBottom: 4 }}>
               answer → <Creator b={b} /> <span className="group">@{b.group}</span>
             </div>
             <textarea
               className="textarea"
-              value={answer}
-              disabled={sending}
-              onChange={(e) => setAnswer(e.target.value)}
+              value={shown}
+              readOnly={!canAnswer}
+              onChange={(e) => canAnswer && setAnswer(e.target.value)}
               placeholder="Your answer goes to the agent as mail."
               onKeyDown={(e) => {
-                if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && answer.trim()) onWrite(b, "answer", answer);
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send();
               }}
             />
           </>
         )}
         <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center", flexWrap: "wrap" }}>
-          {b.can_answer && (
-            <button
-              className="btn primary"
-              disabled={sending || !answer.trim()}
-              onClick={() => onWrite(b, "answer", answer)}
-            >
-              {sending && write?.kind === "answer" ? "Sending…" : "Send answer"}
+          {unconfirmed && (
+            <button className="btn primary" disabled={guarded} onClick={() => onWrite(b, kept!.kind)}>
+              Retry the same {kept!.kind === "answer" ? "answer" : "cancel"}
             </button>
           )}
+          {canAnswer && (
+            <button className="btn primary" disabled={guarded || !answer.trim()} onClick={send}>
+              Send answer
+            </button>
+          )}
+          {sending && <span className="muted">Sending…</span>}
           {creatorAgent && live && (
             <Link to={paths.agent(creatorAgent.name)} className="btn">
               Discuss with {creatorAgent.name}
             </Link>
           )}
-          {b.can_cancel &&
+          {open &&
+            b.can_cancel &&
+            !frozen &&
             (confirmCancel ? (
               <>
                 <span className="warning-text">Cancel this blocker? No mail is sent.</span>
-                <button className="btn danger" disabled={sending} onClick={() => onWrite(b, "cancel")}>
+                <button className="btn danger" disabled={guarded} onClick={() => onWrite(b, "cancel")}>
                   Yes, cancel it
                 </button>
                 <button className="btn" onClick={() => setConfirmCancel(false)}>
@@ -181,18 +309,27 @@ function BlockerCard({
                 </button>
               </>
             ) : (
-              <button className="btn danger" disabled={sending} onClick={() => setConfirmCancel(true)}>
+              <button className="btn danger" disabled={guarded} onClick={() => setConfirmCancel(true)}>
                 Cancel blocker
               </button>
             ))}
-          <span className="faint" style={{ fontSize: 12 }}>
-            ⌘Enter sends
-          </span>
+          {kept && !sending && (
+            <button className="btn ghost" onClick={() => onDismiss(b.root_id)}>
+              Dismiss
+            </button>
+          )}
+          {canAnswer && (
+            <span className="faint" style={{ fontSize: 12 }}>
+              ⌘Enter sends
+            </span>
+          )}
         </div>
-        {write?.state === "unconfirmed" && (
-          <div className="notice warning">Not confirmed: {write.error}. Sending again repeats the same request.</div>
+        {unconfirmed && (
+          <div className="notice warning">
+            Not confirmed: {kept!.error}. Retrying repeats the same request, which the server applies at most once.
+          </div>
         )}
-        {write?.state === "refused" && <div className="notice error">{write.error}</div>}
+        {kept?.state === "refused" && <div className="notice error">{kept.error}</div>}
       </div>
     </div>
   );

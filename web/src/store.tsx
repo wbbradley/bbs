@@ -98,17 +98,28 @@ export function BoardProvider({
       .catch(() => {});
   }, []);
 
+  // One listing at a time; one asked for meanwhile (after a write, say)
+  // runs once that one is done, so it sees the write.
   const blockersBusy = useRef(false);
+  const blockersAgain = useRef(false);
   const refreshBlockers = useCallback(() => {
-    if (blockersBusy.current || !has("blockers-mine.v1")) return;
+    if (!has("blockers-mine.v1")) return;
+    if (blockersBusy.current) {
+      blockersAgain.current = true;
+      return;
+    }
     blockersBusy.current = true;
+    blockersAgain.current = false;
     rpc<ListBlockersResponse>("list_blockers", { mine: true, limit: 50 })
       .then((r) => {
         setBlockers(r);
         setBlockersError(null);
       })
       .catch((e) => setBlockersError(String(e.message ?? e)))
-      .finally(() => (blockersBusy.current = false));
+      .finally(() => {
+        blockersBusy.current = false;
+        if (blockersAgain.current) refreshBlockers();
+      });
   }, [has]);
 
   // Notes arrive in revision order from a cursor; one listing runs at a

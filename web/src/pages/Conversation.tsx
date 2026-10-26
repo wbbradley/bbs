@@ -389,7 +389,13 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
         )}
       </div>
       {answering && pendingInput && (
-        <AnswerDialog agent={agent} input={pendingInput} onClose={() => setAnswering(false)} />
+        // A new request is a new form: nothing chosen for another carries over.
+        <AnswerDialog
+          key={pendingInput.request_id}
+          agent={agent}
+          input={pendingInput}
+          onClose={() => setAnswering(false)}
+        />
       )}
     </>
   );
