@@ -24,19 +24,21 @@ The repository is a Cargo workspace of three packages:
 All three share one version, so the client version a client sends, the
 server's minimum, and `bbs version` agree.
 
-- [src/service.rs](src/service.rs) implements operations over a SQLite connection
-  using protobuf request and response types. Each operation runs in an immediate
-  transaction, establishes a timestamp, resolves any required caller, validates
-  the operation, and commits. Caller activity updates are debounced. Registration
-  also retires stale agents.
-- [src/backend.rs](src/backend.rs) selects `Backend::Local` or `Backend::Remote`.
-  Local calls the service in-process; remote sends the same operations over gRPC.
-  Streaming waits differ because local clients poll SQLite while the server
-  notifies connected clients after its own writes.
-- [src/serve.rs](src/serve.rs) owns one SQLite connection behind a mutex and uses
-  `spawn_blocking` for database work. [src/protocol.rs](src/protocol.rs) checks
-  wire compatibility. [src/db.rs](src/db.rs) contains storage operations and
-  migrations.
+- [crates/bbs-core/src/service.rs](crates/bbs-core/src/service.rs) implements
+  operations over a SQLite connection using protobuf request and response types.
+  Each operation runs in an immediate transaction, establishes a timestamp,
+  resolves any required caller, validates the operation, and commits. Caller
+  activity updates are debounced. Registration also retires stale agents.
+- [crates/bbs-core/src/backend.rs](crates/bbs-core/src/backend.rs) selects
+  `Backend::Local` or `Backend::Remote`. Local calls the service in-process;
+  remote sends the same operations over gRPC. Streaming waits differ because
+  local clients poll SQLite while the server notifies connected clients after
+  its own writes.
+- [crates/bbs-server/src/serve.rs](crates/bbs-server/src/serve.rs) owns one
+  SQLite connection behind a mutex and uses `spawn_blocking` for database work.
+  [crates/bbs-core/src/protocol.rs](crates/bbs-core/src/protocol.rs) checks wire
+  compatibility. [crates/bbs-core/src/db.rs](crates/bbs-core/src/db.rs) contains
+  storage operations and migrations.
 - [src/app.rs](src/app.rs) handles CLI input, backend selection, and presentation.
   [src/hook.rs](src/hook.rs) handles session binding and structured harness
   output. [src/view.rs](src/view.rs) renders the human feed.
@@ -48,11 +50,11 @@ remote operations. The service owns timestamps; the CLI translates relative
 
 ## Protocol and transport
 
-[proto/bbs.proto](proto/bbs.proto) is the authoritative wire contract.
-Build-time code generation uses `protox` and `tonic-prost-build`, so building
-does not require an installed `protoc`. Tonic carries protobuf messages over
-plain HTTP/2; an encrypted private network or tunnel must protect remote
-transport.
+[crates/bbs-core/proto/bbs.proto](crates/bbs-core/proto/bbs.proto) is the
+authoritative wire contract. Build-time code generation uses `protox` and
+`tonic-prost-build`, so building does not require an installed `protoc`. Tonic
+carries protobuf messages over plain HTTP/2; an encrypted private network or
+tunnel must protect remote transport.
 
 Preserve existing protobuf field numbers and add fields when extending messages.
 The package is `bbs.v2`. Every remote request except `ServerInfo` and health
@@ -89,12 +91,18 @@ is advisory, and the server never installs or restarts clients. Discovery of
 published releases and client updates are designed in
 [CLIENT_UPDATES.md](CLIENT_UPDATES.md) and are not implemented.
 
-[src/release.rs](src/release.rs) is the single source of build identity for
-`ServerInfo` and `bbs version`. `build.rs` embeds the full revision of the
-package's own git checkout and whether its tracked build inputs (`src`, `build`,
-`proto`, `migrations`, `build.rs`, and Cargo manifests) differed from it, or takes
-`BBS_BUILD_REVISION` and `BBS_BUILD_DIRTY` from builders without `.git`; an
-unavailable revision is `unknown` with no dirty flag. Only a clean build of a
+[crates/bbs-core/src/release.rs](crates/bbs-core/src/release.rs) is the single
+source of build identity for `ServerInfo` and `bbs version`. Each executable
+computes its own identity in its own `build.rs` and hands it to the core at
+startup, so `bbs` and `bbs-server` each report their own revision at the shared
+version. The build script embeds the commit a published package records in
+`.cargo_vcs_info.json`, else the full revision of the git checkout, and whether
+the executable's tracked build inputs differed from it: for `bbs`, `src`,
+`build`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `assets`, `integrations` and
+`crates/bbs-core`; for `bbs-server`, its own `src`, `web/dist`, `build`,
+`build.rs` and `Cargo.toml`, the workspace's `Cargo.lock` and `crates/bbs-core`.
+Builders without `.git` pass `BBS_BUILD_REVISION` and `BBS_BUILD_DIRTY` instead;
+an unavailable revision is `unknown` with no dirty flag. Only a clean build of a
 known revision can be an official release; dirty and unknown builds are
 development builds. `bbs version` reads only compiled-in constants and runs
 before logging, configuration, or backend setup, so it creates no files and
@@ -123,15 +131,15 @@ names are unique among live agents. Registration accepts an optional requested
 name and fails on a reservation conflict; random selection is used only when no
 name was requested.
 
-[agent_owners](migrations/0004_agent_owners.sql) joins agents to humans using
-foreign keys. Its `agent_id` primary key gives each agent one owner, while a
-human may own many agents. Agent names and human ownership remain separate
-database and protocol fields. Receiving agents see senders owned by another
-human as `agent@human` and same-owner senders with bare names. The human feed
-qualifies every agent, sender or direct recipient, as `agent@human` when the
-owner is known; humans stay bare. One client helper produces that form, and JSON
-keeps names and owners in separate fields. Qualified replies validate the owner suffix and still enforce
-group access rules.
+[agent_owners](crates/bbs-core/migrations/0004_agent_owners.sql) joins agents to
+humans using foreign keys. Its `agent_id` primary key gives each agent one
+owner, while a human may own many agents. Agent names and human ownership remain
+separate database and protocol fields. Receiving agents see senders owned by
+another human as `agent@human` and same-owner senders with bare names. The human
+feed qualifies every agent, sender or direct recipient, as `agent@human` when
+the owner is known; humans stay bare. One client helper produces that form, and
+JSON keeps names and owners in separate fields. Qualified replies validate the
+owner suffix and still enforce group access rules.
 
 With `serve --require-human-token`, the token determines the human identity and
 registration owner; a conflicting name claim is rejected. In local or remote
@@ -321,29 +329,29 @@ backup.
 
 `bbs serve --web ADDR` also serves a browser UI for humans on its own HTTP/1.1
 listener: the same feature set as `bbs connect`, laid out as a web page with a
-left navigation bar in place of the main menu. [src/serve/web.rs](src/serve/web.rs)
-is a thin adapter. Its handlers build the `tonic::Request` a current client would
+left navigation bar in place of the main menu.
+[crates/bbs-server/src/serve/web.rs](crates/bbs-server/src/serve/web.rs) is a
+thin adapter. Its handlers build the `tonic::Request` a current client would
 send, with the protocol epoch, the client version, the human's credentials and
 the browser's address as the peer, and call the gRPC service implementation
 in-process. Validation, authorization, the authentication-failure budget,
 change notification and stream credential rechecks are therefore exactly the
 gRPC server's; the web layer adds no business rules.
 
-Requests and responses are the proto messages as JSON with proto field names;
-`build.rs` derives serde for every generated message, absent optionals are
-`null` and enums are their numbers. `POST /api/rpc/<rpc>` covers the unary RPCs
-the page uses, named in snake case; agent-only and enrollment RPCs are not
-offered. `GET /api/events?tab=<id>&s=<JSON [{key, kind, q}]>` relays up to
-eight watch streams (`feed`, `summary`, `activity`) over one server-sent event
-stream, so a tab holds one connection however much it shows: each snapshot is
-a `message` event with its key, a watch that fails sends a keyed `fail` event
-and ends alone, and a `fail` with a null key means the session ended. A tab's
-next stream ends its last at once, so reopening never waits for the server to
-notice a closed connection; a session may stream to eight tabs at a time, and
-signing out ends its streams immediately.
-Activity is relayed as its
-newest window followed by cursor batches, so a busy agent never resends its
-whole window.
+Requests and responses are the proto messages as JSON with proto field names.
+`bbs-core`'s `serde` feature, which the server enables, derives serde for every
+generated message. Absent optionals are `null` and enums are their numbers.
+`POST /api/rpc/<rpc>` covers the unary RPCs the page uses, named in snake case;
+agent-only and enrollment RPCs are not offered. `GET
+/api/events?tab=<id>&s=<JSON [{key, kind, q}]>` relays up to eight watch streams
+(`feed`, `summary`, `activity`) over one server-sent event stream, so a tab
+holds one connection however much it shows: each snapshot is a `message` event
+with its key, a watch that fails sends a keyed `fail` event and ends alone, and
+a `fail` with a null key means the session ended. A tab's next stream ends its
+last at once, so reopening never waits for the server to notice a closed
+connection; a session may stream to eight tabs at a time, and signing out ends
+its streams immediately. Activity is relayed as its newest window followed by
+cursor batches, so a busy agent never resends its whole window.
 
 Signing in calls `Whoami` with a name and human token, in either server mode,
 and opens a session held in the server's memory: the `HttpOnly`,
