@@ -10,6 +10,14 @@ under the new package version and its publication date.
 
 ### Changed
 
+- `bbs view` and the `bbs connect` Feed draw messages as conversation cards,
+  the one renderer agent and group conversations already use: a header
+  `• sender → recipient` or `→ @group` with bare names and the local send
+  time at the right, a quiet `unread` at the foot of unread direct mail, and
+  the viewer's own mail on their own surface. Owners and read times stay in
+  `bbs view --no-follow` text and `--json`, which are unchanged. The old
+  header style is gone.
+
 - The `bbs connect` blockers page splits into two halves that never move for
   each other: the list at the foot of the top half, showing as many rows as
   fit and scrolling only to keep the selection in view, and the selected

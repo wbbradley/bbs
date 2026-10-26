@@ -1,6 +1,7 @@
 //! Rendering shared by `bbs view`, `bbs headless logs` and `bbs connect`.
 
 pub mod activity;
+pub mod card;
 pub mod markdown;
 pub mod message;
 pub mod theme;

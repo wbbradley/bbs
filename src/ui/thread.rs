@@ -11,8 +11,7 @@ use ratatui::style::{Style, Styled};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use crate::proto::Message;
-use crate::ui::message::{find_matches, fold, message_lines};
+use crate::ui::message::fold;
 
 /// Loaded history kept while the view is open; the oldest rows are dropped
 /// beyond this, never the stream.
@@ -72,36 +71,10 @@ pub trait Row: PartialEq {
     }
 }
 
-impl Row for Message {
-    type Key = i64;
-    fn key(&self) -> i64 {
-        self.id
-    }
-    fn lines(&self, gap: bool, query: Option<&str>) -> Vec<Line<'_>> {
-        message_lines(self, gap, query)
-    }
-    fn lines_at(&self, gap: bool, query: Option<&str>, width: u16) -> Vec<Line<'_>> {
-        crate::ui::message::message_lines_with_recipient_at(self, gap, query, None, Some(width))
-    }
-    /// The sender, recipient, group, or body as sent (markdown included).
-    fn matches(&self, query: &str) -> bool {
-        [
-            Some(self.qualified_sender()),
-            self.qualified_recipient(),
-            self.to_group.as_ref().map(|g| format!("@{g}")),
-        ]
-        .iter()
-        .flatten()
-        .map(String::as_str)
-        .chain([self.body.as_str()])
-        .any(|text| !find_matches(text, query).is_empty())
-    }
-}
-
-/// A scrollable, following thread of rows, messages by default: every row
+/// A scrollable, following thread of rows: every row
 /// loaded since it opened, and where the viewport sits in them. Fields are
 /// crate-visible so the apps' tests can check its state.
-pub struct ThreadView<R: Row = Message> {
+pub struct ThreadView<R: Row> {
     /// Oldest first, by key. Snapshots append newer rows and refresh rows
     /// they still contain, so history only grows while open.
     pub(crate) rows: Vec<R>,

@@ -929,7 +929,7 @@ impl App {
                 Thread::agent(&name, &self.ctx.me, self.ctx.now.clone())
             }
             Some(Conversation::Group(name)) => Thread::group(&name, &self.ctx.me),
-            None => Thread::feed(),
+            None => Thread::feed(&self.ctx.me),
         };
         self.open_at(Box::new(screen), true, Opening::SeekWith(id, rows));
     }
@@ -1158,7 +1158,7 @@ impl App {
                 Thread::agent(&name, &self.ctx.me, self.ctx.now.clone())
             }
             Some(Conversation::Group(name)) => Thread::group(&name, &self.ctx.me),
-            None => Thread::feed(),
+            None => Thread::feed(&self.ctx.me),
         };
         self.open_at(
             Box::new(screen),
@@ -3275,7 +3275,7 @@ mod tests {
         typed(&mut app, "group draft");
         assert_eq!(app.top().draft().unwrap().1.text, "group draft");
         assert!(rx.try_recv().is_err());
-        app.open(Box::new(Thread::feed()), true);
+        app.open(Box::new(Thread::feed("ada")), true);
         while rx.try_recv().is_ok() {}
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         press(&mut app, KeyCode::BackTab, KeyModifiers::NONE);
@@ -10994,7 +10994,7 @@ mod tests {
     }
 
     #[test]
-    fn other_participants_have_a_distinct_surface_only_in_agent_conversations() {
+    fn other_participants_have_a_distinct_surface_in_conversations_and_the_feed() {
         use crate::ui::theme::{Scheme, select, testing::with_scheme};
         with_scheme(Scheme::Gruvbox, || {
             let (mut app, mut rx) = app();
@@ -11067,10 +11067,12 @@ mod tests {
                     ("agent-group-post", theme::Role::GroupConversation),
                 ] {
                     let y = row(text);
-                    let expected = base.patch(theme::style(if conversation {
-                        role
-                    } else {
-                        theme::Role::Screen
+                    // On the feed, mail to the viewer is someone else's
+                    // card too, and the viewer's own posts are theirs.
+                    let expected = base.patch(theme::style(match (conversation, text) {
+                        (false, "incoming-body") => theme::Role::OtherConversation,
+                        (false, "viewer-group-post") => theme::Role::HumanSurface,
+                        _ => role,
                     }));
                     assert!(
                         (0..80).all(|x| buffer[(x, y)].bg == expected.bg.unwrap()),
@@ -11083,38 +11085,25 @@ mod tests {
                 let last = row("tail-end");
                 assert!(last > first);
                 for y in first..=last {
-                    assert!((0..80).all(|x| buffer[(x, y)].bg
-                        == if conversation {
-                            other.bg.unwrap()
-                        } else {
-                            base.bg.unwrap()
-                        }));
+                    assert!((0..80).all(|x| buffer[(x, y)].bg == other.bg.unwrap()));
                 }
                 let header = (0..80)
                     .map(|x| buffer[(x, first - 1)].symbol())
                     .collect::<String>();
-                if conversation {
-                    // The local send time sits at the header's right edge.
-                    let sent = chrono::DateTime::parse_from_rfc3339("2026-10-16T18:00:00Z")
-                        .unwrap()
-                        .with_timezone(&chrono::Local)
-                        .format("%Y-%m-%d %-I:%M:%S%P")
-                        .to_string();
-                    assert!(header.starts_with("• Zed → Mateo "), "{header}");
-                    assert!(header.trim_end().ends_with(&sent), "{header}");
-                } else {
-                    assert!(header.contains("Zed@ada → Mateo@ada"), "{header}");
-                    assert!(header.contains("2026-10-16"), "{header}");
-                }
-                let header_style = if conversation {
-                    base.patch(theme::style(theme::Role::OtherConversationHeader))
-                } else {
-                    base
-                };
+                // The local send time sits at the header's right edge, in a
+                // conversation and on the feed alike.
+                let sent = chrono::DateTime::parse_from_rfc3339("2026-10-16T18:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %-I:%M:%S%P")
+                    .to_string();
+                assert!(header.starts_with("• Zed → Mateo "), "{header}");
+                assert!(header.trim_end().ends_with(&sent), "{header}");
+                let header_style = base.patch(theme::style(theme::Role::OtherConversationHeader));
                 // The stronger tint fills the attribution row, including the
-                // unused columns; ordinary feed headers keep their background.
+                // unused columns.
                 assert!((0..80).all(|x| buffer[(x, first - 1)].bg == header_style.bg.unwrap()));
-                if conversation && crate::ui::theme::current() != Scheme::NoColor {
+                if crate::ui::theme::current() != Scheme::NoColor {
                     assert_ne!(header_style.bg, other.bg);
                 }
                 assert!((0..80).all(|x| buffer[(x, first - 2)].bg == base.bg.unwrap()));
@@ -11142,7 +11131,7 @@ mod tests {
     }
 
     #[test]
-    fn outgoing_mail_is_shaded_only_in_agent_conversations_and_stays_unread() {
+    fn outgoing_mail_is_shaded_in_conversations_and_the_feed_and_stays_unread() {
         let (mut app, mut rx) = app();
         let (feed, _) = mateo_streams(&mut app, &mut rx);
         let outgoing = proto::Message {
@@ -11190,7 +11179,9 @@ mod tests {
                 for padding in [y - 2, y + 1] {
                     assert!((area.left()..area.right()).all(|x| {
                         buffer[(x, padding)].bg
-                            == theme::style(if headerless && padding < y {
+                            == theme::style(if padding < y {
+                                // The separator above (above the header, on
+                                // the feed) keeps the screen's background.
                                 theme::Role::Screen
                             } else {
                                 theme::Role::HumanSurface
@@ -11202,14 +11193,7 @@ mod tests {
                     let text: String = (area.left()..area.right())
                         .map(|x| buffer[(x, padding)].symbol())
                         .collect();
-                    assert_eq!(
-                        text.trim(),
-                        if headerless && padding > y {
-                            "unread"
-                        } else {
-                            ""
-                        }
-                    );
+                    assert_eq!(text.trim(), if padding > y { "unread" } else { "" });
                 }
                 if headerless {
                     assert!((area.left()..area.right()).all(|x| {
@@ -11238,7 +11222,8 @@ mod tests {
             id: feed,
             result: Ok(vec![outgoing]),
         }));
-        assert_background(&mut app, false, false);
+        // On the feed it is the viewer's card too, under its header.
+        assert_background(&mut app, true, false);
     }
 
     #[test]

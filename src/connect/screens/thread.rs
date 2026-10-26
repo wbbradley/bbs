@@ -25,6 +25,7 @@ use crate::connect::keys::{Action, GroupOp};
 use crate::connect::theme;
 use crate::connect::timeline::{Entry, Kinds, Loaded, Show, Stream};
 use crate::proto::{self, FeedRequest, Message, SendRequest};
+use crate::ui::card::Look;
 use crate::ui::thread::{Anchor, MAX_ROWS, Row, ThreadView};
 
 /// Messages each feed snapshot holds, as for `bbs view`.
@@ -461,6 +462,10 @@ impl Thread {
         // as their cards, everyone else's as side cards keeping who sent it
         // and when.
         let group = self.group.is_some();
+        // The board-wide feed draws as `bbs view` does.
+        let feed = |m: &Message| {
+            (self.agent.is_none() && !group).then(|| Look::feed(m, self.human.as_deref()))
+        };
         let own = |m: &Message| {
             group
                 && m.from_kind() == proto::Kind::Human
@@ -494,9 +499,12 @@ impl Thread {
                 } else {
                     None
                 },
-                outgoing: self.direct_from_human(&m) || own(&m),
+                outgoing: feed(&m).map_or(self.direct_from_human(&m) || own(&m), |l| l.outgoing),
                 other_participants: self.other_participants(&m) || (group && !own(&m)),
-                timed: group,
+                timed: feed(&m).map_or(group, |l| l.timed),
+                // The viewer's own mail to the other side says when it is
+                // unread, as does any direct mail on the feed.
+                receipt: feed(&m).map_or(self.direct_from_human(&m) || own(&m), |l| l.receipt),
                 gap: self.message_gaps.contains(&m.id),
                 message: m,
             })
@@ -629,8 +637,10 @@ impl Thread {
     }
 
     /// Everything on the board.
-    pub fn feed() -> Thread {
-        Thread::new("Feed".into(), FeedRequest::default(), None)
+    pub fn feed(human: &str) -> Thread {
+        let mut thread = Thread::new("Feed".into(), FeedRequest::default(), None);
+        thread.human = Some(human.to_string());
+        thread
     }
 
     fn status(&self) -> Line<'static> {
@@ -908,7 +918,10 @@ mod status_tests {
 
     #[test]
     fn group_and_feed_page_keys_keep_moving_a_whole_view() {
-        for mut thread in [super::Thread::group("ops", "ada"), super::Thread::feed()] {
+        for mut thread in [
+            super::Thread::group("ops", "ada"),
+            super::Thread::feed("ada"),
+        ] {
             for (height, jump) in [(30, 30), (24, 24), (2, 2), (1, 1), (0, 1)] {
                 thread.view.layout(80, height);
                 assert_eq!(thread.jump(), jump, "height {height}");
@@ -2549,7 +2562,7 @@ mod seek_tests {
         thread.reload();
         assert_eq!(Screen::feed_scope(&thread, old), None, "a replaced stream");
         assert!(Screen::feed_scope(&thread, thread.feed_id).is_some());
-        assert_eq!(Screen::feed_scope(&Thread::feed(), 1), None);
+        assert_eq!(Screen::feed_scope(&Thread::feed("ada"), 1), None);
     }
 
     #[test]

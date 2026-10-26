@@ -78,7 +78,7 @@ bar.
 | Groups | Groups with members, writers and descriptions | `GroupList` |
 | Blockers | Your open blockers, to answer, discuss or cancel | `ListBlockers` (`blockers-mine.v1`) |
 | Group | One group's broadcasts, a composer, and admin actions | `WatchFeed`, `Send`, group RPCs |
-| Feed | What `bbs view` shows today, with its filters | `WatchFeed` |
+| Feed | What `bbs view` shows, with its filters, drawn as conversation cards | `WatchFeed` |
 | Config | Live local color scheme selection | local preferences |
 | Help | Key bindings | none |
 

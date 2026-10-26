@@ -19,10 +19,13 @@ use crate::app::{display_time, parse_time};
 use crate::backend::{Backend, FeedWatch};
 use crate::cli::ViewArgs;
 use crate::proto::{FeedRequest, Kind, Message};
+use crate::ui::card::Card;
 use crate::ui::thread::ThreadView;
 
 const BACKLOG: u32 = 200;
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long the screen waits to learn who is viewing before drawing anyway.
+const WHOAMI_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn run(backend: &mut Backend, args: ViewArgs) -> Result<()> {
     // Nothing sent from now on is before an --until bound, so following one
@@ -37,6 +40,18 @@ pub async fn run(backend: &mut Backend, args: ViewArgs) -> Result<()> {
         return stream_json(backend, req, follow).await;
     }
     let window = req.backlog as usize;
+    // Only the screen needs to know whose mail is whose; a human's own sits
+    // on their surface. An agent, or no answer in time, sees only others'.
+    let viewer = if tui {
+        tokio::time::timeout(WHOAMI_TIMEOUT, backend.whoami())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .filter(|p| p.kind() == Kind::Human)
+            .map(|p| p.name)
+    } else {
+        None
+    };
     let mut feed = backend.watch_feed(req, false).await?;
     // Fetch before taking over the terminal, so a refusal prints normally.
     let rows = feed.next().await?;
@@ -45,7 +60,7 @@ pub async fn run(backend: &mut Backend, args: ViewArgs) -> Result<()> {
         return Ok(());
     }
     let mut terminal = ratatui::init();
-    let result = feed_loop(&mut terminal, &mut feed, rows, window).await;
+    let result = feed_loop(&mut terminal, &mut feed, rows, window, viewer).await;
     ratatui::restore();
     result
 }
@@ -213,8 +228,9 @@ async fn feed_loop(
     feed: &mut FeedWatch<'_>,
     rows: Vec<Message>,
     window: usize,
+    viewer: Option<String>,
 ) -> Result<()> {
-    let mut view = ViewState::new(rows, window);
+    let mut view = ViewState::new(rows, window, viewer);
     let mut dirty = true;
     loop {
         if dirty {
@@ -246,32 +262,47 @@ async fn feed_loop(
     }
 }
 
-/// The TUI: a thread of messages, with the search prompt being typed.
+/// The TUI: a thread of message cards, with the search prompt being typed.
 struct ViewState {
-    thread: ThreadView,
+    thread: ThreadView<Card>,
+    /// The human viewing, whose own mail is drawn as theirs.
+    viewer: Option<String>,
     /// The search being typed after `/`.
     prompt: Option<String>,
 }
 
 impl std::ops::Deref for ViewState {
-    type Target = ThreadView;
-    fn deref(&self) -> &ThreadView {
+    type Target = ThreadView<Card>;
+    fn deref(&self) -> &ThreadView<Card> {
         &self.thread
     }
 }
 
 impl std::ops::DerefMut for ViewState {
-    fn deref_mut(&mut self) -> &mut ThreadView {
+    fn deref_mut(&mut self) -> &mut ThreadView<Card> {
         &mut self.thread
     }
 }
 
 impl ViewState {
-    fn new(rows: Vec<Message>, window: usize) -> ViewState {
+    fn new(rows: Vec<Message>, window: usize, viewer: Option<String>) -> ViewState {
+        let rows = rows
+            .into_iter()
+            .map(|m| Card::feed(m, viewer.as_deref()))
+            .collect();
         ViewState {
             thread: ThreadView::new(rows, window),
+            viewer,
             prompt: None,
         }
+    }
+
+    fn ingest(&mut self, snapshot: Vec<Message>) {
+        let rows = snapshot
+            .into_iter()
+            .map(|m| Card::feed(m, self.viewer.as_deref()))
+            .collect();
+        self.thread.ingest(rows);
     }
 
     /// Apply one key press; `true` quits.
@@ -367,7 +398,7 @@ mod tests {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {
             with_scheme(scheme, || {
-                renders_headers_and_markdown();
+                renders_cards_with_their_time_and_unread_direct_mail();
                 search_jumps_between_matches_and_highlights();
                 prompt_escape_cancels_instead_of_quitting();
             });
@@ -400,7 +431,7 @@ mod tests {
             .zip(1..)
             .map(|(r, id)| Message { id, ..r.clone() })
             .collect();
-        ViewState::new(rows, BACKLOG as usize)
+        ViewState::new(rows, BACKLOG as usize, None)
     }
 
     fn screen(rows: &[Message], height: u16) -> String {
@@ -429,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_headers_and_markdown() {
+    fn renders_cards_with_their_time_and_unread_direct_mail() {
         let rows = [
             row(Some("acme"), None, None, "standup in **5 minutes**"),
             row(
@@ -440,31 +471,115 @@ mod tests {
             ),
             row(None, Some("Aiko"), None, "ping"),
         ];
-        let out = screen(&rows, 20);
+        let out = screen(&rows, 24);
         assert!(out.contains("3 messages"), "{out}");
-        assert!(out.contains("Juliana → @acme"), "{out}");
+        assert!(out.contains("• Juliana → @acme"), "{out}");
         assert!(
             out.contains("standup in 5 minutes") && !out.contains("**"),
             "{out}"
         );
-        assert!(out.contains("Juliana → Mateo  read "), "{out}");
-        assert!(out.contains("Juliana → Aiko  unread"), "{out}");
-        // Broadcasts never show a read time.
-        let acme = out.lines().find(|l| l.contains("@acme")).unwrap();
-        assert!(!acme.contains("read"), "{acme}");
+        // Every header carries its local send time at the right.
+        let sent = chrono::DateTime::parse_from_rfc3339(&rows[0].created_at)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %-I:%M:%S%P")
+            .to_string();
+        for header in ["Juliana → @acme", "Juliana → Mateo", "Juliana → Aiko"] {
+            let line = out.lines().find(|l| l.contains(header)).expect(header);
+            assert!(line.ends_with(&sent), "{line}");
+        }
+        // Only unread direct mail says so; no read times.
+        assert_eq!(out.matches("unread").count(), 1, "{out}");
+        let ping = out.lines().position(|l| l.contains("ping")).unwrap();
+        assert!(
+            out.lines()
+                .nth(ping + 1)
+                .unwrap()
+                .trim_end()
+                .ends_with("unread"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("read 2026") && !out.contains(" read "),
+            "{out}"
+        );
     }
 
     #[test]
-    fn headers_qualify_agents_with_their_humans() {
+    fn names_are_bare_and_the_viewers_own_mail_is_theirs() {
+        use crate::ui::theme::{self, Role};
         let mut dm = row(None, Some("Mateo"), None, "hi");
         dm.from_owner = Some("will".into());
         dm.to_owner = Some("ada".into());
-        let mut from_human = row(Some("acme"), None, None, "hello");
+        let mut from_human = row(None, Some("Mateo"), None, "mine");
         from_human.from_kind = Kind::Human.into();
         from_human.from_name = "ada".into();
-        let out = screen(&[dm, from_human], 20);
-        assert!(out.contains("Juliana@will → Mateo@ada  unread"), "{out}");
-        assert!(out.contains("ada → @acme"), "{out}");
+        from_human.to_owner = Some("will".into());
+        let rows: Vec<Message> = [dm, from_human]
+            .into_iter()
+            .zip(1..)
+            .map(|(r, id)| Message { id, ..r })
+            .collect();
+        let mut view = ViewState::new(rows, BACKLOG as usize, Some("ada".into()));
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+        terminal.draw(|f| view.render(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        crate::ui::theme::testing::assert_buffer(buffer);
+        let lines: Vec<String> = (0..20)
+            .map(|y| (0..70).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let out = lines.join("\n");
+        assert!(out.contains("• Juliana → Mateo"), "{out}");
+        assert!(out.contains("• ada → Mateo"), "{out}");
+        assert!(!out.contains("@will") && !out.contains("@ada"), "{out}");
+        let at = |text: &str| lines.iter().position(|l| l.contains(text)).unwrap() as u16;
+        let bg = |role| theme::style(Role::Screen).patch(theme::style(role)).bg;
+        assert_eq!(
+            Some(buffer[(69, at("mine"))].bg),
+            bg(Role::HumanSurface),
+            "the viewer's own"
+        );
+        assert_eq!(
+            Some(buffer[(69, at("hi"))].bg),
+            bg(Role::OtherConversation),
+            "someone else's"
+        );
+    }
+
+    #[test]
+    fn cards_fit_every_width_and_scheme_and_a_narrow_header_puts_the_time_above() {
+        use crate::ui::theme::testing::{SCHEMES, with_scheme};
+        let mut long = row(None, Some("Mateo"), None, "x");
+        long.from_name = "AVeryLongAgentName".into();
+        long.to_name = Some("AnotherLongAgentName".into());
+        let rows = [
+            row(Some("acme"), None, None, "group words"),
+            row(None, Some("Mateo"), None, "direct words"),
+            long,
+        ];
+        for scheme in SCHEMES {
+            with_scheme(scheme, || {
+                for width in [60u16, 80, 120] {
+                    let out = draw_sized(&mut view(&rows), width, 24);
+                    assert!(out.contains("• Juliana → @acme"), "{width}: {out}");
+                    assert!(out.contains("• Juliana → Mateo"), "{width}: {out}");
+                    assert!(out.contains("group words") && out.contains("direct words"));
+                }
+                // Too narrow for names and time on one row: the time goes
+                // above them.
+                let out = draw_sized(&mut view(&rows), 44, 24);
+                let names = out
+                    .lines()
+                    .position(|l| l.contains("AVeryLongAgentName →"))
+                    .expect(&out);
+                let above = out.lines().nth(names - 1).unwrap();
+                assert!(
+                    above.starts_with('•') && above.contains("2026-10-09"),
+                    "{out}"
+                );
+                assert!(!out.lines().nth(names).unwrap().contains("2026-"), "{out}");
+            });
+        }
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -487,7 +602,7 @@ mod tests {
 
     #[test]
     fn paused_view_keeps_ingesting_without_moving() {
-        let mut view = ViewState::new(numbered(0..30), 1000);
+        let mut view = ViewState::new(numbered(0..30), 1000, None);
         assert!(draw(&mut view, 10).contains("message number 29"));
         view.handle_key(key(KeyCode::Char('k')));
         let paused = draw(&mut view, 10);
@@ -508,7 +623,7 @@ mod tests {
 
     #[test]
     fn scroll_keys_move_by_line_page_and_end() {
-        let mut view = ViewState::new(numbered(0..30), 1000);
+        let mut view = ViewState::new(numbered(0..30), 1000, None);
         draw(&mut view, 10);
         let bottom = view.top();
         view.handle_key(key(KeyCode::PageUp));
@@ -529,7 +644,7 @@ mod tests {
 
     #[test]
     fn search_jumps_between_matches_and_highlights() {
-        let mut view = ViewState::new(numbered(0..30), 1000);
+        let mut view = ViewState::new(numbered(0..30), 1000, None);
         draw(&mut view, 10);
         for code in [KeyCode::Char('/')]
             .into_iter()
@@ -562,7 +677,7 @@ mod tests {
 
     #[test]
     fn prompt_escape_cancels_instead_of_quitting() {
-        let mut view = ViewState::new(numbered(0..3), 1000);
+        let mut view = ViewState::new(numbered(0..3), 1000, None);
         assert!(!view.handle_key(key(KeyCode::Char('/'))));
         assert!(!view.handle_key(key(KeyCode::Char('q'))));
         assert!(!view.handle_key(key(KeyCode::Esc)));
@@ -572,24 +687,24 @@ mod tests {
         );
         view.handle_key(key(KeyCode::Char('/')));
         assert!(view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
-        assert!(ViewState::new(Vec::new(), 1000).handle_key(key(KeyCode::Esc)));
+        assert!(ViewState::new(Vec::new(), 1000, None).handle_key(key(KeyCode::Esc)));
     }
 
     #[test]
     fn snapshots_refresh_rows_and_the_oldest_are_dropped_past_the_cap() {
-        let mut view = ViewState::new(numbered(0..3), 1000);
+        let mut view = ViewState::new(numbered(0..3), 1000, None);
         let mut read = numbered(1..2);
         read[0].read_at = Some("2026-10-09T14:03:00.000000Z".into());
         // A later window that no longer holds the first row keeps it loaded.
         view.ingest(read);
         assert_eq!(view.rows.len(), 3);
-        assert!(view.rows[1].read_at.is_some());
+        assert!(view.rows[1].message.read_at.is_some());
 
         draw(&mut view, 10);
         view.handle_key(key(KeyCode::Char('g')));
         view.ingest(numbered(3..MAX_ROWS as i64 + 5));
         assert_eq!(view.rows.len(), MAX_ROWS);
-        assert_eq!(view.rows[0].id, 6);
+        assert_eq!(view.rows[0].message.id, 6);
         // The anchored row was dropped, so the view holds at the oldest kept row.
         assert_eq!(view.top(), 0);
         assert!(draw(&mut view, 10).contains("message number 5"));
@@ -601,7 +716,7 @@ mod tests {
         for &i in hits {
             rows[i as usize].body.push_str(" needle");
         }
-        ViewState::new(rows, 1000)
+        ViewState::new(rows, 1000, None)
     }
 
     fn search(view: &mut ViewState, query: &str) {
@@ -656,7 +771,7 @@ mod tests {
 
     #[test]
     fn keys_below_the_tail_keep_following() {
-        let mut view = ViewState::new(numbered(0..30), 1000);
+        let mut view = ViewState::new(numbered(0..30), 1000, None);
         draw(&mut view, 10);
         for code in [
             KeyCode::Char('j'),
@@ -688,7 +803,7 @@ mod tests {
 
     #[test]
     fn rows_are_measured_only_once_the_feed_area_is_known() {
-        let mut view = ViewState::new(numbered(0..30), 1000);
+        let mut view = ViewState::new(numbered(0..30), 1000, None);
         assert!(view.heights.iter().all(Option::is_none));
         draw(&mut view, 10);
         assert!(view.heights.iter().all(Option::is_some));
@@ -696,10 +811,10 @@ mod tests {
 
     #[test]
     fn gap_detection_covers_an_empty_start_and_skips_one_message_windows() {
-        let mut view = ViewState::new(Vec::new(), 3);
+        let mut view = ViewState::new(Vec::new(), 3, None);
         view.ingest(numbered(10..13));
         assert_eq!(view.gaps, HashSet::from([11]));
-        let mut view = ViewState::new(numbered(0..1), 1);
+        let mut view = ViewState::new(numbered(0..1), 1, None);
         for i in 1..5 {
             view.ingest(numbered(i..i + 1));
         }
@@ -708,12 +823,12 @@ mod tests {
 
     #[test]
     fn a_marker_on_the_oldest_kept_row_stays_drawn() {
-        let mut view = ViewState::new(numbered(0..3), 3);
+        let mut view = ViewState::new(numbered(0..3), 3, None);
         view.ingest(numbered(10..13));
         // Three past the cap: rows 1-3 are dropped.
         view.ingest(numbered(13..MAX_ROWS as i64 + 10));
         // Row 11 (the first after the gap) is now the oldest kept row.
-        assert_eq!(view.rows[0].id, 11);
+        assert_eq!(view.rows[0].message.id, 11);
         assert!(view.gaps.contains(&11));
         draw(&mut view, 10);
         view.handle_key(key(KeyCode::Char('g')));
@@ -727,7 +842,7 @@ mod tests {
 
     #[test]
     fn unchanged_rows_keep_their_cached_layout() {
-        let mut view = ViewState::new(numbered(0..3), 1000);
+        let mut view = ViewState::new(numbered(0..3), 1000, None);
         draw(&mut view, 10);
         view.ingest(numbered(0..3));
         assert!(view.heights.iter().all(Option::is_some));
@@ -735,7 +850,7 @@ mod tests {
 
     #[test]
     fn a_full_snapshot_past_the_held_rows_marks_a_gap() {
-        let mut view = ViewState::new(numbered(0..3), 3);
+        let mut view = ViewState::new(numbered(0..3), 3, None);
         // A partial snapshot holds every matching message, so nothing is missing.
         view.ingest(numbered(3..5));
         // Overlapping the held rows, a full snapshot misses nothing either.

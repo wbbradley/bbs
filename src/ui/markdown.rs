@@ -88,7 +88,7 @@ pub fn render_at(source: &str, width: Option<u16>) -> Text<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::{activity::Activity, message::message_lines, theme::testing::*};
+    use crate::ui::{activity::Activity, message::compact_message_lines, theme::testing::*};
     use ratatui::{
         Terminal,
         backend::TestBackend,
@@ -103,7 +103,7 @@ mod tests {
                     body: source.into(),
                     ..Default::default()
                 };
-                let mut lines = message_lines(&row, false, Some("strong"));
+                let mut lines = compact_message_lines(&row, false, Some("strong"), None);
                 let mut activity = Activity::new(true);
                 lines.extend(
                     activity

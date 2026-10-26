@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use chrono::DateTime;
 use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
 use super::app::next_id;
@@ -16,10 +16,8 @@ use super::theme;
 use crate::backend::AGENT_ACTIVITY;
 use crate::proto::{self, Message};
 use crate::ui::activity::{Activity, ToolLine};
-use crate::ui::message::{
-    compact_message_lines, conversation_roles, find_matches, message_lines_with_recipient_at,
-    message_prefix, side_header, side_message_lines,
-};
+use crate::ui::card::{self, Look};
+use crate::ui::message::find_matches;
 use crate::ui::thread::{Row, TurnMarks};
 
 /// Events each batch holds; the stream catches up from the start in batches.
@@ -45,6 +43,8 @@ pub enum Entry {
         other_participants: bool,
         /// A group's own thread shows group mail's send time too.
         timed: bool,
+        /// Unread direct mail says so at its foot.
+        receipt: bool,
         /// A possible gap in the raw feed before this visible message.
         gap: bool,
     },
@@ -108,51 +108,34 @@ impl Entry {
 }
 
 impl Entry {
+    /// How a message row draws as a card.
+    fn look(&self) -> Option<Look> {
+        let Entry::Message {
+            headerless,
+            recipient,
+            outgoing,
+            timed,
+            receipt,
+            gap,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(Look {
+            headerless: *headerless,
+            recipient: *recipient,
+            outgoing: *outgoing,
+            timed: *timed,
+            receipt: *receipt,
+            gap: *gap,
+        })
+    }
+
     fn rendered_lines(&self, gap: bool, query: Option<&str>, width: Option<u16>) -> Vec<Line<'_>> {
         match self {
-            Entry::Message {
-                message,
-                headerless,
-                recipient,
-                outgoing,
-                other_participants,
-                timed,
-                gap: raw_gap,
-                ..
-            } => {
-                let mut lines = if *headerless {
-                    compact_message_lines(message, gap || *raw_gap, query, width)
-                } else if *other_participants {
-                    side_message_lines(message, gap || *raw_gap, query, *recipient, width, *timed)
-                } else {
-                    message_lines_with_recipient_at(
-                        message,
-                        gap || *raw_gap,
-                        query,
-                        *recipient,
-                        width,
-                    )
-                };
-                if *outgoing {
-                    if *headerless {
-                        lines.insert(1 + usize::from(gap || *raw_gap), Line::default());
-                    }
-                    // Until the agent reads it, the bottom padding says so,
-                    // inset from the right as the body is from the left.
-                    // Group mail has no one reader to say it.
-                    lines.push(
-                        if *headerless && message.read_at.is_none() && message.to_group.is_none() {
-                            Line::styled("unread  ", theme::style(theme::Role::HumanNote))
-                                .right_aligned()
-                        } else {
-                            Line::default()
-                        },
-                    );
-                    for line in &mut lines {
-                        line.style = theme::style(theme::Role::HumanSurface).patch(line.style);
-                    }
-                }
-                lines
+            Entry::Message { message, .. } => {
+                card::lines(message, self.look().expect("a message"), gap, query, width)
             }
             Entry::Stream {
                 markdown: Some(text),
@@ -227,27 +210,15 @@ impl Row for Entry {
 
     fn style(&self) -> Style {
         match self {
-            Entry::Message { outgoing: true, .. } => theme::style(theme::Role::HumanSurface),
-            Entry::Message {
-                other_participants: true,
-                message,
-                ..
-            } => theme::style(conversation_roles(message).0),
+            Entry::Message { message, .. } => card::style(message, self.look().expect("a message")),
             _ => Style::default(),
         }
     }
 
     fn inset(&self) -> u16 {
         match self {
-            Entry::Message {
-                headerless: true, ..
-            }
-            | Entry::Message {
-                other_participants: true,
-                ..
-            }
-            | Entry::Stream { reply: true, .. }
-            | Entry::Stream { thought: true, .. } => 2,
+            Entry::Message { .. } => card::INSET,
+            Entry::Stream { reply: true, .. } | Entry::Stream { thought: true, .. } => 2,
             _ => 0,
         }
     }
@@ -259,55 +230,16 @@ impl Row for Entry {
                 .line_count(width);
             return vec![Line::styled("│ ", theme::dim().italic()); height];
         }
-        let Entry::Message {
-            other_participants: true,
-            message,
-            recipient,
-            timed,
-            gap: raw_gap,
-            ..
-        } = self
-        else {
-            return Vec::new();
-        };
-        let measure = |lines: Vec<Line>| {
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .line_count(width)
-        };
-        let prefix_height = measure(message_prefix(gap || *raw_gap));
-        let header_height = measure(side_header(message, query, *recipient, Some(width), *timed));
-        let surface = theme::style(conversation_roles(message).1);
-        let mut gutter = vec![Line::default(); prefix_height];
-        for index in 0..header_height {
-            gutter.push(
-                Line::from(Span::styled(
-                    if index == 0 { "• " } else { "  " },
-                    surface.patch(theme::style(if message.to_group.is_some() {
-                        theme::Role::Group
-                    } else {
-                        theme::Role::Accent
-                    })),
-                ))
-                .style(surface),
-            );
+        match self {
+            Entry::Message { message, .. } => {
+                card::gutter(message, self.look().expect("a message"), gap, query, width)
+            }
+            Entry::Stream { .. } => Vec::new(),
         }
-        gutter
     }
 
     fn separator_style(&self) -> Option<Style> {
-        matches!(
-            self,
-            Entry::Message {
-                other_participants: true,
-                ..
-            } | Entry::Message {
-                headerless: true,
-                outgoing: true,
-                ..
-            }
-        )
-        .then(|| theme::style(theme::Role::Screen))
+        self.look().and_then(card::separator_style)
     }
 
     /// A tool call fits on one line of the width; search still sees all of it.
@@ -332,7 +264,7 @@ impl Row for Entry {
 
     fn matches(&self, query: &str) -> bool {
         match self {
-            Entry::Message { message: m, .. } => m.matches(query),
+            Entry::Message { message: m, .. } => card::matches(m, query),
             Entry::Stream { lines, .. } => lines.iter().any(|line| {
                 let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 !find_matches(&text, query).is_empty()
@@ -942,6 +874,7 @@ mod tests {
             outgoing: false,
             other_participants: false,
             timed: false,
+            receipt: false,
             gap: false,
         };
         let delivered_key = delivered.key();
@@ -1424,6 +1357,7 @@ mod tests {
                     outgoing: false,
                     other_participants: false,
                     timed: false,
+                    receipt: false,
                     gap: false,
                 };
                 let mut view = ThreadView::new(vec![entry], 100);
@@ -1513,6 +1447,7 @@ mod tests {
                         outgoing: false,
                         other_participants: true,
                         timed: false,
+                        receipt: false,
                         gap: true,
                     };
                     let mut view = ThreadView::new(vec![side], 100);
@@ -1601,6 +1536,7 @@ mod tests {
                     outgoing: false,
                     other_participants: true,
                     timed: false,
+                    receipt: false,
                     gap: false,
                 };
                 let mut view = ThreadView::new(vec![side], 100);
@@ -1662,6 +1598,7 @@ mod tests {
             outgoing: false,
             other_participants: true,
             timed: false,
+            receipt: false,
             gap: false,
         };
         let sent = chrono::DateTime::parse_from_rfc3339("2026-10-17T03:30:00Z")
@@ -1979,7 +1916,8 @@ mod tests {
     fn outgoing_background_covers_padding_wrapping_and_scrolled_rows() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for (scheme, compact, width) in SCHEMES.into_iter().flat_map(|scheme| {
-            [false, true]
+            // Mail with a header is a side card, pinned with the feed.
+            [true]
                 .into_iter()
                 .flat_map(move |compact| [24, 48].map(|width| (scheme, compact, width)))
         }) {
@@ -2005,6 +1943,7 @@ mod tests {
                     outgoing,
                     other_participants: false,
                     timed: false,
+                    receipt: outgoing,
                     headerless: compact,
                     gap: false,
                 };
@@ -2179,6 +2118,7 @@ mod tests {
                         recipient: Some(proto::Kind::Agent),
                         other_participants: side,
                         timed: false,
+                        receipt: false,
                         gap: false,
                     });
                 }

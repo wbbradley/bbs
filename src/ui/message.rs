@@ -8,43 +8,8 @@ use ratatui::text::{Line, Span};
 
 use crate::proto::{Kind, Message};
 
-/// A message as displayed: a blank separator, a marker when messages may be
-/// missing before it, the header, and the indented markdown body, with
-/// `query` matches highlighted in the names and body.
-pub fn message_lines<'a>(row: &'a Message, gap: bool, query: Option<&str>) -> Vec<Line<'a>> {
-    message_lines_with_recipient(row, gap, query, None)
-}
-
-/// A conversation can identify a bare recipient from its typed target/human.
-/// Board-wide views leave absent recipient metadata neutral.
-pub fn message_lines_with_recipient<'a>(
-    row: &'a Message,
-    gap: bool,
-    query: Option<&str>,
-    recipient: Option<Kind>,
-) -> Vec<Line<'a>> {
-    message_lines_with_recipient_at(row, gap, query, recipient, None)
-}
-
-pub fn message_lines_with_recipient_at<'a>(
-    row: &'a Message,
-    gap: bool,
-    query: Option<&str>,
-    recipient: Option<Kind>,
-    width: Option<u16>,
-) -> Vec<Line<'a>> {
-    with_header(
-        row,
-        gap,
-        query,
-        vec![header(row, query, recipient)],
-        true,
-        width,
-    )
-}
-
-/// A side conversation identifies its participants without delivery metadata
-/// or owner suffixes. The stored message and ordinary feed header stay intact.
+/// A side card identifies its participants without delivery metadata or
+/// owner suffixes; the stored message stays intact.
 pub fn side_message_lines<'a>(
     row: &'a Message,
     gap: bool,
@@ -58,7 +23,6 @@ pub fn side_message_lines<'a>(
         gap,
         query,
         side_header(row, query, recipient, width, timed),
-        false,
         width,
     )
 }
@@ -146,7 +110,7 @@ pub fn compact_message_lines<'a>(
     query: Option<&str>,
     width: Option<u16>,
 ) -> Vec<Line<'a>> {
-    with_header(row, gap, query, Vec::new(), false, width)
+    with_header(row, gap, query, Vec::new(), width)
 }
 
 fn with_header<'a>(
@@ -154,21 +118,9 @@ fn with_header<'a>(
     gap: bool,
     query: Option<&str>,
     header: Vec<Line<'static>>,
-    indent: bool,
     width: Option<u16>,
 ) -> Vec<Line<'a>> {
-    let mut body = Vec::new();
-    for mut line in crate::ui::markdown::render_at(
-        &row.body,
-        width.map(|w| w.saturating_sub(if indent { 2 } else { 0 })),
-    )
-    .lines
-    {
-        if indent {
-            line.spans.insert(0, Span::raw("  "));
-        }
-        body.push(line);
-    }
+    let mut body = crate::ui::markdown::render_at(&row.body, width).lines;
     if let Some(query) = query {
         for line in &mut body {
             line.spans = std::mem::take(&mut line.spans)
@@ -273,64 +225,6 @@ pub fn highlight<'a>(span: Span<'a>, query: &str) -> Vec<Span<'a>> {
         spans.push(Span::styled(content[at..].to_string(), span.style));
     }
     spans
-}
-
-fn header(row: &Message, query: Option<&str>, recipient: Option<Kind>) -> Line<'static> {
-    let sent = local(&row.created_at);
-    let mut spans = vec![
-        Span::styled(
-            sent.map_or_else(
-                || row.created_at.clone(),
-                |t| t.format("%Y-%m-%d %H:%M:%S").to_string(),
-            ),
-            style(Role::Timestamp),
-        ),
-        Span::raw("  "),
-    ];
-    spans.extend(highlight_names(
-        name_spans(&row.from_name, row.from_owner.as_deref(), row.from_kind()),
-        query,
-    ));
-    spans.push(Span::styled(" → ", style(Role::Muted)));
-    match (&row.to_group, row.to_name.as_deref()) {
-        (Some(group), _) => spans.extend(highlight_names(
-            vec![Span::styled(
-                format!("@{group}"),
-                style(Role::Group).add_modifier(Modifier::BOLD),
-            )],
-            query,
-        )),
-        (None, Some(to)) => {
-            let kind = recipient.unwrap_or(if row.to_owner.is_some() {
-                Kind::Agent
-            } else {
-                Kind::Unspecified
-            });
-            spans.extend(highlight_names(
-                name_spans(to, row.to_owner.as_deref(), kind),
-                query,
-            ));
-            spans.push(Span::raw("  "));
-            match row.read_at.as_deref().and_then(local) {
-                Some(read) => {
-                    let same_day = sent.is_some_and(|s| s.date_naive() == read.date_naive());
-                    let fmt = if same_day {
-                        "%H:%M:%S"
-                    } else {
-                        "%Y-%m-%d %H:%M:%S"
-                    };
-                    spans.push(Span::styled("read ", style(Role::Success)));
-                    spans.push(Span::styled(
-                        read.format(fmt).to_string(),
-                        style(Role::Timestamp),
-                    ));
-                }
-                None => spans.push(Span::styled("unread", style(Role::Error))),
-            }
-        }
-        (None, None) => spans.push(Span::raw("?")),
-    }
-    Line::from(spans)
 }
 
 /// Only structured identity metadata decides a category; unknown names stay text.
@@ -565,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_names_and_qualified_search_keep_their_categories() {
+    fn side_headers_keep_name_categories_and_search() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {
             with_scheme(scheme, || {
@@ -579,22 +473,21 @@ mod tests {
                     read_at: Some("2026-10-18T12:01:00Z".into()),
                     ..Default::default()
                 };
-                let line = header(&row, Some("eo@ad"), None);
-                assert!(line.to_string().contains("Mateo@ada → Zed@ben"));
+                let header = |row: &Message, query, recipient| {
+                    side_header(row, query, recipient, None, false)
+                        .pop()
+                        .unwrap()
+                };
+                let line = header(&row, Some("eo"), None);
+                assert_eq!(line.to_string(), "Mateo → Zed");
                 let reversed: String = line
                     .spans
                     .iter()
                     .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
                     .map(|s| s.content.as_ref())
                     .collect();
-                assert_eq!(reversed, "eo@ad");
-                for (text, role) in [
-                    ("Mat", Role::Agent),
-                    ("ad", Role::Human),
-                    ("Zed", Role::Agent),
-                    ("ben", Role::Human),
-                    ("read ", Role::Success),
-                ] {
+                assert_eq!(reversed, "eo");
+                for (text, role) in [("Mat", Role::Agent), ("Zed", Role::Agent)] {
                     assert_eq!(
                         line.spans
                             .iter()
@@ -605,8 +498,6 @@ mod tests {
                         style(role).fg
                     );
                 }
-                assert_eq!(line.spans[0].style, style(Role::Timestamp));
-                assert_eq!(line.spans.last().unwrap().style, style(Role::Timestamp));
                 row.to_owner = None;
                 let unknown = header(&row, None, None);
                 assert_eq!(
@@ -660,12 +551,9 @@ mod tests {
             body: "**answer**".into(),
             ..Default::default()
         };
-        let full = message_lines(&row, false, Some("answer"));
+        let full = side_message_lines(&row, false, Some("answer"), None, None, false);
         let compact = compact_message_lines(&row, false, Some("answer"), None);
-        let mut body = full[2..].to_vec();
-        for line in &mut body {
-            line.spans.remove(0);
-        }
+        let body = full[2..].to_vec();
         assert_eq!(&compact[1..], &body);
         assert_eq!(compact.len() + 1, full.len());
         assert!(

@@ -68,12 +68,12 @@ pub struct Menu {
 }
 
 impl Menu {
-    fn open(&self, item: Item) -> Transition {
+    fn open(&self, item: Item, ctx: &Ctx) -> Transition {
         match item {
             Item::Agents => Transition::Push(Box::new(Agents::default())),
             Item::Groups => Transition::Push(Box::new(Groups::new())),
             Item::Blockers => Transition::Push(Box::new(BlockersPage)),
-            Item::Feed => Transition::Push(Box::new(Thread::feed())),
+            Item::Feed => Transition::Push(Box::new(Thread::feed(&ctx.me))),
             Item::Config => Transition::Push(Box::new(Config::new())),
             Item::Help => Transition::Push(Box::new(Help::default())),
             Item::Quit => Transition::Quit,
@@ -91,10 +91,10 @@ impl Screen for Menu {
         &HOTKEYS
     }
 
-    fn handle(&mut self, action: Action, _ctx: &Ctx) -> Transition {
+    fn handle(&mut self, action: Action, ctx: &Ctx) -> Transition {
         match action {
             Action::Hotkey(c) => match ITEMS.iter().find(|(key, ..)| *key == c) {
-                Some(&(.., item)) => self.open(item),
+                Some(&(.., item)) => self.open(item, ctx),
                 None => Transition::Stay,
             },
             Action::Up => {
@@ -113,7 +113,7 @@ impl Screen for Menu {
                 self.selected = ITEMS.len() - 1;
                 Transition::Stay
             }
-            Action::Open => self.open(ITEMS[self.selected].3),
+            Action::Open => self.open(ITEMS[self.selected].3, ctx),
             Action::Back => Transition::Pop,
             _ => Transition::Stay,
         }
