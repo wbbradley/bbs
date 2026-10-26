@@ -4,6 +4,19 @@ use std::process::Command;
 #[path = "build/identity.rs"]
 mod identity;
 
+/// Sources consumed by the frontend build, excluding generated dependencies
+/// and bundles. Use the same paths for rebuilding and provenance.
+const WEB_INPUTS: &[&str] = &[
+    "web/src",
+    "web/public",
+    "web/index.html",
+    "web/package.json",
+    "web/package-lock.json",
+    "web/vite.config.ts",
+    "web/tsconfig.json",
+    "assets/connect/logo.txt",
+];
+
 /// Tracked sources of the binary: they trigger rebuilds and define "dirty".
 const INPUTS: &[&str] = &[
     "proto",
@@ -13,9 +26,7 @@ const INPUTS: &[&str] = &[
     "build.rs",
     "Cargo.toml",
     "Cargo.lock",
-    "web/src",
-    "web/index.html",
-    "web/package.json",
+    "assets",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,6 +46,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         embed_web_assets()?;
     }
     for path in INPUTS {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    for path in WEB_INPUTS {
         println!("cargo:rerun-if-changed={path}");
     }
 
@@ -59,8 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || match &packaged {
             Some((_, dirty)) => Some(*dirty),
             None => {
-                let mut args = vec!["status", "--porcelain", "--untracked-files=no", "--"];
+                let mut args = vec!["status", "--porcelain", "--untracked-files=normal", "--"];
                 args.extend(INPUTS);
+                args.extend(WEB_INPUTS);
                 git(&args).map(|s| !s.is_empty())
             }
         },
@@ -92,29 +107,10 @@ fn embed_web_assets() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={}", dist.display());
         dist
     } else if web.join("package.json").is_file() {
-        const INPUTS: &[&str] = &[
-            "web/src",
-            "web/public",
-            "web/index.html",
-            "web/package.json",
-            "web/package-lock.json",
-            "web/vite.config.ts",
-            "web/tsconfig.json",
-            "assets/connect/logo.txt",
-        ];
-        for path in INPUTS {
-            println!("cargo:rerun-if-changed={path}");
-        }
-        // This script also reruns for Rust changes; only web changes rebuild.
+        // Rebuild whenever Cargo reruns this script, including when an input
+        // was deleted. The output directory is emptied by the bundler.
         let dist = out_dir.join("web-dist");
-        let built = newest(&dist.join("index.html"));
-        let inputs = INPUTS
-            .iter()
-            .filter_map(|p| newest(&manifest.join(p)))
-            .max();
-        if built.is_none() || built < inputs {
-            npm_build(&web, &dist)?;
-        }
+        npm_build(&web, &dist)?;
         dist
     } else {
         println!("cargo:rerun-if-changed=web/dist");
@@ -135,29 +131,12 @@ fn embed_web_assets() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The newest modification time of a file or anything under a directory.
-fn newest(path: &std::path::Path) -> Option<std::time::SystemTime> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_dir() {
-        return meta.modified().ok();
-    }
-    std::fs::read_dir(path)
-        .ok()?
-        .filter_map(|e| newest(&e.ok()?.path()))
-        .max()
-}
-
-/// `npm ci` when the installed packages are missing or older than the lock
-/// file, then type-check and bundle into `out`.
+/// Install exactly the locked dependencies, then type-check and bundle.
 fn npm_build(
     web: &std::path::Path,
     out: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    let installed = modified(&web.join("node_modules/.package-lock.json"));
-    if installed.is_none() || installed < modified(&web.join("package-lock.json")) {
-        npm(web, &["ci", "--no-audit", "--no-fund"])?;
-    }
+    npm(web, &["ci", "--no-audit", "--no-fund"])?;
     let out = out.to_str().ok_or("OUT_DIR is not UTF-8")?;
     npm(
         web,

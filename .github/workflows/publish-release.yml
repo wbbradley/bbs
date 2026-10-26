@@ -33,6 +33,11 @@ jobs:
           if-no-files-found: error
       - name: Test
         run: cargo test --locked --features web
+      - name: Test frontend
+        working-directory: web
+        run: npm test
+      - name: Test packaged web feature without Node
+        run: python3 scripts/test_web_package.py
       - name: Write manifest
         run: |
           cargo build --release --locked
