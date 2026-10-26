@@ -39,6 +39,19 @@ jobs:
           cmp bbs-release.json bbs-server-release.json
           python3 -c 'import json, os, sys; m = json.load(open("bbs-release.json")); sys.exit(m["revision"] != os.environ["GITHUB_SHA"])'
           cat bbs-release.json
+      - name: Check initial crate publication is complete
+        run: |
+          python3 - <<'PYBOOT'
+          import urllib.error, urllib.request
+          for name in ("bbs-core", "bbs-server"):
+              try:
+                  with urllib.request.urlopen("https://crates.io/api/v1/crates/" + name, timeout=30):
+                      pass
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      raise SystemExit(name + ": publish the initial crate with owner authorization and configure trusted publishing before running this workflow; see README")
+                  raise
+          PYBOOT
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -74,7 +87,8 @@ jobs:
   # identity. A separate job, so no build script ever runs where the token can
   # be minted (`--no-verify`; the publish job already tested this commit). If
   # it fails, publish the three packages in dependency order from GITHUB_SHA.
-  # Configure trusted publishing for each crate before its first automated release.
+  # New crate names require an owner-authorized initial API-token publication,
+  # then trusted-publisher configuration, before this automated workflow can run.
   crates-io:
     needs: publish
     permissions:
