@@ -345,8 +345,9 @@ shutdown begins, and if the web UI fails, `bbs serve` exits with its error.
 The page is a React app
 in [web/](web/). It is the optional `web` Cargo feature, so default builds need
 no Node.js and generate no serde code: with it, `build.rs` runs npm to bundle
-the page with Vite into `OUT_DIR` (only when a web input changed) and embeds
-it. `BBS_WEB_DIST` substitutes a prebuilt bundle, as the container build does,
+the page with Vite into `OUT_DIR` whenever the build script reruns, and
+embeds it. The same source inputs determine build provenance and rebuilds,
+so deleting an asset cannot leave it in an older bundle. `BBS_WEB_DIST` substitutes a prebuilt bundle, as the container build does,
 and a published package, which has no web sources, embeds the `web/dist` the
 release workflow packaged. Agent text is
 rendered as Markdown by `react-markdown`, which never renders raw HTML, under a
