@@ -86,6 +86,12 @@ def check():
                 ["cargo", "build", "--offline", "--config", patch],
                 cwd=sources[name], env=env, check=True,
             )
+            if name in ("bbs-core", "bbs-cli"):
+                forbidden = ("axum", "ratatui", "clap") if name == "bbs-core" else ("axum",)
+                artifacts = Path(env["CARGO_TARGET_DIR"]) / "debug/deps"
+                for dependency in forbidden:
+                    assert not list(artifacts.glob("lib" + dependency + "-*")), \
+                        f"{name} compiled application dependency {dependency}"
             after = tomllib.loads((sources[name] / "Cargo.lock").read_text())
             resolved = {
                 (p["name"], p["version"], p.get("source"))
@@ -104,7 +110,7 @@ def check():
             ["cargo", "metadata", "--offline", "--filter-platform", host, "--format-version", "1", "--config", patch],
             cwd=sources["bbs-cli"], env=env,
         ))
-        assert not any(p["name"] in ("axum", "bbs-server") for p in cli["packages"]), \
+        assert not any(p["name"] == "bbs-server" for p in cli["packages"]), \
             "CLI depends on the web/server implementation"
         for name in ("bbs-core", "bbs-server"):
             graph = json.loads(subprocess.check_output(
