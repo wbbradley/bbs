@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useWatch, watchOnce, type WatchState } from "./api";
-import { empty, mergeContext, mergeWindow, type Held } from "./merge";
+import { empty, mergeContext, mergeWindow, release, without, type Held } from "./merge";
 import type { Message } from "./types";
 
 /** Rows read on each side of a message opened from search. */
@@ -61,6 +61,8 @@ export function useMessages(
   useEffect(() => {
     generation.current++;
     asked.current = null;
+    // Only the message sought now keeps its context from the cap.
+    setHeld((h) => release(h));
     if (ask === null) setSeekState("none");
     // Gone or changed: whatever is still being read is no longer wanted.
     return () => {
@@ -92,6 +94,12 @@ export function useMessages(
         setHeld((h) => mergeContext(h, [seed], false));
         const [before, after] = await Promise.all([read({ until: seed.created_at }), read({ after_id: seek - 1 })]);
         if (generation.current !== mine) return;
+        // Not under this page's filter after all: it does not belong here.
+        if (!after.messages.some((m) => m.id === seek)) {
+          setHeld((h) => without(h, seek));
+          setSeekState("missing");
+          return;
+        }
         const complete = after.messages.length < CONTEXT;
         setHeld((h) => mergeContext(h, [...before.messages, ...after.messages], complete));
         return;

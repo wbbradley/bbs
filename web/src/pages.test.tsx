@@ -172,6 +172,18 @@ describe("a message found by search", () => {
     expect(screen.getAllByText(/messages may be missing here/).length).toBeGreaterThan(0);
   });
 
+  it("drops a found message that turns out not to belong to this page", async () => {
+    seedFound(mail(50, "Zed", "bob", { body: "someone else's" }));
+    await conversation("?m=50");
+    await act(async () => feed().push({ messages: [mail(400, "Mateo", "ada", { read_at: "x" })] }, true));
+    expect(screen.getByText("someone else's")).toBeTruthy();
+    const after = api.pending("watch:feed").find((c) => c.req.after_id === 49)!;
+    await act(async () => after.resolve({ messages: [mail(60, "Mateo", "ada")] }));
+    await act(async () => api.pending("watch:feed").find((c) => "until" in c.req)!.resolve({ messages: [] }));
+    expect(screen.queryByText("someone else's")).toBeNull();
+    expect(screen.getByText("that message is not in this view")).toBeTruthy();
+  });
+
   it("says when the found message is not in this view", async () => {
     await conversation("?m=50");
     await act(async () => feed().push({ messages: [mail(400, "Mateo", "ada")] }, true));

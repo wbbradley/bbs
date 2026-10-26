@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { KEEP, empty, mergeContext, mergeWindow } from "./merge";
+import { KEEP, empty, mergeContext, mergeWindow, release } from "./merge";
 import { sideDraft } from "./util";
 
 const ids = (...n: number[]) => n.map((id) => ({ id }));
@@ -54,6 +54,30 @@ describe("a found message in a long session", () => {
     // Later windows do not trim it either.
     held = mergeWindow(held, ids(20_000, 20_001), 300);
     expect(held.rows[0].id).toBe(1);
+  });
+});
+
+describe("searching again and again", () => {
+  it("keeps only the current found message's context past the cap", () => {
+    let held = mergeWindow(
+      empty<{ id: number }>(),
+      Array.from({ length: KEEP }, (_, i) => ({ id: 100_000 + i })),
+      KEEP,
+    );
+    for (let seek = 0; seek < 20; seek++) {
+      // A new search lets go of the last one's context, then reads its own.
+      held = release(held);
+      const base = seek * 1000;
+      held = mergeContext(
+        held,
+        Array.from({ length: 100 }, (_, i) => ({ id: base + i })),
+        false,
+      );
+      expect(held.rows.length).toBeLessThanOrEqual(KEEP + 100);
+      expect(held.rows.some((r) => r.id === base + 50)).toBe(true);
+    }
+    // Back at the newest, nothing is kept beyond the cap.
+    expect(release(held).rows.length).toBe(KEEP);
   });
 });
 

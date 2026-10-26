@@ -340,7 +340,9 @@ encrypted, such as a tailnet.
 
 The browser keeps unsent drafts, unsaved note text and blocker answers whose
 outcome is not yet confirmed for the signed-in human only: another human signing
-in on the same browser never sees them. A note cannot be edited until your
+in on the same browser never sees them in the page. They stay in the browser's
+local storage after you sign out, so they are there when you sign back in, and
+anyone who can use that browser profile can read them there. A note cannot be edited until your
 stored notes have loaded, and closing it or leaving the page (Back included)
 stores a change first, staying put if that fails. An unconfirmed blocker answer
 is shown unchanged and sent again only when you choose Retry, as the identical

@@ -92,3 +92,19 @@ export function mergeContext<T extends { id: number }>(held: Held<T>, context: T
     kept,
   );
 }
+
+/**
+ * Let go of the rows kept on purpose, when the message they were read for
+ * is no longer sought: they are then trimmed as any others.
+ */
+export function release<T extends { id: number }>(held: Held<T>): Held<T> {
+  if (held.kept.size === 0) return held;
+  return trim([...held.rows], new Set(held.gaps), new Set());
+}
+
+/** `held` without the row `id`: a row shown early that proved not to belong. */
+export function without<T extends { id: number }>(held: Held<T>, id: number): Held<T> {
+  const kept = new Set(held.kept);
+  kept.delete(id);
+  return { rows: held.rows.filter((r) => r.id !== id), gaps: new Set(held.gaps), kept };
+}
