@@ -62,6 +62,10 @@ export function useMessages(
     generation.current++;
     asked.current = null;
     if (ask === null) setSeekState("none");
+    // Gone or changed: whatever is still being read is no longer wanted.
+    return () => {
+      generation.current++;
+    };
   }, [ask]);
 
   const holds = seek !== null && held.rows.some((m) => m.id === seek);

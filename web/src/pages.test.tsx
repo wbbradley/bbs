@@ -140,6 +140,23 @@ describe("a message found by search", () => {
     expect(reads).toContainEqual(expect.objectContaining({ after_id: 50, backlog: 50 }));
   });
 
+  it("opens an old found message even after a long session holds the most rows a page keeps", async () => {
+    await conversation("?m=1");
+    for (let w = 0; w < 10; w++) {
+      const window = Array.from({ length: 300 }, (_, i) => mail(1000 + w * 300 + i, "Mateo", "ada", { read_at: "x" }));
+      await act(async () => feed().push({ messages: window }));
+    }
+    const after = api.take("watch:feed");
+    await act(async () =>
+      after.resolve({ messages: Array.from({ length: 50 }, (_, i) => mail(1 + i, "Mateo", "ada", { read_at: "x" })) }),
+    );
+    await act(async () => api.take("watch:feed").resolve({ messages: [] }));
+    expect(document.getElementById("msg-1")).toBeTruthy();
+    expect(document.getElementById("msg-1")!.className).toContain("highlight");
+    expect(screen.queryByText("that message is not in this view")).toBeNull();
+    expect(screen.getAllByText(/messages may be missing here/).length).toBeGreaterThan(0);
+  });
+
   it("says when the found message is not in this view", async () => {
     await conversation("?m=50");
     await act(async () => feed().push({ messages: [mail(400, "Mateo", "ada")] }, true));

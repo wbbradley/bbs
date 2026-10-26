@@ -38,6 +38,25 @@ describe("merging windows", () => {
   });
 });
 
+describe("a found message in a long session", () => {
+  it("is kept, with its context, however many newer rows are held", () => {
+    let held = mergeWindow(
+      empty<{ id: number }>(),
+      Array.from({ length: KEEP }, (_, i) => ({ id: 10_000 + i })),
+      KEEP,
+    );
+    held = mergeContext(held, ids(1, 2, 3), false);
+    expect(held.rows.slice(0, 3).map((r) => r.id)).toEqual([1, 2, 3]);
+    expect(held.rows.length).toBe(KEEP + 3 - 3);
+    // Where newer rows were trimmed behind the context, and where the
+    // context does not reach the live rows, a mark.
+    expect(held.gaps.has(held.rows[3].id)).toBe(true);
+    // Later windows do not trim it either.
+    held = mergeWindow(held, ids(20_000, 20_001), 300);
+    expect(held.rows[0].id).toBe(1);
+  });
+});
+
 describe("/btw in a draft", () => {
   it("unescapes only //btw, as connect does", () => {
     expect(sideDraft("// TODO: check")).toEqual({ kind: "mail" });
