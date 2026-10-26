@@ -101,6 +101,16 @@ def check():
         ))
         assert not any(p["name"] in ("axum", "bbs-server") for p in cli["packages"]), \
             "CLI depends on the web/server implementation"
+        for name in ("bbs-core", "bbs-server"):
+            graph = json.loads(subprocess.check_output(
+                ["cargo", "metadata", "--offline", "--format-version", "1", "--config", patch],
+                cwd=sources[name], env=env,
+            ))
+            forbidden = {"ratatui", "ratatui-textarea", "bbs-cli"}
+            if name == "bbs-core":
+                forbidden |= {"axum", "bbs-server"}
+            assert not any(p["name"] in forbidden for p in graph["packages"]), \
+                f"{name} depends on another application's implementation"
         core = next(p for p in cli["packages"] if p["name"] == "bbs-core")
         assert Path(core["manifest_path"]).parent == sources["bbs-core"]
         assert core["version"] == packages["bbs-core"]["version"]
