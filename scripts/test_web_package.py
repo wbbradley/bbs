@@ -8,16 +8,23 @@ import subprocess
 import tarfile
 import tempfile
 
+from check_release_source import check as check_source
+
 
 def check():
     root = Path(__file__).resolve().parent.parent
+    check_source(root)
     env = dict(os.environ)
     env.pop("BBS_WEB_DIST", None)
     env.pop("BBS_BUILD_REVISION", None)
     env.pop("BBS_BUILD_DIRTY", None)
     target = Path(env.get("CARGO_TARGET_DIR", root / "target")).resolve()
     subprocess.run(
-        ["cargo", "package", "--locked", "--no-verify"], cwd=root, env=env, check=True,
+        # Cargo includes the ignored, generated bundle and therefore records
+        # a dirty archive. Check source cleanliness separately above and keep
+        # that honest archive provenance rather than overriding it.
+        ["cargo", "package", "--locked", "--no-verify", "--allow-dirty"],
+        cwd=root, env=env, check=True,
     )
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"], cwd=root, env=env,
@@ -46,12 +53,13 @@ def check():
             cwd=source, env=env, check=True,
         )
         manifest = json.loads(subprocess.check_output(
-            [str(target / "debug/bbs"), "version", "--manifest"], env=env,
+            [str(target / "debug/bbs"), "version", "--json"], env=env,
         ))
         assert manifest["version"] == package["version"]
         vcs = json.loads((source / ".cargo_vcs_info.json").read_text())
         assert manifest["revision"] == vcs["git"]["sha1"]
-    print("Packaged web crate builds without Node/npm and retains its revision.")
+        assert manifest["dirty"] == vcs["git"].get("dirty", False)
+    print("Packaged web crate builds without Node/npm and retains its revision/dirty flag.")
 
 
 if __name__ == "__main__":
