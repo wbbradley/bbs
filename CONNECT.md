@@ -200,7 +200,9 @@ is covered as by any page: its draft, cursor, selection, scroll, mode and side
 panel come back when the page closes. `Esc` or `F2` closes the page, keeping
 the answer draft; from a cancel confirmation either first returns to the card.
 `Ctrl-p` opens over the page: cancelling it returns to the page as it was, and
-a chosen result opens over the page, so `Esc` there comes back to it. A
+a chosen result opens over the page, so `Esc` there comes back to it. `Ctrl-o`
+opens the previous conversation over the page the same way, except while a
+cancel confirmation is asked. A
 conversation already open beneath the page moves over it, with its draft,
 rather than opening twice. Covered, the page keeps its selection, focus,
 scroll and drafts for when it is uncovered. Ctrl-C still quits.

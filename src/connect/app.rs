@@ -546,6 +546,17 @@ impl App {
         {
             return;
         }
+        // From the blockers page, a conversation open beneath it moves over
+        // it rather than opening twice.
+        if self.on_blockers()
+            && let Some(at) = self
+                .stack
+                .iter()
+                .rposition(|s| s.conversation().is_some_and(|c| c.same(&target)))
+        {
+            self.raise(at);
+            return;
+        }
         let screen = match &target {
             Conversation::Agent(agent) => Thread::agent(agent, &self.ctx.me, self.ctx.now.clone()),
             Conversation::Group(group) => Thread::group(group, &self.ctx.me),
@@ -1175,6 +1186,11 @@ impl App {
                 }
                 blockers::Outcome::Discuss { id, name } => {
                     self.discuss(id, &name);
+                    self.viewed();
+                    false
+                }
+                blockers::Outcome::PreviousConversation => {
+                    self.jump(false);
                     self.viewed();
                     false
                 }
@@ -8360,6 +8376,82 @@ mod tests {
             assert!(out.contains("cursor-here"), "{out}");
             assert!(tall[usize::from(height) - 3].contains("[Cancel]"), "{out}");
         }
+    }
+
+    #[test]
+    fn ctrl_o_on_the_blockers_page_opens_the_previous_conversation_over_it() {
+        let (mut app, mut rx) = app();
+        live(&mut app, &[("Theo", 7), ("Grove", 8)]);
+        queue(&mut app, &mut rx, vec![grove_asks()]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        // Nothing visited yet: it says so, and the page stays.
+        ctrl(&mut app, 'o');
+        assert!(app.on_blockers());
+        assert!(bottom(&mut app).contains("No conversation history."));
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("Theo".into()));
+        enter(&mut app);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.on_blockers());
+        typed(&mut app, "half");
+        let page = buffer(&mut app, 80);
+        let depth = app.stack.len();
+        ctrl(&mut app, 'o');
+        assert_eq!(opened(&app), Some(Conversation::Agent("Theo".into())));
+        assert_eq!(app.stack.len(), depth + 1, "over the page");
+        assert!(app.stack[depth - 1].is_blockers());
+        // Esc comes back to the page as it was, its draft too.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.on_blockers());
+        assert_eq!(buffer(&mut app, 80), page);
+        // Ctrl-G keeps to the page, as before.
+        ctrl(&mut app, 'g');
+        assert!(app.on_blockers());
+    }
+
+    #[test]
+    fn ctrl_o_on_the_blockers_page_keeps_a_cancel_confirmation() {
+        let (mut app, mut rx) = app();
+        live(&mut app, &[("Theo", 7), ("Grove", 8)]);
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("Theo".into()));
+        enter(&mut app);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        queue(&mut app, &mut rx, vec![grove_asks()]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        enter(&mut app);
+        assert!(screen(&mut app, 80, 24).contains("Cancel this blocker?"));
+        ctrl(&mut app, 'o');
+        assert!(app.on_blockers());
+        assert!(screen(&mut app, 80, 24).contains("Cancel this blocker?"));
+        // Esc returns to the answer; then Ctrl-O goes.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        ctrl(&mut app, 'o');
+        assert_eq!(opened(&app), Some(Conversation::Agent("Theo".into())));
+    }
+
+    #[test]
+    fn ctrl_o_on_the_blockers_page_moves_a_conversation_open_beneath_it() {
+        let (mut app, mut rx) = app();
+        mateo(&mut app, &mut rx);
+        typed(&mut app, "mateo draft");
+        queue(&mut app, &mut rx, vec![grove_asks()]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        let depth = app.stack.len();
+        while rx.try_recv().is_ok() {}
+        ctrl(&mut app, 'o');
+        assert_eq!(opened(&app), Some(Conversation::Agent("Mateo".into())));
+        assert_eq!(app.stack.len(), depth, "moved, not opened twice");
+        assert!(app.stack[depth - 2].is_blockers());
+        assert_eq!(draft_text(&mut app), "mateo draft");
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, Request::Watch { .. })),
+            "no second watch"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.on_blockers());
     }
 
     fn buffer(app: &mut App, width: u16) -> ratatui::buffer::Buffer {

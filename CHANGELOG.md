@@ -19,6 +19,12 @@ under the new package version and its publication date.
   warnings: cancel confirmations, unconfirmed writes, old servers and the
   status bar's blocker count. Refusals keep the error colour.
 
+### Fixed
+
+- `Ctrl-o` on the `bbs connect` blockers page opens the previous conversation
+  over the page, as on other screens, instead of doing nothing. A cancel
+  confirmation still keeps it.
+
 ## 0.16.1 - 2026-10-25
 
 `bbs connect` refinements: blockers become a page of their own, and group

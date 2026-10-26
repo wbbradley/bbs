@@ -107,6 +107,8 @@ pub enum Outcome {
         id: i64,
         name: String,
     },
+    /// Ctrl-O: the previous conversation, over the page.
+    PreviousConversation,
     /// Not the panel's key (Ctrl-C): let the keymap have it.
     Pass,
 }
@@ -479,6 +481,13 @@ impl Blockers {
         let Some(panel) = &mut self.panel else {
             return Outcome::Pass;
         };
+        // A pending cancel confirmation keeps every other key.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('o')
+            && panel.focus != Focus::Confirm
+        {
+            return Outcome::PreviousConversation;
+        }
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Esc if panel.focus == Focus::Confirm => {
