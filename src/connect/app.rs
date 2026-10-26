@@ -7307,7 +7307,7 @@ mod tests {
         assert_eq!(unread.len(), 1, "{out}");
         let (row, line) = unread[0];
         assert_eq!(Some(row - 1), answer, "{out}");
-        assert!(line.ends_with("unread  "), "{out}");
+        assert!(line.ends_with("unread   "), "{out}");
         assert!(line.find("unread") > Some(60), "{out}");
         // The live feed marks it read, and the note goes.
         app.on_event(Event::Data(feed(true)));
