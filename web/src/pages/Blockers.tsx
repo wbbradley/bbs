@@ -67,13 +67,14 @@ export function BlockersPage({ openNav }: PageProps) {
   // human has signed in by the time it does.
   const [owner] = useState(draftOwnerNow);
   const [kept, setKept] = useState<Record<number, Kept>>(() => loadKept(owner));
+  // Set on every mount, as StrictMode mounts twice in development.
   const mounted = useRef(true);
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
       mounted.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
   const stillTheirs = () => mounted.current && draftOwnerNow() === owner;
   const [selected, setSelected] = useState<number | null>(null);
   const [done, setDone] = useState<string | null>(null);

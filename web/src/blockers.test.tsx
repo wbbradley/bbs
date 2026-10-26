@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./api", () => import("./test/fakeApi"));
@@ -136,6 +137,24 @@ describe("blockers", () => {
     expect(loadKept("bob")).toEqual({});
     expect(loadKept("ada")).toEqual({});
     expect(loadDraft("blocker:1", "ada")).toBe("");
+  });
+
+  it("shows a write's outcome under StrictMode, which mounts the page twice", async () => {
+    listed = [row(1)];
+    api.auto.set("list_blockers", () => ({ blockers: listed, active_count: listed.length, has_more: false }));
+    render(
+      <StrictMode>
+        <Board>
+          <BlockersPage openNav={() => {}} />
+        </Board>
+      </StrictMode>,
+    );
+    await act(async () => {});
+    fireEvent.change(answerBox(), { target: { value: "yes" } });
+    fireEvent.click(screen.getByText("Send answer"));
+    expect(screen.getByText("Sending…")).toBeTruthy();
+    await act(async () => api.take("answer_blocker").reject(new api.ApiError("someone answered first", 409)));
+    expect(screen.getByText("someone answered first")).toBeTruthy();
   });
 
   it("moves the selection to the row now at its place when its row goes", async () => {

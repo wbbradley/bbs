@@ -89,6 +89,21 @@ describe("reading", () => {
   });
 });
 
+describe("an overlay opening with new mail", () => {
+  it("keeps that mail unread when both come in one update", async () => {
+    await conversation();
+    await act(async () => feed().push({ messages: [mail(1, "Mateo", "ada", { read_at: "x" })] }, true));
+    await act(async () => {
+      fireEvent.click(screen.getByText("cover"));
+      feed().push({ messages: [mail(1, "Mateo", "ada", { read_at: "x" }), mail(2, "Mateo", "ada")] });
+    });
+    expect(api.pending("mark_read")).toHaveLength(0);
+    fireEvent.keyDown(window, { key: "Escape" });
+    await act(async () => {});
+    expect(api.take("mark_read").req).toEqual({ from: "Mateo" });
+  });
+});
+
 describe("reconnects", () => {
   it("keep the activity already shown and mark where records may be missing", async () => {
     await conversation();

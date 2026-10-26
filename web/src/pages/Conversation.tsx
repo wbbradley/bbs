@@ -12,7 +12,7 @@ import { PageHeader } from "../components/PageHeader";
 import { SidePanel } from "../components/SidePanel";
 import { Timeline } from "../components/Timeline";
 import { go, navigate, paths, useSearch } from "../router";
-import { useCovered } from "../cover";
+import { isCovered, useCovered } from "../cover";
 import { empty, mergeWindow, type Held } from "../merge";
 import { SeekNote } from "../components/SeekNote";
 import { useMessages } from "../useMessages";
@@ -155,7 +155,8 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
       (m) => !m.read_at && !m.to_group && same(m.to_name, me) && same(m.from_name, agent),
     );
     const newest = Math.max(0, ...unread.map((m) => m.id));
-    if (newest > markedRead.current) {
+    // Asked again now: an overlay may have opened in this very commit.
+    if (newest > markedRead.current && !isCovered()) {
       markedRead.current = newest;
       rpc("mark_read", { from: agent }).catch(() => (markedRead.current = 0));
     }
@@ -164,7 +165,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   useEffect(() => {
     if (!reading || records.length === 0 || activity.state !== "live") return;
     const newest = records[records.length - 1].id;
-    if (newest > markedSeen.current) {
+    if (newest > markedSeen.current && !isCovered()) {
       markedSeen.current = newest;
       rpc("mark_seen", { agent, through_id: newest }).catch(() => (markedSeen.current = 0));
     }
