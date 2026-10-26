@@ -4,20 +4,6 @@ use std::process::Command;
 #[path = "build/identity.rs"]
 mod identity;
 
-/// Sources consumed by the frontend build, at the workspace root, excluding
-/// generated dependencies and bundles. Use the same paths for rebuilding
-/// and provenance.
-const WEB_INPUTS: &[&str] = &[
-    "../../web/src",
-    "../../web/public",
-    "../../web/index.html",
-    "../../web/package.json",
-    "../../web/package-lock.json",
-    "../../web/vite.config.ts",
-    "../../web/tsconfig.json",
-    "../../assets/connect/logo.txt",
-];
-
 /// Tracked sources of `bbs-server`, the shared core's included: they
 /// trigger rebuilds and define "dirty".
 const INPUTS: &[&str] = &[
@@ -30,13 +16,8 @@ const INPUTS: &[&str] = &[
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var_os("CARGO_FEATURE_WEB").is_some() {
-        embed_web_assets()?;
-    }
+    embed_web_assets()?;
     for path in INPUTS {
-        println!("cargo:rerun-if-changed={path}");
-    }
-    for path in WEB_INPUTS {
         println!("cargo:rerun-if-changed={path}");
     }
 
@@ -48,8 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dirty_override = std::env::var("BBS_BUILD_DIRTY").ok();
     // A published package has no `.git`; Cargo records its commit in
     // `.cargo_vcs_info.json` instead.
-    let checkout = git_revision();
-    let packaged = checkout.is_none().then(packaged_revision).flatten();
+    // A packaged source says what it was packaged from; only without that
+    // is the enclosing checkout asked.
+    let packaged = packaged_revision();
+    let checkout = packaged.is_none().then(git_revision).flatten();
     let (revision, dirty) = identity::resolve(
         revision_override.as_deref(),
         dirty_override.as_deref(),
@@ -63,7 +46,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => {
                 let mut args = vec!["status", "--porcelain", "--untracked-files=normal", "--"];
                 args.extend(INPUTS);
-                args.extend(WEB_INPUTS);
                 git(&args).map(|s| !s.is_empty())
             }
         },
@@ -80,33 +62,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Embed the web UI (the `web` feature) as `(path, bytes)` pairs. From a
-/// source checkout, build it with npm into `OUT_DIR`; the build fails without
-/// npm. `BBS_WEB_DIST` names a bundle built elsewhere instead (the container
-/// build), and a published package, which ships no web sources, embeds the
-/// `web/dist` it was packaged with.
+/// Embed the web UI, the bundle committed at `web/dist`, as `(path, bytes)`
+/// pairs. `scripts/build_web.py` builds it from the workspace's `web/`; this
+/// never runs Node.
 fn embed_web_assets() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").ok_or("no manifest dir")?);
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").ok_or("no OUT_DIR")?);
-    // The browser sources sit at the workspace root.
-    let web = manifest.join("../../web");
-    println!("cargo:rerun-if-env-changed=BBS_WEB_DIST");
-    let dist = if let Some(dist) = std::env::var_os("BBS_WEB_DIST") {
-        let dist = PathBuf::from(dist);
-        println!("cargo:rerun-if-changed={}", dist.display());
-        dist
-    } else if web.join("package.json").is_file() {
-        // Rebuild whenever Cargo reruns this script, including when an input
-        // was deleted. The output directory is emptied by the bundler.
-        let dist = out_dir.join("web-dist");
-        npm_build(&web, &dist)?;
-        dist
-    } else {
-        println!("cargo:rerun-if-changed=web/dist");
-        web.join("dist")
-    };
+    let dist = manifest.join("web/dist");
     if !dist.join("index.html").is_file() {
-        return Err(format!("no web UI build at {}", dist.display()).into());
+        return Err(format!(
+            "no web UI bundle at {}; build it with scripts/build_web.py --update",
+            dist.display()
+        )
+        .into());
     }
     let mut files = Vec::new();
     collect(&dist, &dist, &mut files)?;
@@ -120,33 +88,7 @@ fn embed_web_assets() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Install exactly the locked dependencies, then type-check and bundle.
-fn npm_build(
-    web: &std::path::Path,
-    out: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    npm(web, &["ci", "--no-audit", "--no-fund"])?;
-    let out = out.to_str().ok_or("OUT_DIR is not UTF-8")?;
-    npm(
-        web,
-        &["run", "build", "--", "--outDir", out, "--emptyOutDir"],
-    )
-}
-
-fn npm(web: &std::path::Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new("npm")
-        .args(args)
-        .current_dir(web)
-        // Cargo reads build-script stdout as directives; keep npm's on stderr.
-        .stdout(std::process::Stdio::from(std::io::stderr()))
-        .status()
-        .map_err(|e| format!("the `web` feature needs npm (Node.js 20.19 or newer): {e}"))?;
-    if !status.success() {
-        return Err(format!("`npm {}` failed in {}", args.join(" "), web.display()).into());
-    }
-    Ok(())
-}
-
+/// Every file under `dir`, by its path from `root`.
 fn collect(
     root: &std::path::Path,
     dir: &std::path::Path,
@@ -164,12 +106,19 @@ fn collect(
     Ok(())
 }
 
-/// HEAD of the workspace's own checkout, two levels up, never of an
-/// enclosing repository.
+/// HEAD of the bbs workspace this crate sits in, two levels up, never of
+/// an enclosing repository that merely contains it.
 fn git_revision() -> Option<String> {
-    let toplevel = PathBuf::from(git(&["rev-parse", "--show-toplevel"])?);
-    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
-    if toplevel.canonicalize().ok()? != manifest_dir.join("../..").canonicalize().ok()? {
+    let toplevel = PathBuf::from(git(&["rev-parse", "--show-toplevel"])?)
+        .canonicalize()
+        .ok()?;
+    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?)
+        .canonicalize()
+        .ok()?;
+    if manifest_dir.join("../..").canonicalize().ok()? != toplevel
+        || toplevel.join("crates/bbs-server").canonicalize().ok()? != manifest_dir
+        || !toplevel.join("crates/bbs-core/Cargo.toml").is_file()
+    {
         return None;
     }
     // Rebuild when the checked-out commit or the index moves; the HEAD reflog

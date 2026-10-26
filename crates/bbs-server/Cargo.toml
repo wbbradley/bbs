@@ -7,11 +7,7 @@ description = "The bbs server: gRPC for agents and clients, and an optional web 
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-include = ["/build", "/build.rs", "/src", "/web-dist"]
-
-[features]
-# `bbs-server --web`: the browser UI, built with npm from the workspace's web/.
-web = ["dep:axum", "bbs-core/serde"]
+include = ["/build", "/build.rs", "/src", "/web/dist"]
 
 [[bin]]
 name = "bbs-server"
@@ -19,8 +15,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"], optional = true }
-bbs-core = { path = "../bbs-core", version = "=0.16.1" }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
+bbs-core = { path = "../bbs-core", version = "=0.16.1", features = ["serde"] }
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
 data-encoding = "2.11.1"

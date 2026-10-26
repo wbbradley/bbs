@@ -1,5 +1,4 @@
-//! Drive `bbs serve --web` over plain HTTP: sign-in, the JSON API and streams.
-#![cfg(feature = "web")]
+//! Drive `bbs-server --web` over plain HTTP: sign-in, the JSON API and streams.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;

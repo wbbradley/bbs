@@ -24,7 +24,6 @@ use crate::proto::{self, Kind};
 use crate::protocol::Policy;
 use crate::service::{self, Caller, TimerLimits, Watched};
 
-#[cfg(feature = "web")]
 mod web;
 
 /// Keepalive pings let a vanished client free its waiter slot within ~30s.
@@ -41,7 +40,6 @@ const ACTIVITY_BATCH_WAIT: Duration = Duration::from_millis(50);
 
 /// `bbs serve --web`: where the web UI listens, and the origin browsers reach
 /// it at when that is not the listening address itself.
-#[cfg_attr(not(feature = "web"), allow(dead_code))]
 pub struct Web {
     pub addr: SocketAddr,
     pub origin: Option<String>,
@@ -55,11 +53,6 @@ pub async fn run(
     protocol: Policy,
     timer_limits: TimerLimits,
 ) -> Result<()> {
-    if web.is_some() && !cfg!(feature = "web") {
-        anyhow::bail!(
-            "this bbs-server was built without the web UI; rebuild it with `cargo install bbs-server --features web` (see README)"
-        );
-    }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut conn = db::open(&dir.join("bbs.db"))?;
     db::migrate(&mut conn)?;
@@ -91,7 +84,6 @@ async fn serve(
     let addr = listener.local_addr()?;
     // Bound and checked before anything is served, so a bad origin or a busy
     // port stops `serve` at once.
-    #[cfg(feature = "web")]
     let web = match web {
         Some(web) => {
             let listener = tokio::net::TcpListener::bind(web.addr)
@@ -102,8 +94,6 @@ async fn serve(
         }
         None => None,
     };
-    #[cfg(not(feature = "web"))]
-    drop(web);
     let state = Arc::new(State {
         conn: Mutex::new(conn),
         notify: watch::Sender::new(0),
@@ -131,7 +121,6 @@ async fn serve(
     // The web UI runs alongside the gRPC server, never apart from it: if it
     // fails, `serve` exits with its error rather than carry on without it.
     type WebUi = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
-    #[cfg(feature = "web")]
     let mut web_ui: Option<WebUi> = match web {
         Some((listener, boundary)) => {
             let web_addr = listener.local_addr()?;
@@ -145,8 +134,6 @@ async fn serve(
         }
         None => None,
     };
-    #[cfg(not(feature = "web"))]
-    let mut web_ui: Option<WebUi> = None;
     tracing::info!(%addr, state_dir = %dir.display(), "serving");
     tokio::select! {
         result = &mut server => result?,
@@ -539,7 +526,7 @@ impl Drop for Slot {
     }
 }
 
-#[cfg_attr(feature = "web", derive(Clone))]
+#[derive(Clone)]
 struct Server(Arc<State>);
 
 fn caller<T>(req: &Request<T>, require_human_token: bool) -> Caller {
