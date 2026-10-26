@@ -20,28 +20,23 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-      # A published package has no web sources; it ships this build in
-      # web/dist for `--features web`. The crates.io job packages it rather
-      # than running npm itself.
-      - name: Build web UI
-        working-directory: web
-        run: npm ci && npm run build
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: web-dist
-          path: web/dist
-          if-no-files-found: error
-      - name: Test
-        run: cargo test --locked --features web
       - name: Test frontend
         working-directory: web
-        run: npm test
-      - name: Test packaged web feature without Node
-        run: python3 scripts/test_web_package.py
+        run: npm ci && npm test
+      - name: Check committed server assets
+        run: python3 scripts/build_web.py
+      - name: Build workspace
+        run: cargo build --workspace --locked
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Test separate packages without Node
+        run: python3 scripts/test_workspace_package.py
       - name: Write manifest
         run: |
-          cargo build --release --locked
+          cargo build --release --workspace --locked
           target/release/bbs version --manifest > bbs-release.json
+          target/release/bbs-server version --manifest > bbs-server-release.json
+          cmp bbs-release.json bbs-server-release.json
           python3 -c 'import json, os, sys; m = json.load(open("bbs-release.json")); sys.exit(m["revision"] != os.environ["GITHUB_SHA"])'
           cat bbs-release.json
       - name: Publish
@@ -72,13 +67,14 @@ jobs:
 
           \`bbs-release.json\` lists its protocol, schema, config format and minimum Rust version.
           NOTES
-          gh release create "$tag" bbs-release.json --repo "$GITHUB_REPOSITORY" \
+          gh release create "$tag" bbs-release.json bbs-server-release.json --repo "$GITHUB_REPOSITORY" \
             --verify-tag --title "bbs $tag" --notes-file notes.md
           echo "Published [$tag]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$tag) at \`$GITHUB_SHA\`." >> "$GITHUB_STEP_SUMMARY"
   # crates.io trusted publishing: a short-lived token from this workflow's OIDC
   # identity. A separate job, so no build script ever runs where the token can
   # be minted (`--no-verify`; the publish job already tested this commit). If
-  # it fails, run `cargo publish --locked` from GITHUB_SHA by hand.
+  # it fails, publish the three packages in dependency order from GITHUB_SHA.
+  # Configure trusted publishing for each crate before its first automated release.
   crates-io:
     needs: publish
     permissions:
@@ -90,12 +86,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      # The web UI built and tested by the publish job; cargo packages it from
-      # web/dist although git ignores it.
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: web-dist
-          path: web/dist
       - name: Verify release sources are clean
         run: python3 scripts/check_release_source.py
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
@@ -103,6 +93,9 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        # web/dist is generated and ignored. Cargo honestly records it as an
-        # archive change; the separate source check above must pass first.
-        run: cargo publish --locked --no-verify --allow-dirty
+        # Core must be available before the two independent binary packages.
+        # No build scripts or frontend tools run in this credential-bearing job.
+        run: |
+          cargo publish --locked --no-verify -p bbs-core
+          cargo publish --locked --no-verify -p bbs-cli
+          cargo publish --locked --no-verify -p bbs-server

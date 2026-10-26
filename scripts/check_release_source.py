@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject changed release sources before packaging generated, ignored assets."""
+"""Reject changed release sources before packaging the workspace."""
 
 from pathlib import Path
 import subprocess
