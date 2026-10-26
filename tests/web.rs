@@ -351,6 +351,10 @@ impl Sse {
 }
 
 fn events_path(subscriptions: serde_json::Value) -> String {
+    tab_path(subscriptions, "tab1")
+}
+
+fn tab_path(subscriptions: serde_json::Value, tab: &str) -> String {
     let s: String = subscriptions
         .to_string()
         .bytes()
@@ -359,7 +363,7 @@ fn events_path(subscriptions: serde_json::Value) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect();
-    format!("/api/events?s={s}")
+    format!("/api/events?tab={tab}&s={s}")
 }
 
 #[test]
@@ -613,6 +617,93 @@ fn stopping_ends_open_streams_and_exits_promptly() {
     assert!(status.success(), "{status:?}");
     assert!(
         started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Whether the server ends `sse` within `within`: the body ends, or the
+/// connection closes.
+fn ends_within(sse: &mut Sse, within: Duration) -> bool {
+    sse.reader.get_ref().set_read_timeout(Some(within)).unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        let mut line = String::new();
+        match sse.reader.read_line(&mut line) {
+            Ok(0) => return started.elapsed() < within,
+            // The chunked body's terminating chunk ends it too.
+            Ok(_) if line == "0\r\n" => return started.elapsed() < within,
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+#[test]
+fn a_tabs_next_stream_replaces_its_last_at_once() {
+    let server = Server::start("tab-replace");
+    let token = server.human("ada");
+    let cookie = sign_in(&server, "ada", &token);
+    let subs = serde_json::json!([{"key": "s", "kind": "summary"}]);
+    // Nine quick reopens from one tab, each left open by the browser: every
+    // one is served, and each ends the one before it at once.
+    let mut last = Sse::open(&server, &tab_path(subs.clone(), "tabA"), &cookie);
+    assert!(last.next().is_some());
+    for _ in 0..9 {
+        let mut next = Sse::open(&server, &tab_path(subs.clone(), "tabA"), &cookie);
+        assert!(next.next().is_some());
+        assert!(
+            ends_within(&mut last, Duration::from_secs(2)),
+            "replaced stream still open"
+        );
+        last = next;
+    }
+    // Distinct tabs are capped, the ninth refused until one goes.
+    let mut tabs: Vec<Sse> = (0..7)
+        .map(|i| {
+            Sse::open(
+                &server,
+                &tab_path(subs.clone(), &format!("tab{i}")),
+                &cookie,
+            )
+        })
+        .collect();
+    let r = server.request("GET", &tab_path(subs.clone(), "tab-extra"), &[&cookie], "");
+    assert_eq!(r.status, 429, "{}", r.body);
+    // The capped session may still reopen a tab it has.
+    let mut again = Sse::open(&server, &tab_path(subs.clone(), "tab3"), &cookie);
+    assert!(again.next().is_some());
+    assert!(ends_within(&mut tabs[3], Duration::from_secs(2)));
+    // A missing or unusable tab id is refused.
+    let plain = format!(
+        "/api/events?s={}",
+        &tab_path(subs.clone(), "x").split("&s=").nth(1).unwrap()
+    );
+    let r = server.request("GET", &plain, &[&cookie], "");
+    assert_eq!(r.status, 400, "{}", r.body);
+    let r = server.request("GET", &tab_path(subs, "a%20b"), &[&cookie], "");
+    assert_eq!(r.status, 400, "{}", r.body);
+}
+
+#[test]
+fn signing_out_ends_open_streams_at_once() {
+    let server = Server::start("logout-stream");
+    let token = server.human("ada");
+    let cookie = sign_in(&server, "ada", &token);
+    let path = events_path(serde_json::json!([{"key": "s", "kind": "summary"}]));
+    let mut sse = Sse::open(&server, &path, &cookie);
+    assert!(sse.next().is_some());
+    let started = std::time::Instant::now();
+    let r = server.request("POST", "/api/logout", &[CSRF, &cookie], "");
+    assert_eq!(r.status, 204);
+    let (name, data) = sse.next().expect("a fail event");
+    assert_eq!(
+        (name.as_str(), data["key"].clone(), data["status"].clone()),
+        ("fail", serde_json::Value::Null, serde_json::json!(401))
+    );
+    // Well inside the five-second check: logging out signals the stream.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
         "{:?}",
         started.elapsed()
     );

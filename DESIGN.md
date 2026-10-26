@@ -316,11 +316,14 @@ Requests and responses are the proto messages as JSON with proto field names;
 `build.rs` derives serde for every generated message, absent optionals are
 `null` and enums are their numbers. `POST /api/rpc/<rpc>` covers the unary RPCs
 the page uses, named in snake case; agent-only and enrollment RPCs are not
-offered. `GET /api/events?s=<JSON [{key, kind, q}]>` relays up to eight watch
-streams (`feed`, `summary`, `activity`) over one server-sent event stream, so
-a tab holds one connection however much it shows: each snapshot is a `message`
-event with its key, a watch that fails sends a keyed `fail` event and ends
-alone, and a `fail` with a null key means the session ended.
+offered. `GET /api/events?tab=<id>&s=<JSON [{key, kind, q}]>` relays up to
+eight watch streams (`feed`, `summary`, `activity`) over one server-sent event
+stream, so a tab holds one connection however much it shows: each snapshot is
+a `message` event with its key, a watch that fails sends a keyed `fail` event
+and ends alone, and a `fail` with a null key means the session ended. A tab's
+next stream ends its last at once, so reopening never waits for the server to
+notice a closed connection; a session may stream to eight tabs at a time, and
+signing out ends its streams immediately.
 Activity is relayed as its
 newest window followed by cursor batches, so a busy agent never resends its
 whole window.

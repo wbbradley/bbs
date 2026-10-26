@@ -27,7 +27,7 @@ use rand::RngCore;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt, StreamMap};
 use tonic::Request;
@@ -48,11 +48,13 @@ const SESSION_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Sessions held at once; past this the least recently used one ends.
 const MAX_SESSIONS: usize = 4096;
-/// Event streams one session may hold open at once: about one per tab.
+/// Tabs one session may hold an event stream open for at once.
 const STREAMS_PER_SESSION: usize = 8;
 /// Watches one event stream may carry.
 const MAX_SUBSCRIPTIONS: usize = 8;
 const MAX_KEY_LEN: usize = 64;
+/// A tab's id: what lets a tab's next stream replace its last at once.
+const MAX_TAB_LEN: usize = 64;
 /// How often an open event stream checks its session is still signed in.
 const SESSION_CHECK: Duration = Duration::from_secs(5);
 /// Mutating calls must carry this header, which a cross-site form cannot set
@@ -67,7 +69,7 @@ pub async fn serve(
     let state = server.0.clone();
     let app = Arc::new(App {
         server,
-        sessions: Sessions::default(),
+        sessions: Arc::default(),
         boundary,
     });
     let router = Router::new()
@@ -91,7 +93,7 @@ pub async fn serve(
 
 struct App {
     server: Server,
-    sessions: Sessions,
+    sessions: Arc<Sessions>,
     boundary: Boundary,
 }
 
@@ -264,7 +266,15 @@ struct Entry {
     session: Session,
     created: Instant,
     used: Instant,
-    streams: usize,
+    /// Each tab's open event stream: dropping its lease ends that stream.
+    tabs: HashMap<String, Lease>,
+}
+
+/// A tab's hold on its event stream. Dropping it, by the tab opening
+/// another or the session ending, ends the stream at once.
+struct Lease {
+    generation: u64,
+    _cancel: oneshot::Sender<()>,
 }
 
 impl Entry {
@@ -277,7 +287,11 @@ impl Entry {
 /// Open sessions, by a hash of their id: logging out, expiry, or the token
 /// failing ends one at once, and a restart ends them all.
 #[derive(Default)]
-struct Sessions(Mutex<HashMap<[u8; 32], Entry>>);
+struct Sessions {
+    entries: Mutex<HashMap<[u8; 32], Entry>>,
+    /// Leases issued, so a replaced one never releases its successor.
+    generation: std::sync::atomic::AtomicU64,
+}
 
 fn session_key(id: &str) -> Option<[u8; 32]> {
     let raw = BASE64URL_NOPAD.decode(id.as_bytes()).ok()?;
@@ -286,7 +300,7 @@ fn session_key(id: &str) -> Option<[u8; 32]> {
 
 impl Sessions {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Entry>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A new session's id, for the cookie.
@@ -307,7 +321,7 @@ impl Sessions {
                 session,
                 created: now,
                 used: now,
-                streams: 0,
+                tabs: HashMap::new(),
             },
         );
         id
@@ -341,31 +355,66 @@ impl Sessions {
         }
     }
 
-    /// Room for one more open stream on `id`, released when dropped.
-    fn stream(app: &Arc<App>, id: &str) -> Option<StreamSlot> {
-        let key = session_key(id)?;
-        let mut sessions = app.sessions.lock();
-        let entry = sessions.get_mut(&key)?;
-        if entry.streams >= STREAMS_PER_SESSION {
-            return None;
+    /// Tab `tab`'s event stream on session `id`: any stream the tab had
+    /// ends now, and the new one ends when its cancel resolves. Distinct
+    /// tabs are capped; a tab replacing its own stream never is.
+    fn lease(
+        self: &Arc<Self>,
+        id: &str,
+        tab: &str,
+    ) -> Result<(StreamSlot, oneshot::Receiver<()>), ApiError> {
+        let not_signed_in = || ApiError::new(StatusCode::UNAUTHORIZED, "not signed in");
+        let key = session_key(id).ok_or_else(not_signed_in)?;
+        let mut sessions = self.lock();
+        let entry = sessions.get_mut(&key).ok_or_else(not_signed_in)?;
+        if !entry.tabs.contains_key(tab) && entry.tabs.len() >= STREAMS_PER_SESSION {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("at most {STREAMS_PER_SESSION} tabs may stream per session"),
+            ));
         }
-        entry.streams += 1;
-        Some(StreamSlot {
-            app: app.clone(),
-            key,
-        })
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (cancel, cancelled) = oneshot::channel();
+        // Replacing the tab's lease drops the old one, ending its stream.
+        entry.tabs.insert(
+            tab.to_string(),
+            Lease {
+                generation,
+                _cancel: cancel,
+            },
+        );
+        Ok((
+            StreamSlot {
+                sessions: self.clone(),
+                key,
+                tab: tab.to_string(),
+                generation,
+            },
+            cancelled,
+        ))
     }
 }
 
+/// A stream's place in its session, given up when the stream ends, unless
+/// the tab has since opened another.
 struct StreamSlot {
-    app: Arc<App>,
+    sessions: Arc<Sessions>,
     key: [u8; 32],
+    tab: String,
+    generation: u64,
 }
 
 impl Drop for StreamSlot {
     fn drop(&mut self) {
-        if let Some(entry) = self.app.sessions.lock().get_mut(&self.key) {
-            entry.streams = entry.streams.saturating_sub(1);
+        if let Some(entry) = self.sessions.lock().get_mut(&self.key)
+            && entry
+                .tabs
+                .get(&self.tab)
+                .is_some_and(|l| l.generation == self.generation)
+        {
+            entry.tabs.remove(&self.tab);
         }
     }
 }
@@ -750,12 +799,15 @@ fn fail_event(key: Option<&str>, status: StatusCode, message: &str) -> Event {
     Event::default().event("fail").data(data.to_string())
 }
 
-/// Relay `source` to the browser while session `id` stays signed in and the
-/// server is not stopping; holds `slot` until the browser goes.
+/// Relay `source` to the browser while session `id` stays signed in, its tab
+/// opens no other stream, and the server is not stopping; holds `slot`
+/// until then or until the browser goes. A send blocked on a slow browser
+/// gives way to any of those too.
 fn relay(
     app: Arc<App>,
     id: String,
     slot: StreamSlot,
+    mut cancelled: oneshot::Receiver<()>,
     mut source: Pin<Box<dyn Stream<Item = Out> + Send>>,
 ) -> Events {
     let (tx, rx) = mpsc::channel::<Event>(16);
@@ -764,31 +816,48 @@ fn relay(
         let state = app.server.0.clone();
         let mut check = tokio::time::interval(SESSION_CHECK);
         check.tick().await;
+        // Why the relay stops, if not for the browser or the stream ending.
+        enum Stop {
+            Ended,
+            Cancelled,
+        }
         loop {
-            tokio::select! {
-                _ = state.stopping() => break,
-                _ = tx.closed() => break,
+            let next = tokio::select! {
+                _ = state.stopping() => Stop::Ended,
+                _ = tx.closed() => Stop::Ended,
+                _ = &mut cancelled => Stop::Cancelled,
                 _ = check.tick() => {
-                    if !app.sessions.alive(&id, Instant::now()) {
-                        let _ = tx
-                            .send(fail_event(None, StatusCode::UNAUTHORIZED, "signed out"))
-                            .await;
-                        break;
+                    if app.sessions.alive(&id, Instant::now()) {
+                        continue;
+                    }
+                    Stop::Cancelled
+                }
+                out = source.next() => {
+                    let (event, last) = match out {
+                        Some(Out::Event(event)) => (event, false),
+                        Some(Out::Last(event)) => (event, true),
+                        None => break,
+                    };
+                    tokio::select! {
+                        sent = tx.send(event) => {
+                            if sent.is_err() || last {
+                                break;
+                            }
+                            continue;
+                        }
+                        _ = state.stopping() => Stop::Ended,
+                        _ = &mut cancelled => Stop::Cancelled,
                     }
                 }
-                out = source.next() => match out {
-                    Some(Out::Event(event)) => {
-                        if tx.send(event).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Out::Last(event)) => {
-                        let _ = tx.send(event).await;
-                        break;
-                    }
-                    None => break,
-                },
+            };
+            // Signed out (rather than replaced by the tab's next stream):
+            // say so, without waiting on a browser that is not reading.
+            if let Stop::Cancelled = next
+                && !app.sessions.alive(&id, Instant::now())
+            {
+                let _ = tx.try_send(fail_event(None, StatusCode::UNAUTHORIZED, "signed out"));
             }
+            break;
         }
     });
     Box::pin(ReceiverStream::new(rx).map(Ok))
@@ -804,6 +873,8 @@ fn sse(events: Events) -> Response {
 struct EventsQuery {
     /// The watches as JSON: `[{"key", "kind", "q"}]`.
     s: String,
+    /// The tab's own id; its next stream replaces this one.
+    tab: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -829,6 +900,18 @@ async fn events(
         Ok(signed_in) => signed_in,
         Err(e) => return Ok(finish(&app, "", Err(e))),
     };
+    let tab = query.tab;
+    if tab.is_empty()
+        || tab.len() > MAX_TAB_LEN
+        || !tab
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("tab must be 1 to {MAX_TAB_LEN} letters, digits, - or _"),
+        ));
+    }
     let subscriptions: Vec<Subscription> = parse(query.s.as_bytes())?;
     if subscriptions.is_empty() || subscriptions.len() > MAX_SUBSCRIPTIONS {
         return Err(ApiError::new(
@@ -836,6 +919,11 @@ async fn events(
             format!("watch between 1 and {MAX_SUBSCRIPTIONS} streams"),
         ));
     }
+    // The tab's last stream ends before this one's watches open.
+    let (slot, cancelled) = match app.sessions.lease(&id, &tab) {
+        Ok(lease) => lease,
+        Err(e) => return Ok(finish(&app, &id, Err(e))),
+    };
     let mut map = StreamMap::new();
     for sub in subscriptions {
         if sub.key.is_empty() || sub.key.len() > MAX_KEY_LEN || map.contains_key(&sub.key) {
@@ -858,12 +946,6 @@ async fn events(
         };
         map.insert(sub.key, stream);
     }
-    let Some(slot) = Sessions::stream(&app, &id) else {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("at most {STREAMS_PER_SESSION} open streams per session"),
-        ));
-    };
     let (closing, closing_id) = (app.clone(), id.clone());
     let source = map.map(move |(key, item)| match item {
         Ok(snapshot) => Out::Event(
@@ -878,7 +960,7 @@ async fn events(
         }
         Err(e) => Out::Event(fail_event(Some(&key), e.status, &e.message)),
     });
-    Ok(sse(relay(app, id, slot, Box::pin(source))))
+    Ok(sse(relay(app, id, slot, cancelled, Box::pin(source))))
 }
 
 /// The embedded page and its assets; unknown paths get the page, which routes
@@ -1009,6 +1091,39 @@ mod tests {
         sessions.open(session(), now);
         assert!(sessions.get(&first, now).is_none(), "evicted");
         assert!(sessions.get(&last, now).is_some());
+    }
+
+    #[test]
+    fn a_replaced_lease_never_releases_its_successor() {
+        let sessions = Arc::new(Sessions::default());
+        let id = sessions.open(session(), Instant::now());
+        let (old, mut old_cancelled) = sessions.lease(&id, "t").unwrap();
+        let (new, mut new_cancelled) = sessions.lease(&id, "t").unwrap();
+        assert!(
+            old_cancelled
+                .try_recv()
+                .is_err_and(|e| e == oneshot::error::TryRecvError::Closed)
+        );
+        drop(old);
+        assert!(
+            new_cancelled
+                .try_recv()
+                .is_err_and(|e| e == oneshot::error::TryRecvError::Empty)
+        );
+        drop(new);
+        assert!(
+            new_cancelled
+                .try_recv()
+                .is_err_and(|e| e == oneshot::error::TryRecvError::Closed)
+        );
+        // Closing the session ends every lease it holds.
+        let (_slot, mut cancelled) = sessions.lease(&id, "u").unwrap();
+        sessions.close(&id);
+        assert!(
+            cancelled
+                .try_recv()
+                .is_err_and(|e| e == oneshot::error::TryRecvError::Closed)
+        );
     }
 
     #[test]
