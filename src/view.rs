@@ -546,6 +546,16 @@ mod tests {
             "the viewer's own header"
         );
         assert_eq!(buffer[(0, header)].symbol(), "•");
+        // Mail to the viewer names them as a human, as the connect Feed does.
+        let to_me = Message {
+            to_name: Some("ada".into()),
+            ..row(None, None, None, "for me")
+        };
+        assert_eq!(
+            Card::feed(to_me.clone(), Some("ada")).look.recipient,
+            Some(Kind::Human)
+        );
+        assert_eq!(Card::feed(to_me, None).look.recipient, None);
         assert_eq!(
             Some(buffer[(69, at("hi"))].bg),
             bg(Role::OtherConversation),

@@ -483,12 +483,15 @@ impl Thread {
                     .then(|| seen.get(&m.id).cloned())
                     .flatten(),
                 headerless: self.direct_to_human(&m) || self.direct_from_human(&m) || own(&m),
-                recipient: if m.to_owner.is_some()
+                recipient: if let Some(look) = feed(&m) {
+                    look.recipient
+                } else if m.to_owner.is_some()
                     || self.agent.as_ref().is_some_and(|a| {
                         m.to_name
                             .as_ref()
                             .is_some_and(|to| to.eq_ignore_ascii_case(a))
-                    }) {
+                    })
+                {
                     Some(proto::Kind::Agent)
                 } else if self.human.as_ref().is_some_and(|h| {
                     m.to_name

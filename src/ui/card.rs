@@ -36,9 +36,14 @@ impl Look {
     /// The board-wide feed: every message a side card with its time; the
     /// viewer's own on their surface; unread direct mail marked.
     pub fn feed(message: &Message, viewer: Option<&str>) -> Look {
+        let viewer_is = |name: &str| viewer.is_some_and(|v| name.eq_ignore_ascii_case(v));
+        // Mail to the viewer names them as the human they are.
+        let to_viewer = message.to_group.is_none()
+            && message.to_owner.is_none()
+            && message.to_name.as_deref().is_some_and(viewer_is);
         Look {
-            outgoing: message.from_kind() == Kind::Human
-                && viewer.is_some_and(|v| message.from_name.eq_ignore_ascii_case(v)),
+            recipient: to_viewer.then_some(Kind::Human),
+            outgoing: message.from_kind() == Kind::Human && viewer_is(&message.from_name),
             timed: true,
             receipt: true,
             ..Look::default()
