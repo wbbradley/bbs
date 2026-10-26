@@ -27,6 +27,11 @@ def check():
         ["cargo", "metadata", "--no-deps", "--format-version", "1"], cwd=root, env=env,
     ))
     target = Path(metadata["target_directory"])
+    host = next(
+        line.removeprefix("host: ")
+        for line in subprocess.check_output(["rustc", "-vV"], text=True, env=env).splitlines()
+        if line.startswith("host: ")
+    )
     packages = {p["name"]: p for p in metadata["packages"] if p["name"] in NAMES}
     assert set(packages) == set(NAMES), "expected exactly the core, CLI and server packages"
     versions = {p["version"] for p in packages.values()}
@@ -96,14 +101,14 @@ def check():
                 assert report["version"] == packages[name]["version"]
                 assert report["revision"] == vcs[name]["git"]["sha1"]
         cli = json.loads(subprocess.check_output(
-            ["cargo", "metadata", "--offline", "--format-version", "1", "--config", patch],
+            ["cargo", "metadata", "--offline", "--filter-platform", host, "--format-version", "1", "--config", patch],
             cwd=sources["bbs-cli"], env=env,
         ))
         assert not any(p["name"] in ("axum", "bbs-server") for p in cli["packages"]), \
             "CLI depends on the web/server implementation"
         for name in ("bbs-core", "bbs-server"):
             graph = json.loads(subprocess.check_output(
-                ["cargo", "metadata", "--offline", "--format-version", "1", "--config", patch],
+                ["cargo", "metadata", "--offline", "--filter-platform", host, "--format-version", "1", "--config", patch],
                 cwd=sources[name], env=env,
             ))
             forbidden = {"ratatui", "ratatui-textarea", "bbs-cli"}
