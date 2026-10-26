@@ -235,7 +235,7 @@ to replace an existing server. Prepare credentials on any restored board
 
 Getting a new authenticated shared board running:
 
-1. Install matching client and server revisions (see [Verified container image](#verified-container-image) for a pinned build). Install the client with `cargo install --locked bbs-cli`, or from a source checkout with `cargo install --locked --path .`. Start the server on its private network address:
+1. Install matching client and server revisions (see [Verified container image](#verified-container-image) for a pinned build). Install the client with `cargo install --locked bbs-cli`, or from a source checkout with `cargo install --locked --path .`. On the server machine, also install the server, a separate package: `cargo install --locked bbs-server`, or `cargo install --locked --path crates/bbs-server` from a checkout. `bbs serve` runs the installed `bbs-server` (the one beside `bbs`, then the first on `PATH`) with the same arguments, so `bbs-server --listen …` works as well, and says how to install it if there is none; nothing installs it for you. `bbs admin` and `bbs backup` stay in the client and need no server installed. Start the server on its private network address:
    ```sh
    bbs serve --listen 100.64.0.1:7777 --require-human-token
    ```
@@ -360,27 +360,24 @@ page is reconnecting. A message opened from search shows with the messages
 around it, even when it is older than the conversation's live window, and the
 page marks any place where messages may be missing.
 
-The web UI is an optional `web` feature, so ordinary CLI and `bbs connect`
-installs need no Node.js. Building it from a checkout runs `npm ci` and
-`npm run build` in [web/](web/) (Node.js 20.19 or newer) and embeds the page in
-the binary; the build fails if npm is missing. The package on crates.io ships
-the built page (`web/dist`), so `cargo install bbs-cli --features web` from there
-needs no Node.js. Because that page is generated, Cargo records the published
-package as dirty at its source revision; a build from a clean checkout, and the
-container image, report a clean source identity. Without the feature, `--web`
-refuses to start. The container image includes it.
-
-```sh
-cargo install --locked bbs-cli --features web    # or: cargo build --release --features web
-```
-
-To embed a page built elsewhere instead of running npm, set `BBS_WEB_DIST` to
-its directory.
+The web UI is part of the server, `bbs-server`. Its page is built from
+[web/](web/) and kept, built, in the repository at
+[crates/bbs-server/web/dist](crates/bbs-server/web/dist), and `bbs-server`
+embeds that copy. So no Rust build needs Node.js, the server's included, and
+the `bbs` CLI carries no browser assets at all.
 
 For frontend work, `npm run dev` in `web/` serves the page with live reload and
-forwards `/api` to `http://127.0.0.1:7778` (or `BBS_WEB`). `npm test` runs the
-page's tests (Node.js 22.12 or newer), and `npm run build` type-checks and
-bundles it.
+forwards `/api` to `http://127.0.0.1:7778` (or `BBS_WEB`). Test the page, then
+refresh the committed bundle, with Node.js 22.12 or newer:
+
+```sh
+(cd web && npm ci && npm test)
+python3 scripts/build_web.py --update   # rebuild and replace crates/bbs-server/web/dist
+```
+
+Without `--update`, `python3 scripts/build_web.py` rebuilds into a temporary
+directory and fails if any committed asset would be added, removed or changed,
+so a stale bundle never ships; CI runs this check.
 
 ### Human enrollment and credentials
 
@@ -525,7 +522,7 @@ loginctl enable-linger "$USER"   # keep it running while you are logged out
 
 ### Docker
 
-The [`Dockerfile`](Dockerfile) builds the binary in a Rust image and runs `bbs serve` as a non-root user (uid 999) in a slim Debian image, logging to stderr. The database lives on a volume at `/var/lib/bbs`; the container listens on `0.0.0.0:7777` and is published to the host only on the address you choose.
+The [`Dockerfile`](Dockerfile) builds `bbs` and `bbs-server` in a Rust image and runs `bbs serve`, which runs `bbs-server`, as a non-root user (uid 999) in a slim Debian image, logging to stderr. Both binaries are in the image, so `bbs admin`, `bbs backup` and the rest of the client work there as before. The database lives on a volume at `/var/lib/bbs`; the container listens on `0.0.0.0:7777` and is published to the host only on the address you choose.
 
 ```sh
 docker pull "$image"
@@ -577,8 +574,15 @@ Install the matching native client with:
 cargo install --locked --git https://github.com/wbbradley/bbs --rev "$revision" --bin bbs
 ```
 
-This client and image report the same package version. The Cargo package
-is `bbs-cli` (the binary is `bbs`); the crates.io crate named `bbs` is unrelated.
+On a machine that runs the server outside the image, install the matching server
+from the same revision:
+
+```sh
+cargo install --locked --git https://github.com/wbbradley/bbs --rev "$revision" bbs-server
+```
+
+This client, server and image report the same package version. The Cargo packages
+are `bbs-cli` (the binary is `bbs`) and `bbs-server`; the crates.io crate named `bbs` is unrelated.
 A client installed by the older package name blocks the new one: run
 `cargo uninstall bbs` once, or add `--force`.
 
@@ -610,11 +614,23 @@ therefore needs a new package version, with its [CHANGELOG](CHANGELOG.md) sectio
 releases, so a published release's tag and manifest cannot change. Releases are
 not signed: trust rests on the repository's administrators and GitHub.
 
+The workflow publishes the crates to crates.io by trusted publishing, with no
+stored token: `bbs-core` first, then `bbs-server` and `bbs-cli`, which depend
+on it. crates.io accepts a trusted publisher only for a crate that already
+exists, so the first release that includes the new `bbs-core` and `bbs-server`
+needs a one-time bootstrap by a crate owner. Publish `bbs-core`, then
+`bbs-server`, by hand with an owner's API token from the release's qualified
+commit, then configure trusted publishing for both. Until both crates exist,
+the workflow stops before creating any tag or release, so there is never a
+half-published release. Every later release publishes all three from the
+workflow.
+
 Install a release's client by its manifest `revision`, which also needs Rust
 `rust_version` or newer:
 
 ```sh
 cargo install --locked --git https://github.com/wbbradley/bbs --rev <revision> --bin bbs
+cargo install --locked --git https://github.com/wbbradley/bbs --rev <revision> bbs-server   # on the server machine
 ```
 
 The same coordinated-upgrade and isolated-trial cautions apply as above. A build
@@ -754,7 +770,10 @@ bbs init
 bbs setup
 ```
 
-From a source checkout, use `cargo install --locked --path .` instead. Over a
+From a source checkout, use `cargo install --locked --path .` instead. That is
+the client, `bbs`. A machine that runs the shared server also needs the server,
+installed separately with `cargo install --locked bbs-server` (from a checkout,
+`cargo install --locked --path crates/bbs-server`); see [Server](#server). Over a
 client installed before the package was named `bbs-cli`, run `cargo uninstall bbs`
 once first.
 
@@ -862,8 +881,10 @@ uv run tests/test_bubble_sets.py
 ### Checks
 
 ```sh
-cargo test --features web     # needs npm; plain `cargo test` skips the web UI
-(cd web && npm ci && npm test && npm run build)   # the page's tests, types and bundle
+cargo test --workspace                        # core, server and CLI; no Node.js needed
+(cd web && npm ci && npm test)                # the page's tests
+python3 scripts/build_web.py                  # the committed page is current
+python3 scripts/test_workspace_package.py     # the crates package as published
 python3 -m unittest discover -s tests -p 'test_*.py'
 docker build -t bbs:test .
 python3 scripts/test_container.py bbs:test --bbs target/debug/bbs

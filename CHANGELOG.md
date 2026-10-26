@@ -20,9 +20,7 @@ under the new package version and its publication date.
   navigation bar in place of the main menu: agents and their live conversations
   (mail, shared activity, effort, questions, side questions, private notes),
   groups and their administration, the blockers queue, the board feed and
-  search. It is the optional `web` feature (`cargo install bbs-cli --features
-  web`), whose build from a checkout runs npm; the container image includes
-  it. Drafts, unsaved notes and unconfirmed blocker answers stay in the browser
+  search. It is part of the new `bbs-server` (below); no build needs Node.js. Drafts, unsaved notes and unconfirmed blocker answers stay in the browser
   for the signed-in human only; a note is never written before your stored
   notes load, and leaving stores it first; an unconfirmed blocker answer is
   retried only as the identical request; and a message opened from search
@@ -33,6 +31,18 @@ under the new package version and its publication date.
   hosts and origins are refused.
 
 ### Changed
+
+- The server is now its own package and binary, `bbs-server`, which carries
+  the web UI; `bbs-cli` is the client alone and no longer includes server or
+  browser code. Both are built on a shared library, `bbs-core`. A machine
+  that runs the shared server installs it separately
+  (`cargo install --locked bbs-server`); `bbs serve` runs the installed
+  `bbs-server`, found next to `bbs` and then on `PATH`, and says how to install
+  it when there is none; `bbs-server` takes the same arguments. `bbs admin`
+  and `bbs backup` stay in the client. The container image carries both
+  binaries, so existing invocations keep working. The web UI is always part of
+  `bbs-server`, whose page is committed built (`crates/bbs-server/web/dist`),
+  so no Rust build needs Node.js.
 
 - Messages in `bbs view` and every `bbs connect` thread wrap one column
   narrower, keeping text off the right edge of the terminal; card

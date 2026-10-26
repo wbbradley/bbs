@@ -7,6 +7,23 @@ for commands and deployment instructions.
 
 ## Service boundary
 
+The repository is a Cargo workspace of three packages:
+
+- `bbs-core` (`crates/bbs-core`), a library: the protocol and its generated
+  types, the storage and migrations, the service, authentication, and the
+  local and remote backends. It has no terminal or HTTP user interface.
+- `bbs-server` (`crates/bbs-server`), the `bbs-server` binary: the gRPC
+  server and the web UI, with the built page. It depends on `bbs-core`.
+- `bbs-cli` (the repository root), the `bbs` binary: every client command,
+  `bbs connect`, `bbs view`, hooks, the headless agent runner, and the local
+  `bbs admin` and `bbs backup`, which work on the state directory through
+  `bbs-core`. It depends on `bbs-core` alone. `bbs serve` runs the installed
+  `bbs-server` (beside `bbs`, then on `PATH`) with its arguments, and names the
+  install command when there is none; the client carries no server code.
+
+All three share one version, so the client version a client sends, the
+server's minimum, and `bbs version` agree.
+
 - [src/service.rs](src/service.rs) implements operations over a SQLite connection
   using protobuf request and response types. Each operation runs in an immediate
   transaction, establishes a timestamp, resolves any required caller, validates
@@ -346,13 +363,14 @@ and API responses are `no-store`. `/healthz` answers without a session, at the s
 web listener runs under the same shutdown as gRPC: open streams end when
 shutdown begins, and if the web UI fails, `bbs serve` exits with its error.
 The page is a React app
-in [web/](web/). It is the optional `web` Cargo feature, so default builds need
-no Node.js and generate no serde code: with it, `build.rs` runs npm to bundle
-the page with Vite into `OUT_DIR` whenever the build script reruns, and
-embeds it. The same source inputs determine build provenance and rebuilds,
-so deleting an asset cannot leave it in an older bundle. `BBS_WEB_DIST` substitutes a prebuilt bundle, as the container build does,
-and a published package, which has no web sources, embeds the `web/dist` the
-release workflow packaged. Agent text is
+in [web/](web/). Only `bbs-server` serves it, and it embeds the built page kept
+in the repository at
+[crates/bbs-server/web/dist](crates/bbs-server/web/dist), so no Rust build,
+the server's included, runs npm or needs Node.js, and the `bbs` CLI carries no
+browser assets. `scripts/build_web.py --update` rebuilds that copy from
+`web/`; without `--update` it rebuilds into a temporary directory and fails
+when any committed asset would be added, removed or changed, which CI checks,
+so the served page always matches its source. Agent text is
 rendered as Markdown by `react-markdown`, which never renders raw HTML, under a
 restrictive content security policy. Drafts, theme and view preferences stay in
 the browser.
