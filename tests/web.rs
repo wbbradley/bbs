@@ -246,28 +246,12 @@ fn watch_streams_arrive_as_server_sent_events() {
     let server = Server::start("watch");
     let token = server.human("ada");
     let cookie = sign_in(&server, "ada", &token);
-
-    let mut stream = server.connect();
-    let q = "%7B%22backlog%22%3A10%7D";
-    write!(
-        stream,
-        "GET /api/watch/feed?q={q} HTTP/1.1\r\nHost: {}\r\n{cookie}\r\n\r\n",
-        server.web
-    )
-    .unwrap();
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    assert!(line.starts_with("HTTP/1.1 200"), "{line}");
-    let first = loop {
-        line.clear();
-        reader.read_line(&mut line).unwrap();
-        if let Some(data) = line.strip_prefix("data: ") {
-            break data.trim().to_string();
-        }
-    };
-    let snapshot: serde_json::Value = serde_json::from_str(&first).unwrap();
-    assert_eq!(snapshot["messages"], serde_json::json!([]));
+    let path = events_path(serde_json::json!([
+        {"key": "feed", "kind": "feed", "q": {"backlog": 10}}
+    ]));
+    let mut sse = Sse::open(&server, &path, &cookie);
+    let (_, first) = sse.next().expect("the first snapshot");
+    assert_eq!(first["snapshot"]["messages"], serde_json::json!([]));
 
     // A change sends the next snapshot.
     let sent = server.request(
@@ -285,17 +269,16 @@ fn watch_streams_arrive_as_server_sent_events() {
     );
     assert_eq!(r.status, 200, "{}", r.body);
     // Registering the group was a change too; its snapshot may come first.
-    loop {
-        line.clear();
-        assert!(reader.read_line(&mut line).unwrap() > 0, "stream ended");
-        if line.starts_with("data: ") && line.contains("hello from the web") {
-            break;
-        }
-    }
+    let found = std::iter::from_fn(|| sse.next())
+        .find(|(_, d)| d.to_string().contains("hello from the web"));
+    assert!(found.is_some(), "stream ended");
 
-    // Without a session the stream is refused before it opens.
-    let r = server.request("GET", &format!("/api/watch/feed?q={q}"), &[], "");
+    // Without a session the stream is refused before it opens; the old
+    // single-watch route is gone.
+    let r = server.request("GET", &path, &[], "");
     assert_eq!(r.status, 401);
+    let r = server.request("GET", "/api/watch/feed", &[&cookie], "");
+    assert_eq!(r.status, 404);
 }
 
 #[test]

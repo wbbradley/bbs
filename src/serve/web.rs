@@ -76,7 +76,6 @@ pub async fn serve(
         .route("/api/info", get(info))
         .route("/api/rpc/{method}", post(rpc))
         .route("/api/events", get(events))
-        .route("/api/watch/{kind}", get(watch))
         .route("/healthz", get(healthz))
         .fallback(static_file)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
@@ -878,48 +877,6 @@ async fn events(
             Out::Last(fail_event(None, e.status, &e.message))
         }
         Err(e) => Out::Event(fail_event(Some(&key), e.status, &e.message)),
-    });
-    Ok(sse(relay(app, id, slot, Box::pin(source))))
-}
-
-#[derive(serde::Deserialize)]
-struct WatchQuery {
-    /// The request message as JSON.
-    #[serde(default)]
-    q: Option<String>,
-}
-
-/// One watch as server-sent events: each snapshot is a `message` event with
-/// the snapshot as JSON. A failure is one `fail` event, `{"error",
-/// "status"}`, after which the stream ends; the page decides whether to retry.
-async fn watch(
-    State(app): State<Arc<App>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Path(kind): Path<String>,
-    Query(query): Query<WatchQuery>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let (id, session) = match signed_in(&app, &headers) {
-        Ok(signed_in) => signed_in,
-        Err(e) => return Ok(finish(&app, "", Err(e))),
-    };
-    let q = query.q.unwrap_or_default();
-    let stream = match open_watch(&app, &kind, q.as_bytes(), &session, peer).await {
-        Ok(stream) => stream,
-        Err(e) => return Ok(finish(&app, &id, Err(e))),
-    };
-    let Some(slot) = Sessions::stream(&app, &id) else {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("at most {STREAMS_PER_SESSION} open streams per session"),
-        ));
-    };
-    let source = stream.map(|item| match item {
-        Ok(snapshot) => Out::Event(Event::default().json_data(snapshot).expect("JSON")),
-        Err(e) => {
-            let data = serde_json::json!({ "error": e.message, "status": e.status.as_u16() });
-            Out::Last(Event::default().event("fail").data(data.to_string()))
-        }
     });
     Ok(sse(relay(app, id, slot, Box::pin(source))))
 }

@@ -321,7 +321,7 @@ streams (`feed`, `summary`, `activity`) over one server-sent event stream, so
 a tab holds one connection however much it shows: each snapshot is a `message`
 event with its key, a watch that fails sends a keyed `fail` event and ends
 alone, and a `fail` with a null key means the session ended.
-`GET /api/watch/{kind}` relays a single watch. Activity is relayed as its
+Activity is relayed as its
 newest window followed by cursor batches, so a busy agent never resends its
 whole window.
 
