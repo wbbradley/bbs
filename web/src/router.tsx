@@ -4,21 +4,63 @@ import { draftOwnerNow } from "./util";
 // A small history router: the server answers every non-API path with the page.
 
 const listeners = new Set<() => void>();
+const notify = () => listeners.forEach((f) => f());
 
-/** The address the page shows; Back and Forward return to it if refused. */
-let shown = location.pathname + location.search;
+// Each history entry knows its place, so Back and Forward can be undone
+// and redone exactly, never by adding entries.
+const place = (): number => {
+  const idx = (history.state as { idx?: unknown } | null)?.idx;
+  return typeof idx === "number" ? idx : 0;
+};
+if (typeof (history.state as { idx?: unknown } | null)?.idx !== "number") {
+  history.replaceState({ idx: 0 }, "");
+}
+/** The place of the entry the page shows. */
+let index = place();
 
-// Back and Forward ask the leave guards too: the address goes back to the
-// page still shown while they decide, and moves only if they all agree.
+/**
+ * Back or Forward the leave guards must agree to: first the browser is
+ * sent back to the entry shown ("undoing"), then, if they agree, forward
+ * by the same steps again ("redoing"), which the page then follows. A
+ * move made while they decide is undone and dropped.
+ */
+let traversal: { phase: "undoing" | "deciding" | "redoing"; delta: number } | null = null;
+
 window.addEventListener("popstate", () => {
-  const to = location.pathname + location.search;
-  if (leaveGuards.size === 0) {
-    shown = to;
-    listeners.forEach((f) => f());
+  const at = place();
+  if (traversal?.phase === "undoing") {
+    traversal.phase = "deciding";
+    const { delta } = traversal;
+    void (async () => {
+      const ok = await agreeToLeave();
+      if (ok && traversal) {
+        traversal.phase = "redoing";
+        history.go(delta);
+      } else {
+        traversal = null;
+      }
+    })();
     return;
   }
-  history.pushState(null, "", shown);
-  void navigate(to);
+  if (traversal?.phase === "redoing") {
+    traversal = null;
+    index = at;
+    notify();
+    return;
+  }
+  if (traversal?.phase === "deciding") {
+    // Another step while the guards decide: undone, not followed.
+    if (at !== index) history.go(index - at);
+    return;
+  }
+  const delta = at - index;
+  if (delta === 0 || leaveGuards.size === 0) {
+    index = at;
+    notify();
+    return;
+  }
+  traversal = { phase: "undoing", delta };
+  history.go(-delta);
 });
 
 function subscribe(f: () => void) {
@@ -37,16 +79,24 @@ export function addLeaveGuard(guard: () => boolean | Promise<boolean>): () => vo
   return () => leaveGuards.delete(guard);
 }
 
-/** Move to `to` once every leave guard agrees; resolves whether it moved. */
-export async function navigate(to: string, replace = false): Promise<boolean> {
-  if (to === location.pathname + location.search) return true;
-  // A guard that waits on the server may see the human sign out meanwhile;
-  // then the page is no longer theirs to move.
+/**
+ * Whether every leave guard agrees, in turn. A guard that waits on the
+ * server may see the human sign out meanwhile; then the page is no longer
+ * theirs to move.
+ */
+async function agreeToLeave(): Promise<boolean> {
   const owner = draftOwnerNow();
   for (const guard of [...leaveGuards]) {
     if (!(await guard())) return false;
     if (draftOwnerNow() !== owner) return false;
   }
+  return true;
+}
+
+/** Move to `to` once every leave guard agrees; resolves whether it moved. */
+export async function navigate(to: string, replace = false): Promise<boolean> {
+  if (to === location.pathname + location.search) return true;
+  if (!(await agreeToLeave())) return false;
   go(to, replace);
   return true;
 }
@@ -54,10 +104,9 @@ export async function navigate(to: string, replace = false): Promise<boolean> {
 /** Change the address now, with no guards: for this page's own state. */
 export function go(to: string, replace = false) {
   if (to === location.pathname + location.search) return;
-  if (replace) history.replaceState(null, "", to);
-  else history.pushState(null, "", to);
-  shown = to;
-  listeners.forEach((f) => f());
+  if (replace) history.replaceState({ idx: index }, "", to);
+  else history.pushState({ idx: ++index }, "", to);
+  notify();
 }
 
 export function usePath(): string {

@@ -36,26 +36,52 @@ const area = () => screen.getByRole("textbox") as HTMLTextAreaElement;
 beforeEach(() => {
   api.reset();
   localStorage.clear();
-  history.replaceState(null, "", "/agents/Mateo");
+  go("/agents/Mateo");
 });
 afterEach(cleanup);
 
 describe("notes", () => {
-  it("keeps Back from leaving a changed note it could not store", async () => {
-    go("/feed");
+  it("stores a changed note before Back and Forward move, keeping the history as it was", async () => {
+    go("/a");
+    go("/b");
     go("/agents/Mateo");
+    const entries = history.length;
     drawer();
     await act(async () => api.take("list_agent_notes").resolve({ notes: [], has_more: false, next_after_revision: 0 }));
     fireEvent.change(area(), { target: { value: "unsaved" } });
-    // The browser moves the address back, as Back does.
-    history.replaceState(null, "", "/feed");
-    act(() => {
-      window.dispatchEvent(new PopStateEvent("popstate"));
-    });
+    act(() => history.back());
+    await waitFor(() => expect(api.pending("put_agent_note")).toHaveLength(1));
     expect(location.pathname).toBe("/agents/Mateo");
+    await act(async () => api.take("put_agent_note").resolve({ note: note("unsaved", 1) }));
+    await waitFor(() => expect(location.pathname).toBe("/b"));
+    act(() => history.back());
+    await waitFor(() => expect(location.pathname).toBe("/a"));
+    act(() => history.forward());
+    await waitFor(() => expect(location.pathname).toBe("/b"));
+    act(() => history.forward());
+    await waitFor(() => expect(location.pathname).toBe("/agents/Mateo"));
+    expect(history.length).toBe(entries);
+  });
+
+  it("stays on the same entry with its text when the note cannot be stored", async () => {
+    go("/a");
+    go("/agents/Mateo");
+    const entries = history.length;
+    drawer();
+    await act(async () => api.take("list_agent_notes").resolve({ notes: [], has_more: false, next_after_revision: 0 }));
+    fireEvent.change(area(), { target: { value: "unsaved" } });
+    act(() => history.back());
+    await waitFor(() => expect(api.pending("put_agent_note")).toHaveLength(1));
     await act(async () => api.take("put_agent_note").reject(new Error("refused")));
+    await act(async () => new Promise((r) => setTimeout(r, 20)));
     expect(location.pathname).toBe("/agents/Mateo");
     expect(area().value).toBe("unsaved");
+    expect(history.length).toBe(entries);
+    // Back again, now that it can be stored, reaches the entry before.
+    act(() => history.back());
+    await waitFor(() => expect(api.pending("put_agent_note")).toHaveLength(1));
+    await act(async () => api.take("put_agent_note").resolve({ note: note("unsaved", 1) }));
+    await waitFor(() => expect(location.pathname).toBe("/a"));
   });
 
   it("holds the text while it is being stored, so what closes is what was stored", async () => {

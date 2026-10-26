@@ -8,6 +8,7 @@ import { Dialog } from "./components/Dialog";
 import { MessageView } from "./components/MessageView";
 import { Launcher } from "./Launcher";
 import { seedFound } from "./useMessages";
+import { go } from "./router";
 import { Conversation } from "./pages/Conversation";
 import { useBoard } from "./store";
 import { Board, ADA } from "./test/setup";
@@ -49,7 +50,7 @@ function Cover() {
 }
 
 async function conversation(search = "") {
-  history.replaceState(null, "", `/agents/Mateo${search}`);
+  go(`/agents/Mateo${search}`);
   api.auto.set("list_agents", () => ({ agents: [mateo], humans: [] }));
   api.auto.set("list_agent_notes", () => ({ notes: [], has_more: false, next_after_revision: 0 }));
   api.auto.set("side_report", () => ({}));
