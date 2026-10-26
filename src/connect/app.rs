@@ -8433,6 +8433,38 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_o_on_the_blockers_page_leaves_a_pending_answer_to_finish() {
+        let (mut app, mut rx) = app();
+        live(&mut app, &[("Theo", 7), ("Grove", 8)]);
+        ctrl(&mut app, 'p');
+        app.on_event(Event::Paste("Theo".into()));
+        enter(&mut app);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let id = queue(&mut app, &mut rx, vec![grove_asks()]);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        typed(&mut app, "the answer");
+        enter(&mut app);
+        let req = answered(&mut rx);
+        ctrl(&mut app, 'o');
+        assert_eq!(opened(&app), Some(Conversation::Agent("Theo".into())));
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|r| matches!(r, Request::AnswerBlocker { .. })),
+            "nothing resent"
+        );
+        // The write lands while covered; back on the page it is done.
+        app.on_event(Event::Data(Data::BlockerWritten {
+            id,
+            key: req.request_key,
+            result: Ok(Default::default()),
+        }));
+        blockers_listed(&mut app, id, vec![]);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.on_blockers());
+        assert!(screen(&mut app, 80, 24).contains("No open blockers."));
+    }
+
+    #[test]
     fn ctrl_o_on_the_blockers_page_moves_a_conversation_open_beneath_it() {
         let (mut app, mut rx) = app();
         mateo(&mut app, &mut rx);
