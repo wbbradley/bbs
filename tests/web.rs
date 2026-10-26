@@ -15,12 +15,17 @@ struct Server {
 
 impl Server {
     fn start(test: &str) -> Server {
+        Server::start_with(test, &[])
+    }
+
+    fn start_with(test: &str, args: &[&str]) -> Server {
         let home = std::env::temp_dir().join(format!("bbs-web-{}-{test}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_bbs"))
             .args(["serve", "--listen", "127.0.0.1:0", "--web", "127.0.0.1:0"])
             .arg("--require-human-token")
+            .args(args)
             .env("HOME", &home)
             .stdout(Stdio::piped())
             .spawn()
@@ -59,12 +64,22 @@ impl Server {
         stream
     }
 
-    /// One request; the whole response as (status, headers, body).
+    /// One request, as the page sends it (a POST names its origin); the
+    /// whole response.
     fn request(&self, method: &str, path: &str, headers: &[&str], body: &str) -> Response {
+        let origin = format!("origin: http://{}", self.web);
+        let mut all = headers.to_vec();
+        if method == "POST" {
+            all.push(&origin);
+        }
+        self.raw(method, path, &self.web, &all, body)
+    }
+
+    /// One request exactly as given, to `host`.
+    fn raw(&self, method: &str, path: &str, host: &str, headers: &[&str], body: &str) -> Response {
         let mut stream = self.connect();
         let mut head = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n",
-            self.web,
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n",
             body.len()
         );
         for header in headers {
@@ -292,4 +307,328 @@ fn the_page_is_served_for_client_routes() {
     assert!(r.header("content-security-policy").is_some());
     let r = server.request("GET", "/api/nothing", &[], "");
     assert_eq!(r.status, 404);
+}
+
+/// An open event stream: its `event`/`data` pairs, one at a time.
+struct Sse {
+    reader: BufReader<TcpStream>,
+}
+
+impl Sse {
+    fn open(server: &Server, path: &str, cookie: &str) -> Sse {
+        let mut stream = server.connect();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: {}\r\n{cookie}\r\n\r\n",
+            server.web
+        )
+        .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.starts_with("HTTP/1.1 200"), "{line}");
+        let mut cache = None;
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':')
+                && k.eq_ignore_ascii_case("cache-control")
+            {
+                cache = Some(v.trim().to_string());
+            }
+        }
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        Sse { reader }
+    }
+
+    /// The next event as (name, data), or None when the stream ends.
+    fn next(&mut self) -> Option<(String, serde_json::Value)> {
+        let mut name = "message".to_string();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.reader.read_line(&mut line).ok()?;
+            if n == 0 {
+                return None;
+            }
+            // Chunked framing lines carry no field.
+            if let Some(event) = line.strip_prefix("event: ") {
+                name = event.trim().to_string();
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                return Some((name, serde_json::from_str(data.trim()).unwrap()));
+            }
+        }
+    }
+}
+
+fn events_path(subscriptions: serde_json::Value) -> String {
+    let s: String = subscriptions
+        .to_string()
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!("/api/events?s={s}")
+}
+
+#[test]
+fn logging_out_ends_the_session_for_every_copy_of_the_cookie() {
+    let server = Server::start("logout");
+    let token = server.human("ada");
+    let cookie = sign_in(&server, "ada", &token);
+    // The cookie is a session id, not the credential.
+    assert!(!cookie.contains(&token));
+    let encoded = data_encoding::BASE64URL_NOPAD.encode(token.as_bytes());
+    assert!(!cookie.contains(&encoded));
+    assert!(cookie.starts_with("cookie: bbs_session="), "{cookie}");
+    let r = server.request("POST", "/api/logout", &[CSRF, &cookie], "");
+    assert_eq!(r.status, 204);
+    // A copy kept from before signing out is worthless.
+    let r = server.request("POST", "/api/rpc/whoami", &[CSRF, &cookie], "");
+    assert_eq!(r.status, 401, "{}", r.body);
+    // Signing in again starts a different session.
+    let again = sign_in(&server, "ada", &token);
+    assert_ne!(again, cookie);
+    let r = server.request("POST", "/api/rpc/whoami", &[CSRF, &again], "");
+    assert_eq!(r.status, 200, "{}", r.body);
+}
+
+#[test]
+fn a_rotated_token_ends_the_session_and_its_open_streams() {
+    let server = Server::start("rotate-stream");
+    let token = server.human("ada");
+    let cookie = sign_in(&server, "ada", &token);
+    let path = events_path(serde_json::json!([
+        {"key": "feed", "kind": "feed", "q": {"backlog": 10}}
+    ]));
+    let mut sse = Sse::open(&server, &path, &cookie);
+    let (name, data) = sse.next().expect("the first snapshot");
+    assert_eq!(
+        (name.as_str(), &data["key"]),
+        ("message", &serde_json::json!("feed"))
+    );
+    let rotated = Command::new(env!("CARGO_BIN_EXE_bbs"))
+        .args(["admin", "human", "rotate", "ada"])
+        .env("HOME", &server.home)
+        .output()
+        .unwrap();
+    assert!(rotated.status.success());
+    // The stream says the session ended, then ends.
+    let ended = std::iter::from_fn(|| sse.next()).find(|(name, _)| name == "fail");
+    let (_, data) = ended.expect("a fail event");
+    assert_eq!(data["key"], serde_json::Value::Null, "{data}");
+    assert_eq!(data["status"], 401, "{data}");
+    assert!(sse.next().is_none());
+    let r = server.request("POST", "/api/rpc/whoami", &[CSRF, &cookie], "");
+    assert_eq!(r.status, 401, "{}", r.body);
+    assert!(r.header("set-cookie").unwrap().contains("Max-Age=0"));
+}
+
+#[test]
+fn other_hosts_and_origins_are_refused() {
+    let server = Server::start("boundary");
+    let token = server.human("ada");
+    let cookie = sign_in(&server, "ada", &token);
+    let login = serde_json::json!({ "name": "ada", "token": token }).to_string();
+    // A rebound DNS name reaches the port but not the API or the page.
+    let r = server.raw(
+        "POST",
+        "/api/login",
+        "evil.example",
+        &[CSRF, "origin: http://evil.example"],
+        &login,
+    );
+    assert_eq!(r.status, 421, "{}", r.body);
+    let r = server.raw("GET", "/", "evil.example", &[], "");
+    assert_eq!(r.status, 421, "{}", r.body);
+    // Another origin, or none, may not call.
+    let r = server.raw(
+        "POST",
+        "/api/login",
+        &server.web,
+        &[CSRF, "origin: http://localhost:1"],
+        &login,
+    );
+    assert_eq!(r.status, 403, "{}", r.body);
+    let r = server.raw("POST", "/api/rpc/whoami", &server.web, &[CSRF, &cookie], "");
+    assert_eq!(r.status, 403, "{}", r.body);
+    let r = server.raw(
+        "GET",
+        "/api/info",
+        &server.web,
+        &["sec-fetch-site: cross-site"],
+        "",
+    );
+    assert_eq!(r.status, 403, "{}", r.body);
+    let r = server.raw(
+        "GET",
+        "/api/info",
+        &server.web,
+        &["sec-fetch-site: same-origin"],
+        "",
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    // localhost is the same loopback server.
+    let port = server.web.rsplit(':').next().unwrap();
+    let local = format!("localhost:{port}");
+    let origin = format!("origin: http://{local}");
+    let r = server.raw(
+        "POST",
+        "/api/rpc/whoami",
+        &local,
+        &[CSRF, &cookie, &origin],
+        "",
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    // Readiness answers whatever the host, as probes send.
+    let r = server.raw("GET", "/healthz", "10.0.0.7:7778", &[], "");
+    assert_eq!(r.status, 200, "{}", r.body);
+    // The page forbids a base URL and foreign form posts.
+    let r = server.request("GET", "/", &[], "");
+    let csp = r.header("content-security-policy").unwrap();
+    assert!(
+        csp.contains("base-uri 'none'") && csp.contains("form-action 'self'"),
+        "{csp}"
+    );
+}
+
+#[test]
+fn one_event_stream_carries_several_watches() {
+    let server = Server::start("events");
+    let token = server.human("ada");
+    let cookie = sign_in(&server, "ada", &token);
+    let path = events_path(serde_json::json!([
+        {"key": "feed", "kind": "feed", "q": {"backlog": 10}},
+        {"key": "summary", "kind": "summary", "q": {}},
+        {"key": "nope", "kind": "bogus"}
+    ]));
+    let mut sse = Sse::open(&server, &path, &cookie);
+    let mut seen = std::collections::BTreeMap::new();
+    while seen.len() < 3 {
+        let (name, data) = sse.next().expect("an event");
+        seen.insert(data["key"].as_str().unwrap().to_string(), (name, data));
+    }
+    assert_eq!(seen["feed"].0, "message");
+    assert_eq!(
+        seen["feed"].1["snapshot"]["messages"],
+        serde_json::json!([])
+    );
+    assert_eq!(seen["summary"].0, "message");
+    // A bad watch fails alone; the others go on.
+    assert_eq!(seen["nope"].0, "fail");
+    assert_eq!(seen["nope"].1["status"], 404);
+    server.request(
+        "POST",
+        "/api/rpc/group_register",
+        &[CSRF, &cookie],
+        r#"{"group":"core"}"#,
+    );
+    let r = server.request(
+        "POST",
+        "/api/rpc/send",
+        &[CSRF, &cookie],
+        r#"{"to":"@core","body":"over one stream"}"#,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let update = std::iter::from_fn(|| sse.next())
+        .find(|(_, d)| d["key"] == "feed" && d.to_string().contains("over one stream"));
+    assert!(update.is_some());
+    // Bounds.
+    let many: Vec<_> = (0..9)
+        .map(|i| serde_json::json!({"key": format!("k{i}"), "kind": "summary"}))
+        .collect();
+    let r = server.request("GET", &events_path(serde_json::json!(many)), &[&cookie], "");
+    assert_eq!(r.status, 400, "{}", r.body);
+    let twice =
+        serde_json::json!([{"key": "a", "kind": "summary"}, {"key": "a", "kind": "summary"}]);
+    let r = server.request("GET", &events_path(twice), &[&cookie], "");
+    assert_eq!(r.status, 400, "{}", r.body);
+}
+
+#[test]
+fn an_https_origin_makes_the_cookie_secure_and_host_only() {
+    let server = Server::start_with("secure", &["--web-origin", "https://bbs.example.com"]);
+    let token = server.human("ada");
+    let body = serde_json::json!({ "name": "ada", "token": token }).to_string();
+    let r = server.raw(
+        "POST",
+        "/api/login",
+        "bbs.example.com",
+        &[CSRF, "origin: https://bbs.example.com"],
+        &body,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let cookie = r.header("set-cookie").unwrap();
+    assert!(cookie.starts_with("__Host-bbs_session="), "{cookie}");
+    assert!(
+        cookie.contains("; Secure") && cookie.contains("Path=/"),
+        "{cookie}"
+    );
+    // A forwarded-protocol header no longer decides anything.
+    let plain = Server::start("plain-xfp");
+    let token = plain.human("ada");
+    let body = serde_json::json!({ "name": "ada", "token": token }).to_string();
+    let r = plain.request(
+        "POST",
+        "/api/login",
+        &[CSRF, "x-forwarded-proto: https"],
+        &body,
+    );
+    assert!(!r.header("set-cookie").unwrap().contains("Secure"));
+}
+
+#[test]
+fn a_network_address_needs_an_origin() {
+    let home = std::env::temp_dir().join(format!("bbs-web-{}-origin", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_bbs"))
+        .args(["serve", "--listen", "127.0.0.1:0", "--web", "0.0.0.0:0"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--web-origin"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn stopping_ends_open_streams_and_exits_promptly() {
+    let mut server = Server::start("stop");
+    let token = server.human("ada");
+    let cookie = sign_in(&server, "ada", &token);
+    let path = events_path(serde_json::json!([{"key": "s", "kind": "summary"}]));
+    let mut sse = Sse::open(&server, &path, &cookie);
+    assert!(sse.next().is_some());
+    let started = std::time::Instant::now();
+    let kill = Command::new("kill")
+        .args(["-TERM", &server.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    // The stream ends rather than hold the server open.
+    while sse.next().is_some() {}
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(started.elapsed() < Duration::from_secs(8), "still running");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
 }

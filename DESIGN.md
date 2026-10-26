@@ -316,17 +316,33 @@ Requests and responses are the proto messages as JSON with proto field names;
 `build.rs` derives serde for every generated message, absent optionals are
 `null` and enums are their numbers. `POST /api/rpc/<rpc>` covers the unary RPCs
 the page uses, named in snake case; agent-only and enrollment RPCs are not
-offered. `GET /api/watch/{feed,summary,activity}?q=<request JSON>` relays watch
-streams as server-sent events, one snapshot per event and a final `fail` event
-on error. Activity is relayed as its newest window followed by cursor batches,
-so a busy agent never resends its whole window.
+offered. `GET /api/events?s=<JSON [{key, kind, q}]>` relays up to eight watch
+streams (`feed`, `summary`, `activity`) over one server-sent event stream, so
+a tab holds one connection however much it shows: each snapshot is a `message`
+event with its key, a watch that fails sends a keyed `fail` event and ends
+alone, and a `fail` with a null key means the session ended.
+`GET /api/watch/{kind}` relays a single watch. Activity is relayed as its
+newest window followed by cursor batches, so a busy agent never resends its
+whole window.
 
 Signing in calls `Whoami` with a name and human token, in either server mode,
-and keeps both in an `HttpOnly`, `SameSite=Strict` cookie (also `Secure` when
-a TLS proxy sets `X-Forwarded-Proto: https`). Nothing is stored server-side:
-every call checks the credential again, so rotation or revocation takes effect
-at once, and signing out only clears the cookie. Mutating calls require an
-`x-bbs-web` header, which cross-site forms cannot send. The page is a React app
+and opens a session held in the server's memory: the `HttpOnly`,
+`SameSite=Strict` cookie carries only its random id, never the token. A
+session ends when the human signs out, after a day unused or a week in all,
+when any call finds the token rotated or revoked (open streams end within five
+seconds), and when the server restarts. Every call still sends the token, so
+the gRPC server checks it each time.
+
+Browsers reach the UI at one origin: the loopback address it listens on, or
+`--web-origin`, which any other address requires. An `https` origin marks the
+cookie `Secure` and names it `__Host-bbs_session`, which no sibling site can
+set. Requests naming another host are refused, so a rebound DNS name cannot
+reach the API; API calls must come from that origin (by `Origin`, and
+`Sec-Fetch-Site` when sent), mutating calls also need an `x-bbs-web` header,
+and API responses are `no-store`. `/healthz` answers any host, for probes. The
+web listener runs under the same shutdown as gRPC: open streams end when
+shutdown begins, and if the web UI fails, `bbs serve` exits with its error.
+The page is a React app
 in [web/](web/). It is the optional `web` Cargo feature, so default builds need
 no Node.js and generate no serde code: with it, `build.rs` runs npm to bundle
 the page with Vite into `OUT_DIR` (only when a web input changed) and embeds

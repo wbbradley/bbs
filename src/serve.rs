@@ -39,9 +39,17 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 const ACTIVITY_BATCH: usize = 64;
 const ACTIVITY_BATCH_WAIT: Duration = Duration::from_millis(50);
 
+/// `bbs serve --web`: where the web UI listens, and the origin browsers reach
+/// it at when that is not the listening address itself.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub struct Web {
+    pub addr: SocketAddr,
+    pub origin: Option<String>,
+}
+
 pub async fn run(
     listen: SocketAddr,
-    web: Option<SocketAddr>,
+    web: Option<Web>,
     dir: &Path,
     require_human_token: bool,
     protocol: Policy,
@@ -70,7 +78,7 @@ pub async fn run(
 async fn serve(
     conn: Connection,
     listen: SocketAddr,
-    web: Option<SocketAddr>,
+    web: Option<Web>,
     dir: &Path,
     require_human_token: bool,
     protocol: Policy,
@@ -81,15 +89,21 @@ async fn serve(
         .await
         .with_context(|| format!("binding {listen}"))?;
     let addr = listener.local_addr()?;
-    #[cfg_attr(not(feature = "web"), allow(unused_variables))]
-    let web_listener = match web {
-        Some(web) => Some(
-            tokio::net::TcpListener::bind(web)
+    // Bound and checked before anything is served, so a bad origin or a busy
+    // port stops `serve` at once.
+    #[cfg(feature = "web")]
+    let web = match web {
+        Some(web) => {
+            let listener = tokio::net::TcpListener::bind(web.addr)
                 .await
-                .with_context(|| format!("binding {web}"))?,
-        ),
+                .with_context(|| format!("binding {}", web.addr))?;
+            let boundary = web::Boundary::new(listener.local_addr()?, web.origin.as_deref())?;
+            Some((listener, boundary))
+        }
         None => None,
     };
+    #[cfg(not(feature = "web"))]
+    drop(web);
     let state = Arc::new(State {
         conn: Mutex::new(conn),
         notify: watch::Sender::new(0),
@@ -114,29 +128,55 @@ async fn serve(
     tokio::pin!(server);
     // Tests read this line to learn the port when listening on port 0.
     println!("bbs serve listening on {addr}");
+    // The web UI runs alongside the gRPC server, never apart from it: if it
+    // fails, `serve` exits with its error rather than carry on without it.
+    type WebUi = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
     #[cfg(feature = "web")]
-    if let Some(listener) = web_listener {
-        let web_addr = listener.local_addr()?;
-        println!("bbs serve web UI on http://{web_addr}");
-        tracing::info!(%web_addr, "serving web UI");
-        let stopping = state.clone();
-        let server = Server(state.clone());
-        tokio::spawn(async move {
-            let shutdown = async move { stopping.stopping().await };
-            if let Err(e) = web::serve(listener, server, shutdown).await {
-                tracing::error!("{e:#}");
-            }
-        });
-    }
+    let mut web_ui: Option<WebUi> = match web {
+        Some((listener, boundary)) => {
+            let web_addr = listener.local_addr()?;
+            println!("bbs serve web UI on http://{web_addr}");
+            tracing::info!(%web_addr, origin = %boundary.origin(), "serving web UI");
+            Some(Box::pin(web::serve(
+                listener,
+                Server(state.clone()),
+                boundary,
+            )))
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "web"))]
+    let mut web_ui: Option<WebUi> = None;
     tracing::info!(%addr, state_dir = %dir.display(), "serving");
     tokio::select! {
         result = &mut server => result?,
+        result = async {
+            match web_ui.as_mut() {
+                Some(web_ui) => web_ui.await,
+                None => std::future::pending().await,
+            }
+        } => {
+            // It only returns once shutdown begins, which has not.
+            result?;
+            anyhow::bail!("the web UI stopped serving");
+        }
         result = signal => {
             result?;
             health.set_not_serving::<BbsServer<Server>>().await;
             health.set_service_status("", tonic_health::ServingStatus::NotServing).await;
             state.shutdown.send_replace(true);
-            match tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await {
+            let drained = async {
+                let web = async {
+                    match web_ui.as_mut() {
+                        Some(web_ui) => web_ui.await,
+                        None => Ok(()),
+                    }
+                };
+                let (grpc, web) = tokio::join!(&mut server, web);
+                grpc?;
+                web
+            };
+            match tokio::time::timeout(SHUTDOWN_GRACE, drained).await {
                 Ok(result) => result?,
                 // Health watchers and clients that stop consuming streams can
                 // otherwise keep the HTTP/2 connection alive indefinitely.

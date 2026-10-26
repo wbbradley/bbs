@@ -124,6 +124,12 @@ pub enum Command {
         /// Needs a build with the `web` feature.
         #[arg(long, value_name = "ADDR")]
         web: Option<std::net::SocketAddr>,
+        /// The web UI's origin as browsers reach it, such as
+        /// https://bbs.example.com behind a TLS proxy. Required when --web is
+        /// not a loopback address. An https origin marks the session cookie
+        /// Secure; an http one serves sign-in and sessions in plain text.
+        #[arg(long, value_name = "URL", requires = "web")]
+        web_origin: Option<String>,
         /// Directory holding bbs.db (default: ~/.local/state/bbs).
         #[arg(long)]
         state_dir: Option<std::path::PathBuf>,
