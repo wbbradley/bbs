@@ -1,22 +1,87 @@
-//! This build's identity, embedded by `build.rs`. `ServerInfo` and `bbs version`
-//! both report from here.
+//! The running executable's identity, embedded by its own `build.rs` and
+//! handed in with [`init`] before anything reports it. `ServerInfo` and
+//! `version` both report from here.
+
+use std::sync::OnceLock;
 
 use serde::Serialize;
 
-use crate::{config, db, proto, protocol};
+use crate::{db, proto, protocol};
 
+/// The workspace's version: every bbs crate is released together at it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const REVISION: &str = env!("BBS_BUILD_REVISION");
-pub const TARGET: &str = env!("BBS_BUILD_TARGET");
-const RUST_VERSION: &str = env!("CARGO_PKG_RUST_VERSION");
 /// Version of the `bbs-release.json` layout; bump on incompatible changes.
 const MANIFEST_FORMAT: u32 = 1;
-/// `true`, `false`, or empty when unknown.
-const DIRTY: &str = env!("BBS_BUILD_DIRTY");
+/// Version of the fields the client's `~/.config/bbs/config.toml` accepts.
+/// Increase it when a change means an older binary can no longer read a
+/// config this one writes.
+pub const CONFIG_FORMAT: u32 = 4;
+
+/// What an executable was built from, as its `build.rs` found it.
+#[derive(Clone, Copy, Debug)]
+pub struct Identity {
+    /// The executable: `bbs` or `bbs-server`.
+    pub name: &'static str,
+    pub version: &'static str,
+    pub revision: &'static str,
+    pub target: &'static str,
+    /// `true`, `false`, or empty when unknown.
+    pub dirty: &'static str,
+    pub rust_version: &'static str,
+}
+
+/// The calling crate's identity from its build script's environment; an
+/// executable passes it to [`init`] first thing.
+#[macro_export]
+macro_rules! identity {
+    () => {
+        $crate::release::Identity {
+            name: env!("CARGO_BIN_NAME"),
+            version: env!("CARGO_PKG_VERSION"),
+            revision: env!("BBS_BUILD_REVISION"),
+            target: env!("BBS_BUILD_TARGET"),
+            dirty: env!("BBS_BUILD_DIRTY"),
+            rust_version: env!("CARGO_PKG_RUST_VERSION"),
+        }
+    };
+}
+
+static IDENTITY: OnceLock<Identity> = OnceLock::new();
+
+/// Record the executable's identity; the first call wins. Its version must
+/// be the workspace's, so no crate reports a release it is not part of.
+pub fn init(identity: Identity) {
+    assert_eq!(
+        identity.version, VERSION,
+        "every bbs crate is released at one version"
+    );
+    let _ = IDENTITY.set(identity);
+}
+
+/// The executable's identity; without [`init`], as in a library's own
+/// tests, an unknown revision, which no release can be made from.
+fn identity() -> &'static Identity {
+    IDENTITY.get_or_init(|| Identity {
+        name: "bbs-core",
+        version: VERSION,
+        revision: "unknown",
+        target: "unknown",
+        dirty: "",
+        rust_version: env!("CARGO_PKG_RUST_VERSION"),
+    })
+}
+
+pub fn revision() -> &'static str {
+    identity().revision
+}
+
+pub fn target() -> &'static str {
+    identity().target
+}
 
 /// Whether tracked build inputs differed from the revision; unknown with the revision.
 pub fn dirty() -> Option<bool> {
-    parse_dirty(DIRTY)
+    parse_dirty(identity().dirty)
 }
 
 fn parse_dirty(value: &str) -> Option<bool> {
@@ -46,7 +111,7 @@ impl Provenance {
 pub fn info() -> proto::ReleaseInfo {
     proto::ReleaseInfo {
         version: VERSION.into(),
-        revision: REVISION.into(),
+        revision: revision().into(),
         dirty: dirty(),
     }
 }
@@ -100,10 +165,10 @@ fn manifest(revision: &'static str, dirty: Option<bool>) -> anyhow::Result<Manif
         version: VERSION,
         tag: format!("v{VERSION}"),
         revision,
-        rust_version: RUST_VERSION,
+        rust_version: identity().rust_version,
         protocol: protocol(),
         schema_version: db::SCHEMA_VERSION,
-        config_format: config::FORMAT,
+        config_format: CONFIG_FORMAT,
     })
 }
 
@@ -117,13 +182,13 @@ fn protocol() -> Protocol {
 fn report() -> Report {
     Report {
         version: VERSION,
-        revision: REVISION,
+        revision: revision(),
         dirty: dirty(),
-        provenance: Provenance::of(REVISION, dirty()),
-        target: TARGET,
+        provenance: Provenance::of(revision(), dirty()),
+        target: target(),
         protocol: protocol(),
         schema_version: db::SCHEMA_VERSION,
-        config_format: config::FORMAT,
+        config_format: CONFIG_FORMAT,
     }
 }
 
@@ -133,7 +198,7 @@ pub fn print(json: bool, manifest: bool) -> anyhow::Result<()> {
     if manifest {
         println!(
             "{}",
-            serde_json::to_string(&self::manifest(REVISION, dirty())?)?
+            serde_json::to_string(&self::manifest(revision(), dirty())?)?
         );
         return Ok(());
     }
@@ -148,7 +213,8 @@ pub fn print(json: bool, manifest: bool) -> anyhow::Result<()> {
             (Provenance::Unknown, revision) => format!("{revision}, changes unknown"),
         };
         println!(
-            "bbs {} ({source}, {})\nprotocol bbs.v{}: {}\nschema {}, config format {}",
+            "{} {} ({source}, {})\nprotocol bbs.v{}: {}\nschema {}, config format {}",
+            identity().name,
             report.version,
             report.target,
             report.protocol.epoch,
@@ -178,26 +244,25 @@ mod tests {
         assert_eq!(parse_dirty("true"), Some(true));
         assert_eq!(parse_dirty("false"), Some(false));
         assert_eq!(parse_dirty(""), None);
-        assert!(["true", "false", ""].contains(&DIRTY));
-        if REVISION == "unknown" {
-            assert_eq!(DIRTY, "");
-        }
+        // A library's own tests run without an executable's identity.
+        assert_eq!(revision(), "unknown");
+        assert_eq!(dirty(), None);
     }
 
     #[test]
     fn report_uses_shared_constants() {
         let value = serde_json::to_value(report()).unwrap();
         assert_eq!(value["version"], VERSION);
-        assert_eq!(value["revision"], REVISION);
-        assert_eq!(value["target"], TARGET);
+        assert_eq!(value["revision"], revision());
+        assert_eq!(value["target"], target());
         assert_eq!(value["protocol"]["epoch"], protocol::EPOCH);
         assert_eq!(
             value["protocol"]["capabilities"],
             serde_json::json!(protocol::CAPABILITIES)
         );
         assert_eq!(value["schema_version"], db::SCHEMA_VERSION);
-        assert_eq!(value["config_format"], config::FORMAT);
-        assert!(REVISION == "unknown" || REVISION.len() == 40);
+        assert_eq!(value["config_format"], CONFIG_FORMAT);
+        assert!(revision() == "unknown" || revision().len() == 40);
     }
 
     #[test]
@@ -214,7 +279,7 @@ mod tests {
                 "rust_version": env!("CARGO_PKG_RUST_VERSION"),
                 "protocol": {"epoch": protocol::EPOCH, "capabilities": protocol::CAPABILITIES},
                 "schema_version": db::SCHEMA_VERSION,
-                "config_format": config::FORMAT,
+                "config_format": CONFIG_FORMAT,
             })
         );
         for (revision, dirty) in [(rev, Some(true)), (rev, None), ("unknown", Some(false))] {

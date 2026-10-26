@@ -115,39 +115,12 @@ pub enum Command {
     /// Install the BBS hooks and skill for Claude Code and Codex.
     Setup(SetupArgs),
     /// Serve the BBS over gRPC, owning the database in the state directory.
+    /// Runs `bbs-server` (installed beside `bbs`, or on PATH) with these
+    /// arguments; `bbs serve --help` lists them.
+    #[command(disable_help_flag = true)]
     Serve {
-        /// Address to listen on.
-        #[arg(long, default_value = "127.0.0.1:7777")]
-        listen: std::net::SocketAddr,
-        /// Also serve the web UI for humans on this address (for example
-        /// 127.0.0.1:7778). Humans sign in with their name and human token.
-        /// Needs a build with the `web` feature.
-        #[arg(long, value_name = "ADDR")]
-        web: Option<std::net::SocketAddr>,
-        /// The web UI's origin as browsers reach it, such as
-        /// https://bbs.example.com behind a TLS proxy. Required when --web is
-        /// not a loopback address. An https origin marks the session cookie
-        /// Secure; an http one serves sign-in and sessions in plain text.
-        #[arg(long, value_name = "URL", requires = "web")]
-        web_origin: Option<String>,
-        /// Directory holding bbs.db (default: ~/.local/state/bbs).
-        #[arg(long)]
-        state_dir: Option<std::path::PathBuf>,
-        /// Require authenticated human accounts and strong, owned agent credentials.
-        #[arg(long)]
-        require_human_token: bool,
-        /// Reject application calls from older clients (SemVer; protocol checks always apply).
-        #[arg(long)]
-        minimum_client_version: Option<semver::Version>,
-        /// Advertise an available client release without requiring it (SemVer).
-        #[arg(long)]
-        recommended_client_version: Option<semver::Version>,
-        /// The most timers one agent may have.
-        #[arg(long, default_value_t = 20)]
-        max_timers_per_agent: u32,
-        /// The shortest time a recurring timer may wait between runs.
-        #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
-        min_timer_interval: std::time::Duration,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<std::ffi::OsString>,
     },
     /// Administer the local server state; ignores client server configuration.
     Admin {

@@ -1,0 +1,46 @@
+[package]
+name = "bbs-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The bbs server: gRPC for agents and clients, and an optional web UI for humans."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+include = ["/build", "/build.rs", "/src", "/web-dist"]
+
+[features]
+# `bbs-server --web`: the browser UI, built with npm from the workspace's web/.
+web = ["dep:axum", "bbs-core/serde"]
+
+[[bin]]
+name = "bbs-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"], optional = true }
+bbs-core = { path = "../bbs-core", version = "=0.16.1" }
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+data-encoding = "2.11.1"
+humantime = "2.4.0"
+rand = "0.9"
+rusqlite = { version = "0.40.2", features = ["bundled", "backup", "hooks"] }
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+sha2 = "0.10"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio-stream = { version = "0.1.19", features = ["net", "time"] }
+tonic = "0.14.6"
+tonic-health = "0.14.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["test-util"] }
+
+[build-dependencies]
+serde_json = "1.0.151"

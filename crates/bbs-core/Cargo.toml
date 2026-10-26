@@ -1,0 +1,44 @@
+[package]
+name = "bbs-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The protocol, database and service shared by the bbs client and server."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+include = ["/build", "/build.rs", "/migrations", "/proto", "/src"]
+
+[features]
+# serde for every generated message, as the web UI's JSON API carries them.
+serde = []
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+croner = "4.0.1"
+data-encoding = "2.11.1"
+humantime = "2.4.0"
+prost = "0.14.4"
+rand = "0.9"
+regex = "1.13.1"
+rusqlite = { version = "0.40.2", features = ["bundled", "backup", "hooks"] }
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+sha2 = "0.10"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-stream = { version = "0.1.19", features = ["net", "time"] }
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tracing = "0.1.44"
+unicode-segmentation = "1.13"
+
+[dev-dependencies]
+http-body = "1.0"
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["test-util"] }
+
+[build-dependencies]
+protox = "0.10.0"
+tonic-prost-build = "0.14.6"

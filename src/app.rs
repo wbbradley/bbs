@@ -40,11 +40,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let command = command.unwrap_or(Command::Connect);
     let theme_explicit = crate::ui::theme::init(theme.as_deref())?;
     let dir = match &command {
-        Command::Serve {
-            state_dir: Some(dir),
-            ..
-        }
-        | Command::Admin {
+        Command::Admin {
             state_dir: Some(dir),
             ..
         }
@@ -68,36 +64,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                 unreachable!()
             };
             return crate::headless::run(command, &dir, as_human.as_deref()).await;
-        }
-        Command::Serve {
-            listen,
-            web,
-            web_origin,
-            state_dir,
-            require_human_token,
-            minimum_client_version,
-            recommended_client_version,
-            max_timers_per_agent,
-            min_timer_interval,
-        } => {
-            return crate::serve::run(
-                *listen,
-                web.map(|addr| crate::serve::Web {
-                    addr,
-                    origin: web_origin.clone(),
-                }),
-                state_dir.as_deref().unwrap_or(&dir),
-                *require_human_token,
-                crate::protocol::Policy::new(
-                    minimum_client_version.clone(),
-                    recommended_client_version.clone(),
-                )?,
-                crate::service::TimerLimits {
-                    max_per_agent: *max_timers_per_agent,
-                    min_interval: *min_timer_interval,
-                },
-            )
-            .await;
         }
         Command::Admin { command, .. } => return crate::admin::run(&dir, command),
         Command::Backup { destination, .. } => {

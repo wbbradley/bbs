@@ -11,9 +11,7 @@ use tonic_health::pb::{
     HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
 };
 
-mod proto {
-    tonic::include_proto!("bbs.v2");
-}
+use bbs_core::proto;
 
 use proto::bbs_client::BbsClient;
 
@@ -2100,18 +2098,4 @@ async fn search_is_advertised_and_returns_bounded_hits_over_the_wire() {
         .into_inner();
     assert_eq!(unread.messages.len(), 1);
     assert_eq!(unread.messages[0].body, body);
-}
-
-#[cfg(not(feature = "web"))]
-#[test]
-fn web_ui_needs_the_web_feature() {
-    let home = std::env::temp_dir().join(format!("bbs-serve-{}-no-web", std::process::id()));
-    let out = Command::new(env!("CARGO_BIN_EXE_bbs"))
-        .args(["serve", "--listen", "127.0.0.1:0", "--web", "127.0.0.1:0"])
-        .env("HOME", &home)
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&home);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--features web"));
 }

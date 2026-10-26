@@ -7,6 +7,24 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+/// `bbs`, which administers accounts: built beside `bbs-server` by the
+/// workspace, as the tests run with it.
+fn bbs() -> std::path::PathBuf {
+    let dir = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .and_then(|deps| deps.parent())
+        .unwrap()
+        .to_path_buf();
+    let bbs = dir.join(format!("bbs{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        bbs.is_file(),
+        "{} is missing: run `cargo test --workspace`",
+        bbs.display()
+    );
+    bbs
+}
+
 struct Server {
     child: Child,
     home: PathBuf,
@@ -22,8 +40,8 @@ impl Server {
         let home = std::env::temp_dir().join(format!("bbs-web-{}-{test}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bbs"))
-            .args(["serve", "--listen", "127.0.0.1:0", "--web", "127.0.0.1:0"])
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bbs-server"))
+            .args(["--listen", "127.0.0.1:0", "--web", "127.0.0.1:0"])
             .arg("--require-human-token")
             .args(args)
             .env("HOME", &home)
@@ -47,7 +65,7 @@ impl Server {
 
     /// A new human's token, issued as an administrator would.
     fn human(&self, name: &str) -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_bbs"))
+        let out = Command::new(bbs())
             .args(["admin", "human", "add", name])
             .env("HOME", &self.home)
             .output()
@@ -231,7 +249,7 @@ fn calls_need_the_csrf_header_and_a_valid_session() {
     assert_eq!(r.status, 401, "{}", r.body);
 
     // Rotation takes effect at once: the old cookie no longer works.
-    let rotated = Command::new(env!("CARGO_BIN_EXE_bbs"))
+    let rotated = Command::new(bbs())
         .args(["admin", "human", "rotate", "ada"])
         .env("HOME", &server.home)
         .output()
@@ -402,7 +420,7 @@ fn a_rotated_token_ends_the_session_and_its_open_streams() {
         (name.as_str(), &data["key"]),
         ("message", &serde_json::json!("feed"))
     );
-    let rotated = Command::new(env!("CARGO_BIN_EXE_bbs"))
+    let rotated = Command::new(bbs())
         .args(["admin", "human", "rotate", "ada"])
         .env("HOME", &server.home)
         .output()
@@ -579,8 +597,8 @@ fn an_https_origin_makes_the_cookie_secure_and_host_only() {
 fn a_network_address_needs_an_origin() {
     let home = std::env::temp_dir().join(format!("bbs-web-{}-origin", std::process::id()));
     std::fs::create_dir_all(&home).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_bbs"))
-        .args(["serve", "--listen", "127.0.0.1:0", "--web", "0.0.0.0:0"])
+    let out = Command::new(env!("CARGO_BIN_EXE_bbs-server"))
+        .args(["--listen", "127.0.0.1:0", "--web", "0.0.0.0:0"])
         .env("HOME", &home)
         .output()
         .unwrap();

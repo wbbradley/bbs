@@ -1,13 +1,11 @@
 //! Fake provider + local loopback board. No live agents, accounts or prompts.
+use bbs_core::proto;
+use proto::bbs_client::BbsClient;
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tonic::{Request, transport::Channel};
-mod proto {
-    tonic::include_proto!("bbs.v2");
-}
-use proto::bbs_client::BbsClient;
 
 struct Rig {
     home: tempfile::TempDir,

@@ -1,24 +1,16 @@
 mod admin;
+// The shared core, under the names the CLI's modules have always used.
+use bbs_core::{auth, backend, db, proto, protocol, release, service};
 mod app;
-mod auth;
-mod backend;
 mod backup;
 mod blockers;
 mod cli;
 mod config;
 mod connect;
-mod db;
 mod headless;
 mod hook;
-mod names;
-mod proto;
-mod protocol;
-mod release;
-mod search;
 mod serve;
-mod service;
 mod setup;
-mod timer;
 mod ui;
 mod view;
 
@@ -54,7 +46,11 @@ fn init_logging() {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    release::init(bbs_core::identity!());
     let cli = cli::Cli::parse();
+    if let Some(cli::Command::Serve { args }) = &cli.command {
+        return serve::exec(args);
+    }
     // Handled before logging, which creates ~/bbs.log, so they have no side effects.
     // Bare `bbs` outside a terminal behaves as it did before defaulting to
     // connect: usage on stderr, exit 2, no log file or database touched.

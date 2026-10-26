@@ -2184,7 +2184,7 @@ fn old_schema_is_migrated_on_open_even_concurrently() {
     let state = home.join(".local/state/bbs");
     std::fs::create_dir_all(&state).unwrap();
     let db = rusqlite::Connection::open(state.join("bbs.db")).unwrap();
-    db.execute_batch(include_str!("../migrations/0001_init.sql"))
+    db.execute_batch(include_str!("../crates/bbs-core/migrations/0001_init.sql"))
         .unwrap();
     db.execute_batch(
         "PRAGMA user_version = 1;
@@ -4376,4 +4376,25 @@ fn headless_owner_outage_survives_restart_without_model_rerun() {
             .to_string_lossy()
             .starts_with("part-")
     }));
+}
+
+#[test]
+fn serve_without_bbs_server_says_how_to_install_it() {
+    // `bbs` alone, with nothing beside it and nothing on PATH.
+    let dir = tempfile::tempdir().unwrap();
+    let bbs = dir
+        .path()
+        .join(format!("bbs{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_bbs"), &bbs).unwrap();
+    let out = std::process::Command::new(&bbs)
+        .args(["serve", "--listen", "127.0.0.1:0"])
+        .env("PATH", "")
+        .env("HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cargo install bbs-server"), "{err}");
+    // Nothing was started or created on the way.
+    assert!(!dir.path().join(".local").exists());
 }
