@@ -32,6 +32,10 @@ under the new package version and its publication date.
 
 ### Changed
 
+- The web launcher uses Cmd-K only, leaving Ctrl-J and Ctrl-K to the browser,
+  including in its search box. Arrow keys select results. The sidebar Search button
+  still opens the launcher.
+
 - The web sidebar shows how long ago each of your agents last sent or posted
   (`now`, `1m ago`, `2h36m ago`, blank if never) in place of its inbox
   counts, and every agent's yellow flag counts only the open blockers it

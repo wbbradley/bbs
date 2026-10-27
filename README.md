@@ -327,10 +327,12 @@ it created among your blockers (those in groups with an agent of yours), not
 those of the groups it shares. Your agents stay in alphabetical order as
 activity and blocker counts change.
 
-`Cmd-K` (`Ctrl-K` off macOS) opens the launcher. It finds the top-level Agents,
+`Cmd-K` opens the launcher; the sidebar's Search button also opens it.
+`Ctrl-J` and `Ctrl-K` keep their normal browser behavior, including text editing.
+Arrow keys select results. The launcher finds the top-level Agents,
 Groups, Blockers, Feed and Settings pages by name, ahead of matching agents,
 groups, notes and messages. Enter opens the selected result; Esc, a click
-outside or, on macOS, `Cmd-K` again closes it and puts focus back where it was,
+outside or `Cmd-K` again closes it and puts focus back where it was,
 such as your place in a draft. In conversation and blocker reply boxes, Enter
 sends and Shift-Enter adds a line. Conversation inputs have no chevron, keep
 empty placeholders to one row, and refit their height when their width changes,

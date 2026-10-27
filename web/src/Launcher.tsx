@@ -240,14 +240,15 @@ export function Launcher({ onClose }: { onClose: () => void }) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
-            // Its own keys go no further: Ctrl-J/K select here, while ⌘K
-            // still closes it.
-            if (e.key === "Escape" || (e.ctrlKey && !e.metaKey)) e.stopPropagation();
-            if (e.key === "Escape") onClose();
-            else if (e.key === "ArrowDown" || (e.ctrlKey && e.key === "j")) {
+            // Leave Ctrl-J/K to the browser; ⌘K still closes the launcher.
+            if (e.key === "Escape") {
+              e.stopPropagation();
+              onClose();
+            } else if (e.key === "ArrowDown") {
+              e.stopPropagation();
               e.preventDefault();
               setSel((s) => Math.min(s + 1, results.length - 1));
-            } else if (e.key === "ArrowUp" || (e.ctrlKey && e.key === "k")) {
+            } else if (e.key === "ArrowUp") {
               e.preventDefault();
               setSel((s) => Math.max(s - 1, 0));
             } else if (e.key === "Enter") results[sel]?.go();
