@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { rpc } from "../api";
+import { sendsOnEnter } from "../keys";
 import type { PageProps } from "../App";
 import { Markdown } from "../Markdown";
 import { PageHeader } from "../components/PageHeader";
@@ -295,7 +296,10 @@ function BlockerCard({
               onChange={(e) => canAnswer && setAnswer(e.target.value)}
               placeholder="Your answer goes to the agent as mail."
               onKeyDown={(e) => {
-                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send();
+                if (sendsOnEnter(e.nativeEvent)) {
+                  e.preventDefault();
+                  send();
+                }
               }}
             />
           </>
@@ -342,7 +346,7 @@ function BlockerCard({
           )}
           {canAnswer && (
             <span className="faint" style={{ fontSize: 12 }}>
-              ⌘Enter sends
+              Enter sends · Shift-Enter new line
             </span>
           )}
         </div>

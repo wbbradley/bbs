@@ -1,12 +1,19 @@
 import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { loadDraft, saveDraft } from "../util";
+import { sendsOnEnter } from "../keys";
+
+/** Empty placeholders do not add rows; non-empty text fits its wrapped height. */
+function fit(area: HTMLTextAreaElement) {
+  area.style.height = "auto";
+  if (area.value) area.style.height = `${area.scrollHeight}px`;
+}
 
 export interface ComposerHandle {
   focus: () => void;
 }
 
 /**
- * A growing text box. Enter sends; Shift-Enter or Alt-Enter adds a line. The
+ * A growing text box. Enter sends; Shift-Enter adds a line. The
  * draft is kept in this browser per discussion until it is sent.
  */
 export const Composer = forwardRef<
@@ -29,11 +36,20 @@ export const Composer = forwardRef<
   useImperativeHandle(ref, () => ({ focus: () => area.current?.focus() }), []);
   useEffect(() => saveDraft(draftKey, text), [draftKey, text]);
   useLayoutEffect(() => {
+    if (area.current) fit(area.current);
+  }, [text]);
+  useEffect(() => {
     const el = area.current;
     if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [text]);
+    let width = el.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (el.clientWidth === width) return;
+      width = el.clientWidth;
+      fit(el);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   const submit = async () => {
     const body = text;
@@ -58,7 +74,6 @@ export const Composer = forwardRef<
       <div className="composer-inner">
         {above}
         <div className="composer-box" style={sending ? { opacity: 0.7 } : undefined}>
-          <span className="prompt">›</span>
           <textarea
             ref={area}
             rows={1}
@@ -68,7 +83,7 @@ export const Composer = forwardRef<
             autoFocus
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey && !e.altKey && !e.nativeEvent.isComposing) {
+              if (sendsOnEnter(e.nativeEvent)) {
                 e.preventDefault();
                 submit();
               }

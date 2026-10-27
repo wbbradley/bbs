@@ -15,6 +15,14 @@ interface Result {
   go: () => void;
 }
 
+const PAGES = [
+  { name: "Agents", path: paths.agents },
+  { name: "Groups", path: paths.groups },
+  { name: "Blockers", path: paths.blockers },
+  { name: "Feed", path: paths.feed },
+  { name: "Settings", path: paths.settings },
+];
+
 /** Literal match first, then letters in order (fuzzy); null when neither. */
 function score(text: string, query: string): number | null {
   const t = text.toLowerCase();
@@ -49,7 +57,7 @@ function messagePath(m: Message): string {
 }
 
 /**
- * Jump anywhere: agents (by name or status), groups and your notes match as
+ * Jump anywhere: pages, agents (by name or status), groups and your notes match as
  * you type; messages come from the server's search of the whole board.
  */
 export function Launcher({ onClose }: { onClose: () => void }) {
@@ -89,6 +97,16 @@ export function Launcher({ onClose }: { onClose: () => void }) {
       onClose();
       navigate(to);
     };
+    const pages: Result[] = PAGES
+      .map((page) => ({ ...page, score: q ? score(page.name, q) : 0 }))
+      .filter((page) => page.score !== null)
+      .sort((a, b) => a.score! - b.score!)
+      .map((page) => ({
+        key: `p:${page.path}`,
+        kind: "page",
+        label: <Hit text={page.name} query={q} />,
+        go: go(page.path),
+      }));
     const out: { r: Result; s: number; section: number }[] = [];
     for (const a of board.agents) {
       const byName = q ? score(a.name, q) : 1;
@@ -150,7 +168,7 @@ export function Launcher({ onClose }: { onClose: () => void }) {
       }
     }
     out.sort((a, b) => Math.floor(a.s / 3) - Math.floor(b.s / 3) || a.section - b.section || a.s - b.s);
-    const found = out.slice(0, 30).map((o) => o.r);
+    const found = [...pages, ...out.slice(0, 30 - pages.length).map((o) => o.r)];
     for (const h of hits) {
       const m = h.message;
       const line = m.body.split("\n").find((l) => l.toLowerCase().includes(q.toLowerCase())) ?? m.body;
@@ -184,7 +202,7 @@ export function Launcher({ onClose }: { onClose: () => void }) {
       <div className="dialog launcher">
         <input
           autoFocus
-          placeholder="Agents, groups, notes, messages…"
+          placeholder="Pages, agents, groups, notes, messages…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {

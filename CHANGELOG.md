@@ -32,6 +32,11 @@ under the new package version and its publication date.
 
 ### Changed
 
+- The web Cmd-K launcher finds top-level pages by name. Conversation inputs
+  drop the chevron and refit their height on resize, keeping empty placeholders
+  to one row. Both conversation and blocker reply boxes send with Enter and
+  insert a newline with Shift-Enter. IME composition Enter stays in the editor.
+
 - The server is now its own package and binary, `bbs-server`, which carries
   the web UI; `bbs-cli` is the client alone and no longer includes server or
   browser code. Both are built on a shared library, `bbs-core`. A machine

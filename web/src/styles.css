@@ -779,11 +779,6 @@ table.list .status {
   border-radius: 8px;
   padding: 8px 8px 8px 12px;
 }
-.composer-box .prompt {
-  color: var(--muted);
-  font-family: var(--mono);
-  padding-bottom: 3px;
-}
 .composer textarea {
   flex: 1;
   background: none;

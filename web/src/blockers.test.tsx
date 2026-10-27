@@ -62,6 +62,25 @@ afterEach(() => {
 });
 
 describe("blockers", () => {
+  it("sends with Enter, preserves multiline text, and holds keys while a write is unsettled", async () => {
+    await page([row(1)]);
+    fireEvent.change(answerBox(), { target: { value: "\nfirst\nsecond" } });
+    for (const modifier of [{ shiftKey: true }, { altKey: true }, { isComposing: true }, { keyCode: 229 }]) {
+      expect(fireEvent.keyDown(answerBox(), { key: "Enter", ...modifier })).toBe(true);
+      expect(api.pending("answer_blocker")).toHaveLength(0);
+    }
+    expect(fireEvent.keyDown(answerBox(), { key: "Enter" })).toBe(false);
+    const first = api.take("answer_blocker");
+    expect(first.req.answer).toBe("\nfirst\nsecond");
+    expect(answerBox().readOnly).toBe(true);
+    fireEvent.keyDown(answerBox(), { key: "Enter" });
+    expect(api.pending("answer_blocker")).toHaveLength(0);
+    await act(async () => first.reject(new api.ApiError("unconfirmed", 503)));
+    fireEvent.keyDown(answerBox(), { key: "Enter" });
+    expect(api.pending("answer_blocker")).toHaveLength(0);
+    expect(answerBox().value).toBe("\nfirst\nsecond");
+  });
+
   it("repeats an unconfirmed answer exactly, and its answer cannot be edited meanwhile", async () => {
     await page([row(1)]);
     fireEvent.change(answerBox(), { target: { value: "yes" } });
@@ -173,7 +192,7 @@ describe("blockers", () => {
     await poll([row(1, 9, "an entirely new question?")]);
     expect(screen.getByText("Blocker updated.")).toBeTruthy();
     expect((screen.getByText("Send answer") as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.keyDown(answerBox(), { key: "Enter", metaKey: true });
+    fireEvent.keyDown(answerBox(), { key: "Enter" });
     expect(api.pending("answer_blocker")).toHaveLength(0);
     await act(async () => vi.advanceTimersByTime(REPLACED_GUARD_MS + 1));
     expect((screen.getByText("Send answer") as HTMLButtonElement).disabled).toBe(false);

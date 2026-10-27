@@ -8,7 +8,7 @@ import { Dialog } from "./components/Dialog";
 import { MessageView } from "./components/MessageView";
 import { Launcher } from "./Launcher";
 import { seedFound } from "./useMessages";
-import { go } from "./router";
+import { addLeaveGuard, go } from "./router";
 import { Conversation } from "./pages/Conversation";
 import { useBoard } from "./store";
 import { Board, ADA } from "./test/setup";
@@ -208,6 +208,44 @@ describe("a message found by search", () => {
 });
 
 describe("the launcher", () => {
+  it("finds pages without server search and keeps a same-name agent distinct", async () => {
+    api.auto.set("list_agents", () => ({ agents: [{ ...mateo, name: "Feed" }], humans: [] }));
+    go("/agents/Mateo");
+    const close = vi.fn();
+    render(<Board info={null}><Launcher onClose={close} /></Board>);
+    await act(async () => {});
+    const input = screen.getByPlaceholderText("Pages, agents, groups, notes, messages…");
+    expect([...document.querySelectorAll(".launcher-item .kind")].slice(0, 5).map((e) => e.textContent))
+      .toEqual(["page", "page", "page", "page", "page"]);
+    fireEvent.change(input, { target: { value: "Feed" } });
+    expect([...document.querySelectorAll(".launcher-item .kind")].map((e) => e.textContent)).toEqual(["page", "agent"]);
+    await act(async () => fireEvent.keyDown(input, { key: "Enter" }));
+    expect(location.pathname).toBe("/feed");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    await act(async () => fireEvent.keyDown(input, { key: "Enter" }));
+    expect(location.pathname).toBe("/agents/Feed");
+    expect(close).toHaveBeenCalledTimes(2);
+    expect(api.pending("search")).toHaveLength(0);
+  });
+
+  it("fuzzy page navigation respects a refused leave guard", async () => {
+    go("/agents/Mateo");
+    render(<Board info={null}><Launcher onClose={() => {}} /></Board>);
+    await act(async () => {});
+    const guard = vi.fn(async () => false);
+    const remove = addLeaveGuard(guard);
+    try {
+      const input = screen.getByPlaceholderText("Pages, agents, groups, notes, messages…");
+      fireEvent.change(input, { target: { value: "blkr" } });
+      expect(document.querySelector(".launcher-item")?.textContent).toContain("Blockers");
+      await act(async () => fireEvent.keyDown(input, { key: "Enter" }));
+      expect(guard).toHaveBeenCalledTimes(1);
+      expect(location.pathname).toBe("/agents/Mateo");
+    } finally {
+      remove();
+    }
+  });
+
   function Launch() {
     const board = useBoard();
     return (
@@ -227,7 +265,7 @@ describe("the launcher", () => {
         </Board>,
       );
       await act(async () => {});
-      const input = screen.getByPlaceholderText("Agents, groups, notes, messages…");
+      const input = screen.getByPlaceholderText("Pages, agents, groups, notes, messages…");
       fireEvent.change(input, { target: { value: "ab" } });
       await act(async () => vi.advanceTimersByTime(250));
       fireEvent.change(input, { target: { value: "abc" } });
@@ -257,7 +295,7 @@ describe("the launcher", () => {
     await act(async () => {});
     const outside = vi.fn();
     window.addEventListener("keydown", outside);
-    fireEvent.keyDown(screen.getByPlaceholderText("Agents, groups, notes, messages…"), { key: "k", ctrlKey: true });
+    fireEvent.keyDown(screen.getByPlaceholderText("Pages, agents, groups, notes, messages…"), { key: "k", ctrlKey: true });
     window.removeEventListener("keydown", outside);
     expect(outside).not.toHaveBeenCalled();
   });
