@@ -52,6 +52,10 @@ service Bbs {
   // Agent token, self only; requires auto-reply.v1.
   rpc AutoReply(AutoReplyRequest) returns (AutoReplyResponse);
   // Unread mail oldest first, archived as returned; or archived history.
+  // Per-human restart barrier. Empty action queries; start/resume mutate it.
+  rpc AgentDrain(AgentDrainRequest) returns (AgentDrainResponse);
+  // A headless runner reports its highest received id only when fully idle.
+  rpc ReportDrain(ReportDrainRequest) returns (Empty);
   rpc Read(ReadRequest) returns (ReadResponse);
   // Authenticated agents and humans may search the entire ordinary-message
   // corpus, independent of inbox/group membership. Requires message-search.v1.
@@ -816,3 +820,20 @@ message BindSessionRequest { string harness = 1; string session_id = 2; string t
 message BindSessionResponse { Principal agent = 1; }
 message SessionAgentRequest { string harness = 1; string session_id = 2; }
 message SessionAgentResponse { Principal agent = 1; string token = 2; }  // both unset if unbound
+
+message AgentDrainRequest { string action = 1; }
+message AgentDrainTarget {
+  int64 agent_id = 1;
+  string name = 2;
+  uint32 unread = 3;
+  bool completed = 4;
+  bool side_pending = 5;
+}
+message AgentDrainResponse {
+  bool frozen = 1;
+  string status = 2; // running, draining, ready, timed_out
+  int64 watermark = 3;
+  string deadline = 4;
+  repeated AgentDrainTarget agents = 5;
+}
+message ReportDrainRequest { int64 completed_through = 1; }

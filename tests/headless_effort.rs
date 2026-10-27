@@ -39,8 +39,13 @@ impl Rig {
         } else {
             "codex-app-server"
         };
+        let drain_settings = if test == "drain" {
+            "mid_turn = \"queue\"\n"
+        } else {
+            ""
+        };
         std::fs::write(home.join(".config/bbs/config.toml"), format!(
-            "human = \"tester\"\n[headless]\nmin_turn_interval = \"0s\"\n[headless.harness.fake]\ntype = {harness_type:?}\nshare_activity = false\ncommand = [\"python3\", {fake:?}, {kind:?}, {test:?}]\n"
+            "human = \"tester\"\n[headless]\nmin_turn_interval = \"0s\"\n{drain_settings}[headless.harness.fake]\ntype = {harness_type:?}\nshare_activity = false\ncommand = [\"python3\", {fake:?}, {kind:?}, {test:?}]\n"
         )).unwrap();
         let mut rig = Self {
             home,
@@ -445,4 +450,117 @@ async fn codex_timeout_records_uncertain_delivery_without_resend() {
 #[tokio::test]
 async fn acp_load_replay_accepts_only_parent_effort_metadata() {
     lifecycle("acp", "load").await;
+}
+
+async fn restart_drain(kind: &str) {
+    let rig = Rig::new(kind, "drain").await;
+    rig.send("DRAIN_ACTIVE", None).await;
+    rig.wait_wire(|v| v.iter().any(|e| e["kind"] == "drain_held"))
+        .await;
+    let mut client = rig.client().await;
+    let started = client
+        .agent_drain(Rig::request(proto::AgentDrainRequest {
+            action: "start".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(started.frozen);
+    let held_id = rig.send("AFTER_RESTART", None).await;
+    // Wait until the notice has been fetched while the provider turn is held.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = client
+                .agent_drain(Rig::request(proto::AgentDrainRequest::default()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(status.status, "draining");
+            assert!(!status.agents[0].completed);
+            if status.agents[0].unread == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("restart notice was not fetched");
+    std::fs::write(rig.home.join("release-drain-turn"), "go").unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status = client
+                .agent_drain(Rig::request(proto::AgentDrainRequest::default()))
+                .await
+                .unwrap()
+                .into_inner();
+            if status.status == "ready" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("runner did not acknowledge completed turns");
+    assert!(rig.wire().iter().any(|v| {
+        v["kind"] == "delivered"
+            && v["text"]
+                .as_str()
+                .unwrap()
+                .contains("BBS restart preparation")
+    }));
+    assert!(
+        !rig.wire().iter().any(
+            |v| v["kind"] == "attempt" && v["text"].as_str().unwrap().contains("AFTER_RESTART")
+        )
+    );
+    assert!(held_id > started.watermark);
+    client
+        .agent_drain(Rig::request(proto::AgentDrainRequest {
+            action: "resume".into(),
+        }))
+        .await
+        .unwrap();
+    rig.wait_wire(|v| {
+        v.iter().any(|v| {
+            v["kind"] == "delivered" && v["text"].as_str().unwrap().contains("AFTER_RESTART")
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn acp_restart_drain_waits_for_turns_and_holds_new_mail() {
+    restart_drain("acp").await;
+}
+
+#[tokio::test]
+async fn codex_restart_drain_waits_for_turns_and_holds_new_mail() {
+    restart_drain("codex").await;
+}
+
+#[tokio::test]
+async fn restart_drain_does_not_acknowledge_a_failed_turn() {
+    let rig = Rig::new("acp", "drain-error").await;
+    let mut client = rig.client().await;
+    client
+        .agent_drain(Rig::request(proto::AgentDrainRequest {
+            action: "start".into(),
+        }))
+        .await
+        .unwrap();
+    rig.wait_wire(|v| v.iter().any(|e| e["kind"] == "drain_error"))
+        .await;
+    // Cover the retry reporting interval as well as the immediate idle report.
+    let until = tokio::time::Instant::now() + Duration::from_secs(6);
+    while tokio::time::Instant::now() < until {
+        let status = client
+            .agent_drain(Rig::request(proto::AgentDrainRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.status, "draining");
+        assert_eq!(status.agents[0].unread, 0);
+        assert!(!status.agents[0].completed);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

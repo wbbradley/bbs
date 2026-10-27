@@ -1,4 +1,5 @@
 import type { PageProps } from "../App";
+import { AgentDrain } from "../components/AgentDrain";
 import { PageHeader } from "../components/PageHeader";
 import { useBoard, usePrefs } from "../store";
 
@@ -39,6 +40,8 @@ export function SettingsPage({ openNav }: PageProps) {
         <p>
           Signed in as <span className="human">{board.me.name}</span>.
         </p>
+
+        {board.info?.capabilities.includes("agent-drain.v1") && <AgentDrain />}
 
         <h3 className="mono" style={{ marginTop: 32 }}>
           Server

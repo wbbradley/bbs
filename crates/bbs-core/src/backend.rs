@@ -670,6 +670,13 @@ impl Backend {
         }
     }
 
+    pub async fn report_drain(&mut self, req: proto::ReportDrainRequest) -> Result<proto::Empty> {
+        match self {
+            Backend::Local(l) => service::report_drain(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => rpc!(r, report_drain, req, &["agent-drain.v1"]),
+        }
+    }
+
     pub async fn mark_read(
         &mut self,
         req: proto::MarkReadRequest,

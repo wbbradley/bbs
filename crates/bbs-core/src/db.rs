@@ -37,6 +37,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0020_side_conversations.sql"),
     include_str!("../migrations/0021_blockers.sql"),
     include_str!("../migrations/0022_agent_notes.sql"),
+    include_str!("../migrations/0023_agent_drains.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1385,7 +1386,10 @@ pub fn mark_read_from(
     Ok(conn.execute(
         "UPDATE deliveries SET archived_at = ?1
          WHERE recipient_kind = ?2 AND recipient_id = ?3 AND archived_at IS NULL
-           AND message_id IN (SELECT id FROM messages WHERE from_kind = ?4 AND from_id = ?5)",
+           AND message_id IN (SELECT id FROM messages WHERE from_kind = ?4 AND from_id = ?5)
+           AND (?2 != 'agent' OR message_id <= coalesce((
+             SELECT r.watermark FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
+             WHERE o.agent_id = ?3), 9223372036854775807))",
         params![now, me.kind.as_str(), me.id, from.kind.as_str(), from.id],
     )?)
 }
@@ -1490,7 +1494,10 @@ pub fn mark_seen(conn: &Connection, human: i64, agent: i64, through_id: i64) -> 
 pub fn has_unread(conn: &Connection, me: &Principal) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM deliveries
-         WHERE recipient_kind = ?1 AND recipient_id = ?2 AND archived_at IS NULL)",
+         WHERE recipient_kind = ?1 AND recipient_id = ?2 AND archived_at IS NULL
+         AND (?1 != 'agent' OR message_id <= coalesce((
+           SELECT r.watermark FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
+           WHERE o.agent_id = ?2), 9223372036854775807)))",
         params![me.kind.as_str(), me.id],
         |r| r.get(0),
     )?;
@@ -1504,9 +1511,16 @@ pub fn take_unread(
     limit: Option<u32>,
     now: &str,
 ) -> Result<Vec<MessageView>> {
+    // A drain's final notice must come last even if the wall clock moved
+    // backwards. Preserve timestamp ordering outside a restart barrier.
     let sql = format!(
         "{INBOX_SELECT} AND d.archived_at IS NULL
-         ORDER BY m.created_at, m.id LIMIT ?3"
+         AND (?1 != 'agent' OR m.id <= coalesce((
+           SELECT r.watermark FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
+           WHERE o.agent_id = ?2), 9223372036854775807))
+         ORDER BY CASE WHEN ?1 = 'agent' AND EXISTS (
+           SELECT 1 FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
+           WHERE o.agent_id = ?2) THEN m.id END, m.created_at, m.id LIMIT ?3"
     );
     let limit = limit.map_or(i64::MAX, i64::from);
     let msgs: Vec<MessageView> = conn

@@ -668,6 +668,7 @@ async fn rpc(
     }
     let result = dispatch! {
         "whoami" => whoami,
+        "agent_drain" => agent_drain,
         "list_agents" => list_agents,
         "retire" => retire,
         "group_list" => group_list,

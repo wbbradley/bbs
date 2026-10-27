@@ -288,7 +288,11 @@ async fn run_timers(state: Arc<State>) {
         changes.borrow_and_update();
         let now = (state.clock)();
         let wait = match state
-            .call(move |conn| service::fire_timers(conn, now))
+            .call(move |conn| {
+                let completed = service::check_agent_drains(conn, now)?;
+                let (fired, next) = service::fire_timers(conn, now)?;
+                Ok((fired + completed, next))
+            })
             .await
         {
             Ok((fired, next)) => {
@@ -1298,6 +1302,22 @@ impl Bbs for Server {
             self.0.changed();
         }
         Ok(response)
+    }
+
+    async fn agent_drain(
+        &self,
+        req: Request<proto::AgentDrainRequest>,
+    ) -> Result<Response<proto::AgentDrainResponse>, Status> {
+        self.unary("agent_drain", req, Effect::Write, service::agent_drain)
+            .await
+    }
+
+    async fn report_drain(
+        &self,
+        req: Request<proto::ReportDrainRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        self.unary("report_drain", req, Effect::Write, service::report_drain)
+            .await
     }
 
     async fn report_effort(
