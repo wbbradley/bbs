@@ -46,6 +46,17 @@ function Hit({ text, query }: { text: string; query: string }) {
   );
 }
 
+/**
+ * Give focus back to what had it, the cursor and selection with it, unless
+ * it is gone or something else has taken focus since.
+ */
+function giveBack(el: Element | null) {
+  if (!(el instanceof HTMLElement) || el === document.body || !el.isConnected) return;
+  const now = document.activeElement;
+  if (now && now !== document.body) return;
+  el.focus({ preventScroll: true });
+}
+
 /** Where a found message belongs: its group, the agent side, or the Feed. */
 function messagePath(m: Message): string {
   const q = `?m=${m.id}`;
@@ -68,6 +79,18 @@ export function Launcher({ onClose }: { onClose: () => void }) {
   const [searching, setSearching] = useState(false);
   const list = useRef<HTMLDivElement>(null);
   useCover();
+
+  // What had focus before this took it. However the launcher is dismissed
+  // (Esc, a click outside, ⌘K again), focus goes back there; choosing a
+  // result leaves focus to the page it opens, unless it stays on this one.
+  const [before] = useState(() => document.activeElement);
+  const chosen = useRef(false);
+  useEffect(
+    () => () => {
+      if (!chosen.current) giveBack(before);
+    },
+    [before],
+  );
 
   // The server searches once per query typed; only the newest query's
   // answer is shown, however the answers arrive.
@@ -94,8 +117,11 @@ export function Launcher({ onClose }: { onClose: () => void }) {
   const results = useMemo<Result[]>(() => {
     const q = query.trim();
     const go = (to: string) => () => {
+      chosen.current = true;
+      const from = location.pathname + location.search;
       onClose();
-      navigate(to);
+      // Refused by a leave guard, or already here: back where you were.
+      navigate(to).then(() => location.pathname + location.search === from && giveBack(before));
     };
     const pages: Result[] = PAGES
       .map((page) => ({ ...page, score: q ? score(page.name, q) : 0 }))
@@ -190,7 +216,7 @@ export function Launcher({ onClose }: { onClose: () => void }) {
       });
     }
     return found;
-  }, [query, board, hits, onClose]);
+  }, [query, board, hits, onClose, before]);
 
   useEffect(() => setSel(0), [query]);
   useEffect(() => {
@@ -198,7 +224,15 @@ export function Launcher({ onClose }: { onClose: () => void }) {
   }, [sel]);
 
   return (
-    <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+    <div
+      className="overlay"
+      onMouseDown={(e) => {
+        if (e.target !== e.currentTarget) return;
+        // The click would otherwise move focus to the page after it is given back.
+        e.preventDefault();
+        onClose();
+      }}
+    >
       <div className="dialog launcher">
         <input
           autoFocus
