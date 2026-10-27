@@ -564,3 +564,148 @@ async fn restart_drain_does_not_acknowledge_a_failed_turn() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+#[tokio::test]
+async fn acp_restart_drain_ignores_completed_previous_generation_side_history() {
+    fn agent_request<T>(body: T, token: &str) -> Request<T> {
+        let mut request = Rig::request(body);
+        request
+            .metadata_mut()
+            .insert("bbs-token", token.parse().unwrap());
+        request
+    }
+
+    let mut rig = Rig::new("acp", "drain-history").await;
+    rig.stop();
+    // Build retained Codex history through the public service API. Only this
+    // synthetic board's agent token is read locally to authenticate that driver.
+    let db = rusqlite::Connection::open(rig.home.join("board/bbs.db")).unwrap();
+    let token: String = db
+        .query_row(
+            "SELECT token FROM agents WHERE name = 'EffortTest'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(db);
+    let mut driver = rig.client().await;
+    let mut human = rig.client().await;
+    let previous_generation = "previous-codex-generation";
+    driver
+        .begin_side_session(agent_request(
+            proto::BeginSideSessionRequest {
+                generation: previous_generation.into(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    driver
+        .report_context(agent_request(
+            proto::ReportContextRequest {
+                generation: previous_generation.into(),
+                side_supported: Some(true),
+                side_followups: Some(true),
+                preserve_usage: true,
+                ..Default::default()
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    let side_id = human
+        .ask_side(Rig::request(proto::AskSideRequest {
+            agent: "EffortTest".into(),
+            question: "completed before switching harnesses".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .id;
+    driver
+        .claim_side(agent_request(
+            proto::ClaimSideRequest {
+                generation: previous_generation.into(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    driver
+        .report_side(agent_request(
+            proto::ReportSideRequest {
+                generation: previous_generation.into(),
+                id: side_id,
+                status: proto::SideStatus::SideCompleted.into(),
+                answer: Some("finished under Codex".into()),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    human
+        .cancel_side(Rig::request(proto::CancelSideRequest {
+            id: side_id,
+            end: true,
+        }))
+        .await
+        .unwrap();
+
+    rig.start();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let report = human
+                .side_report(Rig::request(proto::SideReportRequest {
+                    agent: "EffortTest".into(),
+                    generation: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            if report.side_supported == Some(false) {
+                let history = report.side.unwrap();
+                assert_eq!(history.id, side_id);
+                assert_eq!(history.status(), proto::SideStatus::SideCompleted);
+                assert!(history.ended);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("ACP runner did not begin its unsupported-side generation");
+    human
+        .agent_drain(Rig::request(proto::AgentDrainRequest {
+            action: "start".into(),
+        }))
+        .await
+        .unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let state = human
+                .agent_drain(Rig::request(proto::AgentDrainRequest::default()))
+                .await
+                .unwrap()
+                .into_inner();
+            if state.status == "ready" {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("completed Codex history blocked the new ACP runner's drain");
+    assert!(ready.agents[0].completed);
+    assert_eq!(ready.agents[0].unread, 0);
+    assert!(!ready.agents[0].side_pending);
+    let db = rusqlite::Connection::open(rig.home.join("board/bbs.db")).unwrap();
+    let (generation, cursor): (String, i64) = db
+        .query_row("SELECT s.generation, t.side_completed_through FROM side_state s JOIN agent_drain_targets t ON t.agent_id = s.agent_id", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_ne!(generation, previous_generation);
+    assert_eq!(
+        cursor, 0,
+        "ACP has no side driver to acknowledge old history"
+    );
+}

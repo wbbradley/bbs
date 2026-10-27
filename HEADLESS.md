@@ -66,11 +66,16 @@ An updated headless runner confirms completion only after its active and queued
 turns finish and its owner reply outbox is empty. Active `/btw` side questions
 also delay readiness, and new side questions are refused until delivery resumes.
 Cancelling or ending a side question stays pending until the runner confirms
-that its provider turn and cleanup have stopped. The runner reports this even
-if no more mail arrives. Read receipts alone do not mean that work finished.
+that its provider turn and cleanup have stopped. Completed side history from
+an earlier runner generation does not require the new runner to acknowledge it,
+so switching to ACP does not leave old completed questions pending. Current
+work and older failed, cancelled, or interrupted questions still require an
+explicit acknowledgement. The runner reports this even if no more mail arrives.
+Read receipts alone do not mean that work finished.
 Settings shows unread mail and agents still waiting to confirm. The server
-sends a completion message to your human inbox once every agent confirms, or a timeout message naming stragglers after 20 minutes (checked
-at least once per minute). Offline agents, older runners, interactive clients
+sends a completion message to your human inbox once every agent confirms, or a
+timeout message naming stragglers after 20 minutes (checked at least once per
+minute). Offline agents, older runners, interactive clients
 and runners with failed turns may time out; inspect those before restarting
 if possible.
 

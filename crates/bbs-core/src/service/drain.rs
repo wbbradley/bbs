@@ -124,9 +124,17 @@ fn snapshot(ctx: &Ctx<'_>, human: i64) -> Result<proto::AgentDrainResponse> {
             ..Default::default()
         });
     };
+    // Completed history from a prior runner generation is not work for the
+    // current side driver (ACP may not have one). Current-generation work and
+    // older failed/cancelled/interrupted work still require explicit quiescence;
+    // neither an ended flag nor an absent driver proves it has stopped.
     let agents = ctx.conn.prepare("SELECT t.agent_id, a.name, t.completed,
         (SELECT count(*) FROM deliveries d WHERE d.recipient_kind = 'agent' AND d.recipient_id = t.agent_id AND d.message_id <= ?2 AND d.archived_at IS NULL),
-        EXISTS(SELECT 1 FROM side_requests s WHERE s.agent_id = t.agent_id AND (s.status = 'open' OR s.id > t.side_completed_through))
+        EXISTS(SELECT 1 FROM side_requests s WHERE s.agent_id = t.agent_id
+          AND (s.status = 'open' OR (s.id > t.side_completed_through
+            AND NOT (s.status = 'completed' AND EXISTS (
+              SELECT 1 FROM side_state state WHERE state.agent_id = s.agent_id
+                AND s.generation IS NOT NULL AND state.generation != s.generation)))))
         FROM agent_drain_targets t JOIN agents a ON a.id = t.agent_id WHERE t.human_id = ?1 ORDER BY lower(a.name)")?
         .query_map(params![human, watermark], |r| Ok(proto::AgentDrainTarget { agent_id: r.get(0)?, name: r.get(1)?, completed: r.get(2)?, unread: r.get(3)?, side_pending: r.get(4)? }))?
         .collect::<Result<Vec<_>, _>>()?;
