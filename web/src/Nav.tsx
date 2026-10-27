@@ -1,8 +1,11 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { logout } from "./api";
 import { Link, navigate, paths, usePath } from "./router";
 import { sortAgents, useBoard, type LiveAgent } from "./store";
-import { cap99, same } from "./util";
+import { ago, cap99, same } from "./util";
+
+/** How often the agents' ages are drawn again; nothing is asked of the server. */
+const AGE_TICK_MS = 30000;
 
 /**
  * The left navigation replaces `bbs connect`'s main menu: the board's pages,
@@ -13,8 +16,22 @@ export function Nav({ onSearch }: { onSearch: () => void }) {
   const board = useBoard();
   const path = usePath();
   const [showOthers, setShowOthers] = useState(false);
-  const mine = sortAgents(board.agents.filter((a) => same(a.owner, board.me.name)));
-  const others = sortAgents(board.agents.filter((a) => !same(a.owner, board.me.name)));
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = window.setInterval(() => tick((n) => n + 1), AGE_TICK_MS);
+    return () => window.clearInterval(t);
+  }, []);
+  // An agent's flag is the blockers it opened itself, by its stable id, never
+  // those of the groups it shares: they come first, as they are shown.
+  const created = (a: LiveAgent) => (a.id === null ? 0 : (board.createdBlockers?.get(a.id) ?? 0));
+  const mine = sortAgents(
+    board.agents.filter((a) => same(a.owner, board.me.name)),
+    created,
+  );
+  const others = sortAgents(
+    board.agents.filter((a) => !same(a.owner, board.me.name)),
+    created,
+  );
   const blockers = board.blockers?.active_count ?? 0;
   const unread = board.agents.reduce((n, a) => n + a.unread, 0);
   const oldestUnread = board.agents
@@ -73,7 +90,7 @@ export function Nav({ onSearch }: { onSearch: () => void }) {
         <div className="nav-section">
           {mine.length === 0 && <div className="nav-item faint">{board.agentsLoaded ? "none live" : "loading…"}</div>}
           {mine.map((a) => (
-            <AgentLink key={a.name} agent={a} active={same(path, paths.agent(a.name))} />
+            <AgentLink key={a.name} agent={a} blockers={created(a)} active={same(path, paths.agent(a.name))} activity />
           ))}
         </div>
 
@@ -86,7 +103,13 @@ export function Nav({ onSearch }: { onSearch: () => void }) {
             {showOthers && (
               <div className="nav-section">
                 {others.map((a) => (
-                  <AgentLink key={a.name} agent={a} active={same(path, paths.agent(a.name))} qualify />
+                  <AgentLink
+                    key={a.name}
+                    agent={a}
+                    blockers={created(a)}
+                    active={same(path, paths.agent(a.name))}
+                    qualify
+                  />
                 ))}
               </div>
             )}
@@ -129,7 +152,24 @@ export function Nav({ onSearch }: { onSearch: () => void }) {
   );
 }
 
-function AgentLink({ agent, active, qualify }: { agent: LiveAgent; active: boolean; qualify?: boolean }) {
+/**
+ * An agent in the navigation, with the blockers it opened. Your own agents
+ * show how long ago each last sent or posted (blank if never), as connect's
+ * Agents list does; others' show their mail and activity counts.
+ */
+function AgentLink({
+  agent,
+  blockers,
+  active,
+  qualify,
+  activity,
+}: {
+  agent: LiveAgent;
+  blockers: number;
+  active: boolean;
+  qualify?: boolean;
+  activity?: boolean;
+}) {
   return (
     <Link to={paths.agent(agent.name)} className={`nav-item${active ? " active" : ""}`} title={agent.status ?? undefined}>
       <span className="nav-glyph agent">◆</span>
@@ -137,9 +177,19 @@ function AgentLink({ agent, active, qualify }: { agent: LiveAgent; active: boole
         <span className="agent">{agent.name}</span>
         {qualify && agent.owner && <span className="faint">@{agent.owner}</span>}
       </span>
-      {(agent.blocker_count ?? 0) > 0 && <span className="badge warn">⚑{agent.blocker_count}</span>}
-      {agent.unread > 0 && <span className="badge mail">✉{cap99(agent.unread)}</span>}
-      {agent.unseen > 0 && agent.unread === 0 && <span className="badge quiet">•{cap99(agent.unseen)}</span>}
+      {blockers > 0 && <span className="badge warn">⚑{blockers}</span>}
+      {activity ? (
+        agent.last_sent_at && (
+          <span className="badge quiet" title={agent.last_sent_at}>
+            {ago(agent.last_sent_at)}
+          </span>
+        )
+      ) : (
+        <>
+          {agent.unread > 0 && <span className="badge mail">✉{cap99(agent.unread)}</span>}
+          {agent.unseen > 0 && agent.unread === 0 && <span className="badge quiet">•{cap99(agent.unseen)}</span>}
+        </>
+      )}
     </Link>
   );
 }

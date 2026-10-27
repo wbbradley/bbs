@@ -1,14 +1,15 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { rpc, useWatch, type WatchState } from "./api";
-import type {
-  Agent,
-  AgentNote,
-  AgentSummary,
-  Group,
-  Human,
-  ListBlockersResponse,
-  Principal,
-  ServerInfo,
+import {
+  Kind,
+  type Agent,
+  type AgentNote,
+  type AgentSummary,
+  type Group,
+  type Human,
+  type ListBlockersResponse,
+  type Principal,
+  type ServerInfo,
 } from "./types";
 import { same, storage } from "./util";
 
@@ -30,6 +31,11 @@ interface Board {
   groupsLoaded: boolean;
   blockers: ListBlockersResponse | null;
   blockersError: string | null;
+  /**
+   * Open blockers in your scope by the id of the agent that created them,
+   * over every page; the last complete count, null until there is one.
+   */
+  createdBlockers: Map<number, number> | null;
   notes: Map<number, AgentNote>;
   /** Every stored note has arrived once; until then none may be written. */
   notesLoaded: boolean;
@@ -52,6 +58,36 @@ export function useBoard(): Board {
 }
 
 const BLOCKER_POLL_MS = 3000;
+const BLOCKER_PAGE = 50;
+
+/**
+ * Count the open blockers of a listing by creating agent, reading the pages
+ * after `first` to the end; null if a page fails, the cursor does not move
+ * on, or `going` says to stop, so no partial count is ever taken for whole.
+ */
+export async function countCreators(
+  first: ListBlockersResponse,
+  going: () => boolean = () => true,
+): Promise<Map<number, number> | null> {
+  const counts = new Map<number, number>();
+  let page = first;
+  let cursor = 0;
+  for (;;) {
+    for (const b of page.blockers) {
+      if (b.creator?.kind === Kind.Agent) counts.set(b.creator.id, (counts.get(b.creator.id) ?? 0) + 1);
+    }
+    if (!page.has_more) return counts;
+    const next = page.next_after_root_id;
+    if (next === null || next === undefined || next <= cursor || !going()) return null;
+    cursor = next;
+    try {
+      page = await rpc<ListBlockersResponse>("list_blockers", { mine: true, limit: BLOCKER_PAGE, after_root_id: next });
+    } catch {
+      return null;
+    }
+    if (!going()) return null;
+  }
+}
 const AGENT_POLL_MS = 30000;
 
 export function BoardProvider({
@@ -71,6 +107,15 @@ export function BoardProvider({
   const [groupsLoaded, setGroupsLoaded] = useState(false);
   const [blockers, setBlockers] = useState<ListBlockersResponse | null>(null);
   const [blockersError, setBlockersError] = useState<string | null>(null);
+  const [createdBlockers, setCreatedBlockers] = useState<Map<number, number> | null>(null);
+  // Answers that arrive after the board is gone (signed out) are dropped.
+  const live = useRef(true);
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+    };
+  }, []);
   const [notes, setNotes] = useState<Map<number, AgentNote>>(new Map());
   const [notesLoaded, setNotesLoaded] = useState(false);
   const [notesError, setNotesError] = useState<string | null>(null);
@@ -103,22 +148,28 @@ export function BoardProvider({
   const blockersBusy = useRef(false);
   const blockersAgain = useRef(false);
   const refreshBlockers = useCallback(() => {
-    if (!has("blockers-mine.v1")) return;
+    if (!live.current || !has("blockers-mine.v1")) return;
     if (blockersBusy.current) {
       blockersAgain.current = true;
       return;
     }
     blockersBusy.current = true;
     blockersAgain.current = false;
-    rpc<ListBlockersResponse>("list_blockers", { mine: true, limit: 50 })
-      .then((r) => {
+    rpc<ListBlockersResponse>("list_blockers", { mine: true, limit: BLOCKER_PAGE })
+      .then(async (r) => {
+        if (!live.current) return;
+        // The first page is the queue's, shown at once; any later pages
+        // only complete the creators' counts.
         setBlockers(r);
         setBlockersError(null);
+        const counts = await countCreators(r, () => live.current);
+        if (counts && live.current) setCreatedBlockers((old) => (sameCounts(old, counts) ? old : counts));
       })
-      .catch((e) => setBlockersError(String(e.message ?? e)))
+      .catch((e) => live.current && setBlockersError(String(e.message ?? e)))
       .finally(() => {
         blockersBusy.current = false;
-        if (blockersAgain.current) refreshBlockers();
+        // A listing asked for before signing out is not this board's to run.
+        if (live.current && blockersAgain.current) refreshBlockers();
       });
   }, [has]);
 
@@ -234,6 +285,7 @@ export function BoardProvider({
     groupsLoaded,
     blockers,
     blockersError,
+    createdBlockers,
     notes,
     notesLoaded,
     notesError,
@@ -248,6 +300,10 @@ export function BoardProvider({
   return <BoardContext.Provider value={board}>{children}</BoardContext.Provider>;
 }
 
+function sameCounts(a: Map<number, number> | null, b: Map<number, number>): boolean {
+  return a !== null && a.size === b.size && [...b].every(([k, n]) => a.get(k) === n);
+}
+
 /** Notes by agent, keeping whichever copy of each is the newer revision. */
 export function mergeNotes(old: Map<number, AgentNote>, found: AgentNote[]): Map<number, AgentNote> {
   if (found.length === 0) return old;
@@ -259,12 +315,18 @@ export function mergeNotes(old: Map<number, AgentNote>, found: AgentNote[]): Map
   return next;
 }
 
-/** Agents by open blockers, then most recently active, then name. */
-export function sortAgents(agents: LiveAgent[]): LiveAgent[] {
+/**
+ * Agents by open blockers, then most recently active, then name. `blockers`
+ * says what counts for an agent: by default those in its groups.
+ */
+export function sortAgents(
+  agents: LiveAgent[],
+  blockers: (a: LiveAgent) => number = (a) => a.blocker_count ?? 0,
+): LiveAgent[] {
   const time = (a: LiveAgent) => (a.last_sent_at ? Date.parse(a.last_sent_at) : -Infinity);
   return [...agents].sort(
     (a, b) =>
-      (b.blocker_count ?? 0) - (a.blocker_count ?? 0) ||
+      blockers(b) - blockers(a) ||
       time(b) - time(a) ||
       a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
   );
