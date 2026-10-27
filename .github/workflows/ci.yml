@@ -13,8 +13,20 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Test
-        run: cargo test --locked
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Test frontend
+        working-directory: web
+        run: npm ci && npm test
+      - name: Check committed server assets
+        run: python3 scripts/build_web.py
+      - name: Build workspace
+        run: cargo build --workspace --locked
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Test separate packages without Node
+        run: python3 scripts/test_workspace_package.py
       - name: Build container
         run: docker build --build-arg BBS_BUILD_REVISION="$GITHUB_SHA" --build-arg BBS_BUILD_DIRTY=false -t bbs:test .
       - name: Test restricted container
@@ -22,6 +34,8 @@ jobs:
       - name: Check container build identity
         run: |
           docker run --rm --entrypoint bbs bbs:test version --json > identity.json
+          docker run --rm --entrypoint bbs-server bbs:test version --json > server-identity.json
+          cmp identity.json server-identity.json
           python3 -c 'import json, os, sys; r = json.load(open("identity.json")); sys.exit(r["revision"] != os.environ["GITHUB_SHA"] or r["provenance"] != "clean")'
   msrv:
     runs-on: ubuntu-24.04
@@ -30,8 +44,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
       - name: Test minimum supported Rust version
         run: |
           msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
           rustup toolchain install "$msrv" --profile minimal
-          cargo "+$msrv" test --locked
+          cargo "+$msrv" build --workspace --locked
+          cargo "+$msrv" test --workspace --locked

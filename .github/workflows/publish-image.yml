@@ -15,8 +15,17 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Check committed server assets
+        run: |
+          (cd web && npm ci)
+          python3 scripts/build_web.py
+      - name: Build workspace
+        run: cargo build --workspace --locked
       - name: Test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
       - name: Build
         run: |
           docker build \

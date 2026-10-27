@@ -47,8 +47,8 @@ const REQUEST_KEYS: &[&str] = &[
 pub struct Policy {
     minimum: Option<Version>,
     recommended: Option<Version>,
-    /// Capabilities this server acts as if it lacked, as an older one would.
-    #[cfg(test)]
+    /// Capabilities this server acts as if it lacked, as an older one would:
+    /// only tests withhold any.
     withheld: Vec<&'static str>,
 }
 
@@ -67,20 +67,19 @@ impl Policy {
         Ok(Self {
             minimum,
             recommended,
-            #[cfg(test)]
             withheld: Vec::new(),
         })
     }
 
-    /// A server that lacks `capability`, as one from before it would.
-    #[cfg(test)]
+    /// A server that lacks `capability`, as one from before it would: for
+    /// tests of old-server behaviour, here and in the server crate.
+    #[doc(hidden)]
     pub fn without(mut self, capability: &'static str) -> Self {
         self.withheld.push(capability);
         self
     }
 
     fn offers(&self, capability: &str) -> bool {
-        #[cfg(test)]
         if self.withheld.contains(&capability) {
             return false;
         }

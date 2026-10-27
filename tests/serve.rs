@@ -11,9 +11,7 @@ use tonic_health::pb::{
     HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
 };
 
-mod proto {
-    tonic::include_proto!("bbs.v2");
-}
+use bbs_core::proto;
 
 use proto::bbs_client::BbsClient;
 

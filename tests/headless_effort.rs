@@ -1,14 +1,12 @@
 //! Loopback board + fake providers; no external accounts or model calls.
+use bbs_core::proto;
+use proto::{EffortReport, bbs_client::BbsClient};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tonic::{Request, transport::Channel};
-mod proto {
-    tonic::include_proto!("bbs.v2");
-}
-use proto::{EffortReport, bbs_client::BbsClient};
 
 struct Rig {
     home: PathBuf,

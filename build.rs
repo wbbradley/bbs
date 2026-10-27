@@ -4,23 +4,24 @@ use std::process::Command;
 #[path = "build/identity.rs"]
 mod identity;
 
-/// Tracked sources of the binary: they trigger rebuilds and define "dirty".
+/// Tracked sources of `bbs`, the shared core's included: they trigger
+/// rebuilds and define "dirty".
 const INPUTS: &[&str] = &[
-    "proto",
     "src",
     "build",
-    "migrations",
     "build.rs",
     "Cargo.toml",
     "Cargo.lock",
+    "assets",
+    "integrations",
+    "crates/bbs-core",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // protox compiles the proto in pure Rust, so the build needs no `protoc`.
-    let fds = protox::compile(["proto/bbs.proto"], ["proto"])?;
-    tonic_prost_build::configure().compile_fds(fds)?;
     for path in INPUTS {
-        println!("cargo:rerun-if-changed={path}");
+        if std::path::Path::new(path).exists() {
+            println!("cargo:rerun-if-changed={path}");
+        }
     }
 
     // Builders without `.git`, such as the container build, pass the revision
@@ -31,8 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dirty_override = std::env::var("BBS_BUILD_DIRTY").ok();
     // A published package has no `.git`; Cargo records its commit in
     // `.cargo_vcs_info.json` instead.
-    let checkout = git_revision();
-    let packaged = checkout.is_none().then(packaged_revision).flatten();
+    // A packaged source says what it was packaged from; only without that
+    // is the enclosing checkout asked.
+    let packaged = packaged_revision();
+    let checkout = packaged.is_none().then(git_revision).flatten();
     let (revision, dirty) = identity::resolve(
         revision_override.as_deref(),
         dirty_override.as_deref(),
@@ -44,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || match &packaged {
             Some((_, dirty)) => Some(*dirty),
             None => {
-                let mut args = vec!["status", "--porcelain", "--untracked-files=no", "--"];
+                let mut args = vec!["status", "--porcelain", "--untracked-files=normal", "--"];
                 args.extend(INPUTS);
                 git(&args).map(|s| !s.is_empty())
             }
@@ -62,11 +65,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// HEAD of this package's own checkout, never of an enclosing repository.
+/// HEAD of the bbs workspace this package roots, never of an enclosing
+/// repository that merely contains it.
 fn git_revision() -> Option<String> {
-    let toplevel = PathBuf::from(git(&["rev-parse", "--show-toplevel"])?);
-    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
-    if toplevel.canonicalize().ok()? != manifest_dir.canonicalize().ok()? {
+    let toplevel = PathBuf::from(git(&["rev-parse", "--show-toplevel"])?)
+        .canonicalize()
+        .ok()?;
+    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?)
+        .canonicalize()
+        .ok()?;
+    if toplevel != manifest_dir || !toplevel.join("crates/bbs-core/Cargo.toml").is_file() {
         return None;
     }
     // Rebuild when the checked-out commit or the index moves; the HEAD reflog

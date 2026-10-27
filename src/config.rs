@@ -10,10 +10,6 @@ use serde::{Deserialize, Serialize};
 use crate::app::home_dir;
 use crate::headless::Settings;
 
-/// Version of the fields `Config` accepts. Increase it when a change means an
-/// older binary can no longer read a config this one writes.
-pub const FORMAT: u32 = 4;
-
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -142,6 +138,16 @@ impl Config {
             .map(str::to_string)
             .or_else(|| self.human.clone())
             .or_else(|| std::env::var("USER").ok())
+    }
+}
+
+impl crate::backend::Settings for Config {
+    fn server(&self) -> Option<&str> {
+        self.server.as_deref()
+    }
+
+    fn human_token(&self) -> Option<String> {
+        self.human_token.clone()
     }
 }
 

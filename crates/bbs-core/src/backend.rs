@@ -10,7 +10,6 @@ use rusqlite::Connection;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::config::Config;
 use crate::db;
 use crate::proto::{self, bbs_client::BbsClient};
 use crate::protocol;
@@ -172,11 +171,18 @@ macro_rules! rpc {
     }};
 }
 
+/// Where a client's configuration points it: a server, with the human's
+/// token for it, or none for the local database.
+pub trait Settings {
+    fn server(&self) -> Option<&str>;
+    fn human_token(&self) -> Option<String>;
+}
+
 impl Backend {
     /// The configured server, else the local database `bbs init` created in `dir`.
-    pub async fn open(config: &Config, dir: &Path, mut caller: Caller) -> Result<Backend> {
-        if let Some(addr) = &config.server {
-            caller.human_token = config.human_token.clone();
+    pub async fn open(config: &impl Settings, dir: &Path, mut caller: Caller) -> Result<Backend> {
+        if let Some(addr) = config.server() {
+            caller.human_token = config.human_token();
             return Ok(Backend::Remote(Remote::connect(addr, caller).await?));
         }
         if !dir.join("bbs.db").exists() {

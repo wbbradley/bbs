@@ -2184,7 +2184,7 @@ fn old_schema_is_migrated_on_open_even_concurrently() {
     let state = home.join(".local/state/bbs");
     std::fs::create_dir_all(&state).unwrap();
     let db = rusqlite::Connection::open(state.join("bbs.db")).unwrap();
-    db.execute_batch(include_str!("../migrations/0001_init.sql"))
+    db.execute_batch(include_str!("../crates/bbs-core/migrations/0001_init.sql"))
         .unwrap();
     db.execute_batch(
         "PRAGMA user_version = 1;
@@ -4376,4 +4376,62 @@ fn headless_owner_outage_survives_restart_without_model_rerun() {
             .to_string_lossy()
             .starts_with("part-")
     }));
+}
+
+#[test]
+fn serve_without_bbs_server_says_how_to_install_it() {
+    // `bbs` alone, with nothing beside it and nothing on PATH.
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_bbs"));
+    let dir = tempfile::tempdir_in(binary.parent().unwrap()).unwrap();
+    let bbs = dir
+        .path()
+        .join(format!("bbs{}", std::env::consts::EXE_SUFFIX));
+    // Linking avoids writable executable handles inherited by parallel test forks.
+    std::fs::hard_link(binary, &bbs).unwrap();
+    let out = std::process::Command::new(&bbs)
+        .args(["serve", "--listen", "127.0.0.1:0"])
+        .env("PATH", "")
+        .env("HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cargo install --locked bbs-server"), "{err}");
+    assert!(!err.contains("--features"), "{err}");
+    // Nothing was started or created on the way.
+    assert!(!dir.path().join(".local").exists());
+}
+
+#[test]
+fn serve_passes_on_only_what_follows_it() {
+    // `bbs`'s own options stay with `bbs`; bbs-server sees just its own.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bbs"))
+        .args(["--as", "ada", "--theme", "no-color", "serve", "--version"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(shown.starts_with("bbs-server "), "{shown}");
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_skips_a_bbs_server_it_cannot_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_bbs"));
+    let dir = tempfile::tempdir_in(binary.parent().unwrap()).unwrap();
+    let bbs = dir.path().join("bbs");
+    // Linking avoids writable executable handles inherited by parallel test forks.
+    std::fs::hard_link(binary, &bbs).unwrap();
+    // A bbs-server beside it without the execute bit is not the server.
+    let fake = dir.path().join("bbs-server");
+    std::fs::write(&fake, "not a program").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = std::process::Command::new(&bbs)
+        .args(["serve", "--version"])
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not installed"));
 }

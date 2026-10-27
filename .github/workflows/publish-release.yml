@@ -17,14 +17,41 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Test
-        run: cargo test --locked
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Test frontend
+        working-directory: web
+        run: npm ci && npm test
+      - name: Check committed server assets
+        run: python3 scripts/build_web.py
+      - name: Build workspace
+        run: cargo build --workspace --locked
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Test separate packages without Node
+        run: python3 scripts/test_workspace_package.py
       - name: Write manifest
         run: |
-          cargo build --release --locked
+          cargo build --release --workspace --locked
           target/release/bbs version --manifest > bbs-release.json
+          target/release/bbs-server version --manifest > bbs-server-release.json
+          cmp bbs-release.json bbs-server-release.json
           python3 -c 'import json, os, sys; m = json.load(open("bbs-release.json")); sys.exit(m["revision"] != os.environ["GITHUB_SHA"])'
           cat bbs-release.json
+      - name: Check initial crate publication is complete
+        run: |
+          python3 - <<'PYBOOT'
+          import urllib.error, urllib.request
+          for name in ("bbs-core", "bbs-server"):
+              try:
+                  with urllib.request.urlopen("https://crates.io/api/v1/crates/" + name, timeout=30):
+                      pass
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      raise SystemExit(name + ": publish the initial crate with owner authorization and configure trusted publishing before running this workflow; see README")
+                  raise
+          PYBOOT
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -46,20 +73,28 @@ jobs:
           Source revision \`$GITHUB_SHA\`. Install this release's client with:
 
           \`\`\`sh
-          cargo install --locked --git https://github.com/wbbradley/bbs --rev $GITHUB_SHA --bin bbs
+          cargo install --locked --git https://github.com/wbbradley/bbs --rev $GITHUB_SHA bbs-cli --bin bbs
+          \`\`\`
+
+          On machines running the server outside the container, also install its matching executable:
+
+          \`\`\`sh
+          cargo install --locked --git https://github.com/wbbradley/bbs --rev $GITHUB_SHA bbs-server
           \`\`\`
 
           Over a client installed before the package was renamed \`bbs-cli\`, run \`cargo uninstall bbs\` once first.
 
           \`bbs-release.json\` lists its protocol, schema, config format and minimum Rust version.
           NOTES
-          gh release create "$tag" bbs-release.json --repo "$GITHUB_REPOSITORY" \
+          gh release create "$tag" bbs-release.json bbs-server-release.json --repo "$GITHUB_REPOSITORY" \
             --verify-tag --title "bbs $tag" --notes-file notes.md
           echo "Published [$tag]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$tag) at \`$GITHUB_SHA\`." >> "$GITHUB_STEP_SUMMARY"
   # crates.io trusted publishing: a short-lived token from this workflow's OIDC
   # identity. A separate job, so no build script ever runs where the token can
   # be minted (`--no-verify`; the publish job already tested this commit). If
-  # it fails, run `cargo publish --locked` from GITHUB_SHA by hand.
+  # it fails, publish the three packages in dependency order from GITHUB_SHA.
+  # New crate names require an owner-authorized initial API-token publication,
+  # then trusted-publisher configuration, before this automated workflow can run.
   crates-io:
     needs: publish
     permissions:
@@ -71,9 +106,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Verify release sources are clean
+        run: python3 scripts/check_release_source.py
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked --no-verify
+        # Core must be available before the two independent binary packages.
+        # No build scripts or frontend tools run in this credential-bearing job.
+        run: |
+          cargo publish --locked --no-verify -p bbs-core
+          cargo publish --locked --no-verify -p bbs-cli
+          cargo publish --locked --no-verify -p bbs-server

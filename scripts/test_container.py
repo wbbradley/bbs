@@ -6,10 +6,14 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+import json
+import re
 import sqlite3
 import subprocess
 import tempfile
 import time
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 
 def run(*args, env=None):
@@ -24,6 +28,57 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def check_web(address, token):
+    # Use the configured public origin while connecting only to Docker's
+    # ephemeral loopback mapping. No proxy or production endpoint is involved.
+    origin = "http://bbs-container.test"
+    headers = {"Host": "bbs-container.test", "Origin": origin, "x-bbs-web": "1"}
+    base = f"http://{address}"
+
+    def request(path, body=None, cookie=None):
+        values = dict(headers)
+        if cookie:
+            values["Cookie"] = cookie
+        if body is not None:
+            values["Content-Type"] = "application/json"
+        return urlopen(Request(
+            base + path, data=None if body is None else json.dumps(body).encode(),
+            headers=values,
+        ), timeout=5)
+
+    with request("/healthz") as response:
+        require(response.status == 200, "HTTP listener is not ready")
+    with request("/") as response:
+        page = response.read().decode()
+        require("text/html" in response.headers.get("Content-Type", ""), "missing HTML UI")
+    assets = re.findall(r'(?:src|href)="(/assets/[^\"]+)"', page)
+    require(any(path.endswith(".js") for path in assets), "index has no bundled JavaScript")
+    for path in assets:
+        with request(path) as response:
+            require(response.status == 200 and bool(response.read()), "missing bundled asset")
+    with request("/api/info") as response:
+        require(bool(json.load(response).get("release")), "HTTP server has no release identity")
+    with request("/api/login", {"name": "webtester", "token": token}) as response:
+        cookie = response.headers["Set-Cookie"]
+        require("HttpOnly" in cookie and "SameSite=Strict" in cookie, "unsafe session cookie")
+        cookie = cookie.split(";", 1)[0]
+    with request("/api/rpc/whoami", {}, cookie) as response:
+        require(json.load(response)["name"] == "webtester", "wrong HTTP identity")
+    subscriptions = quote(json.dumps([{"key": "summary", "kind": "summary", "q": {}}]))
+    with request("/api/events?tab=container-test&s=" + subscriptions, cookie=cookie) as response:
+        require("text/event-stream" in response.headers.get("Content-Type", ""), "missing SSE")
+        require("no-store" in response.headers.get("Cache-Control", ""), "cached SSE")
+        while True:
+            line = response.readline()
+            require(bool(line), "SSE closed without a snapshot")
+            if line.startswith(b"data:"):
+                event = json.loads(line[5:])
+                require(event["key"] == "summary" and "snapshot" in event, "wrong SSE snapshot")
+                break
+    with request("/api/logout", {}, cookie) as response:
+        require(response.status == 204, "HTTP logout failed")
+
+
 def check(image, bbs):
     image_user = run("docker", "image", "inspect", "--format", "{{.Config.User}}", image).strip()
     require(image_user == "999:999", f"expected image USER 999:999, got {image_user!r}")
@@ -33,6 +88,7 @@ def check(image, bbs):
         run(bbs, "init", "--human", "tester", env=env)
         state = Path(temporary, ".local/state/bbs")
         database = state / "bbs.db"
+        token = run(bbs, "admin", "--state-dir", str(state), "human", "add", "webtester", env=env).strip()
         now = datetime.now(timezone.utc)
         with closing(sqlite3.connect(database)) as conn, conn:
             recipient = conn.execute("SELECT id FROM humans WHERE name = 'tester'").fetchone()[0]
@@ -58,8 +114,11 @@ def check(image, bbs):
             "docker", "run", "--detach", "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--publish", "127.0.0.1::7777",
+            "--publish", "127.0.0.1::7778",
             "--mount", f"type=bind,src={state},dst=/var/lib/bbs",
             image,
+            "--listen", "0.0.0.0:7777", "--web", "0.0.0.0:7778",
+            "--web-origin", "http://bbs-container.test",
         ).strip()
         try:
             env["BBS_SERVER"] = run("docker", "port", container, "7777/tcp").strip()
@@ -72,6 +131,8 @@ def check(image, bbs):
                     if time.monotonic() >= deadline:
                         raise
                     time.sleep(0.1)
+            web = run("docker", "port", container, "7778/tcp").strip()
+            check_web(web, token)
             # Each response stays below gRPC's message limit while sorting enough
             # data to force SQLite's temporary B-tree to spill to disk.
             for batch in range(4):
@@ -93,7 +154,7 @@ def check(image, bbs):
             raise
         finally:
             subprocess.run(["docker", "rm", "--force", container], check=True, capture_output=True, timeout=15)
-    print("Restricted container: unread, streaming, archived reads, and stderr logging passed.")
+    print("Restricted container: gRPC reads/logging and HTTP UI/assets/auth/SSE passed.")
 
 
 if __name__ == "__main__":

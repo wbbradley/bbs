@@ -1,3 +1,5 @@
 target
 .git
 PLAN.md
+web/node_modules
+web/dist
