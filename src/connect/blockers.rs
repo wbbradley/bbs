@@ -901,9 +901,9 @@ impl Blockers {
         Line::default()
     }
 
-    /// The list in the top half of `area`, the selected blocker and its
-    /// answer in the bottom half, each against its half's foot: neither half
-    /// moves for what the other holds.
+    /// The list in the top third of `area`, the selected blocker and its
+    /// answer in the bottom two thirds, each against its part's foot: neither
+    /// part moves for what the other holds.
     pub fn render(&mut self, frame: &mut Frame, area: Rect, now: Instant) {
         let Parts {
             head,
@@ -913,12 +913,14 @@ impl Blockers {
             body,
             label,
         } = self.parts(area.width);
-        let [top, area] =
-            Layout::vertical([Constraint::Length(area.height / 2), Constraint::Fill(1)])
-                .areas(area);
+        let [top, area] = Layout::vertical([
+            Constraint::Length(list_height(area.height)),
+            Constraint::Fill(1),
+        ])
+        .areas(area);
         frame.render_widget(ratatui::widgets::Block::new().style(theme::base()), top);
         frame.render_widget(ratatui::widgets::Block::new().style(theme::base()), area);
-        // The top half: as many list rows as fit, the window moving only to
+        // The top third: as many list rows as fit, the window moving only to
         // keep the selection in view.
         let room = usize::from(top.height).saturating_sub(head.len() + more.len());
         let at = self
@@ -963,7 +965,7 @@ impl Blockers {
                 .map(|(_, line)| line),
         );
         head.extend(more);
-        // The bottom half: the selected blocker, its text, who an answer goes
+        // The bottom two thirds: the selected blocker, its text, who an answer goes
         // to, the answer box and the actions, all against the foot.
         let below = self.lines_below(area.width, now);
         let inset = area.width.min(2);
@@ -981,7 +983,7 @@ impl Blockers {
         ]
         .iter()
         .fold(0u16, |sum, rows| sum.saturating_add(*rows));
-        // A tall draft takes no more than the half has, keeping a row of the
+        // A tall draft takes no more than the part has, keeping a row of the
         // details in view; never less than its one line, which scrolls to
         // the cursor.
         let answer = self.answer_height(area.width).min(
@@ -1079,8 +1081,14 @@ impl Blockers {
     }
 }
 
-/// The page's text: the top half's title, notes and list, and the bottom
-/// half's selected blocker above the answer box.
+/// Rows of the top part, the list's: a third of the page, rounded down. The
+/// selected blocker and its answer take the rest.
+fn list_height(height: u16) -> u16 {
+    height / 3
+}
+
+/// The page's text: the top third's title, notes and list, and the bottom
+/// two thirds' selected blocker above the answer box.
 #[derive(Default)]
 struct Parts {
     /// The title bar, and what the list says instead of rows, if anything.
@@ -1309,8 +1317,8 @@ mod tests {
                     let (rows, buffer) = drawn(&mut blockers, width, height, now);
                     let out = rows.join("\n");
                     // The selection restated, its text, who it answers.
-                    // The list at the foot of the top half.
-                    let top = usize::from(height / 2);
+                    // The list at the foot of the top third.
+                    let top = usize::from(list_height(height));
                     let title = top - 3;
                     assert!(rows[title].starts_with(" Open blockers"), "{out}");
                     assert!(rows[top - 2].starts_with("▸ #1 @crew Zed  first?"), "{out}");
@@ -1363,7 +1371,7 @@ mod tests {
                             "{scheme:?} row {y}"
                         );
                     }
-                    // Each half's spare rows are above its content.
+                    // Each part's spare rows are above its content.
                     assert!(rows[..title].iter().all(|r| r.trim().is_empty()), "{out}");
                     assert!(rows[top..at].iter().all(|r| r.trim().is_empty()), "{out}");
                     for y in 0..title as u16 {
@@ -1393,7 +1401,7 @@ mod tests {
                 now,
             );
             blockers.open().unwrap();
-            let top = usize::from(height / 2);
+            let top = usize::from(list_height(height));
             // The list's rows, less the selection marker.
             let head = |rows: &[String]| -> Vec<String> {
                 rows[..top]
@@ -1419,7 +1427,7 @@ mod tests {
             }
             let (tall, _) = drawn(&mut blockers, width, height, now);
             assert_eq!(head(&tall), head(&first), "{tall:#?}");
-            // Each half keeps to itself: the bottom ends on the last row.
+            // Each part keeps to itself: the bottom ends on the last row.
             for rows in [&first, &second, &tall] {
                 assert!(rows[top].trim().is_empty(), "{rows:#?}");
                 let action = rows
@@ -1501,31 +1509,31 @@ mod tests {
             now,
         );
         blockers.open().unwrap();
-        // 60x24: a 12-row top half, the title and 11 rows.
+        // 60x24: an 8-row top third, the title and 7 rows.
         let listed = |rows: &[String]| -> Vec<i64> {
-            rows[..12]
+            rows[..8]
                 .iter()
                 .map(|r| r.chars().skip(2).collect::<String>())
                 .filter_map(|r| r.strip_prefix('#')?.split(' ').next()?.parse().ok())
                 .collect()
         };
         let (rows, _) = drawn(&mut blockers, 60, 24, now);
-        assert_eq!(listed(&rows), (1..=11).collect::<Vec<_>>(), "{rows:#?}");
-        for _ in 0..10 {
+        assert_eq!(listed(&rows), (1..=7).collect::<Vec<_>>(), "{rows:#?}");
+        for _ in 0..6 {
             blockers.key(SCREEN, alt(KeyCode::Down), now);
         }
         let (rows, _) = drawn(&mut blockers, 60, 24, now);
-        assert_eq!(listed(&rows), (1..=11).collect::<Vec<_>>(), "{rows:#?}");
+        assert_eq!(listed(&rows), (1..=7).collect::<Vec<_>>(), "{rows:#?}");
         // Past the foot: one row on.
         blockers.key(SCREEN, alt(KeyCode::Down), now);
         let (rows, _) = drawn(&mut blockers, 60, 24, now);
-        assert_eq!(listed(&rows), (2..=12).collect::<Vec<_>>(), "{rows:#?}");
+        assert_eq!(listed(&rows), (2..=8).collect::<Vec<_>>(), "{rows:#?}");
         // Back up inside the window: it stays.
         for _ in 0..5 {
             blockers.key(SCREEN, alt(KeyCode::Up), now);
         }
         let (rows, _) = drawn(&mut blockers, 60, 24, now);
-        assert_eq!(listed(&rows), (2..=12).collect::<Vec<_>>(), "{rows:#?}");
+        assert_eq!(listed(&rows), (2..=8).collect::<Vec<_>>(), "{rows:#?}");
         let at = |rows: &[String]| rows.iter().position(|r| r.starts_with('▸')).unwrap();
         let selected = at(&rows);
         // A refresh that resolves rows above the window, and replaces one in
@@ -1542,11 +1550,11 @@ mod tests {
         // A taller window shows more, and back again, the selection in view.
         drawn(&mut blockers, 60, 40, now);
         let (rows, _) = drawn(&mut blockers, 60, 24, now);
-        assert!(rows[..12].iter().any(|r| r.starts_with('▸')), "{rows:#?}");
+        assert!(rows[..8].iter().any(|r| r.starts_with('▸')), "{rows:#?}");
     }
 
     #[test]
-    fn an_empty_queue_says_so_at_the_foot_of_the_top_half() {
+    fn an_empty_queue_says_so_at_the_foot_of_the_top_third() {
         use crate::ui::theme::testing::{SCHEMES, with_scheme};
         for scheme in SCHEMES {
             with_scheme(scheme, || {
@@ -1560,8 +1568,8 @@ mod tests {
                     .iter()
                     .position(|r| r.contains("No open blockers."))
                     .expect("done");
-                // Where the list would end; the bottom half stays empty.
-                assert_eq!(done, 24 / 2 - 1, "{rows:#?}");
+                // Where the list would end; the bottom two thirds stay empty.
+                assert_eq!(done, 24 / 3 - 1, "{rows:#?}");
                 let card = theme::style(Role::InfoSurface).bg.unwrap_or_default();
                 let base = theme::base().bg.unwrap_or_default();
                 assert_eq!(buffer[(59, done as u16)].bg, card, "{scheme:?}");
@@ -1574,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn long_details_keep_to_the_bottom_half_and_page_in_between() {
+    fn long_details_keep_to_the_bottom_two_thirds_and_page_in_between() {
         let now = Instant::now();
         let mut blockers = Blockers::new();
         blockers.poll(SCREEN);
@@ -1590,19 +1598,19 @@ mod tests {
         blockers.open().unwrap();
         let (rows, _) = drawn(&mut blockers, 60, 24, now);
         let out = rows.join("\n");
-        // The list ends the top half; the bottom half starts with one gap.
+        // The list ends the top third; the rest starts with one gap.
         assert!(
-            rows[10].starts_with("▸ #1") && rows[11].starts_with("  #2"),
+            rows[6].starts_with("▸ #1") && rows[7].starts_with("  #2"),
             "{out}"
         );
         let at = restated(&rows, "#1 @crew Zed");
-        assert_eq!(at, 13, "one blank row, then the details: {out}");
+        assert_eq!(at, 9, "one blank row, then the details: {out}");
         assert!(rows[at + 1].starts_with("  line 0"), "{out}");
         let label = rows
             .iter()
             .position(|r| r.starts_with("answer → Zed"))
             .expect(&out);
-        assert!(rows[label].contains("PgUp/PgDn text 2/119"), "{out}");
+        assert!(rows[label].contains("PgUp/PgDn text 6/119"), "{out}");
         assert_eq!(
             rows[label - 1].trim(),
             "",
@@ -1619,19 +1627,19 @@ mod tests {
         let (paged, _) = drawn(&mut blockers, 60, 24, now);
         assert!(!paged[at + 1].starts_with("  line 0"), "{paged:#?}");
         assert_eq!(paged[..at + 1], rows[..at + 1]);
-        assert!(paged[label].contains("PgUp/PgDn text 3/119"), "{paged:#?}");
+        assert!(paged[label].contains("PgUp/PgDn text 11/119"), "{paged:#?}");
         assert_eq!(paged[label + 1..], rows[label + 1..]);
         // A taller window shows more of it, still from where it was.
         let (tall, _) = drawn(&mut blockers, 60, 40, now);
-        assert_eq!(restated(&tall, "#1 @crew Zed"), 21);
+        assert_eq!(restated(&tall, "#1 @crew Zed"), 14);
         // A multiline answer takes rows from the text only.
         let shown = blockers.text_rows.1;
         blockers.key(SCREEN, alt(KeyCode::Enter), now);
         blockers.key(SCREEN, alt(KeyCode::Enter), now);
         let (grown, _) = drawn(&mut blockers, 60, 40, now);
         assert_eq!(blockers.text_rows.1, shown - 2, "{grown:#?}");
-        assert_eq!(restated(&grown, "#1 @crew Zed"), 21);
-        assert_eq!(grown[..20], tall[..20], "the top half never moves");
+        assert_eq!(restated(&grown, "#1 @crew Zed"), 14);
+        assert_eq!(grown[..13], tall[..13], "the top third never moves");
     }
 
     #[test]

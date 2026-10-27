@@ -7399,7 +7399,7 @@ mod tests {
                 typed(&mut app, "parent draft");
                 press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
                 let mut table_rows = Vec::new();
-                // The details have the bottom half: tall enough for all of them.
+                // The details have the bottom two thirds: tall enough for all of them.
                 for width in [80u16, 60, 80] {
                     let mut terminal = Terminal::new(TestBackend::new(width, 60)).unwrap();
                     terminal.draw(|f| app.draw(f)).unwrap();
@@ -8317,12 +8317,12 @@ mod tests {
     }
 
     #[test]
-    fn the_page_halves_hold_in_the_apps_body_at_even_and_odd_heights() {
+    fn the_page_parts_hold_in_the_apps_body_at_every_height_mod_three() {
         let long = (0..60)
             .map(|i| format!("paragraph {i}"))
             .collect::<Vec<_>>()
             .join("\n\n");
-        for height in [24u16, 25, 27, 40] {
+        for height in [24u16, 25, 26, 27, 40] {
             let (mut app, mut rx) = app();
             live(&mut app, &[("Zed", 101), ("Mateo", 102)]);
             queue(
@@ -8343,10 +8343,10 @@ mod tests {
                     .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect())
                     .collect()
             };
-            // The body is all but the title and status rows; its top half
+            // The body is all but the title and status rows; its top third
             // ends with the list.
             let body = usize::from(height) - 2;
-            let foot = 1 + body / 2;
+            let foot = 1 + body / 3;
             let list = |rows: &[String]| -> Vec<String> {
                 rows[1..foot]
                     .iter()
