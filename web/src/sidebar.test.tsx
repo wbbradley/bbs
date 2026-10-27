@@ -130,7 +130,7 @@ async function show(withNav = true) {
 }
 
 describe("the sidebar's agents", () => {
-  it("flag only the blockers each agent opened, by its id, and come first by them", async () => {
+  it("flag only the blockers each agent opened, by its id, in alphabetical order", async () => {
     listings(
       new Map([
         [
@@ -148,11 +148,11 @@ describe("the sidebar's agents", () => {
       ]),
     );
     await show();
-    expect(rows()).toEqual(["Jefe⚑2now", "Frank⚑12h36m ago", "Zed"]);
+    expect(rows()).toEqual(["Frank⚑12h36m ago", "Jefe⚑2now", "Zed"]);
     // Others' agents keep their mail counts; their flags are their own too.
     act(() => api.stream("summary").push({ agents: [summary(MATEO, { unread_messages: 3 }), summary(ZED, { unread_messages: 4 })] }));
     fireEvent.click(screen.getByText("show 1"));
-    expect(rows()).toEqual(["Jefe⚑2now", "Frank⚑12h36m ago", "Zed", "Mateo@bob⚑1✉3"]);
+    expect(rows()).toEqual(["Frank⚑12h36m ago", "Jefe⚑2now", "Zed", "Mateo@bob⚑1✉3"]);
   });
 
   it("show how long ago each last sent or posted, keeping time with no requests of their own", async () => {
@@ -175,15 +175,42 @@ describe("the sidebar's agents", () => {
 
     vi.setSystemTime(NOW);
     await show();
-    expect(rows()).toEqual(["Jefenow", "Frank2h36m ago", "Zed"]);
+    expect(rows()).toEqual(["Frank2h36m ago", "Jefenow", "Zed"]);
     // The clock alone moves them on.
     await act(async () => vi.advanceTimersByTime(30000));
-    expect(rows()).toEqual(["Jefe1m ago", "Frank2h36m ago", "Zed"]);
+    expect(rows()).toEqual(["Frank2h36m ago", "Jefe1m ago", "Zed"]);
     // And the live summary brings news at once.
     act(() => api.stream("summary").push({ agents: [summary({ ...ZED, last_sent_at: new Date().toISOString() })] }));
-    expect(rows()).toEqual(["Zednow", "Jefe1m ago", "Frank2h36m ago"]);
+    expect(rows()).toEqual(["Frank2h36m ago", "Jefe1m ago", "Zednow"]);
     await act(async () => vi.advanceTimersByTime(60000));
-    expect(rows()).toEqual(["Zed1m ago", "Jefe2m ago", "Frank2h37m ago"]);
+    expect(rows()).toEqual(["Frank2h37m ago", "Jefe2m ago", "Zed1m ago"]);
+  });
+
+  it("keeps mixed-case names alphabetical when blockers, activity and listed order change", async () => {
+    const alpha = agent(10, "alpha", "ada");
+    const beta = agent(11, "Beta", "ada");
+    let agents = [ZED, beta, JEFE, alpha, FRANK, MATEO];
+    api.auto.set("list_agents", () => ({ agents, humans: [] }));
+    const pages = new Map([[0, page([blocker(by(ZED)), blocker(by(ZED)), blocker(by(JEFE))])]]);
+    listings(pages);
+    await show();
+    const names = () => [...document.querySelectorAll("a.nav-item .label .agent")].map((a) => a.textContent);
+    const alphabetical = ["alpha", "Beta", "Frank", "Jefe", "Zed"];
+    expect(names()).toEqual(alphabetical);
+
+    // The newest activity and the largest flag both move to different agents.
+    pages.set(0, page([blocker(by(beta)), blocker(by(beta)), blocker(by(beta))]));
+    act(() => api.stream("summary").push({ agents: [summary({ ...ZED, last_sent_at: new Date().toISOString() })] }));
+    await act(async () => vi.advanceTimersByTime(3000));
+    expect(names()).toEqual(alphabetical);
+    expect(rows()).toContain("Beta⚑3");
+    expect(rows()).toContain("Zednow");
+
+    // A later list response reverses its order, and the age clock advances.
+    agents = [...agents].reverse();
+    await act(async () => vi.advanceTimersByTime(30000));
+    expect(names()).toEqual(alphabetical);
+    expect(rows()).toContain("Zednow");
   });
 
   it("count past the first page, keeping the last whole count when a later page fails or stalls", async () => {
@@ -195,7 +222,7 @@ describe("the sidebar's agents", () => {
     ]);
     const asked = listings(pages);
     await show();
-    expect(rows().slice(0, 2)).toEqual(["Jefe⚑55now", "Frank⚑12h36m ago"]);
+    expect(rows().slice(0, 2)).toEqual(["Frank⚑12h36m ago", "Jefe⚑55now"]);
     // The queue shows the first page as before.
     expect(screen.getByTestId("queue").textContent).toBe("50");
     expect(asked()).toBe(2);
@@ -205,19 +232,19 @@ describe("the sidebar's agents", () => {
     pages.set(50, new Error("The server could not be reached."));
     await act(async () => vi.advanceTimersByTime(3000));
     expect(screen.getByTestId("queue").textContent).toBe("40");
-    expect(rows().slice(0, 2)).toEqual(["Jefe⚑55now", "Frank⚑12h36m ago"]);
+    expect(rows().slice(0, 2)).toEqual(["Frank⚑12h36m ago", "Jefe⚑55now"]);
 
     // A cursor that does not move on is not followed.
     pages.set(50, page(rest, 50));
     const before = asked();
     await act(async () => vi.advanceTimersByTime(3000));
     expect(asked() - before).toBe(2);
-    expect(rows().slice(0, 2)).toEqual(["Jefe⚑55now", "Frank⚑12h36m ago"]);
+    expect(rows().slice(0, 2)).toEqual(["Frank⚑12h36m ago", "Jefe⚑55now"]);
 
     // Whole again: the new count.
     pages.set(50, page(rest));
     await act(async () => vi.advanceTimersByTime(3000));
-    expect(rows().slice(0, 2)).toEqual(["Jefe⚑45now", "Frank⚑12h36m ago"]);
+    expect(rows().slice(0, 2)).toEqual(["Frank⚑12h36m ago", "Jefe⚑45now"]);
   });
 });
 

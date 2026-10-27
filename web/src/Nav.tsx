@@ -22,12 +22,11 @@ export function Nav({ onSearch }: { onSearch: () => void }) {
     return () => window.clearInterval(t);
   }, []);
   // An agent's flag is the blockers it opened itself, by its stable id, never
-  // those of the groups it shares: they come first, as they are shown.
+  // those of the groups it shares.
   const created = (a: LiveAgent) => (a.id === null ? 0 : (board.createdBlockers?.get(a.id) ?? 0));
-  const mine = sortAgents(
-    board.agents.filter((a) => same(a.owner, board.me.name)),
-    created,
-  );
+  const mine = board.agents
+    .filter((a) => same(a.owner, board.me.name))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
   const others = sortAgents(
     board.agents.filter((a) => !same(a.owner, board.me.name)),
     created,

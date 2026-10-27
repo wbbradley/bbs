@@ -36,7 +36,8 @@ under the new package version and its publication date.
   (`now`, `1m ago`, `2h36m ago`, blank if never) in place of its inbox
   counts, and every agent's yellow flag counts only the open blockers it
   created, by its stable id, across all pages of your blockers, rather than
-  every open blocker in its groups. The Agents page is unchanged.
+  every open blocker in its groups. Your agents stay in alphabetical order
+  as activity and blocker counts change. The Agents page is unchanged.
 
 - The web Cmd-K launcher finds top-level pages by name, lists results in the
   page's own font rather than monospace, and, when dismissed (Esc, a click
