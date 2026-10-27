@@ -260,7 +260,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         mail_tx,
     ));
 
-    let (drain_reports, drain_rx) = tokio::sync::watch::channel(0_i64);
+    let (drain_reports, drain_rx) =
+        tokio::sync::watch::channel(proto::ReportDrainRequest::default());
+    let mut side_drain = interactions.as_ref().and_then(|side| side.drain_progress());
     let drain_reporting = if server_has(&config, dir, "agent-drain.v1").await {
         Some(tokio::spawn(report_drain(identity_backend, drain_rx)))
     } else {
@@ -289,9 +291,13 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             && outbox.is_empty()
             && mail_rx.is_empty()
         {
-            drain_reports.send_if_modified(|id| {
-                if received_through > *id {
-                    *id = received_through;
+            let side_completed_through = side_drain.as_ref().map_or(0, |r| *r.borrow());
+            drain_reports.send_if_modified(|report| {
+                if received_through > report.completed_through
+                    || side_completed_through > report.side_completed_through
+                {
+                    report.completed_through = received_through;
+                    report.side_completed_through = side_completed_through;
                     true
                 } else {
                     false
@@ -471,6 +477,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     Some(Err(err)) => break Err(err),
                     None => break Err(anyhow::anyhow!("owner reply sender stopped; outbox retained")),
                 }
+            }
+            changed = async { side_drain.as_mut().unwrap().changed().await }, if side_drain.is_some() => {
+                if changed.is_err() { side_drain = None; }
             }
             _ = tokio::time::sleep_until(ready_at), if throttled => {}
             status = process.wait() => break Err(match status {
@@ -842,25 +851,31 @@ fn preamble(agent: &str, owner: &str, instructions: Option<&str>, timers: bool) 
 }
 
 /// Retry completion reports without blocking mail, turns, or harness events.
-async fn report_drain(mut backend: Backend, mut reports: tokio::sync::watch::Receiver<i64>) {
-    let mut sent = 0;
+async fn report_drain(
+    mut backend: Backend,
+    mut reports: tokio::sync::watch::Receiver<proto::ReportDrainRequest>,
+) {
+    let mut sent = proto::ReportDrainRequest::default();
     let mut retry = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
             changed = reports.changed() => if changed.is_err() { return; },
             _ = retry.tick() => {},
         }
-        let completed_through = *reports.borrow_and_update();
-        if completed_through <= sent {
+        let report = reports.borrow_and_update().clone();
+        if report.completed_through == 0
+            || (report.completed_through <= sent.completed_through
+                && report.side_completed_through <= sent.side_completed_through)
+        {
             continue;
         }
         match tokio::time::timeout(
             Duration::from_secs(10),
-            backend.report_drain(proto::ReportDrainRequest { completed_through }),
+            backend.report_drain(report.clone()),
         )
         .await
         {
-            Ok(Ok(_)) => sent = completed_through,
+            Ok(Ok(_)) => sent = report,
             Ok(Err(err)) => tracing::warn!("restart completion report: {err:#}"),
             Err(_) => tracing::warn!("restart completion report timed out; retrying"),
         }

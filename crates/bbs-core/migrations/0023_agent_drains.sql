@@ -10,6 +10,7 @@ CREATE TABLE agent_drain_targets (
     agent_id INTEGER NOT NULL REFERENCES agents(id),
     final_message_id INTEGER NOT NULL REFERENCES messages(id),
     completed INTEGER NOT NULL DEFAULT 0,
+    side_completed_through INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(human_id, agent_id)
 );
 CREATE INDEX agent_drain_targets_agent ON agent_drain_targets(agent_id);

@@ -27,7 +27,10 @@ const ACTIVE_AT_DEBOUNCE: chrono::Duration = chrono::Duration::seconds(60);
 mod blockers;
 pub use blockers::{answer_blocker, cancel_blocker, get_blocker, list_blockers, put_blocker};
 mod drain;
-pub use drain::{agent_drain, check_agent_drains, report_drain};
+pub use drain::{
+    agent_drain, agent_drain_with_changes, check_agent_drains, report_drain,
+    report_drain_with_changes,
+};
 mod notes;
 pub use notes::{MAX_NOTE_BYTES, list_agent_notes, put_agent_note};
 
@@ -388,6 +391,18 @@ pub fn register(
             }
             None => pick_name(ctx.conn)?,
         };
+        // Keep the reserved-name error above: restarting an existing headless
+        // agent uses it to take over its token without creating a new identity.
+        let frozen: bool = ctx.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_drains WHERE human_id = ?1)",
+            [owner.id],
+            |r| r.get(0),
+        )?;
+        if frozen {
+            bail!(
+                "agent delivery is paused for restart; resume delivery in Settings before registering a new agent"
+            );
+        }
         let token = new_token(ctx.conn)?;
         let id = db::insert_agent(
             ctx.conn,

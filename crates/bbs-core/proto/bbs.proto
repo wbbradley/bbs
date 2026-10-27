@@ -54,7 +54,7 @@ service Bbs {
   // Unread mail oldest first, archived as returned; or archived history.
   // Per-human restart barrier. Empty action queries; start/resume mutate it.
   rpc AgentDrain(AgentDrainRequest) returns (AgentDrainResponse);
-  // A headless runner reports its highest received id only when fully idle.
+  // Reports completed parent-mail and independently quiescent side-request IDs.
   rpc ReportDrain(ReportDrainRequest) returns (Empty);
   rpc Read(ReadRequest) returns (ReadResponse);
   // Authenticated agents and humans may search the entire ordinary-message
@@ -836,4 +836,9 @@ message AgentDrainResponse {
   string deadline = 4;
   repeated AgentDrainTarget agents = 5;
 }
-message ReportDrainRequest { int64 completed_through = 1; }
+message ReportDrainRequest {
+  int64 completed_through = 1;
+  // Highest side-request id observed quiescent by the runner, including
+  // cancelled/ended requests whose provider work has actually stopped.
+  int64 side_completed_through = 2;
+}

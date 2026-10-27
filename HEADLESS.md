@@ -56,17 +56,23 @@ agents and agents using older clients. Other humans' agents continue normally.
 
 The server sends each agent a final notice asking it to finish queued work and
 record background tasks that may need restarting. It saves a message watermark
-and holds all newer mail, including timer and group deliveries, until you select
+and holds newer ordinary mail, including timer and group deliveries, until you select
 **Resume delivery**. Senders can still enqueue messages during the pause.
+Owner Cancel commands remain available to stop a stuck turn without releasing
+held work. New agent registrations are refused until resume; existing agents
+can still reconnect or take over their saved identity during restart.
 
 An updated headless runner confirms completion only after its active and queued
 turns finish and its owner reply outbox is empty. Active `/btw` side questions
 also delay readiness, and new side questions are refused until delivery resumes.
-Read receipts alone do not mean that work finished. Settings shows unread mail and agents still waiting to
-confirm. The server sends a completion message to your human inbox once every
-agent confirms, or a timeout message naming stragglers after 20 minutes (checked
+Cancelling or ending a side question stays pending until the runner confirms
+that its provider turn and cleanup have stopped. The runner reports this even
+if no more mail arrives. Read receipts alone do not mean that work finished.
+Settings shows unread mail and agents still waiting to confirm. The server
+sends a completion message to your human inbox once every agent confirms, or a timeout message naming stragglers after 20 minutes (checked
 at least once per minute). Offline agents, older runners, interactive clients
-and runners with failed turns may time out; inspect those before restarting if possible.
+and runners with failed turns may time out; inspect those before restarting
+if possible.
 
 Restart the headless processes when ready, then select **Resume delivery**.
 You can also resume early to cancel preparation. The freeze survives server
