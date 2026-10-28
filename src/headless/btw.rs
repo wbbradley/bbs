@@ -26,6 +26,9 @@ struct Hooks {
     )>,
 }
 pub struct Btw {
+    // The highest server-side question observed only after its child turn,
+    // callbacks, and any required cleanup have all become quiescent.
+    drain_progress: watch::Receiver<i64>,
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
     harness: Harness,
@@ -101,6 +104,7 @@ impl Btw {
             return None;
         }
         let (stop, rx) = watch::channel(false);
+        let (drain_progress_tx, drain_progress) = watch::channel(0);
         let task = tokio::spawn(run(
             backend,
             generation,
@@ -109,14 +113,20 @@ impl Btw {
             rx,
             Hooks::default(),
             followups,
+            drain_progress_tx,
         ));
         Some(Self {
+            drain_progress,
             stop,
             task,
             harness,
             warnings,
         })
     }
+    pub fn drain_progress(&self) -> watch::Receiver<i64> {
+        self.drain_progress.clone()
+    }
+
     pub async fn finish(mut self) {
         let _ = self.stop.send(true);
         if timeout(Duration::from_secs(15), &mut self.task)
@@ -200,6 +210,7 @@ async fn run(
     mut stop: watch::Receiver<bool>,
     mut _hooks: Hooks,
     followups: bool,
+    drain_progress: watch::Sender<i64>,
 ) {
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -397,6 +408,28 @@ async fn run(
                 }
             }
             continue;
+        }
+        // A cancelled/ended server row expresses human intent, not provider
+        // completion. Only this driver knows that its active task and cleanup
+        // have finished. Publish after a successful snapshot, with no pending
+        // final report or child-loss report, and never after uncertain cleanup.
+        if !ending
+            && !disabled
+            && current
+                .side
+                .as_ref()
+                .is_none_or(|r| r.status() != SideStatus::SideOpen)
+        {
+            if let Some(row) = current.side.as_ref() {
+                drain_progress.send_if_modified(|id| {
+                    if row.id > *id {
+                        *id = row.id;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
         }
         if (ending || disabled)
             && current
@@ -698,6 +731,7 @@ mod tests {
             let (release, wait) = tokio::sync::oneshot::channel();
             let (stop, rx) = watch::channel(false);
             let (warnings, _) = mpsc::unbounded_channel();
+            let (drain_progress, mut progress) = watch::channel(0);
             let task = tokio::spawn(run(
                 board,
                 "claim-generation".into(),
@@ -708,6 +742,7 @@ mod tests {
                     claim_ack: Some((reached, wait)),
                 },
                 false,
+                drain_progress,
             ));
             timeout(Duration::from_secs(5), held)
                 .await
@@ -740,6 +775,21 @@ mod tests {
             })
             .await
             .unwrap();
+            if !lost {
+                timeout(Duration::from_secs(5), async {
+                    while *progress.borrow_and_update() < id {
+                        progress.changed().await.unwrap();
+                    }
+                })
+                .await
+                .expect("quiescent request was not acknowledged");
+            } else {
+                assert_eq!(
+                    *progress.borrow(),
+                    0,
+                    "uncertain claims cannot certify quiescence"
+                );
+            }
             let _ = stop.send(true);
             timeout(Duration::from_secs(5), task)
                 .await

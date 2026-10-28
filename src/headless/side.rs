@@ -142,6 +142,10 @@ pub struct Side {
     warnings: mpsc::UnboundedSender<String>,
 }
 impl Side {
+    pub fn drain_progress(&self) -> Option<watch::Receiver<i64>> {
+        self.btw.as_ref().map(super::btw::Btw::drain_progress)
+    }
+
     pub fn event(&self, event: &Event) {
         let command = match event {
             Event::OwnerInput(f) => Some(Command::Open(f.clone())),

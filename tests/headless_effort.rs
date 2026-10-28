@@ -39,8 +39,13 @@ impl Rig {
         } else {
             "codex-app-server"
         };
+        let drain_settings = if test == "drain" {
+            "mid_turn = \"queue\"\n"
+        } else {
+            ""
+        };
         std::fs::write(home.join(".config/bbs/config.toml"), format!(
-            "human = \"tester\"\n[headless]\nmin_turn_interval = \"0s\"\n[headless.harness.fake]\ntype = {harness_type:?}\nshare_activity = false\ncommand = [\"python3\", {fake:?}, {kind:?}, {test:?}]\n"
+            "human = \"tester\"\n[headless]\nmin_turn_interval = \"0s\"\n{drain_settings}[headless.harness.fake]\ntype = {harness_type:?}\nshare_activity = false\ncommand = [\"python3\", {fake:?}, {kind:?}, {test:?}]\n"
         )).unwrap();
         let mut rig = Self {
             home,
@@ -618,4 +623,262 @@ async fn codex_timeout_records_uncertain_delivery_without_resend() {
 #[tokio::test]
 async fn acp_load_replay_accepts_only_parent_effort_metadata() {
     lifecycle("acp", "load").await;
+}
+
+async fn restart_drain(kind: &str) {
+    let rig = Rig::new(kind, "drain").await;
+    rig.send("DRAIN_ACTIVE", None).await;
+    rig.wait_wire(|v| v.iter().any(|e| e["kind"] == "drain_held"))
+        .await;
+    let mut client = rig.client().await;
+    let started = client
+        .agent_drain(Rig::request(proto::AgentDrainRequest {
+            action: "start".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(started.frozen);
+    let held_id = rig.send("AFTER_RESTART", None).await;
+    // Wait until the notice has been fetched while the provider turn is held.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = client
+                .agent_drain(Rig::request(proto::AgentDrainRequest::default()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(status.status, "draining");
+            assert!(!status.agents[0].completed);
+            if status.agents[0].unread == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("restart notice was not fetched");
+    std::fs::write(rig.home.join("release-drain-turn"), "go").unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status = client
+                .agent_drain(Rig::request(proto::AgentDrainRequest::default()))
+                .await
+                .unwrap()
+                .into_inner();
+            if status.status == "ready" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("runner did not acknowledge completed turns");
+    assert!(rig.wire().iter().any(|v| {
+        v["kind"] == "delivered"
+            && v["text"]
+                .as_str()
+                .unwrap()
+                .contains("BBS restart preparation")
+    }));
+    assert!(
+        !rig.wire().iter().any(
+            |v| v["kind"] == "attempt" && v["text"].as_str().unwrap().contains("AFTER_RESTART")
+        )
+    );
+    assert!(held_id > started.watermark);
+    client
+        .agent_drain(Rig::request(proto::AgentDrainRequest {
+            action: "resume".into(),
+        }))
+        .await
+        .unwrap();
+    rig.wait_wire(|v| {
+        v.iter().any(|v| {
+            v["kind"] == "delivered" && v["text"].as_str().unwrap().contains("AFTER_RESTART")
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn acp_restart_drain_waits_for_turns_and_holds_new_mail() {
+    restart_drain("acp").await;
+}
+
+#[tokio::test]
+async fn codex_restart_drain_waits_for_turns_and_holds_new_mail() {
+    restart_drain("codex").await;
+}
+
+#[tokio::test]
+async fn restart_drain_does_not_acknowledge_a_failed_turn() {
+    let rig = Rig::new("acp", "drain-error").await;
+    let mut client = rig.client().await;
+    client
+        .agent_drain(Rig::request(proto::AgentDrainRequest {
+            action: "start".into(),
+        }))
+        .await
+        .unwrap();
+    rig.wait_wire(|v| v.iter().any(|e| e["kind"] == "drain_error"))
+        .await;
+    // Cover the retry reporting interval as well as the immediate idle report.
+    let until = tokio::time::Instant::now() + Duration::from_secs(6);
+    while tokio::time::Instant::now() < until {
+        let status = client
+            .agent_drain(Rig::request(proto::AgentDrainRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.status, "draining");
+        assert_eq!(status.agents[0].unread, 0);
+        assert!(!status.agents[0].completed);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn acp_restart_drain_ignores_completed_previous_generation_side_history() {
+    fn agent_request<T>(body: T, token: &str) -> Request<T> {
+        let mut request = Rig::request(body);
+        request
+            .metadata_mut()
+            .insert("bbs-token", token.parse().unwrap());
+        request
+    }
+
+    let mut rig = Rig::new("acp", "drain-history").await;
+    rig.stop();
+    // Build retained Codex history through the public service API. Only this
+    // synthetic board's agent token is read locally to authenticate that driver.
+    let db = rusqlite::Connection::open(rig.home.join("board/bbs.db")).unwrap();
+    let token: String = db
+        .query_row(
+            "SELECT token FROM agents WHERE name = 'EffortTest'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(db);
+    let mut driver = rig.client().await;
+    let mut human = rig.client().await;
+    let previous_generation = "previous-codex-generation";
+    driver
+        .begin_side_session(agent_request(
+            proto::BeginSideSessionRequest {
+                generation: previous_generation.into(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    driver
+        .report_context(agent_request(
+            proto::ReportContextRequest {
+                generation: previous_generation.into(),
+                side_supported: Some(true),
+                side_followups: Some(true),
+                preserve_usage: true,
+                ..Default::default()
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    let side_id = human
+        .ask_side(Rig::request(proto::AskSideRequest {
+            agent: "EffortTest".into(),
+            question: "completed before switching harnesses".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .id;
+    driver
+        .claim_side(agent_request(
+            proto::ClaimSideRequest {
+                generation: previous_generation.into(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    driver
+        .report_side(agent_request(
+            proto::ReportSideRequest {
+                generation: previous_generation.into(),
+                id: side_id,
+                status: proto::SideStatus::SideCompleted.into(),
+                answer: Some("finished under Codex".into()),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    human
+        .cancel_side(Rig::request(proto::CancelSideRequest {
+            id: side_id,
+            end: true,
+        }))
+        .await
+        .unwrap();
+
+    rig.start();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let report = human
+                .side_report(Rig::request(proto::SideReportRequest {
+                    agent: "EffortTest".into(),
+                    generation: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            if report.side_supported == Some(false) {
+                let history = report.side.unwrap();
+                assert_eq!(history.id, side_id);
+                assert_eq!(history.status(), proto::SideStatus::SideCompleted);
+                assert!(history.ended);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("ACP runner did not begin its unsupported-side generation");
+    human
+        .agent_drain(Rig::request(proto::AgentDrainRequest {
+            action: "start".into(),
+        }))
+        .await
+        .unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let state = human
+                .agent_drain(Rig::request(proto::AgentDrainRequest::default()))
+                .await
+                .unwrap()
+                .into_inner();
+            if state.status == "ready" {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("completed Codex history blocked the new ACP runner's drain");
+    assert!(ready.agents[0].completed);
+    assert_eq!(ready.agents[0].unread, 0);
+    assert!(!ready.agents[0].side_pending);
+    let db = rusqlite::Connection::open(rig.home.join("board/bbs.db")).unwrap();
+    let (generation, cursor): (String, i64) = db
+        .query_row("SELECT s.generation, t.side_completed_through FROM side_state s JOIN agent_drain_targets t ON t.agent_id = s.agent_id", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_ne!(generation, previous_generation);
+    assert_eq!(
+        cursor, 0,
+        "ACP has no side driver to acknowledge old history"
+    );
 }

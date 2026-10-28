@@ -288,7 +288,11 @@ async fn run_timers(state: Arc<State>) {
         changes.borrow_and_update();
         let now = (state.clock)();
         let wait = match state
-            .call(move |conn| service::fire_timers(conn, now))
+            .call(move |conn| {
+                let completed = service::check_agent_drains(conn, now)?;
+                let (fired, next) = service::fire_timers(conn, now)?;
+                Ok((fired + completed, next))
+            })
             .await
         {
             Ok((fired, next)) => {
@@ -1300,6 +1304,42 @@ impl Bbs for Server {
         Ok(response)
     }
 
+    async fn agent_drain(
+        &self,
+        req: Request<proto::AgentDrainRequest>,
+    ) -> Result<Response<proto::AgentDrainResponse>, Status> {
+        let response = self
+            .unary(
+                "agent_drain",
+                req,
+                Effect::Query,
+                service::agent_drain_with_changes,
+            )
+            .await?;
+        if response.get_ref().1 {
+            self.0.changed();
+        }
+        Ok(response.map(|(response, _)| response))
+    }
+
+    async fn report_drain(
+        &self,
+        req: Request<proto::ReportDrainRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        let response = self
+            .unary(
+                "report_drain",
+                req,
+                Effect::Query,
+                service::report_drain_with_changes,
+            )
+            .await?;
+        if response.get_ref().1 {
+            self.0.changed();
+        }
+        Ok(response.map(|(response, _)| response))
+    }
+
     async fn report_effort(
         &self,
         req: Request<proto::ReportEffortRequest>,
@@ -1371,6 +1411,234 @@ impl Bbs for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DrainRig {
+        server: Server,
+        token: String,
+    }
+
+    impl DrainRig {
+        fn new() -> Self {
+            let mut conn = Connection::open_in_memory().unwrap();
+            db::migrate(&mut conn).unwrap();
+            service::ensure_human(
+                &mut conn,
+                proto::EnsureHumanRequest {
+                    name: "will".into(),
+                },
+            )
+            .unwrap();
+            let owner = Caller {
+                human: Some("will".into()),
+                ..Default::default()
+            };
+            let token = service::register(
+                &mut conn,
+                &owner,
+                proto::RegisterRequest {
+                    name: Some("Mateo".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .token;
+            let state = Arc::new(State {
+                conn: Mutex::new(conn),
+                notify: watch::Sender::new(0),
+                activity: watch::Sender::new(0),
+                waiters: Mutex::new(HashSet::new()),
+                shutdown: watch::Sender::new(false),
+                require_human_token: false,
+                protocol: Policy::default(),
+                auth_failures: Mutex::new(HashMap::new()),
+                timer_limits: TimerLimits::default(),
+                clock: Arc::new(Utc::now),
+            });
+            Self {
+                server: Server(state),
+                token,
+            }
+        }
+
+        async fn status(&self, action: &str) -> proto::AgentDrainResponse {
+            self.server
+                .agent_drain(with_metadata(
+                    proto::AgentDrainRequest {
+                        action: action.into(),
+                    },
+                    "bbs-human",
+                    "will",
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+        }
+
+        async fn report(&self, completed_through: i64, side_completed_through: i64) {
+            self.server
+                .report_drain(with_metadata(
+                    proto::ReportDrainRequest {
+                        completed_through,
+                        side_completed_through,
+                    },
+                    "bbs-token",
+                    &self.token,
+                ))
+                .await
+                .unwrap();
+        }
+
+        fn notifications(&self) -> u64 {
+            *self.server.0.notify.borrow()
+        }
+
+        fn read_notice(&self) {
+            service::read(
+                &mut self.server.0.conn.lock().unwrap(),
+                &Caller {
+                    token: Some(self.token.clone()),
+                    ..Default::default()
+                },
+                proto::ReadRequest::default(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_rpcs_notify_only_for_domain_changes() {
+        let rig = DrainRig::new();
+        {
+            let conn = rig.server.0.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE humans SET active_at = '2001-01-01T00:00:00.000000Z'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE agents SET active_at = '2001-01-01T00:00:00.000000Z'",
+                [],
+            )
+            .unwrap();
+        }
+        let before = rig.server.0.conn.lock().unwrap().total_changes();
+        assert_eq!(rig.status("").await.status, "running");
+        assert!(
+            rig.server.0.conn.lock().unwrap().total_changes() > before,
+            "authentication refreshed activity"
+        );
+        assert_eq!(
+            rig.notifications(),
+            0,
+            "identity activity is not a drain state change"
+        );
+        rig.status("").await;
+        rig.report(1, 0).await;
+        assert_eq!(
+            rig.notifications(),
+            0,
+            "no-op status and unmatched report stay quiet"
+        );
+
+        let started = rig.status("start").await;
+        assert_eq!(rig.notifications(), 1);
+        rig.status("start").await;
+        rig.status("").await;
+        rig.report(0, 0).await;
+        assert_eq!(
+            rig.notifications(),
+            1,
+            "duplicate start, query and stale report stay quiet"
+        );
+        rig.read_notice();
+        rig.report(started.watermark, 0).await;
+        assert_eq!(rig.notifications(), 2);
+        assert_eq!(rig.status("").await.status, "ready");
+        rig.report(started.watermark, 0).await;
+        assert_eq!(rig.notifications(), 2, "duplicate completion stays quiet");
+        rig.status("resume").await;
+        assert_eq!(rig.notifications(), 3);
+        rig.status("resume").await;
+        assert_eq!(rig.notifications(), 3, "duplicate resume stays quiet");
+    }
+
+    #[tokio::test]
+    async fn drain_status_query_notifies_when_reconciliation_creates_a_timeout_message() {
+        let rig = DrainRig::new();
+        rig.status("start").await;
+        rig.server
+            .0
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agent_drains SET deadline = '2001-01-01T00:00:00.000000Z'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(rig.status("").await.status, "timed_out");
+        assert_eq!(rig.notifications(), 2);
+        rig.status("").await;
+        assert_eq!(rig.notifications(), 2);
+        let messages: i64 = rig
+            .server
+            .0
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM deliveries WHERE recipient_kind = 'human'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(messages, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_side_turn_needs_runner_ack_and_only_new_progress_notifies() {
+        let rig = DrainRig::new();
+        let side_id = {
+            let conn = rig.server.0.conn.lock().unwrap();
+            conn.execute("INSERT INTO side_requests(agent_id, question, asked_at, status, updated_at) SELECT id, 'active side turn', 'now', 'open', 'now' FROM agents", []).unwrap();
+            conn.last_insert_rowid()
+        };
+        let started = rig.status("start").await;
+        rig.read_notice();
+        rig.report(started.watermark, 0).await;
+        assert_eq!(rig.notifications(), 2);
+        let pending = rig.status("").await;
+        assert!(pending.agents[0].completed);
+        assert!(pending.agents[0].side_pending);
+        assert_eq!(pending.status, "draining");
+        {
+            let mut conn = rig.server.0.conn.lock().unwrap();
+            service::cancel_side(
+                &mut conn,
+                &Caller {
+                    human: Some("will".into()),
+                    ..Default::default()
+                },
+                proto::CancelSideRequest {
+                    id: side_id,
+                    end: false,
+                },
+            )
+            .unwrap();
+        }
+        rig.report(started.watermark, 0).await;
+        assert_eq!(rig.status("").await.status, "draining");
+        assert_eq!(
+            rig.notifications(),
+            2,
+            "owner cancellation and duplicate parent ack cannot confirm child quiescence"
+        );
+        rig.report(started.watermark, side_id).await;
+        assert_eq!(rig.status("").await.status, "ready");
+        assert_eq!(rig.notifications(), 3);
+        rig.report(started.watermark, side_id).await;
+        assert_eq!(rig.notifications(), 3);
+    }
 
     #[tokio::test]
     async fn blockers_round_trip_and_old_capability_refusal_preserve_atomicity() {

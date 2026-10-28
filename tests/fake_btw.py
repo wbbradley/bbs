@@ -81,6 +81,8 @@ for line in sys.stdin:
     elif method=='turn/start':
         if p['threadId']=='parent':
             parent_live=True;reply(mid,dict(turn=dict(id='p')));text('parent','p','parent before\n');note('thread/tokenUsage/updated',dict(threadId='parent',turnId='p',tokenUsage=dict(last=dict(totalTokens=40),modelContextWindow=100)));record('parent_active')
+            if any('BBS restart preparation' in item.get('text', '') for item in p.get('input', [])):
+                done('parent','p')
             continue
         assert p['threadId']=='child'
         if scenario.startswith('continue'):

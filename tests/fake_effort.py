@@ -1,5 +1,6 @@
 """No accounts, tools or model calls: effort protocol fixture for local tests."""
 import json
+from pathlib import Path
 import sys
 import time
 
@@ -80,6 +81,10 @@ for line in sys.stdin:
         tid = str(turn)
         text = p['prompt'][0]['text'] if kind == 'acp' else p['input'][0]['text']
         record('attempt', text=text, effort=p.get('effort'))
+        if scenario == 'drain-error':
+            record('drain_error')
+            error(mid)
+            continue
         if kind == 'codex':
             if scenario == 'timeout' and 'effort' in p:
                 time.sleep(30)
@@ -98,7 +103,12 @@ for line in sys.stdin:
             else:
                 note('thread/settings/updated', dict(threadId='thread', threadSettings=dict(model='fixture', effort=current)))
                 note('thread/settings/updated', dict(threadId='child', threadSettings=dict(model='other', effort='max')))
-        if 'HOLD' in text:
+        if scenario == 'drain' and 'DRAIN_ACTIVE' in text:
+            record('drain_held')
+            while not Path('release-drain-turn').exists():
+                time.sleep(0.03)
+            finish(mid, text, tid)
+        elif 'HOLD' in text:
             held = (mid, text, tid)
             record('held', effort=current)
         else:

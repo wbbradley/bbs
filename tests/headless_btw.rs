@@ -642,3 +642,162 @@ async fn rejected_followup_cleans_held_child_without_submitting_or_replaying_it(
     );
     r.stop();
 }
+
+async fn drain_status(r: &Rig, expected: &str) -> proto::AgentDrainResponse {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let state = r
+                .client()
+                .await
+                .agent_drain(req(proto::AgentDrainRequest::default()))
+                .await
+                .unwrap()
+                .into_inner();
+            if state.status == expected {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("drain status did not arrive")
+}
+
+#[tokio::test]
+async fn restart_drain_keeps_owner_cancel_live_without_releasing_ordinary_mail() {
+    let mut r = Rig::new("continue").await;
+    r.send("HOLD MAIN", None).await;
+    r.wait_wire(|w| w.iter().any(|v| v["kind"] == "parent_active"))
+        .await;
+    r.client()
+        .await
+        .agent_drain(req(proto::AgentDrainRequest {
+            action: "start".into(),
+        }))
+        .await
+        .unwrap();
+    r.send("HELD ORDINARY WORK", None).await;
+    r.send("cancel", Some(proto::Control::Cancel)).await;
+    r.wait_wire(|w| {
+        w.iter()
+            .any(|v| v["method"] == "turn/interrupt" && v["params"]["threadId"] == "parent")
+    })
+    .await;
+    let state = drain_status(&r, "ready").await;
+    assert!(state.frozen);
+    assert!(
+        !r.wire().iter().any(|v| v["method"] == "turn/start"
+            && v["params"].to_string().contains("HELD ORDINARY WORK"))
+    );
+    r.client()
+        .await
+        .agent_drain(req(proto::AgentDrainRequest {
+            action: "resume".into(),
+        }))
+        .await
+        .unwrap();
+    r.wait_wire(|w| {
+        w.iter().any(|v| {
+            v["method"] == "turn/start" && v["params"].to_string().contains("HELD ORDINARY WORK")
+        })
+    })
+    .await;
+    r.stop();
+}
+
+#[tokio::test]
+async fn restart_drain_waits_for_side_cancel_and_end_to_be_quiescent() {
+    for end in [false, true] {
+        let mut r = Rig::new("continue-delayed-interrupt").await;
+        r.wait_report(|s| s.side_followups == Some(true)).await;
+        let first = r.ask().await;
+        r.completed(first).await;
+        let second = r.ask_text(Some(first), "HOLD SIDE").await;
+        r.wait_wire(|w| w.iter().any(|v| v["kind"] == "side_active"))
+            .await;
+        let mut client = r.client().await;
+        client
+            .agent_drain(req(proto::AgentDrainRequest {
+                action: "start".into(),
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let state = client
+                    .agent_drain(req(proto::AgentDrainRequest::default()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(state.status, "draining");
+                if state.agents[0].completed {
+                    assert!(state.agents[0].side_pending);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        client
+            .cancel_side(req(proto::CancelSideRequest { id: second, end }))
+            .await
+            .unwrap();
+        let state = client
+            .agent_drain(req(proto::AgentDrainRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.status, "draining");
+        assert!(state.agents[0].side_pending);
+        r.wait_wire(|w| w.iter().any(|v| v["kind"] == "interrupt_pending"))
+            .await;
+        // Even the interrupt ACK is insufficient: the provider's terminal
+        // notification is deliberately withheld until we release it.
+        let state = client
+            .agent_drain(req(proto::AgentDrainRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.status, "draining");
+        assert!(state.agents[0].side_pending);
+        std::fs::write(r.home.path().join("release-interrupt"), "").unwrap();
+        let state = drain_status(&r, "ready").await;
+        assert!(!state.agents[0].side_pending);
+        r.stop();
+    }
+}
+
+#[tokio::test]
+async fn restart_drain_does_not_certify_unconfirmed_side_cleanup() {
+    let mut r = Rig::new("continue-bad-interrupt").await;
+    r.wait_report(|s| s.side_followups == Some(true)).await;
+    let first = r.ask().await;
+    r.completed(first).await;
+    let second = r.ask_text(Some(first), "HOLD SIDE").await;
+    r.wait_wire(|w| w.iter().any(|v| v["kind"] == "side_active"))
+        .await;
+    let mut client = r.client().await;
+    client
+        .agent_drain(req(proto::AgentDrainRequest {
+            action: "start".into(),
+        }))
+        .await
+        .unwrap();
+    client
+        .cancel_side(req(proto::CancelSideRequest {
+            id: second,
+            end: false,
+        }))
+        .await
+        .unwrap();
+    r.wait_report(|s| s.side_supported == Some(false)).await;
+    let state = client
+        .agent_drain(req(proto::AgentDrainRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(state.status, "draining");
+    assert!(state.agents[0].side_pending);
+    r.stop();
+}

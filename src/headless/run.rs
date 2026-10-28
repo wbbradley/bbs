@@ -260,6 +260,18 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         mail_tx,
     ));
 
+    let (drain_reports, drain_rx) =
+        tokio::sync::watch::channel(proto::ReportDrainRequest::default());
+    let mut side_drain = interactions.as_ref().and_then(|side| side.drain_progress());
+    let drain_reporting = if server_has(&config, dir, "agent-drain.v1").await {
+        Some(tokio::spawn(report_drain(identity_backend, drain_rx)))
+    } else {
+        None
+    };
+    let mut received_through = 0_i64;
+    // Failed/ambiguous turns can leave fetched mail unprocessed. A later
+    // successful turn cannot acknowledge that older work as completed.
+    let mut drain_failed = false;
     let mut queue: Vec<proto::Message> = Vec::new();
     let mut turn: Option<JoinHandle<Result<String>>> = None;
     let mut active_mail = Vec::new();
@@ -270,6 +282,28 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     // A resumed session that never completes a turn may be what fails.
     let mut session_proven = !agent_harness.session_resumed();
     let mut result = loop {
+        // A read receipt only means the mail reached this process. A restart
+        // acknowledgement waits for all queued/steered turns and durable owner
+        // replies to finish. Never acknowledge on error or shutdown.
+        if !drain_failed
+            && turn.is_none()
+            && queue.is_empty()
+            && outbox.is_empty()
+            && mail_rx.is_empty()
+        {
+            let side_completed_through = side_drain.as_ref().map_or(0, |r| *r.borrow());
+            drain_reports.send_if_modified(|report| {
+                if received_through > report.completed_through
+                    || side_completed_through > report.side_completed_through
+                {
+                    report.completed_through = received_through;
+                    report.side_completed_through = side_completed_through;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         if !delivering && let Some(part) = outbox.ready() {
             if delivery.queue.send(part.clone()).await.is_err() {
                 break Err(anyhow::anyhow!(
@@ -313,6 +347,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         tokio::select! {
             mail = mail_rx.recv() => match mail {
                 Some(Ok(mut batch)) => {
+                    received_through = batch.iter().map(|m| m.id).max().unwrap_or(0).max(received_through);
                     // Control messages act now and are not prompts. The server
                     // accepts them only from the agent's owner.
                     for message in &batch {
@@ -392,6 +427,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                         continue;
                     }
                     Ok(Err(err)) => {
+                        drain_failed |= err.downcast_ref::<PromptNotStarted>().is_none();
                         if let Some(uncertain) = err.downcast_ref::<EffortUnconfirmed>() {
                             log.event(if uncertain.prompt_sent { "delivery_uncertain" } else { "unprocessed" }, json!({ "text": format_messages(&active_mail, false)?, "acceptance": if uncertain.prompt_sent { "unknown" } else { "not_sent" } }));
                             active_mail.clear();
@@ -410,7 +446,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                         }
                         format!("{err:#}")
                     },
-                    Err(err) => err.to_string(),
+                    Err(err) => { drain_failed = true; err.to_string() },
                 };
                 log.event("turn_error", json!({ "message": message }));
                 turn_errors += 1;
@@ -451,6 +487,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     None => break Err(anyhow::anyhow!("owner reply sender stopped; outbox retained")),
                 }
             }
+            changed = async { side_drain.as_mut().unwrap().changed().await }, if side_drain.is_some() => {
+                if changed.is_err() { side_drain = None; }
+            }
             _ = tokio::time::sleep_until(ready_at), if throttled => {}
             status = process.wait() => break Err(match status {
                 Ok(status) => anyhow::anyhow!("the harness exited ({status})"),
@@ -464,6 +503,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         }
     };
     mail_task.abort();
+    if let Some(task) = drain_reporting {
+        task.abort();
+    }
     // Mail the wait already took but the loop had not yet received.
     while let Ok(Ok(batch)) = mail_rx.try_recv() {
         queue.extend(batch.into_iter().filter(|m| m.control.is_none()));
@@ -840,6 +882,38 @@ fn preamble(agent: &str, owner: &str, instructions: Option<&str>, timers: bool) 
         text.push_str("\n\n");
     }
     text
+}
+
+/// Retry completion reports without blocking mail, turns, or harness events.
+async fn report_drain(
+    mut backend: Backend,
+    mut reports: tokio::sync::watch::Receiver<proto::ReportDrainRequest>,
+) {
+    let mut sent = proto::ReportDrainRequest::default();
+    let mut retry = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            changed = reports.changed() => if changed.is_err() { return; },
+            _ = retry.tick() => {},
+        }
+        let report = reports.borrow_and_update().clone();
+        if report.completed_through == 0
+            || (report.completed_through <= sent.completed_through
+                && report.side_completed_through <= sent.side_completed_through)
+        {
+            continue;
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            backend.report_drain(report.clone()),
+        )
+        .await
+        {
+            Ok(Ok(_)) => sent = report,
+            Ok(Err(err)) => tracing::warn!("restart completion report: {err:#}"),
+            Err(_) => tracing::warn!("restart completion report timed out; retrying"),
+        }
+    }
 }
 
 /// Keep one mail wait open for the agent and forward each batch. Retries on
