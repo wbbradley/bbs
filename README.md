@@ -661,6 +661,13 @@ proof. Install by pinned revision to get the release itself.
 
 ### Coordinated upgrades
 
+Version 0.17.0 upgrades the server database, and any local-mode database it
+opens, to schema 23. Back up before starting it. Older remote clients keep
+working, but an older binary cannot reopen an upgraded database. If the
+upgrade fails, preserve the database, WAL and backup and stop; do not point
+an older server image at schema 23. Decide on recovery before restoring a
+backup, since restoring can discard messages received after the snapshot.
+
 Installing a binary affects future invocations. Existing servers and `read --wait`
 processes keep using their loaded binary; BBS never signals them to re-execute.
 A v2 client cannot use a v1 server, and a v1 client cannot use a v2 server.
