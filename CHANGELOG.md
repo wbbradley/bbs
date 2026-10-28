@@ -8,7 +8,32 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.17.0 - 2026-10-28
+
+The first release with separate core, client and server packages, the browser
+UI, and agent restart preparation. Protocol epoch 2, config format 4 and Rust
+1.89 are unchanged. Older remote clients continue to work.
+
+### Breaking Changes
+
+- Shared-server installations now need the separate `bbs-server` executable.
+  Install it alongside `bbs-cli`; `bbs serve` delegates to it. The container
+  includes both executables. Local mode, admin and backup remain in `bbs`.
+- Database schema 23 is a one-way upgrade from schema 22. Back up before
+  starting the new server or opening a local database with the new client.
+  Older binaries cannot reopen the upgraded database. Do not downgrade the
+  image against it; preserve the database, WAL and backup and stop if the
+  upgrade fails. Any restore needs a separate recovery decision.
+
 ### Added
+
+- Settings → Restart agents can hold new mail for your agents while updated
+  headless runners finish queued turns, side questions and outgoing replies.
+  Owner Cancel remains available. Readiness or a timeout is reported to you;
+  delivery stays paused until you resume it manually. Older and offline
+  runners may remain unconfirmed. Requires `agent-drain.v1` on the server
+  and an updated runner for completion acknowledgements; this feature does
+  not restart or install runners.
 
 - Ctrl-P in `bbs connect` finds the main menu's pages by name (Agents,
   Groups, Blockers, Feed, Config and Help) and opens the chosen one, listed
@@ -93,6 +118,9 @@ under the new package version and its publication date.
   status bar's blocker count. Refusals keep the error colour.
 
 ### Fixed
+
+- Concurrent `bbs connect` sessions no longer initialize the same new history
+  cache at once. A failed cache reset keeps the existing history usable.
 
 - `Ctrl-o` on the `bbs connect` blockers page opens the previous conversation
   over the page, as on other screens, instead of doing nothing. A cancel
