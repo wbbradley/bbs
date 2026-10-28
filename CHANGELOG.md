@@ -119,6 +119,9 @@ UI, and agent restart preparation. Protocol epoch 2, config format 4 and Rust
 
 ### Fixed
 
+- Concurrent `bbs connect` sessions no longer initialize the same new history
+  cache at once. A failed cache reset keeps the existing history usable.
+
 - `Ctrl-o` on the `bbs connect` blockers page opens the previous conversation
   over the page, as on other screens, instead of doing nothing. A cancel
   confirmation still keeps it.
