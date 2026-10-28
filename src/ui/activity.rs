@@ -230,7 +230,11 @@ impl Activity {
                         Span::styled(" turn ━━", style(Role::Accent).bold()),
                     ]));
                 }
-                self.block(&mut out, mail_part(text), style(Role::Text));
+                let mail = r
+                    .get("mail_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| mail_part(text));
+                self.block(&mut out, mail, style(Role::Text));
             }
             "steer" => {
                 self.timed(
@@ -239,7 +243,11 @@ impl Activity {
                     "mail steered into the turn:",
                     style(Role::Accent),
                 );
-                self.block(&mut out, mail_part(text), style(Role::Text));
+                let mail = r
+                    .get("mail_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| mail_part(text));
+                self.block(&mut out, mail, style(Role::Text));
             }
             "thought" if self.compact_thoughts => self.thought(&mut out, text),
             "thought" => {
@@ -520,6 +528,24 @@ mod tests {
             .iter()
             .map(|l| to_ansi(&activity.render(l), false))
             .collect()
+    }
+
+    #[test]
+    fn plain_owner_input_keeps_attribution_without_showing_the_startup_preamble() {
+        for event in ["prompt", "steer"] {
+            let body = "New BBS mail (literal human text)\nkeep the entire message";
+            let line = serde_json::json!({
+                "event": event,
+                "text": format!("SETUP PREAMBLE\n\n{body}"),
+                "mail_text": format!("[2026-10-28T16:33:34Z] from Will (human) to Ade:\n{body}\n"),
+                "mail_ids": [1],
+            })
+            .to_string();
+            let shown = render(&[&line]);
+            assert!(shown.contains("from Will (human) to Ade:"), "{shown}");
+            assert!(shown.contains(body), "{shown}");
+            assert!(!shown.contains("SETUP PREAMBLE"), "{shown}");
+        }
     }
 
     #[test]

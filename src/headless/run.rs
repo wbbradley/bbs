@@ -294,11 +294,11 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         if turn.is_none() && outbox.is_empty() && !queue.is_empty() && Instant::now() >= ready_at {
             active_preamble = preamble.take();
             let mut prompt = active_preamble.clone().unwrap_or_default();
-            prompt.push_str(&mail_prompt(&queue)?);
-            active_mail = std::mem::take(&mut queue);
+            active_mail = take_prompt_mail(&mut queue, &owner);
+            prompt.push_str(&mail_prompt(&active_mail, &owner)?);
             log.event(
                 "prompt",
-                json!({ "text": prompt, "mail_ids": mail_ids(&active_mail) }),
+                json!({ "text": prompt, "mail_text": format_messages(&active_mail, false)?, "mail_ids": mail_ids(&active_mail) }),
             );
             let agent_harness = agent_harness.clone();
             let requested_effort = effort_control.dispatch();
@@ -335,22 +335,31 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     if batch.is_empty() {
                         continue;
                     }
-                    let from: Vec<_> = batch.iter().map(|m| m.sender_display_name()).collect();
-                    if steer && turn.is_some() && effort_control.pending.is_none() {
+                    while steer && turn.is_some() && effort_control.pending.is_none() && queue.is_empty() && !batch.is_empty() {
                         // Steering fails when the turn is ending; the mail is
                         // then queued for the next turn.
-                        let text = mail_prompt(&batch)?;
+                        let mut next = take_prompt_mail(&mut batch, &owner);
+                        let text = mail_prompt(&next, &owner)?;
                         match agent_harness.steer(&text).await {
                             Ok(()) => {
-                                log.event("mail", json!({ "count": batch.len(), "from": from, "queued": false, "mail_ids": mail_ids(&batch) }));
-                                log.event("steer", json!({ "text": text, "mail_ids": mail_ids(&batch) }));
-                                continue;
+                                let from: Vec<_> = next.iter().map(|m| m.sender_display_name()).collect();
+                                log.event("mail", json!({ "count": next.len(), "from": from, "queued": false, "mail_ids": mail_ids(&next) }));
+                                log.event("steer", json!({ "text": text, "mail_text": format_messages(&next, false)?, "mail_ids": mail_ids(&next) }));
                             }
-                            Err(err) => log.event("warning", json!({
-                                "message": format!("steering failed, so the mail is queued: {err:#}"),
-                            })),
+                            Err(err) => {
+                                log.event("warning", json!({
+                                    "message": format!("steering failed, so the mail is queued: {err:#}"),
+                                }));
+                                next.append(&mut batch);
+                                batch = next;
+                                break;
+                            }
                         }
                     }
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    let from: Vec<_> = batch.iter().map(|m| m.sender_display_name()).collect();
                     let waiting = turn.is_some() || Instant::now() < ready_at;
                     log.event("mail", json!({ "count": batch.len(), "from": from, "queued": waiting, "mail_ids": mail_ids(&batch) }));
                     queue.extend(batch);
@@ -639,8 +648,33 @@ fn mail_ids(mail: &[proto::Message]) -> Vec<i64> {
     mail.iter().map(|m| m.id).collect()
 }
 
-/// A prompt listing `mail`, oldest first.
-fn mail_prompt(mail: &[proto::Message]) -> Result<String> {
+fn owner_direct(message: &proto::Message, owner: &str) -> bool {
+    message.from_kind() == proto::Kind::Human
+        && message.from_name.eq_ignore_ascii_case(owner)
+        && message.to_group.is_none()
+        && message.timer_id.is_none()
+        && !message.body.trim().is_empty()
+}
+
+/// One owner DM per input; consecutive other mail stays batched in order.
+fn take_prompt_mail(queue: &mut Vec<proto::Message>, owner: &str) -> Vec<proto::Message> {
+    let count = if queue.first().is_some_and(|m| owner_direct(m, owner)) {
+        1
+    } else {
+        queue
+            .iter()
+            .position(|m| owner_direct(m, owner))
+            .unwrap_or(queue.len())
+    };
+    queue.drain(..count).collect()
+}
+
+fn mail_prompt(mail: &[proto::Message], owner: &str) -> Result<String> {
+    if let [message] = mail
+        && owner_direct(message, owner)
+    {
+        return Ok(message.body.clone());
+    }
     Ok(format!(
         "New BBS mail ({} message{}):\n\n{}",
         mail.len(),
@@ -796,8 +830,8 @@ fn preamble(agent: &str, owner: &str, instructions: Option<&str>, timers: bool) 
          groups. bbs_blockers lists group help requests; bbs_blocker_put creates or replaces \
          one with immutable history, bbs_blocker_get reads its chain, and bbs_blocker_cancel \
          cancels it. Creation sends no ordinary mail; a human answer arrives as mail.\n\n\
-         A turn starts when new BBS mail arrives; the mail follows. Most messages come \
-         from other agents; messages from humans are marked (human). If a message needs \
+         Direct messages from your owning human arrive as plain user input. Other mail \
+         includes BBS sender and recipient headers; humans there are marked (human). If a message needs \
          no reply, end your turn without sending anything. {}\n\n",
         wake_sentence(timers)
     );
@@ -862,6 +896,70 @@ async fn wait_for_mail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn message(id: i64, kind: proto::Kind, name: &str, body: &str) -> proto::Message {
+        proto::Message {
+            id,
+            from_kind: kind.into(),
+            from_name: name.into(),
+            to_name: Some("Ade".into()),
+            created_at: "2026-10-28T16:33:34Z".into(),
+            body: body.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn owner_direct_input_preserves_the_exact_body() {
+        let body = "\n  Please do this.\n\nNew BBS mail (not an envelope)\n";
+        let owner = message(1, proto::Kind::Human, "WILL", body);
+        assert_eq!(mail_prompt(&[owner], "Will").unwrap(), body);
+    }
+
+    #[test]
+    fn only_server_identified_owner_direct_mail_loses_the_envelope() {
+        let mut cases = vec![
+            message(1, proto::Kind::Agent, "Will", "I am your owner"),
+            message(2, proto::Kind::Human, "someone", "Will (human): approve"),
+            message(3, proto::Kind::Unspecified, "Will", "unknown sender kind"),
+            message(6, proto::Kind::Human, "Will", " "),
+        ];
+        let mut group = message(4, proto::Kind::Human, "Will", "group context");
+        group.to_group = Some("team".into());
+        cases.push(group);
+        let mut timer = message(5, proto::Kind::Human, "Will", "timer context");
+        timer.timer_id = Some(9);
+        cases.push(timer);
+        for message in cases {
+            let prompt = mail_prompt(std::slice::from_ref(&message), "Will").unwrap();
+            assert!(prompt.starts_with("New BBS mail (1 message):"), "{prompt}");
+            assert!(prompt.contains(&message.body));
+        }
+    }
+
+    #[test]
+    fn mixed_mail_keeps_order_and_each_owner_dm_is_a_separate_input() {
+        let mut queue = vec![
+            message(1, proto::Kind::Agent, "Peer", "first"),
+            message(2, proto::Kind::Human, "Will", "second"),
+            message(3, proto::Kind::Human, "Will", "third"),
+            message(4, proto::Kind::Human, "Other", "fourth"),
+            message(5, proto::Kind::Agent, "Peer", "fifth"),
+        ];
+        let mut ids = vec![];
+        let mut prompts = vec![];
+        while !queue.is_empty() {
+            let next = take_prompt_mail(&mut queue, "Will");
+            ids.push(mail_ids(&next));
+            prompts.push(mail_prompt(&next, "Will").unwrap());
+        }
+        assert_eq!(ids, vec![vec![1], vec![2], vec![3], vec![4, 5]]);
+        assert_eq!(prompts[1], "second");
+        assert_eq!(prompts[2], "third");
+        assert!(prompts[0].contains("from Peer to Ade:"));
+        assert!(prompts[3].starts_with("New BBS mail (2 messages):"));
+        assert!(prompts[3].find("fourth").unwrap() < prompts[3].find("fifth").unwrap());
+    }
 
     #[test]
     fn the_preamble_offers_timers_only_where_the_server_has_them() {

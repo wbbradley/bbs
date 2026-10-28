@@ -32,6 +32,10 @@ under the new package version and its publication date.
 
 ### Changed
 
+- Headless runners deliver each direct message from their owning human as
+  plain user input, preserving its body without BBS mail formatting. Other
+  senders, group messages and timers keep their context, in the same order.
+
 - The web launcher uses Cmd-K only, leaving Ctrl-J and Ctrl-K to the browser,
   including in its search box. Arrow keys select results. The sidebar Search button
   still opens the launcher.
