@@ -9,6 +9,7 @@ scenario = sys.argv[2] if len(sys.argv) > 2 else ''
 current = 'low'
 turn = 0
 held = None
+steer_rejected = False
 
 def record(kind, **fields):
     with open('effort-wire.jsonl', 'a') as f:
@@ -112,6 +113,14 @@ for line in sys.stdin:
             record('held', effort=current)
         else:
             finish(mid, text, tid)
+    elif method == 'turn/steer':
+        text = p['input'][0]['text']
+        record('steer', text=text)
+        if scenario == 'owner-steer' and 'REJECT_ONCE' in text and not steer_rejected:
+            steer_rejected = True
+            error(mid)
+        else:
+            reply(mid, {})
     elif method in ['session/cancel', 'turn/interrupt']:
         if kind == 'codex':
             reply(mid, {})

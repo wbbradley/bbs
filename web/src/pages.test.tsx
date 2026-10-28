@@ -286,18 +286,28 @@ describe("the launcher", () => {
     }
   });
 
-  it("keeps Ctrl-K for moving up, rather than closing", async () => {
+  it("leaves Ctrl-J and Ctrl-K to the browser, with arrow keys for selection", async () => {
     render(
       <Board>
         <Launcher onClose={() => {}} />
       </Board>,
     );
     await act(async () => {});
+    const input = screen.getByPlaceholderText("Pages, agents, groups, notes, messages…");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    const selected = document.querySelector(".launcher-item.sel")!.textContent;
     const outside = vi.fn();
     window.addEventListener("keydown", outside);
-    fireEvent.keyDown(screen.getByPlaceholderText("Pages, agents, groups, notes, messages…"), { key: "k", ctrlKey: true });
+    for (const key of ["j", "k"]) {
+      const control = new KeyboardEvent("keydown", { key, ctrlKey: true, bubbles: true, cancelable: true });
+      fireEvent(input, control);
+      expect(control.defaultPrevented).toBe(false);
+      expect(document.querySelector(".launcher-item.sel")!.textContent).toBe(selected);
+    }
     window.removeEventListener("keydown", outside);
-    expect(outside).not.toHaveBeenCalled();
+    expect(outside).toHaveBeenCalledTimes(2);
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    expect(document.querySelector(".launcher-item.sel")!.textContent).not.toBe(selected);
   });
 });
 

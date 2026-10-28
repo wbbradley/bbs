@@ -271,6 +271,179 @@ async fn acp_next_turn_and_replay_metadata() {
     lifecycle("acp", "lifecycle").await;
 }
 
+async fn send_peer_mail(r: &Rig) {
+    let registration = r
+        .client()
+        .await
+        .register(Rig::request(proto::RegisterRequest {
+            name: Some("Peer".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut client = r.client().await;
+    client
+        .group_register(Rig::request(proto::GroupRegisterRequest {
+            group: "shared".into(),
+            description: None,
+        }))
+        .await
+        .unwrap();
+    client
+        .group_add(Rig::request(proto::GroupAddRequest {
+            group: "shared".into(),
+            agents: vec!["EffortTest".into(), "Peer".into()],
+        }))
+        .await
+        .unwrap();
+    let mut request = Rig::request(proto::SendRequest {
+        to: "EffortTest".into(),
+        body: "PEER_FIRST".into(),
+        ..Default::default()
+    });
+    request.metadata_mut().remove("bbs-human");
+    request
+        .metadata_mut()
+        .insert("bbs-token", registration.token.parse().unwrap());
+    client.send(request).await.unwrap();
+}
+
+async fn owner_inputs(kind: &str) {
+    let mut r = Rig::new(kind, "owner-inputs").await;
+    r.send("BOOT", None).await;
+    r.wait_wire(|w| w.iter().any(|v| v["kind"] == "delivered"))
+        .await;
+    let first = r
+        .wire()
+        .into_iter()
+        .find(|v| v["kind"] == "attempt")
+        .unwrap();
+    let text = first["text"].as_str().unwrap();
+    assert!(text.starts_with("You are EffortTest"));
+    assert!(text.ends_with("BOOT"));
+    assert!(!text.contains("New BBS mail"));
+    r.stop();
+    r.send("max", Some(proto::Control::SetEffort)).await;
+    send_peer_mail(&r).await;
+    let body = "\n  OWNER_FIRST\nkeep this whitespace\n\n";
+    let first_owner = r.send(body, None).await;
+    let second_owner = r.send("OWNER_SECOND", None).await;
+    r.start();
+    r.wait_wire(|w| w.iter().filter(|v| v["kind"] == "delivered").count() == 4)
+        .await;
+    let wire = r.wire();
+    let inputs: Vec<_> = wire
+        .iter()
+        .filter(|v| v["kind"] == "delivered")
+        .map(|v| v["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(inputs.len(), 4, "{wire:?}");
+    assert!(inputs[1].starts_with("New BBS mail ("));
+    assert!(inputs[1].contains("from Peer to EffortTest:"));
+    assert_eq!(inputs[2], body);
+    assert_eq!(inputs[3], "OWNER_SECOND");
+    let log = std::fs::read_to_string(
+        r.home
+            .join(".local/state/bbs/headless/efforttest/log.jsonl"),
+    )
+    .unwrap();
+    let events: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for (id, body) in [(first_owner, body), (second_owner, "OWNER_SECOND")] {
+        let prompts: Vec<_> = events
+            .iter()
+            .filter(|v| v["event"] == "prompt" && v["mail_ids"] == serde_json::json!([id]))
+            .collect();
+        assert_eq!(prompts.len(), 1, "{log}");
+        assert_eq!(prompts[0]["text"], body);
+        assert!(
+            prompts[0]["mail_text"]
+                .as_str()
+                .unwrap()
+                .contains("from tester (human) to EffortTest:")
+        );
+    }
+    assert!(
+        events
+            .iter()
+            .any(|v| (v["event"] == "turn_error" || v["event"] == "warning")
+                && v["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("effort deliberately rejected")),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn codex_owner_inputs_are_plain_and_separate_from_queued_agent_mail() {
+    owner_inputs("codex").await;
+}
+
+#[tokio::test]
+async fn acp_owner_inputs_are_plain_and_separate_from_queued_agent_mail() {
+    owner_inputs("acp").await;
+}
+
+#[tokio::test]
+async fn owner_steering_is_plain_and_a_failed_steer_stays_ahead_of_later_mail() {
+    let r = Rig::new("codex", "owner-steer").await;
+    r.send("HOLD", None).await;
+    r.wait_wire(|w| w.iter().any(|v| v["kind"] == "held")).await;
+    let accepted = r.send("STEER_ACCEPT\n", None).await;
+    r.wait_wire(|w| {
+        w.iter()
+            .any(|v| v["kind"] == "steer" && v["text"] == "STEER_ACCEPT\n")
+    })
+    .await;
+    r.send("REJECT_ONCE", None).await;
+    r.wait_wire(|w| {
+        w.iter()
+            .any(|v| v["kind"] == "steer" && v["text"] == "REJECT_ONCE")
+    })
+    .await;
+    send_peer_mail(&r).await;
+    r.send("cancel", Some(proto::Control::Cancel)).await;
+    r.wait_wire(|w| {
+        w.iter()
+            .any(|v| v["kind"] == "delivered" && v["text"].as_str().unwrap().contains("PEER_FIRST"))
+    })
+    .await;
+    let wire = r.wire();
+    let inputs: Vec<_> = wire
+        .iter()
+        .filter(|v| v["kind"] == "attempt")
+        .map(|v| v["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(inputs.len(), 3, "{wire:?}");
+    assert_eq!(inputs[1], "REJECT_ONCE");
+    assert!(inputs[2].starts_with("New BBS mail ("));
+    assert!(inputs[2].contains("PEER_FIRST"));
+    assert_eq!(
+        wire.iter().filter(|v| v["kind"] == "steer").count(),
+        2,
+        "{wire:?}"
+    );
+    let log = std::fs::read_to_string(
+        r.home
+            .join(".local/state/bbs/headless/efforttest/log.jsonl"),
+    )
+    .unwrap();
+    let events: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let steered: Vec<_> = events
+        .iter()
+        .filter(|v| v["event"] == "steer" && v["mail_ids"] == serde_json::json!([accepted]))
+        .collect();
+    assert_eq!(steered.len(), 1, "{log}");
+    assert_eq!(steered[0]["text"], "STEER_ACCEPT\n");
+}
+
 async fn rejection(kind: &str) {
     let r = Rig::new(kind, "rejection").await;
     let id = r.send("max", Some(proto::Control::SetEffort)).await;

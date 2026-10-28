@@ -5,10 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("./api", () => import("./test/fakeApi"));
 
 import * as api from "./test/fakeApi";
+import { App } from "./App";
 import { Composer } from "./components/Composer";
 import { Launcher } from "./Launcher";
 import { addLeaveGuard, go } from "./router";
-import { Board } from "./test/setup";
+import { ADA, Board, INFO } from "./test/setup";
 
 beforeEach(() => {
   api.reset();
@@ -52,6 +53,46 @@ async function composer() {
   box.setSelectionRange(5, 5);
   return box;
 }
+
+describe("the app launcher shortcut", () => {
+  it("leaves Ctrl-J and Ctrl-K to the browser and toggles only with Cmd-K", async () => {
+    api.auto.set("whoami", () => ADA);
+    api.auto.set("server_info", () => INFO);
+    api.auto.set("list_agents", () => ({ agents: [], humans: [] }));
+    api.auto.set("group_list", () => ({ groups: [] }));
+    api.auto.set("list_blockers", () => ({ blockers: [], active_count: 0, has_more: false }));
+    render(
+      <>
+        <App />
+        <input aria-label="filter" defaultValue="hello world" />
+        <textarea aria-label="draft" defaultValue="hello world" />
+      </>,
+    );
+    await act(async () => {});
+    for (const name of ["filter", "draft"]) {
+      const box = screen.getByLabelText(name) as HTMLInputElement | HTMLTextAreaElement;
+      box.focus();
+      box.setSelectionRange(5, 5);
+      for (const key of ["j", "J", "k", "K"]) {
+        const control = new KeyboardEvent("keydown", { key, ctrlKey: true, bubbles: true, cancelable: true });
+        fireEvent(box, control);
+        expect(control.defaultPrevented).toBe(false);
+        expect(document.querySelector(".launcher")).toBeNull();
+        expect(document.activeElement).toBe(box);
+        expect(box.selectionStart).toBe(5);
+      }
+      const command = new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true, cancelable: true });
+      fireEvent(box, command);
+      expect(command.defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(search());
+      fireEvent.keyDown(search(), { key: "k", metaKey: true });
+      expect(document.querySelector(".launcher")).toBeNull();
+      expect(document.activeElement).toBe(box);
+    }
+    fireEvent.click(screen.getByRole("button", { name: /Search/ }));
+    expect(document.activeElement).toBe(search());
+  });
+});
 
 describe("the launcher gives focus back", () => {
   it("to a text box, cursor and all, when dismissed by Esc, a click outside or ⌘K", async () => {
