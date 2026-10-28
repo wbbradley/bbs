@@ -186,8 +186,14 @@ impl Store {
     pub fn open(dir: &Path) -> Result<Store, StoreError> {
         std::fs::create_dir_all(dir)?;
         private(dir, 0o700)?;
-        let generation = current(&pointer(dir)?)?;
-        Self::open_at(dir, generation)
+        let mut pointer = pointer(dir)?;
+        // A first open and a rotation must not initialize the same fresh
+        // database concurrently, including its transition to WAL.
+        let tx = pointer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let generation = current(&tx)?;
+        let store = Self::open_at(dir, generation)?;
+        tx.commit()?;
+        Ok(store)
     }
 
     fn open_at(dir: &Path, generation: u64) -> Result<Store, StoreError> {
@@ -327,17 +333,22 @@ impl Store {
         let tx = pointer.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let on_disk = current(&tx)?;
         let next = if on_disk == self.generation {
-            tx.execute("UPDATE current SET generation = ?1", [on_disk as i64 + 1])?;
             on_disk + 1
         } else {
             on_disk
         };
-        tx.commit()?;
-        drop(self);
+        // Hold the pointer lock through initialization and identity copy.
+        // Other sessions can only open a fully initialized generation, and
+        // an initialization error leaves the current pointer unchanged.
         let store = Self::open_at(&dir, next)?;
         if let Some(human) = identity {
             store.set_identity(&human)?;
         }
+        if on_disk == self.generation {
+            tx.execute("UPDATE current SET generation = ?1", [next as i64])?;
+        }
+        tx.commit()?;
+        drop(self);
         Ok(store)
     }
 
@@ -802,6 +813,62 @@ mod tests {
             (x.join().unwrap(), y.join().unwrap())
         });
         assert_eq!((x, y), (3, 3));
+    }
+
+    #[test]
+    fn a_failed_generation_open_keeps_the_current_pointer() {
+        // Publishing before opening the generation left all later sessions
+        // pointing at a database that had never initialized successfully.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set_identity("ada").unwrap();
+        std::fs::create_dir(file(dir.path(), 2)).unwrap();
+
+        assert!(store.next_generation().is_err());
+        assert_eq!(current(&pointer(dir.path()).unwrap()).unwrap(), 1);
+        let current = Store::open(dir.path()).unwrap();
+        assert_eq!(current.generation(), 1);
+        assert_eq!(current.identity().unwrap().as_deref(), Some("ada"));
+    }
+
+    #[test]
+    fn a_failed_generation_identity_keeps_the_current_pointer() {
+        // Identity belongs to initialization too: an error must not publish
+        // a fresh generation whose owner has not been restored.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set_identity("ada").unwrap();
+        let next = Store::open_at(dir.path(), 2).unwrap();
+        next.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_identity BEFORE INSERT ON meta
+             WHEN NEW.key = 'identity'
+             BEGIN SELECT RAISE(ABORT, 'identity write failed'); END;",
+            )
+            .unwrap();
+        drop(next);
+
+        assert!(store.next_generation().is_err());
+        assert_eq!(current(&pointer(dir.path()).unwrap()).unwrap(), 1);
+        let current = Store::open(dir.path()).unwrap();
+        assert_eq!(current.generation(), 1);
+        assert_eq!(current.identity().unwrap().as_deref(), Some("ada"));
+    }
+
+    #[test]
+    fn two_sessions_can_initialize_the_first_generation_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::sync::Barrier::new(2);
+        let generations = std::thread::scope(|s| {
+            let open = || {
+                start.wait();
+                Store::open(dir.path()).unwrap().generation()
+            };
+            let a = s.spawn(open);
+            let b = s.spawn(open);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_eq!(generations, (1, 1));
     }
 
     #[test]
