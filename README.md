@@ -338,6 +338,9 @@ sends and Shift-Enter adds a line. Conversation inputs have no chevron, keep
 empty placeholders to one row, and refit their height when their width changes,
 preserving the text you type.
 
+Selecting a blocker focuses its editable answer box. Refreshes keep focus where
+it is, and open dialogs or the launcher keep their focus.
+
 ```sh
 bbs serve --listen 100.64.0.1:7777 --require-human-token \
   --web 100.64.0.1:7778 --web-origin http://100.64.0.1:7778

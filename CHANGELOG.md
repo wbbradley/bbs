@@ -8,6 +8,12 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Fixed
+
+- Selecting a blocker in the web UI focuses its answer box, including when
+  the next blocker is selected after one leaves the queue. Refreshes keep
+  focus where it is, and read-only answers are not focused automatically.
+
 ## 0.17.0 - 2026-10-28
 
 The first release with separate core, client and server packages, the browser
