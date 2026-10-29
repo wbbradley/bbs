@@ -10,6 +10,8 @@ under the new package version and its publication date.
 
 ### Fixed
 
+- Headless runners retain effort-setting warnings when a turn finishes or
+  the runner stops before its event loop reads the outcome.
 - Selecting a blocker in the web UI focuses its answer box, including when
   the next blocker is selected after one leaves the queue. Refreshes keep
   focus where it is, and read-only answers are not focused automatically.
