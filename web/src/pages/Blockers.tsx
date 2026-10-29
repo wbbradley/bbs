@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { rpc } from "../api";
 import { sendsOnEnter } from "../keys";
+import { isCovered } from "../cover";
 import type { PageProps } from "../App";
 import { Markdown } from "../Markdown";
 import { PageHeader } from "../components/PageHeader";
@@ -112,6 +113,15 @@ export function BlockersPage({ openNav }: PageProps) {
   const order = useRef<number[]>([]);
   const target = nearest(selected, order.current, roots);
   const current = rows.find((b) => b.root_id === target) ?? null;
+  const answerInput = useRef<HTMLTextAreaElement>(null);
+  const focusAnswer = useCallback(() => {
+    if (isCovered()) return;
+    const input = answerInput.current;
+    if (input && !input.readOnly && !input.disabled) input.focus({ preventScroll: true });
+  }, []);
+  useEffect(() => {
+    focusAnswer();
+  }, [target, focusAnswer]);
   useEffect(() => {
     order.current = roots;
     if (target !== selected) setSelected(target);
@@ -193,6 +203,7 @@ export function BlockersPage({ openNav }: PageProps) {
                 onClick={() => {
                   setSelected(b.root_id);
                   setDone(null);
+                  if (b.root_id === target) focusAnswer();
                 }}
               >
                 <div className="meta">
@@ -209,6 +220,7 @@ export function BlockersPage({ openNav }: PageProps) {
             {current ? (
               <BlockerCard
                 key={current.id}
+                answerInput={answerInput}
                 b={current}
                 held={!listedRoots.has(current.root_id)}
                 kept={kept[current.root_id]}
@@ -232,6 +244,7 @@ function Creator({ b }: { b: Blocker }) {
 }
 
 function BlockerCard({
+  answerInput,
   b,
   held,
   kept,
@@ -239,6 +252,7 @@ function BlockerCard({
   onWrite,
   onDismiss,
 }: {
+  answerInput: RefObject<HTMLTextAreaElement | null>;
   b: Blocker;
   /** Listed only for its write's outcome: read only until dismissed. */
   held: boolean;
@@ -290,6 +304,7 @@ function BlockerCard({
               answer → <Creator b={b} /> <span className="group">@{b.group}</span>
             </div>
             <textarea
+              ref={answerInput}
               className="textarea"
               value={shown}
               readOnly={!canAnswer}

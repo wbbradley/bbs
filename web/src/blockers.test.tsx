@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("./api", () => import("./test/fakeApi"));
 
 import * as api from "./test/fakeApi";
+import { Dialog } from "./components/Dialog";
 import { BlockersPage, REPLACED_GUARD_MS, loadKept, nearest } from "./pages/Blockers";
 import { useBoard } from "./store";
 import { Board } from "./test/setup";
@@ -62,6 +63,73 @@ afterEach(() => {
 });
 
 describe("blockers", () => {
+  it("focuses each selected answer, including a second click on the same row", async () => {
+    await page([row(1), row(2)]);
+    expect(document.activeElement).toBe(answerBox());
+    fireEvent.change(answerBox(), { target: { value: "first draft" } });
+
+    fireEvent.click(screen.getByText("question 2?", { selector: ".preview" }));
+    expect(document.activeElement).toBe(answerBox());
+    fireEvent.change(answerBox(), { target: { value: "second draft" } });
+    answerBox().setSelectionRange(2, 6);
+    screen.getByText("refresh").focus();
+    fireEvent.click(screen.getByText("question 2?", { selector: ".preview" }));
+    expect(document.activeElement).toBe(answerBox());
+    expect(answerBox().selectionStart).toBe(2);
+    expect(answerBox().selectionEnd).toBe(6);
+
+    fireEvent.click(screen.getByText("question 1?", { selector: ".preview" }));
+    expect(document.activeElement).toBe(answerBox());
+    expect(answerBox().value).toBe("first draft");
+    expect(api.pending("answer_blocker")).toHaveLength(0);
+  });
+
+  it("does not take focus back on a refresh or a replacement of the selected root", async () => {
+    await page([row(1), row(2)]);
+    const refresh = screen.getByText("refresh");
+    refresh.focus();
+    await poll([row(1), row(2)]);
+    expect(document.activeElement).toBe(refresh);
+    await poll([row(1, 9, "replacement question?"), row(2)]);
+    expect(document.activeElement).toBe(refresh);
+    expect(screen.getByText("Blocker updated.")).toBeTruthy();
+  });
+
+  it("focuses the next answer when the selected blocker leaves the queue", async () => {
+    await page([row(1), row(2), row(3)]);
+    fireEvent.click(screen.getByText("question 2?", { selector: ".preview" }));
+    screen.getByText("refresh").focus();
+    await poll([row(1), row(3)]);
+    expect(screen.getByText("question 3?", { selector: ".md p" })).toBeTruthy();
+    expect(document.activeElement).toBe(answerBox());
+  });
+
+  it("does not focus a selected read-only answer", async () => {
+    setDraftOwner("ada");
+    saveDraft("blocker:2", "saved answer");
+    await page([row(1), { ...row(2), can_answer: false }]);
+    const refresh = screen.getByText("refresh");
+    refresh.focus();
+    fireEvent.click(screen.getByText("question 2?", { selector: ".preview" }));
+    expect(answerBox().readOnly).toBe(true);
+    expect(document.activeElement).toBe(refresh);
+    fireEvent.click(screen.getByText("question 2?", { selector: ".preview" }));
+    expect(document.activeElement).toBe(refresh);
+  });
+
+  it("keeps a dialog's focus when the selected blocker changes beneath it", async () => {
+    await page([row(1), row(2)]);
+    render(
+      <Dialog title="Another action" onClose={() => {}}>
+        <input autoFocus placeholder="Dialog input" />
+      </Dialog>,
+    );
+    const input = screen.getByPlaceholderText("Dialog input");
+    expect(document.activeElement).toBe(input);
+    await poll([row(2)]);
+    expect(document.activeElement).toBe(input);
+  });
+
   it("sends with Enter, preserves multiline text, and holds keys while a write is unsettled", async () => {
     await page([row(1)]);
     fireEvent.change(answerBox(), { target: { value: "\nfirst\nsecond" } });
