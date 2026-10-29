@@ -406,16 +406,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 turn = None;
                 // The wire reader queues notifications before resolving the
                 // response. Persist those final deltas before clearing the turn.
-                let mut drain_error = None;
-                while let Ok(event) = events.try_recv() {
-                    match event {
-                        Event::EffortOutcome(outcome) => effort_control.complete(outcome),
-                        Event::EffortChanged => {},
-                        other => if let Err(err) = record_side(&mut log, &mut outbox, other, interactions.as_ref()) { drain_error = Some(err); break; },
-                    }
-                }
+                let drained = drain_turn_events(&mut log, &mut outbox, &mut effort_control, &mut events, interactions.as_ref());
                 let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
-                if let Some(err) = drain_error { break Err(err); }
+                if let Err(err) = drained { break Err(err); }
                 if let Err(err) = outbox.seal() { break Err(err); }
                 let message = match done {
                     Ok(Ok(stop)) => {
@@ -469,10 +462,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
                 }
                 Some(Event::EffortOutcome(outcome)) => {
-                    if !outcome.detail.is_empty() {
-                        log.event("warning", json!({ "message": outcome.detail, "effort_request": outcome.request_id }));
-                    }
-                    effort_control.complete(outcome);
+                    record_effort_outcome(&mut log, &mut effort_control, outcome);
                     let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
                 }
                 Some(event) => if let Err(err) = record_side(&mut log, &mut outbox, event, interactions.as_ref()) { break Err(err); },
@@ -544,7 +534,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     // Drain effort ACKs already emitted before harness exit/turn completion.
     while let Ok(event) = events.try_recv() {
         match event {
-            Event::EffortOutcome(outcome) => effort_control.complete(outcome),
+            Event::EffortOutcome(outcome) => {
+                record_effort_outcome(&mut log, &mut effort_control, outcome)
+            }
             Event::EffortChanged => {}
             other => {
                 if let Err(err) = record_side(&mut log, &mut outbox, other, interactions.as_ref()) {
@@ -616,6 +608,37 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     }
     let _ = tokio::time::timeout(SHARE_FLUSH, reporting).await;
     result
+}
+
+fn record_effort_outcome(
+    log: &mut Log,
+    control: &mut effort::Control,
+    outcome: proto::EffortOutcome,
+) {
+    if !outcome.detail.is_empty() {
+        log.event(
+            "warning",
+            json!({ "message": outcome.detail, "effort_request": outcome.request_id }),
+        );
+    }
+    control.complete(outcome);
+}
+
+fn drain_turn_events(
+    log: &mut Log,
+    outbox: &mut Outbox,
+    effort_control: &mut effort::Control,
+    events: &mut mpsc::UnboundedReceiver<Event>,
+    side: Option<&side::Side>,
+) -> Result<()> {
+    while let Ok(event) = events.try_recv() {
+        match event {
+            Event::EffortOutcome(outcome) => record_effort_outcome(log, effort_control, outcome),
+            Event::EffortChanged => {}
+            other => record_side(log, outbox, other, side)?,
+        }
+    }
+    Ok(())
 }
 
 fn record_side(
@@ -981,6 +1004,58 @@ mod tests {
             body: body.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn completed_turn_keeps_queued_effort_rejection_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut log = Log::open(&path).unwrap();
+        let mut outbox = Outbox::open(&dir.path().join("outbox"), "board".into(), 1).unwrap();
+        let mut control = effort::Control::default();
+        let state = proto::EffortState {
+            supported: true,
+            choices: vec![effort::choice("max", "Max", true, false)],
+            ..Default::default()
+        };
+        control.request(
+            proto::EffortRequest {
+                request_id: 3,
+                value: "max".into(),
+            },
+            &state,
+        );
+        assert_eq!(control.dispatch().unwrap().request_id, 3);
+        let (tx, mut events) = mpsc::unbounded_channel();
+        // Both notifications are already queued when the completed turn wins
+        // the select, so the drain must preserve the warning before its text.
+        tx.send(Event::EffortOutcome(effort::outcome(
+            3,
+            proto::effort_outcome::Result::Failed,
+            "effort deliberately rejected",
+        )))
+        .unwrap();
+        tx.send(Event::Text(Default::default(), "delivered".into()))
+            .unwrap();
+        drain_turn_events(&mut log, &mut outbox, &mut control, &mut events, None).unwrap();
+        assert!(control.pending.is_none());
+        let answered = control.report(state).answered.unwrap();
+        assert_eq!(answered.request_id, 3);
+        assert_eq!(
+            answered.result,
+            i32::from(proto::effort_outcome::Result::Failed)
+        );
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0]["event"], "warning");
+        assert_eq!(records[0]["message"], "effort deliberately rejected");
+        assert_eq!(records[0]["effort_request"], 3);
+        assert_eq!(records[1]["event"], "text");
+        assert_eq!(records[1]["text"], "delivered");
     }
 
     #[test]
