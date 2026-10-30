@@ -8,6 +8,12 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Fixed
+
+- Web message boxes reopen empty when their saved draft contains only
+  whitespace, rather than restoring an otherwise blank line. Drafts containing
+  text keep their original spacing and line breaks.
+
 ## 0.18.0 - 2026-10-30
 
 Structured blocker answers. Protocol epoch 2, config format 4 and Rust 1.89
