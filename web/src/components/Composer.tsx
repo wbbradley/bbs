@@ -28,7 +28,10 @@ export const Composer = forwardRef<
     above?: ReactNode;
   }
 >(function Composer({ draftKey, placeholder, disabled, onSubmit, hint, above }, ref) {
-  const [text, setText] = useState(() => loadDraft(draftKey));
+  const [text, setText] = useState(() => {
+    const draft = loadDraft(draftKey);
+    return draft.trim() ? draft : "";
+  });
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const area = useRef<HTMLTextAreaElement>(null);
