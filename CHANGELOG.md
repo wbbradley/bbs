@@ -15,6 +15,11 @@ under the new package version and its publication date.
   before sending. Humans answer with a selection, a note, or both
   (`bbs blocker answer --select`), and the answer mail lists the picks.
   Requires `blocker-choices.v1`.
+- In `bbs connect`, a blocker with choices shows them above the answer box,
+  and ↑/↓ moves between them. On a select-one blocker, Space or Enter
+  answers at once with that option and any note. On a select-many blocker,
+  Space toggles, Delete clears and Enter sends. Tab or typing moves to the
+  note. Nothing the server would refuse is sent; the status line says why.
 
 ### Changed
 

@@ -37,7 +37,7 @@ const AGENT_KEYS: &[(&str, &str)] = &[
     ),
     (
         "F2",
-        "any screen: the Blockers page; Alt-↑/↓ select, PgUp/PgDn text, Tab discuss/cancel, Esc back",
+        "any screen: the Blockers page; Alt-↑/↓ select, ↑/↓ Space Del choices, PgUp/PgDn text, Tab note/discuss/cancel, Esc back",
     ),
     (
         "Tab / Shift-Tab",
