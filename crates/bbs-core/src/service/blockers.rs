@@ -3,7 +3,7 @@ use rusqlite::Connection;
 
 use super::{Caller, Ctx, group_name, principal, require_group, with_ctx};
 use crate::db::{self, Kind, Principal, blockers as store};
-use crate::proto;
+use crate::{blocker_choices, proto};
 
 const MAX_TEXT: usize = 8192;
 const MAX_PAGE: u32 = 100;
@@ -65,6 +65,13 @@ fn require_open(row: &store::Row) -> Result<()> {
     Ok(())
 }
 
+fn selected(json: Option<&str>) -> Result<Vec<String>> {
+    Ok(json
+        .map(serde_json::from_str)
+        .transpose()?
+        .unwrap_or_default())
+}
+
 fn as_proto(ctx: &Ctx<'_>, actor: &Principal, row: store::Row) -> Result<proto::Blocker> {
     let open = row.outcome.is_none() && row.replaced_by.is_none() && !row.archived;
     let can_cancel = open && manages(ctx, actor, row.group_id)?;
@@ -78,6 +85,27 @@ fn as_proto(ctx: &Ctx<'_>, actor: &Principal, row: store::Row) -> Result<proto::
     };
     let mut creator = principal(row.creator);
     creator.owner = row.creator_owner;
+    let choices = row
+        .choices
+        .as_deref()
+        .map(blocker_choices::from_json)
+        .transpose()?;
+    let outcome = row
+        .outcome
+        .map(|o| -> Result<_> {
+            Ok(proto::BlockerOutcome {
+                status: status.into(),
+                selected: selected(o.selected.as_deref())?,
+                actor: Some(proto::Principal {
+                    owner: o.actor_owner,
+                    ..principal(o.actor)
+                }),
+                created_at: o.created_at,
+                answer: o.answer,
+                message_id: o.message_id,
+            })
+        })
+        .transpose()?;
     Ok(proto::Blocker {
         id: row.id,
         group_id: row.group_id,
@@ -89,18 +117,10 @@ fn as_proto(ctx: &Ctx<'_>, actor: &Principal, row: store::Row) -> Result<proto::
         replaces: row.replaces,
         replaced_by: row.replaced_by,
         status: status.into(),
-        outcome: row.outcome.map(|o| proto::BlockerOutcome {
-            status: status.into(),
-            actor: Some(proto::Principal {
-                owner: o.actor_owner,
-                ..principal(o.actor)
-            }),
-            created_at: o.created_at,
-            answer: o.answer,
-            message_id: o.message_id,
-        }),
+        outcome,
         can_answer,
         can_cancel,
+        choices,
     })
 }
 
@@ -245,13 +265,19 @@ pub fn put_blocker(
     if let Some(id) = req.replaces {
         positive(id, "predecessor ID")?;
     }
+    let choices = req
+        .choices
+        .as_ref()
+        .map(|c| blocker_choices::validate(c).map(|c| blocker_choices::to_json(&c)))
+        .transpose()?;
     with_ctx(conn, caller, |ctx| {
         let actor = ctx.agent()?;
         let groups = db::group_ids_named(ctx.conn, group_name(&req.group))?;
         if let Some(response) = replay(ctx, &actor, &req.request_key, |op| {
             matches!(op,
-            store::Operation::Put { group: old_group, body, replaces, .. }
-            if groups.contains(old_group) && *body == req.body && *replaces == req.replaces)
+            store::Operation::Put { group: old_group, body, replaces, choices: old_choices, .. }
+            if groups.contains(old_group) && *body == req.body && *replaces == req.replaces
+                && *old_choices == choices)
         })? {
             return Ok(response);
         }
@@ -273,7 +299,10 @@ pub fn put_blocker(
             ctx.conn,
             group,
             actor.id,
-            &req.body,
+            store::Version {
+                body: &req.body,
+                choices: choices.as_deref(),
+            },
             prior.as_ref(),
             &ctx.now_s,
             &req.request_key,
@@ -302,25 +331,40 @@ pub fn answer_blocker(
     req: proto::AnswerBlockerRequest,
 ) -> Result<proto::BlockerMutationResponse> {
     positive(req.id, "ID")?;
-    text(&req.answer, "answer")?;
+    if req.selected.is_empty() {
+        text(&req.answer, "answer")?;
+    } else if req.answer.len() > MAX_TEXT {
+        bail!("blocker answer must be at most {MAX_TEXT} UTF-8 bytes");
+    }
     key(&req.request_key)?;
     with_ctx(conn, caller, |ctx| {
         let actor = ctx.human()?;
+        let row = require_row(ctx, req.id)?;
+        let choices = row
+            .choices
+            .as_deref()
+            .map(blocker_choices::from_json)
+            .transpose()?;
+        // Replays compare the canonical answer, so a selection retried in
+        // another order is the same request.
+        let answer = blocker_choices::answer(choices.as_ref(), &req.selected, &req.answer);
         if let Some(response) = replay(ctx, &actor, &req.request_key, |op| {
-            matches!(op,
-            store::Operation::Answer { id, answer, .. } if *id == req.id && *answer == req.answer)
+            matches!((op, &answer),
+            (store::Operation::Answer { id, answer: old, selected, .. }, Ok(new))
+            if *id == req.id && *old == new.text && *selected == new.selected_json())
         })? {
             return Ok(response);
         }
-        let row = require_row(ctx, req.id)?;
         authorize(ctx, &actor, row.group_id)?;
         require_open(&row)?;
         if !db::agent_is_live(ctx.conn, row.creator.id)? {
             bail!("creating agent is retired; cancel or replace this blocker instead");
         }
+        let answer = answer?;
+        text(&answer.text, "answer")?;
         let body = format!(
             "Blocker #{} in @{}:\n{}\n\nAnswer:\n{}",
-            row.id, row.group, row.body, req.answer
+            row.id, row.group, row.body, answer.text
         );
         super::validate_body(&body)?;
         let message_id = db::insert_message(ctx.conn, &actor, None, &body, &ctx.now_s)?;
@@ -332,7 +376,11 @@ pub fn answer_blocker(
             "answered",
             &actor,
             &ctx.now_s,
-            Some((&req.answer, message_id)),
+            Some(store::Answer {
+                text: &answer.text,
+                message_id,
+                selected: answer.selected_json().as_deref(),
+            }),
             Some(&req.request_key),
         )?;
         finish(ctx, &actor, row.id, Some(message_id))
@@ -460,6 +508,7 @@ mod tests {
                 &mut self.conn,
                 &self.agents[agent],
                 proto::PutBlockerRequest {
+                    choices: None,
                     group: "crew".into(),
                     body: body.into(),
                     replaces,
@@ -481,6 +530,7 @@ mod tests {
                 &mut self.conn,
                 &self.humans[human],
                 proto::AnswerBlockerRequest {
+                    selected: Vec::new(),
                     id,
                     answer: "Approved; continue with option B.".into(),
                     request_key: key.into(),
@@ -522,6 +572,7 @@ mod tests {
                 &mut b.conn,
                 who,
                 proto::PutBlockerRequest {
+                    choices: None,
                     group: group.into(),
                     body: key.into(),
                     request_key: key.into(),
@@ -803,6 +854,7 @@ mod tests {
             &mut b.conn,
             &b.agents[2],
             proto::PutBlockerRequest {
+                choices: None,
                 group: "other".into(),
                 body: "other issue".into(),
                 request_key: "other".into(),
@@ -891,6 +943,7 @@ mod tests {
             &mut b.conn,
             &mateo,
             proto::PutBlockerRequest {
+                choices: None,
                 group: "new-group".into(),
                 body: "new agent".into(),
                 request_key: "new".into(),
@@ -1072,6 +1125,7 @@ mod tests {
                 &mut b.conn,
                 &b.agents[0],
                 proto::AnswerBlockerRequest {
+                    selected: Vec::new(),
                     id: first.id,
                     answer: "Pretend to be human".into(),
                     request_key: "wrong-kind".into(),
@@ -1084,6 +1138,7 @@ mod tests {
                 &mut b.conn,
                 &b.agents[2],
                 proto::PutBlockerRequest {
+                    choices: None,
                     group: "crew".into(),
                     body: "not a member".into(),
                     request_key: "foreign".into(),
@@ -1097,6 +1152,7 @@ mod tests {
                 &mut b.conn,
                 &b.humans[0],
                 proto::PutBlockerRequest {
+                    choices: None,
                     group: "crew".into(),
                     body: "human create".into(),
                     request_key: "human".into(),
@@ -1148,6 +1204,7 @@ mod tests {
     fn blocker_receipts_refuse_payload_or_operation_reuse_and_replay_without_new_mail() {
         let mut b = Board::memory();
         let request = proto::PutBlockerRequest {
+            choices: None,
             group: "crew".into(),
             body: "Original".into(),
             request_key: "key".into(),
@@ -1387,6 +1444,7 @@ mod tests {
                     &mut b.conn,
                     &b.agents[0],
                     proto::PutBlockerRequest {
+                        choices: None,
                         group: "crew".into(),
                         body,
                         request_key: "invalid".into(),
@@ -1431,6 +1489,7 @@ mod tests {
                 &mut b.conn,
                 &b.agents[0],
                 proto::PutBlockerRequest {
+                    choices: None,
                     group: "crew".into(),
                     body: "fork a chain".into(),
                     replaces: Some(first.id),
@@ -1483,6 +1542,7 @@ mod tests {
             &mut b.conn,
             &b.agents[0],
             proto::PutBlockerRequest {
+                choices: None,
                 group: "crew".into(),
                 body: "Archive after commit".into(),
                 request_key: "put".into(),
@@ -1497,6 +1557,7 @@ mod tests {
                 &mut b.conn,
                 &b.agents[0],
                 proto::PutBlockerRequest {
+                    choices: None,
                     group: "crew".into(),
                     body: "New write after archive".into(),
                     request_key: "new".into(),
@@ -1577,6 +1638,7 @@ mod tests {
             &mut b.conn,
             &b.agents[0],
             proto::PutBlockerRequest {
+                choices: None,
                 group: "@crew".into(),
                 body: "Original group".into(),
                 request_key: "old-key".into(),
@@ -1636,6 +1698,7 @@ mod tests {
                 &mut b.conn,
                 &b.agents[0],
                 proto::PutBlockerRequest {
+                    choices: None,
                     group: "crew".into(),
                     body: "Move history".into(),
                     replaces: Some(old.id),
@@ -1667,6 +1730,7 @@ mod tests {
                         &mut conn,
                         &caller,
                         proto::AnswerBlockerRequest {
+                            selected: Vec::new(),
                             id: first.id,
                             answer: format!("Answer from {i}"),
                             request_key: format!("answer-{i}"),

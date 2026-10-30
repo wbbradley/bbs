@@ -308,7 +308,11 @@ pub enum BlockerCommand {
         id: i64,
         #[arg(long)]
         request_key: Option<String>,
-        /// Plaintext; omitted or "-" reads stdin. At most 8 KiB.
+        /// Option ID to select, repeatable (blocker-choices.v1).
+        #[arg(long = "select", value_name = "ID")]
+        selected: Vec<String>,
+        /// Plaintext; "-" reads stdin, as does omitting it without --select.
+        /// At most 8 KiB. With --select it is an optional note.
         answer: Option<String>,
     },
     /// Group member or eligible human: cancel this version without mail.

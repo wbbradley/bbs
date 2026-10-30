@@ -38,6 +38,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0021_blockers.sql"),
     include_str!("../migrations/0022_agent_notes.sql"),
     include_str!("../migrations/0023_agent_drains.sql"),
+    include_str!("../migrations/0024_blocker_choices.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

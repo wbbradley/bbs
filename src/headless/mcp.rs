@@ -450,6 +450,31 @@ pub fn tool_list() -> Value {
                 "body": string("One nonblank description, at most 8192 UTF-8 bytes, stored as written. Markdown (headings, emphasis, lists, code, tables) renders in bbs connect: separate paragraphs with a blank line, since a single newline joins lines as in any Markdown."),
                 "replaces": { "type":"integer", "minimum":1, "description":"Optional current predecessor version, including answered/cancelled heads. Must be in the same group." },
                 "request_key": string("Unique key for this intent, 1..128 UTF-8 bytes. Reuse only with exactly the same operation and payload."),
+                "choices": {
+                    "type": "object",
+                    "description": "Optional response options shown to the human as buttons (select_one) or checkboxes (select_many). The human can always answer with free text instead of, or as well as, a selection; the answer mail lists each pick as `Selected: <label> [<id>]`, then any note. Requires blocker-choices.v1; checked before sending.",
+                    "properties": {
+                        "mode": { "type": "string", "enum": ["select_one", "select_many"] },
+                        "options": {
+                            "type": "array", "minItems": 2, "maxItems": 8,
+                            "description": "Shown in this order.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "pattern": "^[a-z0-9_-]{1,32}$", "description": "Unique stable ID echoed back in the answer." },
+                                    "label": string("One nonblank line, at most 120 UTF-8 bytes."),
+                                    "detail": string("Optional explanation, at most 500 UTF-8 bytes."),
+                                },
+                                "required": ["id", "label"],
+                                "additionalProperties": false,
+                            },
+                        },
+                        "min": { "type": "integer", "minimum": 1, "description": "select_many only: fewest picks; default 1." },
+                        "max": { "type": "integer", "minimum": 1, "description": "select_many only: most picks; default all options." },
+                    },
+                    "required": ["mode", "options"],
+                    "additionalProperties": false,
+                },
             }), &["group", "body", "request_key"]),
         },
         {

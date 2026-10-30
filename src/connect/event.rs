@@ -1558,6 +1558,7 @@ mod tests {
                 id: 999,
                 answer: "yes".into(),
                 request_key: "k1".into(),
+                ..Default::default()
             },
         })
         .unwrap();

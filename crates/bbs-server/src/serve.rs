@@ -1744,6 +1744,7 @@ mod tests {
                 id: first,
                 answer: "Proceed".into(),
                 request_key: "answer".into(),
+                ..Default::default()
             };
             let cancel = proto::CancelBlockerRequest {
                 id: first,
