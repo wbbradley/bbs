@@ -496,12 +496,18 @@ impl Blockers {
         let Some(row) = self.selected().cloned() else {
             return;
         };
-        if self.panel.as_ref().map(|p| p.focus) != Some(Focus::Answer) || !row.can_answer {
+        let Some(panel) = self.panel.as_mut() else {
+            return;
+        };
+        if !row.can_answer || !matches!(panel.focus, Focus::Answer | Focus::Options) {
             return;
         }
         let chain = self.chains.entry(row.root_id).or_insert_with(Chain::new);
         if chain.pending.is_none() {
+            // Pasting over the options starts the note, as typing does.
+            panel.focus = Focus::Answer;
             chain.answer.paste(text);
+            chain.hint = None;
         }
     }
 
@@ -706,6 +712,17 @@ impl Blockers {
                     }
                     KeyCode::Delete | KeyCode::Backspace if editable => {
                         chain.picked.clear();
+                        chain.hint = None;
+                    }
+                    // Typing starts the note rather than being lost.
+                    KeyCode::Char(_)
+                        if editable
+                            && !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        panel.focus = Focus::Answer;
+                        chain.answer.key(key, 0);
                         chain.hint = None;
                     }
                     _ => {}
@@ -2991,6 +3008,26 @@ mod tests {
         assert_eq!(
             (req.selected.as_slice(), req.answer.as_str()),
             (&["a".to_string()][..], "soon")
+        );
+    }
+
+    #[test]
+    fn typing_or_pasting_over_the_options_starts_the_note() {
+        let now = Instant::now();
+        let one = proto::BlockerChoiceMode::BlockerSelectOne;
+        let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
+        typed(&mut blockers, "ok", now);
+        assert_eq!(focus(&blockers), Focus::Answer);
+        assert_eq!(blockers.chains[&1].answer.draft().text, "ok");
+        assert_eq!(blockers.chains[&1].picked, ["a"]);
+
+        let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        blockers.paste("from the clipboard");
+        assert_eq!(focus(&blockers), Focus::Answer);
+        assert_eq!(
+            blockers.chains[&1].answer.draft().text,
+            "from the clipboard"
         );
     }
 

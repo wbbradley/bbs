@@ -16,9 +16,9 @@ under the new package version and its publication date.
   (`bbs blocker answer --select`), and the answer mail lists the picks.
   Requires `blocker-choices.v1`.
 - In `bbs connect`, a blocker with choices shows them above the answer box:
-  ↑/↓ moves, Space picks or toggles, Delete clears, and Tab moves to the
-  note. Enter sends only an answer the server would accept, and otherwise
-  says why.
+  ↑/↓ moves, Space picks or toggles, Delete clears, and Tab or typing
+  moves to the note. Enter sends only an answer the server would accept,
+  and otherwise says why.
 
 ### Changed
 
