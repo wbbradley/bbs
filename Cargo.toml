@@ -6,7 +6,7 @@ default-members = [".", "crates/bbs-core", "crates/bbs-server"]
 resolver = "3"
 
 [workspace.package]
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -42,7 +42,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-bbs-core = { path = "crates/bbs-core", version = "=0.17.0" }
+bbs-core = { path = "crates/bbs-core", version = "=0.18.0" }
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
 data-encoding = "2.11.1"
