@@ -602,6 +602,28 @@ impl Blockers {
         }
         let panel = self.panel.as_mut().expect("open");
         let chain = self.chains.entry(row.root_id).or_insert_with(Chain::new);
+        // Select one answers at once: Space or Enter on an option picks it
+        // and sends as Enter does, with any note, its retry and its lock.
+        let one =
+            options(&row).is_some_and(|c| c.mode() != proto::BlockerChoiceMode::BlockerSelectMany);
+        let key = if panel.focus == Focus::Options
+            && one
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter)
+        {
+            let guarded = chain.guard_until.is_some_and(|until| now < until);
+            if row.can_answer
+                && !gone
+                && chain.pending.is_none()
+                && !guarded
+                && let Some(option) = options(&row).and_then(|c| c.options.get(chain.cursor))
+            {
+                chain.picked = vec![option.id.clone()];
+            }
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        } else {
+            key
+        };
         match key.code {
             KeyCode::Tab | KeyCode::BackTab => {
                 // Options, answer, discuss, then cancel, skipping what is not offered.
@@ -693,24 +715,21 @@ impl Blockers {
                 match key.code {
                     KeyCode::Up => chain.cursor = chain.cursor.saturating_sub(1),
                     KeyCode::Down => chain.cursor = (chain.cursor + 1).min(count.saturating_sub(1)),
-                    KeyCode::Char(' ') if editable => {
-                        if let Some(choices) = options(&row)
-                            && let Some(option) = choices.options.get(chain.cursor)
+                    // Select many toggles; select one answered above.
+                    KeyCode::Char(' ') if editable && !one => {
+                        if let Some(option) =
+                            options(&row).and_then(|c| c.options.get(chain.cursor))
                         {
                             let id = option.id.clone();
-                            if choices.mode() == proto::BlockerChoiceMode::BlockerSelectMany {
-                                if let Some(at) = chain.picked.iter().position(|p| *p == id) {
-                                    chain.picked.remove(at);
-                                } else {
-                                    chain.picked.push(id);
-                                }
+                            if let Some(at) = chain.picked.iter().position(|p| *p == id) {
+                                chain.picked.remove(at);
                             } else {
-                                chain.picked = vec![id];
+                                chain.picked.push(id);
                             }
                             chain.hint = None;
                         }
                     }
-                    KeyCode::Delete | KeyCode::Backspace if editable => {
+                    KeyCode::Delete | KeyCode::Backspace if editable && !one => {
                         chain.picked.clear();
                         chain.hint = None;
                     }
@@ -949,9 +968,10 @@ impl Blockers {
             count,
             Style::new().add_modifier(Modifier::BOLD),
         )];
-        let keys = if focused {
-            let pick = if many { "Space toggles" } else { "Space picks" };
-            format!(" · ↑/↓ · {pick} · Del clears · Tab note · Enter sends")
+        let keys = if focused && many {
+            " · ↑/↓ · Space toggles · Del clears · Tab note · Enter sends".to_string()
+        } else if focused {
+            " · ↑/↓ · Space or Enter answers · Tab note".to_string()
         } else {
             " · or answer with a note".into()
         };
@@ -2967,25 +2987,73 @@ mod tests {
     }
 
     #[test]
-    fn select_one_moves_its_pick_and_delete_clears_it() {
+    fn select_one_answers_on_space_or_enter_with_any_note() {
         let now = Instant::now();
         let one = proto::BlockerChoiceMode::BlockerSelectOne;
         let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        let row = blockers.selected().unwrap().clone();
+        let heading = blockers.option_lines(&row, Focus::Options)[0].to_string();
+        assert!(heading.contains("Space or Enter answers"), "{heading}");
+        let req = answer_request(blockers.key(SCREEN, press(KeyCode::Char(' ')), now));
+        assert_eq!(req.selected, ["a"]);
+        assert_eq!(req.answer, "");
+
+        // A note typed first goes with the pick; Enter answers as Space does.
+        let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        typed(&mut blockers, "soon", now);
+        blockers.key(
+            SCREEN,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            now,
+        );
+        assert_eq!(focus(&blockers), Focus::Options);
+        blockers.key(SCREEN, press(KeyCode::Down), now);
+        let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+        assert_eq!(req.selected, ["b"]);
+        assert_eq!(req.answer, "soon");
+    }
+
+    #[test]
+    fn select_one_waits_out_a_replacement_and_says_when_nothing_is_given() {
+        let now = Instant::now();
+        let one = proto::BlockerChoiceMode::BlockerSelectOne;
+        let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        // Just replaced: Space neither answers nor picks.
+        let mut newer = row(3, 1, "Zed", "which, now?");
+        newer.choices = Some(choices(one, &["a", "b"], None));
+        blockers.poll(SCREEN);
+        blockers.on_data(SCREEN, &list(vec![newer]), now);
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Char(' ')), now),
+            Outcome::Stay
+        ));
+        assert!(blockers.chains[&1].picked.is_empty());
+        // Nothing picked and no note: Enter in the note sends nothing, and says why.
+        let later = now + GUARD;
+        blockers.key(SCREEN, press(KeyCode::Tab), later);
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Enter), later),
+            Outcome::Stay
+        ));
+        assert!(status(&blockers, later).contains("needs a selection or a nonblank note"));
+        // The next edit clears the reason.
+        typed(&mut blockers, "x", later);
+        assert!(!status(&blockers, later).contains("needs a selection"));
+    }
+
+    #[test]
+    fn select_many_toggles_and_delete_clears() {
+        let now = Instant::now();
+        let many = proto::BlockerChoiceMode::BlockerSelectMany;
+        let mut blockers = open_with(choices(many, &["a", "b"], None), now);
         blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
         blockers.key(SCREEN, press(KeyCode::Down), now);
         blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
-        assert_eq!(blockers.chains[&1].picked, ["b"]);
+        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
+        assert_eq!(blockers.chains[&1].picked, ["a"]);
         blockers.key(SCREEN, press(KeyCode::Delete), now);
         assert!(blockers.chains[&1].picked.is_empty());
-        // Nothing picked and no note: nothing sent, and the line says why.
-        assert!(matches!(
-            blockers.key(SCREEN, press(KeyCode::Enter), now),
-            Outcome::Stay
-        ));
-        assert!(status(&blockers, now).contains("needs a selection or a nonblank note"));
-        // The next edit clears the reason.
-        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
-        assert_eq!(status(&blockers, now), "");
     }
 
     #[test]
@@ -3000,7 +3068,8 @@ mod tests {
         assert!(req.selected.is_empty());
         assert_eq!(req.answer, "neither");
 
-        let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        let many = proto::BlockerChoiceMode::BlockerSelectMany;
+        let mut blockers = open_with(choices(many, &["a", "b"], None), now);
         blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
         blockers.key(SCREEN, press(KeyCode::Tab), now);
         typed(&mut blockers, "soon", now);
@@ -3015,7 +3084,8 @@ mod tests {
     fn typing_or_pasting_over_the_options_starts_the_note() {
         let now = Instant::now();
         let one = proto::BlockerChoiceMode::BlockerSelectOne;
-        let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        let many = proto::BlockerChoiceMode::BlockerSelectMany;
+        let mut blockers = open_with(choices(many, &["a", "b"], None), now);
         blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
         typed(&mut blockers, "ok", now);
         assert_eq!(focus(&blockers), Focus::Answer);
@@ -3099,10 +3169,13 @@ mod tests {
         let now = Instant::now();
         let one = proto::BlockerChoiceMode::BlockerSelectOne;
         let mut blockers = open_with(choices(one, &["a", "b"], None), now);
-        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
-        let first = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
-        // While it is out, the picks are fixed.
-        blockers.key(SCREEN, press(KeyCode::Delete), now);
+        let first = answer_request(blockers.key(SCREEN, press(KeyCode::Char(' ')), now));
+        // While it is out, the pick is fixed: another option's Space sends nothing.
+        blockers.key(SCREEN, press(KeyCode::Down), now);
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Char(' ')), now),
+            Outcome::Stay
+        ));
         assert_eq!(blockers.chains[&1].picked, ["a"]);
         blockers.on_data(
             SCREEN,
