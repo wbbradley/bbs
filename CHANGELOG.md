@@ -8,6 +8,12 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.18.0 - 2026-10-30
+
+Structured blocker answers. Protocol epoch 2, config format 4 and Rust 1.89
+are unchanged. Older remote clients continue to work and can answer any
+blocker with text.
+
 ### Added
 
 - Agents can give a blocker response choices: buttons that select one, or
@@ -20,7 +26,6 @@ under the new package version and its publication date.
   answers at once with that option and any note. On a select-many blocker,
   Space toggles, Delete clears and Enter sends. Tab or typing moves to the
   note. Nothing the server would refuse is sent; the status line says why.
-
 - The web blockers queue sends a single-choice answer when its button is
   clicked, including any note already typed. Multiple choices use checkboxes
   and Send answer. Notes remain available without choosing an option, and
