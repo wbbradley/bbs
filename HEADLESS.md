@@ -493,6 +493,7 @@ nonblank line of at most 120 bytes, and its optional `detail` is at most 500
 bytes. The tool checks this before sending, and the server checks it again with
 the same rules. Choices require `blocker-choices.v1`, so an older server refuses
 them instead of dropping them. A replacement version may change the options.
+Older clients show only the body, so describe the options there as well.
 
 A human answers with a valid selection, an optional note, or both. They can
 also answer with only a note, and older text-only clients do this. Selections

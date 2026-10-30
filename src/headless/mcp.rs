@@ -452,7 +452,7 @@ pub fn tool_list() -> Value {
                 "request_key": string("Unique key for this intent, 1..128 UTF-8 bytes. Reuse only with exactly the same operation and payload."),
                 "choices": {
                     "type": "object",
-                    "description": "Optional response options shown to the human as buttons (select_one) or checkboxes (select_many). The human can always answer with free text instead of, or as well as, a selection; the answer mail lists each pick as `Selected: <label> [<id>]`, then any note. Requires blocker-choices.v1; checked before sending.",
+                    "description": "Optional response options shown to the human as buttons (select_one) or checkboxes (select_many). The human can always answer with free text instead of, or as well as, a selection; the answer mail lists each pick as `Selected: <label> [<id>]`, then any note. Also describe the options in body: older clients show only the body. Requires blocker-choices.v1; checked before sending.",
                     "properties": {
                         "mode": { "type": "string", "enum": ["select_one", "select_many"] },
                         "options": {
