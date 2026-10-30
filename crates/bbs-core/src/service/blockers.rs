@@ -1749,4 +1749,176 @@ mod tests {
         assert_eq!(b.messages(), before + 1);
         assert_eq!(b.list().active_count, 0);
     }
+
+    fn choices(mode: proto::BlockerChoiceMode, ids: &[&str]) -> proto::BlockerChoices {
+        proto::BlockerChoices {
+            mode: mode.into(),
+            options: ids
+                .iter()
+                .map(|id| proto::BlockerOption {
+                    id: id.to_string(),
+                    label: format!("Use {id}"),
+                    detail: None,
+                })
+                .collect(),
+            min: None,
+            max: None,
+        }
+    }
+
+    fn put_choices(
+        b: &mut Board,
+        choices: proto::BlockerChoices,
+        replaces: Option<i64>,
+        key: &str,
+    ) -> Result<proto::BlockerMutationResponse> {
+        put_blocker(
+            &mut b.conn,
+            &b.agents[0],
+            proto::PutBlockerRequest {
+                group: "crew".into(),
+                body: "Which plan?".into(),
+                replaces,
+                request_key: key.into(),
+                choices: Some(choices),
+            },
+        )
+    }
+
+    fn select(
+        b: &mut Board,
+        id: i64,
+        selected: &[&str],
+        note: &str,
+        key: &str,
+    ) -> Result<proto::BlockerMutationResponse> {
+        answer_blocker(
+            &mut b.conn,
+            &b.humans[0],
+            proto::AnswerBlockerRequest {
+                id,
+                answer: note.into(),
+                request_key: key.into(),
+                selected: selected.iter().map(|s| s.to_string()).collect(),
+            },
+        )
+    }
+
+    fn mail(b: &Board, message_id: i64) -> String {
+        b.conn
+            .query_row(
+                "SELECT body FROM messages WHERE id = ?1",
+                [message_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn blocker_choices_are_validated_stored_canonically_and_replayed() {
+        use proto::BlockerChoiceMode::*;
+        let mut b = Board::memory();
+        let before = b.messages();
+        let blockers = |b: &Board| -> i64 {
+            b.conn
+                .query_row("SELECT COUNT(*) FROM blockers", [], |r| r.get(0))
+                .unwrap()
+        };
+        // The server applies the same validator as the harness.
+        assert!(
+            put_choices(&mut b, choices(BlockerSelectOne, &["a"]), None, "few")
+                .unwrap_err()
+                .to_string()
+                .contains("2 to 8 options")
+        );
+        assert!(put_choices(&mut b, choices(Unspecified, &["a", "b"]), None, "mode").is_err());
+        assert_eq!(blockers(&b), 0);
+
+        let many = put_choices(
+            &mut b,
+            choices(BlockerSelectMany, &["a", "b", "c"]),
+            None,
+            "k",
+        )
+        .unwrap()
+        .blocker
+        .unwrap();
+        let stored = many.choices.clone().unwrap();
+        assert_eq!((stored.min, stored.max), (Some(1), Some(3)));
+        assert_eq!(stored.options[2].label, "Use c");
+        // A retry with the defaults spelled out is the same canonical request.
+        let explicit = proto::BlockerChoices {
+            min: Some(1),
+            max: Some(3),
+            ..choices(BlockerSelectMany, &["a", "b", "c"])
+        };
+        assert!(put_choices(&mut b, explicit, None, "k").unwrap().replayed);
+        let changed = choices(BlockerSelectOne, &["a", "b", "c"]);
+        assert!(put_choices(&mut b, changed, None, "k").is_err());
+        assert_eq!(blockers(&b), 1);
+        // Free-text blockers take no selection; choice blockers take free text.
+        let plain = b.put(0, "Plain question", None, "plain");
+        assert!(
+            select(&mut b, plain.id, &["a"], "", "plain-pick")
+                .unwrap_err()
+                .to_string()
+                .contains("no choices")
+        );
+        assert!(select(&mut b, many.id, &[], " ", "blank").is_err());
+        assert!(select(&mut b, many.id, &["a", "zz"], "", "unknown").is_err());
+        assert_eq!(b.messages(), before);
+
+        let answered = select(&mut b, many.id, &["c", "a"], "Start with c.", "pick").unwrap();
+        let outcome = answered.blocker.unwrap().outcome.unwrap();
+        assert_eq!(outcome.selected, ["a", "c"]);
+        let text = "Selected: Use a [a]\nSelected: Use c [c]\n\nStart with c.";
+        assert_eq!(outcome.answer.as_deref(), Some(text));
+        assert!(
+            mail(&b, answered.message_id.unwrap())
+                .ends_with(&format!("Which plan?\n\nAnswer:\n{text}"))
+        );
+        // The same selection in another order replays without new mail.
+        let again = select(&mut b, many.id, &["a", "c"], "Start with c.", "pick").unwrap();
+        assert!(again.replayed);
+        assert_eq!(again.message_id, answered.message_id);
+        assert!(select(&mut b, many.id, &["a"], "Start with c.", "pick").is_err());
+        assert_eq!(b.messages(), before + 1);
+
+        // A replacement may change the options; the old version's are stale.
+        let one = put_choices(&mut b, choices(BlockerSelectOne, &["x", "y"]), None, "one")
+            .unwrap()
+            .blocker
+            .unwrap();
+        let next = put_choices(
+            &mut b,
+            choices(BlockerSelectOne, &["y", "z"]),
+            Some(one.id),
+            "next",
+        )
+        .unwrap()
+        .blocker
+        .unwrap();
+        assert!(select(&mut b, one.id, &["x"], "", "stale").is_err());
+        assert!(select(&mut b, next.id, &["x"], "", "gone").is_err());
+        assert!(select(&mut b, next.id, &["y", "z"], "", "two").is_err());
+        let picked = select(&mut b, next.id, &["z"], "", "z").unwrap();
+        let outcome = picked.blocker.unwrap().outcome.unwrap();
+        assert_eq!(
+            (outcome.selected, outcome.answer.as_deref()),
+            (vec!["z".to_string()], Some("Selected: Use z [z]"))
+        );
+
+        // A text-only answer to a choice blocker stores no selection.
+        let last = put_choices(&mut b, choices(BlockerSelectOne, &["p", "q"]), None, "last")
+            .unwrap()
+            .blocker
+            .unwrap();
+        let free = b.answer(0, last.id, "free").unwrap().blocker.unwrap();
+        let outcome = free.outcome.unwrap();
+        assert!(outcome.selected.is_empty());
+        assert_eq!(
+            outcome.answer.as_deref(),
+            Some("Approved; continue with option B.")
+        );
+    }
 }

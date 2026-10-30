@@ -8,6 +8,20 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- Agents can give a blocker response choices: buttons that select one, or
+  checkboxes that select a bounded number. `bbs_blocker_put` checks them
+  before sending. Humans answer with a selection, a note, or both
+  (`bbs blocker answer --select`), and the answer mail lists the picks.
+  Requires `blocker-choices.v1`.
+
+### Changed
+
+- Database schema 24 is a one-way upgrade from schema 23. Back up before
+  starting the new server or opening a local database with the new client.
+  Older binaries cannot reopen the upgraded database.
+
 ### Fixed
 
 - Headless runners retain effort-setting warnings when a turn finishes or

@@ -1642,8 +1642,13 @@ mod tests {
 
     #[tokio::test]
     async fn blockers_round_trip_and_old_capability_refusal_preserve_atomicity() {
-        use crate::backend::{BLOCKERS, BLOCKERS_MINE, Backend, Remote};
-        for withheld in [Some(BLOCKERS), Some(BLOCKERS_MINE), None] {
+        use crate::backend::{BLOCKER_CHOICES, BLOCKERS, BLOCKERS_MINE, Backend, Remote};
+        for withheld in [
+            Some(BLOCKERS),
+            Some(BLOCKERS_MINE),
+            Some(BLOCKER_CHOICES),
+            None,
+        ] {
             let supported = withheld.is_none();
             let mut conn = Connection::open_in_memory().unwrap();
             db::migrate(&mut conn).unwrap();
@@ -1774,6 +1779,49 @@ mod tests {
                         .active_count,
                     1
                 );
+                server.abort();
+                continue;
+            }
+            if withheld == Some(BLOCKER_CHOICES) {
+                let before = snapshot();
+                let choices = proto::BlockerChoices {
+                    mode: proto::BlockerChoiceMode::BlockerSelectOne.into(),
+                    options: ["a", "b"]
+                        .map(|id| proto::BlockerOption {
+                            id: id.into(),
+                            label: id.into(),
+                            detail: None,
+                        })
+                        .into(),
+                    ..Default::default()
+                };
+                let errors = [
+                    agent
+                        .put_blocker(proto::PutBlockerRequest {
+                            choices: Some(choices),
+                            ..put.clone()
+                        })
+                        .await
+                        .unwrap_err(),
+                    human
+                        .answer_blocker(proto::AnswerBlockerRequest {
+                            selected: vec!["a".into()],
+                            ..answer.clone()
+                        })
+                        .await
+                        .unwrap_err(),
+                ];
+                for error in errors {
+                    assert_eq!(
+                        error.downcast_ref::<Status>().unwrap().code(),
+                        tonic::Code::FailedPrecondition
+                    );
+                    assert!(format!("{error:#}").contains(BLOCKER_CHOICES));
+                }
+                assert_eq!(snapshot(), before);
+                // Text-only blockers still work against a pre-choices server.
+                agent.put_blocker(put).await.unwrap();
+                human.answer_blocker(answer).await.unwrap();
                 server.abort();
                 continue;
             }

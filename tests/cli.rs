@@ -2449,6 +2449,114 @@ fn blocker_tools_and_cli_keep_versions_retries_and_answer_delivery(mode: Mode) {
     );
 }
 
+fn blocker_choices_are_checked_in_the_tool_and_answered_by_selection(mode: Mode) {
+    use serde_json::{Value, json};
+    let bbs = Bbs::with_mode("blocker-choices", mode);
+    let (_, token) = bbs.register();
+    bbs.ok(&["group", "register", "crew"]);
+    bbs.ok(&["--token", &token, "group", "join", "crew"]);
+    bbs.ok(&["--token", &token, "read"]);
+    let call = |args: Value| -> Value {
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"bbs_blocker_put","arguments":args}});
+        let out = bbs.run_with_env(
+            &["headless", "mcp"],
+            &format!("{request}\n"),
+            &[("BBS_HEADLESS_TOKEN", &token)],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"].clone()
+    };
+    let options = json!([
+        {"id":"merge","label":"Merge now"},
+        {"id":"wait","label":"Wait for CI","detail":"About 20 minutes"},
+        {"id":"close","label":"Close the PR"},
+    ]);
+    // The harness refuses bad choices before any RPC, with the server's rules.
+    for (choices, reason) in [
+        (
+            json!({"mode":"select_one","options":[{"id":"a","label":"A"}]}),
+            "2 to 8 options",
+        ),
+        (
+            json!({"mode":"select_some","options":options}),
+            "invalid blocker put arguments",
+        ),
+        (
+            json!({"mode":"select_one","options":options,"max":2}),
+            "no min or max",
+        ),
+        (
+            json!({"mode":"select_many","options":options,"min":3,"max":2}),
+            "min <= max",
+        ),
+        (
+            json!({"mode":"select_one","options":[{"id":"A","label":"x"},{"id":"b","label":"y"}]}),
+            "a-z",
+        ),
+        (
+            json!({"mode":"select_one","options":options,"extra":1}),
+            "invalid blocker put arguments",
+        ),
+    ] {
+        let result =
+            call(json!({"group":"crew","body":"Merge?","request_key":"bad","choices":choices}));
+        assert_eq!(result["isError"], true, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(reason), "{text:?} lacks {reason:?}");
+    }
+    let put = call(json!({"group":"crew","body":"Merge?","request_key":"good",
+        "choices":{"mode":"select_many","options":options,"max":2}}));
+    assert_ne!(put["isError"], true, "{put}");
+    let put: Value = serde_json::from_str(put["content"][0]["text"].as_str().unwrap()).unwrap();
+    let id = put["blocker"]["id"].as_i64().unwrap().to_string();
+    let choices = &put["blocker"]["choices"];
+    assert_eq!(
+        (
+            choices["mode"].clone(),
+            choices["min"].clone(),
+            choices["max"].clone()
+        ),
+        (json!("select_many"), json!(1), json!(2))
+    );
+    assert_eq!(choices["options"][1]["detail"], "About 20 minutes");
+    let shown = bbs.ok(&["blocker", "get", &id]);
+    assert!(shown.contains("--select wait  Wait for CI"), "{shown}");
+
+    assert!(
+        bbs.err(&[
+            "blocker", "answer", &id, "--select", "merge", "--select", "wait", "--select", "close"
+        ])
+        .contains("select 1 to 2")
+    );
+    let answer: Value = serde_json::from_str(&bbs.ok(&[
+        "blocker",
+        "answer",
+        &id,
+        "--select",
+        "wait",
+        "--select",
+        "merge",
+        "--request-key",
+        "pick",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(
+        answer["blocker"]["outcome"]["selected"],
+        json!(["merge", "wait"])
+    );
+    let mail = bbs.ok(&["--token", &token, "read"]);
+    assert!(
+        mail.contains("Answer:\nSelected: Merge now [merge]\nSelected: Wait for CI [wait]"),
+        "{mail}"
+    );
+}
+
 fn headless_search_reads_the_corpus_and_pages_without_archiving(mode: Mode) {
     let bbs = Bbs::with_mode("search-tools", mode);
     let (a, ta) = bbs.register();
@@ -4072,6 +4180,7 @@ fn headless_run_takes_over_an_owned_agent(mode: Mode) {
 
 both_modes!(
     blocker_tools_and_cli_keep_versions_retries_and_answer_delivery,
+    blocker_choices_are_checked_in_the_tool_and_answered_by_selection,
     requested_names_are_validated_and_reserved,
     concurrent_registration_reserves_one_name,
     registration_records_human_from_as_config_or_user,
