@@ -18,6 +18,7 @@ use super::composer::Composer;
 use super::event::{Data, Request, SideError};
 use super::theme::{self, Role};
 use crate::proto;
+use bbs_core::blocker_choices;
 
 /// After a blocker's text changes under the reader, Enter waits this long.
 pub const GUARD: Duration = Duration::from_secs(1);
@@ -39,8 +40,15 @@ enum Support {
 /// One write, kept whole so a retry repeats it exactly.
 #[derive(Clone, Debug, PartialEq)]
 enum Write {
-    Answer { id: i64, answer: String },
-    Cancel { id: i64 },
+    /// The note, and the option IDs picked, in declared order.
+    Answer {
+        id: i64,
+        answer: String,
+        selected: Vec<String>,
+    },
+    Cancel {
+        id: i64,
+    },
 }
 
 #[derive(Debug)]
@@ -55,6 +63,11 @@ struct Pending {
 /// A chain's local state, by its stable root.
 struct Chain {
     answer: Composer,
+    /// Option IDs picked, and the option the cursor is on.
+    picked: Vec<String>,
+    cursor: usize,
+    /// Why the last Enter sent nothing; cleared by the next edit.
+    hint: Option<String>,
     pending: Option<Pending>,
     error: Option<String>,
     /// The version and text last shown, to notice a replacement.
@@ -66,6 +79,9 @@ impl Chain {
     fn new() -> Chain {
         Chain {
             answer: Composer::new("answer"),
+            picked: Vec::new(),
+            cursor: 0,
+            hint: None,
             pending: None,
             error: None,
             seen: None,
@@ -76,6 +92,8 @@ impl Chain {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Focus {
+    /// The blocker's response options, above the answer box.
+    Options,
     Answer,
     /// Open the creating agent's conversation.
     Discuss,
@@ -207,7 +225,7 @@ impl Blockers {
             list_top: None,
             list_start: 0,
             selected,
-            focus: Focus::Answer,
+            focus: home(&self.rows, &self.held, selected),
             scroll: 0,
         });
         Ok(())
@@ -300,6 +318,14 @@ impl Blockers {
                 replaced.push(row.root_id);
             }
             chain.seen = Some(current);
+            // Picks hold only options this version still offers.
+            let offered = options(row)
+                .map(|c| c.options.as_slice())
+                .unwrap_or_default();
+            chain
+                .picked
+                .retain(|id| offered.iter().any(|o| &o.id == id));
+            chain.cursor = chain.cursor.min(offered.len().saturating_sub(1));
         }
         // Drafts go with their blocker, unless a write is still out.
         let roots: Vec<i64> = self.rows.iter().map(|b| b.root_id).collect();
@@ -326,6 +352,7 @@ impl Blockers {
             let lost = match panel.focus {
                 Focus::Cancel | Focus::Confirm => !gone && !row.is_some_and(|b| b.can_cancel),
                 Focus::Discuss => row.and_then(agent_creator).is_none(),
+                Focus::Options => home(&self.rows, &self.held, selected) != Focus::Options,
                 Focus::Answer => false,
             };
             if lost {
@@ -363,8 +390,16 @@ impl Blockers {
                     // the next poll to settle. The delivered answer leaves
                     // the draft, so Enter cannot send it again to the new
                     // version; a cancel sent no text, and the draft stays.
-                    if let Write::Answer { answer, .. } = &pending.write {
+                    if let Write::Answer {
+                        answer, selected, ..
+                    } = &pending.write
+                    {
                         chain.answer.clear_if(answer);
+                        if chain.picked.len() == selected.len()
+                            && selected.iter().all(|id| chain.picked.contains(id))
+                        {
+                            chain.picked.clear();
+                        }
                     }
                     chain.error = None;
                     return;
@@ -381,10 +416,11 @@ impl Blockers {
                 self.held.retain(|r| *r != root);
                 let roots: Vec<i64> = self.rows.iter().map(|b| b.root_id).collect();
                 if let Some(panel) = &mut self.panel {
-                    if panel.selected == Some(root) {
-                        panel.focus = Focus::Answer;
-                    }
+                    let was = panel.selected == Some(root);
                     panel.selected = nearest(panel.selected, &old, &roots);
+                    if was {
+                        panel.focus = home(&self.rows, &self.held, panel.selected);
+                    }
                 }
             }
             Err(SideError::Transient(_)) => {
@@ -423,7 +459,7 @@ impl Blockers {
         let roots: Vec<i64> = self.rows.iter().map(|b| b.root_id).collect();
         if let Some(panel) = &mut self.panel {
             panel.selected = nearest(panel.selected, &old, &roots);
-            panel.focus = Focus::Answer;
+            panel.focus = home(&self.rows, &self.held, panel.selected);
             panel.scroll = 0;
         }
     }
@@ -510,7 +546,7 @@ impl Blockers {
                     (at + 1).min(roots.len().saturating_sub(1))
                 };
                 panel.selected = roots.get(to).copied();
-                panel.focus = Focus::Answer;
+                panel.focus = home(&self.rows, &self.held, panel.selected);
                 panel.scroll = 0;
                 return Outcome::Stay;
             }
@@ -562,8 +598,12 @@ impl Blockers {
         let chain = self.chains.entry(row.root_id).or_insert_with(Chain::new);
         match key.code {
             KeyCode::Tab | KeyCode::BackTab => {
-                // Answer, then discuss, then cancel, skipping what is not offered.
-                let mut chain = vec![Focus::Answer];
+                // Options, answer, discuss, then cancel, skipping what is not offered.
+                let mut chain = Vec::new();
+                if row.can_answer && !gone && options(&row).is_some() {
+                    chain.push(Focus::Options);
+                }
+                chain.push(Focus::Answer);
                 if agent_creator(&row).is_some() {
                     chain.push(Focus::Discuss);
                 }
@@ -610,21 +650,71 @@ impl Blockers {
                         panel.focus = Focus::Cancel;
                         submit(id, chain, Write::Cancel { id: row.id }, now)
                     }
-                    Focus::Answer => {
+                    Focus::Answer | Focus::Options => {
                         // A blocker no longer open takes no answer.
                         if !row.can_answer || gone {
                             return Outcome::Stay;
                         }
                         let answer = chain.answer.draft().text;
-                        if answer.trim().is_empty() {
+                        // Declared order, as the server stores them.
+                        let selected: Vec<String> = options(&row)
+                            .map(|c| c.options.as_slice())
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|o| chain.picked.contains(&o.id))
+                            .map(|o| o.id.clone())
+                            .collect();
+                        if options(&row).is_none() && answer.trim().is_empty() {
                             return Outcome::Stay;
                         }
-                        submit(id, chain, Write::Answer { id: row.id, answer }, now)
+                        // The server's own rule, so it refuses nothing sent here.
+                        if let Err(e) = blocker_choices::answer(options(&row), &selected, &answer) {
+                            chain.hint = Some(e.to_string());
+                            return Outcome::Stay;
+                        }
+                        let write = Write::Answer {
+                            id: row.id,
+                            answer,
+                            selected,
+                        };
+                        submit(id, chain, write, now)
                     }
                 }
             }
+            _ if panel.focus == Focus::Options => {
+                let count = options(&row).map_or(0, |c| c.options.len());
+                let editable = row.can_answer && !gone && chain.pending.is_none();
+                match key.code {
+                    KeyCode::Up => chain.cursor = chain.cursor.saturating_sub(1),
+                    KeyCode::Down => chain.cursor = (chain.cursor + 1).min(count.saturating_sub(1)),
+                    KeyCode::Char(' ') if editable => {
+                        if let Some(choices) = options(&row)
+                            && let Some(option) = choices.options.get(chain.cursor)
+                        {
+                            let id = option.id.clone();
+                            if choices.mode() == proto::BlockerChoiceMode::BlockerSelectMany {
+                                if let Some(at) = chain.picked.iter().position(|p| *p == id) {
+                                    chain.picked.remove(at);
+                                } else {
+                                    chain.picked.push(id);
+                                }
+                            } else {
+                                chain.picked = vec![id];
+                            }
+                            chain.hint = None;
+                        }
+                    }
+                    KeyCode::Delete | KeyCode::Backspace if editable => {
+                        chain.picked.clear();
+                        chain.hint = None;
+                    }
+                    _ => {}
+                }
+                Outcome::Stay
+            }
             _ if panel.focus == Focus::Answer && row.can_answer && chain.pending.is_none() => {
                 chain.answer.key(key, 0);
+                chain.hint = None;
                 Outcome::Stay
             }
             _ => Outcome::Stay,
@@ -660,12 +750,14 @@ impl Blockers {
             selected,
             body,
             label,
+            options,
         } = self.parts(width);
         head.extend(list.into_iter().map(|(_, line)| line));
         head.extend(more);
         head.extend(selected);
         head.extend(body);
         head.extend(label);
+        head.extend(options);
         head
     }
 
@@ -813,7 +905,64 @@ impl Blockers {
             selected: Some(theme::clip_line(selected, width)),
             body,
             label: Some(theme::clip_line(label, width)),
+            options: self.option_lines(row, panel.focus),
         }
+    }
+
+    /// The blocker's options: a heading saying how many to pick, then one
+    /// line each, marked when picked; the cursor shows while they have focus.
+    fn option_lines(&self, row: &proto::Blocker, focus: Focus) -> Vec<Line<'static>> {
+        let Some(choices) = options(row) else {
+            return Vec::new();
+        };
+        let chain = self.chains.get(&row.root_id);
+        let picked = |id: &str| chain.is_some_and(|c| c.picked.iter().any(|p| p == id));
+        let many = choices.mode() == proto::BlockerChoiceMode::BlockerSelectMany;
+        let count = if many {
+            let n = choices.options.len() as u32;
+            match (choices.min.unwrap_or(1), choices.max.unwrap_or(n)) {
+                (min, max) if min == max => format!("Choose {min}"),
+                (min, max) => format!("Choose {min} to {max}"),
+            }
+        } else {
+            "Choose one".into()
+        };
+        let focused = focus == Focus::Options;
+        let mut heading = vec![Span::styled(
+            count,
+            Style::new().add_modifier(Modifier::BOLD),
+        )];
+        let keys = if focused {
+            let pick = if many { "Space toggles" } else { "Space picks" };
+            format!(" · ↑/↓ · {pick} · Del clears · Tab note · Enter sends")
+        } else {
+            " · or answer with a note".into()
+        };
+        heading.push(Span::styled(keys, theme::dim()));
+        let mut lines = vec![Line::from(heading)];
+        for (i, option) in choices.options.iter().enumerate() {
+            let on = picked(&option.id);
+            let mark = match (many, on) {
+                (true, true) => "[x]",
+                (true, false) => "[ ]",
+                (false, true) => "(•)",
+                (false, false) => "( )",
+            };
+            let here = focused && chain.map_or(0, |c| c.cursor) == i;
+            let mut spans = vec![
+                Span::raw(if here { "▸ " } else { "  " }),
+                Span::raw(format!("{mark} {}", option.label)),
+            ];
+            if let Some(detail) = &option.detail {
+                spans.push(Span::styled(format!(" — {detail}"), theme::dim()));
+            }
+            let mut line = Line::from(spans);
+            if here {
+                line = line.style(theme::style(Role::Selection));
+            }
+            lines.push(line);
+        }
+        lines
     }
 
     /// The Cancel action, or its confirmation, and the state line.
@@ -891,6 +1040,9 @@ impl Blockers {
                     theme::style(Role::Warning),
                 );
             }
+            if let Some(hint) = &chain.hint {
+                return Line::styled(hint.clone(), theme::style(Role::Warning));
+            }
         }
         if self.notice_until.is_some_and(|until| now < until) {
             return Line::styled("Blockers updated.", theme::style(Role::Success));
@@ -912,6 +1064,7 @@ impl Blockers {
             selected,
             body,
             label,
+            options,
         } = self.parts(area.width);
         let [top, area] = Layout::vertical([
             Constraint::Length(list_height(area.height)),
@@ -972,6 +1125,14 @@ impl Blockers {
         let body = Paragraph::new(body).wrap(Wrap { trim: false });
         let rows = body.line_count(detail_width(area.width)) as u16;
         let label_gap = u16::from(label.is_some());
+        // The options wrap: a long detail keeps every word.
+        let option_rows = if options.is_empty() {
+            0
+        } else {
+            Paragraph::new(options.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(area.width) as u16
+        };
         // A blank row parts the list from the blocker restated below it.
         let list_gap = u16::from(selected.is_some());
         let fixed = [
@@ -979,6 +1140,7 @@ impl Blockers {
             list_gap,
             selected.iter().count() as u16,
             label.iter().count() as u16,
+            option_rows,
             below.len() as u16,
         ]
         .iter()
@@ -1002,6 +1164,7 @@ impl Blockers {
             body_area,
             _,
             label_area,
+            options_area,
             middle,
             bottom,
         ] = Layout::vertical([
@@ -1011,6 +1174,7 @@ impl Blockers {
             Constraint::Length(shown),
             Constraint::Length(label_gap),
             Constraint::Length(label.iter().count() as u16),
+            Constraint::Length(option_rows),
             Constraint::Length(answer),
             Constraint::Length(below.len() as u16),
         ])
@@ -1056,6 +1220,10 @@ impl Blockers {
             frame.render_widget(body.scroll((panel.scroll, 0)), body_area);
         }
         frame.render_widget(Paragraph::new(Vec::from_iter(label)), label_area);
+        frame.render_widget(
+            Paragraph::new(options).wrap(Wrap { trim: false }),
+            options_area,
+        );
         frame.render_widget(Paragraph::new(below), bottom);
         let Some((root, editable)) = self
             .selected()
@@ -1102,6 +1270,8 @@ struct Parts {
     body: Vec<Line<'static>>,
     /// Who an answer goes to, or why there is none.
     label: Option<Line<'static>>,
+    /// The response options under it, headed by how many to pick.
+    options: Vec<Line<'static>>,
 }
 
 /// Where the selection goes when its row leaves: the row now at its place.
@@ -1138,6 +1308,23 @@ fn creator(row: &proto::Blocker) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
+/// The blocker's response options, if it offers any.
+fn options(row: &proto::Blocker) -> Option<&proto::BlockerChoices> {
+    row.choices.as_ref().filter(|c| !c.options.is_empty())
+}
+
+/// Where focus starts on the blocker `root`: its options when it offers any
+/// and takes an answer, else the answer box.
+fn home(rows: &[proto::Blocker], held: &[i64], root: Option<i64>) -> Focus {
+    let row = rows.iter().find(|b| Some(b.root_id) == root);
+    match row {
+        Some(row) if row.can_answer && !held.contains(&row.root_id) && options(row).is_some() => {
+            Focus::Options
+        }
+        _ => Focus::Answer,
+    }
+}
+
 fn submit(id: u64, chain: &mut Chain, write: Write, now: Instant) -> Outcome {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
@@ -1164,13 +1351,14 @@ fn request(id: u64, key: &str, write: &Write) -> Request {
         Write::Answer {
             id: blocker,
             answer,
+            selected,
         } => Request::AnswerBlocker {
             id,
             req: proto::AnswerBlockerRequest {
                 id: *blocker,
                 answer: answer.clone(),
                 request_key: key.to_string(),
-                selected: Vec::new(),
+                selected: selected.clone(),
             },
         },
         Write::Cancel { id: blocker } => Request::CancelBlocker {
@@ -2701,5 +2889,213 @@ mod tests {
         assert_eq!(blockers.selected().unwrap().root_id, 2);
         assert_eq!(blockers.chains[&2].answer.draft().text, "mine");
         assert!(!blockers.chains.contains_key(&1));
+    }
+
+    fn choices(
+        mode: proto::BlockerChoiceMode,
+        ids: &[&str],
+        max: Option<u32>,
+    ) -> proto::BlockerChoices {
+        proto::BlockerChoices {
+            mode: mode.into(),
+            options: ids
+                .iter()
+                .map(|id| proto::BlockerOption {
+                    id: (*id).into(),
+                    label: format!("Option {id}"),
+                    detail: (*id == "b").then(|| "the middle one".into()),
+                })
+                .collect(),
+            min: max.map(|_| 1),
+            max,
+        }
+    }
+
+    /// One blocker offering `choices`, polled once, with the panel open.
+    fn open_with(choices: proto::BlockerChoices, now: Instant) -> Blockers {
+        let mut blockers = Blockers::new();
+        assert!(blockers.poll(SCREEN).is_some());
+        let mut row = row(1, 1, "Zed", "which?");
+        row.choices = Some(choices);
+        blockers.on_data(SCREEN, &list(vec![row]), now);
+        blockers.open().unwrap();
+        blockers
+    }
+
+    fn status(blockers: &Blockers, now: Instant) -> String {
+        blockers.lines_below(80, now)[1].to_string()
+    }
+
+    #[test]
+    fn picks_start_focused_and_send_in_declared_order() {
+        let now = Instant::now();
+        let many = proto::BlockerChoiceMode::BlockerSelectMany;
+        let mut blockers = open_with(choices(many, &["a", "b", "c"], Some(2)), now);
+        assert_eq!(focus(&blockers), Focus::Options);
+        for key in [
+            KeyCode::Down,
+            KeyCode::Char(' '),
+            KeyCode::Up,
+            KeyCode::Char(' '),
+        ] {
+            assert!(matches!(
+                blockers.key(SCREEN, press(key), now),
+                Outcome::Stay
+            ));
+        }
+        assert_eq!(blockers.chains[&1].picked, ["b", "a"]);
+        let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+        assert_eq!((req.id, req.answer.as_str()), (1, ""));
+        assert_eq!(req.selected, ["a", "b"]);
+    }
+
+    #[test]
+    fn select_one_moves_its_pick_and_delete_clears_it() {
+        let now = Instant::now();
+        let one = proto::BlockerChoiceMode::BlockerSelectOne;
+        let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
+        blockers.key(SCREEN, press(KeyCode::Down), now);
+        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
+        assert_eq!(blockers.chains[&1].picked, ["b"]);
+        blockers.key(SCREEN, press(KeyCode::Delete), now);
+        assert!(blockers.chains[&1].picked.is_empty());
+        // Nothing picked and no note: nothing sent, and the line says why.
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        assert!(status(&blockers, now).contains("needs a selection or a nonblank note"));
+        // The next edit clears the reason.
+        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
+        assert_eq!(status(&blockers, now), "");
+    }
+
+    #[test]
+    fn a_note_alone_answers_and_rides_along_with_a_pick() {
+        let now = Instant::now();
+        let one = proto::BlockerChoiceMode::BlockerSelectOne;
+        let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        assert_eq!(focus(&blockers), Focus::Answer);
+        typed(&mut blockers, "neither", now);
+        let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+        assert!(req.selected.is_empty());
+        assert_eq!(req.answer, "neither");
+
+        let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        typed(&mut blockers, "soon", now);
+        let req = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+        assert_eq!(
+            (req.selected.as_slice(), req.answer.as_str()),
+            (&["a".to_string()][..], "soon")
+        );
+    }
+
+    #[test]
+    fn too_many_picks_send_nothing_and_say_why() {
+        let now = Instant::now();
+        let many = proto::BlockerChoiceMode::BlockerSelectMany;
+        let mut blockers = open_with(choices(many, &["a", "b", "c"], Some(2)), now);
+        for _ in 0..3 {
+            blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
+            blockers.key(SCREEN, press(KeyCode::Down), now);
+        }
+        // A note does not excuse an invalid selection.
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        typed(&mut blockers, "all", now);
+        assert!(matches!(
+            blockers.key(SCREEN, press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        assert!(status(&blockers, now).contains("select 1 to 2"));
+    }
+
+    #[test]
+    fn tab_starts_at_the_options_and_skips_them_when_read_only() {
+        let now = Instant::now();
+        let one = proto::BlockerChoiceMode::BlockerSelectOne;
+        let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            blockers.key(SCREEN, press(KeyCode::Tab), now);
+            seen.push(focus(&blockers));
+        }
+        assert_eq!(
+            seen,
+            [Focus::Answer, Focus::Discuss, Focus::Cancel, Focus::Options]
+        );
+
+        let mut row = row(1, 1, "Zed", "which?");
+        row.choices = Some(choices(one, &["a", "b"], None));
+        row.can_answer = false;
+        let mut blockers = Blockers::new();
+        blockers.poll(SCREEN);
+        blockers.on_data(SCREEN, &list(vec![row]), now);
+        blockers.open().unwrap();
+        assert_eq!(focus(&blockers), Focus::Answer);
+        blockers.key(SCREEN, press(KeyCode::Tab), now);
+        assert_eq!(focus(&blockers), Focus::Discuss);
+    }
+
+    #[test]
+    fn a_replacement_keeps_only_picks_it_still_offers() {
+        let now = Instant::now();
+        let many = proto::BlockerChoiceMode::BlockerSelectMany;
+        let mut blockers = open_with(choices(many, &["a", "b", "c"], None), now);
+        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
+        blockers.key(SCREEN, press(KeyCode::Down), now);
+        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
+        blockers.key(SCREEN, press(KeyCode::Down), now);
+        let mut newer = row(3, 1, "Zed", "which, now?");
+        newer.choices = Some(choices(many, &["a", "c"], None));
+        blockers.poll(SCREEN);
+        blockers.on_data(SCREEN, &list(vec![newer]), now);
+        assert_eq!(blockers.chains[&1].picked, ["a"]);
+        assert_eq!(blockers.chains[&1].cursor, 1);
+    }
+
+    #[test]
+    fn a_retry_repeats_the_same_picks() {
+        let now = Instant::now();
+        let one = proto::BlockerChoiceMode::BlockerSelectOne;
+        let mut blockers = open_with(choices(one, &["a", "b"], None), now);
+        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
+        let first = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+        // While it is out, the picks are fixed.
+        blockers.key(SCREEN, press(KeyCode::Delete), now);
+        assert_eq!(blockers.chains[&1].picked, ["a"]);
+        blockers.on_data(
+            SCREEN,
+            &written(
+                &first.request_key,
+                Err(SideError::Transient("timeout".into())),
+            ),
+            now,
+        );
+        let again = answer_request(blockers.key(SCREEN, press(KeyCode::Enter), now));
+        assert_eq!(again, first);
+    }
+
+    #[test]
+    fn the_options_draw_above_the_answer_box_with_their_marks() {
+        let now = Instant::now();
+        let many = proto::BlockerChoiceMode::BlockerSelectMany;
+        let mut blockers = open_with(choices(many, &["a", "b", "c"], Some(2)), now);
+        blockers.key(SCREEN, press(KeyCode::Down), now);
+        blockers.key(SCREEN, press(KeyCode::Char(' ')), now);
+        let (rows, _) = drawn(&mut blockers, 80, 30, now);
+        let at = |what: &str| {
+            rows.iter()
+                .position(|r| r.contains(what))
+                .unwrap_or_else(|| panic!("{what}: {rows:#?}"))
+        };
+        let heading = at("Choose 1 to 2");
+        assert!(rows[heading].contains("Space toggles"));
+        assert_eq!(at("[ ] Option a"), heading + 1);
+        assert!(rows[heading + 2].starts_with("▸ [x] Option b — the middle one"));
+        assert!(at("answer → Zed") < heading);
     }
 }
