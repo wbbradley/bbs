@@ -8,8 +8,9 @@ import * as api from "./test/fakeApi";
 import { Dialog } from "./components/Dialog";
 import { BlockersPage, REPLACED_GUARD_MS, loadKept, nearest } from "./pages/Blockers";
 import { useBoard } from "./store";
-import { Board } from "./test/setup";
-import type { Blocker } from "./types";
+import { Board, INFO } from "./test/setup";
+import { BlockerChoiceMode, type Blocker, type ServerInfo } from "./types";
+import { BLOCKER_CHOICES } from "./blockerChoices";
 import { loadDraft, saveDraft, setDraftOwner } from "./util";
 
 const row = (root: number, id = root, body = `question ${root}?`): Blocker => ({
@@ -34,11 +35,11 @@ function Refresh() {
   return <button onClick={board.refreshBlockers}>refresh</button>;
 }
 
-async function page(rows: Blocker[]) {
+async function page(rows: Blocker[], info: ServerInfo | null = INFO) {
   listed = rows;
   api.auto.set("list_blockers", () => ({ blockers: listed, active_count: listed.length, has_more: false }));
   render(
-    <Board>
+    <Board info={info}>
       <Refresh />
       <BlockersPage openNav={() => {}} />
     </Board>,
@@ -278,5 +279,175 @@ describe("blockers", () => {
     await act(async () => out.resolve({ blockers: [row(1)], active_count: 1, has_more: false }));
     calls = api.pending("list_blockers").length;
     expect(calls).toBe(1);
+  });
+});
+
+const choiceInfo: ServerInfo = { ...INFO, capabilities: [...INFO.capabilities, BLOCKER_CHOICES] };
+const choiceRow = (mode: number = BlockerChoiceMode.SelectOne, id = 1): Blocker => ({
+  ...row(1, id),
+  choices: {
+    mode,
+    options: [
+      { id: "approve", label: "Approve", detail: "Continue the plan" },
+      { id: "wait", label: "Wait", detail: null },
+      { id: "decline", label: "Decline", detail: null },
+    ],
+    min: mode === BlockerChoiceMode.SelectMany ? 2 : null,
+    max: mode === BlockerChoiceMode.SelectMany ? 2 : null,
+  },
+});
+async function choicePage(rows: Blocker[] = [choiceRow()]) {
+  api.auto.set("server_info", () => choiceInfo);
+  await page(rows, choiceInfo);
+}
+const sendButton = () => screen.getByRole("button", { name: "Send answer" }) as HTMLButtonElement;
+const checkbox = (name: string) => screen.getByRole("checkbox", { name }) as HTMLInputElement;
+
+describe("structured blocker answers", () => {
+  it("sends a single pick immediately with its note frozen before the fresh capability check", async () => {
+    await choicePage();
+    api.auto.delete("server_info");
+    fireEvent.change(answerBox(), { target: { value: "\n  keep this note\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    const info = api.take("server_info");
+    expect(api.pending("answer_blocker")).toHaveLength(0);
+    expect((screen.getByRole("button", { name: "Wait" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(answerBox().readOnly).toBe(true);
+    fireEvent.change(answerBox(), { target: { value: "changed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Wait" }));
+    expect(api.pending("server_info")).toHaveLength(0);
+    await act(async () => info.resolve(choiceInfo));
+    const out = api.take("answer_blocker");
+    expect(out.req.selected).toEqual(["approve"]);
+    expect(out.req.answer).toBe("\n  keep this note\n");
+    expect(loadKept()[1].selected).toEqual(["approve"]);
+  });
+
+  it("accepts a single pick without text, and still sends a note alone through Send", async () => {
+    await choicePage();
+    expect(sendButton().disabled).toBe(true);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Wait" })));
+    const out = api.take("answer_blocker");
+    expect(out.req.selected).toEqual(["wait"]);
+    expect(out.req.answer).toBe("");
+    await act(async () => out.reject(new api.ApiError("refused", 409)));
+    fireEvent.change(answerBox(), { target: { value: "Another approach" } });
+    fireEvent.click(sendButton());
+    const note = api.take("answer_blocker");
+    expect(note.req.answer).toBe("Another approach");
+    expect(note.req.selected).toBeUndefined();
+  });
+
+  it("requires a valid checkbox count even with a note, and sends IDs in declared order", async () => {
+    await choicePage([choiceRow(BlockerChoiceMode.SelectMany)]);
+    fireEvent.change(answerBox(), { target: { value: "note" } });
+    fireEvent.click(checkbox("Wait"));
+    expect(sendButton().disabled).toBe(true);
+    fireEvent.keyDown(answerBox(), { key: "Enter" });
+    expect(api.pending("answer_blocker")).toHaveLength(0);
+    fireEvent.click(checkbox("Approve"));
+    expect(sendButton().disabled).toBe(false);
+    expect(api.pending("answer_blocker")).toHaveLength(0);
+    fireEvent.click(checkbox("Decline"));
+    expect(sendButton().disabled).toBe(true);
+    fireEvent.click(checkbox("Decline"));
+    await act(async () => fireEvent.click(sendButton()));
+    expect(api.take("answer_blocker").req.selected).toEqual(["approve", "wait"]);
+  });
+
+  it("can clear an incomplete selection and answer with only free text", async () => {
+    await choicePage([choiceRow(BlockerChoiceMode.SelectMany)]);
+    fireEvent.click(checkbox("Wait"));
+    fireEvent.change(answerBox(), { target: { value: "None of these" } });
+    expect(sendButton().disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Clear selection" }));
+    expect(checkbox("Wait").checked).toBe(false);
+    fireEvent.click(sendButton());
+    expect(api.take("answer_blocker").req.selected).toBeUndefined();
+  });
+
+  it("keeps drafts on navigation and polls, but resets option IDs on replacement without stealing focus", async () => {
+    const many = choiceRow(BlockerChoiceMode.SelectMany);
+    await choicePage([many, row(2)]);
+    fireEvent.click(checkbox("Wait"));
+    fireEvent.change(answerBox(), { target: { value: "saved note" } });
+    fireEvent.click(screen.getByText("question 2?", { selector: ".preview" }));
+    fireEvent.click(screen.getByText("question 1?", { selector: ".preview" }));
+    expect(checkbox("Wait").checked).toBe(true);
+    const refresh = screen.getByText("refresh");
+    refresh.focus();
+    await poll([{ ...many }, row(2)]);
+    expect(checkbox("Wait").checked).toBe(true);
+    expect(document.activeElement).toBe(refresh);
+    await poll([choiceRow(BlockerChoiceMode.SelectMany, 9), row(2)]);
+    expect(checkbox("Wait").checked).toBe(false);
+    expect(answerBox().value).toBe("saved note");
+    expect(document.activeElement).toBe(refresh);
+    expect(checkbox("Wait").disabled).toBe(true);
+  });
+
+  it("retries the exact frozen selection, note, version and key after replacement and remount", async () => {
+    await choicePage([choiceRow(BlockerChoiceMode.SelectMany)]);
+    fireEvent.click(checkbox("Wait"));
+    fireEvent.click(checkbox("Approve"));
+    fireEvent.change(answerBox(), { target: { value: "exact note" } });
+    await act(async () => fireEvent.click(sendButton()));
+    const first = api.take("answer_blocker");
+    await act(async () => first.reject(new api.ApiError("timeout", 503)));
+    vi.useFakeTimers();
+    cleanup();
+    await choicePage([choiceRow(BlockerChoiceMode.SelectMany, 9)]);
+    expect(checkbox("Wait").disabled).toBe(true);
+    expect(checkbox("Wait").checked).toBe(true);
+    expect(answerBox().value).toBe("exact note");
+    await act(async () => vi.advanceTimersByTime(REPLACED_GUARD_MS + 1));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Retry the same answer" })));
+    expect(api.take("answer_blocker").req).toEqual(first.req);
+  });
+
+  it("refuses a selected write when fresh server info lacks the capability despite cached support", async () => {
+    await choicePage();
+    api.auto.set("server_info", () => INFO);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Approve" })));
+    expect(api.pending("answer_blocker")).toHaveLength(0);
+    expect(screen.getByText(/cannot accept option selections/)).toBeTruthy();
+    expect(loadKept()[1].state).toBe("refused");
+  });
+
+  it("keeps an earlier unconfirmed answer frozen when a retry's capability check fails", async () => {
+    await choicePage();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Approve" })));
+    const first = api.take("answer_blocker");
+    await act(async () => first.reject(new api.ApiError("network", 0)));
+    api.auto.set("server_info", () => INFO);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Retry the same answer" })));
+    expect(api.pending("answer_blocker")).toHaveLength(0);
+    expect(loadKept()[1].state).toBe("unconfirmed");
+    expect(loadKept()[1].key).toBe(first.req.request_key);
+    expect(answerBox().readOnly).toBe(true);
+  });
+
+  it("does not POST under another sign-in after the capability check finishes", async () => {
+    await choicePage();
+    api.auto.delete("server_info");
+    fireEvent.change(answerBox(), { target: { value: "ada note" } });
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    const info = api.take("server_info");
+    cleanup();
+    setDraftOwner("bob");
+    saveDraft("blocker:1", "bob note");
+    await act(async () => info.resolve(choiceInfo));
+    expect(api.pending("answer_blocker")).toHaveLength(0);
+    expect(loadDraft("blocker:1", "bob")).toBe("bob note");
+    expect(loadKept("bob")).toEqual({});
+    expect(loadKept("ada")[1].state).toBe("refused");
+  });
+
+  it("keeps choice controls read-only when the blocker cannot be answered", async () => {
+    await choicePage([{ ...choiceRow(), can_answer: false }]);
+    expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    expect(api.pending("answer_blocker")).toHaveLength(0);
+    expect(api.pending("server_info")).toHaveLength(0);
   });
 });

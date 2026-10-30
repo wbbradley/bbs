@@ -434,6 +434,36 @@ select.input {
   outline: none;
 }
 
+.blocker-options {
+  border: 0;
+  padding: 0;
+  margin: 0 0 14px;
+  min-width: 0;
+}
+.blocker-options legend { font-weight: 600; }
+.blocker-options p { margin: 4px 0 8px; }
+.blocker-option-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.blocker-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1px solid var(--selection);
+  border-radius: 5px;
+  padding: 8px 12px;
+  background: var(--bg-deep);
+  color: var(--text);
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+  max-width: 100%;
+}
+.blocker-option.selected { border-color: var(--agent); background: var(--selection); }
+.blocker-option-label, .blocker-option-detail { display: block; }
+.blocker-option-detail { font-size: 12px; margin-top: 3px; }
+.blocker-option input { flex-shrink: 0; margin-top: 4px; }
+.blocker-option:focus-visible, .blocker-option:focus-within { outline: 2px solid var(--agent); outline-offset: 2px; }
+.blocker-options:disabled .blocker-option { cursor: default; opacity: 0.65; }
+
 label.field {
   display: block;
   margin-bottom: 12px;

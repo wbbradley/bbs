@@ -340,6 +340,9 @@ preserving the text you type.
 
 Selecting a blocker focuses its editable answer box. Refreshes keep focus where
 it is, and open dialogs or the launcher keep their focus.
+For a blocker with a single-choice answer, clicking an option sends it immediately
+with any note already typed. For multiple choices, tick the options and use Send
+answer. You can always answer with just a note; clear any checkboxes first.
 
 ```sh
 bbs serve --listen 100.64.0.1:7777 --require-human-token \

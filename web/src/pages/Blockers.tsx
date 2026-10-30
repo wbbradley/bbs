@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
-import { rpc } from "../api";
+import { ApiError, rpc, serverInfo } from "../api";
+import { answerSelection, BLOCKER_CHOICES, loadSelection, saveSelection } from "../blockerChoices";
 import { sendsOnEnter } from "../keys";
 import { isCovered } from "../cover";
 import type { PageProps } from "../App";
 import { Markdown } from "../Markdown";
 import { PageHeader } from "../components/PageHeader";
+import { BlockerOptions } from "../components/BlockerOptions";
 import { Link, paths } from "../router";
 import { useBoard } from "../store";
-import { BlockerStatus, Kind, type Blocker, type BlockerMutationResponse } from "../types";
+import { BlockerChoiceMode, BlockerStatus, Kind, type Blocker, type BlockerMutationResponse } from "../types";
 import { ago, draftOwnerNow, fullTime, loadDraft, ownedKey, randomKey, same, saveDraft, storage } from "../util";
 
 /** After a blocker's text changes under the reader, its actions wait this long. */
@@ -25,6 +27,7 @@ export interface Kept {
   kind: "answer" | "cancel";
   key: string;
   answer?: string;
+  selected?: string[];
   state: "sending" | "unconfirmed" | "refused";
   error?: string;
   /** The row as it was, to show if the server stops listing it. */
@@ -142,32 +145,51 @@ export function BlockersPage({ openNav }: PageProps) {
   }, [current]);
   const guarded = Date.now() < guardUntil;
 
-  const write = async (b: Blocker, kind: Kept["kind"], answer?: string) => {
+  const write = async (b: Blocker, kind: Kept["kind"], answer?: string, selected: string[] = []) => {
     const prior = kept[b.root_id];
     // A repeat is the very request that went unconfirmed.
     const op: Kept =
       prior && prior.state === "unconfirmed"
         ? { ...prior, state: "sending", error: undefined }
-        : { root: b.root_id, id: b.id, kind, key: randomKey(), answer, state: "sending", row: b };
+        : { root: b.root_id, id: b.id, kind, key: randomKey(), answer, selected: [...selected], state: "sending", row: b };
     update((k) => ({ ...k, [b.root_id]: op }));
     setDone(null);
+    let submitted = false;
     try {
+      if (op.kind === "answer" && op.selected?.length) {
+        // A tab can outlive its server version. Check the current server,
+        // not the capability snapshot held by the page, before sending IDs.
+        const info = await serverInfo();
+        if (!info?.capabilities?.includes(BLOCKER_CHOICES)) {
+          throw new ApiError("This server cannot accept option selections right now. This attempt did not send an answer.", 409);
+        }
+        if (!stillTheirs()) throw new ApiError("Sign-in changed before this answer could be sent.", 409);
+      }
+      submitted = true;
       const r =
         op.kind === "answer"
-          ? await rpc<BlockerMutationResponse>("answer_blocker", { id: op.id, answer: op.answer, request_key: op.key })
+          ? await rpc<BlockerMutationResponse>("answer_blocker", {
+              id: op.id, answer: op.answer, request_key: op.key,
+              ...(op.selected?.length ? { selected: op.selected } : {}),
+            })
           : await rpc<BlockerMutationResponse>("cancel_blocker", { id: op.id, request_key: op.key });
       update((k) => {
         const next = { ...k };
         delete next[op.root];
         return next;
       });
-      if (op.kind === "answer") saveDraft(`blocker:${op.root}`, "", owner);
+      if (op.kind === "answer") {
+        saveDraft(`blocker:${op.root}`, "", owner);
+        saveSelection(op.id, [], owner);
+      }
       if (!stillTheirs()) return;
       setDone(`${op.kind === "answer" ? "Answered" : "Cancelled"} #${r.blocker?.id ?? op.id} in @${op.row.group}.`);
       board.refreshBlockers();
     } catch (e) {
       const err = e as { status?: number; message?: string };
-      const state = !err.status || err.status >= 500 || err.status === 429 ? "unconfirmed" : "refused";
+      const state = !submitted
+        ? prior?.state === "unconfirmed" ? "unconfirmed" : "refused"
+        : !err.status || err.status >= 500 || err.status === 429 ? "unconfirmed" : "refused";
       update((k) => ({ ...k, [op.root]: { ...op, state, error: err.message } }));
     }
   };
@@ -178,7 +200,10 @@ export function BlockersPage({ openNav }: PageProps) {
       delete next[root];
       return next;
     });
-    if (!listedRoots.has(root)) saveDraft(`blocker:${root}`, "", owner);
+    if (!listedRoots.has(root)) {
+      saveDraft(`blocker:${root}`, "", owner);
+      if (kept[root]) saveSelection(kept[root].id, [], owner);
+    }
   };
 
   const unsupported = board.info !== null && !board.has("blockers-mine.v1");
@@ -258,14 +283,17 @@ function BlockerCard({
   held: boolean;
   kept?: Kept;
   guarded: boolean;
-  onWrite: (b: Blocker, kind: Kept["kind"], answer?: string) => void;
+  onWrite: (b: Blocker, kind: Kept["kind"], answer?: string, selected?: string[]) => void;
   onDismiss: (root: number) => void;
 }) {
   const board = useBoard();
+  const [owner] = useState(draftOwnerNow);
   const draftKey = `blocker:${b.root_id}`;
-  const [answer, setAnswer] = useState(() => loadDraft(draftKey));
+  const [answer, setAnswer] = useState(() => loadDraft(draftKey, owner));
+  const [selection, setSelection] = useState(() => loadSelection(b.id, owner));
   const [confirmCancel, setConfirmCancel] = useState(false);
-  useEffect(() => saveDraft(draftKey, answer), [draftKey, answer]);
+  useEffect(() => saveDraft(draftKey, answer, owner), [draftKey, answer, owner]);
+  useEffect(() => saveSelection(b.id, selection, owner), [b.id, selection, owner]);
   useEffect(() => {
     if (guarded) setConfirmCancel(false);
   }, [guarded]);
@@ -274,6 +302,8 @@ function BlockerCard({
   // While a write is out or unsettled, its answer is the one shown, unchanged.
   const frozen = sending || unconfirmed;
   const shown = frozen && kept?.kind === "answer" ? (kept.answer ?? "") : answer;
+  const choices = frozen && kept?.kind === "answer" ? kept.row.choices : b.choices;
+  const shownSelection = frozen && kept?.kind === "answer" ? (kept.selected ?? []) : selection;
   const creatorAgent = b.creator?.kind === Kind.Agent ? b.creator : null;
   const live = creatorAgent && board.agents.some((a) => a.id === creatorAgent.id && same(a.name, creatorAgent.name));
   const open = !held && b.status === BlockerStatus.Open;
@@ -283,8 +313,16 @@ function BlockerCard({
       : "You have no agent in this group, so you cannot answer it."
     : null;
   const canAnswer = open && b.can_answer && !frozen;
+  const supportsChoices = board.has(BLOCKER_CHOICES);
+  // Single-choice buttons send themselves. Send remains the note-only path.
+  const sendSelection = answerSelection(choices, choices?.mode === BlockerChoiceMode.SelectOne ? [] : selection, answer);
+  const canSend = sendSelection !== null && (sendSelection.length === 0 || supportsChoices);
   const send = () => {
-    if (canAnswer && !guarded && answer.trim()) onWrite(b, "answer", answer);
+    if (canAnswer && !guarded && canSend) onWrite(b, "answer", answer, sendSelection!);
+  };
+  const pick = (id: string) => {
+    const selected = answerSelection(choices, [id], answer);
+    if (canAnswer && !guarded && supportsChoices && selected) onWrite(b, "answer", answer, selected);
   };
 
   return (
@@ -298,6 +336,22 @@ function BlockerCard({
       <div style={{ marginTop: 18 }}>
         {!open && <div className="notice warning">No longer open.</div>}
         {open && reason && <div className="notice info">{reason}</div>}
+        {choices && (
+          <>
+            <BlockerOptions
+              choices={choices}
+              selected={shownSelection}
+              disabled={!canAnswer || guarded || !supportsChoices}
+              onPick={pick}
+              onChange={(ids) => canAnswer && !guarded && supportsChoices && setSelection(ids)}
+            />
+            {!supportsChoices && <div className="notice info">Options are unavailable from this server. You can still write an answer.</div>}
+            {frozen && kept?.id !== b.id && <div className="notice info">This selection belongs to the unconfirmed answer to #{kept?.id}.</div>}
+            {shownSelection.length > 0 && choices.mode !== BlockerChoiceMode.SelectOne && (
+              <button className="btn" disabled={!canAnswer || guarded} onClick={() => setSelection([])}>Clear selection</button>
+            )}
+          </>
+        )}
         {(b.can_answer || shown) && (
           <>
             <div className="mono muted" style={{ fontSize: 12, marginBottom: 4 }}>
@@ -326,7 +380,7 @@ function BlockerCard({
             </button>
           )}
           {canAnswer && (
-            <button className="btn primary" disabled={guarded || !answer.trim()} onClick={send}>
+            <button className="btn primary" disabled={guarded || !canSend} onClick={send}>
               Send answer
             </button>
           )}

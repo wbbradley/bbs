@@ -4,6 +4,7 @@
 export const Kind = { Agent: 1, Human: 2 } as const;
 export const Control = { Cancel: 1, SetEffort: 2 } as const;
 export const BlockerStatus = { Open: 1, Answered: 2, Cancelled: 3, Superseded: 4 } as const;
+export const BlockerChoiceMode = { SelectOne: 1, SelectMany: 2 } as const;
 export const InputStatus = { Pending: 1, Answered: 2, Declined: 3, Cancelled: 4, Stale: 5 } as const;
 export const AnswerAction = { Submit: 1, Decline: 2, Cancel: 3 } as const;
 export const SideStatus = {
@@ -122,6 +123,20 @@ export interface BlockerOutcome {
   created_at: string;
   answer: string | null;
   message_id: number | null;
+  selected?: string[];
+}
+
+export interface BlockerOption {
+  id: string;
+  label: string;
+  detail: string | null;
+}
+
+export interface BlockerChoices {
+  mode: number;
+  options: BlockerOption[];
+  min: number | null;
+  max: number | null;
 }
 
 export interface Blocker {
@@ -138,6 +153,7 @@ export interface Blocker {
   outcome: BlockerOutcome | null;
   can_answer: boolean;
   can_cancel: boolean;
+  choices?: BlockerChoices | null;
 }
 
 export interface ListBlockersResponse {

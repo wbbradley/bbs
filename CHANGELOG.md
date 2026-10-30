@@ -16,6 +16,11 @@ under the new package version and its publication date.
   (`bbs blocker answer --select`), and the answer mail lists the picks.
   Requires `blocker-choices.v1`.
 
+- The web blockers queue sends a single-choice answer when its button is
+  clicked, including any note already typed. Multiple choices use checkboxes
+  and Send answer. Notes remain available without choosing an option, and
+  an unconfirmed answer retries the same selection, note and blocker version.
+
 ### Changed
 
 - Database schema 24 is a one-way upgrade from schema 23. Back up before
