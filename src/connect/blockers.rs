@@ -1170,6 +1170,7 @@ fn request(id: u64, key: &str, write: &Write) -> Request {
                 id: *blocker,
                 answer: answer.clone(),
                 request_key: key.to_string(),
+                selected: Vec::new(),
             },
         },
         Write::Cancel { id: blocker } => Request::CancelBlocker {

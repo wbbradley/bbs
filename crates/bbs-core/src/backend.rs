@@ -37,6 +37,8 @@ pub const SIDE_CONVERSATIONS: &str = "side-conversations.v1";
 pub const MESSAGE_SEARCH: &str = "message-search.v1";
 pub const BLOCKERS: &str = "blockers.v1";
 pub const BLOCKERS_MINE: &str = "blockers-mine.v1";
+/// Structured blocker options and answers selecting them.
+pub const BLOCKER_CHOICES: &str = "blocker-choices.v1";
 pub const AGENT_NOTES: &str = "agent-notes.v1";
 /// Replicating the caller's whole personal history with `FeedRequest.sync`.
 pub const FEED_SYNC: &str = "feed-sync.v1";
@@ -440,7 +442,12 @@ impl Backend {
         match self {
             Backend::Local(l) => service::put_blocker(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => {
-                rpc!(r, put_blocker, req, &[BLOCKERS]).map_err(|e| missing_rpc(e, BLOCKERS))
+                let capability = if req.choices.is_some() {
+                    BLOCKER_CHOICES
+                } else {
+                    BLOCKERS
+                };
+                rpc!(r, put_blocker, req, &[capability]).map_err(|e| missing_rpc(e, capability))
             }
         }
     }
@@ -452,7 +459,12 @@ impl Backend {
         match self {
             Backend::Local(l) => service::answer_blocker(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => {
-                rpc!(r, answer_blocker, req, &[BLOCKERS]).map_err(|e| missing_rpc(e, BLOCKERS))
+                let capability = if req.selected.is_empty() {
+                    BLOCKERS
+                } else {
+                    BLOCKER_CHOICES
+                };
+                rpc!(r, answer_blocker, req, &[capability]).map_err(|e| missing_rpc(e, capability))
             }
         }
     }

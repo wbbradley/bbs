@@ -30,9 +30,14 @@ pub fn row(blocker: &proto::Blocker) -> Value {
         "body": blocker.body, "created_at": blocker.created_at,
         "replaces": blocker.replaces, "replaced_by": blocker.replaced_by,
         "status": status, "can_answer": blocker.can_answer, "can_cancel": blocker.can_cancel,
+        "choices": blocker.choices.as_ref().map(|c| json!({
+            "mode": if c.mode() == proto::BlockerChoiceMode::BlockerSelectMany { "select_many" } else { "select_one" },
+            "options": c.options.iter().map(|o| json!({ "id": o.id, "label": o.label, "detail": o.detail })).collect::<Vec<_>>(),
+            "min": c.min, "max": c.max,
+        })),
         "outcome": blocker.outcome.as_ref().map(|o| json!({
             "actor": o.actor.as_ref().map(identity), "created_at": o.created_at,
-            "answer": o.answer, "message_id": o.message_id,
+            "answer": o.answer, "message_id": o.message_id, "selected": o.selected,
         })),
     })
 }
@@ -108,16 +113,67 @@ struct PutArgs {
     body: String,
     replaces: Option<i64>,
     request_key: String,
+    choices: Option<ChoicesArgs>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum Mode {
+    SelectOne,
+    SelectMany,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChoicesArgs {
+    mode: Mode,
+    options: Vec<OptionArgs>,
+    min: Option<u32>,
+    max: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OptionArgs {
+    id: String,
+    label: String,
+    detail: Option<String>,
+}
+
+/// Choices are validated here, before the RPC, with the server's own rules.
 pub fn put_request(args: &Value) -> Result<proto::PutBlockerRequest> {
     let args: PutArgs =
         serde_json::from_value(args.clone()).context("invalid blocker put arguments")?;
+    let choices = args
+        .choices
+        .map(|c| {
+            bbs_core::blocker_choices::validate(&proto::BlockerChoices {
+                mode: match c.mode {
+                    Mode::SelectOne => proto::BlockerChoiceMode::BlockerSelectOne,
+                    Mode::SelectMany => proto::BlockerChoiceMode::BlockerSelectMany,
+                }
+                .into(),
+                options: c
+                    .options
+                    .into_iter()
+                    .map(|o| proto::BlockerOption {
+                        id: o.id,
+                        label: o.label,
+                        detail: o.detail,
+                    })
+                    .collect(),
+                min: c.min,
+                max: c.max,
+            })
+            .context("invalid blocker choices")
+        })
+        .transpose()?;
     Ok(proto::PutBlockerRequest {
         group: args.group,
         body: args.body,
         replaces: args.replaces,
         request_key: args.request_key,
+        choices,
     })
 }
 
@@ -142,14 +198,28 @@ fn request_key(key: Option<String>) -> String {
 }
 
 fn human_row(value: &Value) -> String {
-    format!(
+    let mut text = format!(
         "#{} @{} [{}] {}\n{}\n",
         value["id"],
         value["group"].as_str().unwrap_or_default(),
         value["status"].as_str().unwrap_or_default(),
         value["creator"]["name"].as_str().unwrap_or_default(),
         value["body"].as_str().unwrap_or_default()
-    )
+    );
+    if let Some(options) = value["choices"]["options"].as_array() {
+        text.push_str(&format!(
+            "Choices ({}):\n",
+            value["choices"]["mode"].as_str().unwrap_or_default()
+        ));
+        for option in options {
+            text.push_str(&format!(
+                "  --select {}  {}\n",
+                option["id"].as_str().unwrap_or_default(),
+                option["label"].as_str().unwrap_or_default()
+            ));
+        }
+    }
+    text
 }
 
 pub async fn run(
@@ -196,17 +266,22 @@ pub async fn run(
             body,
         } => {
             let key = request_key(key);
-            let response = backend.put_blocker(proto::PutBlockerRequest { group, body: crate::app::read_body(body)?, replaces, request_key: key.clone() }).await
+            let response = backend.put_blocker(proto::PutBlockerRequest { group, body: crate::app::read_body(body)?, replaces, request_key: key.clone(), choices: None }).await
                 .with_context(|| format!("blocker request key {key}; reuse --request-key with the same payload if retrying"))?;
             mutation(&response, &key)
         }
         BlockerCommand::Answer {
             id,
             request_key: key,
+            selected,
             answer,
         } => {
             let key = request_key(key);
-            let response = backend.answer_blocker(proto::AnswerBlockerRequest { id, answer: crate::app::read_body(answer)?, request_key: key.clone() }).await
+            let answer = match answer {
+                None if !selected.is_empty() => String::new(),
+                answer => crate::app::read_body(answer)?,
+            };
+            let response = backend.answer_blocker(proto::AnswerBlockerRequest { id, answer, request_key: key.clone(), selected }).await
                 .with_context(|| format!("blocker request key {key}; reuse --request-key with the same payload if retrying"))?;
             mutation(&response, &key)
         }

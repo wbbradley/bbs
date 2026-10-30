@@ -159,6 +159,37 @@ message BlockerOutcome {
   string created_at = 3;
   optional string answer = 4;
   optional int64 message_id = 5;
+  // Option IDs the human picked, in the blocker's declared option order.
+  repeated string selected = 6;
+}
+
+// Structured response options for a blocker (blocker-choices.v1). The human
+// can always answer with free text instead of, or as well as, a selection.
+message BlockerOption {
+  // Stable machine ID: [a-z0-9_-]{1,32}, unique within the blocker.
+  string id = 1;
+  // One line, 1..120 UTF-8 bytes.
+  string label = 2;
+  // At most 500 UTF-8 bytes.
+  optional string detail = 3;
+}
+
+enum BlockerChoiceMode {
+  BLOCKER_CHOICE_MODE_UNSPECIFIED = 0;
+  // Buttons: pick exactly one.
+  BLOCKER_SELECT_ONE = 1;
+  // Checkboxes: pick between min and max.
+  BLOCKER_SELECT_MANY = 2;
+}
+
+message BlockerChoices {
+  BlockerChoiceMode mode = 1;
+  // 2..8 options, shown in this order.
+  repeated BlockerOption options = 2;
+  // SELECT_MANY only: 1 <= min <= max <= options; defaults 1 and options.
+  // Stored and returned with the defaults filled in.
+  optional uint32 min = 3;
+  optional uint32 max = 4;
 }
 
 message Blocker {
@@ -176,6 +207,7 @@ message Blocker {
   BlockerOutcome outcome = 11;
   bool can_answer = 12;
   bool can_cancel = 13;
+  BlockerChoices choices = 14;
 }
 
 message ListBlockersRequest {
@@ -220,12 +252,18 @@ message PutBlockerRequest {
   optional int64 replaces = 3;
   // Caller-scoped idempotency key: reuse only for the same exact operation.
   string request_key = 4;
+  // Requires blocker-choices.v1, so an older server cannot drop it silently.
+  BlockerChoices choices = 5;
 }
 
 message AnswerBlockerRequest {
   int64 id = 1;
+  // Free text. Optional when selected is nonempty; the server composes the
+  // stored answer and mail from the selection labels followed by this note.
   string answer = 2;
   string request_key = 3;
+  // Option IDs of the exact current version; requires blocker-choices.v1.
+  repeated string selected = 4;
 }
 
 message CancelBlockerRequest {

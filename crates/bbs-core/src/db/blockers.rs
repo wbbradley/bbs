@@ -13,6 +13,8 @@ pub struct Outcome {
     pub created_at: String,
     pub answer: Option<String>,
     pub message_id: Option<i64>,
+    /// Canonical JSON array of selected option IDs; none for a free-text answer.
+    pub selected: Option<String>,
 }
 
 pub struct Row {
@@ -28,13 +30,15 @@ pub struct Row {
     pub replaces: Option<i64>,
     pub replaced_by: Option<i64>,
     pub outcome: Option<Outcome>,
+    /// Canonical JSON response options; none for a free-text blocker.
+    pub choices: Option<String>,
 }
 
 const SELECT: &str = "SELECT b.id, b.group_id, g.name, g.archived_at,
     a.id, a.name, h.name, b.body, b.created_at, COALESCE(b.root_id, b.id),
     b.replaces, successor.id, e.kind, e.actor_kind, e.actor_id,
     CASE e.actor_kind WHEN 'human' THEN eh.name ELSE ea.name END,
-    e.created_at, e.answer, e.message_id, actor_owner.name
+    e.created_at, e.answer, e.message_id, actor_owner.name, b.choices, e.selected
     FROM blockers b JOIN bbs_groups g ON g.id = b.group_id
     JOIN agents a ON a.id = b.creator_id
     LEFT JOIN agent_owners owner ON owner.agent_id = a.id
@@ -63,6 +67,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             created_at: r.get(16)?,
             answer: r.get(17)?,
             message_id: r.get(18)?,
+            selected: r.get(21)?,
         })
     } else {
         None
@@ -84,6 +89,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         replaces: r.get(10)?,
         replaced_by: r.get(11)?,
         outcome,
+        choices: r.get(20)?,
     })
 }
 
@@ -206,29 +212,42 @@ pub fn human_owns_member(conn: &Connection, group: i64, human: i64) -> Result<bo
     )?)
 }
 
+pub struct Version<'a> {
+    pub body: &'a str,
+    /// Canonical JSON from `blocker_choices::to_json`.
+    pub choices: Option<&'a str>,
+}
+
 pub fn insert(
     conn: &Connection,
     group: i64,
     creator: i64,
-    body: &str,
+    version: Version<'_>,
     prior: Option<&Row>,
     now: &str,
     key: &str,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO blockers (group_id, creator_id, body, replaces, root_id, created_at, request_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO blockers (group_id, creator_id, body, replaces, root_id, created_at, request_key, choices)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             group,
             creator,
-            body,
+            version.body,
             prior.map(|p| p.id),
             prior.map(|p| p.root_id),
             now,
-            key
+            key,
+            version.choices
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+pub struct Answer<'a> {
+    pub text: &'a str,
+    pub message_id: i64,
+    pub selected: Option<&'a str>,
 }
 
 pub fn event(
@@ -237,13 +256,23 @@ pub fn event(
     kind: &str,
     actor: &Principal,
     now: &str,
-    answer: Option<(&str, i64)>,
+    answer: Option<Answer<'_>>,
     key: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO blocker_events (blocker_id, kind, actor_kind, actor_id, created_at, answer, message_id, request_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![id, kind, actor.kind.as_str(), actor.id, now, answer.map(|a| a.0), answer.map(|a| a.1), key],
+        "INSERT INTO blocker_events (blocker_id, kind, actor_kind, actor_id, created_at, answer, message_id, request_key, selected)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id,
+            kind,
+            actor.kind.as_str(),
+            actor.id,
+            now,
+            answer.as_ref().map(|a| a.text),
+            answer.as_ref().map(|a| a.message_id),
+            key,
+            answer.as_ref().and_then(|a| a.selected)
+        ],
     )?;
     Ok(())
 }
@@ -257,11 +286,13 @@ pub enum Operation {
         group: i64,
         body: String,
         replaces: Option<i64>,
+        choices: Option<String>,
     },
     Answer {
         id: i64,
         answer: String,
         message_id: i64,
+        selected: Option<String>,
     },
     Cancel {
         id: i64,
@@ -285,21 +316,21 @@ impl Operation {
 pub fn operation(conn: &Connection, actor: &Principal, key: &str) -> Result<Option<Operation>> {
     if actor.kind == Kind::Agent {
         let created = conn.query_row(
-            "SELECT id, group_id, body, replaces FROM blockers WHERE creator_id = ?1 AND request_key = ?2",
+            "SELECT id, group_id, body, replaces, choices FROM blockers WHERE creator_id = ?1 AND request_key = ?2",
             params![actor.id, key],
-            |r| Ok(Operation::Put { id: r.get(0)?, group: r.get(1)?, body: r.get(2)?, replaces: r.get(3)? }),
+            |r| Ok(Operation::Put { id: r.get(0)?, group: r.get(1)?, body: r.get(2)?, replaces: r.get(3)?, choices: r.get(4)? }),
         ).optional()?;
         if created.is_some() {
             return Ok(created);
         }
     }
     Ok(conn.query_row(
-        "SELECT blocker_id, kind, answer, message_id FROM blocker_events WHERE actor_kind = ?1 AND actor_id = ?2 AND request_key = ?3",
+        "SELECT blocker_id, kind, answer, message_id, selected FROM blocker_events WHERE actor_kind = ?1 AND actor_id = ?2 AND request_key = ?3",
         params![actor.kind.as_str(), actor.id, key],
         |r| {
             let id = r.get(0)?;
             if r.get::<_, String>(1)? == "answered" {
-                Ok(Operation::Answer { id, answer: r.get(2)?, message_id: r.get(3)? })
+                Ok(Operation::Answer { id, answer: r.get(2)?, message_id: r.get(3)?, selected: r.get(4)? })
             } else { Ok(Operation::Cancel { id }) }
         },
     ).optional()?)

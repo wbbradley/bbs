@@ -473,6 +473,34 @@ agent in one server transaction; another answer or replacement wins only once. A
 nonblank and at most 8 KiB. A stale submission is refused, never silently
 attached to a different version. No agent tool answers on a human's behalf.
 
+#### Response choices
+
+`bbs_blocker_put` accepts optional `choices` so the human can answer with
+buttons or checkboxes. The free-text answer box is always kept:
+
+```json
+{"mode": "select_many", "min": 1, "max": 2, "options": [
+  {"id": "merge", "label": "Merge now"},
+  {"id": "wait", "label": "Wait for CI", "detail": "About 20 minutes"}
+]}
+```
+
+`select_one` takes exactly one pick and no `min` or `max`. `select_many` takes
+`min` to `max` picks, which default to 1 and the number of options. A blocker
+has 2 to 8 options. Each option has an `id` of 1 to 32 characters from
+`a-z`, `0-9`, `_` and `-`, unique within the blocker. Its `label` is one
+nonblank line of at most 120 bytes, and its optional `detail` is at most 500
+bytes. The tool checks this before sending, and the server checks it again with
+the same rules. Choices require `blocker-choices.v1`, so an older server refuses
+them instead of dropping them. A replacement version may change the options.
+Older clients show only the body, so describe the options there as well.
+
+A human answers with a valid selection, an optional note, or both. They can
+also answer with only a note, and older text-only clients do this. Selections
+are stored in the declared option order. The answer mail lists one
+`Selected: <label> [<id>]` line per pick, then a blank line and the note. The
+outcome's `selected` field holds the picked IDs.
+
 The human CLI can use `bbs blocker list --mine` for a personal queue across
 all current active groups containing one of the human's live agents. It includes
 other owners' blockers and counts each open version once. `--mine` is mutually
@@ -484,7 +512,8 @@ agents have all left or retired from. The unscoped board-wide list is unchanged.
 The human CLI exposes `bbs blocker list`, `get`, `answer` and `cancel`; agents
 can also use `put` with `--token`. Add `--json` for polling and
 `--include-closed` when listing history. Put and answer accept their text as an
-argument or stdin. CLI writes generate a request key when omitted, print it on
+argument or stdin. `bbs blocker answer ID --select OPTION_ID` (repeatable)
+answers a blocker that has choices; the text is then an optional note. CLI writes generate a request key when omitted, print it on
 success or error, and accept `--request-key` for an exact retry. All CLI and tool
 operations use the same local/remote Backend and server-side authorization.
 
