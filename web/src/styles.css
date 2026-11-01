@@ -937,6 +937,38 @@ table.list .status {
   min-height: 0;
 }
 
+.timer-drawer {
+  flex-shrink: 0;
+}
+.timer-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.timer-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+.timer-title {
+  font-weight: 600;
+}
+.timer-card dl {
+  margin: 10px 0;
+  font-size: 13px;
+}
+.timer-card dt {
+  color: var(--muted);
+}
+.timer-card dd {
+  margin: 0 0 6px;
+}
+.timer-message {
+  white-space: pre-wrap;
+}
+
 .overlay {
   position: fixed;
   inset: 0;

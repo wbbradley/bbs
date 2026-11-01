@@ -88,6 +88,15 @@ export interface Human {
   active_at: string;
 }
 
+export interface Timer {
+  id: number;
+  agent: string;
+  creator: string;
+  repeat: string | null;
+  next_run: string;
+  body: string;
+}
+
 export interface AgentSummary {
   agent: string;
   unread_messages: number;

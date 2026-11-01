@@ -670,6 +670,7 @@ async fn rpc(
         "whoami" => whoami,
         "agent_drain" => agent_drain,
         "list_agents" => list_agents,
+        "timer_list" => timer_list,
         "retire" => retire,
         "group_list" => group_list,
         "group_register" => group_register,

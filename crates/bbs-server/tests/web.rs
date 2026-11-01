@@ -234,6 +234,66 @@ fn humans_sign_in_with_their_token_and_use_the_api() {
 }
 
 #[test]
+fn timer_lists_are_authenticated_filtered_and_do_not_offer_timer_writes() {
+    let server = Server::start("timers");
+    let token = server.human("ada");
+    for name in ["Mateo", "Zed"] {
+        let registered = Command::new(bbs())
+            .args(["--as", "ada", "register", "--name", name])
+            .env("HOME", &server.home)
+            .output()
+            .unwrap();
+        assert!(registered.status.success(), "{registered:?}");
+        let added = Command::new(bbs())
+            .args([
+                "--as",
+                "ada",
+                "timer",
+                "add",
+                name,
+                "every 1h",
+                "Scheduled check",
+            ])
+            .env("HOME", &server.home)
+            .output()
+            .unwrap();
+        assert!(added.status.success(), "{added:?}");
+    }
+    let body = r#"{"agent":"Mateo"}"#;
+    let unauthenticated = server.request("POST", "/api/rpc/timer_list", &[CSRF], body);
+    assert_eq!(unauthenticated.status, 401);
+    let cookie = sign_in(&server, "ada", &token);
+    let no_csrf = server.request("POST", "/api/rpc/timer_list", &[&cookie], body);
+    assert_eq!(no_csrf.status, 403);
+    let result = server.request("POST", "/api/rpc/timer_list", &[CSRF, &cookie], body);
+    assert_eq!(result.status, 200, "{}", result.body);
+    let timers = result.json();
+    let timers = timers["timers"].as_array().unwrap();
+    assert_eq!(timers.len(), 1);
+    assert_eq!(timers[0]["agent"], "Mateo");
+    assert_eq!(timers[0]["body"], "Scheduled check");
+    assert_eq!(timers[0]["creator"], "ada");
+    assert_eq!(timers[0]["repeat"], "every 1h");
+    assert!(timers[0]["next_run"].is_string());
+    for method in ["timer_add", "timer_remove"] {
+        let r = server.request(
+            "POST",
+            &format!("/api/rpc/{method}"),
+            &[CSRF, &cookie],
+            "{}",
+        );
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+    let missing = server.request(
+        "POST",
+        "/api/rpc/timer_list",
+        &[CSRF, &cookie],
+        r#"{"agent":"Nobody"}"#,
+    );
+    assert_eq!(missing.status, 400, "{}", missing.body);
+}
+
+#[test]
 fn calls_need_the_csrf_header_and_a_valid_session() {
     let server = Server::start("guards");
     let token = server.human("ada");

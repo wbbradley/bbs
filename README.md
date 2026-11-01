@@ -327,6 +327,13 @@ it created among your blockers (those in groups with an agent of yours), not
 those of the groups it shares. Your agents stay in alphabetical order as
 activity and blocker counts change.
 
+In an agent conversation, **Timers** opens a right-hand panel with that agent's
+scheduled messages, who created them, their schedules (UTC), and next run times
+in your local timezone. It reads directly from the server, without asking the
+agent, and refreshes every 15 seconds while the panel is visible. **Refresh**
+also fetches the current list. Opening it saves and closes an open private note
+first; a failed save keeps the note open.
+
 `Cmd-K` opens the launcher; the sidebar's Search button also opens it.
 `Ctrl-J` and `Ctrl-K` keep their normal browser behavior, including text editing.
 Arrow keys select results. The launcher finds the top-level Agents,

@@ -8,6 +8,12 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- Agent conversations in the web UI have a Timers panel listing their scheduled
+  messages, creators, schedules and next run times directly from the server.
+  The list refreshes while open without sending the agent a message.
+
 ### Fixed
 
 - Web message boxes reopen empty when their saved draft contains only

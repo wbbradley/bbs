@@ -8,6 +8,7 @@ import { Composer, type ComposerHandle } from "../components/Composer";
 import { EffortControl } from "../components/Effort";
 import { MessageView } from "../components/MessageView";
 import { NoteDrawer, type NoteHandle } from "../components/NoteDrawer";
+import { TimerDrawer } from "../components/TimerDrawer";
 import { PageHeader } from "../components/PageHeader";
 import { SidePanel } from "../components/SidePanel";
 import { Timeline } from "../components/Timeline";
@@ -49,7 +50,8 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const [activityHeld, setActivityHeld] = useState<Held<Activity>>(empty);
   const [show, setShow] = useState<Show>("all");
   const [following, setFollowing] = useState(true);
-  const [noteOpen, setNoteOpen] = useState(false);
+  const [drawer, setDrawer] = useState<"note" | "timers" | null>(null);
+  const noteOpen = drawer === "note";
   const [answering, setAnswering] = useState(false);
   const [sideOpen, setSideOpen] = useState(false);
   const [sideHistory, setSideHistory] = useState<SideRequest[]>([]);
@@ -62,8 +64,12 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const note = useRef<NoteHandle>(null);
   // Closing the note stores a change first, and keeps it open if it cannot.
   const toggleNote = async () => {
-    if (!noteOpen) return setNoteOpen(true);
-    if (!note.current || (await note.current.requestClose())) setNoteOpen(false);
+    if (!noteOpen) return setDrawer("note");
+    if (!note.current || (await note.current.requestClose())) setDrawer(null);
+  };
+  const toggleTimers = async () => {
+    if (noteOpen && note.current && !(await note.current.requestClose())) return;
+    setDrawer(drawer === "timers" ? null : "timers");
   };
 
   useEffect(() => {
@@ -147,7 +153,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   // overlay, nor while a found message holds the view, nor before a
   // reconnected stream has sent what is new.
   const covered = useCovered();
-  const reading = visible && following && !covered && !noteOpen && seekId === null;
+  const reading = visible && following && !covered && drawer === null && seekId === null;
   const markedRead = useRef(0);
   useEffect(() => {
     if (!reading || !feedLoaded || feed.state !== "live") return;
@@ -331,6 +337,11 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
             Note{board.notes.get(noteId)?.body ? " •" : ""}
           </button>
         )}
+        {info && board.has("timers.v1") && (
+          <button className={`btn small${drawer === "timers" ? " primary" : ""}`} aria-expanded={drawer === "timers"} onClick={toggleTimers}>
+            Timers
+          </button>
+        )}
         {owned && board.has("side-questions.v1") && (
           <button className="btn small" onClick={() => setSideOpen(true)} title="/btw: ask on the side">
             Aside
@@ -409,8 +420,9 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
           </div>
         </div>
         {noteOpen && noteId !== null && (
-          <NoteDrawer ref={note} agentId={noteId} agent={agent} onClose={() => setNoteOpen(false)} />
+          <NoteDrawer ref={note} agentId={noteId} agent={agent} onClose={() => setDrawer(null)} />
         )}
+        {drawer === "timers" && <TimerDrawer key={agent} agent={agent} onClose={() => setDrawer(null)} />}
       </div>
       {answering && pendingInput && (
         // A new request is a new form: nothing chosen for another carries over.
