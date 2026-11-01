@@ -368,3 +368,35 @@ async fn failed_goal_pause_still_interrupts_and_reports_the_pause_failure() {
         .await;
     }
 }
+
+#[tokio::test]
+async fn goal_completion_before_start_ack_preserves_continuation_output() {
+    let rig = Rig::new("closed-before-ack").await;
+    rig.send("START", None).await;
+    rig.wait("goal-wire.jsonl", |r| {
+        r.iter().any(|r| r["kind"] == "early-finished")
+    })
+    .await;
+    rig.wait(".local/state/bbs/headless/goaltest/log.jsonl", |r| {
+        r.iter().any(|r| r["event"] == "owner_delivery")
+    })
+    .await;
+    let received = BbsClient::connect(format!("http://{}", rig.addr))
+        .await
+        .unwrap()
+        .read(req(proto::ReadRequest {
+            limit: Some(100),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        received
+            .messages
+            .iter()
+            .map(|m| m.body.as_str())
+            .collect::<Vec<_>>(),
+        ["Early continuation output"]
+    );
+}

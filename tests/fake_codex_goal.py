@@ -82,10 +82,19 @@ for line in sys.stdin:
             continue
         if not scenario.startswith("resume"):
             note("thread/goal/updated", threadId=thread, goal=dict(status="active"))
-        if scenario != "before-ack":
+        if scenario not in ["before-ack", "closed-before-ack"]:
             reply(mid, dict(turn=dict(id=root, rootTurnId=root, status="inProgress")))
         start(root)
         finish(root)
+        if scenario == "closed-before-ack":
+            start("goal-early")
+            note("item/completed", threadId=thread, turnId="goal-early", item=dict(
+                type="agentMessage", id="early-text", text="Early continuation output"))
+            note("thread/goal/updated", threadId=thread, goal=dict(status="complete"))
+            finish("goal-early")
+            reply(mid, dict(turn=dict(id=root, rootTurnId=root, status="inProgress")))
+            record("early-finished")
+            continue
         if scenario in ["resume-foreign", "resume-race"]:
             record("ordinary-finished")
             continue

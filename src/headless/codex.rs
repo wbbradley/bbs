@@ -893,6 +893,17 @@ fn dispatch_notification(
                 _ => return,
             }
         };
+        {
+            let mut current = turn.turn.lock().unwrap();
+            if current.done.is_some() && current.id.is_none() && !current.continuing {
+                // Cancellation needs the live status even before the ACK.
+                // Replay it too, in order with the buffered turn boundaries,
+                // so a later goal completion cannot hide earlier output.
+                current
+                    .before_ack
+                    .push(Queued::Notification(method.to_string(), params.clone()));
+            }
+        }
         *turn.goal.lock().unwrap() = Some(active);
         let between = {
             let current = turn.turn.lock().unwrap();
