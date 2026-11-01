@@ -136,6 +136,13 @@ for line in sys.stdin:
         record("interrupted")
     elif method == "thread/goal/set":
         assert p["status"] == "paused" and p["origin"] == "automatic", p
+        if scenario in ["pause-denied", "pause-unconfirmed", "pause-timeout"]:
+            record("pause-failed", scenario=scenario)
+            if scenario == "pause-denied":
+                out(dict(jsonrpc="2.0", id=mid, error=dict(code=-32600, message="pause refused")))
+            elif scenario == "pause-unconfirmed":
+                reply(mid, dict(goal=dict(threadId=thread, status="active")))
+            continue
         note("thread/goal/updated", threadId=thread, goal=dict(status="paused"))
         reply(mid, dict(goal=dict(threadId=thread, status="paused")))
         record("paused")

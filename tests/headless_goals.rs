@@ -332,3 +332,39 @@ async fn resume_does_not_use_a_foreign_goal_or_overwrite_a_newer_notification() 
         );
     }
 }
+
+#[tokio::test]
+async fn failed_goal_pause_still_interrupts_and_reports_the_pause_failure() {
+    for scenario in ["pause-denied", "pause-unconfirmed", "pause-timeout"] {
+        let rig = Rig::new(scenario).await;
+        rig.send("START", None).await;
+        rig.wait("goal-wire.jsonl", |r| {
+            r.iter().any(|r| r["kind"] == "waiting")
+        })
+        .await;
+        rig.send("Cancel", Some(proto::Control::Cancel)).await;
+        rig.wait("goal-wire.jsonl", |r| {
+            r.iter().any(|r| r["kind"] == "interrupted")
+        })
+        .await;
+        let wire = rig.rows("goal-wire.jsonl");
+        let paused = wire
+            .iter()
+            .position(|r| r["kind"] == "pause-failed")
+            .unwrap();
+        let interrupted = wire
+            .iter()
+            .position(|r| r["kind"] == "interrupted")
+            .unwrap();
+        assert!(paused < interrupted);
+        rig.wait(".local/state/bbs/headless/goaltest/log.jsonl", |r| {
+            r.iter().any(|r| {
+                r["event"] == "error"
+                    && r["message"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("cancel:"))
+            })
+        })
+        .await;
+    }
+}

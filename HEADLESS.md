@@ -31,6 +31,7 @@ The adapter follows only new turns in the opened parent thread with the same
 tools, assistant replies and activity work in each continuation, incoming mail
 can steer the current continuation, and owner Cancel pauses the goal before
 interrupting its current turn (including when cancellation arrives between turns).
+If pausing fails, cancellation still attempts the interrupt and reports the error.
 With `--mid-turn queue`, mail waits until the goal stops instead. The minimum
 turn interval applies to BBS prompts, not Codex's internal goal scheduling.
 This requires the app-server's goal notifications and continuation root IDs;

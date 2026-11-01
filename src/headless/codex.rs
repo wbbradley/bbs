@@ -586,6 +586,35 @@ impl Codex {
             self.turn.set(|turn| turn.cancel_requested = true);
             self.cancel_input();
         }
+        let paused = self.pause_goal().await;
+        // Even a rejected or uncertain pause must not leave a running turn
+        // un-interrupted. Retain the pause error after the interrupt attempt.
+        let interrupted = if let Some(id) = self.turn.running_id(TURN_ID_WAIT).await {
+            self.rpc
+                .request(
+                    "turn/interrupt",
+                    json!({ "threadId": self.thread_id, "turnId": id }),
+                )
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        } else if self.turn.turn.lock().unwrap().done.is_some() {
+            Err(anyhow!(
+                "the goal's next turn did not become interruptible within {TURN_ID_WAIT:?}"
+            ))
+        } else {
+            Ok(())
+        };
+        match (paused, interrupted) {
+            (Err(pause), Err(interrupt)) => {
+                Err(pause.context(format!("interrupt also failed: {interrupt:#}")))
+            }
+            (Err(pause), _) => Err(pause),
+            (Ok(()), interrupt) => interrupt,
+        }
+    }
+
+    async fn pause_goal(&self) -> Result<()> {
         if *self.turn.goal.lock().unwrap() == Some(true) {
             // Stop automatic scheduling before interrupting the current turn,
             // including a cancel received in the gap between continuations.
@@ -607,16 +636,6 @@ impl Codex {
             }
             let _ordered = self.turn.dispatch.lock().unwrap();
             dispatch_notification("thread/goal/updated", &result, &self.turn, &self.events);
-        }
-        if let Some(id) = self.turn.running_id(TURN_ID_WAIT).await {
-            self.rpc
-                .request(
-                    "turn/interrupt",
-                    json!({ "threadId": self.thread_id, "turnId": id }),
-                )
-                .await?;
-        } else if self.turn.turn.lock().unwrap().done.is_some() {
-            bail!("the goal's next turn did not become interruptible within {TURN_ID_WAIT:?}");
         }
         Ok(())
     }
