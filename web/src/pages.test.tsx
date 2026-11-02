@@ -8,6 +8,7 @@ import { Dialog } from "./components/Dialog";
 import { MessageView } from "./components/MessageView";
 import { Launcher } from "./Launcher";
 import { seedFound } from "./useMessages";
+import { KEEP } from "./merge";
 import { addLeaveGuard, go } from "./router";
 import { Conversation } from "./pages/Conversation";
 import { useBoard } from "./store";
@@ -172,10 +173,13 @@ describe("a message found by search", () => {
 
   it("opens an old found message even after a long session holds the most rows a page keeps", async () => {
     await conversation("?m=1");
-    for (let w = 0; w < 10; w++) {
-      const window = Array.from({ length: 300 }, (_, i) => mail(1000 + w * 300 + i, "Mateo", "ada", { read_at: "x" }));
-      await act(async () => feed().push({ messages: window }));
-    }
+    await act(async () => {
+      for (let w = 0; w < 10; w++) {
+        const window = Array.from({ length: 300 }, (_, i) => mail(1000 + w * 300 + i, "Mateo", "ada", { read_at: "x" }));
+        feed().push({ messages: window });
+      }
+    });
+    expect(document.querySelectorAll('[id^="msg-"]')).toHaveLength(KEEP);
     const after = api.take("watch:feed");
     await act(async () =>
       after.resolve({ messages: Array.from({ length: 50 }, (_, i) => mail(1 + i, "Mateo", "ada", { read_at: "x" })) }),
