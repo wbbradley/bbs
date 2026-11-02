@@ -8,6 +8,14 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- The web Blockers page has a Closed mode for browsing answered and cancelled
+  blockers, with their recorded answers, actor and time, newest questions first.
+  The additive `blockers-closed.v1` list API filters closed records before paging
+  and uses a descending root cursor. Load more pages or
+  refresh the read-only list without losing open drafts or unconfirmed writes.
+
 ### Fixed
 
 - Codex headless agents retain their BBS tools, reply delivery and mail steering

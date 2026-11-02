@@ -85,6 +85,7 @@ pub fn list_request(args: &Value) -> Result<proto::ListBlockersRequest> {
         limit: args.limit,
         after_root_id: args.after_root_id,
         mine: false,
+        ..Default::default()
     })
 }
 
@@ -244,6 +245,7 @@ pub async fn run(
                     include_closed,
                     limit,
                     after_root_id,
+                    ..Default::default()
                 })
                 .await?;
             list(&response)

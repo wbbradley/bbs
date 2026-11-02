@@ -2172,6 +2172,7 @@ mod tests {
                     active_count: 60,
                     has_more: true,
                     next_after_root_id: Some(50),
+                    next_before_root_id: None,
                 })),
             },
             now,

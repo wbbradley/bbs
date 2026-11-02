@@ -181,6 +181,13 @@ fn humans_sign_in_with_their_token_and_use_the_api() {
     let public = server.request("GET", "/api/info", &[], "");
     assert_eq!(public.status, 200);
     assert_eq!(public.json()["require_human_token"], true);
+    assert!(
+        public.json()["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "blockers-closed.v1")
+    );
 
     let wrong = serde_json::json!({ "name": "ada", "token": "nope" }).to_string();
     let r = server.request("POST", "/api/login", &[CSRF], &wrong);
@@ -199,6 +206,26 @@ fn humans_sign_in_with_their_token_and_use_the_api() {
     assert_eq!(me.status, 200, "{}", me.body);
     assert_eq!(me.json()["name"], "ada");
     assert_eq!(me.json()["kind"], 2);
+
+    let closed = server.request(
+        "POST",
+        "/api/rpc/list_blockers",
+        &[CSRF, &cookie],
+        r#"{"mine":true,"closed_only":true,"limit":50}"#,
+    );
+    assert_eq!(closed.status, 200, "{}", closed.body);
+    assert_eq!(closed.json()["blockers"], serde_json::json!([]));
+    assert_eq!(
+        closed.json()["next_before_root_id"],
+        serde_json::Value::Null
+    );
+    let invalid = server.request(
+        "POST",
+        "/api/rpc/list_blockers",
+        &[CSRF, &cookie],
+        r#"{"mine":true,"closed_only":true,"after_root_id":1}"#,
+    );
+    assert_eq!(invalid.status, 400, "{}", invalid.body);
 
     let created = server.request(
         "POST",
@@ -245,6 +272,13 @@ fn calls_need_the_csrf_header_and_a_valid_session() {
     assert_eq!(r.status, 403, "{}", r.body);
 
     let r = server.request("POST", "/api/rpc/whoami", &[CSRF], "");
+    assert_eq!(r.status, 401, "{}", r.body);
+    let r = server.request(
+        "POST",
+        "/api/rpc/list_blockers",
+        &[CSRF],
+        r#"{"mine":true,"closed_only":true}"#,
+    );
     assert_eq!(r.status, 401, "{}", r.body);
 
     // Rotation takes effect at once: the old cookie no longer works.

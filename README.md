@@ -340,6 +340,15 @@ preserving the text you type.
 
 Selecting a blocker focuses its editable answer box. Refreshes keep focus where
 it is, and open dialogs or the launcher keep their focus.
+
+Switch from **Open** to **Closed** to browse answered and cancelled blockers in
+the same groups as your open queue. Closed records show their outcome, who
+closed them, when, and the recorded answer. They are read only. The list shows
+each blocker's latest version, with the newest original questions first; use
+**Load more** for older pages or **Refresh** for a fresh listing. Switching modes keeps open drafts and
+unconfirmed answers intact.
+Closed mode requires a server advertising `blockers-closed.v1`.
+
 For a blocker with a single-choice answer, clicking an option sends it immediately
 with any note already typed. For multiple choices, tick the options and use Send
 answer. You can always answer with just a note; clear any checkboxes first.

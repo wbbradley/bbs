@@ -4,13 +4,14 @@ import { answerSelection, BLOCKER_CHOICES, loadSelection, saveSelection } from "
 import { sendsOnEnter } from "../keys";
 import { isCovered } from "../cover";
 import type { PageProps } from "../App";
-import { Markdown } from "../Markdown";
+import { BlockerBody, BlockerCreator as Creator } from "../components/BlockerBody";
+import { ClosedBlockers } from "../components/ClosedBlockers";
 import { PageHeader } from "../components/PageHeader";
 import { BlockerOptions } from "../components/BlockerOptions";
 import { Link, paths } from "../router";
 import { useBoard } from "../store";
 import { BlockerChoiceMode, BlockerStatus, Kind, type Blocker, type BlockerMutationResponse } from "../types";
-import { ago, draftOwnerNow, fullTime, loadDraft, ownedKey, randomKey, same, saveDraft, storage } from "../util";
+import { ago, draftOwnerNow, loadDraft, ownedKey, randomKey, same, saveDraft, storage } from "../util";
 
 /** After a blocker's text changes under the reader, its actions wait this long. */
 export const REPLACED_GUARD_MS = 1000;
@@ -68,6 +69,27 @@ export function nearest(selected: number | null, old: number[], now: number[]): 
 
 export function BlockersPage({ openNav }: PageProps) {
   const board = useBoard();
+  const [closed, setClosed] = useState(false);
+  const supported = board.has("blockers-mine.v1");
+  const unsupported = board.info !== null && !supported;
+  return <>
+    <PageHeader title="Blockers" sub={`${board.blockers?.active_count ?? 0} open`} openNav={openNav}>
+      <div className="segmented" role="group" aria-label="Blocker status">
+        <button className={!closed ? "on" : ""} aria-pressed={!closed} onClick={() => setClosed(false)}>Open</button>
+        <button className={closed ? "on" : ""} aria-pressed={closed} disabled={!supported || !board.has("blockers-closed.v1")} title={board.has("blockers-closed.v1") ? undefined : "Closed blockers need a newer server (blockers-closed.v1)."} onClick={() => setClosed(true)}>Closed</button>
+      </div>
+    </PageHeader>
+    {unsupported ? <div className="page"><div className="notice warning">The blockers queue needs a newer server (blockers-mine.v1).</div></div> : <>
+      <section className="blocker-mode" aria-label="Open blockers" hidden={closed}>
+        <OpenBlockers active={!closed} />
+      </section>
+      {closed && <ClosedBlockers />}
+    </>}
+  </>;
+}
+
+function OpenBlockers({ active }: { active: boolean }) {
+  const board = useBoard();
   // The human this page is for; a write ends as theirs even if another
   // human has signed in by the time it does.
   const [owner] = useState(draftOwnerNow);
@@ -118,10 +140,10 @@ export function BlockersPage({ openNav }: PageProps) {
   const current = rows.find((b) => b.root_id === target) ?? null;
   const answerInput = useRef<HTMLTextAreaElement>(null);
   const focusAnswer = useCallback(() => {
-    if (isCovered()) return;
+    if (!active || isCovered()) return;
     const input = answerInput.current;
     if (input && !input.readOnly && !input.disabled) input.focus({ preventScroll: true });
-  }, []);
+  }, [active]);
   useEffect(() => {
     focusAnswer();
   }, [target, focusAnswer]);
@@ -206,15 +228,7 @@ export function BlockersPage({ openNav }: PageProps) {
     }
   };
 
-  const unsupported = board.info !== null && !board.has("blockers-mine.v1");
   return (
-    <>
-      <PageHeader title="Blockers" sub={`${board.blockers?.active_count ?? 0} open`} openNav={openNav} />
-      {unsupported ? (
-        <div className="page">
-          <div className="notice warning">The blockers queue needs a newer server (blockers-mine.v1).</div>
-        </div>
-      ) : (
         <div className="blockers">
           <div className="blocker-list">
             <div className="blocker-list-title">Open blockers</div>
@@ -249,7 +263,7 @@ export function BlockersPage({ openNav }: PageProps) {
                 b={current}
                 held={!listedRoots.has(current.root_id)}
                 kept={kept[current.root_id]}
-                guarded={guarded}
+                guarded={guarded || !active}
                 onWrite={write}
                 onDismiss={dismiss}
               />
@@ -258,14 +272,7 @@ export function BlockersPage({ openNav }: PageProps) {
             )}
           </div>
         </div>
-      )}
-    </>
   );
-}
-
-function Creator({ b }: { b: Blocker }) {
-  if (!b.creator) return <span className="faint">unknown</span>;
-  return <span className={b.creator.kind === Kind.Agent ? "agent" : "human"}>{b.creator.name}</span>;
 }
 
 function BlockerCard({
@@ -327,12 +334,7 @@ function BlockerCard({
 
   return (
     <div>
-      <div className="mono muted" style={{ fontSize: 12, marginBottom: 8 }}>
-        #{b.id} in <span className="group">@{b.group}</span> from <Creator b={b} />, {ago(b.created_at)} ·{" "}
-        <span title={fullTime(b.created_at)}>{new Date(b.created_at).toLocaleString()}</span>
-        {b.replaces && <span> · replaces #{b.replaces}</span>}
-      </div>
-      <Markdown text={b.body} />
+      <BlockerBody b={b} />
       <div style={{ marginTop: 18 }}>
         {!open && <div className="notice warning">No longer open.</div>}
         {open && reason && <div className="notice info">{reason}</div>}

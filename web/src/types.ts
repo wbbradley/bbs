@@ -161,6 +161,7 @@ export interface ListBlockersResponse {
   active_count: number;
   has_more: boolean;
   next_after_root_id: number | null;
+  next_before_root_id?: number | null;
 }
 
 export interface AgentNote {

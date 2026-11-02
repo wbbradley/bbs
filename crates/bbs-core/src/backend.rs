@@ -37,6 +37,7 @@ pub const SIDE_CONVERSATIONS: &str = "side-conversations.v1";
 pub const MESSAGE_SEARCH: &str = "message-search.v1";
 pub const BLOCKERS: &str = "blockers.v1";
 pub const BLOCKERS_MINE: &str = "blockers-mine.v1";
+pub const BLOCKERS_CLOSED: &str = "blockers-closed.v1";
 /// Structured blocker options and answers selecting them.
 pub const BLOCKER_CHOICES: &str = "blocker-choices.v1";
 pub const AGENT_NOTES: &str = "agent-notes.v1";
@@ -417,7 +418,13 @@ impl Backend {
         match self {
             Backend::Local(l) => service::list_blockers(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => {
-                let capability = if req.mine { BLOCKERS_MINE } else { BLOCKERS };
+                let capability = if req.closed_only || req.before_root_id.is_some() {
+                    BLOCKERS_CLOSED
+                } else if req.mine {
+                    BLOCKERS_MINE
+                } else {
+                    BLOCKERS
+                };
                 rpc!(r, list_blockers, req, &[capability]).map_err(|e| missing_rpc(e, capability))
             }
         }
@@ -1281,6 +1288,19 @@ mod tests {
                 .await
                 .is_err()
         );
+        for req in [
+            proto::ListBlockersRequest {
+                mine: true,
+                closed_only: true,
+                ..Default::default()
+            },
+            proto::ListBlockersRequest {
+                before_root_id: Some(9),
+                ..Default::default()
+            },
+        ] {
+            assert!(backend.list_blockers(req).await.is_err());
+        }
         assert!(
             backend
                 .get_blocker(proto::GetBlockerRequest::default())
@@ -1360,6 +1380,8 @@ mod tests {
             ("ReportSide", Some("side-conversations.v1")),
             ("ListBlockers", Some("blockers.v1")),
             ("ListBlockers", Some("blockers-mine.v1")),
+            ("ListBlockers", Some("blockers-closed.v1")),
+            ("ListBlockers", Some("blockers-closed.v1")),
             ("GetBlocker", Some("blockers.v1")),
             ("PutBlocker", Some("blockers.v1")),
             ("AnswerBlocker", Some("blockers.v1")),

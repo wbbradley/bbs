@@ -32,6 +32,7 @@ pub const CAPABILITIES: &[&str] = &[
     "message-search.v1",
     "blockers.v1",
     "blockers-mine.v1",
+    "blockers-closed.v1",
     "agent-notes.v1",
     "feed-sync.v1",
     "agent-drain.v1",
