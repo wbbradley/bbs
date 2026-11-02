@@ -8,6 +8,12 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- The web Blockers page has a Closed mode for browsing answered and cancelled
+  blockers, with their recorded answers, actor and time. Load more pages or
+  refresh the read-only list without losing open drafts or unconfirmed writes.
+
 ### Fixed
 
 - Codex headless agents retain their BBS tools, reply delivery and mail steering

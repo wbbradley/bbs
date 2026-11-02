@@ -1073,6 +1073,35 @@ mark {
   flex: 1;
   min-height: 0;
 }
+.blocker-mode {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.blocker-mode[hidden] {
+  display: none;
+}
+.closed-blockers-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.closed-blocker-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+}
+.blocker-outcome {
+  margin-top: 18px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
 .blocker-list {
   border-right: 1px solid var(--border);
   overflow-y: auto;
