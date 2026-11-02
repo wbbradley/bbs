@@ -278,7 +278,7 @@ pub fn put_blocker(
     caller: &Caller,
     req: proto::PutBlockerRequest,
 ) -> Result<proto::BlockerMutationResponse> {
-    text(&req.body, "body")?;
+    crate::blocker_limits::validate_body(&req.body)?;
     key(&req.request_key)?;
     if let Some(id) = req.replaces {
         positive(id, "predecessor ID")?;
@@ -745,6 +745,134 @@ mod tests {
         ] {
             assert!(list_blockers(&mut b.conn, &b.humans[0], req).is_err());
         }
+    }
+
+    #[test]
+    fn put_size_limits_reject_new_versions_without_changing_the_chain() {
+        let mut b = Board::memory();
+        let body = "é".repeat(1024);
+        let original = b.put(0, &body, None, "boundary");
+        assert_eq!(original.body, body);
+        let before = b.messages();
+        for replaces in [None, Some(original.id)] {
+            let req = proto::PutBlockerRequest {
+                group: "crew".into(),
+                body: format!("{body}x"),
+                replaces,
+                request_key: "oversized".into(),
+                choices: None,
+            };
+            let error = put_blocker(&mut b.conn, &b.agents[0], req)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("2 KiB (2048 UTF-8 bytes)"), "{error}");
+            assert!(error.contains("received 2049 bytes"), "{error}");
+            let options = ["a", "b"].map(|id| proto::BlockerOption {
+                id: id.into(),
+                label: id.into(),
+                detail: Some("x".repeat(500)),
+            });
+            let req = proto::PutBlockerRequest {
+                group: "crew".into(),
+                body: "short".into(),
+                replaces,
+                request_key: "oversized".into(),
+                choices: Some(proto::BlockerChoices {
+                    mode: proto::BlockerChoiceMode::BlockerSelectOne.into(),
+                    options: options.to_vec(),
+                    min: None,
+                    max: None,
+                }),
+            };
+            let error = put_blocker(&mut b.conn, &b.agents[0], req)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("1 KiB (1024 UTF-8 bytes"), "{error}");
+        }
+        assert_eq!(b.messages(), before);
+        let listing = b.list();
+        assert_eq!(listing.blockers.len(), 1);
+        assert_eq!(listing.blockers[0].id, original.id);
+        assert_eq!(listing.blockers[0].body, body);
+        assert!(listing.blockers[0].outcome.is_none());
+        assert_eq!(
+            store::history(&b.conn, original.root_id, i64::MAX, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        // A refused size does not consume its request key or supersede anything.
+        let updated = b.put(0, "short enough", Some(original.id), "oversized");
+        assert_eq!(updated.replaces, Some(original.id));
+    }
+
+    #[test]
+    fn legacy_large_blockers_remain_readable_and_answer_limits_do_not_shrink() {
+        let mut b = Board::memory();
+        let choices = proto::BlockerChoices {
+            mode: proto::BlockerChoiceMode::BlockerSelectOne.into(),
+            options: ["a", "b"]
+                .into_iter()
+                .map(|id| proto::BlockerOption {
+                    id: id.into(),
+                    label: id.into(),
+                    detail: Some("x".repeat(500)),
+                })
+                .collect(),
+            min: None,
+            max: None,
+        };
+        let json = blocker_choices::to_json(&choices);
+        assert!(json.len() > crate::blocker_limits::MAX_CHOICES_BYTES);
+        let group = db::group_ids_named(&b.conn, "crew").unwrap()[0];
+        let body = "legacy".repeat(500);
+        let now = "2026-11-02T00:00:00Z";
+        let id = store::insert(
+            &b.conn,
+            group,
+            b.ids[0],
+            store::Version {
+                body: &body,
+                choices: Some(&json),
+            },
+            None,
+            now,
+            "legacy",
+        )
+        .unwrap();
+        let actor = db::Principal {
+            kind: db::Kind::Agent,
+            id: b.ids[0],
+            name: "Mateo".into(),
+        };
+        store::event(&b.conn, id, "created", &actor, now, None, None).unwrap();
+        let got = get_blocker(
+            &mut b.conn,
+            &b.humans[0],
+            proto::GetBlockerRequest {
+                id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(got.blocker.unwrap().body, body);
+        assert_eq!(b.list().blockers[0].choices.as_ref(), Some(&choices));
+        let answer = "y".repeat(8192);
+        let result = answer_blocker(
+            &mut b.conn,
+            &b.humans[0],
+            proto::AnswerBlockerRequest {
+                id,
+                answer: answer.clone(),
+                request_key: "legacy-answer".into(),
+                selected: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.blocker.unwrap().outcome.unwrap().answer,
+            Some(answer)
+        );
     }
 
     #[test]
@@ -1630,8 +1758,8 @@ mod tests {
     #[test]
     fn blocker_bounds_invalid_scopes_and_stale_replacement_leave_history_unchanged() {
         let mut b = Board::memory();
-        let first = b.put(0, &"界".repeat(2730), None, "first");
-        for body in [" \n\t".into(), "界".repeat(2731)] {
+        let first = b.put(0, &"界".repeat(682), None, "first");
+        for body in [" \n\t".into(), "界".repeat(683)] {
             assert!(
                 put_blocker(
                     &mut b.conn,

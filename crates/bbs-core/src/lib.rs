@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod backend;
 pub mod blocker_choices;
+pub mod blocker_limits;
 pub mod db;
 pub mod names;
 pub mod proto;

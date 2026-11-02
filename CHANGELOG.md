@@ -16,6 +16,13 @@ under the new package version and its publication date.
   and uses a descending root cursor. Load more pages or
   refresh the read-only list without losing open drafts or unconfirmed writes.
 
+### Changed
+
+- New blocker descriptions are limited to 2 KiB (2048 UTF-8 bytes), including
+  Markdown. Structured response choices are limited to 1 KiB (1024 UTF-8 bytes
+  of canonical JSON). The headless tool and server reject oversized requests
+  with the limit and actual size; saved blockers and answer limits are unchanged.
+
 ### Fixed
 
 - Codex headless agents retain their BBS tools, reply delivery and mail steering

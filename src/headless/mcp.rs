@@ -447,12 +447,12 @@ pub fn tool_list() -> Value {
             "description": "Create a group blocker or replace a chain's current version with a new linked immutable version. You must currently belong to the group; no broadcast write grant needed. Replacement supersedes an open version, preserves history and queue position. Does not send ordinary mail. Requires blockers.v1. Reuse request_key with the same payload after an uncertain result; never generate a new key just to retry.",
             "inputSchema": object(json!({
                 "group": string("Group name, with or without @."),
-                "body": string("One nonblank description, at most 8192 UTF-8 bytes, stored as written. Markdown (headings, emphasis, lists, code, tables) renders in bbs connect: separate paragraphs with a blank line, since a single newline joins lines as in any Markdown."),
+                "body": string("One nonblank Markdown description, at most 2 KiB (2048 UTF-8 bytes), including formatting, stored as written. Separate paragraphs with a blank line: a single newline joins lines as in any Markdown."),
                 "replaces": { "type":"integer", "minimum":1, "description":"Optional current predecessor version, including answered/cancelled heads. Must be in the same group." },
                 "request_key": string("Unique key for this intent, 1..128 UTF-8 bytes. Reuse only with exactly the same operation and payload."),
                 "choices": {
                     "type": "object",
-                    "description": "Optional response options shown to the human as buttons (select_one) or checkboxes (select_many). The human can always answer with free text instead of, or as well as, a selection; the answer mail lists each pick as `Selected: <label> [<id>]`, then any note. Also describe the options in body: older clients show only the body. Requires blocker-choices.v1; checked before sending.",
+                    "description": "Optional response configuration, at most 1 KiB (1024 UTF-8 bytes of canonical JSON including mode, options and defaulted select_many bounds). Options appear as buttons (select_one) or checkboxes (select_many). The human can always answer with free text; answer mail lists each pick as `Selected: <label> [<id>]`, then any note. Requires blocker-choices.v1; limits are checked before sending and by the server.",
                     "properties": {
                         "mode": { "type": "string", "enum": ["select_one", "select_many"] },
                         "options": {

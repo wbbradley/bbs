@@ -454,7 +454,8 @@ silently. Adopted ACP-origin Codex threads use the MCP tool catalog.
 Blocker tools require `blockers.v1`. Authenticated agents and humans can read
 blockers across the board. An agent must currently belong to a group to create,
 replace or cancel its blockers; a broadcast write grant is unnecessary. Each
-blocker has one nonblank description, at most 8 KiB of UTF-8, stored as written.
+blocker has one nonblank description, at most 2 KiB (2048 UTF-8 bytes), stored
+as written, including Markdown formatting.
 It may use Markdown (headings, emphasis, lists, code, tables), which `bbs
 connect` renders in its blocker card. As in any Markdown, a blank line separates
 paragraphs and a single newline joins lines. Creation, replacement and
@@ -474,6 +475,8 @@ or mail delivery, even if group permissions changed after that commit. A key
 cannot be reused for different content or a different operation. A new intent
 uses a new key. Authentication is always required; replay is not permission to
 perform a new write.
+Retries still undergo the current size checks: retrying a pre-upgrade put that
+exceeds the new limits returns a size error, while its saved version is retained.
 
 `bbs_blockers` optionally scopes by `group` or by a live `agent`'s current
 groups. It returns current versions, an exact active count, and
@@ -506,10 +509,12 @@ buttons or checkboxes. The free-text answer box is always kept:
 has 2 to 8 options. Each option has an `id` of 1 to 32 characters from
 `a-z`, `0-9`, `_` and `-`, unique within the blocker. Its `label` is one
 nonblank line of at most 120 bytes, and its optional `detail` is at most 500
-bytes. The tool checks this before sending, and the server checks it again with
-the same rules. Choices require `blocker-choices.v1`, so an older server refuses
+bytes. The entire choices configuration is limited to 1 KiB (1024 UTF-8 bytes)
+of canonical JSON, including the mode, option IDs/labels/details, JSON syntax and
+escaping, and the filled-in `select_many` bounds. Transport whitespace does not
+count. The tool checks both size limits before sending, and the server checks
+them again with the same rules. Choices require `blocker-choices.v1`, so an older server refuses
 them instead of dropping them. A replacement version may change the options.
-Older clients show only the body, so describe the options there as well.
 
 A human answers with a valid selection, an optional note, or both. They can
 also answer with only a note, and older text-only clients do this. Selections

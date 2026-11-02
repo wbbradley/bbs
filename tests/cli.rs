@@ -2273,6 +2273,22 @@ fn blocker_tools_and_cli_keep_versions_retries_and_answer_delivery(mode: Mode) {
         assert!(tools.iter().any(|t| t["name"] == name), "missing {name}");
     }
     assert!(!tools.iter().any(|t| t["name"] == "bbs_blocker_answer"));
+    let put_schema = &tools
+        .iter()
+        .find(|t| t["name"] == "bbs_blocker_put")
+        .unwrap()["inputSchema"]["properties"];
+    assert!(
+        put_schema["body"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("2 KiB (2048 UTF-8 bytes)")
+    );
+    assert!(
+        put_schema["choices"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("1 KiB (1024 UTF-8 bytes")
+    );
     let call = |name: &str, args: Value| -> Value {
         let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
             "params":{"name":name,"arguments":args}});
@@ -2476,6 +2492,24 @@ fn blocker_choices_are_checked_in_the_tool_and_answered_by_selection(mode: Mode)
         {"id":"wait","label":"Wait for CI","detail":"About 20 minutes"},
         {"id":"close","label":"Close the PR"},
     ]);
+    for args in [
+        json!({"group":"crew","body":"é".repeat(1024)+"x","request_key":"body-too-large"}),
+        json!({"group":"crew","body":"Question?","request_key":"choices-too-large","choices":{
+        "mode":"select_one","options":[
+            {"id":"a","label":"A","detail":"x".repeat(500)},
+            {"id":"b","label":"B","detail":"x".repeat(500)}
+        ]}}),
+    ] {
+        let reason = if args["choices"].is_null() {
+            "2 KiB (2048 UTF-8 bytes)"
+        } else {
+            "1 KiB (1024 UTF-8 bytes"
+        };
+        let result = call(args);
+        assert_eq!(result["isError"], true, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(reason), "{text:?} lacks {reason:?}");
+    }
     // The harness refuses bad choices before any RPC, with the server's rules.
     for (choices, reason) in [
         (
