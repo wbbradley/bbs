@@ -452,7 +452,7 @@ pub fn tool_list() -> Value {
                 "request_key": string("Unique key for this intent, 1..128 UTF-8 bytes. Reuse only with exactly the same operation and payload."),
                 "choices": {
                     "type": "object",
-                    "description": "Optional response configuration, at most 1 KiB (1024 UTF-8 bytes of canonical JSON including mode, options and defaulted select_many bounds). Options appear as buttons (select_one) or checkboxes (select_many). The human can always answer with free text; answer mail lists each pick as `Selected: <label> [<id>]`, then any note. Describe the options in body too for older clients. Requires blocker-choices.v1; limits are checked before sending and by the server.",
+                    "description": "Optional response configuration, at most 1 KiB (1024 UTF-8 bytes of canonical JSON including mode, options and defaulted select_many bounds). Options appear as buttons (select_one) or checkboxes (select_many). The human can always answer with free text; answer mail lists each pick as `Selected: <label> [<id>]`, then any note. Requires blocker-choices.v1; limits are checked before sending and by the server.",
                     "properties": {
                         "mode": { "type": "string", "enum": ["select_one", "select_many"] },
                         "options": {
