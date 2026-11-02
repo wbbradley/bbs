@@ -34,6 +34,8 @@ const TURN_ID_WAIT: Duration = Duration::from_secs(10);
 struct TurnState {
     inputs: input::Requests,
     turn: Mutex<Turn>,
+    /// None until the provider reports whether this thread has an active goal.
+    goal: Mutex<Option<bool>>,
     dispatch: Mutex<()>,
     changed: Notify,
 }
@@ -71,6 +73,11 @@ struct Turn {
     id: Option<String>,
     /// Resolved by `turn/completed`.
     done: Option<oneshot::Sender<Result<String>>>,
+    /// The chain returned by our turn/start ACK, retained across goal turns.
+    root_id: Option<String>,
+    seen: std::collections::HashSet<String>,
+    /// The previous turn completed, but its active goal still owns the prompt.
+    continuing: bool,
     text_seen: std::collections::HashSet<String>,
     text_done: std::collections::HashSet<String>,
     before_ack: Vec<Queued>,
@@ -282,6 +289,22 @@ impl Codex {
                     self.thread_id = id.to_string();
                     self.resumed = true;
                     self.dynamic_tools = dynamic_tools;
+                    // Goals survive resume. Older app-servers have no goal RPC.
+                    if let Ok(Ok(result)) = timeout(
+                        effort::SET_TIMEOUT,
+                        self.rpc.request("thread/goal/get", json!({"threadId": id})),
+                    )
+                    .await
+                    {
+                        let mut goal = self.turn.goal.lock().unwrap();
+                        // A notification received during the RPC is newer.
+                        if goal.is_none() {
+                            *goal = Some(
+                                result["goal"]["threadId"].as_str() == Some(id)
+                                    && result["goal"]["status"] == "active",
+                            );
+                        }
+                    }
                     if let Some(mcp) = mcp {
                         self.fork["config"] = mcp;
                     }
@@ -509,6 +532,13 @@ impl Codex {
             let mut queued = Vec::new();
             self.turn.set(|turn| {
                 turn.id = Some(id.to_string());
+                turn.root_id = Some(
+                    result["turn"]["rootTurnId"]
+                        .as_str()
+                        .unwrap_or(id)
+                        .to_string(),
+                );
+                turn.seen.insert(id.to_string());
                 queued = std::mem::take(&mut turn.before_ack);
             });
             for event in queued {
@@ -556,13 +586,56 @@ impl Codex {
             self.turn.set(|turn| turn.cancel_requested = true);
             self.cancel_input();
         }
-        if let Some(id) = self.turn.running_id(TURN_ID_WAIT).await {
+        let paused = self.pause_goal().await;
+        // Even a rejected or uncertain pause must not leave a running turn
+        // un-interrupted. Retain the pause error after the interrupt attempt.
+        let interrupted = if let Some(id) = self.turn.running_id(TURN_ID_WAIT).await {
             self.rpc
                 .request(
                     "turn/interrupt",
                     json!({ "threadId": self.thread_id, "turnId": id }),
                 )
-                .await?;
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        } else if self.turn.turn.lock().unwrap().done.is_some() {
+            Err(anyhow!(
+                "the goal's next turn did not become interruptible within {TURN_ID_WAIT:?}"
+            ))
+        } else {
+            Ok(())
+        };
+        match (paused, interrupted) {
+            (Err(pause), Err(interrupt)) => {
+                Err(pause.context(format!("interrupt also failed: {interrupt:#}")))
+            }
+            (Err(pause), _) => Err(pause),
+            (Ok(()), interrupt) => interrupt,
+        }
+    }
+
+    async fn pause_goal(&self) -> Result<()> {
+        if *self.turn.goal.lock().unwrap() == Some(true) {
+            // Stop automatic scheduling before interrupting the current turn,
+            // including a cancel received in the gap between continuations.
+            let result = timeout(
+                effort::SET_TIMEOUT,
+                self.rpc.request(
+                    "thread/goal/set",
+                    json!({
+                        "threadId": self.thread_id, "status": "paused", "origin": "automatic"
+                    }),
+                ),
+            )
+            .await
+            .context("pausing the Codex goal timed out")??;
+            if result["goal"]["status"] != "paused"
+                || result["goal"]["threadId"].as_str() != Some(&self.thread_id)
+            {
+                bail!("Codex did not confirm that the goal was paused");
+            }
+            let _ordered = self.turn.dispatch.lock().unwrap();
+            dispatch_notification("thread/goal/updated", &result, &self.turn, &self.events);
         }
         Ok(())
     }
@@ -633,16 +706,22 @@ fn handle(
             let rpc = rpc.clone();
             let tools = tools.clone();
             tokio::spawn(async move {
-                let running = turn.running_id(TURN_ID_WAIT).await;
-                let valid = {
+                turn.running_id(TURN_ID_WAIT).await;
+                // The ACK may bind the original turn and then replay a
+                // completed turn plus its continuation. Validate only after
+                // that ordered replay, not against the transient ACK id.
+                let running = {
+                    let _ordered = turn.dispatch.lock().unwrap();
                     let current = turn.turn.lock().unwrap();
-                    current.done.is_some()
-                        && running.is_some()
-                        && running.as_deref() == params["turnId"].as_str()
-                        && current.id == running
-                        && !current.cancel_requested
+                    (current.done.is_some()
+                        && !current.exited
+                        && current.id.is_some()
+                        && current.id.as_deref() == params["turnId"].as_str()
+                        && !current.cancel_requested)
+                        .then(|| current.id.clone())
+                        .flatten()
                 };
-                if !valid {
+                if running.is_none() {
                     rpc.respond_later(id, Err("tool call is not in the active parent turn".into()));
                     return;
                 }
@@ -762,6 +841,7 @@ fn dispatch_input(
         && !current.exited
         && !current.cancel_requested
         && current.id.is_none()
+        && !current.continuing
     {
         if current
             .before_ack
@@ -803,6 +883,72 @@ fn dispatch_notification(
     turn: &TurnState,
     events: &mpsc::UnboundedSender<Event>,
 ) {
+    if matches!(method, "thread/goal/updated" | "thread/goal/cleared") {
+        let active = if method == "thread/goal/cleared" {
+            false
+        } else {
+            match params["goal"]["status"].as_str() {
+                Some("active") => true,
+                Some("paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete") => false,
+                _ => return,
+            }
+        };
+        {
+            let mut current = turn.turn.lock().unwrap();
+            if current.done.is_some() && current.id.is_none() && !current.continuing {
+                // Cancellation needs the live status even before the ACK.
+                // Replay it too, in order with the buffered turn boundaries,
+                // so a later goal completion cannot hide earlier output.
+                current
+                    .before_ack
+                    .push(Queued::Notification(method.to_string(), params.clone()));
+            }
+        }
+        *turn.goal.lock().unwrap() = Some(active);
+        let between = {
+            let current = turn.turn.lock().unwrap();
+            current.continuing && current.id.is_none()
+        };
+        // Pausing, completing or limiting a goal between turns releases the
+        // prompt too; no further turn/completed notification will arrive.
+        if !active && between {
+            let status = if turn.turn.lock().unwrap().cancel_requested {
+                "interrupted"
+            } else {
+                "completed"
+            };
+            notification_event("turn/completed", &json!({"turn":{"status":status}}), turn);
+        }
+        return;
+    }
+    if method == "turn/started" {
+        let mut current = turn.turn.lock().unwrap();
+        if current.continuing && current.id.is_none() {
+            let incoming = &params["turn"];
+            let id = incoming["id"].as_str().filter(|s| !s.is_empty());
+            if current.done.is_none()
+                || current.exited
+                || incoming["status"] != "inProgress"
+                || current.root_id.as_deref() != incoming["rootTurnId"].as_str()
+                || id.is_none_or(|id| current.seen.contains(id))
+            {
+                return;
+            }
+            // A pending cancel still needs this id to interrupt the new turn.
+            // Its tool calls remain blocked by cancel_requested.
+            let id = id.unwrap().to_string();
+            current.seen.insert(id.clone());
+            current.id = Some(id);
+            current.continuing = false;
+            current.text_seen.clear();
+            current.text_done.clear();
+            current.usage_invalid = false;
+            drop(current);
+            turn.changed.notify_waiters();
+            let _ = events.send(Event::ContextChanged(None));
+            return;
+        }
+    }
     if method == "serverRequest/resolved" {
         let mut current = turn.turn.lock().unwrap();
         if current.done.is_some() && current.id.is_none() {
@@ -836,7 +982,7 @@ fn dispatch_notification(
             if method == "thread/tokenUsage/updated" && current.usage_invalid {
                 return;
             }
-            if current.done.is_none() {
+            if current.done.is_none() || (current.continuing && current.id.is_none()) {
                 if incoming != current.latest_id.as_deref() {
                     return;
                 }
@@ -949,10 +1095,23 @@ fn notification_event(method: &str, params: &Value, turn: &TurnState) -> Option<
             Event::ContextChanged(None)
         }
         "turn/completed" => {
+            if params["turn"]["status"] == "completed" && *turn.goal.lock().unwrap() == Some(true) {
+                let mut current = turn.turn.lock().unwrap();
+                if !current.cancel_requested && !current.exited && current.id.is_some() {
+                    let id = current.id.take().unwrap();
+                    current.root_id.get_or_insert_with(|| id.clone());
+                    current.seen.insert(id.clone());
+                    current.latest_id = Some(id);
+                    current.continuing = true;
+                    drop(current);
+                    turn.changed.notify_waiters();
+                    return Some(Event::Other("waiting for Codex goal continuation".into()));
+                }
+            }
             let mut done = None;
             turn.set(|turn| {
                 let old = std::mem::take(turn);
-                turn.latest_id = old.id;
+                turn.latest_id = old.id.or(old.latest_id);
                 turn.usage_invalid = old.usage_invalid;
                 done = old.done;
             });
@@ -1026,6 +1185,191 @@ fn item_event(method: &str, item: &Value) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_continuations_keep_the_prompt_open_and_follow_only_its_root() {
+        let state = TurnState::default();
+        let (done, mut result) = oneshot::channel();
+        state.set(|s| {
+            s.id = Some("root".into());
+            s.done = Some(done);
+        });
+        let (events, mut rx) = mpsc::unbounded_channel();
+        dispatch_notification(
+            "thread/goal/updated",
+            &json!({"goal":{"status":"active"}}),
+            &state,
+            &events,
+        );
+        dispatch_notification(
+            "turn/completed",
+            &json!({"turn":{"id":"root","status":"completed"}}),
+            &state,
+            &events,
+        );
+        assert!(
+            matches!(result.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "an active goal has more turns to run"
+        );
+        while rx.try_recv().is_ok() {}
+        // A continuation without the current root, or a replay, cannot take over.
+        for (id, root) in [("foreign", "other"), ("root", "root")] {
+            dispatch_notification(
+                "turn/started",
+                &json!({"turn":{"id":id,"rootTurnId":root,"status":"inProgress"}}),
+                &state,
+                &events,
+            );
+            assert!(state.turn.lock().unwrap().id.is_none());
+        }
+        for id in ["goal-1", "goal-2"] {
+            dispatch_notification(
+                "turn/started",
+                &json!({"turn":{"id":id,"rootTurnId":"root","status":"inProgress"}}),
+                &state,
+                &events,
+            );
+            assert_eq!(state.turn.lock().unwrap().id.as_deref(), Some(id));
+            dispatch_notification(
+                "item/agentMessage/delta",
+                &json!({"turnId":"root","itemId":"old","delta":"stale"}),
+                &state,
+                &events,
+            );
+            dispatch_notification(
+                "item/agentMessage/delta",
+                &json!({"turnId":id,"itemId":"message","delta":"goal output"}),
+                &state,
+                &events,
+            );
+            assert!(matches!(rx.try_recv(), Ok(Event::ContextChanged(None))));
+            assert!(matches!(rx.try_recv(), Ok(Event::Text(_, text)) if text == "goal output"));
+            assert!(rx.try_recv().is_err());
+            dispatch_notification(
+                "turn/completed",
+                &json!({"turn":{"id":id,"status":"completed"}}),
+                &state,
+                &events,
+            );
+            assert!(matches!(
+                result.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(
+                matches!(rx.try_recv(), Ok(Event::Other(kind)) if kind == "waiting for Codex goal continuation")
+            );
+            dispatch_notification(
+                "thread/tokenUsage/updated",
+                &json!({"turnId":id,"tokenUsage":{"last":{"totalTokens":42},"modelContextWindow":100}}),
+                &state,
+                &events,
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(Event::ContextChanged(Some(usage))) if usage.used_tokens == Some(42))
+            );
+        }
+        dispatch_notification(
+            "thread/goal/updated",
+            &json!({"goal":{"status":"complete"}}),
+            &state,
+            &events,
+        );
+        assert_eq!(result.try_recv().unwrap().unwrap(), "completed");
+        dispatch_notification(
+            "turn/started",
+            &json!({"turn":{"id":"late","rootTurnId":"root","status":"inProgress"}}),
+            &state,
+            &events,
+        );
+        assert!(state.turn.lock().unwrap().id.is_none());
+    }
+
+    #[test]
+    fn held_goals_release_on_clear_or_terminal_status_but_not_unknown_status() {
+        for status in [
+            "paused",
+            "blocked",
+            "usageLimited",
+            "budgetLimited",
+            "complete",
+            "clear",
+        ] {
+            let state = TurnState::default();
+            let (done, mut result) = oneshot::channel();
+            state.set(|s| {
+                s.id = Some("root".into());
+                s.done = Some(done);
+            });
+            let (events, _) = mpsc::unbounded_channel();
+            dispatch_notification(
+                "thread/goal/updated",
+                &json!({"goal":{"status":"active"}}),
+                &state,
+                &events,
+            );
+            dispatch_notification(
+                "turn/completed",
+                &json!({"turn":{"id":"root","status":"completed"}}),
+                &state,
+                &events,
+            );
+            dispatch_notification(
+                "thread/goal/updated",
+                &json!({"goal":{"status":"future-unknown"}}),
+                &state,
+                &events,
+            );
+            assert!(matches!(
+                result.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            let method = if status == "clear" {
+                "thread/goal/cleared"
+            } else {
+                "thread/goal/updated"
+            };
+            dispatch_notification(method, &json!({"goal":{"status":status}}), &state, &events);
+            assert_eq!(result.try_recv().unwrap().unwrap(), "completed");
+        }
+    }
+
+    #[test]
+    fn failed_or_interrupted_turn_does_not_wait_for_an_active_goal() {
+        for status in ["failed", "interrupted"] {
+            let state = TurnState::default();
+            let (done, mut result) = oneshot::channel();
+            state.set(|s| {
+                s.id = Some("root".into());
+                s.done = Some(done);
+            });
+            let (events, _) = mpsc::unbounded_channel();
+            dispatch_notification(
+                "thread/goal/updated",
+                &json!({"goal":{"status":"active"}}),
+                &state,
+                &events,
+            );
+            dispatch_notification(
+                "turn/completed",
+                &json!({"turn":{"id":"root","status":status,"error":{"message":"failure"}}}),
+                &state,
+                &events,
+            );
+            let outcome = result.try_recv().unwrap();
+            if status == "failed" {
+                assert!(outcome.unwrap_err().to_string().contains("failure"));
+            } else {
+                assert_eq!(outcome.unwrap(), "interrupted");
+            }
+            dispatch_notification(
+                "turn/started",
+                &json!({"turn":{"id":"late","rootTurnId":"root","status":"inProgress"}}),
+                &state,
+                &events,
+            );
+            assert!(state.turn.lock().unwrap().id.is_none());
+        }
+    }
 
     #[test]
     fn context_accepts_latest_completed_then_rejects_older_or_invalidated_usage() {

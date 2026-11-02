@@ -10,6 +10,9 @@ under the new package version and its publication date.
 
 ### Fixed
 
+- Codex headless agents retain their BBS tools, reply delivery and mail steering
+  across native goal continuation turns, while rejecting unrelated or stale
+  callbacks. Owner cancellation targets the current continuation.
 - Web message boxes reopen empty when their saved draft contains only
   whitespace, rather than restoring an otherwise blank line. Drafts containing
   text keep their original spacing and line breaks.
