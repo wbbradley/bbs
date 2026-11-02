@@ -141,6 +141,15 @@ pub fn list_blockers(
     if let Some(id) = req.after_root_id {
         positive(id, "root cursor")?;
     }
+    if let Some(id) = req.before_root_id {
+        positive(id, "root cursor")?;
+    }
+    if req.closed_only && req.after_root_id.is_some() {
+        bail!("closed-only blockers use before_root_id, not after_root_id");
+    }
+    if !req.closed_only && req.before_root_id.is_some() {
+        bail!("before_root_id requires closed_only");
+    }
     with_ctx(conn, caller, |ctx| {
         let actor = ctx.actor()?;
         let human = if req.mine {
@@ -168,13 +177,21 @@ pub fn list_blockers(
             group,
             agent,
             human,
-            req.include_closed,
-            req.after_root_id.unwrap_or(0),
+            if req.closed_only {
+                store::ListMode::Closed {
+                    before: req.before_root_id,
+                }
+            } else {
+                store::ListMode::All {
+                    include_closed: req.include_closed,
+                    after: req.after_root_id.unwrap_or(0),
+                }
+            },
             limit + 1,
         )?;
         let has_more = rows.len() > limit;
         rows.truncate(limit);
-        let next_after_root_id = has_more.then(|| rows.last().expect("nonempty page").root_id);
+        let cursor = has_more.then(|| rows.last().expect("nonempty page").root_id);
         Ok(proto::ListBlockersResponse {
             blockers: rows
                 .into_iter()
@@ -182,7 +199,8 @@ pub fn list_blockers(
                 .collect::<Result<_>>()?,
             active_count: store::active_count(ctx.conn, group, agent, human)?,
             has_more,
-            next_after_root_id,
+            next_after_root_id: if req.closed_only { None } else { cursor },
+            next_before_root_id: if req.closed_only { cursor } else { None },
         })
     })
 }
@@ -551,6 +569,181 @@ mod tests {
                 proto::ListBlockersRequest::default(),
             )
             .unwrap()
+        }
+    }
+
+    #[test]
+    fn closed_listing_filters_before_paging_newest_roots_and_keeps_current_scope() {
+        let mut b = Board::memory();
+        let will = b.humans[0].clone();
+        let mut roots = Vec::new();
+        for n in 0..65 {
+            let row = b.put(0, "closed question", None, &format!("closed-{n}"));
+            if n % 2 == 0 {
+                b.answer(0, row.id, &format!("answer-{n}")).unwrap();
+            } else {
+                cancel_blocker(
+                    &mut b.conn,
+                    &b.agents[0],
+                    proto::CancelBlockerRequest {
+                        id: row.id,
+                        request_key: format!("cancel-{n}"),
+                    },
+                )
+                .unwrap();
+            }
+            roots.push(row.id);
+            b.put(0, "still open", None, &format!("open-{n}"));
+        }
+        // A replacement stays at its root's position, not its newer version ID.
+        let replacement = b.put(
+            0,
+            "replaced oldest question",
+            Some(roots[0]),
+            "replace-oldest",
+        );
+        b.answer(0, replacement.id, "answer-replacement").unwrap();
+        service::group_register(
+            &mut b.conn,
+            &b.humans[2],
+            proto::GroupRegisterRequest {
+                group: "elsewhere".into(),
+                description: None,
+            },
+        )
+        .unwrap();
+        service::group_join(
+            &mut b.conn,
+            &b.agents[2],
+            proto::GroupRequest {
+                group: "elsewhere".into(),
+            },
+        )
+        .unwrap();
+        let hidden = put_blocker(
+            &mut b.conn,
+            &b.agents[2],
+            proto::PutBlockerRequest {
+                group: "elsewhere".into(),
+                body: "not your queue".into(),
+                request_key: "hidden".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .blocker
+        .unwrap();
+        b.answer(2, hidden.id, "answer-hidden").unwrap();
+        let list = |b: &mut Board, before_root_id| {
+            list_blockers(
+                &mut b.conn,
+                &will,
+                proto::ListBlockersRequest {
+                    mine: true,
+                    closed_only: true,
+                    before_root_id,
+                    limit: Some(50),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let first = list(&mut b, None);
+        assert_eq!(first.blockers.len(), 50);
+        assert_eq!(first.active_count, 65);
+        assert!(first.has_more);
+        assert_eq!(first.next_after_root_id, None);
+        assert_eq!(first.next_before_root_id, Some(roots[15]));
+        assert_eq!(
+            first.blockers.iter().map(|r| r.root_id).collect::<Vec<_>>(),
+            roots[15..].iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert!(
+            first
+                .blockers
+                .iter()
+                .all(|r| r.outcome.is_some() && !r.can_answer && !r.can_cancel)
+        );
+        // A newly closed root appears on refresh, without shifting older pages.
+        let fresh = b.put(0, "newest", None, "fresh");
+        b.answer(0, fresh.id, "answer-fresh").unwrap();
+        let second = list(&mut b, first.next_before_root_id);
+        assert_eq!(second.blockers.len(), 15);
+        assert!(!second.has_more);
+        assert_eq!(second.next_before_root_id, None);
+        assert_eq!(second.blockers.last().unwrap().id, replacement.id);
+        assert_eq!(
+            second
+                .blockers
+                .iter()
+                .map(|r| r.root_id)
+                .collect::<Vec<_>>(),
+            roots[..15].iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(list(&mut b, None).blockers[0].id, fresh.id);
+        let old_queue = list_blockers(
+            &mut b.conn,
+            &will,
+            proto::ListBlockersRequest {
+                mine: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            old_queue
+                .blockers
+                .windows(2)
+                .all(|p| p[0].root_id < p[1].root_id)
+        );
+        service::group_leave(
+            &mut b.conn,
+            &b.agents[0],
+            proto::GroupRequest {
+                group: "crew".into(),
+            },
+        )
+        .unwrap();
+        assert!(list(&mut b, None).blockers.is_empty());
+        assert!(
+            list_blockers(
+                &mut b.conn,
+                &b.agents[0],
+                proto::ListBlockersRequest {
+                    mine: true,
+                    closed_only: true,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn closed_listing_rejects_mixed_or_invalid_cursors() {
+        let mut b = Board::memory();
+        for req in [
+            proto::ListBlockersRequest {
+                closed_only: true,
+                after_root_id: Some(1),
+                ..Default::default()
+            },
+            proto::ListBlockersRequest {
+                before_root_id: Some(1),
+                ..Default::default()
+            },
+            proto::ListBlockersRequest {
+                closed_only: true,
+                before_root_id: Some(0),
+                ..Default::default()
+            },
+            proto::ListBlockersRequest {
+                closed_only: true,
+                before_root_id: Some(-1),
+                ..Default::default()
+            },
+        ] {
+            assert!(list_blockers(&mut b.conn, &b.humans[0], req).is_err());
         }
     }
 

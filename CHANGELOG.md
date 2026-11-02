@@ -11,7 +11,9 @@ under the new package version and its publication date.
 ### Added
 
 - The web Blockers page has a Closed mode for browsing answered and cancelled
-  blockers, with their recorded answers, actor and time. Load more pages or
+  blockers, with their recorded answers, actor and time, newest questions first.
+  The additive `blockers-closed.v1` list API filters closed records before paging
+  and uses a descending root cursor. Load more pages or
   refresh the read-only list without losing open drafts or unconfirmed writes.
 
 ### Fixed

@@ -18,22 +18,23 @@ export function ClosedBlockers() {
   const [error, setError] = useState<string | null>(null);
   const generation = useRef(0);
 
-  const load = useCallback(async (after?: number) => {
+  const load = useCallback(async (before?: number) => {
     const request = ++generation.current;
     setBusy(true);
     setError(null);
     try {
       const page = await rpc<ListBlockersResponse>("list_blockers", {
-        mine: true, include_closed: true, limit: PAGE,
-        ...(after === undefined ? {} : { after_root_id: after }),
+        mine: true, closed_only: true, limit: PAGE,
+        ...(before === undefined ? {} : { before_root_id: before }),
       });
       if (request !== generation.current) return;
-      if (page.has_more && (!Number.isSafeInteger(page.next_after_root_id) || (page.next_after_root_id ?? 0) <= (after ?? 0))) {
+      const next = page.next_before_root_id;
+      if (page.has_more && (!Number.isSafeInteger(next) || (next ?? 0) <= 0 || (before !== undefined && next! >= before))) {
         throw new Error("The server returned a history cursor that did not advance.");
       }
       setListing((old) => ({
         ...page,
-        blockers: after === undefined ? page.blockers : [...new Map(
+        blockers: before === undefined ? page.blockers : [...new Map(
           [...(old?.blockers ?? []), ...page.blockers].map((b) => [b.root_id, b]),
         ).values()],
       }));
@@ -71,7 +72,7 @@ export function ClosedBlockers() {
           </button>
         ))}
         {listing?.has_more && <div className="blocker-list-title">
-          <button className="btn small" disabled={busy} onClick={() => load(listing.next_after_root_id!)}>{busy ? "Loading…" : "Load more"}</button>
+          <button className="btn small" disabled={busy} onClick={() => load(listing.next_before_root_id!)}>{busy ? "Loading…" : "Load more"}</button>
         </div>}
       </div>
       <div className="blocker-detail">

@@ -122,27 +122,44 @@ const SCOPE: &str = "(?1 IS NULL OR g.name = ?1)
       SELECT m.group_id FROM group_members m JOIN bbs_groups scope_group ON scope_group.id = m.group_id
       WHERE m.agent_id = ?2 AND scope_group.archived_at IS NULL))";
 
+pub enum ListMode {
+    All { include_closed: bool, after: i64 },
+    Closed { before: Option<i64> },
+}
+
 pub fn list(
     conn: &Connection,
     group: Option<&str>,
     agent: Option<i64>,
     human: Option<i64>,
-    closed: bool,
-    after: i64,
+    mode: ListMode,
     limit: usize,
 ) -> Result<Vec<Row>> {
+    let (predicate, order, cursor) = match mode {
+        ListMode::All {
+            include_closed,
+            after,
+        } => (
+            if include_closed {
+                "1"
+            } else {
+                "e.id IS NULL AND g.archived_at IS NULL"
+            },
+            "ASC",
+            Some(after),
+        ),
+        ListMode::Closed { before } => ("e.id IS NOT NULL", "DESC", before),
+    };
+    let comparison = if order == "DESC" { "<" } else { ">" };
     let mut query = conn.prepare(&format!(
         "{SELECT} WHERE {} AND successor.id IS NULL
-         AND (?4 OR (e.id IS NULL AND g.archived_at IS NULL))
-         AND COALESCE(b.root_id, b.id) > ?5
-         ORDER BY COALESCE(b.root_id, b.id) LIMIT ?6",
+         AND ({predicate})
+         AND (?4 IS NULL OR COALESCE(b.root_id, b.id) {comparison} ?4)
+         ORDER BY COALESCE(b.root_id, b.id) {order} LIMIT ?5",
         scope()
     ))?;
     Ok(query
-        .query_map(
-            params![group, agent, human, closed, after, limit as i64],
-            read_row,
-        )?
+        .query_map(params![group, agent, human, cursor, limit as i64], read_row)?
         .collect::<rusqlite::Result<_>>()?)
 }
 

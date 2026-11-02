@@ -21,8 +21,8 @@ const row = (id: number, status: number = BlockerStatus.Open): Blocker => ({
     message_id: null, selected: [],
   },
 });
-const listing = (blockers: Blocker[], has_more = false, next_after_root_id: number | null = null) => ({
-  blockers, active_count: 2, has_more, next_after_root_id,
+const listing = (blockers: Blocker[], has_more = false, next_before_root_id: number | null = null) => ({
+  blockers, active_count: 2, has_more, next_before_root_id, next_after_root_id: null,
 });
 
 function RefreshOpen() {
@@ -32,10 +32,10 @@ function RefreshOpen() {
 
 async function page(rows: Blocker[] = [row(1), row(2)], strict = false) {
   api.auto.set("list_blockers", (req) => {
-    if (!req.include_closed) return listing(rows);
+    if (!req.closed_only) return listing(rows);
     return new Promise((resolve, reject) => api.calls.push({ method: "list_blockers", req, resolve, reject }));
   });
-  const content = <Board info={{ ...INFO, capabilities: [...INFO.capabilities, BLOCKER_CHOICES] }}><RefreshOpen /><BlockersPage openNav={() => {}} /></Board>;
+  const content = <Board info={{ ...INFO, capabilities: [...INFO.capabilities, BLOCKER_CHOICES, "blockers-closed.v1"] }}><RefreshOpen /><BlockersPage openNav={() => {}} /></Board>;
   const view = render(strict ? <StrictMode>{content}</StrictMode> : content);
   await act(async () => {});
   return view;
@@ -50,13 +50,23 @@ beforeEach(() => { api.reset(); localStorage.clear(); });
 afterEach(cleanup);
 
 describe("closed blocker mode", () => {
+  it("does not query closed history on a server without the descending-list capability", async () => {
+    render(<Board><BlockersPage openNav={() => {}} /></Board>);
+    await act(async () => {});
+    const button = screen.getByRole("button", { name: "Closed" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(screen.queryByRole("region", { name: "Closed blockers" })).toBeNull();
+    expect(api.pending("list_blockers")).toHaveLength(0);
+  });
+
   it("loads only on demand, displays saved outcomes read-only, and leaves open counts alone", async () => {
     await page();
     expect(api.pending("list_blockers")).toHaveLength(0);
     showClosed();
     expect(closed().getByRole("status").textContent).toContain("Loading");
     const request = api.take("list_blockers");
-    expect(request.req).toEqual({ mine: true, include_closed: true, limit: 50 });
+    expect(request.req).toEqual({ mine: true, closed_only: true, limit: 50 });
     await act(async () => request.resolve(listing([row(1), row(9, BlockerStatus.Answered), row(10, BlockerStatus.Cancelled)])));
     expect(closed().queryByText("Question 1?")).toBeNull();
     expect(closed().getByText("Saved answer")).toBeTruthy();
@@ -112,14 +122,14 @@ describe("closed blocker mode", () => {
     expect(api.take("answer_blocker").req).toEqual(pending.req);
   });
 
-  it("paginates past open-only results and preserves loaded rows and the cursor after failure", async () => {
+  it("paginates newest closed results first and preserves loaded rows and the cursor after failure", async () => {
     await page(); showClosed();
-    await act(async () => api.take("list_blockers").resolve(listing([row(1)], true, 50)));
-    expect(closed().getByText(/No closed blockers in these results/)).toBeTruthy();
+    await act(async () => api.take("list_blockers").resolve(listing([row(120, BlockerStatus.Answered)], true, 120)));
+    expect(closed().getByText("Saved answer")).toBeTruthy();
     fireEvent.click(closed().getByRole("button", { name: "Load more" }));
     let request = api.take("list_blockers");
-    expect(request.req).toEqual({ mine: true, include_closed: true, limit: 50, after_root_id: 50 });
-    await act(async () => request.resolve(listing([row(80, BlockerStatus.Cancelled)], true, 100)));
+    expect(request.req).toEqual({ mine: true, closed_only: true, limit: 50, before_root_id: 120 });
+    await act(async () => request.resolve(listing([row(80, BlockerStatus.Cancelled)], true, 80)));
     fireEvent.click(closed().getByRole("button", { name: "Load more" }));
     request = api.take("list_blockers");
     await act(async () => request.reject(new Error("offline")));
@@ -128,9 +138,9 @@ describe("closed blocker mode", () => {
     fireEvent.click(closed().getByRole("button", { name: "Load more" }));
     const retry = api.take("list_blockers");
     expect(retry.req).toEqual(request.req);
-    await act(async () => retry.resolve(listing([row(120, BlockerStatus.Answered)])));
+    await act(async () => retry.resolve(listing([row(20, BlockerStatus.Answered)])));
     expect(closed().getByText("Question 80?", { selector: ".preview" })).toBeTruthy();
-    expect(closed().getByText("Question 120?", { selector: ".preview" })).toBeTruthy();
+    expect(closed().getByText("Question 20?", { selector: ".preview" })).toBeTruthy();
     expect(closed().queryByRole("button", { name: "Load more" })).toBeNull();
     expect(screen.getByText("2 open")).toBeTruthy();
   });

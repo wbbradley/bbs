@@ -221,6 +221,11 @@ message ListBlockersRequest {
   // Human only: current active groups containing a live agent the caller owns.
   // Requires blockers-mine.v1, so an older server cannot silently ignore it.
   bool mine = 6;
+  // Terminal current versions only, newest stable roots first.
+  // Requires blockers-closed.v1. Cannot use after_root_id in this mode.
+  bool closed_only = 7;
+  // Exclusive descending root cursor, only with closed_only.
+  optional int64 before_root_id = 8;
 }
 
 message ListBlockersResponse {
@@ -228,7 +233,7 @@ message ListBlockersResponse {
   uint64 active_count = 2;
   bool has_more = 3;
   optional int64 next_after_root_id = 4;
-
+  optional int64 next_before_root_id = 5;
 }
 
 message GetBlockerRequest {

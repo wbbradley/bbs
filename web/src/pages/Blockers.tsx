@@ -76,7 +76,7 @@ export function BlockersPage({ openNav }: PageProps) {
     <PageHeader title="Blockers" sub={`${board.blockers?.active_count ?? 0} open`} openNav={openNav}>
       <div className="segmented" role="group" aria-label="Blocker status">
         <button className={!closed ? "on" : ""} aria-pressed={!closed} onClick={() => setClosed(false)}>Open</button>
-        <button className={closed ? "on" : ""} aria-pressed={closed} disabled={!supported} onClick={() => setClosed(true)}>Closed</button>
+        <button className={closed ? "on" : ""} aria-pressed={closed} disabled={!supported || !board.has("blockers-closed.v1")} title={board.has("blockers-closed.v1") ? undefined : "Closed blockers need a newer server (blockers-closed.v1)."} onClick={() => setClosed(true)}>Closed</button>
       </div>
     </PageHeader>
     {unsupported ? <div className="page"><div className="notice warning">The blockers queue needs a newer server (blockers-mine.v1).</div></div> : <>
