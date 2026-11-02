@@ -145,6 +145,7 @@ struct OptionArgs {
 pub fn put_request(args: &Value) -> Result<proto::PutBlockerRequest> {
     let args: PutArgs =
         serde_json::from_value(args.clone()).context("invalid blocker put arguments")?;
+    bbs_core::blocker_limits::validate_body(&args.body)?;
     let choices = args
         .choices
         .map(|c| {
@@ -333,5 +334,27 @@ pub async fn run(
             text.push_str(&format!("Request key: {key}\n"));
         }
         Ok(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn put_requests_validate_utf8_budgets_before_an_rpc_can_be_made() {
+        let mut args = json!({"group":"unused","body":"é".repeat(1024),"request_key":"sizes"});
+        assert_eq!(put_request(&args).unwrap().body.len(), 2048);
+        args["body"] = json!("é".repeat(1024) + "x");
+        let error = format!("{:#}", put_request(&args).unwrap_err());
+        assert!(error.contains("2 KiB (2048 UTF-8 bytes)"), "{error}");
+        assert!(error.contains("received 2049 bytes"), "{error}");
+        args["body"] = json!("Short question");
+        args["choices"] = json!({"mode":"select_one","options":[
+            {"id":"a","label":"A","detail":"x".repeat(500)},
+            {"id":"b","label":"B","detail":"x".repeat(500)}
+        ]});
+        let error = format!("{:#}", put_request(&args).unwrap_err());
+        assert!(error.contains("1 KiB (1024 UTF-8 bytes"), "{error}");
     }
 }

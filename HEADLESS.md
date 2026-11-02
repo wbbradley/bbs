@@ -454,7 +454,8 @@ silently. Adopted ACP-origin Codex threads use the MCP tool catalog.
 Blocker tools require `blockers.v1`. Authenticated agents and humans can read
 blockers across the board. An agent must currently belong to a group to create,
 replace or cancel its blockers; a broadcast write grant is unnecessary. Each
-blocker has one nonblank description, at most 8 KiB of UTF-8, stored as written.
+blocker has one nonblank description, at most 2 KiB (2048 UTF-8 bytes), stored
+as written, including Markdown formatting.
 It may use Markdown (headings, emphasis, lists, code, tables), which `bbs
 connect` renders in its blocker card. As in any Markdown, a blank line separates
 paragraphs and a single newline joins lines. Creation, replacement and
@@ -506,8 +507,11 @@ buttons or checkboxes. The free-text answer box is always kept:
 has 2 to 8 options. Each option has an `id` of 1 to 32 characters from
 `a-z`, `0-9`, `_` and `-`, unique within the blocker. Its `label` is one
 nonblank line of at most 120 bytes, and its optional `detail` is at most 500
-bytes. The tool checks this before sending, and the server checks it again with
-the same rules. Choices require `blocker-choices.v1`, so an older server refuses
+bytes. The entire choices configuration is limited to 1 KiB (1024 UTF-8 bytes)
+of canonical JSON, including the mode, option IDs/labels/details, JSON syntax and
+escaping, and the filled-in `select_many` bounds. Transport whitespace does not
+count. The tool checks both size limits before sending, and the server checks
+them again with the same rules. Choices require `blocker-choices.v1`, so an older server refuses
 them instead of dropping them. A replacement version may change the options.
 Older clients show only the body, so describe the options there as well.
 

@@ -5,6 +5,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::blocker_limits::MAX_CHOICES_BYTES;
 use crate::proto::{self, BlockerChoiceMode};
 
 pub const MIN_OPTIONS: usize = 2;
@@ -90,12 +91,19 @@ pub fn validate(choices: &proto::BlockerChoices) -> Result<proto::BlockerChoices
         }
         _ => bail!("blocker choices mode must be select_one or select_many"),
     };
-    Ok(proto::BlockerChoices {
+    let canonical = proto::BlockerChoices {
         mode: choices.mode,
         options: choices.options.clone(),
         min,
         max,
-    })
+    };
+    let bytes = to_json(&canonical).len();
+    if bytes > MAX_CHOICES_BYTES {
+        bail!(
+            "blocker response options must be at most 1 KiB ({MAX_CHOICES_BYTES} UTF-8 bytes of canonical choices JSON, including mode, options and bounds); received {bytes} bytes"
+        );
+    }
+    Ok(canonical)
 }
 
 /// The canonical JSON stored for validated choices.
@@ -247,6 +255,45 @@ mod tests {
     fn refused(c: proto::BlockerChoices, needle: &str) {
         let error = validate(&c).unwrap_err().to_string();
         assert!(error.contains(needle), "{error:?} lacks {needle:?}");
+    }
+
+    #[test]
+    fn choices_budget_counts_canonical_json_and_defaulted_bounds() {
+        for mode in [
+            BlockerChoiceMode::BlockerSelectOne,
+            BlockerChoiceMode::BlockerSelectMany,
+        ] {
+            let mut c = validate(&choices(mode, 2)).unwrap();
+            for option in &mut c.options {
+                option.detail = Some(String::new());
+            }
+            let padding = MAX_CHOICES_BYTES - to_json(&c).len();
+            c.options[0].detail = Some("é".repeat((padding / 2) / 2));
+            let remaining = MAX_CHOICES_BYTES - to_json(&c).len();
+            c.options[1].detail = Some("x".repeat(remaining));
+            if mode == BlockerChoiceMode::BlockerSelectMany {
+                c.min = None;
+                c.max = None;
+            }
+            assert_eq!(to_json(&validate(&c).unwrap()).len(), MAX_CHOICES_BYTES);
+            c.options[1].detail.as_mut().unwrap().push('x');
+            let error = validate(&c).unwrap_err().to_string();
+            assert!(
+                error.contains("1 KiB (1024 UTF-8 bytes of canonical choices JSON"),
+                "{error}"
+            );
+            assert!(error.contains("received 1025 bytes"), "{error}");
+        }
+        let mut escaped = choices(BlockerChoiceMode::BlockerSelectOne, 2);
+        for option in &mut escaped.options {
+            option.detail = Some("\n".repeat(250));
+        }
+        // Each detail is only 250 raw bytes; JSON escaping also consumes space.
+        refused(escaped.clone(), "1024 UTF-8 bytes");
+        // Reading stored legacy choices does not revalidate new write budgets.
+        let old = from_json(&to_json(&escaped)).unwrap();
+        assert_eq!(old, escaped);
+        assert!(answer(Some(&old), &["o0".into()], "").is_ok());
     }
 
     #[test]
