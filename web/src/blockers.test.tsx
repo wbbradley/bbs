@@ -9,7 +9,7 @@ import { Dialog } from "./components/Dialog";
 import { BlockersPage, REPLACED_GUARD_MS, loadKept, nearest } from "./pages/Blockers";
 import { useBoard } from "./store";
 import { Board, INFO } from "./test/setup";
-import { BlockerChoiceMode, type Blocker, type ServerInfo } from "./types";
+import { BlockerChoiceMode, BlockerStatus, type Blocker, type ServerInfo } from "./types";
 import { BLOCKER_CHOICES } from "./blockerChoices";
 import { loadDraft, saveDraft, setDraftOwner } from "./util";
 
@@ -64,6 +64,64 @@ afterEach(() => {
 });
 
 describe("blockers", () => {
+  it.each(["answer", "cancel"] as const)("advances on a confirmed %s before the list refresh finishes", async (kind) => {
+    setDraftOwner("ada");
+    saveDraft("blocker:2", "next draft");
+    await page([row(1), row(2)]);
+    api.auto.delete("list_blockers");
+    if (kind === "answer") {
+      fireEvent.change(answerBox(), { target: { value: "yes" } });
+      fireEvent.click(screen.getByText("Send answer"));
+    } else {
+      fireEvent.click(screen.getByText("Cancel blocker"));
+      fireEvent.click(screen.getByText("Yes, cancel it"));
+    }
+    const out = api.take(`${kind}_blocker`);
+    expect(screen.getByText("question 1?", { selector: ".md p" })).toBeTruthy();
+    await act(async () => out.resolve({ blocker: { ...row(1), status: kind === "answer" ? BlockerStatus.Answered : BlockerStatus.Cancelled } }));
+    expect(api.pending("list_blockers")).toHaveLength(1);
+    expect(screen.queryByText("question 1?", { selector: ".preview" })).toBeNull();
+    expect(screen.getByText("question 2?", { selector: ".md p" })).toBeTruthy();
+    expect(answerBox().value).toBe("next draft");
+    expect(document.activeElement).toBe(answerBox());
+    await act(async () => api.take("list_blockers").reject(new api.ApiError("refresh unavailable", 503)));
+    expect(screen.getByText("question 2?", { selector: ".md p" })).toBeTruthy();
+    expect(loadKept()).toEqual({});
+  });
+
+  it("ignores a stale poll of the answered version but shows a new question in the same chain", async () => {
+    await page([row(1), row(2)]);
+    api.auto.delete("list_blockers");
+    fireEvent.click(screen.getByText("refresh"));
+    const stale = api.take("list_blockers");
+    fireEvent.change(answerBox(), { target: { value: "yes" } });
+    fireEvent.click(screen.getByText("Send answer"));
+    await act(async () => api.take("answer_blocker").resolve({ blocker: { ...row(1), status: BlockerStatus.Answered } }));
+    expect(screen.getByText("question 2?", { selector: ".md p" })).toBeTruthy();
+    await act(async () => stale.resolve({ blockers: [row(1), row(2)], active_count: 2, has_more: false }));
+    expect(screen.queryByText("question 1?", { selector: ".preview" })).toBeNull();
+    await act(async () => api.take("list_blockers").resolve({ blockers: [row(1, 9, "new question?"), row(2)], active_count: 2, has_more: false }));
+    fireEvent.click(screen.getByText("new question?", { selector: ".preview" }));
+    expect(screen.getByText("new question?", { selector: ".md p" })).toBeTruthy();
+    expect(answerBox().readOnly).toBe(false);
+  });
+
+  it("keeps the send and cancel controls mounted but disabled while sending", async () => {
+    await page([row(1)]);
+    fireEvent.change(answerBox(), { target: { value: "yes" } });
+    const send = screen.getByRole("button", { name: "Send answer" }) as HTMLButtonElement;
+    const cancel = screen.getByRole("button", { name: "Cancel blocker" }) as HTMLButtonElement;
+    fireEvent.click(send);
+    expect(screen.getByRole("button", { name: "Send answer" })).toBe(send);
+    expect(screen.getByRole("button", { name: "Cancel blocker" })).toBe(cancel);
+    expect(send.disabled).toBe(true);
+    expect(cancel.disabled).toBe(true);
+    fireEvent.click(send);
+    fireEvent.click(cancel);
+    expect(api.pending("answer_blocker")).toHaveLength(1);
+    expect(api.pending("cancel_blocker")).toHaveLength(0);
+  });
+
   it("focuses each selected answer, including a second click on the same row", async () => {
     await page([row(1), row(2)]);
     expect(document.activeElement).toBe(answerBox());
@@ -304,6 +362,18 @@ const sendButton = () => screen.getByRole("button", { name: "Send answer" }) as 
 const checkbox = (name: string) => screen.getByRole("checkbox", { name }) as HTMLInputElement;
 
 describe("structured blocker answers", () => {
+  it("advances a confirmed option answer without repainting the old choices during refresh", async () => {
+    await choicePage([choiceRow(), row(2)]);
+    api.auto.delete("list_blockers");
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Approve" })));
+    expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByRole("button", { name: "Approve" }).classList.contains("selected")).toBe(true);
+    await act(async () => api.take("answer_blocker").resolve({ blocker: { ...choiceRow(), status: BlockerStatus.Answered } }));
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(screen.getByText("question 2?", { selector: ".md p" })).toBeTruthy();
+    expect(api.pending("list_blockers")).toHaveLength(1);
+  });
+
   it("sends a single pick immediately with its note frozen before the fresh capability check", async () => {
     await choicePage();
     api.auto.delete("server_info");
