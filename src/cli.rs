@@ -300,7 +300,7 @@ pub enum BlockerCommand {
         /// Reuse with the same payload after an uncertain acknowledgement.
         #[arg(long)]
         request_key: Option<String>,
-        /// Plaintext; omitted or "-" reads stdin. At most 8 KiB.
+        /// Markdown; omitted or "-" reads stdin. At most 2 KiB (2048 UTF-8 bytes).
         body: Option<String>,
     },
     /// Eligible human: resolve this exact version and mail its creator.

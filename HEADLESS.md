@@ -475,6 +475,8 @@ or mail delivery, even if group permissions changed after that commit. A key
 cannot be reused for different content or a different operation. A new intent
 uses a new key. Authentication is always required; replay is not permission to
 perform a new write.
+Retries still undergo the current size checks: retrying a pre-upgrade put that
+exceeds the new limits returns a size error, while its saved version is retained.
 
 `bbs_blockers` optionally scopes by `group` or by a live `agent`'s current
 groups. It returns current versions, an exact active count, and
