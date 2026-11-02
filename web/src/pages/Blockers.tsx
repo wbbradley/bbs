@@ -104,6 +104,9 @@ function OpenBlockers({ active }: { active: boolean }) {
   }, []);
   const stillTheirs = () => mounted.current && draftOwnerNow() === owner;
   const [selected, setSelected] = useState<number | null>(null);
+  // A successful write closes this version immediately. Older list responses
+  // must not show it again, but a new version in the same chain can reopen it.
+  const [closedIds, setClosedIds] = useState<Set<number>>(() => new Set());
   const [done, setDone] = useState<string | null>(null);
   const [guardUntil, setGuardUntil] = useState(0);
   const [, tick] = useState(0);
@@ -127,7 +130,7 @@ function OpenBlockers({ active }: { active: boolean }) {
 
   // The server's rows, then rows it no longer lists that hold a write's
   // outcome, until dismissed.
-  const listed = board.blockers?.blockers ?? [];
+  const listed = (board.blockers?.blockers ?? []).filter((b) => !closedIds.has(b.id));
   const listedRoots = new Set(listed.map((b) => b.root_id));
   const held = Object.values(kept)
     .filter((k) => !listedRoots.has(k.root))
@@ -205,6 +208,7 @@ function OpenBlockers({ active }: { active: boolean }) {
         saveSelection(op.id, [], owner);
       }
       if (!stillTheirs()) return;
+      setClosedIds((ids) => new Set(ids).add(op.id));
       setDone(`${op.kind === "answer" ? "Answered" : "Cancelled"} #${r.blocker?.id ?? op.id} in @${op.row.group}.`);
       board.refreshBlockers();
     } catch (e) {
@@ -381,8 +385,8 @@ function BlockerCard({
               Retry the same {kept!.kind === "answer" ? "answer" : "cancel"}
             </button>
           )}
-          {canAnswer && (
-            <button className="btn primary" disabled={guarded || !canSend} onClick={send}>
+          {open && b.can_answer && !unconfirmed && (
+            <button className="btn primary" disabled={!canAnswer || guarded || !canSend} onClick={send}>
               Send answer
             </button>
           )}
@@ -394,19 +398,19 @@ function BlockerCard({
           )}
           {open &&
             b.can_cancel &&
-            !frozen &&
+            !unconfirmed &&
             (confirmCancel ? (
               <>
                 <span className="warning-text">Cancel this blocker? No mail is sent.</span>
-                <button className="btn danger" disabled={guarded} onClick={() => onWrite(b, "cancel")}>
+                <button className="btn danger" disabled={sending || guarded} onClick={() => onWrite(b, "cancel")}>
                   Yes, cancel it
                 </button>
-                <button className="btn" onClick={() => setConfirmCancel(false)}>
+                <button className="btn" disabled={sending} onClick={() => setConfirmCancel(false)}>
                   Back
                 </button>
               </>
             ) : (
-              <button className="btn danger" disabled={guarded} onClick={() => setConfirmCancel(true)}>
+              <button className="btn danger" disabled={sending || guarded} onClick={() => setConfirmCancel(true)}>
                 Cancel blocker
               </button>
             ))}
@@ -415,7 +419,7 @@ function BlockerCard({
               Dismiss
             </button>
           )}
-          {canAnswer && (
+          {open && b.can_answer && !unconfirmed && (
             <span className="faint" style={{ fontSize: 12 }}>
               Enter sends · Shift-Enter new line
             </span>

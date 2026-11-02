@@ -25,6 +25,9 @@ under the new package version and its publication date.
 
 ### Fixed
 
+- The web Blockers page advances as soon as an answer or cancellation is
+  confirmed, without briefly re-enabling the old question during a list refresh.
+  Send and cancel controls stay in place, disabled, while a write is pending.
 - Codex headless agents retain their BBS tools, reply delivery and mail steering
   across native goal continuation turns, while rejecting unrelated or stale
   callbacks. Owner cancellation targets the current continuation.

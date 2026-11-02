@@ -358,6 +358,8 @@ Closed mode requires a server advertising `blockers-closed.v1`.
 For a blocker with a single-choice answer, clicking an option sends it immediately
 with any note already typed. For multiple choices, tick the options and use Send
 answer. You can always answer with just a note; clear any checkboxes first.
+Confirmed answers and cancellations advance immediately, without waiting for a
+list refresh. Pending writes keep their controls in place but disabled.
 
 ```sh
 bbs serve --listen 100.64.0.1:7777 --require-human-token \
