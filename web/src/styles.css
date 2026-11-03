@@ -112,6 +112,9 @@ kbd {
 .human {
   color: var(--human);
 }
+.name-link:hover {
+  text-decoration: underline;
+}
 .group {
   color: var(--group);
 }

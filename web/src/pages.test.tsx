@@ -332,4 +332,17 @@ describe("feed cards", () => {
     expect(document.getElementById("msg-3")!.className).toContain("groupmail");
     expect(document.getElementById("msg-3")!.textContent).not.toContain("unread");
   });
+
+  it("link agents and groups, but not humans or the page shown", () => {
+    go("/agents/mateo", true);
+    render(
+      <>
+        <MessageView m={mail(1, "Mateo", "Jefe", { to_owner: "ada" })} me={ADA.name} mode={{ kind: "feed" }} />
+        <MessageView m={mail(2, "bob", "", { to_name: null, to_group: "crew" })} me={ADA.name} mode={{ kind: "feed" }} />
+      </>,
+    );
+    const links = (id: string) => [...document.querySelectorAll(`#${id} .msg-head a`)].map((a) => a.getAttribute("href"));
+    expect(links("msg-1")).toEqual(["/agents/Jefe"]);
+    expect(links("msg-2")).toEqual(["/groups/crew"]);
+  });
 });

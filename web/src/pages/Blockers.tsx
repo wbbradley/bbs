@@ -4,7 +4,7 @@ import { answerSelection, BLOCKER_CHOICES, loadSelection, saveSelection } from "
 import { sendsOnEnter } from "../keys";
 import { isCovered } from "../cover";
 import type { PageProps } from "../App";
-import { BlockerBody, BlockerCreator as Creator } from "../components/BlockerBody";
+import { BlockerBody, BlockerCreator as Creator, BlockerCreatorLink, BlockerGroupLink } from "../components/BlockerBody";
 import { ClosedBlockers } from "../components/ClosedBlockers";
 import { PageHeader } from "../components/PageHeader";
 import { BlockerOptions } from "../components/BlockerOptions";
@@ -361,7 +361,7 @@ function BlockerCard({
         {(b.can_answer || shown) && (
           <>
             <div className="mono muted" style={{ fontSize: 12, marginBottom: 4 }}>
-              answer → <Creator b={b} /> <span className="group">@{b.group}</span>
+              answer → <BlockerCreatorLink b={b} /> <BlockerGroupLink b={b} />
             </div>
             <textarea
               ref={answerInput}

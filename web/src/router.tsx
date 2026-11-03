@@ -1,5 +1,5 @@
 import { useSyncExternalStore, type MouseEvent, type ReactNode } from "react";
-import { draftOwnerNow } from "./util";
+import { draftOwnerNow, same } from "./util";
 
 // A small history router: the server answers every non-API path with the page.
 
@@ -141,6 +141,25 @@ export function Link({
     <a href={to} className={className} onClick={click} title={title}>
       {children}
     </a>
+  );
+}
+
+const decoded = (path: string): string => {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
+  }
+};
+
+/** A link, or plain text when it would lead to the page already shown. */
+export function NameLink({ to, className, children }: { to: string; className: string; children: ReactNode }) {
+  const path = usePath();
+  if (same(decoded(path), decoded(to))) return <span className={className}>{children}</span>;
+  return (
+    <Link to={to} className={`${className} name-link`}>
+      {children}
+    </Link>
   );
 }
 

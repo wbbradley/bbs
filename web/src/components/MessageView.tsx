@@ -1,5 +1,6 @@
 import { memo, type ReactNode } from "react";
 import { Markdown } from "../Markdown";
+import { NameLink, paths } from "../router";
 import { Kind, type Message } from "../types";
 import { clock, fullTime, same } from "../util";
 
@@ -11,12 +12,24 @@ export type MessageMode =
   /** The board feed: every message as a card. */
   | { kind: "feed" };
 
+/** Agents link to their conversation; humans have no page. */
 function Name({ name, kind }: { name: string; kind: number }) {
-  return <span className={kind === Kind.Agent ? "agent" : "human"}>{name}</span>;
+  if (kind !== Kind.Agent) return <span className="human">{name}</span>;
+  return (
+    <NameLink to={paths.agent(name)} className="agent">
+      {name}
+    </NameLink>
+  );
 }
 
 function Recipient({ m }: { m: Message }) {
-  if (m.to_group) return <span className="group">@{m.to_group}</span>;
+  if (m.to_group) {
+    return (
+      <NameLink to={paths.group(m.to_group)} className="group">
+        @{m.to_group}
+      </NameLink>
+    );
+  }
   if (!m.to_name) return null;
   return <Name name={m.to_name} kind={m.to_owner ? Kind.Agent : Kind.Human} />;
 }
