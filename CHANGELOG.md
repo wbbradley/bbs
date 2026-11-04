@@ -21,6 +21,8 @@ under the new package version and its publication date.
 - The web UI uses the normal sans-serif font for names, headings, the page
   titlebar, metadata lines and text inputs. Monospace remains for code (inline
   and fenced Markdown), tool-call command lines, and version strings.
+- In the web UI, the Blockers page's Cancel blocker button cancels at once,
+  without the "Cancel this blocker? No mail is sent." confirmation step.
 - New blocker descriptions are limited to 2 KiB (2048 UTF-8 bytes), including
   Markdown. Structured response choices are limited to 1 KiB (1024 UTF-8 bytes
   of canonical JSON). The headless tool and server reject oversized requests
