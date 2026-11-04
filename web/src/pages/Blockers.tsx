@@ -360,7 +360,7 @@ function BlockerCard({
         )}
         {(b.can_answer || shown) && (
           <>
-            <div className="mono muted" style={{ fontSize: 12, marginBottom: 4 }}>
+            <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
               answer → <BlockerCreatorLink b={b} /> <BlockerGroupLink b={b} />
             </div>
             <textarea

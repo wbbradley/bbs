@@ -151,7 +151,6 @@ kbd {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  font-family: var(--mono);
   font-size: 13px;
 }
 
@@ -259,7 +258,6 @@ kbd {
   border-radius: 9px;
   background: var(--selection);
   color: var(--text);
-  font-family: var(--mono);
 }
 .badge.warn {
   background: var(--warning);
@@ -330,7 +328,6 @@ kbd {
   flex-wrap: wrap;
 }
 .page-header h1 {
-  font-family: var(--mono);
   font-size: 16px;
   margin: 0;
   font-weight: 700;
@@ -428,7 +425,6 @@ select.input {
 .textarea {
   resize: vertical;
   min-height: 80px;
-  font-family: var(--mono);
   font-size: 13px;
 }
 .input:focus,
@@ -499,7 +495,6 @@ label.field > span {
   color: var(--faint);
   padding: 40px 0;
   text-align: center;
-  font-family: var(--mono);
 }
 
 /* ---- Tables ---- */
@@ -511,7 +506,6 @@ table.list {
 }
 table.list th {
   text-align: left;
-  font-family: var(--mono);
   font-size: 11px;
   font-weight: 600;
   color: var(--faint);
@@ -534,11 +528,10 @@ table.list tr.row:hover td {
 }
 table.list td.num {
   text-align: right;
-  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 table.list td.name {
-  font-family: var(--mono);
   white-space: nowrap;
 }
 table.list .status {
@@ -617,7 +610,6 @@ table.list .status {
   bottom: 4px;
   font-size: 11px;
   color: var(--human-note);
-  font-family: var(--mono);
 }
 
 .msg.side,
@@ -650,7 +642,6 @@ table.list .status {
   justify-content: space-between;
   gap: 12px;
   padding: 4px 14px;
-  font-family: var(--mono);
   font-size: 12px;
 }
 .msg-head .names {
@@ -674,13 +665,11 @@ table.list .status {
 .time-divider {
   text-align: center;
   color: var(--faint);
-  font-family: var(--mono);
   font-size: 11px;
   margin: 18px 0 6px;
 }
 
 .control-note {
-  font-family: var(--mono);
   font-size: 12px;
   color: var(--muted);
   margin: 6px 0;
@@ -751,7 +740,6 @@ table.list .status {
   color: var(--faint);
 }
 .act-event {
-  font-family: var(--mono);
   font-size: 12px;
   margin: 4px 0;
   color: var(--muted);
@@ -775,7 +763,6 @@ table.list .status {
   margin-top: 14px;
   border-top: 1px dashed var(--selection);
   padding-top: 2px;
-  font-family: var(--mono);
   font-size: 11px;
   color: var(--faint);
 }
@@ -784,7 +771,6 @@ table.list .status {
   color: var(--success);
 }
 .turn-end {
-  font-family: var(--mono);
   font-size: 11px;
   color: var(--faint);
   margin: 2px 0 10px;
@@ -828,7 +814,6 @@ table.list .status {
   display: flex;
   justify-content: space-between;
   gap: 10px;
-  font-family: var(--mono);
   font-size: 11px;
   color: var(--faint);
   padding: 4px 4px 0;
@@ -838,7 +823,6 @@ table.list .status {
   display: flex;
   gap: 14px;
   align-items: center;
-  font-family: var(--mono);
   font-size: 11px;
   color: var(--muted);
   padding: 3px 20px;
@@ -880,7 +864,6 @@ table.list .status {
   padding: 6px 12px;
   background: var(--other-header);
   border-radius: 8px 8px 0 0;
-  font-family: var(--mono);
   font-size: 12px;
 }
 .side-panel-body {
@@ -888,7 +871,6 @@ table.list .status {
   padding: 6px 14px 10px;
 }
 .side-q {
-  font-family: var(--mono);
   font-size: 12px;
   color: var(--muted);
   margin-top: 8px;
@@ -910,7 +892,6 @@ table.list .status {
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
   gap: 8px;
-  font-family: var(--mono);
   font-size: 13px;
 }
 .drawer-head .spacer {
@@ -966,7 +947,6 @@ table.list .status {
 .dialog-head {
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
-  font-family: var(--mono);
   font-weight: 700;
 }
 .dialog-body {
@@ -985,7 +965,6 @@ table.list .status {
   margin-bottom: 16px;
 }
 .question .qhead {
-  font-family: var(--mono);
   font-size: 12px;
   color: var(--info);
   margin-bottom: 2px;
@@ -1023,7 +1002,6 @@ table.list .status {
   padding: 14px 16px;
   font-size: 16px;
   outline: none;
-  font-family: var(--mono);
 }
 .launcher-results {
   overflow-y: auto;
@@ -1056,7 +1034,6 @@ table.list .status {
   color: var(--muted);
 }
 .launcher-section {
-  font-family: var(--mono);
   font-size: 11px;
   color: var(--faint);
   padding: 8px 10px 2px;
@@ -1113,7 +1090,6 @@ mark {
 .blocker-list-title {
   background: var(--info);
   color: var(--bg);
-  font-family: var(--mono);
   font-weight: 700;
   padding: 6px 14px;
   font-size: 12px;
@@ -1133,7 +1109,6 @@ mark {
   background: var(--selection);
 }
 .blocker-row .meta {
-  font-family: var(--mono);
   font-size: 11px;
   color: var(--muted);
 }
@@ -1166,7 +1141,6 @@ mark {
 }
 .card-tile h3 {
   margin: 0 0 4px;
-  font-family: var(--mono);
   font-size: 14px;
 }
 .chips {
@@ -1176,7 +1150,6 @@ mark {
   margin-top: 6px;
 }
 .chip {
-  font-family: var(--mono);
   font-size: 11px;
   padding: 1px 7px;
   border-radius: 9px;
@@ -1293,7 +1266,6 @@ mark {
   overflow: hidden;
 }
 .login-box h1 {
-  font-family: var(--mono);
   font-size: 16px;
   margin: 0 0 4px;
 }
@@ -1350,6 +1322,5 @@ mark {
 .gap {
   margin: 10px 0;
   color: var(--warning);
-  font-family: var(--mono);
   font-size: 12px;
 }

@@ -28,7 +28,7 @@ export function GroupsPage({ openNav }: PageProps) {
                   <h3 className="group">@{g.name}</h3>
                   <div className="muted">{g.description ?? <span className="faint">No description</span>}</div>
                   <div className="chips">
-                    {g.members.length === 0 && <span className="faint mono">no members</span>}
+                    {g.members.length === 0 && <span className="faint">no members</span>}
                     {g.members.map((m) => (
                       <span key={m} className={`chip agent${writers.has(m.toLowerCase()) ? " writer" : ""}`}>
                         {m}
@@ -86,7 +86,7 @@ function CreateGroup({ onClose }: { onClose: () => void }) {
     >
       <label className="field">
         <span>Name</span>
-        <input className="input mono" value={name} onChange={(e) => setName(e.target.value)} placeholder="team" autoFocus />
+        <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="team" autoFocus />
       </label>
       <label className="field">
         <span>Description (one line, optional)</span>
