@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { logout } from "./api";
 import { Link, navigate, paths, usePath } from "./router";
 import { sortAgents, useBoard, type LiveAgent } from "./store";
+import { FocusMark } from "./components/Focus";
 import { ago, cap99, same } from "./util";
 
 /** How often the agents' ages are drawn again; nothing is asked of the server. */
@@ -176,6 +177,7 @@ function AgentLink({
         <span className="agent">{agent.name}</span>
         {qualify && agent.owner && <span className="faint">@{agent.owner}</span>}
       </span>
+      <FocusMark owner={agent.owner} since={agent.focused_at ?? null} />
       {blockers > 0 && <span className="badge warn">⚑{blockers}</span>}
       {activity ? (
         agent.last_sent_at && (

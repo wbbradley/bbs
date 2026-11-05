@@ -185,10 +185,17 @@ impl Tools {
                         control: None,
                     })
                     .await?;
-                match r.recipients {
+                let mut out = match r.recipients {
                     Some(n) => format!("Sent to {} ({n} recipients).", r.to),
                     None => format!("Sent to {}.", r.to),
+                };
+                if !r.skipped.is_empty() {
+                    out.push_str(&format!(
+                        " Not sent to members in focus mode: {}.",
+                        r.skipped.join(", ")
+                    ));
                 }
+                out
             }
             "bbs_agents" => format_agents(
                 &b.list_agents(proto::ListAgentsRequest { all: false })

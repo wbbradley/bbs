@@ -80,6 +80,14 @@ impl Agents {
             .or(agent.last_sent_at.as_deref())
     }
 
+    /// Whether the agent is in focus mode, live from the summary stream.
+    fn focused(&self, agent: &proto::Agent, ctx: &Ctx) -> bool {
+        match ctx.inbox.summaries.get(&agent.name.to_ascii_lowercase()) {
+            Some(s) if !agent.retired => s.focused_at.is_some(),
+            _ => agent.focused_at.is_some(),
+        }
+    }
+
     /// More blockers first, then the smallest ACTIVE age. Unknown activity
     /// comes last within a count; names break ties without changing selection.
     fn shown<'a>(&'a self, ctx: &Ctx) -> Vec<&'a proto::Agent> {
@@ -271,10 +279,14 @@ impl Screen for Agents {
         let rows = shown.iter().zip(&ages).map(|(a, age)| {
             let owner = a.owner.as_deref().unwrap_or("?");
             let author_style = theme::style(theme::Role::Agent);
-            let name = Line::from(vec![Span::styled(
+            let mut name = vec![Span::styled(
                 a.name.clone(),
                 author_style.add_modifier(Modifier::BOLD),
-            )]);
+            )];
+            if self.focused(a, ctx) {
+                name.push(Span::styled(" ◎", theme::style(theme::Role::Accent)));
+            }
+            let name = Line::from(name);
             let owner = Line::from(vec![Span::styled(
                 owner.to_string(),
                 theme::style(theme::Role::Human),

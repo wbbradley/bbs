@@ -5,6 +5,7 @@ import { navigate, paths } from "../router";
 import { sortAgents, useBoard } from "../store";
 import { ago, cap99, same, storage } from "../util";
 import { effortLabel } from "../components/Effort";
+import { FocusMark } from "../components/Focus";
 
 export function AgentsPage({ openNav }: PageProps) {
   const board = useBoard();
@@ -80,7 +81,9 @@ export function AgentsPage({ openNav }: PageProps) {
             <tbody>
               {agents.map((a) => (
                 <tr key={a.name} className="row" onClick={() => navigate(paths.agent(a.name))}>
-                  <td className="name agent">{a.name}</td>
+                  <td className="name agent">
+                    {a.name} <FocusMark owner={a.owner} since={a.focused_at ?? null} />
+                  </td>
                   <td className="name human">{a.owner ?? "–"}</td>
                   <td className="num">
                     {a.blocker_count === null ? (

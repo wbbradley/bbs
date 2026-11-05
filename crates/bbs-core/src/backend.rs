@@ -43,6 +43,7 @@ pub const BLOCKER_CHOICES: &str = "blocker-choices.v1";
 pub const AGENT_NOTES: &str = "agent-notes.v1";
 /// Replicating the caller's whole personal history with `FeedRequest.sync`.
 pub const FEED_SYNC: &str = "feed-sync.v1";
+pub const AGENT_FOCUS: &str = "agent-focus.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -686,6 +687,18 @@ impl Backend {
             Backend::Remote(r) => rpc!(r, post_activity, events, &[AGENT_ACTIVITY])
                 .map(|r| r.accepted)
                 .map_err(|e| missing_rpc(e, AGENT_ACTIVITY)),
+        }
+    }
+
+    pub async fn set_focus(
+        &mut self,
+        req: proto::SetFocusRequest,
+    ) -> Result<proto::SetFocusResponse> {
+        match self {
+            Backend::Local(l) => service::set_focus(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, set_focus, req, &[AGENT_FOCUS]).map_err(|e| missing_rpc(e, AGENT_FOCUS))
+            }
         }
     }
 

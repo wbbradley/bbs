@@ -801,6 +801,15 @@ impl Bbs for Server {
             .await
     }
 
+    async fn set_focus(
+        &self,
+        req: Request<proto::SetFocusRequest>,
+    ) -> Result<Response<proto::SetFocusResponse>, Status> {
+        // A write: ending focus releases held mail to waiting agents.
+        self.unary("set_focus", req, Effect::Write, service::set_focus)
+            .await
+    }
+
     async fn rotate_agent_token(
         &self,
         req: Request<proto::RetireRequest>,

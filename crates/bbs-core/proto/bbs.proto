@@ -143,6 +143,23 @@ service Bbs {
   rpc ListAgentNotes(ListAgentNotesRequest) returns (ListAgentNotesResponse);
   // Last-write-wins replace of the caller's note on one live agent.
   rpc PutAgentNote(PutAgentNoteRequest) returns (PutAgentNoteResponse);
+
+  // Focus mode (agent-focus.v1): the owning human starts or ends it for one
+  // live agent, which is told by a direct message from the owner. While
+  // focused, only the owner's direct mail and blocker answers reach the agent;
+  // other senders are refused, broadcasts and others' timers are not
+  // delivered to it, and the agent can message only its owner.
+  rpc SetFocus(SetFocusRequest) returns (SetFocusResponse);
+}
+
+message SetFocusRequest {
+  string agent = 1;
+  bool focused = 2;  // false ends focus mode
+}
+message SetFocusResponse {
+  string agent = 1;                  // canonical name
+  optional string focused_at = 2;    // when focus began; absent when not focused
+  bool changed = 3;                  // false: it already was (or wasn't) focused
 }
 
 enum BlockerStatus {
@@ -448,6 +465,9 @@ message SendResponse {
   string to = 1;                   // canonical recipient: "Juliana" or "@acme"
   optional uint32 recipients = 2;  // broadcasts only: recipients visible to the caller
   optional int64 id = 3;           // the message's id, for control correlation
+  // Broadcasts only (agent-focus.v1): members in focus mode, who were not sent
+  // the message.
+  repeated string skipped = 4;
 }
 
 // Auto-replies to the owning human (auto-reply.v1). The destination is the
@@ -683,6 +703,9 @@ message Agent {
   optional uint64 blocker_count = 13;
   // The stable agent id; a reused name is a different id.
   optional int64 id = 14;
+  // When the agent's owner put it in focus mode (agent-focus.v1); absent when
+  // it is not focused or the server is older.
+  optional string focused_at = 15;
 }
 
 // The window is the most recent `backlog` (1 to 1000) messages that match every
@@ -800,6 +823,8 @@ message AgentSummary {
   optional uint64 blocker_count = 10;
   // As Agent.id.
   optional int64 agent_id = 11;
+  // As Agent.focused_at.
+  optional string focused_at = 12;
 }
 // Every live agent, by name.
 message AgentSummarySnapshot {

@@ -263,6 +263,26 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
             let r = backend.retire(proto::RetireRequest { agent }).await?;
             format!("Retired {}.\n", r.name)
         }
+        Command::Focus { agent, off } => {
+            let r = backend
+                .set_focus(proto::SetFocusRequest {
+                    agent,
+                    focused: !off,
+                })
+                .await?;
+            match (off, r.changed) {
+                (false, true) => format!(
+                    "{} is in focus mode and was told so: only your direct messages reach it, and it can message only you.\n",
+                    r.agent
+                ),
+                (false, false) => format!("{} is already in focus mode.\n", r.agent),
+                (true, true) => format!(
+                    "{} left focus mode and was told so; others can reach it again.\n",
+                    r.agent
+                ),
+                (true, false) => format!("{} is not in focus mode.\n", r.agent),
+            }
+        }
         Command::Send { to, body } => {
             let req = proto::SendRequest {
                 to,
@@ -270,10 +290,18 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 control: None,
             };
             let r = backend.send(req).await?;
-            match r.recipients {
+            let mut out = match r.recipients {
                 Some(n) => format!("Sent to {} ({n} recipients).\n", r.to),
                 None => format!("Sent to {}.\n", r.to),
+            };
+            if !r.skipped.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "Not sent to members in focus mode: {}.",
+                    r.skipped.join(", ")
+                );
             }
+            out
         }
         Command::Read {
             limit,
@@ -428,6 +456,8 @@ struct AgentJson<'a> {
     hostname: Option<&'a str>,
     pwd: Option<&'a str>,
     status: Option<&'a str>,
+    /// When its owner put it in focus mode; null when not focused.
+    focused_at: Option<&'a str>,
 }
 
 fn kind_name(kind: proto::Kind) -> &'static str {
@@ -596,6 +626,7 @@ fn agents_json(r: &proto::ListAgentsResponse) -> Result<String> {
         hostname: None,
         pwd: None,
         status: None,
+        focused_at: None,
     });
     let agents = r.agents.iter().map(|a| AgentJson {
         name: &a.name,
@@ -607,6 +638,7 @@ fn agents_json(r: &proto::ListAgentsResponse) -> Result<String> {
         hostname: Some(&a.hostname),
         pwd: Some(&a.pwd),
         status: a.status.as_deref(),
+        focused_at: a.focused_at.as_deref(),
     });
     json_lines(humans.chain(agents))
 }
@@ -633,7 +665,11 @@ pub(crate) fn format_agents(r: &proto::ListAgentsResponse) -> String {
         ]);
     }
     for a in &r.agents {
-        let kind = if a.retired { "retired" } else { "agent" };
+        let kind = match (a.retired, a.focused_at.is_some()) {
+            (true, _) => "retired",
+            (false, true) => "focused",
+            (false, false) => "agent",
+        };
         let g = a.groups.join(",");
         table.push([
             a.name.clone(),

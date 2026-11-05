@@ -267,6 +267,8 @@ export function BoardProvider({
           effort: s.effort ?? a.effort,
           effort_reported_at: s.effort_reported_at ?? a.effort_reported_at,
           blocker_count: s.blocker_count ?? a.blocker_count,
+          // Null ends focus, so only a missing field (an older server) falls back.
+          focused_at: s.focused_at !== undefined ? s.focused_at : a.focused_at,
         };
       }),
     [listed, summaries],

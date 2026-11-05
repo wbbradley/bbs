@@ -77,6 +77,16 @@ pub enum Command {
     Bye,
     /// Retire another agent and announce it to its groups (humans only).
     Retire { agent: String },
+    /// Put one of your agents in focus mode, or take it out with --off
+    /// (humans only). The agent is told either way. While focused, only your
+    /// direct messages and blocker answers reach it, and it can message only
+    /// you; other senders are refused, and group mail is not delivered to it.
+    Focus {
+        agent: String,
+        /// End focus mode.
+        #[arg(long)]
+        off: bool,
+    },
     /// Send a message to an agent, a human, or @group.
     Send {
         /// Recipient name, or @group to broadcast.

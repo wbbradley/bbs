@@ -845,14 +845,22 @@ pub fn group_list(conn: &mut Connection, caller: &Caller) -> Result<proto::Group
 // ---- messages --------------------------------------------------------------
 
 /// Deliver `body` from `me` to every member of the group and every human,
-/// except `me`. Returns (recipients, recipients visible to `me`): humans
+/// except `me` and members in focus mode, who don't receive it. Returns
+/// (recipients, recipients visible to `me`, skipped focused members): humans
 /// silently receive every broadcast, so agents only see the agent count.
-fn broadcast(ctx: &Ctx, me: &db::Principal, gid: i64, body: &str) -> Result<(usize, usize)> {
+fn broadcast(
+    ctx: &Ctx,
+    me: &db::Principal,
+    gid: i64,
+    body: &str,
+) -> Result<(usize, usize, Vec<String>)> {
     let msg = db::insert_message(ctx.conn, me, Some(gid), body, &ctx.now_s)?;
     let mut count = 0;
     let mut visible = 0;
+    let focused = db::focused_members(ctx.conn, gid)?;
     let agents = db::group_member_ids(ctx.conn, gid)?
         .into_iter()
+        .filter(|id| !focused.iter().any(|(f, _)| f == id))
         .map(|id| (db::Kind::Agent, id));
     let humans = db::human_ids(ctx.conn)?
         .into_iter()
@@ -867,7 +875,38 @@ fn broadcast(ctx: &Ctx, me: &db::Principal, gid: i64, body: &str) -> Result<(usi
             visible += 1;
         }
     }
-    Ok((count, visible))
+    let skipped = focused.into_iter().map(|(_, name)| name).collect();
+    Ok((count, visible, skipped))
+}
+
+/// Refuse mail to or from an agent in focus mode, except between it and its
+/// owner. Controls never reach here; they are owner-only already.
+fn check_focus(ctx: &Ctx, me: &db::Principal, target: Option<&db::Principal>) -> Result<()> {
+    if me.kind == db::Kind::Agent && db::focused_at(ctx.conn, me.id)?.is_some() {
+        let owner = db::agent_owner_id(ctx.conn, me.id)?;
+        let to_owner = target.is_some_and(|t| t.kind == db::Kind::Human && Some(t.id) == owner);
+        if !to_owner {
+            let owner =
+                db::agent_owner_name(ctx.conn, me.id)?.unwrap_or_else(|| "your owner".to_string());
+            bail!(
+                "you are in focus mode: until {owner} ends it, you can message only {owner}. \
+                 Reply to {owner} directly, or ask them to end focus mode."
+            );
+        }
+    }
+    if let Some(t) = target.filter(|t| t.kind == db::Kind::Agent)
+        && db::focused_at(ctx.conn, t.id)?.is_some()
+    {
+        let owner = db::agent_owner_id(ctx.conn, t.id)?;
+        if !(me.kind == db::Kind::Human && Some(me.id) == owner) {
+            bail!(
+                "{} is unreachable: it is in focus mode with its owner and is not accepting \
+                 messages. Retry later, or try another approach.",
+                t.name
+            );
+        }
+    }
+    Ok(())
 }
 
 /// A control message: from a human, direct to a live agent that human owns.
@@ -914,6 +953,7 @@ fn send_control(
         to: target.name,
         recipients: None,
         id: Some(msg),
+        skipped: Vec::new(),
     })
 }
 
@@ -1807,7 +1847,8 @@ pub fn send(
                     );
                 }
             }
-            let (count, visible) = broadcast(ctx, &me, gid, body)?;
+            check_focus(ctx, &me, None)?;
+            let (count, visible, skipped) = broadcast(ctx, &me, gid, body)?;
             tracing::info!(
                 from = me.name,
                 to,
@@ -1819,6 +1860,7 @@ pub fn send(
                 to: format!("@{group}"),
                 recipients: Some(visible as u32),
                 id: None,
+                skipped,
             });
         }
 
@@ -1841,6 +1883,7 @@ pub fn send(
         {
             bail!("{} is not in any of your groups", target.name);
         }
+        check_focus(ctx, &me, Some(&target))?;
         let msg = db::insert_message(ctx.conn, &me, None, body, &ctx.now_s)?;
         db::insert_delivery(ctx.conn, msg, target.kind, target.id)?;
         match (me.kind, target.kind) {
@@ -1862,6 +1905,64 @@ pub fn send(
             to: target.name,
             recipients: None,
             id: Some(msg),
+            skipped: Vec::new(),
+        })
+    })
+}
+
+fn focus_notice(owner: &str, focused: bool) -> String {
+    if focused {
+        format!(
+            "Focus mode is on: {owner} has put you in focus mode for a one-on-one \
+             conversation. Until {owner} ends it, only {owner}'s messages and answers to \
+             your blockers reach you. Other agents' and humans' direct messages are \
+             refused, group messages are not delivered to you, and you can message only \
+             {owner}."
+        )
+    } else {
+        format!(
+            "Focus mode is off: {owner} ended it. Other agents, humans and groups can \
+             reach you again, and you can message them. Group messages sent during focus \
+             were not delivered to you; bbs_search finds them if you need to catch up."
+        )
+    }
+}
+
+/// Start or end focus mode for one live agent; only its owner may. The agent
+/// is told by a direct message from the owner.
+pub fn set_focus(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::SetFocusRequest,
+) -> Result<proto::SetFocusResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let Some(agent) = db::live_agent_by_name(ctx.conn, &req.agent)? else {
+            bail!("no live agent named {:?}", req.agent);
+        };
+        if db::agent_owner_id(ctx.conn, agent.id)? != Some(me.id) {
+            bail!("{} is not your agent", agent.name);
+        }
+        let now = req.focused.then_some(ctx.now_s.as_str());
+        let changed = db::set_focus(ctx.conn, agent.id, now)?;
+        if changed {
+            // Tell the agent, as a direct message from its owner, so its
+            // harness and model both know why mail stops or resumes.
+            let notice = focus_notice(&me.name, req.focused);
+            let msg = db::insert_message(ctx.conn, &me, None, &notice, &ctx.now_s)?;
+            db::insert_delivery(ctx.conn, msg, db::Kind::Agent, agent.id)?;
+            db::record_human_conversation(ctx.conn, agent.id, me.id, &ctx.now_s)?;
+            tracing::info!(
+                by = me.name,
+                agent = agent.name,
+                focused = req.focused,
+                "set focus"
+            );
+        }
+        Ok(proto::SetFocusResponse {
+            focused_at: db::focused_at(ctx.conn, agent.id)?,
+            agent: agent.name,
+            changed,
         })
     })
 }
@@ -1963,6 +2064,7 @@ pub fn list_agents(
                 effort: a.effort.as_deref().and_then(effort_from_json),
                 effort_reported_at: a.effort_reported_at,
                 last_human_conversation_at: a.last_human_conversation_at,
+                focused_at: a.focused_at,
             })
             .collect();
         Ok(proto::ListAgentsResponse { humans, agents })
@@ -2622,6 +2724,7 @@ pub fn agent_summary(
                 effort: s.effort.as_deref().and_then(effort_from_json),
                 effort_reported_at: s.effort_reported_at,
                 last_human_conversation_at: s.last_human_conversation_at,
+                focused_at: s.focused_at,
             })
             .collect();
         Ok(proto::AgentSummarySnapshot {
@@ -2861,9 +2964,17 @@ pub fn fire_timers(
                 continue;
             }
         };
-        let msg = db::insert_message(&tx, &timer.creator, None, &timer.body, &now_s)?;
-        db::insert_delivery(&tx, msg, db::Kind::Agent, timer.target_id)?;
-        db::set_message_timer(&tx, msg, timer.id)?;
+        // A timer another agent set for a focused agent is skipped, like its
+        // group mail; the schedule continues. The agent's own timers fire.
+        let skip =
+            timer.creator.id != timer.target_id && db::focused_at(&tx, timer.target_id)?.is_some();
+        if skip {
+            tracing::info!(id = timer.id, "timer skipped: target in focus mode");
+        } else {
+            let msg = db::insert_message(&tx, &timer.creator, None, &timer.body, &now_s)?;
+            db::insert_delivery(&tx, msg, db::Kind::Agent, timer.target_id)?;
+            db::set_message_timer(&tx, msg, timer.id)?;
+        }
         match schedule.and_then(|s| s.next_after(now)) {
             Some(next) => db::set_timer_next_run(&tx, timer.id, &fmt_time(next))?,
             None => db::delete_timer(&tx, timer.id)?,
@@ -5723,6 +5834,248 @@ mod tests {
             "feed stays human-only"
         );
         assert!(feed(&mut conn, &will, proto::FeedRequest { with: None, ..req }).is_err());
+    }
+
+    #[test]
+    fn focus_mode_keeps_an_agent_to_its_owner_and_skips_group_mail() {
+        let (mut conn, will, [mateo, zed, _lu]) = board();
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        for agent in ["Mateo", "Zed"] {
+            let req = proto::SetGroupWriterRequest {
+                group: "crew".into(),
+                agent: agent.into(),
+                grant: true,
+            };
+            set_group_writer(&mut conn, &will, req).unwrap();
+        }
+        inbox(&mut conn, &mateo);
+        inbox(&mut conn, &zed);
+        let focus = |conn: &mut Connection, by: &Caller, focused: bool| {
+            let req = proto::SetFocusRequest {
+                agent: "mateo".into(),
+                focused,
+            };
+            set_focus(conn, by, req)
+        };
+        let try_send = |conn: &mut Connection, from: &Caller, to: &str| {
+            let req = proto::SendRequest {
+                to: to.into(),
+                body: format!("to {to}"),
+                control: None,
+            };
+            send(conn, from, req)
+        };
+        let bodies = |conn: &mut Connection, who: &Caller| -> Vec<String> {
+            inbox(conn, who).into_iter().map(|m| m.body).collect()
+        };
+
+        // Only the owning human may focus an agent.
+        let err = focus(&mut conn, &ada, true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Mateo is not your agent"),
+            "{err:#}"
+        );
+        let err = focus(&mut conn, &zed, true).unwrap_err();
+        assert!(format!("{err:#}").contains("humans only"), "{err:#}");
+        let r = focus(&mut conn, &will, true).unwrap();
+        assert_eq!((r.agent.as_str(), r.changed), ("Mateo", true));
+        let since = r.focused_at.unwrap();
+        let r = focus(&mut conn, &will, true).unwrap();
+        assert_eq!(
+            (r.changed, r.focused_at.as_deref()),
+            (false, Some(since.as_str()))
+        );
+        let listed = list_agents(&mut conn, &zed, proto::ListAgentsRequest::default()).unwrap();
+        let listed = |name: &str| {
+            listed
+                .agents
+                .iter()
+                .find(|a| a.name == name)
+                .unwrap()
+                .focused_at
+                .clone()
+        };
+        assert_eq!(listed("Mateo"), Some(since.clone()));
+        assert_eq!(listed("Zed"), None);
+        let summary = agent_summary(&mut conn, &will, proto::AgentSummaryRequest {}).unwrap();
+        assert!(
+            summary
+                .agents
+                .iter()
+                .any(|a| a.agent == "Mateo" && a.focused_at.as_deref() == Some(&since))
+        );
+
+        // The agent was told, by a message from its owner.
+        let notice = inbox(&mut conn, &mateo);
+        assert_eq!(notice.len(), 1, "{notice:?}");
+        assert_eq!(notice[0].from_name, "will");
+        assert!(
+            notice[0]
+                .body
+                .starts_with("Focus mode is on: will has put you")
+        );
+
+        // Other agents and humans are refused; broadcasts, the owner's too,
+        // are accepted but not sent to the focused member.
+        for from in [&zed, &ada] {
+            let err = try_send(&mut conn, from, "Mateo").unwrap_err();
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("Mateo is unreachable: it is in focus mode"),
+                "{err}"
+            );
+            assert!(
+                err.contains("Retry later, or try another approach"),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            try_send(&mut conn, &zed, "@crew").unwrap().skipped,
+            ["Mateo"]
+        );
+        assert_eq!(
+            try_send(&mut conn, &will, "@crew").unwrap().skipped,
+            ["Mateo"]
+        );
+        // Zed still got will's broadcast.
+        assert_eq!(bodies(&mut conn, &zed), ["to @crew"]);
+        // Others' timers are skipped while the agent's own still fire.
+        for (by, body) in [(&zed, "zed's timer"), (&mateo, "own timer")] {
+            let req = proto::TimerAddRequest {
+                agent: "Mateo".into(),
+                when: "in 1m".into(),
+                body: body.into(),
+            };
+            timer_add(&mut conn, by, req, TimerLimits::default()).unwrap();
+        }
+        fire_timers(&mut conn, Utc::now() + chrono::Duration::minutes(2)).unwrap();
+        try_send(&mut conn, &will, "Mateo").unwrap();
+        // The timer fired at its future time, so it sorts last.
+        assert_eq!(bodies(&mut conn, &mateo), ["to Mateo", "own timer"]);
+        assert!(
+            !db::has_unread(
+                &conn,
+                &db::live_agent_by_name(&conn, "Mateo").unwrap().unwrap()
+            )
+            .unwrap()
+        );
+
+        // The focused agent can message only its owner.
+        for to in ["Zed", "ada", "@crew"] {
+            let err = try_send(&mut conn, &mateo, to).unwrap_err();
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("you are in focus mode: until will ends it"),
+                "{err}"
+            );
+        }
+        try_send(&mut conn, &mateo, "will").unwrap();
+        let req = proto::AutoReplyRequest {
+            key: "k1".into(),
+            body: "auto".into(),
+        };
+        auto_reply(&mut conn, &mateo, req).unwrap();
+
+        // Ending focus tells the agent, nothing skipped arrives late, and mail
+        // flows again.
+        let r = focus(&mut conn, &will, false).unwrap();
+        assert_eq!((r.changed, r.focused_at), (true, None));
+        assert!(!focus(&mut conn, &will, false).unwrap().changed);
+        let after = bodies(&mut conn, &mateo);
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert!(after[0].starts_with("Focus mode is off: will ended it."));
+        try_send(&mut conn, &zed, "Mateo").unwrap();
+        assert!(
+            try_send(&mut conn, &zed, "@crew")
+                .unwrap()
+                .skipped
+                .is_empty()
+        );
+        try_send(&mut conn, &mateo, "Zed").unwrap();
+
+        // Retirement ends focus.
+        focus(&mut conn, &will, true).unwrap();
+        retire_agent(
+            &mut conn,
+            &will,
+            proto::RetireRequest {
+                agent: "Mateo".into(),
+            },
+        )
+        .unwrap();
+        let mateo_id: i64 = conn
+            .query_row("SELECT id FROM agents WHERE name = 'Mateo'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(db::focused_at(&conn, mateo_id).unwrap(), None);
+    }
+
+    #[test]
+    fn focus_mode_never_holds_a_blocker_answer_from_another_human() {
+        let (mut conn, will, [mateo, _zed, _lu]) = board();
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        // ada answers @crew blockers by owning a member.
+        let req = proto::RegisterRequest {
+            name: Some("Ida".into()),
+            ..Default::default()
+        };
+        let ida = Caller {
+            token: Some(register(&mut conn, &ada, req).unwrap().token),
+            ..Default::default()
+        };
+        let req = proto::GroupRequest {
+            group: "crew".into(),
+        };
+        group_join(&mut conn, &ida, req).unwrap();
+        let req = proto::PutBlockerRequest {
+            group: "crew".into(),
+            body: "which way?".into(),
+            request_key: "q1".into(),
+            ..Default::default()
+        };
+        let put = blockers::put_blocker(&mut conn, &mateo, req).unwrap();
+        let id = put.blocker.unwrap().id;
+        inbox(&mut conn, &mateo);
+        let req = proto::SetFocusRequest {
+            agent: "Mateo".into(),
+            focused: true,
+        };
+        set_focus(&mut conn, &will, req).unwrap();
+        // The focus notice.
+        assert_eq!(inbox(&mut conn, &mateo).len(), 1);
+
+        let req = proto::AnswerBlockerRequest {
+            id,
+            answer: "left".into(),
+            request_key: "a1".into(),
+            ..Default::default()
+        };
+        blockers::answer_blocker(&mut conn, &ada, req).unwrap();
+        // ada's ordinary mail is still held; the answer is not.
+        let err = send(
+            &mut conn,
+            &ada,
+            proto::SendRequest {
+                to: "Mateo".into(),
+                body: "chat".into(),
+                control: None,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("is unreachable"), "{err:#}");
+        let got = inbox(&mut conn, &mateo);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].body.contains("left"), "{:?}", got[0].body);
+        assert_eq!(got[0].from_name, "ada");
     }
 
     #[test]

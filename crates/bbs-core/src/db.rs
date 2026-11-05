@@ -39,6 +39,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0022_agent_notes.sql"),
     include_str!("../migrations/0023_agent_drains.sql"),
     include_str!("../migrations/0024_blocker_choices.sql"),
+    include_str!("../migrations/0025_agent_focus.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +81,8 @@ pub struct AgentRow {
     pub effort_reported_at: Option<String>,
     /// The newest direct message between the agent and any human; None when never.
     pub last_human_conversation_at: Option<String>,
+    /// When its owner put it in focus mode; None when not focused.
+    pub focused_at: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -447,10 +450,34 @@ pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
     )?;
     conn.execute("DELETE FROM side_requests WHERE agent_id = ?1", params![id])?;
     conn.execute(
-        "UPDATE agents SET effort = NULL, effort_reported_at = NULL WHERE id = ?1",
+        "UPDATE agents SET effort = NULL, effort_reported_at = NULL, focused_at = NULL
+         WHERE id = ?1",
         params![id],
     )?;
     Ok(())
+}
+
+/// Start (`Some(now)`) or end (`None`) focus mode for a live agent; returns
+/// whether it changed.
+pub fn set_focus(conn: &Connection, id: i64, now: Option<&str>) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE agents SET focused_at = ?2
+         WHERE id = ?1 AND retired_at IS NULL AND (focused_at IS NULL) = (?2 IS NOT NULL)",
+        params![id, now],
+    )?;
+    Ok(changed > 0)
+}
+
+/// When the agent's focus mode began; None when it is not focused.
+pub fn focused_at(conn: &Connection, id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT focused_at FROM agents WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 /// Store an agent's validated effort report JSON and when it arrived.
@@ -551,7 +578,8 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                      SELECT created_at FROM activity
                      WHERE agent_id = a.id
                      ORDER BY id DESC LIMIT 1))),
-                (SELECT max(last_at) FROM agent_human_conversations p WHERE p.agent_id = a.id)
+                (SELECT max(last_at) FROM agent_human_conversations p WHERE p.agent_id = a.id),
+                a.focused_at
          FROM agents a
          LEFT JOIN agent_owners o ON o.agent_id = a.id
          LEFT JOIN humans h ON h.id = o.human_id
@@ -573,6 +601,7 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                 effort_reported_at: r.get(9)?,
                 last_sent_at: r.get(10)?,
                 last_human_conversation_at: r.get(11)?,
+                focused_at: r.get(12)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -709,6 +738,19 @@ pub fn share_group(conn: &Connection, a: i64, b: i64) -> Result<bool> {
         |r| r.get(0),
     )?;
     Ok(n > 0)
+}
+
+/// The group's live members in focus mode: (id, name).
+pub fn focused_members(conn: &Connection, group_id: i64) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.name FROM group_members m JOIN agents a ON a.id = m.agent_id
+         WHERE m.group_id = ?1 AND a.retired_at IS NULL AND a.focused_at IS NOT NULL
+         ORDER BY lower(a.name)",
+    )?;
+    let members = stmt
+        .query_map(params![group_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(members)
 }
 
 pub fn group_member_ids(conn: &Connection, group_id: i64) -> Result<Vec<i64>> {
@@ -1414,6 +1456,8 @@ pub struct AgentSummary {
     pub effort_reported_at: Option<String>,
     /// The newest direct message between the agent and any human; None when never.
     pub last_human_conversation_at: Option<String>,
+    /// When its owner put it in focus mode; None when not focused.
+    pub focused_at: Option<String>,
 }
 
 /// Unread mail through the human's inbox index; unseen activity per live
@@ -1429,7 +1473,7 @@ const AGENT_SUMMARIES: &str = "
         GROUP BY m.from_id),
     summaries AS MATERIALIZED (
         SELECT g.id AS agent_id, g.name, coalesce(u.n, 0) AS unread, u.oldest AS unread_oldest,
-               g.effort, g.effort_reported_at,
+               g.effort, g.effort_reported_at, g.focused_at,
                (SELECT count(*) FROM activity act
                 WHERE act.agent_id = g.id AND act.id > coalesce(s.seen_id, 0)) AS unseen,
                -- Ids grow with arrival, so the first unseen is the oldest.
@@ -1453,7 +1497,7 @@ const AGENT_SUMMARIES: &str = "
         LEFT JOIN unread u ON u.agent_id = g.id
         WHERE g.retired_at IS NULL)
     SELECT name, unread, unread_oldest, unseen, unseen_oldest, last_sent, effort,
-           effort_reported_at, human_conversation, agent_id FROM summaries
+           effort_reported_at, human_conversation, agent_id, focused_at FROM summaries
     ORDER BY lower(name)";
 
 /// For each live agent, the direct messages it sent `human` that are unread,
@@ -1474,6 +1518,7 @@ pub fn agent_summaries(conn: &Connection, human: i64) -> Result<Vec<AgentSummary
                 effort: r.get(6)?,
                 effort_reported_at: r.get(7)?,
                 last_human_conversation_at: r.get(8)?,
+                focused_at: r.get(10)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -1495,19 +1540,33 @@ pub fn mark_seen(conn: &Connection, human: i64, agent: i64, through_id: i64) -> 
     Ok(moved > 0)
 }
 
+/// Mail a focused agent may take: its owner's direct messages (controls
+/// included), its own timers, and answers to its blockers from any human.
+/// Mail sent during focus is refused or not delivered at all; this holds what
+/// was already waiting when focus began until it ends. Expects the message as `m`, the recipient
+/// kind as ?1 and its id as ?2.
+const FOCUS_ALLOWS: &str = "(?1 != 'agent'
+         OR (SELECT focused_at FROM agents WHERE id = ?2) IS NULL
+         OR (m.to_group_id IS NULL AND m.from_kind = 'human'
+             AND m.from_id = (SELECT human_id FROM agent_owners WHERE agent_id = ?2))
+         OR (m.from_kind = 'agent' AND m.from_id = ?2)
+         OR EXISTS (SELECT 1 FROM blocker_events e
+             WHERE e.message_id = m.id AND e.kind = 'answered'))";
+
 pub fn has_unread(conn: &Connection, me: &Principal) -> Result<bool> {
-    let n: i64 = conn.query_row(
+    let sql = format!(
         "SELECT EXISTS (SELECT 1 FROM deliveries
          WHERE recipient_kind = ?1 AND recipient_id = ?2 AND archived_at IS NULL
+         AND EXISTS (SELECT 1 FROM messages m WHERE m.id = deliveries.message_id
+           AND {FOCUS_ALLOWS})
          AND (?1 != 'agent'
            OR EXISTS (SELECT 1 FROM messages m
                WHERE m.id = deliveries.message_id AND m.control = 'cancel')
            OR message_id <= coalesce((
            SELECT r.watermark FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
-           WHERE o.agent_id = ?2), 9223372036854775807)))",
-        params![me.kind.as_str(), me.id],
-        |r| r.get(0),
-    )?;
+           WHERE o.agent_id = ?2), 9223372036854775807)))"
+    );
+    let n: i64 = conn.query_row(&sql, params![me.kind.as_str(), me.id], |r| r.get(0))?;
     Ok(n != 0)
 }
 
@@ -1523,7 +1582,7 @@ pub fn take_unread(
     // the service validates their ownership before insertion. Preserve
     // timestamp ordering outside a restart barrier.
     let sql = format!(
-        "{INBOX_SELECT} AND d.archived_at IS NULL
+        "{INBOX_SELECT} AND d.archived_at IS NULL AND {FOCUS_ALLOWS}
          AND (?1 != 'agent' OR m.control = 'cancel' OR m.id <= coalesce((
            SELECT r.watermark FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
            WHERE o.agent_id = ?2), 9223372036854775807))
