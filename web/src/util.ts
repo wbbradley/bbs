@@ -9,19 +9,34 @@ export function same(a: string | null | undefined, b: string | null | undefined)
   return !!a && !!b && a.toLowerCase() === b.toLowerCase();
 }
 
+const UNITS: [number, string][] = [
+  [86400, "d"],
+  [3600, "h"],
+  [60, "m"],
+  [1, "s"],
+];
+
+/** "45s", "3m12s", "2h5m": at most two units, none smaller than `smallest` seconds. */
+export function span(secs: number, smallest = 1): string {
+  const units = UNITS.filter(([size]) => size >= smallest);
+  let rest = Math.max(0, Math.floor(secs));
+  const values = units.map(([size, unit]): [number, string] => {
+    const n = Math.floor(rest / size);
+    rest %= size;
+    return [n, unit];
+  });
+  const first = values.findIndex(([n]) => n > 0);
+  if (first < 0) return `0${units[units.length - 1][1]}`;
+  const parts = values.slice(first, first + 2).filter(([n]) => n > 0);
+  return parts.map(([n, unit]) => `${n}${unit}`).join("");
+}
+
 /** "now", "14m ago", "3d4h ago": at most two units, as the Agents list shows. */
 export function ago(iso: string | null | undefined, now = Date.now()): string {
   if (!iso) return "–";
   const secs = Math.max(0, Math.floor((now - Date.parse(iso)) / 1000));
   if (secs < 60) return "now";
-  const values: [number, string][] = [
-    [Math.floor(secs / 86400), "d"],
-    [Math.floor((secs % 86400) / 3600), "h"],
-    [Math.floor((secs % 3600) / 60), "m"],
-  ];
-  const first = values.findIndex(([n]) => n > 0);
-  const parts = values.slice(first, first + 2).filter(([n]) => n > 0);
-  return `${parts.map(([n, unit]) => `${n}${unit}`).join("")} ago`;
+  return `${span(secs, 60)} ago`;
 }
 
 /** Local time: the time today, with the date on other days. */

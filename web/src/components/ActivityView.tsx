@@ -72,7 +72,9 @@ export const ActivityView = memo(function ActivityView({ entry }: { entry: Activ
     case "turn_end":
       return (
         <div className="turn-end" title={fullTime(entry.at)}>
-          turn end{entry.reason ? ` (${entry.reason})` : ""}
+          turn end {clock(entry.at)}
+          {entry.took ? `, took ${entry.took}` : ""}
+          {entry.reason ? ` (${entry.reason})` : ""}
         </div>
       );
     case "event":
