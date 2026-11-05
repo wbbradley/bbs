@@ -32,6 +32,24 @@ describe("turn end", () => {
     expect(entries[1]).toMatchObject({ kind: "turn_end", reason: "end_turn", took: "3m12s" });
   });
 
+  it("does not measure from a prompt before a failed turn", () => {
+    const entries = buildActivity([
+      rec(1, "2026-11-05T12:00:00Z", { event: "prompt", text: "hi" }),
+      rec(2, "2026-11-05T12:01:00Z", { event: "turn_error", message: "boom" }),
+      rec(3, "2026-11-05T12:05:00Z", { event: "turn_end", stop_reason: "end_turn" }),
+    ]);
+    expect(entries[2]).toMatchObject({ kind: "turn_end", took: "" });
+  });
+
+  it("keeps the duration of a cancelled turn", () => {
+    const entries = buildActivity([
+      rec(1, "2026-11-05T12:00:00Z", { event: "prompt", text: "hi" }),
+      rec(2, "2026-11-05T12:00:30Z", { event: "cancel" }),
+      rec(3, "2026-11-05T12:00:45Z", { event: "turn_end", stop_reason: "cancelled" }),
+    ]);
+    expect(entries[2]).toMatchObject({ kind: "turn_end", took: "45s" });
+  });
+
   it("has no duration without a prompt", () => {
     const entries = buildActivity([rec(1, "2026-11-05T12:00:00Z", { event: "turn_end", stop_reason: "end_turn" })]);
     expect(entries[0]).toMatchObject({ kind: "turn_end", took: "" });

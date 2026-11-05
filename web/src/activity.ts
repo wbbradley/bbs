@@ -79,6 +79,9 @@ export function buildActivity(records: Activity[]): ActivityEntry[] {
       }
       running.clear();
     }
+    // A turn ends at its turn_end, or without one at a failure or restart.
+    // A cancel still ends in a turn_end, which keeps the duration.
+    if (["turn_error", "stop", "start", "session"].includes(event)) turnStart = null;
     switch (event) {
       case "update":
         break;
