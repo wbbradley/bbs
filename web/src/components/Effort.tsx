@@ -33,7 +33,7 @@ export function EffortControl({
   const state = report?.state;
   if (!state?.supported) {
     return (
-      <span className="mono muted" style={{ fontSize: 12 }} title={state?.reason}>
+      <span className="muted" style={{ fontSize: 12 }} title={state?.reason}>
         effort {state ? "unsupported" : "unknown"}
       </span>
     );
@@ -61,7 +61,7 @@ export function EffortControl({
   };
 
   return (
-    <span className="mono" style={{ fontSize: 12, display: "inline-flex", gap: 6, alignItems: "center" }}>
+    <span style={{ fontSize: 12, display: "inline-flex", gap: 6, alignItems: "center" }}>
       <span className="muted">effort</span>
       {owned && choices.length > 0 ? (
         <select

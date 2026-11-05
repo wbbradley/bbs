@@ -56,7 +56,7 @@ export function Login({
         <label className="field">
           <span>Human token</span>
           <input
-            className="input mono"
+            className="input"
             type="password"
             value={token}
             onChange={(e) => setToken(e.target.value)}

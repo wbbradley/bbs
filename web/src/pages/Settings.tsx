@@ -11,7 +11,7 @@ export function SettingsPage({ openNav }: PageProps) {
     <>
       <PageHeader title="Settings" openNav={openNav} />
       <div className="page" style={{ maxWidth: 640 }}>
-        <h3 className="mono">Appearance</h3>
+        <h3>Appearance</h3>
         <p className="muted">Kept in this browser.</p>
         <div className="segmented" style={{ marginBottom: 16 }}>
           <button className={prefs.theme === "dark" ? "on" : ""} onClick={() => setPrefs({ theme: "dark" })}>
@@ -34,7 +34,7 @@ export function SettingsPage({ openNav }: PageProps) {
           Compact view also hides reasoning
         </label>
 
-        <h3 className="mono" style={{ marginTop: 32 }}>
+        <h3 style={{ marginTop: 32 }}>
           Account
         </h3>
         <p>
@@ -43,7 +43,7 @@ export function SettingsPage({ openNav }: PageProps) {
 
         {board.info?.capabilities.includes("agent-drain.v1") && <AgentDrain />}
 
-        <h3 className="mono" style={{ marginTop: 32 }}>
+        <h3 style={{ marginTop: 32 }}>
           Server
         </h3>
         {release ? (

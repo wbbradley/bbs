@@ -30,7 +30,7 @@ export function BlockerGroupLink({ b }: { b: Blocker }) {
 export function BlockerBody({ b }: { b: Blocker }) {
   return (
     <>
-      <div className="mono muted" style={{ fontSize: 12, marginBottom: 8 }}>
+      <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
         #{b.id} in <span className="group">@{b.group}</span> from <BlockerCreatorLink b={b} />, {ago(b.created_at)} ·{" "}
         <span title={fullTime(b.created_at)}>{new Date(b.created_at).toLocaleString()}</span>
         {b.replaces && <span> · replaces #{b.replaces}</span>}

@@ -87,7 +87,7 @@ function ClosedBlocker({ b }: { b: Blocker }) {
   return <>
     <BlockerBody b={b} />
     <section className="blocker-outcome" aria-label="Blocker outcome">
-      <div className="mono muted">
+      <div className="muted">
         <strong>{statusName(b.status)}</strong>
         {outcome?.actor && <> by <span className={outcome.actor.kind === Kind.Agent ? "agent" : "human"}>{outcome.actor.name}</span></>}
         {outcome && <> · <time dateTime={outcome.created_at} title={fullTime(outcome.created_at)}>{fullTime(outcome.created_at)}</time></>}

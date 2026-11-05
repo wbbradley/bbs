@@ -55,7 +55,7 @@ export function AgentDrain() {
 
   return (
     <section aria-label="Restart agents">
-      <h3 className="mono" style={{ marginTop: 32 }}>Restart agents</h3>
+      <h3 style={{ marginTop: 32 }}>Restart agents</h3>
       <p className="muted">
         Pause new mail for all your live agents, send a final restart notice, and wait up to 20 minutes
         for queued turns and replies to finish. New mail is held until you resume delivery.
@@ -74,7 +74,7 @@ export function AgentDrain() {
           <p className="muted">Delivery remains paused through restart. Resume it manually when your agents are ready.</p>
           {drain.agents.length > 0 && <ul>
             {drain.agents.map((agent) => <li key={agent.agent_id}>
-              <span className="mono">{agent.name}</span>: {agent.unread > 0
+              <span>{agent.name}</span>: {agent.unread > 0
                 ? `${agent.unread} unread before the watermark`
                 : agent.side_pending ? "waiting for side question completion"
                 : agent.completed ? "finished" : "waiting for turn completion"}

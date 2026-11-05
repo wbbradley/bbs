@@ -139,7 +139,7 @@ function GroupAdmin({ group, onClose }: { group: string; onClose: () => void }) 
           const writer = writers.has(m.toLowerCase());
           return (
             <div key={m} style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 0" }}>
-              <span className="agent mono" style={{ flex: 1, cursor: "pointer" }} onClick={() => navigate(paths.agent(m))}>
+              <span className="agent" style={{ flex: 1, cursor: "pointer" }} onClick={() => navigate(paths.agent(m))}>
                 {m}
               </span>
               {info.writers && (

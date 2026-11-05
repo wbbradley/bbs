@@ -96,8 +96,8 @@ export function AgentsPage({ openNav }: PageProps) {
                   <td className="num muted" title={a.last_sent_at ?? undefined}>
                     {ago(a.last_sent_at)}
                   </td>
-                  <td className="hide-narrow mono muted">{effortLabel(a.effort)}</td>
-                  <td className="hide-narrow mono group">{a.groups.map((g) => `@${g}`).join(" ")}</td>
+                  <td className="hide-narrow muted">{effortLabel(a.effort)}</td>
+                  <td className="hide-narrow group">{a.groups.map((g) => `@${g}`).join(" ")}</td>
                   <td className="hide-narrow">
                     <div className="status" title={`${a.status ?? ""}\n${a.hostname}:${a.pwd}`}>
                       {a.status ?? <span className="faint">{a.hostname}:{a.pwd}</span>}
