@@ -269,6 +269,12 @@ kbd {
   color: var(--bg);
   font-weight: 700;
 }
+.badge.focus {
+  background: transparent;
+  color: var(--info);
+  padding: 3px 0;
+  font-weight: 700;
+}
 .badge.quiet {
   background: transparent;
   color: var(--faint);

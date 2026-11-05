@@ -6,6 +6,7 @@ import { ActivityView, ToolRun } from "../components/ActivityView";
 import { AnswerDialog } from "../components/AnswerDialog";
 import { Composer, type ComposerHandle } from "../components/Composer";
 import { EffortControl } from "../components/Effort";
+import { FocusMark, FocusToggle } from "../components/Focus";
 import { MessageView } from "../components/MessageView";
 import { NoteDrawer, type NoteHandle } from "../components/NoteDrawer";
 import { PageHeader } from "../components/PageHeader";
@@ -298,7 +299,11 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
     <>
       <PageHeader
         openNav={openNav}
-        title={<span className="agent">{agent}</span>}
+        title={
+          <>
+            <span className="agent">{agent}</span> <FocusMark owner={info?.owner ?? null} since={info?.focused_at ?? null} />
+          </>
+        }
         sub={
           info ? (
             <>
@@ -336,6 +341,9 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
             Aside
           </button>
         )}
+        {owned && info && board.has("agent-focus.v1") && (
+          <FocusToggle agent={agent} since={info.focused_at ?? null} onNotice={setNotice} />
+        )}
         {owned && turn.running && (
           <button className="btn small danger" onClick={cancelTurn}>
             Cancel turn
@@ -368,7 +376,13 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
             onSubmit={send}
             hint={
               notice ??
-              (owned ? "/btw asks on the side · /answer · /context" : info ? `${agent} belongs to ${info.owner}` : "")
+              (owned
+                ? "/btw asks on the side · /answer · /context"
+                : info?.focused_at
+                  ? `${agent} is in focus mode with ${info.owner ?? "its owner"} and is not accepting messages`
+                  : info
+                    ? `${agent} belongs to ${info.owner}`
+                    : "")
             }
             above={
               <>

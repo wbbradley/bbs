@@ -186,6 +186,25 @@ describe("the sidebar's agents", () => {
     expect(rows()).toEqual(["Frank2h37m ago", "Jefe2m ago", "Zed1m ago"]);
   });
 
+  it("mark agents in focus mode, following the live summary", async () => {
+    listings(new Map([[0, page([])]]));
+    const focused = { ...FRANK, focused_at: before(60) };
+    api.auto.set("list_agents", () => ({ agents: [JEFE, focused, ZED, MATEO], humans: [] }));
+    await show();
+    expect(rows()).toEqual(["Frank◎2h36m ago", "Jefenow", "Zed"]);
+    expect(screen.getByLabelText("In focus mode").title).toMatch(/^Focused 1m ago: only ada's direct messages/);
+    // A summary without the field (an older server) keeps the listed state.
+    act(() => api.stream("summary").push({ agents: [summary(focused)] }));
+    expect(rows()).toEqual(["Frank◎2h36m ago", "Jefenow", "Zed"]);
+    // Focus ends and begins as the summary says.
+    act(() =>
+      api.stream("summary").push({
+        agents: [summary(focused, { focused_at: null }), summary(ZED, { focused_at: before(0) })],
+      }),
+    );
+    expect(rows()).toEqual(["Frank2h36m ago", "Jefenow", "Zed◎"]);
+  });
+
   it("keeps mixed-case names alphabetical when blockers, activity and listed order change", async () => {
     const alpha = agent(10, "alpha", "ada");
     const beta = agent(11, "Beta", "ada");

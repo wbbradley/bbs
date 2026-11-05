@@ -671,6 +671,7 @@ async fn rpc(
         "agent_drain" => agent_drain,
         "list_agents" => list_agents,
         "retire" => retire,
+        "set_focus" => set_focus,
         "group_list" => group_list,
         "group_register" => group_register,
         "group_delete" => group_delete,

@@ -185,10 +185,17 @@ impl Tools {
                         control: None,
                     })
                     .await?;
-                match r.recipients {
+                let mut out = match r.recipients {
                     Some(n) => format!("Sent to {} ({n} recipients).", r.to),
                     None => format!("Sent to {}.", r.to),
+                };
+                if !r.held.is_empty() {
+                    out.push_str(&format!(
+                        " In focus mode, receiving it when focus ends: {}.",
+                        r.held.join(", ")
+                    ));
                 }
+                out
             }
             "bbs_agents" => format_agents(
                 &b.list_agents(proto::ListAgentsRequest { all: false })

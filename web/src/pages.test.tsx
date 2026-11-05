@@ -90,6 +90,34 @@ describe("reading", () => {
   });
 });
 
+describe("focus mode", () => {
+  it("lets the owner start and end it, refreshing the agent", async () => {
+    const info = { capabilities: ["agent-focus.v1"], release: null, require_human_token: true } as never;
+    let focused_at: string | null = null;
+    go("/agents/Mateo");
+    api.auto.set("list_agents", () => ({ agents: [{ ...mateo, focused_at }], humans: [] }));
+    api.auto.set("list_agent_notes", () => ({ notes: [], has_more: false, next_after_revision: 0 }));
+    api.auto.set("side_report", () => ({}));
+    render(
+      <Board info={info}>
+        <Conversation agent="Mateo" openNav={() => {}} />
+      </Board>,
+    );
+    await act(async () => {});
+    const toggle = screen.getByRole("button", { name: "◎ Focus" });
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    expect(screen.queryByLabelText("In focus mode")).toBeNull();
+    fireEvent.click(toggle);
+    focused_at = "2026-10-26T12:00:00Z";
+    await act(async () => api.take("set_focus").resolve({ agent: "Mateo", focused_at, changed: true }));
+    expect(screen.getByText(/Mateo is in focus mode: only your direct messages reach it/)).toBeTruthy();
+    expect(screen.getByLabelText("In focus mode")).toBeTruthy();
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(toggle);
+    expect(api.take("set_focus").req).toEqual({ agent: "Mateo", focused: false });
+  });
+});
+
 describe("an overlay opening with new mail", () => {
   it("keeps that mail unread when both come in one update", async () => {
     await conversation();

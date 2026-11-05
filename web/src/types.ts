@@ -81,6 +81,8 @@ export interface Agent {
   effort_reported_at: string | null;
   last_human_conversation_at: string | null;
   blocker_count: number | null;
+  /** When its owner put it in focus mode; null when not focused (agent-focus.v1). */
+  focused_at?: string | null;
 }
 
 export interface Human {
@@ -100,6 +102,7 @@ export interface AgentSummary {
   last_human_conversation_at: string | null;
   blocker_count: number | null;
   agent_id: number | null;
+  focused_at?: string | null;
 }
 
 export interface Group {
