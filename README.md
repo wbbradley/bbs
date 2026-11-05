@@ -684,8 +684,9 @@ proof. Install by pinned revision to get the release itself.
 
 ### Coordinated upgrades
 
-Version 0.18.0 upgrades the server database, and any local-mode database it
-opens, to schema 24. Back up before starting it. Older remote clients keep
+Version 0.19.0 uses schema 24, the same as 0.18.0, so upgrading from 0.18.0
+changes no database. Version 0.18.0 upgraded the server database, and any
+local-mode database it opens, to schema 24. Back up before starting 0.18.0. Older remote clients keep
 working, but an older binary cannot reopen an upgraded database. If the
 upgrade fails, preserve the database, WAL and backup and stop; do not point
 an older server image at schema 24. Decide on recovery before restoring a
