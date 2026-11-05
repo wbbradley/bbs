@@ -1541,13 +1541,16 @@ pub fn mark_seen(conn: &Connection, human: i64, agent: i64, through_id: i64) -> 
 }
 
 /// Mail a focused agent may take: its owner's direct messages (controls
-/// included) and its own timers. The rest waits until focus ends. Expects the
-/// message as `m`, the recipient kind as ?1 and its id as ?2.
+/// included), its own timers, and answers to its blockers from any human.
+/// The rest waits until focus ends. Expects the message as `m`, the recipient
+/// kind as ?1 and its id as ?2.
 const FOCUS_ALLOWS: &str = "(?1 != 'agent'
          OR (SELECT focused_at FROM agents WHERE id = ?2) IS NULL
          OR (m.to_group_id IS NULL AND m.from_kind = 'human'
              AND m.from_id = (SELECT human_id FROM agent_owners WHERE agent_id = ?2))
-         OR (m.from_kind = 'agent' AND m.from_id = ?2))";
+         OR (m.from_kind = 'agent' AND m.from_id = ?2)
+         OR EXISTS (SELECT 1 FROM blocker_events e
+             WHERE e.message_id = m.id AND e.kind = 'answered'))";
 
 pub fn has_unread(conn: &Connection, me: &Principal) -> Result<bool> {
     let sql = format!(

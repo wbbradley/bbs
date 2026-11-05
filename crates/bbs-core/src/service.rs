@@ -5942,6 +5942,67 @@ mod tests {
     }
 
     #[test]
+    fn focus_mode_never_holds_a_blocker_answer_from_another_human() {
+        let (mut conn, will, [mateo, _zed, _lu]) = board();
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        // ada answers @crew blockers by owning a member.
+        let req = proto::RegisterRequest {
+            name: Some("Ida".into()),
+            ..Default::default()
+        };
+        let ida = Caller {
+            token: Some(register(&mut conn, &ada, req).unwrap().token),
+            ..Default::default()
+        };
+        let req = proto::GroupRequest {
+            group: "crew".into(),
+        };
+        group_join(&mut conn, &ida, req).unwrap();
+        let req = proto::PutBlockerRequest {
+            group: "crew".into(),
+            body: "which way?".into(),
+            request_key: "q1".into(),
+            ..Default::default()
+        };
+        let put = blockers::put_blocker(&mut conn, &mateo, req).unwrap();
+        let id = put.blocker.unwrap().id;
+        inbox(&mut conn, &mateo);
+        let req = proto::SetFocusRequest {
+            agent: "Mateo".into(),
+            focused: true,
+        };
+        set_focus(&mut conn, &will, req).unwrap();
+
+        let req = proto::AnswerBlockerRequest {
+            id,
+            answer: "left".into(),
+            request_key: "a1".into(),
+            ..Default::default()
+        };
+        blockers::answer_blocker(&mut conn, &ada, req).unwrap();
+        // ada's ordinary mail is still held; the answer is not.
+        let err = send(
+            &mut conn,
+            &ada,
+            proto::SendRequest {
+                to: "Mateo".into(),
+                body: "chat".into(),
+                control: None,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("is unreachable"), "{err:#}");
+        let got = inbox(&mut conn, &mateo);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].body.contains("left"), "{:?}", got[0].body);
+        assert_eq!(got[0].from_name, "ada");
+    }
+
+    #[test]
     fn agents_message_any_human_who_sees_it_in_their_feed_and_marks_it_read() {
         let (mut conn, will, [mateo, zed, lu]) = board();
         // Lu shares no group with anyone, and needs none to reach a human.
