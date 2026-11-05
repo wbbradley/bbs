@@ -145,9 +145,10 @@ service Bbs {
   rpc PutAgentNote(PutAgentNoteRequest) returns (PutAgentNoteResponse);
 
   // Focus mode (agent-focus.v1): the owning human starts or ends it for one
-  // live agent. While focused, only the owner's direct mail reaches the
-  // agent; other senders are refused, broadcasts wait in its inbox until
-  // focus ends, and the agent can message only its owner.
+  // live agent, which is told by a direct message from the owner. While
+  // focused, only the owner's direct mail and blocker answers reach the agent;
+  // other senders are refused, broadcasts and others' timers are not
+  // delivered to it, and the agent can message only its owner.
   rpc SetFocus(SetFocusRequest) returns (SetFocusResponse);
 }
 
@@ -464,9 +465,9 @@ message SendResponse {
   string to = 1;                   // canonical recipient: "Juliana" or "@acme"
   optional uint32 recipients = 2;  // broadcasts only: recipients visible to the caller
   optional int64 id = 3;           // the message's id, for control correlation
-  // Broadcasts only (agent-focus.v1): members in focus mode, who receive the
-  // message when their focus ends.
-  repeated string held = 4;
+  // Broadcasts only (agent-focus.v1): members in focus mode, who were not sent
+  // the message.
+  repeated string skipped = 4;
 }
 
 // Auto-replies to the owning human (auto-reply.v1). The destination is the

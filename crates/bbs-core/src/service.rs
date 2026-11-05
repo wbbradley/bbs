@@ -845,9 +845,9 @@ pub fn group_list(conn: &mut Connection, caller: &Caller) -> Result<proto::Group
 // ---- messages --------------------------------------------------------------
 
 /// Deliver `body` from `me` to every member of the group and every human,
-/// except `me`. Returns (recipients, recipients visible to `me`, members in
-/// focus mode): humans silently receive every broadcast, so agents only see
-/// the agent count. Focused members' copies wait until their focus ends.
+/// except `me` and members in focus mode, who don't receive it. Returns
+/// (recipients, recipients visible to `me`, skipped focused members): humans
+/// silently receive every broadcast, so agents only see the agent count.
 fn broadcast(
     ctx: &Ctx,
     me: &db::Principal,
@@ -857,9 +857,10 @@ fn broadcast(
     let msg = db::insert_message(ctx.conn, me, Some(gid), body, &ctx.now_s)?;
     let mut count = 0;
     let mut visible = 0;
-    let held = db::focused_member_names(ctx.conn, gid)?;
+    let focused = db::focused_members(ctx.conn, gid)?;
     let agents = db::group_member_ids(ctx.conn, gid)?
         .into_iter()
+        .filter(|id| !focused.iter().any(|(f, _)| f == id))
         .map(|id| (db::Kind::Agent, id));
     let humans = db::human_ids(ctx.conn)?
         .into_iter()
@@ -874,7 +875,8 @@ fn broadcast(
             visible += 1;
         }
     }
-    Ok((count, visible, held))
+    let skipped = focused.into_iter().map(|(_, name)| name).collect();
+    Ok((count, visible, skipped))
 }
 
 /// Refuse mail to or from an agent in focus mode, except between it and its
@@ -951,7 +953,7 @@ fn send_control(
         to: target.name,
         recipients: None,
         id: Some(msg),
-        held: Vec::new(),
+        skipped: Vec::new(),
     })
 }
 
@@ -1846,7 +1848,7 @@ pub fn send(
                 }
             }
             check_focus(ctx, &me, None)?;
-            let (count, visible, held) = broadcast(ctx, &me, gid, body)?;
+            let (count, visible, skipped) = broadcast(ctx, &me, gid, body)?;
             tracing::info!(
                 from = me.name,
                 to,
@@ -1858,7 +1860,7 @@ pub fn send(
                 to: format!("@{group}"),
                 recipients: Some(visible as u32),
                 id: None,
-                held,
+                skipped,
             });
         }
 
@@ -1903,12 +1905,31 @@ pub fn send(
             to: target.name,
             recipients: None,
             id: Some(msg),
-            held: Vec::new(),
+            skipped: Vec::new(),
         })
     })
 }
 
-/// Start or end focus mode for one live agent; only its owner may.
+fn focus_notice(owner: &str, focused: bool) -> String {
+    if focused {
+        format!(
+            "Focus mode is on: {owner} has put you in focus mode for a one-on-one \
+             conversation. Until {owner} ends it, only {owner}'s messages and answers to \
+             your blockers reach you. Other agents' and humans' direct messages are \
+             refused, group messages are not delivered to you, and you can message only \
+             {owner}."
+        )
+    } else {
+        format!(
+            "Focus mode is off: {owner} ended it. Other agents, humans and groups can \
+             reach you again, and you can message them. Group messages sent during focus \
+             were not delivered to you; bbs_search finds them if you need to catch up."
+        )
+    }
+}
+
+/// Start or end focus mode for one live agent; only its owner may. The agent
+/// is told by a direct message from the owner.
 pub fn set_focus(
     conn: &mut Connection,
     caller: &Caller,
@@ -1925,6 +1946,12 @@ pub fn set_focus(
         let now = req.focused.then_some(ctx.now_s.as_str());
         let changed = db::set_focus(ctx.conn, agent.id, now)?;
         if changed {
+            // Tell the agent, as a direct message from its owner, so its
+            // harness and model both know why mail stops or resumes.
+            let notice = focus_notice(&me.name, req.focused);
+            let msg = db::insert_message(ctx.conn, &me, None, &notice, &ctx.now_s)?;
+            db::insert_delivery(ctx.conn, msg, db::Kind::Agent, agent.id)?;
+            db::record_human_conversation(ctx.conn, agent.id, me.id, &ctx.now_s)?;
             tracing::info!(
                 by = me.name,
                 agent = agent.name,
@@ -2937,9 +2964,17 @@ pub fn fire_timers(
                 continue;
             }
         };
-        let msg = db::insert_message(&tx, &timer.creator, None, &timer.body, &now_s)?;
-        db::insert_delivery(&tx, msg, db::Kind::Agent, timer.target_id)?;
-        db::set_message_timer(&tx, msg, timer.id)?;
+        // A timer another agent set for a focused agent is skipped, like its
+        // group mail; the schedule continues. The agent's own timers fire.
+        let skip =
+            timer.creator.id != timer.target_id && db::focused_at(&tx, timer.target_id)?.is_some();
+        if skip {
+            tracing::info!(id = timer.id, "timer skipped: target in focus mode");
+        } else {
+            let msg = db::insert_message(&tx, &timer.creator, None, &timer.body, &now_s)?;
+            db::insert_delivery(&tx, msg, db::Kind::Agent, timer.target_id)?;
+            db::set_message_timer(&tx, msg, timer.id)?;
+        }
         match schedule.and_then(|s| s.next_after(now)) {
             Some(next) => db::set_timer_next_run(&tx, timer.id, &fmt_time(next))?,
             None => db::delete_timer(&tx, timer.id)?,
@@ -5802,7 +5837,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_mode_keeps_an_agent_to_its_owner_and_holds_group_mail() {
+    fn focus_mode_keeps_an_agent_to_its_owner_and_skips_group_mail() {
         let (mut conn, will, [mateo, zed, _lu]) = board();
         ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
         let ada = Caller {
@@ -5818,6 +5853,7 @@ mod tests {
             set_group_writer(&mut conn, &will, req).unwrap();
         }
         inbox(&mut conn, &mateo);
+        inbox(&mut conn, &zed);
         let focus = |conn: &mut Connection, by: &Caller, focused: bool| {
             let req = proto::SetFocusRequest {
                 agent: "mateo".into(),
@@ -5873,7 +5909,18 @@ mod tests {
                 .any(|a| a.agent == "Mateo" && a.focused_at.as_deref() == Some(&since))
         );
 
-        // Other agents and humans are refused; broadcasts are accepted and held.
+        // The agent was told, by a message from its owner.
+        let notice = inbox(&mut conn, &mateo);
+        assert_eq!(notice.len(), 1, "{notice:?}");
+        assert_eq!(notice[0].from_name, "will");
+        assert!(
+            notice[0]
+                .body
+                .starts_with("Focus mode is on: will has put you")
+        );
+
+        // Other agents and humans are refused; broadcasts, the owner's too,
+        // are accepted but not sent to the focused member.
         for from in [&zed, &ada] {
             let err = try_send(&mut conn, from, "Mateo").unwrap_err();
             let err = format!("{err:#}");
@@ -5886,10 +5933,29 @@ mod tests {
                 "{err}"
             );
         }
-        let r = try_send(&mut conn, &zed, "@crew").unwrap();
-        assert_eq!(r.held, ["Mateo"]);
+        assert_eq!(
+            try_send(&mut conn, &zed, "@crew").unwrap().skipped,
+            ["Mateo"]
+        );
+        assert_eq!(
+            try_send(&mut conn, &will, "@crew").unwrap().skipped,
+            ["Mateo"]
+        );
+        // Zed still got will's broadcast.
+        assert_eq!(bodies(&mut conn, &zed), ["to @crew"]);
+        // Others' timers are skipped while the agent's own still fire.
+        for (by, body) in [(&zed, "zed's timer"), (&mateo, "own timer")] {
+            let req = proto::TimerAddRequest {
+                agent: "Mateo".into(),
+                when: "in 1m".into(),
+                body: body.into(),
+            };
+            timer_add(&mut conn, by, req, TimerLimits::default()).unwrap();
+        }
+        fire_timers(&mut conn, Utc::now() + chrono::Duration::minutes(2)).unwrap();
         try_send(&mut conn, &will, "Mateo").unwrap();
-        assert_eq!(bodies(&mut conn, &mateo), ["to Mateo"]);
+        // The timer fired at its future time, so it sorts last.
+        assert_eq!(bodies(&mut conn, &mateo), ["to Mateo", "own timer"]);
         assert!(
             !db::has_unread(
                 &conn,
@@ -5914,13 +5980,21 @@ mod tests {
         };
         auto_reply(&mut conn, &mateo, req).unwrap();
 
-        // Ending focus delivers the held broadcast, and mail flows again.
+        // Ending focus tells the agent, nothing skipped arrives late, and mail
+        // flows again.
         let r = focus(&mut conn, &will, false).unwrap();
         assert_eq!((r.changed, r.focused_at), (true, None));
         assert!(!focus(&mut conn, &will, false).unwrap().changed);
-        assert_eq!(bodies(&mut conn, &mateo), ["to @crew"]);
+        let after = bodies(&mut conn, &mateo);
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert!(after[0].starts_with("Focus mode is off: will ended it."));
         try_send(&mut conn, &zed, "Mateo").unwrap();
-        assert!(try_send(&mut conn, &zed, "@crew").unwrap().held.is_empty());
+        assert!(
+            try_send(&mut conn, &zed, "@crew")
+                .unwrap()
+                .skipped
+                .is_empty()
+        );
         try_send(&mut conn, &mateo, "Zed").unwrap();
 
         // Retirement ends focus.
@@ -5976,6 +6050,8 @@ mod tests {
             focused: true,
         };
         set_focus(&mut conn, &will, req).unwrap();
+        // The focus notice.
+        assert_eq!(inbox(&mut conn, &mateo).len(), 1);
 
         let req = proto::AnswerBlockerRequest {
             id,

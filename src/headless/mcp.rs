@@ -189,10 +189,10 @@ impl Tools {
                     Some(n) => format!("Sent to {} ({n} recipients).", r.to),
                     None => format!("Sent to {}.", r.to),
                 };
-                if !r.held.is_empty() {
+                if !r.skipped.is_empty() {
                     out.push_str(&format!(
-                        " In focus mode, receiving it when focus ends: {}.",
-                        r.held.join(", ")
+                        " Not sent to members in focus mode: {}.",
+                        r.skipped.join(", ")
                     ));
                 }
                 out

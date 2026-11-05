@@ -740,17 +740,17 @@ pub fn share_group(conn: &Connection, a: i64, b: i64) -> Result<bool> {
     Ok(n > 0)
 }
 
-/// The group's live members in focus mode, by name.
-pub fn focused_member_names(conn: &Connection, group_id: i64) -> Result<Vec<String>> {
+/// The group's live members in focus mode: (id, name).
+pub fn focused_members(conn: &Connection, group_id: i64) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT a.name FROM group_members m JOIN agents a ON a.id = m.agent_id
+        "SELECT a.id, a.name FROM group_members m JOIN agents a ON a.id = m.agent_id
          WHERE m.group_id = ?1 AND a.retired_at IS NULL AND a.focused_at IS NOT NULL
          ORDER BY lower(a.name)",
     )?;
-    let names = stmt
-        .query_map(params![group_id], |r| r.get(0))?
+    let members = stmt
+        .query_map(params![group_id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    Ok(names)
+    Ok(members)
 }
 
 pub fn group_member_ids(conn: &Connection, group_id: i64) -> Result<Vec<i64>> {
@@ -1542,7 +1542,8 @@ pub fn mark_seen(conn: &Connection, human: i64, agent: i64, through_id: i64) -> 
 
 /// Mail a focused agent may take: its owner's direct messages (controls
 /// included), its own timers, and answers to its blockers from any human.
-/// The rest waits until focus ends. Expects the message as `m`, the recipient
+/// Mail sent during focus is refused or not delivered at all; this holds what
+/// was already waiting when focus began until it ends. Expects the message as `m`, the recipient
 /// kind as ?1 and its id as ?2.
 const FOCUS_ALLOWS: &str = "(?1 != 'agent'
          OR (SELECT focused_at FROM agents WHERE id = ?2) IS NULL

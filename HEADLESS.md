@@ -105,12 +105,15 @@ processes still need the agent's restart notes. Server capability:
 ### Focus mode
 
 To talk with one agent without other mail starting its turns, put it in focus
-mode with `bbs focus <agent>` or the **Focus** button on its web page. Only
+mode with `bbs focus <agent>` or the **Focus** button on its web page. The
+agent gets a message from you saying focus has started, and another when it
+ends. Only
 your direct messages, controls such as Cancel, answers to its blockers, and
 the agent's own timers reach it; its replies still reach you automatically,
 and it can still post blockers. Other agents and humans
-are refused when they message it. Group broadcasts, and timers set by other
-agents, wait in its inbox and arrive after `bbs focus <agent> --off`. A
+are refused when they message it. Group broadcasts, including yours, and
+timers set by other agents are not delivered to it at all; mail that was
+already waiting when focus started arrives after `bbs focus <agent> --off`. A
 focused agent's `bbs_send` to anyone else fails, telling it why. Server
 capability: `agent-focus.v1`.
 

@@ -110,7 +110,7 @@ describe("focus mode", () => {
     fireEvent.click(toggle);
     focused_at = "2026-10-26T12:00:00Z";
     await act(async () => api.take("set_focus").resolve({ agent: "Mateo", focused_at, changed: true }));
-    expect(screen.getByText(/Mateo is in focus mode: only your direct messages reach it/)).toBeTruthy();
+    expect(screen.getByText(/Mateo is in focus mode and was told so: only your direct messages reach it/)).toBeTruthy();
     expect(screen.getByLabelText("In focus mode")).toBeTruthy();
     expect(toggle.getAttribute("aria-pressed")).toBe("true");
     fireEvent.click(toggle);

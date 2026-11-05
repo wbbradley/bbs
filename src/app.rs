@@ -272,12 +272,12 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 .await?;
             match (off, r.changed) {
                 (false, true) => format!(
-                    "{} is in focus mode: only your direct messages reach it, and it can message only you.\n",
+                    "{} is in focus mode and was told so: only your direct messages reach it, and it can message only you.\n",
                     r.agent
                 ),
                 (false, false) => format!("{} is already in focus mode.\n", r.agent),
                 (true, true) => format!(
-                    "{} left focus mode; mail held during focus is now delivered.\n",
+                    "{} left focus mode and was told so; others can reach it again.\n",
                     r.agent
                 ),
                 (true, false) => format!("{} is not in focus mode.\n", r.agent),
@@ -294,11 +294,11 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 Some(n) => format!("Sent to {} ({n} recipients).\n", r.to),
                 None => format!("Sent to {}.\n", r.to),
             };
-            if !r.held.is_empty() {
+            if !r.skipped.is_empty() {
                 let _ = writeln!(
                     out,
-                    "In focus mode, receiving it when focus ends: {}.",
-                    r.held.join(", ")
+                    "Not sent to members in focus mode: {}.",
+                    r.skipped.join(", ")
                 );
             }
             out

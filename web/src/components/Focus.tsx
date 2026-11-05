@@ -39,8 +39,8 @@ export function FocusToggle({
       await rpc("set_focus", { agent, focused: !since });
       onNotice(
         since
-          ? `${agent} left focus mode; mail held during focus is now delivered.`
-          : `${agent} is in focus mode: only your direct messages reach it, and it can message only you.`,
+          ? `${agent} left focus mode and was told so; others can reach it again.`
+          : `${agent} is in focus mode and was told so: only your direct messages reach it, and it can message only you.`,
       );
       board.refreshAgents();
     } catch (e) {
@@ -57,8 +57,8 @@ export function FocusToggle({
       aria-pressed={!!since}
       title={
         since
-          ? "End focus mode and deliver the mail held during it"
-          : "Focus mode: refuse other senders, hold group mail, and keep this agent from messaging anyone but you"
+          ? "End focus mode"
+          : "Focus mode: refuse other senders, skip group mail, and keep this agent from messaging anyone but you"
       }
     >
       ◎ Focus
