@@ -1,4 +1,5 @@
 import type { Activity, Message } from "./types";
+import { span } from "./util";
 
 // A headless agent's shared activity log as timeline entries, after
 // src/ui/activity.rs: thoughts, text, one line per tool call, and events.
@@ -20,7 +21,7 @@ export type ActivityEntry =
   | { kind: "prompt"; id: number; at: string; text: string; mailIds: number[] }
   | { kind: "steer"; id: number; at: string; text: string; mailIds: number[] }
   | { kind: "mail"; id: number; at: string; from: string[]; queued: boolean; mailIds: number[] }
-  | { kind: "turn_end"; id: number; at: string; reason: string }
+  | { kind: "turn_end"; id: number; at: string; reason: string; took: string }
   | { kind: "event"; id: number; at: string; text: string; level: "info" | "warning" | "error" };
 
 type Rec = Record<string, unknown>;
@@ -56,6 +57,8 @@ const RESETS = new Set(["start", "session", "prompt", "turn_end", "turn_error", 
 export function buildActivity(records: Activity[]): ActivityEntry[] {
   const out: ActivityEntry[] = [];
   const running = new Map<string, { entry: Extract<ActivityEntry, { kind: "tool" }>; started: number }>();
+  // When the current turn's prompt arrived, for the turn end's duration.
+  let turnStart: string | null = null;
   for (const a of records) {
     let r: Rec;
     try {
@@ -105,6 +108,7 @@ export function buildActivity(records: Activity[]): ActivityEntry[] {
         });
         break;
       case "prompt":
+        turnStart = a.created_at;
         out.push({ ...base, kind: "prompt", text: mailPart(str(r, "text")), mailIds: ids(r, "mail_ids") });
         break;
       case "steer":
@@ -157,9 +161,13 @@ export function buildActivity(records: Activity[]): ActivityEntry[] {
       case "permission":
         out.push({ ...base, kind: "event", level: "warning", text: `permission ${rest(r)}` });
         break;
-      case "turn_end":
-        out.push({ ...base, kind: "turn_end", reason: str(r, "stop_reason") });
+      case "turn_end": {
+        const secs = turnStart ? (Date.parse(a.created_at) - Date.parse(turnStart)) / 1000 : NaN;
+        const took = Number.isNaN(secs) ? "" : span(secs);
+        out.push({ ...base, kind: "turn_end", reason: str(r, "stop_reason"), took });
+        turnStart = null;
         break;
+      }
       case "turn_error":
       case "error":
         out.push({ ...base, kind: "event", level: "error", text: `${event}: ${str(r, "message")}` });
