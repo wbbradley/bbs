@@ -74,7 +74,6 @@ describe("blockers", () => {
       fireEvent.click(screen.getByText("Send answer"));
     } else {
       fireEvent.click(screen.getByText("Cancel blocker"));
-      fireEvent.click(screen.getByText("Yes, cancel it"));
     }
     const out = api.take(`${kind}_blocker`);
     expect(screen.getByText("question 1?", { selector: ".md p" })).toBeTruthy();

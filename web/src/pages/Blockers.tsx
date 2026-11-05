@@ -302,12 +302,8 @@ function BlockerCard({
   const draftKey = `blocker:${b.root_id}`;
   const [answer, setAnswer] = useState(() => loadDraft(draftKey, owner));
   const [selection, setSelection] = useState(() => loadSelection(b.id, owner));
-  const [confirmCancel, setConfirmCancel] = useState(false);
   useEffect(() => saveDraft(draftKey, answer, owner), [draftKey, answer, owner]);
   useEffect(() => saveSelection(b.id, selection, owner), [b.id, selection, owner]);
-  useEffect(() => {
-    if (guarded) setConfirmCancel(false);
-  }, [guarded]);
   const sending = kept?.state === "sending";
   const unconfirmed = kept?.state === "unconfirmed";
   // While a write is out or unsettled, its answer is the one shown, unchanged.
@@ -396,24 +392,11 @@ function BlockerCard({
               Discuss with {creatorAgent.name}
             </Link>
           )}
-          {open &&
-            b.can_cancel &&
-            !unconfirmed &&
-            (confirmCancel ? (
-              <>
-                <span className="warning-text">Cancel this blocker? No mail is sent.</span>
-                <button className="btn danger" disabled={sending || guarded} onClick={() => onWrite(b, "cancel")}>
-                  Yes, cancel it
-                </button>
-                <button className="btn" disabled={sending} onClick={() => setConfirmCancel(false)}>
-                  Back
-                </button>
-              </>
-            ) : (
-              <button className="btn danger" disabled={sending || guarded} onClick={() => setConfirmCancel(true)}>
-                Cancel blocker
-              </button>
-            ))}
+          {open && b.can_cancel && !unconfirmed && (
+            <button className="btn danger" disabled={sending || guarded} onClick={() => onWrite(b, "cancel")}>
+              Cancel blocker
+            </button>
+          )}
           {kept && !sending && (
             <button className="btn ghost" onClick={() => onDismiss(b.root_id)}>
               Dismiss
