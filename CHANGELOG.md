@@ -8,8 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.19.0 - 2026-11-05
+
 ### Added
 
+- In the web UI, agent and group names in blocker headers, blocker answer
+  lines and message card headers link to that agent's conversation or that
+  group's page. A name that would link to the page already shown stays plain.
 - The web Blockers page has a Closed mode for browsing answered and cancelled
   blockers, with their recorded answers, actor and time, newest questions first.
   The additive `blockers-closed.v1` list API filters closed records before paging
