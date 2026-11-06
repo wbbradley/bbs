@@ -328,6 +328,10 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     // Tool calls in the running turn, and whether its prompt carried the goal.
     let mut turn_tools: HashSet<String> = HashSet::new();
     let mut goal_prompt = false;
+    // The goal (by its set time) when the running turn started, and the goal
+    // as it was before that turn's prompt counted it.
+    let mut turn_goal: Option<String> = None;
+    let mut before_prompt: Option<Goal> = None;
     // Restart preparation holds goal prompts until then.
     let mut goal_hold: Option<Instant> = None;
     let mut native_warned = false;
@@ -401,16 +405,27 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             // the goal follows in the next turn.
             let alone = matches!(active_mail.as_slice(), [m] if owner_direct(m, &owner));
             goal_prompt = false;
+            turn_goal = state.goal.as_ref().map(|g| g.set_at.clone());
+            before_prompt = state.goal.clone();
             if goal_due
                 && !alone
                 && let Some(g) = state.goal.as_mut()
             {
-                if !active_mail.is_empty() {
-                    prompt.push_str("\n\n");
+                if g.spent() {
+                    goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
+                } else {
+                    if !active_mail.is_empty() {
+                        prompt.push_str("\n\n");
+                    }
+                    prompt.push_str(&g.prompt());
+                    goal_prompt = true;
+                    goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
                 }
-                prompt.push_str(&g.prompt());
-                goal_prompt = true;
-                goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
+            }
+            if active_mail.is_empty() && !goal_prompt {
+                // The goal stopped instead of prompting, and there is no mail.
+                preamble = active_preamble.take();
+                continue;
             }
             turn_tools.clear();
             log.event(
@@ -527,10 +542,20 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 if let Err(err) = drained { break Err(err); }
                 if let Err(err) = outbox.seal() { break Err(err); }
                 let tools = matches!(done, Ok(Ok(_))).then_some(turn_tools.len());
-                if goal_turn_ended(&mut state.goal, &agent_dir.dir, &mut log, goal_prompt.then_some(tools)) {
+                let not_started = matches!(&done, Ok(Err(e)) if e.downcast_ref::<PromptNotStarted>().is_some());
+                let same_goal = state.goal.as_ref().map(|g| &g.set_at) == turn_goal.as_ref();
+                if not_started && goal_prompt && same_goal {
+                    // The prompt was never sent: it does not count.
+                    state.goal = before_prompt.take();
+                    goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
+                }
+                let turn = (goal_prompt && !not_started).then_some(tools);
+                if goal_turn_ended(&mut state.goal, &agent_dir.dir, &mut log, turn_goal.as_deref(), turn) {
                     goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
                 }
                 goal_prompt = false;
+                turn_goal = None;
+                before_prompt = None;
                 if !native_warned && goal_active && agent_harness.native_goal_active() {
                     native_warned = true;
                     log.event("warning", json!({ "message": "a Codex native goal started while the runner has a goal; its continuation turns count as one goal turn" }));
@@ -796,7 +821,8 @@ fn goal_control(
         proto::Control::GoalSet => {
             if harness.native_goal_active() {
                 return refused(
-                    "goal not set: this Codex thread has a native goal running; pause or clear it first",
+                    "goal not set: this Codex thread has a native goal running; stop it with \
+                     `bbs headless cancel <agent>` first",
                 );
             }
             *goal = Some(Goal::new(message.body.clone(), owner.to_string(), budget));
@@ -828,12 +854,14 @@ fn goal_control(
 
 /// Apply the agent's updates when a turn ends; then, when its prompt carried
 /// the goal, account for the turn: `Some(tools)` with the tool calls a
-/// completed turn made, `Some(None)` for a failed one. Returns whether the
-/// goal changed.
+/// completed turn made, `Some(None)` for a failed one. Both apply only to the
+/// goal the turn started with (`started`, its set time): a goal set during
+/// the turn takes nothing from it. Returns whether the goal changed.
 fn goal_turn_ended(
     goal: &mut Option<Goal>,
     dir: &Path,
     log: &mut Log,
+    started: Option<&str>,
     turn: Option<Option<usize>>,
 ) -> bool {
     let updates = goal::take_updates(dir).unwrap_or_else(|err| {
@@ -843,7 +871,7 @@ fn goal_turn_ended(
         );
         Vec::new()
     });
-    let Some(g) = goal.as_mut() else {
+    let Some(g) = goal.as_mut().filter(|g| Some(g.set_at.as_str()) == started) else {
         return false;
     };
     let mut changed = false;
@@ -1316,6 +1344,58 @@ mod tests {
         assert_eq!(records[0]["effort_request"], 3);
         assert_eq!(records[1]["event"], "text");
         assert_eq!(records[1]["text"], "delivered");
+    }
+
+    #[test]
+    fn a_goal_set_during_a_turn_takes_nothing_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(&dir.path().join("log")).unwrap();
+        let old = Goal::new("old".into(), "will".into(), 5);
+        let mut goal = Some(Goal::new("new".into(), "will".into(), 5));
+        let new_id = goal.as_ref().unwrap().set_at.clone();
+        // The agent, still on the old objective, completes "the" goal: the
+        // tool stamps the update with the goal saved now, the new one.
+        goal::append_update(
+            dir.path(),
+            &goal::Update {
+                goal: new_id.clone(),
+                kind: goal::UpdateKind::Complete {
+                    evidence: "old work".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(!goal_turn_ended(
+            &mut goal,
+            dir.path(),
+            &mut log,
+            Some(&old.set_at),
+            Some(Some(0))
+        ));
+        let g = goal.as_ref().unwrap();
+        assert_eq!(
+            (g.status, g.idle_turns, g.next),
+            (goal::Status::Active, 0, goal::Next::New)
+        );
+        // The same update in a turn that started with the new goal applies.
+        goal::append_update(
+            dir.path(),
+            &goal::Update {
+                goal: new_id.clone(),
+                kind: goal::UpdateKind::Complete {
+                    evidence: "done".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(goal_turn_ended(
+            &mut goal,
+            dir.path(),
+            &mut log,
+            Some(&new_id),
+            Some(Some(1))
+        ));
+        assert_eq!(goal.unwrap().status, goal::Status::Complete);
     }
 
     #[test]

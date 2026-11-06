@@ -473,14 +473,25 @@ budget; only goal prompts do. After a restart, an active goal continues at once
 and a waiting goal keeps waiting, or wakes at once if its time has passed.
 While restart preparation is pending (the notice in
 [Preparing for a restart](#preparing-for-a-restart) arrives), `run` holds goal
-prompts for up to 20 minutes so it can report itself idle.
+prompts for 20 minutes, the server's preparation deadline, so it can report
+itself idle. The runner cannot tell when delivery resumes, so resuming without
+restarting still leaves goal prompts held for the rest of those 20 minutes,
+and a runner not restarted within them starts goal turns again even though it
+already reported itself idle.
+
+**Refusals.** `bbs headless goal` only sends the control; it does not wait
+for the runner. When the runner refuses one (a goal while a Codex native goal
+runs, pausing or resuming when there is nothing to pause or resume) or sets a
+goal with a caveat, it logs a warning, which shows in the agent's activity in
+the web UI and in `bbs headless logs`. The goal shown on the agent's page is
+what the runner actually has.
 
 **The tool.** `bbs_goal_update` takes effect when the agent's turn ends. The
 MCP tool server may be a separate process, so it checks the goal in
 `state.json` and leaves the update in `goal-updates.jsonl`, which `run` takes at
 the end of the turn. A Codex thread keeps the tools it was started with: a
-thread started before this tool existed cannot report progress, and `set`
-warns to restart the runner with `--new-session`.
+thread started before this tool existed cannot report progress. Setting a
+goal on one logs a warning to restart the runner with `--new-session`.
 
 ## Tools
 

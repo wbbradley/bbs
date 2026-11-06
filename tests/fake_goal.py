@@ -10,6 +10,7 @@ restart. Once the script runs out, it blocks the goal. Actions:
   idle           make no tool call
   complete-bare  mark the goal complete without evidence (refused)
   complete       mark the goal complete with evidence
+  wait1s         wait for one second
   wait2s         wait for two seconds
   block          block the goal
   waitcancel     wait for session/cancel, then end the turn cancelled
@@ -110,6 +111,8 @@ def main():
                 tool("bbs_goal_update", {"status": "complete"})
             elif action == "complete":
                 tool("bbs_goal_update", {"status": "complete", "evidence": "tests pass"})
+            elif action == "wait1s":
+                tool("bbs_goal_update", {"status": "waiting", "for": "1s", "reason": "deploy"})
             elif action == "wait2s":
                 tool("bbs_goal_update", {"status": "waiting", "for": "2s", "reason": "deploy"})
             elif action == "block":

@@ -4190,6 +4190,15 @@ fn headless_goal_stalls_on_idle_turns_and_is_limited_by_its_budget() {
 }
 
 #[test]
+fn headless_goal_waiting_every_turn_still_uses_its_budget() {
+    let (bbs, _run) = goal_runner("goal-wait-budget", "wait1s,wait1s,wait1s,wait1s", 2);
+    bbs.ok(&["headless", "goal", "Zed", "set", "Keep checking"]);
+    wait_goal_status(&bbs, "limited");
+    assert_eq!(goal_prompts(&bbs).len(), 2);
+    assert_eq!(headless_state(&bbs, "Zed")["goal"]["iteration"], 2);
+}
+
+#[test]
 fn headless_goal_wakes_on_mail_and_pauses_on_cancel() {
     let (bbs, _run) = goal_runner("goal-mail", "block,waitcancel", 50);
     let (_, tp) = bbs.register();

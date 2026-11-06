@@ -139,8 +139,10 @@ pub enum UpdateKind {
     Waiting { wake_at: String, reason: String },
 }
 
+/// A goal's set time, which is also its identity for updates: to the
+/// microsecond, so two goals set within one second differ.
 fn now_s() -> String {
-    rfc3339(Utc::now())
+    Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
 fn rfc3339(t: DateTime<Utc>) -> String {
@@ -285,6 +287,18 @@ impl Goal {
             let reason = format!("used its budget of {} turns", self.budget);
             self.set(Status::Limited, Changer::Runner, &reason);
         }
+        true
+    }
+
+    /// Before a goal prompt: an active goal that has used its budget stops as
+    /// limited instead. Waits and blocks end turns early, so the check after
+    /// each turn alone would miss them. Returns whether it stopped.
+    pub fn spent(&mut self) -> bool {
+        if self.status != Status::Active || self.iteration < self.budget {
+            return false;
+        }
+        let reason = format!("used its budget of {} turns", self.budget);
+        self.set(Status::Limited, Changer::Runner, &reason);
         true
     }
 
@@ -591,6 +605,7 @@ mod tests {
         assert!(g.turn_ended(Some(1)));
         assert_eq!(g.status, Status::Limited);
         assert_eq!(g.changed_by, Changer::Runner);
+        assert!(!g.spent(), "only an active goal stops");
         // Resuming a limited goal starts a fresh budget.
         g.resume().unwrap();
         assert_eq!((g.status, g.iteration), (Status::Active, 0));
@@ -598,6 +613,31 @@ mod tests {
             g.prompt()
                 .starts_with("[bbs goal · continuation 1 · budget 1/3 turns]")
         );
+    }
+
+    #[test]
+    fn waits_do_not_escape_the_budget() {
+        let mut g = goal();
+        for _ in 0..3 {
+            assert!(!g.spent());
+            g.prompt();
+            let wait = UpdateKind::Waiting {
+                wake_at: "2026-11-06T09:00:00Z".into(),
+                reason: "r".into(),
+            };
+            g.apply(&update(&g, wait));
+            assert!(!g.turn_ended(Some(1)), "a waiting goal is not accounted");
+            assert!(g.wake());
+        }
+        assert!(g.spent());
+        assert_eq!(g.status, Status::Limited);
+    }
+
+    #[test]
+    fn goals_set_in_one_second_differ() {
+        let a = Goal::new("a".into(), "will".into(), 1);
+        let b = Goal::new("b".into(), "will".into(), 1);
+        assert_ne!(a.set_at, b.set_at);
     }
 
     #[test]
