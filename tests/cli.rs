@@ -2798,6 +2798,86 @@ fn timers_are_set_listed_fired_and_removed(mode: Mode) {
     assert!(bbs.ok(&["--token", &tb, "timer", "list"]).is_empty());
 }
 
+fn timers_are_edited_and_cancelled_with_notices(mode: Mode) {
+    let bbs = Bbs::with_mode("timer-edits", mode);
+    let (a, ta) = bbs.register();
+    bbs.ok(&["timer", "add", &a, "every 1h", "check the build"]);
+
+    // A human's edit tells the agent what changed, but not the new text.
+    let out = bbs.ok(&[
+        "timer",
+        "edit",
+        "1",
+        "--text",
+        "check the deploy",
+        "--next-run",
+        "2099-01-01T09:00:00Z",
+        "--repeat",
+        "every 2h",
+    ]);
+    assert_eq!(
+        out,
+        format!("Timer 1 for {a}: every 2h, next at 2099-01-01T09:00:00Z.\n"),
+    );
+    let mail = bbs.ok(&["--token", &ta, "read"]);
+    assert!(
+        mail.contains(&format!(
+            "from will (human) to {a} (timer 1):\nTimer #1 was edited by will: text changed; \
+             repeat \"every 2h\" (was \"every 1h\"); next run 2099-01-01T09:00:00Z"
+        )),
+        "{mail}"
+    );
+    assert!(!mail.contains("check the deploy"), "{mail}");
+
+    // A changed repeat alone starts the new schedule from now; clearing it
+    // makes the timer one-time and keeps its next run.
+    let out = bbs.ok(&["timer", "edit", "1", "--repeat", "0 9 * * *"]);
+    assert!(out.contains("0 9 * * *, next at "), "{out}");
+    assert!(!out.contains("2099"), "{out}");
+    let out = bbs.ok(&["timer", "edit", "1", "--repeat", ""]);
+    assert!(out.contains("once at "), "{out}");
+    let mail = bbs.ok(&["--token", &ta, "read"]);
+    assert!(mail.contains("repeat once (was \"0 9 * * *\")"), "{mail}");
+
+    for (args, why) in [
+        (vec!["timer", "edit", "1"], "nothing to change"),
+        (
+            vec!["timer", "edit", "1", "--repeat", "in 1h"],
+            "invalid repeat",
+        ),
+        (
+            vec!["timer", "edit", "1", "--repeat", "every 1m"],
+            "shortest interval is 5m",
+        ),
+        (
+            vec!["timer", "edit", "1", "--next-run", "2001-01-01T00:00:00Z"],
+            "is in the past",
+        ),
+        (vec!["timer", "edit", "1", "--text", " "], "empty"),
+        (vec!["timer", "edit", "9", "--text", "x"], "no timer 9"),
+    ] {
+        let err = bbs.err(&args);
+        assert!(err.contains(why), "{args:?}: {err}");
+    }
+
+    // An agent's own edits and removals are not news to it.
+    bbs.ok(&["--token", &ta, "timer", "edit", "1", "--text", "mine"]);
+    bbs.ok(&["--token", &ta, "timer", "add", &a, "in 1h", "second"]);
+    bbs.ok(&["--token", &ta, "timer", "rm", "2"]);
+    assert!(bbs.ok(&["--token", &ta, "read"]).is_empty());
+
+    // A human's removal tells the agent which timer went.
+    bbs.ok(&["timer", "rm", "1"]);
+    let mail = bbs.ok(&["--token", &ta, "read"]);
+    assert!(
+        mail.contains(&format!(
+            "from will (human) to {a} (timer 1):\nTimer #1 was cancelled by will (once, due "
+        )),
+        "{mail}"
+    );
+    assert!(!mail.contains("mine"), "{mail}");
+}
+
 fn view_with_shows_what_a_name_sent_and_was_sent_directly(mode: Mode) {
     let bbs = Bbs::with_mode("view-with", mode);
     bbs.ok(&["group", "register", "crew"]);
@@ -4526,6 +4606,7 @@ both_modes!(
     view_filters_by_group_sender_owner_and_scope,
     view_with_shows_what_a_name_sent_and_was_sent_directly,
     timers_are_set_listed_fired_and_removed,
+    timers_are_edited_and_cancelled_with_notices,
     headless_agents_manage_timers_with_tools,
     headless_search_reads_the_corpus_and_pages_without_archiving,
     view_since_and_until_bound_history,

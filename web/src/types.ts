@@ -65,6 +65,17 @@ export interface Message {
   auto_reply: boolean | null;
 }
 
+export interface Timer {
+  id: number;
+  agent: string;
+  creator: string;
+  /** "every 1h 30m" or a cron expression; null for a one-time timer. */
+  repeat: string | null;
+  next_run: string;
+  body: string;
+  created_at: string | null;
+}
+
 export interface EffortChoice {
   value: string;
   label: string;

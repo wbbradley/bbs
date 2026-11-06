@@ -692,6 +692,9 @@ async fn rpc(
         "cancel_blocker" => cancel_blocker,
         "list_agent_notes" => list_agent_notes,
         "put_agent_note" => put_agent_note,
+        "timer_list" => timer_list,
+        "timer_update" => timer_update,
+        "timer_remove" => timer_remove,
     };
     Ok(finish(&app, &id, result))
 }

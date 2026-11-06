@@ -176,6 +176,24 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                     .await?;
                 format!("Removed timer {} for {}.\n", t.id, t.agent)
             }
+            TimerCommand::Edit {
+                id,
+                text,
+                next_run,
+                repeat,
+            } => {
+                if text.is_none() && next_run.is_none() && repeat.is_none() {
+                    anyhow::bail!("nothing to change: pass --text, --next-run or --repeat");
+                }
+                let req = proto::TimerUpdateRequest {
+                    id,
+                    body: text,
+                    next_run,
+                    repeat,
+                };
+                let t = backend.timer_update(req).await?;
+                format!("Timer {} for {}: {}.\n", t.id, t.agent, timer_schedule(&t))
+            }
         },
         Command::Group { command } => match command {
             GroupCommand::Register { group, description } => {

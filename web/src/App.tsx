@@ -10,6 +10,7 @@ import { FeedPage } from "./pages/Feed";
 import { GroupPage } from "./pages/Group";
 import { GroupsPage } from "./pages/Groups";
 import { SettingsPage } from "./pages/Settings";
+import { TimerPage, TimersPage } from "./pages/Timers";
 import { navigate, paths, usePath } from "./router";
 import { BoardProvider } from "./store";
 import type { Principal, ServerInfo } from "./types";
@@ -119,6 +120,8 @@ function Route({ path, openNav }: { path: string } & PageProps) {
       return name ? <GroupPage key={name} group={name} openNav={openNav} /> : <GroupsPage openNav={openNav} />;
     case "blockers":
       return <BlockersPage openNav={openNav} />;
+    case "timers":
+      return name ? <TimerPage key={name} id={Number(name)} openNav={openNav} /> : <TimersPage openNav={openNav} />;
     case "feed":
       return <FeedPage openNav={openNav} />;
     case "settings":
