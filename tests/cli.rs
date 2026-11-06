@@ -3364,13 +3364,16 @@ impl Drop for RunGuard {
     }
 }
 
-/// Whether `pid` is a running (not zombie) process.
+/// Whether `pid` is a running (not zombie) process. `ps` answers on both
+/// Linux and macOS, which has no `/proc`.
 fn running(pid: &str) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
-        s.rsplit(')')
-            .next()
-            .is_some_and(|rest| !rest.trim_start().starts_with('Z'))
-    })
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .is_ok_and(|out| {
+            let stat = String::from_utf8_lossy(&out.stdout);
+            out.status.success() && !stat.trim().is_empty() && !stat.trim_start().starts_with('Z')
+        })
 }
 
 /// Poll `f` until it returns `Some`, failing after 20 seconds.

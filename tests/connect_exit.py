@@ -70,7 +70,9 @@ def check_exit(binary, key, trailing_fragment=False):
         # Also cleans up a stuck BBS child on a failed regression.
         try:
             os.killpg(pid, signal.SIGKILL)
-        except ProcessLookupError:
+        # Nothing left to kill. macOS refuses (EPERM) rather than reporting
+        # no such group when its only member is the exited, unreaped child.
+        except (ProcessLookupError, PermissionError):
             pass
         os.waitpid(pid, 0)
         os.close(master)
