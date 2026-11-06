@@ -7,6 +7,7 @@ mod codex;
 mod codex_btw;
 mod context;
 mod effort;
+mod goal;
 mod harness;
 mod input;
 mod log;
@@ -43,11 +44,25 @@ pub async fn run(command: HeadlessCommand, dir: &Path, as_human: Option<&str>) -
         HeadlessCommand::Mcp {
             local_state_dir,
             auto_owner_reply,
+            goal_dir,
+            goal_max_wait,
         } => {
+            let goal = match goal_dir {
+                Some(dir) => Some(mcp::GoalTool {
+                    dir,
+                    max_wait: match goal_max_wait {
+                        Some(s) => humantime::parse_duration(&s)
+                            .map_err(|e| anyhow::anyhow!("invalid --goal-max-wait {s:?}: {e}"))?,
+                        None => goal::DEFAULT_MAX_WAIT,
+                    },
+                }),
+                None => None,
+            };
             mcp::run(
                 local_state_dir.as_deref().unwrap_or(dir),
                 local_state_dir.is_some(),
                 auto_owner_reply,
+                goal,
             )
             .await
         }

@@ -21,6 +21,13 @@ pub struct State {
     /// Without it, the thread was opened through ACP with an MCP server.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dynamic_tools: bool,
+    /// The runner's goal, if it has one (see goal.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<super::goal::Goal>,
+    /// The session was started with `bbs_goal_update` among its tools. A Codex
+    /// thread keeps the tools it started with.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub goal_tool: bool,
 }
 
 pub struct AgentDir {
@@ -88,7 +95,7 @@ impl AgentDir {
         self.dir.join("harness.stderr")
     }
 
-    fn state_path(&self) -> PathBuf {
+    pub fn state_path(&self) -> PathBuf {
         self.dir.join("state.json")
     }
 

@@ -424,6 +424,12 @@ pub enum HeadlessCommand {
         /// Runner has automatic owner delivery enabled.
         #[arg(long, hide = true)]
         auto_owner_reply: bool,
+        /// The agent's headless state directory, for `bbs_goal_update`.
+        #[arg(long, hide = true)]
+        goal_dir: Option<std::path::PathBuf>,
+        /// The longest wait `bbs_goal_update` accepts, like "24h".
+        #[arg(long, hide = true, requires = "goal_dir")]
+        goal_max_wait: Option<String>,
     },
 }
 

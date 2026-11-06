@@ -37,6 +37,12 @@ pub struct Settings {
     /// Turns that may fail in a row before `run` stops.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turn_errors: Option<NonZeroU32>,
+    /// Goal prompts per goal before the runner stops it as limited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_turn_budget: Option<NonZeroU32>,
+    /// The longest an agent may wait on its goal, like "24h".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_max_wait: Option<String>,
     /// `[headless.harness.<name>]` tables.
     #[serde(
         default,
@@ -209,6 +215,20 @@ impl Settings {
             None => Ok(DEFAULT_MIN_TURN_INTERVAL),
         }
     }
+
+    pub fn goal_turn_budget(&self) -> u32 {
+        self.goal_turn_budget
+            .map_or(super::goal::DEFAULT_BUDGET, NonZeroU32::get)
+    }
+
+    pub fn goal_max_wait(&self) -> Result<Duration> {
+        match &self.goal_max_wait {
+            Some(s) => {
+                humantime::parse_duration(s).with_context(|| format!("invalid goal_max_wait {s:?}"))
+            }
+            None => Ok(super::goal::DEFAULT_MAX_WAIT),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +261,8 @@ default_harness = "omp"
 mid_turn = "queue"
 min_turn_interval = "2m"
 max_turn_errors = 5
+goal_turn_budget = 20
+goal_max_wait = "6h"
 
 [headless.harness.omp]
 command = ["omp", "acp"]
@@ -258,6 +280,8 @@ env = { RUST_LOG = "warn" }
         assert_eq!(s.mid_turn, Some(MidTurn::Queue));
         assert_eq!(s.min_turn_interval().unwrap(), Duration::from_secs(120));
         assert_eq!(s.max_turn_errors.map(NonZeroU32::get), Some(5));
+        assert_eq!(s.goal_turn_budget(), 20);
+        assert_eq!(s.goal_max_wait().unwrap(), Duration::from_secs(6 * 3600));
         let (name, omp) = s.harness(None).unwrap();
         assert_eq!(name, "omp");
         assert_eq!(omp.kind, HarnessType::Acp);
@@ -275,6 +299,11 @@ env = { RUST_LOG = "warn" }
         let s = parse("[headless.harness.omp]\ncommand = [\"omp\", \"acp\"]\n").unwrap();
         assert_eq!(s.harness(None).unwrap().0, "omp");
         assert_eq!(s.min_turn_interval().unwrap(), DEFAULT_MIN_TURN_INTERVAL);
+        assert_eq!(s.goal_turn_budget(), super::super::goal::DEFAULT_BUDGET);
+        assert_eq!(
+            s.goal_max_wait().unwrap(),
+            super::super::goal::DEFAULT_MAX_WAIT
+        );
     }
 
     #[test]

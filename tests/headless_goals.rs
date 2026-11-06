@@ -400,3 +400,36 @@ async fn goal_completion_before_start_ack_preserves_continuation_output() {
         ["Early continuation output"]
     );
 }
+
+#[tokio::test]
+async fn a_runner_goal_is_refused_while_a_native_goal_runs() {
+    let rig = Rig::new("plain").await;
+    rig.send("START", None).await;
+    rig.wait("goal-wire.jsonl", |r| {
+        r.iter().any(|r| r["kind"] == "waiting")
+    })
+    .await;
+    rig.send("Ship it", Some(proto::Control::GoalSet)).await;
+    let log = ".local/state/bbs/headless/goaltest/log.jsonl";
+    rig.wait(log, |r| {
+        r.iter().any(|r| {
+            r["event"] == "warning"
+                && r["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("native goal running"))
+        })
+    })
+    .await;
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            rig.home
+                .path()
+                .join(".local/state/bbs/headless/goaltest/state.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(state["goal"].is_null(), "{state}");
+    // A fresh thread is started with the goal tool.
+    assert_eq!(state["goal_tool"], true);
+}

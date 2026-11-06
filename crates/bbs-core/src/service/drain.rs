@@ -7,7 +7,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::{Caller, Ctx, fmt_time, with_ctx};
 use crate::{db, proto};
 
-const NOTICE: &str = "BBS restart preparation: delivery of new messages is paused. Finish your active turns and queued work, then become idle. Your headless process may be restarted. Record any long-running background tasks that you will need to restart or check after restart. Delivery resumes only when your human explicitly resumes it.";
+/// The message every owned agent gets when its human starts restart preparation.
+pub const NOTICE: &str = "BBS restart preparation: delivery of new messages is paused. Finish your active turns and queued work, then become idle. Your headless process may be restarted. Record any long-running background tasks that you will need to restart or check after restart. Delivery resumes only when your human explicitly resumes it.";
 
 pub fn agent_drain(
     conn: &mut Connection,

@@ -27,7 +27,12 @@ const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// ...from this far back, when it gives no start.
 const DEFAULT_HISTORY_SINCE: &str = "7d";
 
-pub async fn run(dir: &Path, local: bool, auto_owner_reply: bool) -> Result<()> {
+pub async fn run(
+    dir: &Path,
+    local: bool,
+    auto_owner_reply: bool,
+    goal: Option<GoalTool>,
+) -> Result<()> {
     if local && !dir.is_absolute() {
         bail!("--local-state-dir must be an absolute path");
     }
@@ -38,6 +43,7 @@ pub async fn run(dir: &Path, local: bool, auto_owner_reply: bool) -> Result<()> 
     let mut tools = Tools::new(dir, token);
     tools.local = local;
     tools.auto_owner_reply = auto_owner_reply;
+    tools.goal = goal;
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
     let mut line = String::new();
@@ -67,6 +73,14 @@ pub async fn run(dir: &Path, local: bool, auto_owner_reply: bool) -> Result<()> 
     }
 }
 
+/// Where `bbs_goal_update` finds the runner's goal and leaves updates for it.
+#[derive(Clone)]
+pub struct GoalTool {
+    /// The agent's headless state directory.
+    pub dir: std::path::PathBuf,
+    pub max_wait: std::time::Duration,
+}
+
 /// The agent's BBS tools, acting with its token.
 pub struct Tools {
     dir: std::path::PathBuf,
@@ -74,6 +88,7 @@ pub struct Tools {
     backend: Option<Backend>,
     local: bool,
     auto_owner_reply: bool,
+    goal: Option<GoalTool>,
 }
 
 impl Tools {
@@ -84,6 +99,7 @@ impl Tools {
             backend: None,
             local: false,
             auto_owner_reply: false,
+            goal: None,
         }
     }
 
@@ -95,12 +111,33 @@ impl Tools {
             backend: None,
             local: self.local,
             auto_owner_reply: self.auto_owner_reply,
+            goal: self.goal.clone(),
         }
     }
 
     pub fn auto_owner_reply(mut self) -> Self {
         self.auto_owner_reply = true;
         self
+    }
+
+    pub fn goal(mut self, goal: GoalTool) -> Self {
+        self.goal = Some(goal);
+        self
+    }
+
+    /// `bbs_goal_update`: check the update against the runner's goal and
+    /// leave it for the runner, which applies it when the turn ends.
+    fn goal_update(&self, args: &Value) -> Result<String> {
+        let Some(tool) = &self.goal else {
+            bail!("Goals are only available to agents run by `bbs headless run`.");
+        };
+        let state = super::state::AgentDir {
+            dir: tool.dir.clone(),
+        }
+        .load()?;
+        let (update, reply) = super::goal::tool_update(state.goal.as_ref(), args, tool.max_wait)?;
+        super::goal::append_update(&tool.dir, &update)?;
+        Ok(reply)
     }
 
     async fn handle(&mut self, msg: &Value) -> Result<Value> {
@@ -156,6 +193,9 @@ impl Tools {
     }
 
     async fn call_once(&mut self, name: &str, args: &Value) -> Result<String> {
+        if name == "bbs_goal_update" {
+            return self.goal_update(args);
+        }
         let arg = |key: &str| -> Result<String> {
             args[key]
                 .as_str()
@@ -522,6 +562,17 @@ pub fn tool_list() -> Value {
             "inputSchema": object(json!({ "agent": string("Agent name (default: you)") }), &[]),
         },
         {
+            "name": "bbs_goal_update",
+            "description": "Report progress on the goal your runner keeps prompting you toward: complete (with evidence), blocked (with a reason; you wait for mail) or waiting (with a reason and either until or for; you are prompted again then, or sooner if mail arrives). Takes effect when your turn ends.",
+            "inputSchema": object(json!({
+                "status": { "type": "string", "enum": ["complete", "blocked", "waiting"], "description": "The goal's new status" },
+                "evidence": string("complete: what shows the objective is met, such as checks you ran"),
+                "reason": string("blocked or waiting: what you need, or what you are waiting for"),
+                "until": string("waiting: an RFC 3339 time to be prompted again, such as 2026-11-06T09:00:00Z"),
+                "for": string("waiting: how long to wait instead, such as 30m or 2h"),
+            }), &["status"]),
+        },
+        {
             "name": "bbs_timer_rm",
             "description": "Remove a timer by its id, as shown by bbs_timer_list.",
             "inputSchema": object(json!({ "id": { "type": "integer", "description": "Timer id" } }), &["id"]),
@@ -532,6 +583,44 @@ pub fn tool_list() -> Value {
 #[cfg(test)]
 mod search_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn goal_updates_are_left_for_the_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = super::super::state::AgentDir {
+            dir: dir.path().to_path_buf(),
+        };
+        let mut tools = Tools::new(dir.path(), "token".into());
+        let args = json!({"status": "blocked", "reason": "which branch?"});
+        // Not run by a runner.
+        let err = tools.call("bbs_goal_update", &args).await.unwrap_err();
+        assert!(format!("{err:#}").contains("bbs headless run"), "{err:#}");
+        let mut tools = tools.goal(GoalTool {
+            dir: dir.path().to_path_buf(),
+            max_wait: super::super::goal::DEFAULT_MAX_WAIT,
+        });
+        // No goal yet.
+        assert!(tools.call("bbs_goal_update", &args).await.is_err());
+        let goal = super::super::goal::Goal::new("Ship".into(), "will".into(), 5);
+        agent
+            .save(&super::super::state::State {
+                goal: Some(goal.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let reply = tools.call("bbs_goal_update", &args).await.unwrap();
+        assert!(reply.starts_with("Goal blocked."), "{reply}");
+        let updates = super::super::goal::take_updates(dir.path()).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].goal, goal.set_at);
+        assert!(
+            tool_list()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "bbs_goal_update")
+        );
+    }
     #[test]
     fn search_tool_preserves_literal_input_filters_and_cursor() {
         let args = json!({"query":"  É.*  ","case_sensitive":true,"limit":100,"before_id":42,

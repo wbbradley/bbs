@@ -19,6 +19,15 @@ under the new package version and its publication date.
   the newest report, so it survives activity trimming and does not depend on
   `share_activity`; retirement clears it. Schema 26 adds nullable `agents.goal`
   and `agents.goal_reported_at`; earlier binaries cannot open it.
+- Headless runners keep a goal for their agent, with any harness: while it is
+  active, `run` prompts the agent toward it turn after turn, at most once per
+  `min_turn_interval`. The agent reports progress with the new
+  `bbs_goal_update` tool (complete with evidence, blocked, or waiting until a
+  time); mail ends a wait or block. The runner stops a goal after
+  `goal_turn_budget` goal prompts (default 50) or three turns in a row with no
+  tool calls, holds goal prompts during restart preparation, and keeps the goal
+  in `state.json` across restarts. Owner Cancel pauses the goal. A runner goal
+  is refused while a Codex native goal runs. See HEADLESS.md, "Goals".
 
 ### Changed
 
