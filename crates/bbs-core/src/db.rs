@@ -494,12 +494,13 @@ pub fn set_effort(conn: &Connection, id: i64, report: &str, now: &str) -> Result
     Ok(())
 }
 
-/// Store an agent's validated goal report JSON (None clears it) and when it
-/// arrived.
+/// Store an agent's validated goal report JSON (None: it has no goal) and
+/// when it arrived. The time stays set either way: it says a goal-capable
+/// runner reported.
 pub fn set_goal(conn: &Connection, id: i64, report: Option<&str>, now: &str) -> Result<()> {
     conn.execute(
         "UPDATE agents SET goal = ?2, goal_reported_at = ?3 WHERE id = ?1",
-        params![id, report, report.map(|_| now)],
+        params![id, report, now],
     )?;
     Ok(())
 }

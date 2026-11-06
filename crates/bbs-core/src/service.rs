@@ -2589,7 +2589,10 @@ pub fn report_goal(
     with_ctx(conn, caller, |ctx| {
         let me = ctx.agent()?;
         let json = match &req.goal {
-            Some(goal) => Some(goal_json(&validate_goal(goal)?)),
+            Some(goal) => {
+                let owner = db::agent_owner_name(ctx.conn, me.id)?;
+                Some(goal_json(&validate_goal(goal, owner.as_deref())?))
+            }
             None => None,
         };
         db::set_goal(ctx.conn, me.id, json.as_deref(), &ctx.now_s)?;
@@ -2597,8 +2600,9 @@ pub fn report_goal(
     })
 }
 
-/// The report checked, with its times in stored form.
-fn validate_goal(goal: &proto::GoalReport) -> Result<proto::GoalReport> {
+/// The report checked, with its times in stored form. Only the agent's
+/// owner can set its goal, so `set_by` must name them.
+fn validate_goal(goal: &proto::GoalReport, owner: Option<&str>) -> Result<proto::GoalReport> {
     let status = goal.status();
     if status == proto::GoalStatus::Unspecified {
         bail!("unspecified goal status");
@@ -2609,6 +2613,9 @@ fn validate_goal(goal: &proto::GoalReport) -> Result<proto::GoalReport> {
     if goal.set_by.is_empty() || goal.set_by.len() > MAX_GOAL_NAME {
         bail!("set_by is 1 to {MAX_GOAL_NAME} bytes");
     }
+    if !owner.is_some_and(|o| o.eq_ignore_ascii_case(&goal.set_by)) {
+        bail!("set_by must be the agent's owner");
+    }
     if goal.reason.len() > MAX_GOAL_TEXT || goal.evidence.len() > MAX_GOAL_TEXT {
         bail!("reason and evidence are at most {MAX_GOAL_TEXT} bytes each");
     }
@@ -2617,6 +2624,9 @@ fn validate_goal(goal: &proto::GoalReport) -> Result<proto::GoalReport> {
     }
     if goal.budget == 0 {
         bail!("a goal's budget is at least one turn");
+    }
+    if goal.iteration > goal.budget {
+        bail!("a goal cannot use more than its budget of turns");
     }
     if !GOAL_CHANGERS.contains(&goal.changed_by.as_str()) {
         bail!("changed_by is one of {GOAL_CHANGERS:?}");
@@ -3972,6 +3982,8 @@ mod tests {
                 "evidence",
             ),
             (bad(&|g| g.budget = 0), "budget"),
+            (bad(&|g| g.iteration = 51), "more than its budget"),
+            (bad(&|g| g.set_by = "mallory".into()), "owner"),
             (bad(&|g| g.changed_by = "someone".into()), "changed_by"),
             (
                 bad(&|g| g.wake_at = Some("2026-11-06T09:00:00Z".into())),
@@ -3987,8 +3999,14 @@ mod tests {
         done.evidence = "v1.0 tagged".into();
         report(&mut conn, Some(done)).unwrap();
         assert_eq!(stored(&mut conn).0.unwrap().evidence, "v1.0 tagged");
+        // No goal clears the report but keeps its time: a runner reported.
         report(&mut conn, None).unwrap();
-        assert_eq!(stored(&mut conn), (None, None));
+        let (g, at) = stored(&mut conn);
+        assert!(g.is_none() && at.is_some());
+        // The owner's name matches in any case.
+        let mut shouted = goal(proto::GoalStatus::Active);
+        shouted.set_by = "WILL".into();
+        report(&mut conn, Some(shouted)).unwrap();
         // Goal controls read back with their kinds; set needs an objective.
         let control = |conn: &mut Connection, body: &str, c: proto::Control| {
             send(

@@ -544,7 +544,7 @@ enum GoalStatus {
 message GoalReport {
   string objective = 1;              // 1 to 4096 bytes, as the owner set it
   GoalStatus status = 2;
-  string set_by = 3;                 // the human who set it
+  string set_by = 3;                 // the human who set it: the agent's owner
   string set_at = 4;                 // RFC 3339
   uint32 iteration = 5;              // goal prompts sent
   uint32 budget = 6;                 // the most goal prompts before LIMITED
@@ -553,7 +553,8 @@ message GoalReport {
   optional string wake_at = 9;       // WAITING with a time: RFC 3339
   string changed_by = 10;            // "agent", "owner" or "runner"
 }
-// No goal clears the stored report.
+// No goal clears the stored report; its time is still recorded, so clients
+// know a goal-capable runner drives the agent.
 message ReportGoalRequest { optional GoalReport goal = 1; }
 message ReportGoalResponse {}
 
@@ -746,7 +747,8 @@ message Agent {
   // The newest reported goal (agent-goal.v1); absent when the agent has none,
   // never reported or the server is older.
   optional GoalReport goal = 16;
-  // When the server received that report; labels report age only.
+  // When the server received the newest goal report, including one saying
+  // there is no goal; absent when no goal-capable runner has reported.
   optional string goal_reported_at = 17;
 }
 
