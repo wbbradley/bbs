@@ -1,5 +1,6 @@
 //! `bbs headless run`: drive one agent's harness from its BBS mail.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,9 +13,10 @@ use tokio::time::Instant;
 
 use super::acp::McpServer;
 use super::effort;
+use super::goal::{self, Goal};
 use super::harness::{BbsTools, EffortUnconfirmed, Event, Harness, PromptNotStarted, Resume};
 use super::log::Log;
-use super::mcp::{TOKEN_ENV, Tools};
+use super::mcp::{GoalTool, TOKEN_ENV, Tools};
 use super::outbox::{self, Outbox};
 use super::settings::{DEFAULT_MAX_TURN_ERRORS, HarnessType, McpEnv, MidTurn, Settings};
 use super::state::{AgentDir, State};
@@ -57,6 +59,8 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         .or(settings.max_turn_errors)
         .unwrap_or(DEFAULT_MAX_TURN_ERRORS)
         .get();
+    let goal_budget = settings.goal_turn_budget();
+    let goal_max_wait = settings.goal_max_wait()?;
     let cwd = match &args.cwd {
         Some(cwd) => cwd
             .canonicalize()
@@ -127,7 +131,19 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         json!({ "agent": agent, "harness": harness, "cwd": cwd, "pid": std::process::id() }),
     );
 
-    let mut mcp_args = vec!["headless".into(), "mcp".into(), "--auto-owner-reply".into()];
+    let mut mcp_args = vec![
+        "headless".into(),
+        "mcp".into(),
+        "--auto-owner-reply".into(),
+        "--goal-dir".into(),
+        agent_dir.dir.display().to_string(),
+        "--goal-max-wait".into(),
+        humantime::format_duration(goal_max_wait).to_string(),
+    ];
+    let goal_tool = GoalTool {
+        dir: agent_dir.dir.clone(),
+        max_wait: goal_max_wait,
+    };
     if harness_config.mcp_env == McpEnv::Process && config.server.is_none() {
         mcp_args.extend([
             "--local-state-dir".into(),
@@ -192,7 +208,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             &harness_config,
             &cwd,
             &stderr,
-            BbsTools { mcp, tools: Tools::new(dir, token.clone()).auto_owner_reply(), input_enabled: side_session.is_some() },
+            BbsTools { mcp, tools: Tools::new(dir, token.clone()).auto_owner_reply().goal(goal_tool), input_enabled: side_session.is_some() },
             resume,
         ) => started,
         _ = signals.recv() => Err(anyhow::anyhow!("stopped during harness setup")),
@@ -212,7 +228,19 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     state.harness = Some(harness.clone());
     state.session_id = Some(agent_harness.session_id().to_string());
     state.dynamic_tools = agent_harness.dynamic_tools();
+    // An MCP server lists its tools afresh each session; a resumed Codex
+    // thread keeps the ones it started with.
+    state.goal_tool |= !agent_harness.session_resumed() || !agent_harness.dynamic_tools();
     agent_dir.save(&state)?;
+    // Updates left by a turn that never finished belong to no completed turn.
+    match goal::take_updates(&agent_dir.dir) {
+        Ok(stale) if !stale.is_empty() => log.event(
+            "warning",
+            json!({ "message": format!("discarded {} goal update(s) from an unfinished turn", stale.len()) }),
+        ),
+        Ok(_) => {}
+        Err(err) => log.event("warning", json!({ "message": format!("{err:#}") })),
+    }
     log.event(
         "session",
         json!({ "id": agent_harness.session_id(), "resumed": agent_harness.session_resumed() }),
@@ -248,6 +276,22 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     );
     let mut effort_control = effort::Control::default();
     let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
+    let (goal_reports, goal_reporting) =
+        if server_has(&config, dir, crate::backend::AGENT_GOAL).await {
+            let (reports, task) = goal::reporter(
+                config.clone(),
+                dir.to_path_buf(),
+                token.clone(),
+                share_warn.clone(),
+            );
+            let _ = reports.send(state.goal.as_ref().map(Goal::report));
+            (Some(reports), Some(task))
+        } else {
+            (None, None)
+        };
+    if let Some(g) = &state.goal {
+        log.event("goal", goal_record(Some(g)));
+    }
     let mut delivery =
         outbox::Sender::start(config.clone(), dir.to_path_buf(), token.clone(), share_warn);
     let mut delivering = false;
@@ -281,6 +325,16 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     let mut turn_errors = 0;
     // A resumed session that never completes a turn may be what fails.
     let mut session_proven = !agent_harness.session_resumed();
+    // Tool calls in the running turn, and whether its prompt carried the goal.
+    let mut turn_tools: HashSet<String> = HashSet::new();
+    let mut goal_prompt = false;
+    // The goal (by its set time) when the running turn started, and the goal
+    // as it was before that turn's prompt counted it.
+    let mut turn_goal: Option<String> = None;
+    let mut before_prompt: Option<Goal> = None;
+    // Restart preparation holds goal prompts until then.
+    let mut goal_hold: Option<Instant> = None;
+    let mut native_warned = false;
     let mut result = loop {
         // A read receipt only means the mail reached this process. A restart
         // acknowledgement waits for all queued/steered turns and durable owner
@@ -325,14 +379,58 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         let ready_at = last_start
             .map(|t| t + interval)
             .unwrap_or_else(Instant::now);
-        if turn.is_none() && outbox.is_empty() && !queue.is_empty() && Instant::now() >= ready_at {
+        let held = goal_hold.filter(|t| Instant::now() < *t);
+        let goal_active = state
+            .goal
+            .as_ref()
+            .is_some_and(|g| g.status == goal::Status::Active);
+        let goal_due = goal_active && held.is_none();
+        let wake = state
+            .goal
+            .as_ref()
+            .and_then(Goal::wake_time)
+            .map(|t| Instant::now() + (t - chrono::Utc::now()).to_std().unwrap_or_default());
+        if turn.is_none()
+            && outbox.is_empty()
+            && (!queue.is_empty() || goal_due)
+            && Instant::now() >= ready_at
+        {
             active_preamble = preamble.take();
             let mut prompt = active_preamble.clone().unwrap_or_default();
             active_mail = take_prompt_mail(&mut queue, &owner);
-            prompt.push_str(&mail_prompt(&active_mail, &owner)?);
+            if !active_mail.is_empty() {
+                prompt.push_str(&mail_prompt(&active_mail, &owner)?);
+            }
+            // An owner's direct message is submitted alone, exactly as sent;
+            // the goal follows in the next turn.
+            let alone = matches!(active_mail.as_slice(), [m] if owner_direct(m, &owner));
+            goal_prompt = false;
+            turn_goal = state.goal.as_ref().map(|g| g.set_at.clone());
+            before_prompt = state.goal.clone();
+            if goal_due
+                && !alone
+                && let Some(g) = state.goal.as_mut()
+            {
+                if g.spent() {
+                    goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
+                } else {
+                    if !active_mail.is_empty() {
+                        prompt.push_str("\n\n");
+                    }
+                    prompt.push_str(&g.prompt());
+                    goal_prompt = true;
+                    goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
+                }
+            }
+            if active_mail.is_empty() && !goal_prompt {
+                // The goal stopped instead of prompting, and there is no mail.
+                preamble = active_preamble.take();
+                continue;
+            }
+            turn_tools.clear();
             log.event(
                 "prompt",
-                json!({ "text": prompt, "mail_text": format_messages(&active_mail, false)?, "mail_ids": mail_ids(&active_mail) }),
+                json!({ "text": prompt, "mail_text": format_messages(&active_mail, false)?, "mail_ids": mail_ids(&active_mail), "goal": goal_prompt }),
             );
             let agent_harness = agent_harness.clone();
             let requested_effort = effort_control.dispatch();
@@ -343,7 +441,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             last_start = Some(Instant::now());
             continue;
         }
-        let throttled = turn.is_none() && outbox.is_empty() && !queue.is_empty();
+        let throttled = turn.is_none() && outbox.is_empty() && (!queue.is_empty() || goal_due);
         tokio::select! {
             mail = mail_rx.recv() => match mail {
                 Some(Ok(mut batch)) => {
@@ -358,6 +456,22 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                             let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
                         }
                     }
+                    let mut goal_dirty = false;
+                    for message in &batch {
+                        let (changed, note) = goal_control(&mut state.goal, message, &owner, goal_budget, &agent_harness, state.goal_tool);
+                        goal_dirty |= changed;
+                        if let Some(note) = note {
+                            eprintln!("bbs: warning: {note}");
+                            log.event("warning", json!({ "message": note }));
+                        }
+                    }
+                    if goal_dirty {
+                        native_warned = false;
+                        // Updates the agent made for an earlier goal no longer apply.
+                        if state.goal.as_ref().is_some_and(|g| g.iteration == 0 && g.status == goal::Status::Active) {
+                            let _ = goal::take_updates(&agent_dir.dir);
+                        }
+                    }
                     let cancels = batch.iter().filter(|m| m.control() == proto::Control::Cancel).count();
                     batch.retain(|m| m.control.is_none());
                     if cancels > 0 {
@@ -366,6 +480,23 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                             log.event("error", json!({ "message": format!("cancel: {err:#}") }));
                         }
                         log.event("cancel", json!({ "turn_running": running }));
+                        // Cancelling pauses the goal, so the turn is not simply restarted.
+                        if let Some(g) = state.goal.as_mut() {
+                            goal_dirty |= g.pause("turn cancelled by owner");
+                        }
+                    }
+                    let notice = |m: &proto::Message| owner_direct(m, &owner) && m.body == crate::service::DRAIN_NOTICE;
+                    if batch.iter().any(notice) {
+                        goal_hold = Some(Instant::now() + goal::RESTART_HOLD);
+                        log.event("update", json!({ "kind": "goal prompts held for restart preparation" }));
+                    }
+                    if batch.iter().any(|m| !notice(m))
+                        && let Some(g) = state.goal.as_mut()
+                    {
+                        goal_dirty |= g.mail_arrived();
+                    }
+                    if goal_dirty {
+                        goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
                     }
                     if batch.is_empty() {
                         continue;
@@ -406,10 +537,31 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 turn = None;
                 // The wire reader queues notifications before resolving the
                 // response. Persist those final deltas before clearing the turn.
-                let drained = drain_turn_events(&mut log, &mut outbox, &mut effort_control, &mut events, interactions.as_ref());
+                let drained = drain_turn_events(&mut log, &mut outbox, &mut effort_control, &mut events, interactions.as_ref(), &mut turn_tools);
                 let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
                 if let Err(err) = drained { break Err(err); }
                 if let Err(err) = outbox.seal() { break Err(err); }
+                let tools = matches!(done, Ok(Ok(_))).then_some(turn_tools.len());
+                let not_started = matches!(&done, Ok(Err(e)) if e.downcast_ref::<PromptNotStarted>().is_some());
+                let same_goal = state.goal.as_ref().map(|g| &g.set_at) == turn_goal.as_ref();
+                if not_started && goal_prompt && same_goal {
+                    // The prompt was never sent: it does not count.
+                    if let (Some(g), Some(before)) = (state.goal.as_mut(), before_prompt.as_ref()) {
+                        g.unprompt(before);
+                    }
+                    goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
+                }
+                let turn = (goal_prompt && !not_started).then_some(tools);
+                if goal_turn_ended(&mut state.goal, &agent_dir.dir, &mut log, turn_goal.as_deref(), turn) {
+                    goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
+                }
+                goal_prompt = false;
+                turn_goal = None;
+                before_prompt = None;
+                if !native_warned && goal_active && agent_harness.native_goal_active() {
+                    native_warned = true;
+                    log.event("warning", json!({ "message": "a Codex native goal started while the runner has a goal; its continuation turns count as one goal turn" }));
+                }
                 let message = match done {
                     Ok(Ok(stop)) => {
                         active_mail.clear();
@@ -465,7 +617,10 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     record_effort_outcome(&mut log, &mut effort_control, outcome);
                     let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
                 }
-                Some(event) => if let Err(err) = record_side(&mut log, &mut outbox, event, interactions.as_ref()) { break Err(err); },
+                Some(event) => {
+                    if let Event::Tool(id, _) = &event { turn_tools.insert(id.clone()); }
+                    if let Err(err) = record_side(&mut log, &mut outbox, event, interactions.as_ref()) { break Err(err); }
+                }
             },
             reply = delivery.replies.recv(), if delivering => {
                 match reply {
@@ -481,6 +636,14 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 if changed.is_err() { side_drain = None; }
             }
             _ = tokio::time::sleep_until(ready_at), if throttled => {}
+            _ = tokio::time::sleep_until(wake.unwrap_or(ready_at)), if wake.is_some() && turn.is_none() => {
+                if let Some(g) = state.goal.as_mut() && g.wake() {
+                    goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
+                }
+            }
+            _ = tokio::time::sleep_until(held.unwrap_or(ready_at)), if held.is_some() && goal_active && turn.is_none() => {
+                goal_hold = None;
+            }
             status = process.wait() => break Err(match status {
                 Ok(status) => anyhow::anyhow!("the harness exited ({status})"),
                 Err(err) => anyhow::anyhow!("waiting for the harness: {err}"),
@@ -607,7 +770,122 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         let _ = tokio::time::timeout(SHARE_FLUSH, task).await;
     }
     let _ = tokio::time::timeout(SHARE_FLUSH, reporting).await;
+    drop(goal_reports);
+    if let Some(task) = goal_reporting {
+        let _ = tokio::time::timeout(SHARE_FLUSH, task).await;
+    }
     result
+}
+
+/// The goal's state as a log record, or that it was cleared.
+fn goal_record(goal: Option<&Goal>) -> serde_json::Value {
+    match goal {
+        Some(g) => json!({
+            "objective": g.objective, "status": g.status, "iteration": g.iteration,
+            "budget": g.budget, "reason": g.reason, "evidence": g.evidence,
+            "wake_at": g.wake_at, "changed_by": g.changed_by, "set_by": g.set_by,
+        }),
+        None => json!({ "status": "cleared" }),
+    }
+}
+
+/// Persist, log and report the goal after a change.
+fn goal_changed(
+    state: &State,
+    agent_dir: &AgentDir,
+    log: &mut Log,
+    reports: Option<&mpsc::UnboundedSender<Option<proto::GoalReport>>>,
+) {
+    if let Err(err) = agent_dir.save(state) {
+        log.event(
+            "warning",
+            json!({ "message": format!("saving the goal: {err:#}") }),
+        );
+    }
+    log.event("goal", goal_record(state.goal.as_ref()));
+    if let Some(reports) = reports {
+        let _ = reports.send(state.goal.as_ref().map(Goal::report));
+    }
+}
+
+/// Act on a goal control from the owner: whether the goal changed, and
+/// anything the owner should know (a refusal or a caveat).
+fn goal_control(
+    goal: &mut Option<Goal>,
+    message: &proto::Message,
+    owner: &str,
+    budget: u32,
+    harness: &Harness,
+    goal_tool: bool,
+) -> (bool, Option<String>) {
+    let refused = |why: &str| (false, Some(why.to_string()));
+    match message.control() {
+        proto::Control::GoalSet => {
+            if harness.native_goal_active() {
+                return refused(
+                    "goal not set: this Codex thread has a native goal running; stop it with \
+                     `bbs headless cancel <agent>` first",
+                );
+            }
+            *goal = Some(Goal::new(message.body.clone(), owner.to_string(), budget));
+            let caveat = (!goal_tool).then(|| {
+                "goal set, but this resumed Codex thread predates bbs_goal_update, so the agent \
+                 cannot report progress; restart the runner with --new-session"
+                    .to_string()
+            });
+            (true, caveat)
+        }
+        proto::Control::GoalPause => match goal.as_mut() {
+            Some(g) => match g.pause("paused by owner") {
+                true => (true, None),
+                false => refused("goal not paused: it is not active, waiting or blocked"),
+            },
+            None => refused("goal not paused: there is no goal"),
+        },
+        proto::Control::GoalResume => match goal.as_mut() {
+            Some(g) => match g.resume() {
+                Ok(()) => (true, None),
+                Err(e) => (false, Some(format!("goal not resumed: {e}"))),
+            },
+            None => refused("goal not resumed: there is no goal"),
+        },
+        proto::Control::GoalClear => (goal.take().is_some(), None),
+        _ => (false, None),
+    }
+}
+
+/// Apply the agent's updates when a turn ends; then, when its prompt carried
+/// the goal, account for the turn: `Some(tools)` with the tool calls a
+/// completed turn made, `Some(None)` for a failed one. Both apply only to the
+/// goal the turn started with (`started`, its set time): a goal set during
+/// the turn takes nothing from it. Returns whether the goal changed.
+fn goal_turn_ended(
+    goal: &mut Option<Goal>,
+    dir: &Path,
+    log: &mut Log,
+    started: Option<&str>,
+    turn: Option<Option<usize>>,
+) -> bool {
+    let updates = goal::take_updates(dir).unwrap_or_else(|err| {
+        log.event(
+            "warning",
+            json!({ "message": format!("reading goal updates: {err:#}") }),
+        );
+        Vec::new()
+    });
+    let Some(g) = goal.as_mut().filter(|g| Some(g.set_at.as_str()) == started) else {
+        return false;
+    };
+    let mut changed = false;
+    // The last update wins: each one applies only while the goal is active,
+    // so apply the newest.
+    if let Some(update) = updates.iter().rev().find(|u| u.goal == g.set_at) {
+        changed |= g.apply(update);
+    }
+    if let Some(tools) = turn {
+        changed |= g.turn_ended(tools);
+    }
+    changed
 }
 
 fn record_effort_outcome(
@@ -630,8 +908,12 @@ fn drain_turn_events(
     effort_control: &mut effort::Control,
     events: &mut mpsc::UnboundedReceiver<Event>,
     side: Option<&side::Side>,
+    tools: &mut HashSet<String>,
 ) -> Result<()> {
     while let Ok(event) = events.try_recv() {
+        if let Event::Tool(id, _) = &event {
+            tools.insert(id.clone());
+        }
         match event {
             Event::EffortOutcome(outcome) => record_effort_outcome(log, effort_control, outcome),
             Event::EffortChanged => {}
@@ -1037,7 +1319,15 @@ mod tests {
         .unwrap();
         tx.send(Event::Text(Default::default(), "delivered".into()))
             .unwrap();
-        drain_turn_events(&mut log, &mut outbox, &mut control, &mut events, None).unwrap();
+        drain_turn_events(
+            &mut log,
+            &mut outbox,
+            &mut control,
+            &mut events,
+            None,
+            &mut HashSet::new(),
+        )
+        .unwrap();
         assert!(control.pending.is_none());
         let answered = control.report(state).answered.unwrap();
         assert_eq!(answered.request_id, 3);
@@ -1056,6 +1346,58 @@ mod tests {
         assert_eq!(records[0]["effort_request"], 3);
         assert_eq!(records[1]["event"], "text");
         assert_eq!(records[1]["text"], "delivered");
+    }
+
+    #[test]
+    fn a_goal_set_during_a_turn_takes_nothing_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(&dir.path().join("log")).unwrap();
+        let old = Goal::new("old".into(), "will".into(), 5);
+        let mut goal = Some(Goal::new("new".into(), "will".into(), 5));
+        let new_id = goal.as_ref().unwrap().set_at.clone();
+        // The agent, still on the old objective, completes "the" goal: the
+        // tool stamps the update with the goal saved now, the new one.
+        goal::append_update(
+            dir.path(),
+            &goal::Update {
+                goal: new_id.clone(),
+                kind: goal::UpdateKind::Complete {
+                    evidence: "old work".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(!goal_turn_ended(
+            &mut goal,
+            dir.path(),
+            &mut log,
+            Some(&old.set_at),
+            Some(Some(0))
+        ));
+        let g = goal.as_ref().unwrap();
+        assert_eq!(
+            (g.status, g.idle_turns, g.next),
+            (goal::Status::Active, 0, goal::Next::New)
+        );
+        // The same update in a turn that started with the new goal applies.
+        goal::append_update(
+            dir.path(),
+            &goal::Update {
+                goal: new_id.clone(),
+                kind: goal::UpdateKind::Complete {
+                    evidence: "done".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(goal_turn_ended(
+            &mut goal,
+            dir.path(),
+            &mut log,
+            Some(&new_id),
+            Some(Some(1))
+        ));
+        assert_eq!(goal.unwrap().status, goal::Status::Complete);
     }
 
     #[test]

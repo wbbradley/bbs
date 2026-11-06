@@ -129,6 +129,14 @@ impl Harness {
         }
     }
 
+    /// Whether the Codex thread has a native goal running.
+    pub fn native_goal_active(&self) -> bool {
+        match self {
+            Harness::Acp(_) => false,
+            Harness::Codex(codex) => codex.native_goal_active(),
+        }
+    }
+
     /// Whether mail can be added to a running turn. ACP has no way to.
     pub fn can_steer(&self) -> bool {
         matches!(self, Harness::Codex(_))

@@ -4025,6 +4025,242 @@ fn headless_stops_after_repeated_turn_errors(mode: Mode) {
     assert!(headless_state(&bbs, "Zed")["session_id"].is_null());
 }
 
+/// A runner driving tests/fake_goal.py with `script`; the agent is Zed.
+fn goal_runner(test: &str, script: &str, budget: u32) -> (Bbs, RunGuard) {
+    let bbs = Bbs::new(test);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_goal.py");
+    let dir = bbs.home.join(".config/bbs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[headless]\nmin_turn_interval = \"0s\"\ngoal_turn_budget = {budget}\n\
+             [headless.harness.fake]\ncommand = [\"python3\", {fake:?}]\n\
+             env = {{ FAKE_GOAL_SCRIPT = {script:?} }}\n"
+        ),
+    )
+    .unwrap();
+    let run = RunGuard::start(&bbs, "Zed");
+    goal_logged(&bbs, "session", 1);
+    (bbs, run)
+}
+
+fn goal_logged(bbs: &Bbs, event: &str, count: usize) {
+    let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
+    eventually(event, || {
+        let log = std::fs::read_to_string(&log).ok()?;
+        (log.matches(&format!("\"event\":\"{event}\"")).count() >= count).then_some(())
+    });
+}
+
+fn goal_prompts(bbs: &Bbs) -> Vec<String> {
+    std::fs::read_to_string(bbs.home.join("fake-goal-prompts.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn goal_status(bbs: &Bbs) -> Option<String> {
+    headless_state(bbs, "Zed")["goal"]["status"]
+        .as_str()
+        .map(str::to_string)
+}
+
+fn wait_goal_status(bbs: &Bbs, status: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while goal_status(bbs).as_deref() != Some(status) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for goal status {status}: state {}, prompts {:#?}, log {}",
+            headless_state(bbs, "Zed"),
+            goal_prompts(bbs),
+            std::fs::read_to_string(bbs.home.join(".local/state/bbs/headless/zed/log.jsonl"))
+                .unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn headless_goal_continues_waits_across_a_restart_and_completes() {
+    let (bbs, run) = goal_runner("goal-complete", "tool,complete-bare,wait2s,complete", 50);
+    bbs.ok(&["headless", "goal", "Zed", "set", "Ship the release"]);
+    wait_goal_status(&bbs, "waiting");
+    // Stop while waiting; the wait has passed by the time it starts again.
+    run.stop();
+    std::thread::sleep(std::time::Duration::from_millis(2200));
+    let run = RunGuard::start(&bbs, "Zed");
+    wait_goal_status(&bbs, "complete");
+    let prompts = goal_prompts(&bbs);
+    let headers: Vec<&str> = prompts
+        .iter()
+        .map(|p| p.lines().find(|l| l.starts_with("[bbs goal")).unwrap())
+        .collect();
+    assert_eq!(
+        headers,
+        [
+            "[bbs goal · new · budget 1/50 turns]",
+            "[bbs goal · continuation 2 · budget 2/50 turns]",
+            "[bbs goal · continuation 3 · budget 3/50 turns]",
+            "[bbs goal · resumed after wait · budget 4/50 turns]",
+        ]
+    );
+    assert!(
+        prompts[0].contains("Objective (set by will, "),
+        "{}",
+        prompts[0]
+    );
+    assert!(prompts[0].contains("Ship the release"));
+    assert!(
+        prompts[3].contains("for: deploy. That time has come."),
+        "{}",
+        prompts[3]
+    );
+    let results = std::fs::read_to_string(bbs.home.join("fake-goal-results.jsonl")).unwrap();
+    let results: Vec<serde_json::Value> = results
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(results[0]["isError"], true, "complete needs evidence");
+    assert!(
+        results[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("evidence")
+    );
+    assert!(results[1]["isError"].is_null());
+    let state = headless_state(&bbs, "Zed");
+    assert_eq!(state["goal"]["evidence"], "tests pass");
+    // The board gets the report; the runner sends it in the background.
+    eventually("the completed goal on the board", || {
+        let stored: Option<String> = bbs
+            .db()
+            .query_row("SELECT goal FROM agents WHERE name = 'Zed'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        stored
+            .filter(|s| s.contains("GOAL_STATUS_COMPLETE"))
+            .map(|_| ())
+    });
+    // No further prompts once complete.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(goal_prompts(&bbs).len(), 4);
+    drop(run);
+}
+
+#[test]
+fn headless_goal_stalls_on_idle_turns_and_is_limited_by_its_budget() {
+    let (bbs, _run) = goal_runner("goal-stall", "idle,idle,idle,tool,tool", 4);
+    bbs.ok(&["headless", "goal", "Zed", "set", "Tidy up"]);
+    wait_goal_status(&bbs, "stalled");
+    let prompts = goal_prompts(&bbs);
+    assert_eq!(prompts.len(), 3);
+    assert!(
+        prompts[1].contains("Your last turn used no tools"),
+        "{}",
+        prompts[1]
+    );
+    // Resuming keeps the count: one more goal prompt uses the budget of 4.
+    bbs.ok(&["headless", "goal", "Zed", "resume"]);
+    wait_goal_status(&bbs, "limited");
+    assert_eq!(goal_prompts(&bbs).len(), 4);
+    // Resuming a limited goal starts a fresh budget.
+    bbs.ok(&["headless", "goal", "Zed", "resume"]);
+    eventually("a fresh budget", || {
+        goal_prompts(&bbs)
+            .get(4)
+            .filter(|p| p.contains("budget 1/4 turns"))
+            .map(|_| ())
+    });
+    bbs.ok(&["headless", "goal", "Zed", "clear"]);
+    eventually("cleared", || {
+        headless_state(&bbs, "Zed")["goal"].is_null().then_some(())
+    });
+    eventually("report cleared", || {
+        let stored: Option<String> = bbs
+            .db()
+            .query_row("SELECT goal FROM agents WHERE name = 'Zed'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        stored.is_none().then_some(())
+    });
+}
+
+#[test]
+fn headless_goal_waiting_every_turn_still_uses_its_budget() {
+    let (bbs, _run) = goal_runner("goal-wait-budget", "wait1s,wait1s,wait1s,wait1s", 2);
+    bbs.ok(&["headless", "goal", "Zed", "set", "Keep checking"]);
+    wait_goal_status(&bbs, "limited");
+    assert_eq!(goal_prompts(&bbs).len(), 2);
+    assert_eq!(headless_state(&bbs, "Zed")["goal"]["iteration"], 2);
+}
+
+#[test]
+fn headless_goal_wakes_on_mail_and_pauses_on_cancel() {
+    let (bbs, _run) = goal_runner("goal-mail", "block,waitcancel", 50);
+    let (_, tp) = bbs.register();
+    let tz = headless_state(&bbs, "Zed")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    bbs.ok(&["group", "register", "crew"]);
+    bbs.ok(&["--token", &tp, "group", "join", "crew"]);
+    bbs.ok(&["--token", &tz, "group", "join", "crew"]);
+    bbs.ok(&["headless", "goal", "Zed", "set", "Answer the question"]);
+    wait_goal_status(&bbs, "blocked");
+    // Mail from another agent wakes it: mail first, the goal below.
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "use main"]);
+    eventually("the mail prompt", || goal_prompts(&bbs).get(1).map(|_| ()));
+    let prompt = &goal_prompts(&bbs)[1];
+    let mail = prompt.find("use main").unwrap();
+    let goal = prompt.find("[bbs goal · resumed after wait").unwrap();
+    assert!(mail < goal, "{prompt}");
+    assert!(
+        prompt.contains("You were blocked: which branch? New mail arrived."),
+        "{prompt}"
+    );
+    // That turn waits for a cancel, which pauses the goal.
+    goal_logged(&bbs, "tool", 2);
+    bbs.ok(&["headless", "cancel", "Zed"]);
+    wait_goal_status(&bbs, "paused");
+    // The owner's own message goes alone, and the paused goal adds nothing.
+    bbs.ok(&["send", "--to", "Zed", "hello"]);
+    eventually("the owner's prompt", || {
+        goal_prompts(&bbs).get(2).map(|_| ())
+    });
+    assert_eq!(goal_prompts(&bbs)[2], "hello");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(goal_prompts(&bbs).len(), 3);
+    assert_eq!(goal_status(&bbs).as_deref(), Some("paused"));
+}
+
+#[test]
+fn headless_goal_prompts_hold_for_restart_preparation() {
+    let script = vec!["slow"; 100].join(",");
+    let (bbs, _run) = goal_runner("goal-hold", &script, 200);
+    bbs.ok(&["headless", "goal", "Zed", "set", "Keep going"]);
+    eventually("goal prompts", || {
+        (goal_prompts(&bbs).len() >= 2).then_some(())
+    });
+    // The notice every owned agent gets when its human prepares a restart.
+    let notice = "BBS restart preparation: delivery of new messages is paused. Finish your active turns and queued work, then become idle. Your headless process may be restarted. Record any long-running background tasks that you will need to restart or check after restart. Delivery resumes only when your human explicitly resumes it.";
+    bbs.ok(&["send", "--to", "Zed", notice]);
+    eventually("the notice", || {
+        goal_prompts(&bbs).iter().any(|p| p == notice).then_some(())
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let prompts = goal_prompts(&bbs);
+    assert_eq!(
+        prompts.last().map(String::as_str),
+        Some(notice),
+        "goal prompts continued"
+    );
+    assert_eq!(goal_status(&bbs).as_deref(), Some("active"));
+}
+
 fn headless_new_session_skips_resume(mode: Mode) {
     let bbs = Bbs::with_mode("new-session", mode);
     let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_acp.py");

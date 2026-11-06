@@ -614,6 +614,10 @@ impl Codex {
         }
     }
 
+    pub fn native_goal_active(&self) -> bool {
+        *self.turn.goal.lock().unwrap() == Some(true)
+    }
+
     async fn pause_goal(&self) -> Result<()> {
         if *self.turn.goal.lock().unwrap() == Some(true) {
             // Stop automatic scheduling before interrupting the current turn,

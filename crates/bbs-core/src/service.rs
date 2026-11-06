@@ -28,8 +28,8 @@ mod blockers;
 pub use blockers::{answer_blocker, cancel_blocker, get_blocker, list_blockers, put_blocker};
 mod drain;
 pub use drain::{
-    agent_drain, agent_drain_with_changes, check_agent_drains, report_drain,
-    report_drain_with_changes,
+    NOTICE as DRAIN_NOTICE, agent_drain, agent_drain_with_changes, check_agent_drains,
+    report_drain, report_drain_with_changes,
 };
 mod notes;
 pub use notes::{MAX_NOTE_BYTES, list_agent_notes, put_agent_note};
