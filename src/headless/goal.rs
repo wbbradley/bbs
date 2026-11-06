@@ -311,6 +311,15 @@ impl Goal {
         text
     }
 
+    /// Undoes `prompt()` for a prompt that was never sent. `before` is the
+    /// goal as it was just before `prompt()`. Only the prompt's own changes
+    /// are undone, so a pause that arrived meanwhile stands.
+    pub fn unprompt(&mut self, before: &Goal) {
+        self.iteration = self.iteration.saturating_sub(1);
+        self.next = before.next;
+        self.ended = before.ended.clone();
+    }
+
     fn render(&self) -> String {
         let budget = format!("budget {}/{} turns", self.iteration, self.budget);
         let header = match self.next {
@@ -576,6 +585,23 @@ mod tests {
             goal: g.set_at.clone(),
             kind,
         }
+    }
+
+    #[test]
+    fn an_unsent_prompt_is_undone_but_a_pause_stands() {
+        let mut g = goal();
+        let before = g.clone();
+        g.prompt();
+        assert!(g.pause("paused by owner"));
+        g.unprompt(&before);
+        assert_eq!(g.status, Status::Paused);
+        assert_eq!(g.iteration, 0);
+        assert_eq!(g.next, Next::New);
+        assert!(g.resume().is_ok());
+        assert!(
+            g.prompt()
+                .starts_with("[bbs goal · continuation 1 · budget 1/3 turns]\n")
+        );
     }
 
     #[test]

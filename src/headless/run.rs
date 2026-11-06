@@ -546,7 +546,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 let same_goal = state.goal.as_ref().map(|g| &g.set_at) == turn_goal.as_ref();
                 if not_started && goal_prompt && same_goal {
                     // The prompt was never sent: it does not count.
-                    state.goal = before_prompt.take();
+                    if let (Some(g), Some(before)) = (state.goal.as_mut(), before_prompt.as_ref()) {
+                        g.unprompt(before);
+                    }
                     goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
                 }
                 let turn = (goal_prompt && !not_started).then_some(tools);
