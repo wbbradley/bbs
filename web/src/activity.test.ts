@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { buildActivity } from "./activity";
+import { buildActivity, mergeTimeline } from "./activity";
 import { ago, span } from "./util";
-import type { Activity } from "./types";
+import type { Activity, Message } from "./types";
 
 const rec = (id: number, at: string, record: object) => ({ id, created_at: at, record: JSON.stringify(record) }) as Activity;
 
@@ -53,5 +53,49 @@ describe("turn end", () => {
   it("has no duration without a prompt", () => {
     const entries = buildActivity([rec(1, "2026-11-05T12:00:00Z", { event: "turn_end", stop_reason: "end_turn" })]);
     expect(entries[0]).toMatchObject({ kind: "turn_end", took: "" });
+  });
+});
+
+describe("timeline placement", () => {
+  const msg = (id: number, at: string, extra: Partial<Message> = {}): Message =>
+    ({
+      id,
+      created_at: at,
+      from_kind: 2,
+      from_name: "ada",
+      to_group: null,
+      to_name: "Mateo",
+      read_at: null,
+      body: `body ${id}`,
+      ...extra,
+    }) as Message;
+  const order = (items: ReturnType<typeof mergeTimeline>) => items.map((i) => i.key);
+
+  it("shows mail where a prompt delivered it, not where it was sent", () => {
+    const entries = buildActivity([
+      rec(1, "2026-11-05T12:00:00Z", { event: "prompt", text: "first" }),
+      rec(2, "2026-11-05T12:05:00Z", { event: "turn_end", stop_reason: "end_turn" }),
+      rec(3, "2026-11-05T12:06:00Z", { event: "prompt", text: "mail", mail_ids: [10] }),
+    ]);
+    const items = mergeTimeline([msg(10, "2026-11-05T12:01:00Z", { read_at: "2026-11-05T12:01:01Z" })], entries, "Mateo");
+    expect(order(items)).toEqual(["a1", "a2", "a3", "m10"]);
+  });
+
+  it("shows direct mail with no delivery record where the agent read it", () => {
+    const entries = buildActivity([
+      rec(1, "2026-11-05T12:00:00Z", { event: "prompt", text: "first" }),
+      rec(2, "2026-11-05T12:05:00Z", { event: "turn_end", stop_reason: "end_turn" }),
+    ]);
+    const mail = [
+      msg(10, "2026-11-05T11:59:00Z", { read_at: "2026-11-05T12:06:00Z" }),
+      msg(11, "2026-11-05T11:59:30Z"),
+      // The agent's own mail keeps its send time, whoever read it.
+      msg(12, "2026-11-05T12:01:00Z", { from_kind: 1, from_name: "Mateo", to_name: "ada", read_at: "2026-11-05T12:07:00Z" }),
+      // Group mail has no reader of its own.
+      msg(13, "2026-11-05T11:58:00Z", { to_name: null, to_group: "crew", read_at: "2026-11-05T12:08:00Z" }),
+    ];
+    expect(order(mergeTimeline(mail, entries, "Mateo"))).toEqual(["m13", "m11", "a1", "m12", "a2", "m10"]);
+    // Without an agent, send times stand.
+    expect(order(mergeTimeline(mail, entries))).toEqual(["m13", "m10", "m11", "a1", "m12", "a2"]);
   });
 });

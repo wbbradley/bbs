@@ -73,6 +73,19 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("reading", () => {
+  it("marks your mail to the agent unread until the agent reads it", async () => {
+    await conversation();
+    await act(async () => feed().push({ messages: [mail(1, "ada", "Mateo"), mail(2, "Mateo", "ada", { read_at: "x" })] }, true));
+    const mine = () => document.getElementById("msg-1")!;
+    expect(mine().className).toContain("mine");
+    expect(mine().querySelector(".unread")!.textContent).toBe("unread");
+    expect(document.getElementById("msg-2")!.querySelector(".unread")).toBeNull();
+    await act(async () =>
+      feed().push({ messages: [mail(1, "ada", "Mateo", { read_at: "2026-10-26T13:00:00Z" }), mail(2, "Mateo", "ada", { read_at: "x" })] }),
+    );
+    expect(mine().querySelector(".unread")).toBeNull();
+  });
+
   it("marks mail read when shown, but not beneath an overlay nor before a reconnect has sent what is new", async () => {
     await conversation();
     await act(async () => feed().push({ messages: [mail(1, "Mateo", "ada")] }, true));
@@ -148,6 +161,25 @@ describe("reconnects", () => {
     await act(async () => activity().push({ events: window }, true));
     expect(screen.getByText("early thought")).toBeTruthy();
     expect(screen.getByText(/activity may be missing here/)).toBeTruthy();
+  });
+});
+
+describe("mail placement", () => {
+  it("shows mail where it was delivered, with or without activity shown", async () => {
+    await conversation();
+    const rec = (id: number, sec: number, record: object) => ({
+      id,
+      created_at: `2026-10-26T12:10:${String(sec).padStart(2, "0")}Z`,
+      record: JSON.stringify(record),
+    });
+    const activity = () => api.streams.filter((s) => s.open && s.kind === "activity").at(-1)!;
+    // Mail 1 (sent 12:00:01) reaches the agent in a later prompt; mail 70 (sent 12:01:10) was sent after it.
+    await act(async () => feed().push({ messages: [mail(1, "ada", "Mateo", { read_at: "x" }), mail(70, "Mateo", "ada")] }, true));
+    await act(async () => activity().push({ events: [rec(1, 30, { event: "prompt", text: "mail", mail_ids: [1] })] }, true));
+    const ids = () => [...document.querySelectorAll(".msg")].map((e) => e.id);
+    expect(ids()).toEqual(["msg-70", "msg-1"]);
+    fireEvent.click(screen.getByText("Mail"));
+    expect(ids()).toEqual(["msg-70", "msg-1"]);
   });
 });
 

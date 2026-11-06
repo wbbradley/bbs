@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- The web conversation view's Mail view now places mail where it entered the
+  agent's context, as the All view does, rather than at its send time. Direct
+  mail to the agent with no delivery record (an agent that is not headless,
+  or a prompt older than the activity loaded) shows where the agent read it.
+
 ## 0.20.0 - 2026-11-05
 
 ### Added

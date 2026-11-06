@@ -174,7 +174,10 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
 
   const compact = prefs.compact;
   const rows = useMemo(() => {
-    const items = mergeTimeline(show === "activity" ? [] : messages, show === "messages" ? [] : entries);
+    // Activity places mail where it was delivered even when only messages show.
+    const items = mergeTimeline(show === "activity" ? [] : messages, entries, agent).filter(
+      (item) => show !== "messages" || item.type === "message",
+    );
     const out: { key: string; at: string; node: ReactNode }[] = [];
     let tools: Extract<ActivityEntry, { kind: "tool" }>[] = [];
     const activityGaps = [...activityHeld.gaps].sort((a, b) => a - b);
