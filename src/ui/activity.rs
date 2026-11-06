@@ -297,7 +297,7 @@ impl Activity {
                 None => self.timed(&mut out, &time, "stopped", style(Role::Text).bold()),
             },
             "unprocessed" => {
-                let line = format!("unprocessed mail:");
+                let line = "unprocessed mail:".to_string();
                 self.timed(&mut out, &time, &line, style(Role::Warning).bold());
                 self.block(&mut out, text, style(Role::Text));
             }
