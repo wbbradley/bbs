@@ -1392,6 +1392,20 @@ impl Bbs for Server {
             .await
     }
 
+    async fn timer_update(
+        &self,
+        req: Request<proto::TimerUpdateRequest>,
+    ) -> Result<Response<proto::Timer>, Status> {
+        let limits = self.0.timer_limits;
+        self.unary(
+            "timer_update",
+            req,
+            Effect::Write,
+            move |conn, caller, req| service::timer_update(conn, caller, req, limits),
+        )
+        .await
+    }
+
     type WatchAgentSummaryStream = BoxStream<proto::AgentSummarySnapshot>;
     type WatchActivityStream = BoxStream<proto::ActivitySnapshot>;
 

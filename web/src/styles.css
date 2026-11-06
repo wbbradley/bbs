@@ -1330,3 +1330,38 @@ mark {
   color: var(--warning);
   font-size: 12px;
 }
+
+/* ---- Timers ---- */
+
+.timer-detail {
+  max-width: 720px;
+}
+dl.timer-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px 16px;
+  margin: 0 0 18px;
+}
+dl.timer-meta dt {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+dl.timer-meta dd {
+  margin: 2px 0 0;
+}
+.timer-detail label.field small {
+  display: block;
+  margin-top: 4px;
+}
+.timer-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.timer-actions .spacer {
+  flex: 1;
+}

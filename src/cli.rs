@@ -269,8 +269,23 @@ pub enum TimerCommand {
     /// List an agent's timers, soonest first: by default your own (agents)
     /// or everyone's (humans).
     List { agent: Option<String> },
-    /// Remove a timer by its id.
+    /// Remove a timer by its id. Its agent is told, unless it removed it.
     Rm { id: i64 },
+    /// Change a timer's text or schedule. Its agent is told what changed,
+    /// unless it made the change.
+    Edit {
+        id: i64,
+        /// The new text.
+        #[arg(long, allow_hyphen_values = true)]
+        text: Option<String>,
+        /// The next run, as an RFC 3339 time.
+        #[arg(long)]
+        next_run: Option<String>,
+        /// "every 1h" or a 5-field cron expression (UTC); "" makes the timer
+        /// one-time. Without --next-run, the new schedule starts from now.
+        #[arg(long)]
+        repeat: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

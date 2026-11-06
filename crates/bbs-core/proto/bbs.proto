@@ -87,6 +87,8 @@ service Bbs {
   rpc TimerAdd(TimerAddRequest) returns (Timer);
   rpc TimerList(TimerListRequest) returns (TimerListResponse);
   rpc TimerRemove(TimerRemoveRequest) returns (Timer);
+  // Change a timer's text or schedule; requires timers-edit.v1.
+  rpc TimerUpdate(TimerUpdateRequest) returns (Timer);
 
   // Harness session binding (hooks). The agent token is in the request.
   // Trust mode needs no caller metadata.
@@ -919,6 +921,16 @@ message TimerAddRequest {
 message TimerListRequest { optional string agent = 1; }  // absent: yours (agents) or everyone's (humans)
 message TimerListResponse { repeated Timer timers = 1; }
 message TimerRemoveRequest { int64 id = 1; }
+// Absent fields are left as they are.
+message TimerUpdateRequest {
+  int64 id = 1;
+  optional string body = 2;
+  // RFC 3339, in the future. Absent with a changed repeat: the new
+  // schedule's first run from now.
+  optional string next_run = 3;
+  // "every 1h" or a 5-field cron expression (UTC); empty makes it one-time.
+  optional string repeat = 4;
+}
 message Timer {
   int64 id = 1;
   string agent = 2;
@@ -926,6 +938,7 @@ message Timer {
   optional string repeat = 4;  // absent for a one-time timer
   string next_run = 5;         // RFC 3339 UTC
   string body = 6;
+  optional string created_at = 7;  // RFC 3339 UTC; absent from older servers
 }
 
 message MarkReadRequest { string from = 1; }  // an agent or human name

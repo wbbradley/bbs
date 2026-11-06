@@ -39,6 +39,7 @@ pub const CAPABILITIES: &[&str] = &[
     "blocker-choices.v1",
     "agent-focus.v1",
     "agent-goal.v1",
+    "timers-edit.v1",
 ];
 const MAX_METADATA_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;

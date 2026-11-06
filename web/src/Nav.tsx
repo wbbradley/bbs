@@ -71,6 +71,7 @@ export function Nav({ onSearch }: { onSearch: () => void }) {
             "Blockers",
             blockers > 0 && <span className="badge warn">{blockers}</span>,
           )}
+          {item(paths.timers, "◷", "Timers")}
           {item(paths.feed, "≡", "Feed")}
           {item(paths.settings, "⚙", "Settings")}
           {oldestUnread && (
