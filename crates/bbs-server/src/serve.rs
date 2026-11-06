@@ -1349,6 +1349,14 @@ impl Bbs for Server {
         Ok(response.map(|(response, _)| response))
     }
 
+    async fn report_goal(
+        &self,
+        req: Request<proto::ReportGoalRequest>,
+    ) -> Result<Response<proto::ReportGoalResponse>, Status> {
+        self.unary("report_goal", req, Effect::Write, service::report_goal)
+            .await
+    }
+
     async fn report_effort(
         &self,
         req: Request<proto::ReportEffortRequest>,

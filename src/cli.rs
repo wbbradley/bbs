@@ -409,6 +409,12 @@ pub enum HeadlessCommand {
     },
     /// Cancel an agent's running turn (the agent's owning human only).
     Cancel { agent: String },
+    /// Set, pause, resume or clear an agent's goal (the agent's owning human only).
+    Goal {
+        agent: String,
+        #[command(subcommand)]
+        action: GoalAction,
+    },
     /// Serve the agent's BBS tools over MCP on stdio (started by the harness).
     #[command(hide = true)]
     Mcp {
@@ -419,6 +425,21 @@ pub enum HeadlessCommand {
         #[arg(long, hide = true)]
         auto_owner_reply: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GoalAction {
+    /// Give the agent a goal to work toward across turns, replacing any it has.
+    Set {
+        /// What the agent should achieve, as it will read it (at most 4096 bytes).
+        objective: String,
+    },
+    /// Stop prompting toward the goal until it is resumed.
+    Pause,
+    /// Prompt toward a paused, blocked, stalled or limited goal again.
+    Resume,
+    /// Remove the goal.
+    Clear,
 }
 
 #[derive(Args, Debug)]
