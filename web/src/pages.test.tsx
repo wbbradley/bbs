@@ -73,6 +73,19 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("reading", () => {
+  it("marks your mail to the agent unread until the agent reads it", async () => {
+    await conversation();
+    await act(async () => feed().push({ messages: [mail(1, "ada", "Mateo"), mail(2, "Mateo", "ada", { read_at: "x" })] }, true));
+    const mine = () => document.getElementById("msg-1")!;
+    expect(mine().className).toContain("mine");
+    expect(mine().querySelector(".unread")!.textContent).toBe("unread");
+    expect(document.getElementById("msg-2")!.querySelector(".unread")).toBeNull();
+    await act(async () =>
+      feed().push({ messages: [mail(1, "ada", "Mateo", { read_at: "2026-10-26T13:00:00Z" }), mail(2, "Mateo", "ada", { read_at: "x" })] }),
+    );
+    expect(mine().querySelector(".unread")).toBeNull();
+  });
+
   it("marks mail read when shown, but not beneath an overlay nor before a reconnect has sent what is new", async () => {
     await conversation();
     await act(async () => feed().push({ messages: [mail(1, "Mateo", "ada")] }, true));
