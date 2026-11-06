@@ -728,7 +728,7 @@ fn a_tabs_next_stream_replaces_its_last_at_once() {
     // A missing or unusable tab id is refused.
     let plain = format!(
         "/api/events?s={}",
-        &tab_path(subs.clone(), "x").split("&s=").nth(1).unwrap()
+        tab_path(subs.clone(), "x").split("&s=").nth(1).unwrap()
     );
     let r = server.request("GET", &plain, &[&cookie], "");
     assert_eq!(r.status, 400, "{}", r.body);

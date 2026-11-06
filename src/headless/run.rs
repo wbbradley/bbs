@@ -1201,19 +1201,14 @@ async fn report_drain(
             changed = reports.changed() => if changed.is_err() { return; },
             _ = retry.tick() => {},
         }
-        let report = reports.borrow_and_update().clone();
+        let report = *reports.borrow_and_update();
         if report.completed_through == 0
             || (report.completed_through <= sent.completed_through
                 && report.side_completed_through <= sent.side_completed_through)
         {
             continue;
         }
-        match tokio::time::timeout(
-            Duration::from_secs(10),
-            backend.report_drain(report.clone()),
-        )
-        .await
-        {
+        match tokio::time::timeout(Duration::from_secs(10), backend.report_drain(report)).await {
             Ok(Ok(_)) => sent = report,
             Ok(Err(err)) => tracing::warn!("restart completion report: {err:#}"),
             Err(_) => tracing::warn!("restart completion report timed out; retrying"),
