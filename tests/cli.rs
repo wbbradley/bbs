@@ -4132,14 +4132,18 @@ fn headless_goal_continues_waits_across_a_restart_and_completes() {
     assert!(results[1]["isError"].is_null());
     let state = headless_state(&bbs, "Zed");
     assert_eq!(state["goal"]["evidence"], "tests pass");
-    // The board has the report.
-    let stored: String = bbs
-        .db()
-        .query_row("SELECT goal FROM agents WHERE name = 'Zed'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert!(stored.contains("GOAL_STATUS_COMPLETE"), "{stored}");
+    // The board gets the report; the runner sends it in the background.
+    eventually("the completed goal on the board", || {
+        let stored: Option<String> = bbs
+            .db()
+            .query_row("SELECT goal FROM agents WHERE name = 'Zed'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        stored
+            .filter(|s| s.contains("GOAL_STATUS_COMPLETE"))
+            .map(|_| ())
+    });
     // No further prompts once complete.
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert_eq!(goal_prompts(&bbs).len(), 4);
