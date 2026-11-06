@@ -269,6 +269,8 @@ export function BoardProvider({
           blocker_count: s.blocker_count ?? a.blocker_count,
           // Null ends focus, so only a missing field (an older server) falls back.
           focused_at: s.focused_at !== undefined ? s.focused_at : a.focused_at,
+          // As focus: null clears the goal.
+          goal: s.goal !== undefined ? s.goal : a.goal,
         };
       }),
     [listed, summaries],

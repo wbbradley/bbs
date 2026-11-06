@@ -6,6 +6,7 @@ import { ActivityView, ToolRun } from "../components/ActivityView";
 import { AnswerDialog } from "../components/AnswerDialog";
 import { Composer, type ComposerHandle } from "../components/Composer";
 import { EffortControl } from "../components/Effort";
+import { GoalDialog, GoalStrip } from "../components/Goal";
 import { FocusMark, FocusToggle } from "../components/Focus";
 import { MessageView } from "../components/MessageView";
 import { NoteDrawer, type NoteHandle } from "../components/NoteDrawer";
@@ -57,6 +58,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const [side, setSide] = useState<SideReport | null>(null);
   const [sideError, setSideError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [goalOpen, setGoalOpen] = useState(false);
   const [visible, setVisible] = useState(document.visibilityState === "visible");
   const [, tick] = useState(0);
   const composer = useRef<ComposerHandle>(null);
@@ -344,6 +346,11 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
             Aside
           </button>
         )}
+        {owned && info && !info.goal && board.has("agent-goal.v1") && (
+          <button className="btn small" onClick={() => setGoalOpen(true)} title="Give the agent a goal to work toward across turns">
+            Goal
+          </button>
+        )}
         {owned && info && board.has("agent-focus.v1") && (
           <FocusToggle agent={agent} since={info.focused_at ?? null} onNotice={setNotice} />
         )}
@@ -389,6 +396,15 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
             }
             above={
               <>
+                {info?.goal && (
+                  <GoalStrip
+                    agent={agent}
+                    goal={info.goal}
+                    owned={owned}
+                    onEdit={() => setGoalOpen(true)}
+                    onNotice={setNotice}
+                  />
+                )}
                 {pendingInput && (
                   <div className="attention">
                     <span>
@@ -429,6 +445,9 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
           <NoteDrawer ref={note} agentId={noteId} agent={agent} onClose={() => setNoteOpen(false)} />
         )}
       </div>
+      {goalOpen && (
+        <GoalDialog agent={agent} current={info?.goal ?? null} onClose={() => setGoalOpen(false)} onNotice={setNotice} />
+      )}
       {answering && pendingInput && (
         // A new request is a new form: nothing chosen for another carries over.
         <AnswerDialog

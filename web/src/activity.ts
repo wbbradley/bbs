@@ -54,6 +54,18 @@ function rest(r: Rec): string {
 /** Turn boundaries end any call still running, without inventing a result. */
 const RESETS = new Set(["start", "session", "prompt", "turn_end", "turn_error", "cancel", "stop"]);
 
+/** "goal waiting (agent) 3/50: until 09:00 — CI runs", or "goal cleared". */
+function goalLine(r: Rec): string {
+  const status = str(r, "status");
+  if (status === "cleared") return "goal cleared";
+  const by = str(r, "changed_by");
+  const turns = typeof r.iteration === "number" ? ` ${r.iteration}/${r.budget}` : "";
+  const why = status === "complete" ? str(r, "evidence") : str(r, "reason");
+  const until = status === "waiting" && str(r, "wake_at") ? `until ${str(r, "wake_at")}` : "";
+  const tail = [until, why].filter(Boolean).join(" — ");
+  return `goal ${status}${by ? ` (${by})` : ""}${turns}${tail ? `: ${tail}` : ""}`;
+}
+
 export function buildActivity(records: Activity[]): ActivityEntry[] {
   const out: ActivityEntry[] = [];
   const running = new Map<string, { entry: Extract<ActivityEntry, { kind: "tool" }>; started: number }>();
@@ -181,6 +193,16 @@ export function buildActivity(records: Activity[]): ActivityEntry[] {
       case "cancel":
         out.push({ ...base, kind: "event", level: "warning", text: "cancel" });
         break;
+      case "goal": {
+        const status = str(r, "status");
+        out.push({
+          ...base,
+          kind: "event",
+          level: ["blocked", "stalled", "limited"].includes(status) ? "warning" : "info",
+          text: goalLine(r),
+        });
+        break;
+      }
       case "stop":
         out.push({
           ...base,

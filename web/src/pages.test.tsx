@@ -131,6 +131,71 @@ describe("focus mode", () => {
   });
 });
 
+describe("goals", () => {
+  const info = { capabilities: ["agent-goal.v1"], release: null, require_human_token: true } as never;
+  const goal = {
+    objective: "Ship the release",
+    status: 3,
+    set_by: "ada",
+    set_at: "2026-11-05T09:00:00Z",
+    iteration: 4,
+    budget: 50,
+    reason: "which branch?",
+    evidence: "",
+    wake_at: null,
+    changed_by: "agent",
+  };
+  const page = async (agent: Agent) => {
+    go("/agents/Mateo");
+    api.auto.set("list_agents", () => ({ agents: [agent], humans: [] }));
+    api.auto.set("list_agent_notes", () => ({ notes: [], has_more: false, next_after_revision: 0 }));
+    api.auto.set("side_report", () => ({}));
+    render(
+      <Board info={info}>
+        <Conversation agent="Mateo" openNav={() => {}} />
+      </Board>,
+    );
+    await act(async () => {});
+  };
+
+  it("let the owner set one", async () => {
+    await page(mateo);
+    fireEvent.click(screen.getByRole("button", { name: "Goal" }));
+    const set = screen.getByRole("button", { name: "Set goal" }) as HTMLButtonElement;
+    expect(set.disabled).toBe(true);
+    fireEvent.change(screen.getByPlaceholderText(/integration tests/), { target: { value: "  Ship the release " } });
+    fireEvent.click(set);
+    expect(api.take("send").req).toEqual({ to: "Mateo", body: "Ship the release", control: 3 });
+  });
+
+  it("show the goal with the owner's controls", async () => {
+    await page({ ...mateo, goal } as Agent);
+    expect(screen.queryByRole("button", { name: "Goal" })).toBeNull();
+    const strip = document.querySelector(".attention.goal")!;
+    expect(strip.textContent).toContain("goal · blocked");
+    expect(strip.textContent).toContain("4/50 turns");
+    expect(strip.textContent).toContain("Ship the release");
+    expect(strip.textContent).toContain("which branch?");
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    const pause = api.take("send");
+    expect(pause.req).toMatchObject({ to: "Mateo", control: 4 });
+    await act(async () => pause.resolve({ to: "Mateo", id: 9 }));
+    expect(screen.getByText("Asked Mateo's runner to pause its goal.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(api.take("send").req).toMatchObject({ to: "Mateo", control: 6 });
+  });
+
+  it("offer resume once stopped, and no controls to others", async () => {
+    await page({ ...mateo, goal: { ...goal, status: 6, reason: "used its budget of 50 turns" } } as Agent);
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    expect(api.take("send").req).toMatchObject({ control: 5 });
+    cleanup();
+    await page({ ...mateo, owner: "bob", goal } as Agent);
+    expect(document.querySelector(".attention.goal")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Pause" })).toBeNull();
+  });
+});
+
 describe("an overlay opening with new mail", () => {
   it("keeps that mail unread when both come in one update", async () => {
     await conversation();

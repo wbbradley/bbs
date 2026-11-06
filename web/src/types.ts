@@ -2,7 +2,23 @@
 // names, absent optionals as null, enums as their numbers.
 
 export const Kind = { Agent: 1, Human: 2 } as const;
-export const Control = { Cancel: 1, SetEffort: 2 } as const;
+export const Control = {
+  Cancel: 1,
+  SetEffort: 2,
+  GoalSet: 3,
+  GoalPause: 4,
+  GoalResume: 5,
+  GoalClear: 6,
+} as const;
+export const GoalStatus = {
+  Active: 1,
+  Waiting: 2,
+  Blocked: 3,
+  Complete: 4,
+  Paused: 5,
+  Limited: 6,
+  Stalled: 7,
+} as const;
 export const BlockerStatus = { Open: 1, Answered: 2, Cancelled: 3, Superseded: 4 } as const;
 export const BlockerChoiceMode = { SelectOne: 1, SelectMany: 2 } as const;
 export const InputStatus = { Pending: 1, Answered: 2, Declined: 3, Cancelled: 4, Stale: 5 } as const;
@@ -83,6 +99,24 @@ export interface Agent {
   blocker_count: number | null;
   /** When its owner put it in focus mode; null when not focused (agent-focus.v1). */
   focused_at?: string | null;
+  /** Its runner's goal; null when it has none, absent from older servers. */
+  goal?: GoalReport | null;
+  goal_reported_at?: string | null;
+}
+
+/** A headless runner's goal as it last reported it (agent-goal.v1). */
+export interface GoalReport {
+  objective: string;
+  status: number;
+  set_by: string;
+  set_at: string;
+  iteration: number;
+  budget: number;
+  reason: string;
+  evidence: string;
+  wake_at: string | null;
+  /** "agent", "owner" or "runner". */
+  changed_by: string;
 }
 
 export interface Human {
@@ -103,6 +137,8 @@ export interface AgentSummary {
   blocker_count: number | null;
   agent_id: number | null;
   focused_at?: string | null;
+  goal?: GoalReport | null;
+  goal_reported_at?: string | null;
 }
 
 export interface Group {

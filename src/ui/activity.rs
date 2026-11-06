@@ -280,6 +280,15 @@ impl Activity {
                 self.timed(&mut out, &time, &line, style(Role::Warning).bold());
             }
             "cancel" => self.timed(&mut out, &time, "cancel", style(Role::Warning)),
+            "goal" => {
+                let status = str_field(&r, "status");
+                let role = match status {
+                    "blocked" | "stalled" | "limited" => Role::Warning,
+                    "complete" => Role::Success,
+                    _ => Role::Text,
+                };
+                self.timed(&mut out, &time, &goal_line(&r), style(role));
+            }
             "stop" => match r.get("error").and_then(Value::as_str) {
                 Some(err) => {
                     let line = format!("stopped: {err}");
@@ -488,6 +497,44 @@ fn dim() -> Style {
     style(Role::Muted)
 }
 
+/// "goal waiting (agent) 3/50: until 2026-11-06T09:00:00Z — CI runs", or
+/// "goal cleared".
+fn goal_line(r: &serde_json::Map<String, Value>) -> String {
+    let status = str_field(r, "status");
+    if status == "cleared" {
+        return "goal cleared".into();
+    }
+    let mut line = format!("goal {status}");
+    let by = str_field(r, "changed_by");
+    if !by.is_empty() {
+        line.push_str(&format!(" ({by})"));
+    }
+    if let (Some(i), Some(b)) = (
+        r.get("iteration").and_then(Value::as_u64),
+        r.get("budget").and_then(Value::as_u64),
+    ) {
+        line.push_str(&format!(" {i}/{b}"));
+    }
+    let why = if status == "complete" {
+        str_field(r, "evidence")
+    } else {
+        str_field(r, "reason")
+    };
+    let until = match r.get("wake_at").and_then(Value::as_str) {
+        Some(at) if status == "waiting" => format!("until {at}"),
+        _ => String::new(),
+    };
+    let tail: Vec<&str> = [until.as_str(), why]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !tail.is_empty() {
+        line.push_str(": ");
+        line.push_str(&tail.join(" — "));
+    }
+    line
+}
+
 fn str_field<'a>(r: &'a Map<String, Value>, key: &str) -> &'a str {
     r.get(key).and_then(Value::as_str).unwrap_or_default()
 }
@@ -528,6 +575,31 @@ mod tests {
             .iter()
             .map(|l| to_ansi(&activity.render(l), false))
             .collect()
+    }
+
+    #[test]
+    fn goal_changes_read_as_one_line() {
+        let waiting = serde_json::json!({
+            "event": "goal", "status": "waiting", "changed_by": "agent", "iteration": 3,
+            "budget": 50, "reason": "CI runs", "evidence": "", "wake_at": "2026-11-06T09:00:00Z",
+        })
+        .to_string();
+        let done = serde_json::json!({
+            "event": "goal", "status": "complete", "changed_by": "agent", "iteration": 4,
+            "budget": 50, "reason": "", "evidence": "tests pass",
+        })
+        .to_string();
+        let cleared = serde_json::json!({ "event": "goal", "status": "cleared" }).to_string();
+        let shown = render(&[&waiting, &done, &cleared]);
+        assert!(
+            shown.contains("goal waiting (agent) 3/50: until 2026-11-06T09:00:00Z — CI runs"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("goal complete (agent) 4/50: tests pass"),
+            "{shown}"
+        );
+        assert!(shown.contains("goal cleared"), "{shown}");
     }
 
     #[test]

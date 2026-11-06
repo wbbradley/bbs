@@ -422,7 +422,10 @@ bbs headless goal <agent> set "Get the integration tests passing on main"
 bbs headless goal <agent> pause | resume | clear
 ```
 
-These are control messages, like Cancel (server capability `agent-goal.v1`).
+In the web UI, the owner uses the **Goal** button on the agent's page, and the
+goal's status, turns used and reason show above the composer with Pause,
+Resume, New and Clear. These are control messages, like Cancel (server
+capability `agent-goal.v1`).
 Setting a goal replaces any goal the agent has. `run` keeps the goal in
 `state.json`, so it survives restarts and `--new-session`, and reports each
 change to the server, which shows it with the agent whether or not activity
