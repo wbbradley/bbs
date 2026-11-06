@@ -98,6 +98,9 @@ service Bbs {
   // A headless agent's driver reports its harness-confirmed effort state.
   // Agent token, self only; requires agent-effort.v1.
   rpc ReportEffort(ReportEffortRequest) returns (ReportEffortResponse);
+  // A headless agent's runner reports its goal state, or that it has none.
+  // Agent token, self only; requires agent-goal.v1.
+  rpc ReportGoal(ReportGoalRequest) returns (ReportGoalResponse);
 
   // Side channels (agent-interactions.v1): structured owner input and context
   // usage, separate from ordinary mail delivery and prompt submission.
@@ -453,6 +456,12 @@ enum Control {
   // Set the agent's effort to the level named in `body`; also requires
   // agent-effort.v1.
   CONTROL_SET_EFFORT = 2;
+  // Goals (agent-goal.v1): set the agent's goal to the objective in `body`
+  // (1 to 4096 bytes), replacing any goal it has; pause, resume or clear it.
+  CONTROL_GOAL_SET = 3;
+  CONTROL_GOAL_PAUSE = 4;
+  CONTROL_GOAL_RESUME = 5;
+  CONTROL_GOAL_CLEAR = 6;
 }
 
 message SendRequest {
@@ -519,6 +528,35 @@ message EffortReport {
 }
 message ReportEffortRequest { EffortReport report = 1; }
 message ReportEffortResponse {}
+
+// Goals (agent-goal.v1). A headless runner keeps the goal and reports each
+// change; the server stores the newest report and validates only its shape.
+enum GoalStatus {
+  GOAL_STATUS_UNSPECIFIED = 0;
+  GOAL_STATUS_ACTIVE = 1;    // the runner sends prompts toward it
+  GOAL_STATUS_WAITING = 2;   // the agent waits until wake_at, or for mail
+  GOAL_STATUS_BLOCKED = 3;   // the agent needs a person or agent; waits for mail
+  GOAL_STATUS_COMPLETE = 4;  // the agent met it, with evidence
+  GOAL_STATUS_PAUSED = 5;    // the owner paused it (or cancelled a turn)
+  GOAL_STATUS_LIMITED = 6;   // the runner stopped at the turn budget
+  GOAL_STATUS_STALLED = 7;   // the runner stopped after turns with no progress
+}
+message GoalReport {
+  string objective = 1;              // 1 to 4096 bytes, as the owner set it
+  GoalStatus status = 2;
+  string set_by = 3;                 // the human who set it: the agent's owner
+  string set_at = 4;                 // RFC 3339
+  uint32 iteration = 5;              // goal prompts sent
+  uint32 budget = 6;                 // the most goal prompts before LIMITED
+  string reason = 7;                 // why the status last changed; may be empty
+  string evidence = 8;               // COMPLETE: what shows it is met
+  optional string wake_at = 9;       // WAITING with a time: RFC 3339
+  string changed_by = 10;            // "agent", "owner" or "runner"
+}
+// No goal clears the stored report; its time is still recorded, so clients
+// know a goal-capable runner drives the agent.
+message ReportGoalRequest { optional GoalReport goal = 1; }
+message ReportGoalResponse {}
 
 // Side channels (agent-interactions.v1). Nothing here is mail: no message,
 // delivery, inbox, history or recency row is ever created.
@@ -706,6 +744,12 @@ message Agent {
   // When the agent's owner put it in focus mode (agent-focus.v1); absent when
   // it is not focused or the server is older.
   optional string focused_at = 15;
+  // The newest reported goal (agent-goal.v1); absent when the agent has none,
+  // never reported or the server is older.
+  optional GoalReport goal = 16;
+  // When the server received the newest goal report, including one saying
+  // there is no goal; absent when no goal-capable runner has reported.
+  optional string goal_reported_at = 17;
 }
 
 // The window is the most recent `backlog` (1 to 1000) messages that match every
@@ -825,6 +869,9 @@ message AgentSummary {
   optional int64 agent_id = 11;
   // As Agent.focused_at.
   optional string focused_at = 12;
+  // As Agent.goal and Agent.goal_reported_at.
+  optional GoalReport goal = 13;
+  optional string goal_reported_at = 14;
 }
 // Every live agent, by name.
 message AgentSummarySnapshot {

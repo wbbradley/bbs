@@ -24,7 +24,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::backend::Backend;
-use crate::cli::HeadlessCommand;
+use crate::cli::{GoalAction, HeadlessCommand};
 use crate::config::Config;
 use crate::proto;
 use crate::service::Caller;
@@ -39,6 +39,7 @@ pub async fn run(command: HeadlessCommand, dir: &Path, as_human: Option<&str>) -
             pretty,
         } => log::print(&state::AgentDir::new(&agent)?.log_path(), follow, pretty).await,
         HeadlessCommand::Cancel { agent } => cancel(dir, as_human, agent).await,
+        HeadlessCommand::Goal { agent, action } => goal(dir, as_human, agent, action).await,
         HeadlessCommand::Mcp {
             local_state_dir,
             auto_owner_reply,
@@ -53,8 +54,14 @@ pub async fn run(command: HeadlessCommand, dir: &Path, as_human: Option<&str>) -
     }
 }
 
-/// Ask the agent's running `bbs headless run` to cancel its turn.
-async fn cancel(dir: &Path, as_human: Option<&str>, agent: String) -> Result<()> {
+/// Send a control message to an agent its human owns.
+async fn control(
+    dir: &Path,
+    as_human: Option<&str>,
+    agent: String,
+    body: String,
+    control: proto::Control,
+) -> Result<String> {
     let config = Config::load()?;
     let caller = Caller {
         human: config.human(as_human),
@@ -64,10 +71,42 @@ async fn cancel(dir: &Path, as_human: Option<&str>, agent: String) -> Result<()>
     let r = backend
         .send(proto::SendRequest {
             to: agent,
-            body: "Cancel your running turn (bbs headless cancel).".into(),
-            control: Some(proto::Control::Cancel.into()),
+            body,
+            control: Some(control.into()),
         })
         .await?;
-    println!("Asked {} to cancel its running turn.", r.to);
+    Ok(r.to)
+}
+
+/// Ask the agent's running `bbs headless run` to cancel its turn.
+async fn cancel(dir: &Path, as_human: Option<&str>, agent: String) -> Result<()> {
+    let body = "Cancel your running turn (bbs headless cancel).".to_string();
+    let to = control(dir, as_human, agent, body, proto::Control::Cancel).await?;
+    println!("Asked {to} to cancel its running turn.");
+    Ok(())
+}
+
+/// Ask the agent's running `bbs headless run` to change its goal.
+async fn goal(dir: &Path, as_human: Option<&str>, agent: String, action: GoalAction) -> Result<()> {
+    let (body, kind, verb) = match action {
+        GoalAction::Set { objective } => (objective, proto::Control::GoalSet, "set"),
+        GoalAction::Pause => (
+            "Pause your goal.".into(),
+            proto::Control::GoalPause,
+            "pause",
+        ),
+        GoalAction::Resume => (
+            "Resume your goal.".into(),
+            proto::Control::GoalResume,
+            "resume",
+        ),
+        GoalAction::Clear => (
+            "Clear your goal.".into(),
+            proto::Control::GoalClear,
+            "clear",
+        ),
+    };
+    let to = control(dir, as_human, agent, body, kind).await?;
+    println!("Asked {to}'s runner to {verb} its goal.");
     Ok(())
 }

@@ -40,6 +40,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0023_agent_drains.sql"),
     include_str!("../migrations/0024_blocker_choices.sql"),
     include_str!("../migrations/0025_agent_focus.sql"),
+    include_str!("../migrations/0026_agent_goal.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +84,9 @@ pub struct AgentRow {
     pub last_human_conversation_at: Option<String>,
     /// When its owner put it in focus mode; None when not focused.
     pub focused_at: Option<String>,
+    /// The newest validated goal report (JSON) and when the server got it.
+    pub goal: Option<String>,
+    pub goal_reported_at: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -450,7 +454,8 @@ pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
     )?;
     conn.execute("DELETE FROM side_requests WHERE agent_id = ?1", params![id])?;
     conn.execute(
-        "UPDATE agents SET effort = NULL, effort_reported_at = NULL, focused_at = NULL
+        "UPDATE agents SET effort = NULL, effort_reported_at = NULL, focused_at = NULL,
+                goal = NULL, goal_reported_at = NULL
          WHERE id = ?1",
         params![id],
     )?;
@@ -484,6 +489,17 @@ pub fn focused_at(conn: &Connection, id: i64) -> Result<Option<String>> {
 pub fn set_effort(conn: &Connection, id: i64, report: &str, now: &str) -> Result<()> {
     conn.execute(
         "UPDATE agents SET effort = ?2, effort_reported_at = ?3 WHERE id = ?1",
+        params![id, report, now],
+    )?;
+    Ok(())
+}
+
+/// Store an agent's validated goal report JSON (None: it has no goal) and
+/// when it arrived. The time stays set either way: it says a goal-capable
+/// runner reported.
+pub fn set_goal(conn: &Connection, id: i64, report: Option<&str>, now: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE agents SET goal = ?2, goal_reported_at = ?3 WHERE id = ?1",
         params![id, report, now],
     )?;
     Ok(())
@@ -579,7 +595,7 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                      WHERE agent_id = a.id
                      ORDER BY id DESC LIMIT 1))),
                 (SELECT max(last_at) FROM agent_human_conversations p WHERE p.agent_id = a.id),
-                a.focused_at
+                a.focused_at, a.goal, a.goal_reported_at
          FROM agents a
          LEFT JOIN agent_owners o ON o.agent_id = a.id
          LEFT JOIN humans h ON h.id = o.human_id
@@ -602,6 +618,8 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                 last_sent_at: r.get(10)?,
                 last_human_conversation_at: r.get(11)?,
                 focused_at: r.get(12)?,
+                goal: r.get(13)?,
+                goal_reported_at: r.get(14)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -1458,6 +1476,9 @@ pub struct AgentSummary {
     pub last_human_conversation_at: Option<String>,
     /// When its owner put it in focus mode; None when not focused.
     pub focused_at: Option<String>,
+    /// The newest validated goal report (JSON) and when the server got it.
+    pub goal: Option<String>,
+    pub goal_reported_at: Option<String>,
 }
 
 /// Unread mail through the human's inbox index; unseen activity per live
@@ -1473,7 +1494,7 @@ const AGENT_SUMMARIES: &str = "
         GROUP BY m.from_id),
     summaries AS MATERIALIZED (
         SELECT g.id AS agent_id, g.name, coalesce(u.n, 0) AS unread, u.oldest AS unread_oldest,
-               g.effort, g.effort_reported_at, g.focused_at,
+               g.effort, g.effort_reported_at, g.focused_at, g.goal, g.goal_reported_at,
                (SELECT count(*) FROM activity act
                 WHERE act.agent_id = g.id AND act.id > coalesce(s.seen_id, 0)) AS unseen,
                -- Ids grow with arrival, so the first unseen is the oldest.
@@ -1497,7 +1518,8 @@ const AGENT_SUMMARIES: &str = "
         LEFT JOIN unread u ON u.agent_id = g.id
         WHERE g.retired_at IS NULL)
     SELECT name, unread, unread_oldest, unseen, unseen_oldest, last_sent, effort,
-           effort_reported_at, human_conversation, agent_id, focused_at FROM summaries
+           effort_reported_at, human_conversation, agent_id, focused_at, goal,
+           goal_reported_at FROM summaries
     ORDER BY lower(name)";
 
 /// For each live agent, the direct messages it sent `human` that are unread,
@@ -1519,6 +1541,8 @@ pub fn agent_summaries(conn: &Connection, human: i64) -> Result<Vec<AgentSummary
                 effort_reported_at: r.get(7)?,
                 last_human_conversation_at: r.get(8)?,
                 focused_at: r.get(10)?,
+                goal: r.get(11)?,
+                goal_reported_at: r.get(12)?,
             })
         })?
         .collect::<Result<_, _>>()?;

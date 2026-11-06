@@ -193,6 +193,10 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
         control: match m.control.as_deref() {
             Some("cancel") => Some(proto::Control::Cancel.into()),
             Some("set-effort") => Some(proto::Control::SetEffort.into()),
+            Some("goal-set") => Some(proto::Control::GoalSet.into()),
+            Some("goal-pause") => Some(proto::Control::GoalPause.into()),
+            Some("goal-resume") => Some(proto::Control::GoalResume.into()),
+            Some("goal-clear") => Some(proto::Control::GoalClear.into()),
             _ => None,
         },
         timer_id: m.timer_id,
@@ -926,6 +930,16 @@ fn send_control(
             }
             "set-effort"
         }
+        Ok(proto::Control::GoalSet) => {
+            // The body is the objective, which reports carry verbatim.
+            if body.trim().is_empty() || body.len() > MAX_GOAL_OBJECTIVE {
+                bail!("a goal's objective is 1 to {MAX_GOAL_OBJECTIVE} bytes");
+            }
+            "goal-set"
+        }
+        Ok(proto::Control::GoalPause) => "goal-pause",
+        Ok(proto::Control::GoalResume) => "goal-resume",
+        Ok(proto::Control::GoalClear) => "goal-clear",
         _ => bail!("unknown control {control}"),
     };
     if me.kind != db::Kind::Human {
@@ -2065,6 +2079,8 @@ pub fn list_agents(
                 effort_reported_at: a.effort_reported_at,
                 last_human_conversation_at: a.last_human_conversation_at,
                 focused_at: a.focused_at,
+                goal: a.goal.as_deref().and_then(goal_from_json),
+                goal_reported_at: a.goal_reported_at,
             })
             .collect();
         Ok(proto::ListAgentsResponse { humans, agents })
@@ -2556,6 +2572,114 @@ fn effort_json(report: &proto::EffortReport) -> String {
     .to_string()
 }
 
+// ---- agent goals (agent-goal.v1) ---------------------------------------------
+
+/// Bounds on one goal report and on a goal-set control's objective.
+const MAX_GOAL_OBJECTIVE: usize = 4096;
+const MAX_GOAL_TEXT: usize = 4096;
+const MAX_GOAL_NAME: usize = 128;
+const GOAL_CHANGERS: [&str; 3] = ["agent", "owner", "runner"];
+
+/// Store the calling agent's own goal report after validation, or clear it.
+pub fn report_goal(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::ReportGoalRequest,
+) -> Result<proto::ReportGoalResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        let json = match &req.goal {
+            Some(goal) => {
+                let owner = db::agent_owner_name(ctx.conn, me.id)?;
+                Some(goal_json(&validate_goal(goal, owner.as_deref())?))
+            }
+            None => None,
+        };
+        db::set_goal(ctx.conn, me.id, json.as_deref(), &ctx.now_s)?;
+        Ok(proto::ReportGoalResponse {})
+    })
+}
+
+/// The report checked, with its times in stored form. Only the agent's
+/// owner can set its goal, so `set_by` must name them.
+fn validate_goal(goal: &proto::GoalReport, owner: Option<&str>) -> Result<proto::GoalReport> {
+    let status = goal.status();
+    if status == proto::GoalStatus::Unspecified {
+        bail!("unspecified goal status");
+    }
+    if goal.objective.trim().is_empty() || goal.objective.len() > MAX_GOAL_OBJECTIVE {
+        bail!("a goal's objective is 1 to {MAX_GOAL_OBJECTIVE} bytes");
+    }
+    if goal.set_by.is_empty() || goal.set_by.len() > MAX_GOAL_NAME {
+        bail!("set_by is 1 to {MAX_GOAL_NAME} bytes");
+    }
+    if !owner.is_some_and(|o| o.eq_ignore_ascii_case(&goal.set_by)) {
+        bail!("set_by must be the agent's owner");
+    }
+    if goal.reason.len() > MAX_GOAL_TEXT || goal.evidence.len() > MAX_GOAL_TEXT {
+        bail!("reason and evidence are at most {MAX_GOAL_TEXT} bytes each");
+    }
+    if status == proto::GoalStatus::Complete && goal.evidence.trim().is_empty() {
+        bail!("a complete goal needs evidence");
+    }
+    if goal.budget == 0 {
+        bail!("a goal's budget is at least one turn");
+    }
+    if goal.iteration > goal.budget {
+        bail!("a goal cannot use more than its budget of turns");
+    }
+    if !GOAL_CHANGERS.contains(&goal.changed_by.as_str()) {
+        bail!("changed_by is one of {GOAL_CHANGERS:?}");
+    }
+    let wake_at = match &goal.wake_at {
+        Some(at) if status == proto::GoalStatus::Waiting => Some(parse_time("wake_at", at)?),
+        Some(_) => bail!("only a waiting goal has wake_at"),
+        None => None,
+    };
+    Ok(proto::GoalReport {
+        set_at: parse_time("set_at", &goal.set_at)?,
+        wake_at,
+        ..goal.clone()
+    })
+}
+
+/// A stored report back to its typed form; validated at write, so a parse
+/// failure here means hand-edited storage and reads as no goal.
+fn goal_from_json(stored: &str) -> Option<proto::GoalReport> {
+    let v: serde_json::Value = serde_json::from_str(stored).ok()?;
+    let text = |k: &str| Some(v.get(k)?.as_str()?.to_string());
+    let count = |k: &str| u32::try_from(v.get(k)?.as_u64()?).ok();
+    Some(proto::GoalReport {
+        objective: text("objective")?,
+        status: proto::GoalStatus::from_str_name(v.get("status")?.as_str()?)? as i32,
+        set_by: text("set_by")?,
+        set_at: text("set_at")?,
+        iteration: count("iteration")?,
+        budget: count("budget")?,
+        reason: text("reason")?,
+        evidence: text("evidence")?,
+        wake_at: text("wake_at"),
+        changed_by: text("changed_by")?,
+    })
+}
+
+/// The validated report as stored JSON.
+fn goal_json(goal: &proto::GoalReport) -> String {
+    serde_json::json!({
+        "objective": goal.objective,
+        "status": goal.status().as_str_name(),
+        "set_by": goal.set_by,
+        "set_at": goal.set_at,
+        "iteration": goal.iteration,
+        "budget": goal.budget,
+        "reason": goal.reason,
+        "evidence": goal.evidence,
+        "wake_at": goal.wake_at,
+        "changed_by": goal.changed_by,
+    })
+    .to_string()
+}
+
 // ---- agent activity --------------------------------------------------------
 
 /// The largest activity record accepted; senders cut long text to fit.
@@ -2725,6 +2849,8 @@ pub fn agent_summary(
                 effort_reported_at: s.effort_reported_at,
                 last_human_conversation_at: s.last_human_conversation_at,
                 focused_at: s.focused_at,
+                goal: s.goal.as_deref().and_then(goal_from_json),
+                goal_reported_at: s.goal_reported_at,
             })
             .collect();
         Ok(proto::AgentSummarySnapshot {
@@ -3780,6 +3906,139 @@ mod tests {
             .agents;
         let m = agents.iter().find(|a| a.name == "Mateo").unwrap();
         assert!(m.effort.is_none());
+    }
+
+    #[test]
+    fn goal_controls_and_reports_validate_and_round_trip() {
+        let (mut conn, will, agents) = board();
+        let mateo = agents[0].clone();
+        let goal = |status: proto::GoalStatus| proto::GoalReport {
+            objective: "Ship the release".into(),
+            status: status.into(),
+            set_by: "will".into(),
+            set_at: "2026-11-05T09:00:00+00:00".into(),
+            iteration: 2,
+            budget: 50,
+            reason: String::new(),
+            evidence: String::new(),
+            wake_at: None,
+            changed_by: "runner".into(),
+        };
+        let report = |conn: &mut Connection, g: Option<proto::GoalReport>| {
+            report_goal(conn, &mateo, proto::ReportGoalRequest { goal: g })
+        };
+        let stored = |conn: &mut Connection| {
+            let agents = list_agents(conn, &will, proto::ListAgentsRequest { all: true })
+                .unwrap()
+                .agents;
+            let m = agents.into_iter().find(|a| a.name == "Mateo").unwrap();
+            (m.goal, m.goal_reported_at)
+        };
+        // Humans cannot report.
+        assert!(
+            report_goal(
+                &mut conn,
+                &will,
+                proto::ReportGoalRequest {
+                    goal: Some(goal(proto::GoalStatus::Active))
+                }
+            )
+            .is_err()
+        );
+        // A valid report round-trips through the list and the summaries, with
+        // its times in stored form.
+        let mut waiting = goal(proto::GoalStatus::Waiting);
+        waiting.wake_at = Some("2026-11-06T09:00:00Z".into());
+        waiting.reason = "CI runs at 0800Z".into();
+        waiting.changed_by = "agent".into();
+        report(&mut conn, Some(waiting)).unwrap();
+        let (g, at) = stored(&mut conn);
+        let g = g.unwrap();
+        assert!(at.is_some());
+        assert_eq!(g.status(), proto::GoalStatus::Waiting);
+        assert_eq!(g.objective, "Ship the release");
+        assert_eq!(g.wake_at.as_deref(), Some("2026-11-06T09:00:00.000000Z"));
+        assert_eq!(g.set_at, "2026-11-05T09:00:00.000000Z");
+        assert_eq!((g.iteration, g.budget), (2, 50));
+        let summaries = agent_summary(&mut conn, &will, proto::AgentSummaryRequest {})
+            .unwrap()
+            .agents;
+        let s = summaries.iter().find(|s| s.agent == "Mateo").unwrap();
+        assert_eq!(s.goal.as_ref().unwrap().reason, "CI runs at 0800Z");
+        // Invalid reports are refused.
+        let bad = |edit: &dyn Fn(&mut proto::GoalReport)| {
+            let mut g = goal(proto::GoalStatus::Active);
+            edit(&mut g);
+            g
+        };
+        for (g, want) in [
+            (bad(&|g| g.status = 0), "unspecified"),
+            (bad(&|g| g.objective = " ".into()), "objective"),
+            (bad(&|g| g.objective = "x".repeat(4097)), "objective"),
+            (bad(&|g| g.set_by = String::new()), "set_by"),
+            (bad(&|g| g.reason = "x".repeat(4097)), "at most"),
+            (
+                bad(&|g| g.status = proto::GoalStatus::Complete.into()),
+                "evidence",
+            ),
+            (bad(&|g| g.budget = 0), "budget"),
+            (bad(&|g| g.iteration = 51), "more than its budget"),
+            (bad(&|g| g.set_by = "mallory".into()), "owner"),
+            (bad(&|g| g.changed_by = "someone".into()), "changed_by"),
+            (
+                bad(&|g| g.wake_at = Some("2026-11-06T09:00:00Z".into())),
+                "only a waiting",
+            ),
+            (bad(&|g| g.set_at = "yesterday".into()), "set_at"),
+        ] {
+            let err = report(&mut conn, Some(g)).unwrap_err();
+            assert!(format!("{err:#}").contains(want), "{want}: {err:#}");
+        }
+        // A complete goal with evidence is accepted; no goal clears the report.
+        let mut done = goal(proto::GoalStatus::Complete);
+        done.evidence = "v1.0 tagged".into();
+        report(&mut conn, Some(done)).unwrap();
+        assert_eq!(stored(&mut conn).0.unwrap().evidence, "v1.0 tagged");
+        // No goal clears the report but keeps its time: a runner reported.
+        report(&mut conn, None).unwrap();
+        let (g, at) = stored(&mut conn);
+        assert!(g.is_none() && at.is_some());
+        // The owner's name matches in any case.
+        let mut shouted = goal(proto::GoalStatus::Active);
+        shouted.set_by = "WILL".into();
+        report(&mut conn, Some(shouted)).unwrap();
+        // Goal controls read back with their kinds; set needs an objective.
+        let control = |conn: &mut Connection, body: &str, c: proto::Control| {
+            send(
+                conn,
+                &will,
+                proto::SendRequest {
+                    to: "Mateo".into(),
+                    body: body.into(),
+                    control: Some(c.into()),
+                },
+            )
+        };
+        assert!(control(&mut conn, " ", proto::Control::GoalSet).is_err());
+        assert!(control(&mut conn, &"x".repeat(4097), proto::Control::GoalSet).is_err());
+        let kinds = [
+            proto::Control::GoalSet,
+            proto::Control::GoalPause,
+            proto::Control::GoalResume,
+            proto::Control::GoalClear,
+        ];
+        for c in kinds {
+            control(&mut conn, "Ship the release", c).unwrap();
+        }
+        let mail = read(&mut conn, &mateo, proto::ReadRequest::default())
+            .unwrap()
+            .messages;
+        let got: Vec<_> = mail.iter().filter_map(|m| m.control).collect();
+        assert_eq!(got, kinds.map(i32::from).to_vec());
+        // Retirement clears the report.
+        report(&mut conn, Some(goal(proto::GoalStatus::Active))).unwrap();
+        bye(&mut conn, &mateo).unwrap();
+        assert_eq!(stored(&mut conn), (None, None));
     }
 
     #[test]

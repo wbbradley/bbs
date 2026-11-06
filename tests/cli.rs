@@ -4120,6 +4120,44 @@ fn control_messages_are_for_owned_agents_only(mode: Mode) {
     );
 }
 
+fn goal_controls_are_for_owned_agents_only(mode: Mode) {
+    let bbs = Bbs::with_mode("goal-control", mode);
+    bbs.ok(&["human", "add", "alice"]);
+    let (a, ta) = bbs.register();
+    let out = bbs.ok(&["headless", "goal", &a, "set", "Ship the release"]);
+    assert!(out.contains("runner to set its goal"), "{out}");
+    for action in ["pause", "resume", "clear"] {
+        bbs.ok(&["headless", "goal", &a, action]);
+    }
+    let rows: Vec<(String, String)> = bbs
+        .db()
+        .prepare("SELECT control, body FROM messages WHERE control IS NOT NULL ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let kinds: Vec<&str> = rows.iter().map(|(c, _)| c.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["goal-set", "goal-pause", "goal-resume", "goal-clear"]
+    );
+    assert_eq!(rows[0].1, "Ship the release");
+    assert!(
+        bbs.ok(&["--token", &ta, "read"])
+            .contains("Ship the release")
+    );
+    assert!(
+        bbs.err(&["--as", "alice", "headless", "goal", &a, "pause"])
+            .contains("is not your agent")
+    );
+    let long = "x".repeat(4097);
+    assert!(
+        bbs.err(&["headless", "goal", &a, "set", &long])
+            .contains("objective")
+    );
+}
+
 fn headless_signals_during_setup_stop_the_harness(mode: Mode) {
     let bbs = Bbs::with_mode("setup-signal", mode);
     // A harness that never answers `initialize`, with a command of its own.
@@ -4269,6 +4307,7 @@ both_modes!(
     headless_new_session_skips_resume,
     connect_is_for_humans_at_a_terminal,
     control_messages_are_for_owned_agents_only,
+    goal_controls_are_for_owned_agents_only,
     headless_run_takes_over_an_owned_agent,
     headless_signals_during_setup_stop_the_harness,
 );

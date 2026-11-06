@@ -8,6 +8,18 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- Goal controls and reporting for headless agents (`agent-goal.v1`, schema 26).
+  `bbs headless goal <agent> set "<objective>" | pause | resume | clear` sends
+  the agent's runner a goal control (the agent's owning human only). Runners
+  report the goal's state with the new `ReportGoal` RPC: objective, status
+  (active, waiting, blocked, complete, paused, limited or stalled), turns used
+  and budget, reason, evidence and wake time. `Agent` and `AgentSummary` carry
+  the newest report, so it survives activity trimming and does not depend on
+  `share_activity`; retirement clears it. Schema 26 adds nullable `agents.goal`
+  and `agents.goal_reported_at`; earlier binaries cannot open it.
+
 ### Changed
 
 - The web conversation view's Mail view now places mail where it entered the

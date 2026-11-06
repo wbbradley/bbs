@@ -44,6 +44,7 @@ pub const AGENT_NOTES: &str = "agent-notes.v1";
 /// Replicating the caller's whole personal history with `FeedRequest.sync`.
 pub const FEED_SYNC: &str = "feed-sync.v1";
 pub const AGENT_FOCUS: &str = "agent-focus.v1";
+pub const AGENT_GOAL: &str = "agent-goal.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -491,10 +492,21 @@ impl Backend {
 
     pub async fn send(&mut self, req: proto::SendRequest) -> Result<proto::SendResponse> {
         let effort = req.control == Some(proto::Control::SetEffort as i32);
+        let goal = req.control.is_some_and(|c| {
+            matches!(
+                proto::Control::try_from(c),
+                Ok(proto::Control::GoalSet
+                    | proto::Control::GoalPause
+                    | proto::Control::GoalResume
+                    | proto::Control::GoalClear)
+            )
+        });
         match self {
             Backend::Local(l) => service::send(&mut l.conn, &l.caller, req),
             Backend::Remote(r) if effort => rpc!(r, send, req, &[AGENT_CONTROL, AGENT_EFFORT])
                 .map_err(|e| missing_rpc(e, AGENT_EFFORT)),
+            Backend::Remote(r) if goal => rpc!(r, send, req, &[AGENT_CONTROL, AGENT_GOAL])
+                .map_err(|e| missing_rpc(e, AGENT_GOAL)),
             Backend::Remote(r) if req.control.is_some() => {
                 rpc!(r, send, req, &[AGENT_CONTROL]).map_err(|e| missing_rpc(e, AGENT_CONTROL))
             }
@@ -651,6 +663,20 @@ impl Backend {
             Backend::Local(l) => service::report_side(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => {
                 rpc!(r, report_side, req, &[cap]).map_err(|e| missing_rpc(e, cap))
+            }
+        }
+    }
+
+    /// Report the calling agent's own goal, or that it has none. A server
+    /// needs `agent-goal.v1`.
+    pub async fn report_goal(
+        &mut self,
+        req: proto::ReportGoalRequest,
+    ) -> Result<proto::ReportGoalResponse> {
+        match self {
+            Backend::Local(l) => service::report_goal(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => {
+                rpc!(r, report_goal, req, &[AGENT_GOAL]).map_err(|e| missing_rpc(e, AGENT_GOAL))
             }
         }
     }
