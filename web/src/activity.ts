@@ -208,8 +208,9 @@ export type TimelineItem =
  * or steer delivered shows where it entered the agent's context, in place of
  * that echo; receipts and text records naming loaded mail give way to it.
  * Direct mail to `agent` with no delivery record loaded (an agent that is not
- * headless, or a prompt older than the activity held) shows where the agent
- * read it, which is when it took the mail.
+ * headless, or a prompt older than the activity held) shows where its copy
+ * was marked read: usually when the agent took it, though retiring the agent
+ * or marking a sender's mail read also mark it.
  */
 export function mergeTimeline(messages: Message[], entries: ActivityEntry[], agent?: string): TimelineItem[] {
   const loaded = new Set(messages.map((m) => m.id));
