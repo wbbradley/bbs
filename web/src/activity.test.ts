@@ -99,3 +99,20 @@ describe("timeline placement", () => {
     expect(order(mergeTimeline(mail, entries))).toEqual(["m13", "m10", "m11", "a1", "m12", "a2"]);
   });
 });
+
+describe("goal records", () => {
+  it("read as one line, with stops as warnings", () => {
+    const entries = buildActivity([
+      rec(1, "2026-11-05T12:00:00Z", { event: "goal", status: "active", changed_by: "owner", iteration: 0, budget: 50, reason: "", evidence: "", wake_at: null }),
+      rec(2, "2026-11-05T12:01:00Z", { event: "goal", status: "waiting", changed_by: "agent", iteration: 3, budget: 50, reason: "CI runs", evidence: "", wake_at: "2026-11-06T09:00:00Z" }),
+      rec(3, "2026-11-05T12:02:00Z", { event: "goal", status: "stalled", changed_by: "runner", iteration: 6, budget: 50, reason: "3 turns in a row used no tools", evidence: "" }),
+      rec(4, "2026-11-05T12:03:00Z", { event: "goal", status: "cleared" }),
+    ]);
+    expect(entries.map((e) => (e.kind === "event" ? [e.level, e.text] : e.kind))).toEqual([
+      ["info", "goal active (owner) 0/50"],
+      ["info", "goal waiting (agent) 3/50: until 2026-11-06T09:00:00Z — CI runs"],
+      ["warning", "goal stalled (runner) 6/50: 3 turns in a row used no tools"],
+      ["info", "goal cleared"],
+    ]);
+  });
+});

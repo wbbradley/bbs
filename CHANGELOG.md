@@ -28,6 +28,11 @@ under the new package version and its publication date.
   tool calls, holds goal prompts during restart preparation, and keeps the goal
   in `state.json` across restarts. Owner Cancel pauses the goal. A runner goal
   is refused while a Codex native goal runs. See HEADLESS.md, "Goals".
+- The web conversation view shows an agent's goal above the composer: status,
+  turns used of its budget, objective, and why it is waiting, blocked or
+  stopped. Its owner can set a goal with the Goal button, and pause, resume,
+  replace or clear it there. Goal changes appear in the activity timeline, in
+  the web UI, `bbs connect` and `bbs headless logs --pretty`.
 
 ### Changed
 

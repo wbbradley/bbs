@@ -131,6 +131,128 @@ describe("focus mode", () => {
   });
 });
 
+describe("goals", () => {
+  const info = { capabilities: ["agent-goal.v1"], release: null, require_human_token: true } as never;
+  const goal = {
+    objective: "Ship the release",
+    status: 3,
+    set_by: "ada",
+    set_at: "2026-11-05T09:00:00Z",
+    iteration: 4,
+    budget: 50,
+    reason: "which branch?",
+    evidence: "",
+    wake_at: null,
+    changed_by: "agent",
+  };
+  // A runner that understands goals has reported, with no goal.
+  const runner = { ...mateo, goal: null, goal_reported_at: "2026-11-05T08:00:00Z" } as Agent;
+  const page = async (agent: Agent, server = info) => {
+    go("/agents/Mateo");
+    api.auto.set("list_agents", () => ({ agents: [agent], humans: [] }));
+    api.auto.set("list_agent_notes", () => ({ notes: [], has_more: false, next_after_revision: 0 }));
+    api.auto.set("side_report", () => ({}));
+    render(
+      <Board info={server}>
+        <Conversation agent="Mateo" openNav={() => {}} />
+      </Board>,
+    );
+    await act(async () => {});
+  };
+
+  it("let the owner set one", async () => {
+    await page(runner);
+    fireEvent.click(screen.getByRole("button", { name: "Goal" }));
+    const set = screen.getByRole("button", { name: "Set goal" }) as HTMLButtonElement;
+    expect(set.disabled).toBe(true);
+    fireEvent.change(screen.getByPlaceholderText(/integration tests/), { target: { value: "  Ship the release " } });
+    fireEvent.click(set);
+    expect(api.take("send").req).toEqual({ to: "Mateo", body: "Ship the release", control: 3 });
+  });
+
+  it("measure the objective as it will be sent", async () => {
+    await page(runner);
+    fireEvent.click(screen.getByRole("button", { name: "Goal" }));
+    const set = screen.getByRole("button", { name: "Set goal" }) as HTMLButtonElement;
+    const box = screen.getByPlaceholderText(/integration tests/);
+    fireEvent.change(box, { target: { value: "x".repeat(4096) + "\n" } });
+    expect(set.disabled).toBe(false);
+    fireEvent.change(box, { target: { value: "x".repeat(4097) } });
+    expect(set.disabled).toBe(true);
+  });
+
+  it("offer a goal only to the owner of an agent whose runner understands goals", async () => {
+    // No goal-capable runner has reported for this agent.
+    await page(mateo);
+    expect(screen.queryByRole("button", { name: "Goal" })).toBeNull();
+    cleanup();
+    await page({ ...runner, owner: "bob" } as Agent);
+    expect(screen.queryByRole("button", { name: "Goal" })).toBeNull();
+    cleanup();
+    await page(runner, { ...(info as object), capabilities: [] } as never);
+    expect(screen.queryByRole("button", { name: "Goal" })).toBeNull();
+  });
+
+  it("follow the goal in live summaries", async () => {
+    await page({ ...runner, goal } as Agent);
+    expect(document.querySelector(".attention.goal")).toBeTruthy();
+    const summary = (extra: object) => ({
+      agent: "Mateo",
+      unread_messages: 0,
+      oldest_unread_message: null,
+      unseen_stream: 0,
+      oldest_unseen_stream: null,
+      last_sent_at: null,
+      effort: null,
+      effort_reported_at: null,
+      last_human_conversation_at: null,
+      blocker_count: 0,
+      agent_id: 7,
+      ...extra,
+    });
+    // A summary without the field (an older server) keeps the listed goal.
+    await act(async () => api.stream("summary").push({ agents: [summary({})] }));
+    expect(document.querySelector(".attention.goal")).toBeTruthy();
+    // A null goal clears it, and the owner can set another.
+    await act(async () => api.stream("summary").push({ agents: [summary({ goal: null })] }));
+    expect(document.querySelector(".attention.goal")).toBeNull();
+    expect(screen.getByRole("button", { name: "Goal" })).toBeTruthy();
+  });
+
+  it("show the goal with the owner's controls", async () => {
+    await page({ ...mateo, goal } as Agent);
+    expect(screen.queryByRole("button", { name: "Goal" })).toBeNull();
+    const strip = document.querySelector(".attention.goal")!;
+    expect(strip.textContent).toContain("goal · blocked");
+    expect(strip.textContent).toContain("4/50 turns");
+    expect(strip.textContent).toContain("Ship the release");
+    expect(strip.textContent).toContain("which branch?");
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    const pause = api.take("send");
+    expect(pause.req).toMatchObject({ to: "Mateo", control: 4 });
+    await act(async () => pause.resolve({ to: "Mateo", id: 9 }));
+    expect(screen.getByText("Asked Mateo's runner to pause its goal.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(api.take("send").req).toMatchObject({ to: "Mateo", control: 6 });
+  });
+
+  it("offer resume once stopped, and no controls to others", async () => {
+    await page({ ...mateo, goal: { ...goal, status: 6, reason: "used its budget of 50 turns" } } as Agent);
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    expect(api.take("send").req).toMatchObject({ control: 5 });
+    cleanup();
+    // A status this page does not know offers only New and Clear.
+    await page({ ...mateo, goal: { ...goal, status: 99 } } as Agent);
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Pause" })).toBeNull();
+    expect(screen.getByRole("button", { name: "New" })).toBeTruthy();
+    cleanup();
+    await page({ ...mateo, owner: "bob", goal } as Agent);
+    expect(document.querySelector(".attention.goal")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Pause" })).toBeNull();
+  });
+});
+
 describe("an overlay opening with new mail", () => {
   it("keeps that mail unread when both come in one update", async () => {
     await conversation();

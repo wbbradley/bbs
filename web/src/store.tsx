@@ -269,6 +269,10 @@ export function BoardProvider({
           blocker_count: s.blocker_count ?? a.blocker_count,
           // Null ends focus, so only a missing field (an older server) falls back.
           focused_at: s.focused_at !== undefined ? s.focused_at : a.focused_at,
+          // As focus: null clears the goal. The report time says a runner
+          // that understands goals drives the agent.
+          goal: s.goal !== undefined ? s.goal : a.goal,
+          goal_reported_at: s.goal_reported_at !== undefined ? s.goal_reported_at : a.goal_reported_at,
         };
       }),
     [listed, summaries],
