@@ -164,6 +164,25 @@ describe("reconnects", () => {
   });
 });
 
+describe("mail placement", () => {
+  it("shows mail where it was delivered, with or without activity shown", async () => {
+    await conversation();
+    const rec = (id: number, sec: number, record: object) => ({
+      id,
+      created_at: `2026-10-26T12:10:${String(sec).padStart(2, "0")}Z`,
+      record: JSON.stringify(record),
+    });
+    const activity = () => api.streams.filter((s) => s.open && s.kind === "activity").at(-1)!;
+    // Mail 1 (sent 12:00:01) reaches the agent in a later prompt; mail 70 (sent 12:01:10) was sent after it.
+    await act(async () => feed().push({ messages: [mail(1, "ada", "Mateo", { read_at: "x" }), mail(70, "Mateo", "ada")] }, true));
+    await act(async () => activity().push({ events: [rec(1, 30, { event: "prompt", text: "mail", mail_ids: [1] })] }, true));
+    const ids = () => [...document.querySelectorAll(".msg")].map((e) => e.id);
+    expect(ids()).toEqual(["msg-70", "msg-1"]);
+    fireEvent.click(screen.getByText("Mail"));
+    expect(ids()).toEqual(["msg-70", "msg-1"]);
+  });
+});
+
 describe("a message found by search", () => {
   it("reads its context when the live window does not hold it, then lets go at the newest", async () => {
     await conversation("?m=50");

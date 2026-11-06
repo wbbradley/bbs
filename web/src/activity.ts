@@ -1,5 +1,5 @@
 import type { Activity, Message } from "./types";
-import { span } from "./util";
+import { same, span } from "./util";
 
 // A headless agent's shared activity log as timeline entries, after
 // src/ui/activity.rs: thoughts, text, one line per tool call, and events.
@@ -207,8 +207,11 @@ export type TimelineItem =
  * Messages and activity in one order. Each thing shows once: mail a prompt
  * or steer delivered shows where it entered the agent's context, in place of
  * that echo; receipts and text records naming loaded mail give way to it.
+ * Direct mail to `agent` with no delivery record loaded (an agent that is not
+ * headless, or a prompt older than the activity held) shows where the agent
+ * read it, which is when it took the mail.
  */
-export function mergeTimeline(messages: Message[], entries: ActivityEntry[]): TimelineItem[] {
+export function mergeTimeline(messages: Message[], entries: ActivityEntry[], agent?: string): TimelineItem[] {
   const loaded = new Set(messages.map((m) => m.id));
   // Where each piece of mail first entered the agent's context.
   const delivered = new Map<number, { at: string; order: number }>();
@@ -219,7 +222,8 @@ export function mergeTimeline(messages: Message[], entries: ActivityEntry[]): Ti
   const keyed: { item: TimelineItem; at: number; order: number }[] = [];
   for (const m of messages) {
     const spot = delivered.get(m.id);
-    const at = spot?.at ?? m.created_at;
+    const read = agent !== undefined && !m.to_group && same(m.to_name, agent) ? m.read_at : null;
+    const at = spot?.at ?? read ?? m.created_at;
     keyed.push({
       item: { type: "message", key: `m${m.id}`, message: m, at },
       at: Date.parse(at),
