@@ -52,7 +52,7 @@ export function GoalDialog({
   const [objective, setObjective] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const bytes = new TextEncoder().encode(objective).length;
+  const bytes = new TextEncoder().encode(objective.trim()).length;
   const set = async () => {
     setBusy(true);
     setError(null);
@@ -133,7 +133,9 @@ export function GoalStrip({
       setBusy(false);
     }
   };
-  const running = goal.status === GoalStatus.Active || goal.status === GoalStatus.Waiting || goal.status === GoalStatus.Blocked;
+  const running = ([GoalStatus.Active, GoalStatus.Waiting, GoalStatus.Blocked] as number[]).includes(goal.status);
+  // Only these can be resumed; an unknown status offers just New and Clear.
+  const stopped = ([GoalStatus.Paused, GoalStatus.Limited, GoalStatus.Stalled] as number[]).includes(goal.status);
   return (
     <div className={`attention goal goal-${status}`} title={`Set by ${goal.set_by}, ${fullTime(goal.set_at)}`}>
       <span className="goal-text">
@@ -147,16 +149,15 @@ export function GoalStrip({
       <span className="spacer" />
       {owned && (
         <>
-          {running ? (
+          {running && (
             <button className="btn small" disabled={busy} onClick={() => act(Control.GoalPause, "Pause your goal.", `Asked ${agent}'s runner to pause its goal.`)}>
               Pause
             </button>
-          ) : (
-            goal.status !== GoalStatus.Complete && (
-              <button className="btn small" disabled={busy} onClick={() => act(Control.GoalResume, "Resume your goal.", `Asked ${agent}'s runner to resume its goal.`)}>
-                Resume
-              </button>
-            )
+          )}
+          {stopped && (
+            <button className="btn small" disabled={busy} onClick={() => act(Control.GoalResume, "Resume your goal.", `Asked ${agent}'s runner to resume its goal.`)}>
+              Resume
+            </button>
           )}
           <button className="btn small" disabled={busy} onClick={onEdit}>
             New

@@ -101,6 +101,8 @@ export interface Agent {
   focused_at?: string | null;
   /** Its runner's goal; null when it has none, absent from older servers. */
   goal?: GoalReport | null;
+  /** When its runner last reported its goal, or that it has none; null when
+   * no goal-capable runner has reported. */
   goal_reported_at?: string | null;
 }
 

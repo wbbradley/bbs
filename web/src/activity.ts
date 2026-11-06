@@ -54,7 +54,7 @@ function rest(r: Rec): string {
 /** Turn boundaries end any call still running, without inventing a result. */
 const RESETS = new Set(["start", "session", "prompt", "turn_end", "turn_error", "cancel", "stop"]);
 
-/** "goal waiting (agent) 3/50: until 09:00 — CI runs", or "goal cleared". */
+/** "goal waiting (agent) 3/50: until 2026-11-06T09:00:00Z — CI runs", or "goal cleared". */
 function goalLine(r: Rec): string {
   const status = str(r, "status");
   if (status === "cleared") return "goal cleared";

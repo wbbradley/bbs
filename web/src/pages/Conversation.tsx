@@ -346,7 +346,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
             Aside
           </button>
         )}
-        {owned && info && !info.goal && board.has("agent-goal.v1") && (
+        {owned && info && !info.goal && info.goal_reported_at && board.has("agent-goal.v1") && (
           <button className="btn small" onClick={() => setGoalOpen(true)} title="Give the agent a goal to work toward across turns">
             Goal
           </button>
