@@ -17,8 +17,10 @@ use tokio::{
 
 const CALL: Duration = Duration::from_secs(3);
 const IDLE: Duration = Duration::from_secs(31 * 60);
-#[derive(Default)]
-struct Hooks {
+/// How `run` behaves: whether the server supports follow-up questions, and
+/// test hooks.
+struct Options {
+    followups: bool,
     #[cfg(test)]
     claim_ack: Option<(
         tokio::sync::oneshot::Sender<()>,
@@ -111,8 +113,11 @@ impl Btw {
             harness.clone(),
             warnings.clone(),
             rx,
-            Hooks::default(),
-            followups,
+            Options {
+                followups,
+                #[cfg(test)]
+                claim_ack: None,
+            },
             drain_progress_tx,
         ));
         Some(Self {
@@ -208,10 +213,14 @@ async fn run(
     harness: Harness,
     warnings: mpsc::UnboundedSender<String>,
     mut stop: watch::Receiver<bool>,
-    mut _hooks: Hooks,
-    followups: bool,
+    options: Options,
     drain_progress: watch::Sender<i64>,
 ) {
+    let Options {
+        followups,
+        #[cfg(test)]
+        mut claim_ack,
+    } = options;
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut active: Option<Active> = None;
@@ -419,17 +428,16 @@ async fn run(
                 .side
                 .as_ref()
                 .is_none_or(|r| r.status() != SideStatus::SideOpen)
+            && let Some(row) = current.side.as_ref()
         {
-            if let Some(row) = current.side.as_ref() {
-                drain_progress.send_if_modified(|id| {
-                    if row.id > *id {
-                        *id = row.id;
-                        true
-                    } else {
-                        false
-                    }
-                });
-            }
+            drain_progress.send_if_modified(|id| {
+                if row.id > *id {
+                    *id = row.id;
+                    true
+                } else {
+                    false
+                }
+            });
         }
         if (ending || disabled)
             && current
@@ -454,7 +462,7 @@ async fn run(
         )
         .await;
         #[cfg(test)]
-        let claim = if let Some((reached, release)) = _hooks.claim_ack.take() {
+        let claim = if let Some((reached, release)) = claim_ack.take() {
             let _ = reached.send(());
             if release.await.unwrap_or(true) {
                 claim
@@ -738,10 +746,10 @@ mod tests {
                 harness.clone(),
                 warnings,
                 rx,
-                Hooks {
+                Options {
+                    followups: false,
                     claim_ack: Some((reached, wait)),
                 },
-                false,
                 drain_progress,
             ));
             timeout(Duration::from_secs(5), held)

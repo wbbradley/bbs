@@ -43,7 +43,7 @@ pub fn choice(value: &str, label: &str, claude: bool, codex: bool) -> EffortChoi
 /// Standard JSON-RPC dispatch/parameter rejection, before method execution.
 /// An internal/application/transport error does not prove a setter was unapplied.
 pub fn definite_rejection(code: i64) -> bool {
-    matches!(code, -32600 | -32601 | -32602)
+    matches!(code, -32602..=-32600)
 }
 
 pub fn validate(state: &EffortState, value: &str) -> Result<()> {

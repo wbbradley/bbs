@@ -597,7 +597,6 @@ impl Codex {
                 )
                 .await
                 .map(|_| ())
-                .map_err(anyhow::Error::from)
         } else if self.turn.turn.lock().unwrap().done.is_some() {
             Err(anyhow!(
                 "the goal's next turn did not become interruptible within {TURN_ID_WAIT:?}"
