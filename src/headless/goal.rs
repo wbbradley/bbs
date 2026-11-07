@@ -10,6 +10,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -139,10 +140,21 @@ pub enum UpdateKind {
     Waiting { wake_at: String, reason: String },
 }
 
+/// The newest set time handed out, in microseconds since the epoch.
+static LAST_SET_AT: AtomicI64 = AtomicI64::new(i64::MIN);
+
 /// A goal's set time, which is also its identity for updates: to the
-/// microsecond, so two goals set within one second differ.
+/// microsecond, and strictly later than any this process handed out before,
+/// so two goals never share one even when set in the same microsecond.
 fn now_s() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true)
+    let now = Utc::now().timestamp_micros();
+    let next = |last: i64| now.max(last.saturating_add(1));
+    let last = LAST_SET_AT
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(next(last)))
+        .expect("the update always succeeds");
+    DateTime::from_timestamp_micros(next(last))
+        .expect("a set time within chrono's range")
+        .to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
 fn rfc3339(t: DateTime<Utc>) -> String {
@@ -664,6 +676,28 @@ mod tests {
         let a = Goal::new("a".into(), "will".into(), 1);
         let b = Goal::new("b".into(), "will".into(), 1);
         assert_ne!(a.set_at, b.set_at);
+    }
+
+    #[test]
+    fn goals_set_at_once_on_many_threads_all_differ() {
+        // Every thread starts together, so many land in one microsecond.
+        const THREADS: usize = 16;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    (0..100).map(|_| now_s()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let all: Vec<String> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), all.len());
     }
 
     #[test]
