@@ -19,6 +19,7 @@ const PAGES = [
   { name: "Agents", path: paths.agents },
   { name: "Groups", path: paths.groups },
   { name: "Blockers", path: paths.blockers },
+  { name: "Timers", path: paths.timers },
   { name: "Feed", path: paths.feed },
   { name: "Settings", path: paths.settings },
 ];

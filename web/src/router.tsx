@@ -169,6 +169,8 @@ export const paths = {
   groups: "/groups",
   group: (name: string) => `/groups/${encodeURIComponent(name)}`,
   blockers: "/blockers",
+  timers: "/timers",
+  timer: (id: number) => `/timers/${id}`,
   feed: "/feed",
   settings: "/settings",
 };

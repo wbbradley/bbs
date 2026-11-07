@@ -2214,11 +2214,15 @@ pub fn activity_page(
 
 pub struct TimerRow {
     pub id: i64,
+    pub target_id: i64,
     pub target: String,
     pub creator: String,
+    pub creator_kind: Kind,
+    pub creator_id: i64,
     pub body: String,
     pub repeat: Option<String>,
     pub next_run: String,
+    pub created_at: String,
 }
 
 /// A timer due to fire, with what firing it needs.
@@ -2258,8 +2262,9 @@ pub fn timer_count(conn: &Connection, target_id: i64) -> Result<i64> {
 /// Timers, soonest first: one agent's, or with `None` everyone's.
 pub fn timers(conn: &Connection, target_id: Option<i64>) -> Result<Vec<TimerRow>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, a.name, CASE t.creator_kind WHEN 'agent' THEN ca.name ELSE ch.name END,
-                t.body, t.repeat, t.next_run
+        "SELECT t.id, t.target_id, a.name,
+                CASE t.creator_kind WHEN 'agent' THEN ca.name ELSE ch.name END,
+                t.body, t.repeat, t.next_run, t.created_at, t.creator_kind, t.creator_id
          FROM timers t
          JOIN agents a ON a.id = t.target_id
          LEFT JOIN agents ca ON t.creator_kind = 'agent' AND ca.id = t.creator_id
@@ -2271,24 +2276,66 @@ pub fn timers(conn: &Connection, target_id: Option<i64>) -> Result<Vec<TimerRow>
         .query_map([target_id], |r| {
             Ok(TimerRow {
                 id: r.get(0)?,
-                target: r.get(1)?,
-                creator: r.get(2)?,
-                body: r.get(3)?,
-                repeat: r.get(4)?,
-                next_run: r.get(5)?,
+                target_id: r.get(1)?,
+                target: r.get(2)?,
+                creator: r.get(3)?,
+                body: r.get(4)?,
+                repeat: r.get(5)?,
+                next_run: r.get(6)?,
+                created_at: r.get(7)?,
+                creator_kind: if r.get::<_, String>(8)? == "human" {
+                    Kind::Human
+                } else {
+                    Kind::Agent
+                },
+                creator_id: r.get(9)?,
             })
         })?
         .collect::<Result<_, _>>()?;
     Ok(rows)
 }
 
-/// A timer's target, for checking who may remove it.
+/// A timer's target, for checking who may manage it.
 pub fn timer_target(conn: &Connection, id: i64) -> Result<Option<i64>> {
     Ok(conn
         .query_row("SELECT target_id FROM timers WHERE id = ?1", [id], |r| {
             r.get(0)
         })
         .optional()?)
+}
+
+/// One timer by id.
+pub fn timer(conn: &Connection, id: i64) -> Result<Option<TimerRow>> {
+    let Some(target_id) = timer_target(conn, id)? else {
+        return Ok(None);
+    };
+    Ok(timers(conn, Some(target_id))?
+        .into_iter()
+        .find(|t| t.id == id))
+}
+
+/// Make `creator` the one a timer's messages come from.
+pub fn set_timer_creator(conn: &Connection, id: i64, creator: &Principal) -> Result<()> {
+    conn.execute(
+        "UPDATE timers SET creator_kind = ?2, creator_id = ?3 WHERE id = ?1",
+        params![id, creator.kind.as_str(), creator.id],
+    )?;
+    Ok(())
+}
+
+/// Replace a timer's text and schedule.
+pub fn update_timer(
+    conn: &Connection,
+    id: i64,
+    body: &str,
+    repeat: Option<&str>,
+    next_run: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE timers SET body = ?2, repeat = ?3, next_run = ?4 WHERE id = ?1",
+        params![id, body, repeat, next_run],
+    )?;
+    Ok(())
 }
 
 pub fn delete_timer(conn: &Connection, id: i64) -> Result<()> {

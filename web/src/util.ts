@@ -39,6 +39,58 @@ export function ago(iso: string | null | undefined, now = Date.now()): string {
   return `${span(secs, 60)} ago`;
 }
 
+/** "now", "in 14m", "in 3d4h": `ago` for times to come. */
+export function until(iso: string | null | undefined, now = Date.now()): string {
+  if (!iso) return "–";
+  const secs = Math.floor((Date.parse(iso) - now) / 1000);
+  if (secs < 60) return "now";
+  return `in ${span(secs, 60)}`;
+}
+
+// humantime's units, as the server writes a timer's `every` duration.
+const DURATION_UNITS: Record<string, number> = {
+  years: 31557600,
+  year: 31557600,
+  y: 31557600,
+  months: 2630016,
+  month: 2630016,
+  M: 2630016,
+  weeks: 604800,
+  week: 604800,
+  w: 604800,
+  days: 86400,
+  day: 86400,
+  d: 86400,
+  h: 3600,
+  m: 60,
+  s: 1,
+};
+
+/**
+ * A timer's repeat as the Timers list shows it: "every 1h30m" for an
+ * interval, a cron expression as written, "once" for a one-time timer.
+ */
+export function repeatLabel(repeat: string | null | undefined): string {
+  if (!repeat) return "once";
+  const every = /^every\s+(.+)$/.exec(repeat.trim());
+  if (!every) return repeat;
+  let secs = 0;
+  for (const part of every[1].split(/\s+/)) {
+    const m = /^(\d+)([a-zA-Z]+)$/.exec(part);
+    const size = m ? DURATION_UNITS[m[2]] : undefined;
+    if (!m || size === undefined) return repeat;
+    secs += Number(m[1]) * size;
+  }
+  return `every ${span(secs)}`;
+}
+
+/** A time to the second in UTC: "2026-11-06 09:00:00 UTC". */
+export function utcTime(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : `${d.toISOString().slice(0, 19).replace("T", " ")} UTC`;
+}
+
 /** Local time: the time today, with the date on other days. */
 export function clock(iso: string | null | undefined): string {
   if (!iso) return "";

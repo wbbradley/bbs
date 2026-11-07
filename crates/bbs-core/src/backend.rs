@@ -45,6 +45,7 @@ pub const AGENT_NOTES: &str = "agent-notes.v1";
 pub const FEED_SYNC: &str = "feed-sync.v1";
 pub const AGENT_FOCUS: &str = "agent-focus.v1";
 pub const AGENT_GOAL: &str = "agent-goal.v1";
+pub const TIMERS_EDIT: &str = "timers-edit.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -775,6 +776,16 @@ impl Backend {
             Backend::Remote(r) => {
                 rpc!(r, timer_remove, req, &[TIMERS]).map_err(|e| missing_rpc(e, TIMERS))
             }
+        }
+    }
+
+    pub async fn timer_update(&mut self, req: proto::TimerUpdateRequest) -> Result<proto::Timer> {
+        match self {
+            Backend::Local(l) => {
+                service::timer_update(&mut l.conn, &l.caller, req, TimerLimits::default())
+            }
+            Backend::Remote(r) => rpc!(r, timer_update, req, &[TIMERS, TIMERS_EDIT])
+                .map_err(|e| missing_rpc(e, TIMERS_EDIT)),
         }
     }
 
