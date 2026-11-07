@@ -2948,9 +2948,17 @@ fn timer_proto(t: db::TimerRow) -> proto::Timer {
 }
 
 /// Whether a change to a timer by `me` is news to its agent: it is unless
-/// the agent made it itself.
-fn tell_timer_agent(me: &db::Principal, target_id: i64) -> bool {
-    !(me.kind == db::Kind::Agent && me.id == target_id)
+/// the agent made it itself, or the agent is in focus mode and `me` is not
+/// its owner, who alone may reach it then (as `check_focus` rules for mail).
+fn tell_timer_agent(ctx: &Ctx, me: &db::Principal, target_id: i64) -> Result<bool> {
+    if me.kind == db::Kind::Agent && me.id == target_id {
+        return Ok(false);
+    }
+    if db::focused_at(ctx.conn, target_id)?.is_some() {
+        let owner = db::agent_owner_id(ctx.conn, target_id)?;
+        return Ok(me.kind == db::Kind::Human && Some(me.id) == owner);
+    }
+    Ok(true)
 }
 
 /// Send a timer's agent `body` from `me`, marked as from that timer.
@@ -3063,7 +3071,7 @@ pub fn timer_remove(
         let me = ctx.actor()?;
         let timer = managed_timer(ctx, &me, req.id)?;
         db::delete_timer(ctx.conn, timer.id)?;
-        if tell_timer_agent(&me, timer.target_id) {
+        if tell_timer_agent(ctx, &me, timer.target_id)? {
             let schedule = match &timer.repeat {
                 Some(r) => format!("{r:?}"),
                 None => format!("once, due {}", notice_time(&timer.next_run)),
@@ -3093,8 +3101,9 @@ fn managed_timer(ctx: &Ctx, me: &db::Principal, id: i64) -> Result<db::TimerRow>
 
 /// Change a timer's text, next run or repeat. A changed repeat without a
 /// next run starts the new schedule from now; an explicit next run is kept
-/// even for a recurring timer. The agent is told what changed (not the new
-/// text) unless it made the change itself.
+/// even for a recurring timer. Whoever changes the text becomes the timer's
+/// creator, so it never sends words in someone else's name. The agent is
+/// told what changed (not the new text) unless it made the change itself.
 pub fn timer_update(
     conn: &mut Connection,
     caller: &Caller,
@@ -3106,12 +3115,18 @@ pub fn timer_update(
         let mut timer = managed_timer(ctx, &me, req.id)?;
         let mut changes = Vec::new();
 
+        let mut text_changed = false;
         if let Some(body) = req.body
             && body != timer.body
         {
             validate_body(&body)?;
             timer.body = body;
-            changes.push("text changed".to_string());
+            text_changed = true;
+            changes.push(if !timer.creator.eq_ignore_ascii_case(&me.name) {
+                format!("text changed, now sent from {}", me.name)
+            } else {
+                "text changed".to_string()
+            });
         }
 
         let mut first_run = None;
@@ -3181,7 +3196,11 @@ pub fn timer_update(
             timer.repeat.as_deref(),
             &timer.next_run,
         )?;
-        if tell_timer_agent(&me, timer.target_id) {
+        if text_changed {
+            db::set_timer_creator(ctx.conn, timer.id, &me)?;
+            timer.creator = me.name.clone();
+        }
+        if tell_timer_agent(ctx, &me, timer.target_id)? {
             let notice = format!(
                 "Timer #{} was edited by {}: {}.",
                 timer.id,
@@ -5975,6 +5994,75 @@ mod tests {
         assert_eq!(fire_timers(&mut conn, due).unwrap(), (0, None));
         let listed = timer_list(&mut conn, &zed, proto::TimerListRequest::default()).unwrap();
         assert!(listed.timers.is_empty());
+    }
+
+    fn edit(conn: &mut Connection, by: &Caller, id: i64, body: &str) -> Result<proto::Timer> {
+        let req = proto::TimerUpdateRequest {
+            id,
+            body: Some(body.into()),
+            ..Default::default()
+        };
+        timer_update(conn, by, req, TimerLimits::default())
+    }
+
+    #[test]
+    fn an_edited_timer_fires_from_whoever_changed_its_text() {
+        let (mut conn, will, [mateo, zed, _]) = board();
+        let t = add(&mut conn, &mateo, "Zed", "in 30m").unwrap();
+        // Rescheduling keeps the creator; new text is the editor's own.
+        let req = proto::TimerUpdateRequest {
+            id: t.id,
+            next_run: Some(fmt_time(Utc::now() + chrono::Duration::hours(1))),
+            ..Default::default()
+        };
+        let moved = timer_update(&mut conn, &will, req, TimerLimits::default()).unwrap();
+        assert_eq!(moved.creator, "Mateo");
+        assert_eq!(
+            edit(&mut conn, &will, t.id, "new words").unwrap().creator,
+            "will"
+        );
+        fire_timers(&mut conn, Utc::now() + chrono::Duration::hours(2)).unwrap();
+        let fired: Vec<_> = inbox(&mut conn, &zed)
+            .into_iter()
+            .filter(|m| m.timer_id == Some(t.id) && m.body == "new words")
+            .map(|m| m.from_name)
+            .collect();
+        assert_eq!(fired, ["will"]);
+    }
+
+    #[test]
+    fn timer_notices_respect_focus_mode() {
+        let (mut conn, will, [mateo, zed, _]) = board();
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        let t = add(&mut conn, &zed, "Mateo", "every 1h").unwrap();
+        inbox(&mut conn, &mateo);
+        let req = proto::SetFocusRequest {
+            agent: "Mateo".into(),
+            focused: true,
+        };
+        set_focus(&mut conn, &will, req).unwrap();
+        inbox(&mut conn, &mateo);
+        let notices = |conn: &mut Connection| -> Vec<String> {
+            inbox(conn, &mateo)
+                .into_iter()
+                .filter(|m| m.timer_id == Some(t.id))
+                .map(|m| m.from_name)
+                .collect()
+        };
+        // Neither another agent nor another human reaches it in focus mode.
+        edit(&mut conn, &zed, t.id, "from zed").unwrap();
+        edit(&mut conn, &ada, t.id, "from ada").unwrap();
+        assert!(notices(&mut conn).is_empty());
+        // Its owner does.
+        edit(&mut conn, &will, t.id, "from will").unwrap();
+        assert_eq!(notices(&mut conn), ["will"]);
+        let req = proto::TimerRemoveRequest { id: t.id };
+        timer_remove(&mut conn, &zed, req).unwrap();
+        assert!(notices(&mut conn).is_empty());
     }
 
     #[test]

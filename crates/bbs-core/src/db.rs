@@ -2306,6 +2306,15 @@ pub fn timer(conn: &Connection, id: i64) -> Result<Option<TimerRow>> {
         .find(|t| t.id == id))
 }
 
+/// Make `creator` the one a timer's messages come from.
+pub fn set_timer_creator(conn: &Connection, id: i64, creator: &Principal) -> Result<()> {
+    conn.execute(
+        "UPDATE timers SET creator_kind = ?2, creator_id = ?3 WHERE id = ?1",
+        params![id, creator.kind.as_str(), creator.id],
+    )?;
+    Ok(())
+}
+
 /// Replace a timer's text and schedule.
 pub fn update_timer(
     conn: &Connection,

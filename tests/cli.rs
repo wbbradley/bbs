@@ -2800,7 +2800,13 @@ fn timers_are_set_listed_fired_and_removed(mode: Mode) {
 
 fn timers_are_edited_and_cancelled_with_notices(mode: Mode) {
     let bbs = Bbs::with_mode("timer-edits", mode);
+    bbs.ok(&["group", "register", "crew"]);
     let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    let (_c, tc) = bbs.register();
+    for token in [&ta, &tb] {
+        bbs.ok(&["--token", token, "group", "join", "crew"]);
+    }
     bbs.ok(&["timer", "add", &a, "every 1h", "check the build"]);
 
     // A human's edit tells the agent what changed, but not the new text.
@@ -2855,10 +2861,29 @@ fn timers_are_edited_and_cancelled_with_notices(mode: Mode) {
         ),
         (vec!["timer", "edit", "1", "--text", " "], "empty"),
         (vec!["timer", "edit", "9", "--text", "x"], "no timer 9"),
+        (
+            vec!["--token", &tc, "timer", "edit", "1", "--text", "x"],
+            "is not in any of your groups",
+        ),
     ] {
         let err = bbs.err(&args);
         assert!(err.contains(why), "{args:?}: {err}");
     }
+
+    // An agent in the same group may edit it; changing the text makes the
+    // timer its own, so it never speaks in another's name.
+    let out = bbs.ok(&["--token", &tb, "timer", "list", &a]);
+    assert!(out.contains("from will: check the deploy"), "{out}");
+    bbs.ok(&["--token", &tb, "timer", "edit", "1", "--text", "from b"]);
+    let mail = bbs.ok(&["--token", &ta, "read"]);
+    assert!(
+        mail.contains(&format!(
+            "from {b} to {a} (timer 1):\nTimer #1 was edited by {b}: text changed, now sent from {b}."
+        )),
+        "{mail}"
+    );
+    let out = bbs.ok(&["--token", &tb, "timer", "list", &a]);
+    assert!(out.contains(&format!("from {b}: from b")), "{out}");
 
     // An agent's own edits and removals are not news to it.
     bbs.ok(&["--token", &ta, "timer", "edit", "1", "--text", "mine"]);
