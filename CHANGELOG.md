@@ -52,6 +52,12 @@ under the new package version and its publication date.
   mail to the agent with no delivery record (an agent that is not headless,
   or a prompt older than the activity loaded) shows where the agent read it.
 
+### Fixed
+
+- In focus mode, timers the agent's owner set now fire, and a timer from
+  another human whose id matched the agent's no longer slipped through.
+  Only the agent's own timers and its owner's fire; others are skipped.
+
 ## 0.20.0 - 2026-11-05
 
 ### Added

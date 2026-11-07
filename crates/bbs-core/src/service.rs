@@ -3257,10 +3257,16 @@ pub fn fire_timers(
                 continue;
             }
         };
-        // A timer another agent set for a focused agent is skipped, like its
-        // group mail; the schedule continues. The agent's own timers fire.
-        let skip =
-            timer.creator.id != timer.target_id && db::focused_at(&tx, timer.target_id)?.is_some();
+        // While the agent is focused, only its own timers and its owner's
+        // fire, as only its owner's mail reaches it; others are skipped and
+        // their schedules continue.
+        let skip = db::focused_at(&tx, timer.target_id)?.is_some()
+            && !match timer.creator.kind {
+                db::Kind::Agent => timer.creator.id == timer.target_id,
+                db::Kind::Human => {
+                    db::agent_owner_id(&tx, timer.target_id)? == Some(timer.creator.id)
+                }
+            };
         if skip {
             tracing::info!(id = timer.id, "timer skipped: target in focus mode");
         } else {
@@ -6332,6 +6338,45 @@ mod tests {
     }
 
     #[test]
+    fn a_focused_agent_gets_its_owners_timers_but_not_another_humans() {
+        let (mut conn, will, _) = board();
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        let ada_id = db::find_human(&conn, "ada").unwrap().unwrap().id;
+        let zed_id = db::live_agent_by_name(&conn, "Zed").unwrap().unwrap().id;
+        // Humans and agents are numbered apart, so ids alone can collide.
+        assert_eq!(ada_id, zed_id);
+        let req = proto::SetFocusRequest {
+            agent: "Zed".into(),
+            focused: true,
+        };
+        set_focus(&mut conn, &will, req).unwrap();
+        // Its owner's timer fires; ada's, though her id is Zed's, does not.
+        for (by, body) in [(&ada, "ada's timer"), (&will, "will's timer")] {
+            let req = proto::TimerAddRequest {
+                agent: "Zed".into(),
+                when: "in 1m".into(),
+                body: body.into(),
+            };
+            timer_add(&mut conn, by, req, TimerLimits::default()).unwrap();
+        }
+        fire_timers(&mut conn, Utc::now() + chrono::Duration::minutes(2)).unwrap();
+        // Skipped means no message was written, not just one held from `read`.
+        let mut stmt = conn
+            .prepare("SELECT body FROM messages WHERE timer_id IS NOT NULL")
+            .unwrap();
+        let sent: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(sent, ["will's timer"]);
+    }
+
+    #[test]
     fn focus_mode_keeps_an_agent_to_its_owner_and_skips_group_mail() {
         let (mut conn, will, [mateo, zed, _lu]) = board();
         ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
@@ -6438,8 +6483,13 @@ mod tests {
         );
         // Zed still got will's broadcast.
         assert_eq!(bodies(&mut conn, &zed), ["to @crew"]);
-        // Others' timers are skipped while the agent's own still fire.
-        for (by, body) in [(&zed, "zed's timer"), (&mateo, "own timer")] {
+        // Only the agent's own timers and its owner's fire; others' are skipped.
+        for (by, body) in [
+            (&zed, "zed's timer"),
+            (&ada, "ada's timer"),
+            (&will, "will's timer"),
+            (&mateo, "own timer"),
+        ] {
             let req = proto::TimerAddRequest {
                 agent: "Mateo".into(),
                 when: "in 1m".into(),
@@ -6450,7 +6500,10 @@ mod tests {
         fire_timers(&mut conn, Utc::now() + chrono::Duration::minutes(2)).unwrap();
         try_send(&mut conn, &will, "Mateo").unwrap();
         // The timer fired at its future time, so it sorts last.
-        assert_eq!(bodies(&mut conn, &mateo), ["to Mateo", "own timer"]);
+        assert_eq!(
+            bodies(&mut conn, &mateo),
+            ["to Mateo", "will's timer", "own timer"]
+        );
         assert!(
             !db::has_unread(
                 &conn,
