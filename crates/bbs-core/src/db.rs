@@ -2217,6 +2217,8 @@ pub struct TimerRow {
     pub target_id: i64,
     pub target: String,
     pub creator: String,
+    pub creator_kind: Kind,
+    pub creator_id: i64,
     pub body: String,
     pub repeat: Option<String>,
     pub next_run: String,
@@ -2262,7 +2264,7 @@ pub fn timers(conn: &Connection, target_id: Option<i64>) -> Result<Vec<TimerRow>
     let mut stmt = conn.prepare(
         "SELECT t.id, t.target_id, a.name,
                 CASE t.creator_kind WHEN 'agent' THEN ca.name ELSE ch.name END,
-                t.body, t.repeat, t.next_run, t.created_at
+                t.body, t.repeat, t.next_run, t.created_at, t.creator_kind, t.creator_id
          FROM timers t
          JOIN agents a ON a.id = t.target_id
          LEFT JOIN agents ca ON t.creator_kind = 'agent' AND ca.id = t.creator_id
@@ -2281,6 +2283,12 @@ pub fn timers(conn: &Connection, target_id: Option<i64>) -> Result<Vec<TimerRow>
                 repeat: r.get(5)?,
                 next_run: r.get(6)?,
                 created_at: r.get(7)?,
+                creator_kind: if r.get::<_, String>(8)? == "human" {
+                    Kind::Human
+                } else {
+                    Kind::Agent
+                },
+                creator_id: r.get(9)?,
             })
         })?
         .collect::<Result<_, _>>()?;

@@ -3122,7 +3122,8 @@ pub fn timer_update(
             validate_body(&body)?;
             timer.body = body;
             text_changed = true;
-            changes.push(if !timer.creator.eq_ignore_ascii_case(&me.name) {
+            let same_creator = timer.creator_kind == me.kind && timer.creator_id == me.id;
+            changes.push(if !same_creator {
                 format!("text changed, now sent from {}", me.name)
             } else {
                 "text changed".to_string()
@@ -3199,6 +3200,8 @@ pub fn timer_update(
         if text_changed {
             db::set_timer_creator(ctx.conn, timer.id, &me)?;
             timer.creator = me.name.clone();
+            timer.creator_kind = me.kind;
+            timer.creator_id = me.id;
         }
         if tell_timer_agent(ctx, &me, timer.target_id)? {
             let notice = format!(
