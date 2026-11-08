@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.22.0 - 2026-11-08
+
 ### Changed
 
 - `bbs_goal_update(status="blocked")` needs `blocker`: the id of one of the
