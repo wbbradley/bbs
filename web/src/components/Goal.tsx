@@ -28,6 +28,8 @@ function detail(goal: GoalReport): string | null {
       return goal.wake_at ? `until ${clock(goal.wake_at)}${goal.reason ? `: ${goal.reason}` : ""}` : goal.reason;
     case GoalStatus.Complete:
       return goal.evidence;
+    case GoalStatus.Blocked:
+      return goal.blocker_id ? `on blocker #${goal.blocker_id}${goal.reason ? `: ${goal.reason}` : ""}` : goal.reason || null;
     default:
       return goal.reason || null;
   }

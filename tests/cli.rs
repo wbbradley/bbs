@@ -4303,9 +4303,18 @@ fn headless_goal_waiting_every_turn_still_uses_its_budget() {
     assert_eq!(headless_state(&bbs, "Zed")["goal"]["iteration"], 2);
 }
 
-#[test]
-fn headless_goal_wakes_on_mail_and_pauses_on_cancel() {
-    let (bbs, _run) = goal_runner("goal-mail", "block,waitcancel", 50);
+/// The blocker the goal is blocked on, from the runner's state.
+fn goal_blocker(bbs: &Bbs) -> String {
+    headless_state(bbs, "Zed")["goal"]["blocker"]
+        .as_i64()
+        .expect("a goal blocked on a blocker")
+        .to_string()
+}
+
+/// A goal runner whose agent Zed and a second agent (whose token is returned)
+/// are both in @crew, with the goal set.
+fn crew_goal_runner(test: &str, script: &str) -> (Bbs, RunGuard, String) {
+    let (bbs, run) = goal_runner(test, script, 50);
     let (_, tp) = bbs.register();
     let tz = headless_state(&bbs, "Zed")["token"]
         .as_str()
@@ -4315,31 +4324,74 @@ fn headless_goal_wakes_on_mail_and_pauses_on_cancel() {
     bbs.ok(&["--token", &tp, "group", "join", "crew"]);
     bbs.ok(&["--token", &tz, "group", "join", "crew"]);
     bbs.ok(&["headless", "goal", "Zed", "set", "Answer the question"]);
+    (bbs, run, tp)
+}
+
+#[test]
+fn headless_goal_blocks_until_its_blocker_is_answered_and_pauses_on_cancel() {
+    let (bbs, _run, tp) = crew_goal_runner("goal-mail", "block,waitcancel");
     wait_goal_status(&bbs, "blocked");
-    // Mail from another agent wakes it: mail first, the goal below.
-    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "use main"]);
+    let id = goal_blocker(&bbs);
+    // Other mail is delivered but does not end the block.
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "unrelated news"]);
     eventually("the mail prompt", || goal_prompts(&bbs).get(1).map(|_| ()));
-    let prompt = &goal_prompts(&bbs)[1];
-    let mail = prompt.find("use main").unwrap();
-    let goal = prompt.find("[bbs goal · resumed after wait").unwrap();
-    assert!(mail < goal, "{prompt}");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(goal_prompts(&bbs).len(), 2);
+    assert!(!goal_prompts(&bbs)[1].contains("[bbs goal"));
+    assert_eq!(goal_status(&bbs).as_deref(), Some("blocked"));
+    // Answering the blocker does. The owner's answer goes alone, exactly as
+    // sent, and the resumed goal follows in the next turn.
+    bbs.ok(&["blocker", "answer", &id, "use main"]);
+    eventually("the resumed goal", || goal_prompts(&bbs).get(3).map(|_| ()));
+    let answer = &goal_prompts(&bbs)[2];
+    assert!(answer.contains("Answer:\nuse main"), "{answer}");
+    assert!(!answer.contains("[bbs goal"), "{answer}");
+    let prompt = &goal_prompts(&bbs)[3];
     assert!(
-        prompt.contains("You were blocked: which branch? New mail arrived."),
+        prompt.starts_with("[bbs goal · resumed after wait"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!(
+            "You were blocked on blocker #{id}: which branch? It was answered; the answer is in \
+             your mail."
+        )),
         "{prompt}"
     );
     // That turn waits for a cancel, which pauses the goal.
-    goal_logged(&bbs, "tool", 2);
+    goal_logged(&bbs, "tool", 3);
     bbs.ok(&["headless", "cancel", "Zed"]);
     wait_goal_status(&bbs, "paused");
     // The owner's own message goes alone, and the paused goal adds nothing.
     bbs.ok(&["send", "--to", "Zed", "hello"]);
     eventually("the owner's prompt", || {
-        goal_prompts(&bbs).get(2).map(|_| ())
+        goal_prompts(&bbs).get(4).map(|_| ())
     });
-    assert_eq!(goal_prompts(&bbs)[2], "hello");
+    assert_eq!(goal_prompts(&bbs)[4], "hello");
     std::thread::sleep(std::time::Duration::from_millis(300));
-    assert_eq!(goal_prompts(&bbs).len(), 3);
+    assert_eq!(goal_prompts(&bbs).len(), 5);
     assert_eq!(goal_status(&bbs).as_deref(), Some("paused"));
+}
+
+#[test]
+fn headless_goal_resumes_when_someone_else_cancels_its_blocker() {
+    let (bbs, _run, tp) = crew_goal_runner("goal-blocker-cancel", "block,complete");
+    wait_goal_status(&bbs, "blocked");
+    let id = goal_blocker(&bbs);
+    bbs.ok(&["--token", &tp, "blocker", "cancel", &id]);
+    wait_goal_status(&bbs, "complete");
+    let prompt = &goal_prompts(&bbs)[1];
+    assert!(
+        prompt.contains(&format!("Blocker #{id} in @crew was cancelled by ")),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!(
+            "You were blocked on blocker #{id}: which branch? It was cancelled, so it will not \
+             be answered."
+        )),
+        "{prompt}"
+    );
 }
 
 #[test]

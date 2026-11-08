@@ -94,6 +94,16 @@ pub struct Ended {
     pub reason: String,
     /// True when mail ended it, false when the time came.
     pub by_mail: bool,
+    /// Blocked on a blocker: the blocker and how it closed.
+    #[serde(default)]
+    pub blocker: Option<Closed>,
+}
+
+/// A blocker a blocked goal waited on, once it closed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Closed {
+    pub id: i64,
+    pub answered: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +131,10 @@ pub struct Goal {
     pub next: Next,
     #[serde(default)]
     pub ended: Option<Ended>,
+    /// Blocked: the first version (root) of the agent's blocker it waits on.
+    /// None for a goal blocked before blockers were required.
+    #[serde(default)]
+    pub blocker: Option<i64>,
 }
 
 /// An update the agent made with `bbs_goal_update`.
@@ -135,9 +149,19 @@ pub struct Update {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum UpdateKind {
-    Complete { evidence: String },
-    Blocked { reason: String },
-    Waiting { wake_at: String, reason: String },
+    Complete {
+        evidence: String,
+    },
+    Blocked {
+        reason: String,
+        /// The blocker's root; None only in updates from before it was required.
+        #[serde(default)]
+        blocker: Option<i64>,
+    },
+    Waiting {
+        wake_at: String,
+        reason: String,
+    },
 }
 
 /// The newest set time handed out, in microseconds since the epoch.
@@ -183,6 +207,7 @@ impl Goal {
             changed_by: Changer::Owner,
             next: Next::New,
             ended: None,
+            blocker: None,
         }
     }
 
@@ -192,6 +217,9 @@ impl Goal {
         self.reason = reason.to_string();
         if status != Status::Waiting {
             self.wake_at = None;
+        }
+        if status != Status::Blocked {
+            self.blocker = None;
         }
     }
 
@@ -222,31 +250,46 @@ impl Goal {
         Ok(())
     }
 
-    /// Mail arrived: a waiting or blocked goal resumes. Returns whether it changed.
+    /// Mail arrived: a waiting goal resumes, as does a goal blocked without
+    /// a blocker. A goal blocked on a blocker waits for that blocker to close.
+    /// Returns whether it changed.
     pub fn mail_arrived(&mut self) -> bool {
-        self.end_wait(true)
+        self.waits_on().is_none() && self.end_wait(true, None)
     }
 
     /// The wait's time came. Returns whether it changed.
     pub fn wake(&mut self) -> bool {
-        self.status == Status::Waiting && self.end_wait(false)
+        self.status == Status::Waiting && self.end_wait(false, None)
     }
 
-    fn end_wait(&mut self, by_mail: bool) -> bool {
+    /// The blocker a blocked goal waits on, by its root.
+    pub fn waits_on(&self) -> Option<i64> {
+        self.blocker.filter(|_| self.status == Status::Blocked)
+    }
+
+    /// The blocker the goal waits on was answered or cancelled: the goal
+    /// resumes. Returns whether it changed.
+    pub fn blocker_closed(&mut self, id: i64, answered: bool) -> bool {
+        self.waits_on() == Some(id) && self.end_wait(answered, Some(Closed { id, answered }))
+    }
+
+    fn end_wait(&mut self, by_mail: bool, blocker: Option<Closed>) -> bool {
         if !matches!(self.status, Status::Waiting | Status::Blocked) {
             return false;
         }
+        let reason = match &blocker {
+            Some(c) if c.answered => format!("blocker #{} was answered", c.id),
+            Some(c) => format!("blocker #{} was cancelled", c.id),
+            None if by_mail => "mail arrived".to_string(),
+            None => "the wait ended".to_string(),
+        };
         self.ended = Some(Ended {
             until: self.wake_at.clone(),
             reason: self.reason.clone(),
             by_mail,
+            blocker,
         });
-        let reason = if by_mail {
-            "mail arrived"
-        } else {
-            "the wait ended"
-        };
-        self.set(Status::Active, Changer::Runner, reason);
+        self.set(Status::Active, Changer::Runner, &reason);
         self.idle_turns = 0;
         self.next = Next::Resumed;
         true
@@ -269,7 +312,10 @@ impl Goal {
                 self.set(Status::Complete, Changer::Agent, "");
                 self.evidence = evidence.clone();
             }
-            UpdateKind::Blocked { reason } => self.set(Status::Blocked, Changer::Agent, reason),
+            UpdateKind::Blocked { reason, blocker } => {
+                self.set(Status::Blocked, Changer::Agent, reason);
+                self.blocker = *blocker;
+            }
             UpdateKind::Waiting { wake_at, reason } => {
                 self.set(Status::Waiting, Changer::Agent, reason);
                 self.wake_at = Some(wake_at.clone());
@@ -348,19 +394,25 @@ impl Goal {
                  Take a concrete action now (run a command, edit a file, or call bbs_goal_update)."
                 .to_string(),
             (Next::Resumed, Some(ended)) => {
-                let was = match &ended.until {
-                    Some(until) => format!("You were waiting until {until} for: {}", ended.reason),
-                    None => format!("You were blocked: {}", ended.reason),
+                let was = match (&ended.until, &ended.blocker) {
+                    (Some(until), _) => {
+                        format!("You were waiting until {until} for: {}", ended.reason)
+                    }
+                    (None, Some(c)) => {
+                        format!("You were blocked on blocker #{}: {}", c.id, ended.reason)
+                    }
+                    (None, None) => format!("You were blocked: {}", ended.reason),
                 };
                 let was = if was.ends_with(['.', '?', '!']) {
                     was
                 } else {
                     format!("{was}.")
                 };
-                let why = if ended.by_mail {
-                    "New mail arrived."
-                } else {
-                    "That time has come."
+                let why = match (&ended.blocker, ended.by_mail) {
+                    (Some(c), _) if c.answered => "It was answered; the answer is in your mail.",
+                    (Some(_), _) => "It was cancelled, so it will not be answered.",
+                    (None, true) => "New mail arrived.",
+                    (None, false) => "That time has come.",
                 };
                 format!(
                     "{was} {why} Check whether that condition now holds, then continue toward \
@@ -388,6 +440,7 @@ impl Goal {
             reason: self.reason.clone(),
             evidence: self.evidence.clone(),
             wake_at: self.wake_at.clone(),
+            blocker_id: self.waits_on(),
             changed_by: match self.changed_by {
                 Changer::Agent => "agent",
                 Changer::Owner => "owner",
@@ -403,8 +456,9 @@ const INSTRUCTIONS: &str = "\
 the objective already covers.
 - If the objective is fully met: first verify it (run the checks or tests that prove it), then \
 call bbs_goal_update(status=\"complete\", evidence=\"...\").
-- If you can't proceed without a decision or input from someone else: call \
-bbs_goal_update(status=\"blocked\", reason=\"...\") and post the question on the board.
+- If you can't proceed without a decision or input from someone else: ask with bbs_blocker_put, \
+then call bbs_goal_update(status=\"blocked\", blocker=<its id>, reason=\"...\"). Goal prompts \
+resume when that blocker is answered or cancelled.
 - If you need to wait for a time or an outcome: call \
 bbs_goal_update(status=\"waiting\", until=\"...\" or for=\"...\", reason=\"...\").
 Don't mark the goal complete just to end the loop.";
@@ -434,14 +488,29 @@ pub fn tool_update(
             },
             "Goal marked complete. End your turn.".to_string(),
         ),
-        "blocked" => (
-            UpdateKind::Blocked {
-                reason: need("reason", "Blocking the goal")?,
-            },
-            "Goal blocked. No more goal prompts come until mail arrives; post your question on \
-             the board if you have not, then end your turn."
-                .to_string(),
-        ),
+        "blocked" => {
+            let blocker = match &args["blocker"] {
+                serde_json::Value::Null => bail!(
+                    "Blocking the goal needs \"blocker\": ask with bbs_blocker_put first, then \
+                     pass its id."
+                ),
+                v => v
+                    .as_i64()
+                    .filter(|id| *id > 0)
+                    .with_context(|| format!("blocker {v} is not a blocker id such as 12"))?,
+            };
+            let reason = text("reason").unwrap_or_else(|| format!("waiting on blocker #{blocker}"));
+            (
+                UpdateKind::Blocked {
+                    reason,
+                    blocker: Some(blocker),
+                },
+                format!(
+                    "Goal blocked on blocker #{blocker}. No more goal prompts come until it is \
+                     answered or cancelled. End your turn."
+                ),
+            )
+        }
         "waiting" => {
             let reason = need("reason", "Waiting")?;
             let now = Utc::now();
@@ -753,14 +822,54 @@ mod tests {
         assert!(text.contains(
             "You were waiting until 2026-11-06T09:00:00Z for: CI runs at 0800Z. That time has come."
         ));
-        // Blocked, then mail.
+        // Blocked on a blocker: mail does not end it, but the blocker closing does.
         assert!(g.apply(&update(
             &g,
             UpdateKind::Blocked {
-                reason: "which branch?".into()
+                reason: "which branch?".into(),
+                blocker: Some(12),
             }
         )));
+        assert_eq!(g.waits_on(), Some(12));
+        assert_eq!(g.report().blocker_id, Some(12));
         assert!(!g.wake(), "a block has no time");
+        assert!(
+            !g.mail_arrived(),
+            "other mail does not end a block on a blocker"
+        );
+        assert!(!g.blocker_closed(13, true), "another blocker");
+        assert!(g.blocker_closed(12, true));
+        assert_eq!(g.reason, "blocker #12 was answered");
+        assert_eq!((g.waits_on(), g.blocker), (None, None));
+        let text = g.prompt();
+        assert!(
+            text.contains(
+                "You were blocked on blocker #12: which branch? It was answered; the answer is in \
+                 your mail."
+            ),
+            "{text}"
+        );
+        // A cancelled blocker ends the block too.
+        assert!(g.apply(&update(
+            &g,
+            UpdateKind::Blocked {
+                reason: "ship it?".into(),
+                blocker: Some(14),
+            }
+        )));
+        assert!(g.blocker_closed(14, false));
+        assert!(
+            g.prompt()
+                .contains("You were blocked on blocker #14: ship it? It was cancelled")
+        );
+        // A goal blocked by an older runner, with no blocker, still ends on mail.
+        assert!(g.apply(&update(
+            &g,
+            UpdateKind::Blocked {
+                reason: "which branch?".into(),
+                blocker: None,
+            }
+        )));
         assert!(g.mail_arrived());
         let text = g.prompt();
         assert!(text.contains("You were blocked: which branch? New mail arrived."));
@@ -793,7 +902,18 @@ mod tests {
         let err = |args: serde_json::Value| format!("{:#}", ok(args).unwrap_err());
         assert!(err(json!({"status": "complete"})).contains("evidence"));
         assert!(err(json!({"status": "complete", "evidence": "  "})).contains("evidence"));
-        assert!(err(json!({"status": "blocked"})).contains("reason"));
+        assert!(err(json!({"status": "blocked", "reason": "r"})).contains("bbs_blocker_put"));
+        assert!(err(json!({"status": "blocked", "blocker": "12"})).contains("blocker id"));
+        assert!(err(json!({"status": "blocked", "blocker": 0})).contains("blocker id"));
+        let (u, reply) = ok(json!({"status": "blocked", "blocker": 12})).unwrap();
+        assert_eq!(
+            u.kind,
+            UpdateKind::Blocked {
+                reason: "waiting on blocker #12".into(),
+                blocker: Some(12)
+            }
+        );
+        assert!(reply.starts_with("Goal blocked on blocker #12."), "{reply}");
         assert!(err(json!({"status": "waiting", "for": "1h"})).contains("reason"));
         assert!(err(json!({"status": "waiting", "reason": "r"})).contains("exactly one"));
         assert!(
@@ -838,7 +958,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let g = goal();
         assert!(take_updates(dir.path()).unwrap().is_empty());
-        let first = update(&g, UpdateKind::Blocked { reason: "a".into() });
+        let first = update(
+            &g,
+            UpdateKind::Blocked {
+                reason: "a".into(),
+                blocker: Some(3),
+            },
+        );
         let second = update(
             &g,
             UpdateKind::Complete {

@@ -432,7 +432,31 @@ pub fn cancel_blocker(
             None,
             Some(&req.request_key),
         )?;
-        finish(ctx, &actor, row.id, None)
+        // Tell the creator, as an answer would, unless it cancelled its own.
+        // The notice is not recorded on the outcome, so a replay returns none.
+        let mut message_id = None;
+        if db::agent_is_live(ctx.conn, row.creator.id)?
+            && super::tell_agent(ctx, &actor, row.creator.id)?
+        {
+            let head = format!(
+                "Blocker #{} in @{} was cancelled by {}.",
+                row.id, row.group, actor.name
+            );
+            let quoted = format!("{head}\n\n{}", row.body);
+            // A blocker from before the current limits may be too long to quote.
+            let body = if super::validate_body(&quoted).is_ok() {
+                quoted
+            } else {
+                head
+            };
+            let id = db::insert_message(ctx.conn, &actor, None, &body, &ctx.now_s)?;
+            db::insert_delivery(ctx.conn, id, Kind::Agent, row.creator.id)?;
+            if actor.kind == Kind::Human {
+                db::record_human_conversation(ctx.conn, row.creator.id, actor.id, &ctx.now_s)?;
+            }
+            message_id = Some(id);
+        }
+        finish(ctx, &actor, row.id, message_id)
     })
 }
 
@@ -1559,20 +1583,112 @@ mod tests {
         let replay = cancel_blocker(&mut b.conn, &b.humans[1], cancel).unwrap();
         assert!(replay.replayed);
         assert_eq!(one.blocker, replay.blocker);
-        assert_eq!(b.messages(), before);
+        // One cancel notice to the creator; the replay sends no more.
+        assert!(one.message_id.is_some() && replay.message_id.is_none());
+        assert_eq!(b.messages(), before + 1);
         assert!(b.answer(1, id, "new-answer").is_err());
         let new = b.put(1, "Need help again", Some(id), "another");
         let before = b.messages();
-        cancel_blocker(
+        let cancel = proto::CancelBlockerRequest {
+            id: new.id,
+            request_key: "another-cancel".into(),
+        };
+        let first = cancel_blocker(&mut b.conn, &b.agents[0], cancel.clone()).unwrap();
+        assert!(
+            first.message_id.is_some(),
+            "the creator hears of the cancel"
+        );
+        let replay = cancel_blocker(&mut b.conn, &b.agents[0], cancel).unwrap();
+        assert!(replay.replayed && replay.message_id.is_none());
+        assert_eq!(b.messages(), before + 1);
+    }
+
+    /// The cancel notices the creator received, newest last.
+    fn cancel_notices(b: &Board, creator: i64) -> Vec<String> {
+        let mut stmt = b
+            .conn
+            .prepare(
+                "SELECT m.body FROM messages m JOIN deliveries d ON d.message_id = m.id
+                 WHERE d.recipient_kind = 'agent' AND d.recipient_id = ?1
+                   AND m.body LIKE 'Blocker #% was cancelled by %' ORDER BY m.id",
+            )
+            .unwrap();
+        stmt.query_map([creator], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn cancelling_tells_the_creator_unless_it_cancelled_its_own() {
+        let mut b = Board::memory();
+        let cancel = |b: &mut Board, by: &Caller, id: i64, key: &str| {
+            cancel_blocker(
+                &mut b.conn,
+                by,
+                proto::CancelBlockerRequest {
+                    id,
+                    request_key: key.into(),
+                },
+            )
+            .unwrap()
+        };
+        // Its own: no notice.
+        let own = b.put(0, "Which branch?", None, "own");
+        let by = b.agents[0].clone();
+        assert!(cancel(&mut b, &by, own.id, "c-own").message_id.is_none());
+        assert!(cancel_notices(&b, b.ids[0]).is_empty());
+        // Another member agent, then a human who owns a member.
+        let a = b.put(0, "Which branch?", None, "a");
+        let by = b.agents[1].clone();
+        cancel(&mut b, &by, a.id, "c-a");
+        let c = b.put(0, "Ship it?", None, "c");
+        let by = b.humans[1].clone();
+        let notice = cancel(&mut b, &by, c.id, "c-c").message_id.unwrap();
+        assert_eq!(
+            cancel_notices(&b, b.ids[0]),
+            vec![
+                format!(
+                    "Blocker #{} in @crew was cancelled by Zed.\n\nWhich branch?",
+                    a.id
+                ),
+                format!(
+                    "Blocker #{} in @crew was cancelled by ada.\n\nShip it?",
+                    c.id
+                ),
+            ]
+        );
+        let sender: String = b
+            .conn
+            .query_row(
+                "SELECT from_kind FROM messages WHERE id = ?1",
+                [notice],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sender, "human");
+        // In focus mode only the owner reaches the creator.
+        service::set_focus(
             &mut b.conn,
-            &b.agents[0],
-            proto::CancelBlockerRequest {
-                id: new.id,
-                request_key: "another-cancel".into(),
+            &b.humans[0],
+            proto::SetFocusRequest {
+                agent: "Mateo".into(),
+                focused: true,
             },
         )
         .unwrap();
-        assert_eq!(b.messages(), before);
+        let d = b.put(0, "Tag it?", None, "d");
+        let by = b.agents[1].clone();
+        assert!(cancel(&mut b, &by, d.id, "c-d").message_id.is_none());
+        let e = b.put(0, "Merge it?", None, "e");
+        let by = b.humans[0].clone();
+        assert!(cancel(&mut b, &by, e.id, "c-e").message_id.is_some());
+        let notices = cancel_notices(&b, b.ids[0]);
+        assert_eq!(notices.len(), 3);
+        assert!(notices[2].starts_with(&format!(
+            "Blocker #{} in @crew was cancelled by will.",
+            e.id
+        )));
     }
 
     #[test]

@@ -127,17 +127,51 @@ impl Tools {
 
     /// `bbs_goal_update`: check the update against the runner's goal and
     /// leave it for the runner, which applies it when the turn ends.
-    fn goal_update(&self, args: &Value) -> Result<String> {
-        let Some(tool) = &self.goal else {
+    async fn goal_update(&mut self, args: &Value) -> Result<String> {
+        let Some(tool) = self.goal.clone() else {
             bail!("Goals are only available to agents run by `bbs headless run`.");
         };
         let state = super::state::AgentDir {
             dir: tool.dir.clone(),
         }
         .load()?;
-        let (update, reply) = super::goal::tool_update(state.goal.as_ref(), args, tool.max_wait)?;
+        let (mut update, reply) =
+            super::goal::tool_update(state.goal.as_ref(), args, tool.max_wait)?;
+        if let super::goal::UpdateKind::Blocked {
+            blocker: Some(id), ..
+        } = &mut update.kind
+        {
+            *id = self.own_open_blocker(*id).await?;
+        }
         super::goal::append_update(&tool.dir, &update)?;
         Ok(reply)
+    }
+
+    /// Check that blocker `id` is the agent's own and still open; its root,
+    /// which stays the same when the blocker is replaced.
+    async fn own_open_blocker(&mut self, id: i64) -> Result<i64> {
+        let b = self.backend().await?;
+        let me = b.whoami().await?;
+        let found = b
+            .get_blocker(proto::GetBlockerRequest {
+                id,
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await?;
+        let current = found
+            .current
+            .context("the server returned no current blocker")?;
+        if current.creator.as_ref().map(|c| c.id) != Some(me.id) {
+            bail!("Blocker #{id} is not yours: block the goal on a blocker you put.");
+        }
+        if current.status() != proto::BlockerStatus::BlockerOpen {
+            bail!(
+                "Blocker #{id} is already closed: read its outcome with bbs_blocker_get, or put \
+                 a new blocker."
+            );
+        }
+        Ok(current.root_id)
     }
 
     async fn handle(&mut self, msg: &Value) -> Result<Value> {
@@ -194,7 +228,7 @@ impl Tools {
 
     async fn call_once(&mut self, name: &str, args: &Value) -> Result<String> {
         if name == "bbs_goal_update" {
-            return self.goal_update(args);
+            return self.goal_update(args).await;
         }
         let arg = |key: &str| -> Result<String> {
             args[key]
@@ -526,7 +560,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "bbs_blocker_cancel",
-            "description": "Cancel an exact open blocker version in a group you currently belong to. Keeps immutable history and sends no mail. Requires blockers.v1. Retry an uncertain result with the same request_key and ID.",
+            "description": "Cancel an exact open blocker version in a group you currently belong to. Keeps immutable history; its creator is mailed a notice unless you are the creator. Requires blockers.v1. Retry an uncertain result with the same request_key and ID.",
             "inputSchema": object(json!({
                 "id": { "type":"integer", "minimum":1, "description":"Exact open version ID; stale versions are refused." },
                 "request_key": string("Unique 1..128 byte intent key; reuse for the same retry."),
@@ -563,10 +597,11 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "bbs_goal_update",
-            "description": "Report progress on the goal your runner keeps prompting you toward: complete (with evidence), blocked (with a reason; you wait for mail) or waiting (with a reason and either until or for; you are prompted again then, or sooner if mail arrives). Takes effect when your turn ends.",
+            "description": "Report progress on the goal your runner keeps prompting you toward: complete (with evidence), blocked (on a blocker you put with bbs_blocker_put; goal prompts resume when it is answered or cancelled) or waiting (with a reason and either until or for; you are prompted again then, or sooner if mail arrives). Takes effect when your turn ends.",
             "inputSchema": object(json!({
                 "status": { "type": "string", "enum": ["complete", "blocked", "waiting"], "description": "The goal's new status" },
                 "evidence": string("complete: what shows the objective is met, such as checks you ran"),
+                "blocker": { "type": "integer", "description": "blocked: the id of your open blocker, from bbs_blocker_put" },
                 "reason": string("blocked or waiting: what you need, or what you are waiting for"),
                 "until": string("waiting: an RFC 3339 time to be prompted again, such as 2026-11-06T09:00:00Z"),
                 "for": string("waiting: how long to wait instead, such as 30m or 2h"),
@@ -591,7 +626,7 @@ mod search_tests {
             dir: dir.path().to_path_buf(),
         };
         let mut tools = Tools::new(dir.path(), "token".into());
-        let args = json!({"status": "blocked", "reason": "which branch?"});
+        let args = json!({"status": "waiting", "reason": "CI", "for": "30m"});
         // Not run by a runner.
         let err = tools.call("bbs_goal_update", &args).await.unwrap_err();
         assert!(format!("{err:#}").contains("bbs headless run"), "{err:#}");
@@ -609,7 +644,7 @@ mod search_tests {
             })
             .unwrap();
         let reply = tools.call("bbs_goal_update", &args).await.unwrap();
-        assert!(reply.starts_with("Goal blocked."), "{reply}");
+        assert!(reply.starts_with("Waiting until "), "{reply}");
         let updates = super::super::goal::take_updates(dir.path()).unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].goal, goal.set_at);
@@ -621,6 +656,171 @@ mod search_tests {
                 .any(|t| t["name"] == "bbs_goal_update")
         );
     }
+    #[tokio::test]
+    async fn blocking_needs_an_open_blocker_of_the_agents_own() {
+        use super::super::goal::{Goal, UpdateKind};
+        use crate::service::Caller;
+        let board = tempfile::tempdir().unwrap();
+        let mut db = crate::db::open(&board.path().join("bbs.db")).unwrap();
+        crate::db::migrate(&mut db).unwrap();
+        drop(db);
+        let config = Config::default();
+        let open = |caller: Caller| Backend::open(&config, board.path(), caller);
+        let mut human = open(Caller {
+            human: Some("will".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        human
+            .ensure_human(proto::EnsureHumanRequest {
+                name: "will".into(),
+            })
+            .await
+            .unwrap();
+        human
+            .group_register(proto::GroupRegisterRequest {
+                group: "crew".into(),
+                description: None,
+            })
+            .await
+            .unwrap();
+        let mut agents = Vec::new();
+        for name in ["Agent", "Other"] {
+            let token = human
+                .register(proto::RegisterRequest {
+                    name: Some(name.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .token;
+            let mut b = open(Caller {
+                token: Some(token.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            b.group_join(proto::GroupRequest {
+                group: "crew".into(),
+            })
+            .await
+            .unwrap();
+            agents.push((token, b));
+        }
+        async fn put(
+            b: &mut Backend,
+            key: &str,
+            replaces: Option<i64>,
+        ) -> Result<proto::BlockerMutationResponse> {
+            b.put_blocker(proto::PutBlockerRequest {
+                group: "crew".into(),
+                body: "Which branch?".into(),
+                request_key: key.into(),
+                replaces,
+                choices: None,
+            })
+            .await
+        }
+        let mine = put(&mut agents[0].1, "mine", None)
+            .await
+            .unwrap()
+            .blocker
+            .unwrap();
+        let newer = put(&mut agents[0].1, "newer", Some(mine.id))
+            .await
+            .unwrap()
+            .blocker
+            .unwrap();
+        let theirs = put(&mut agents[1].1, "theirs", None)
+            .await
+            .unwrap()
+            .blocker
+            .unwrap();
+        let done = put(&mut agents[0].1, "done", None)
+            .await
+            .unwrap()
+            .blocker
+            .unwrap();
+        agents[0]
+            .1
+            .cancel_blocker(proto::CancelBlockerRequest {
+                id: done.id,
+                request_key: "cancel".into(),
+            })
+            .await
+            .unwrap();
+
+        let state = tempfile::tempdir().unwrap();
+        let goal = Goal::new("Ship".into(), "will".into(), 5);
+        super::super::state::AgentDir {
+            dir: state.path().to_path_buf(),
+        }
+        .save(&super::super::state::State {
+            goal: Some(goal.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut tools = Tools {
+            local: true,
+            ..Tools::new(board.path(), agents[0].0.clone())
+        }
+        .goal(GoalTool {
+            dir: state.path().to_path_buf(),
+            max_wait: super::super::goal::DEFAULT_MAX_WAIT,
+        });
+        let mut block = async |blocker: Value| {
+            let args = json!({"status": "blocked", "reason": "which branch?", "blocker": blocker});
+            tools
+                .call("bbs_goal_update", &args)
+                .await
+                .map_err(|e| format!("{e:#}"))
+        };
+        assert!(
+            block(Value::Null)
+                .await
+                .unwrap_err()
+                .contains("bbs_blocker_put")
+        );
+        assert!(
+            block(json!(theirs.id))
+                .await
+                .unwrap_err()
+                .contains("not yours")
+        );
+        assert!(
+            block(json!(done.id))
+                .await
+                .unwrap_err()
+                .contains("already closed")
+        );
+        assert!(block(json!(9999)).await.is_err(), "no such blocker");
+        assert!(
+            super::super::goal::take_updates(state.path())
+                .unwrap()
+                .is_empty()
+        );
+        // The newest version, recorded by its root.
+        let reply = block(json!(newer.id)).await.unwrap();
+        assert!(
+            reply.starts_with(&format!("Goal blocked on blocker #{}.", newer.id)),
+            "{reply}"
+        );
+        let updates = super::super::goal::take_updates(state.path()).unwrap();
+        assert_eq!(
+            updates.iter().map(|u| &u.kind).collect::<Vec<_>>(),
+            [&UpdateKind::Blocked {
+                reason: "which branch?".into(),
+                blocker: Some(mine.id),
+            }]
+        );
+        // The old version is closed now: it was replaced.
+        assert!(
+            block(json!(mine.id)).await.is_ok(),
+            "the chain's current version is open"
+        );
+    }
+
     #[test]
     fn search_tool_preserves_literal_input_filters_and_cursor() {
         let args = json!({"query":"  É.*  ","case_sensitive":true,"limit":100,"before_id":42,

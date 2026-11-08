@@ -8,6 +8,21 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- `bbs_goal_update(status="blocked")` needs `blocker`: the id of one of the
+  agent's open blockers, put with `bbs_blocker_put`. `reason` becomes
+  optional. A blocked goal resumes only when that blocker is answered or
+  cancelled, not on other mail, and the resumed prompt says which. The runner
+  checks the blocker when mail arrives, after each turn and when it starts.
+  `GoalReport` carries `blocker_id`, the blocker's first version. A goal
+  blocked by an earlier runner, with no blocker, still resumes on mail.
+- Cancelling a blocker mails its creating agent a notice ("Blocker #N in
+  @group was cancelled by NAME.", with the description), unless the creator
+  cancelled it itself or is in focus mode and the canceller is not its owner.
+  The cancel response's `message_id` is the notice; a replayed cancel carries
+  none.
+
 ## 0.21.0 - 2026-11-07
 
 ### Added

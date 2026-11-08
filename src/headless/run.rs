@@ -292,6 +292,10 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     if let Some(g) = &state.goal {
         log.event("goal", goal_record(Some(g)));
     }
+    // The blocker may have closed while the runner was stopped.
+    if check_blocker(&mut state.goal, &config, dir, &token, &mut log).await {
+        goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
+    }
     let mut delivery =
         outbox::Sender::start(config.clone(), dir.to_path_buf(), token.clone(), share_warn);
     let mut delivering = false;
@@ -300,7 +304,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     let mail_task = tokio::spawn(wait_for_mail(
         config.clone(),
         dir.to_path_buf(),
-        token,
+        token.clone(),
         mail_tx,
     ));
 
@@ -495,6 +499,10 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     {
                         goal_dirty |= g.mail_arrived();
                     }
+                    // An answer or a cancel notice arrives as mail.
+                    if !batch.is_empty() {
+                        goal_dirty |= check_blocker(&mut state.goal, &config, dir, &token, &mut log).await;
+                    }
                     if goal_dirty {
                         goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
                     }
@@ -553,6 +561,11 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 }
                 let turn = (goal_prompt && !not_started).then_some(tools);
                 if goal_turn_ended(&mut state.goal, &agent_dir.dir, &mut log, turn_goal.as_deref(), turn) {
+                    goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
+                }
+                // The blocker may have closed during the turn, before the
+                // block took effect, or the agent cancelled it itself.
+                if check_blocker(&mut state.goal, &config, dir, &token, &mut log).await {
                     goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
                 }
                 goal_prompt = false;
@@ -852,6 +865,59 @@ fn goal_control(
         proto::Control::GoalClear => (goal.take().is_some(), None),
         _ => (false, None),
     }
+}
+
+/// How long the runner waits to learn whether a blocker closed.
+const BLOCKER_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// When the goal is blocked on a blocker, ask the server whether that blocker
+/// was answered or cancelled, and if so resume the goal. Returns whether the
+/// goal changed. A failed check leaves the goal blocked: the next mail or
+/// turn checks again, and the owner can resume it.
+async fn check_blocker(
+    goal: &mut Option<Goal>,
+    config: &Config,
+    dir: &Path,
+    token: &str,
+    log: &mut Log,
+) -> bool {
+    let Some(id) = goal.as_ref().and_then(Goal::waits_on) else {
+        return false;
+    };
+    let ask = async {
+        let caller = Caller {
+            token: Some(token.to_string()),
+            ..Default::default()
+        };
+        Backend::open(config, dir, caller)
+            .await?
+            .get_blocker(proto::GetBlockerRequest {
+                id,
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+    };
+    let found = match tokio::time::timeout(BLOCKER_CHECK_TIMEOUT, ask).await {
+        Ok(Ok(found)) => found,
+        Ok(Err(err)) => {
+            let message = format!("checking blocker #{id}: {err:#}");
+            log.event("warning", json!({ "message": message }));
+            return false;
+        }
+        Err(_) => {
+            let message = format!("checking blocker #{id}: timed out");
+            log.event("warning", json!({ "message": message }));
+            return false;
+        }
+    };
+    let answered = match found.current.map(|c| c.status()) {
+        Some(proto::BlockerStatus::BlockerAnswered) => true,
+        Some(proto::BlockerStatus::BlockerCancelled) => false,
+        _ => return false,
+    };
+    goal.as_mut()
+        .is_some_and(|g| g.blocker_closed(id, answered))
 }
 
 /// Apply the agent's updates when a turn ends; then, when its prompt carried

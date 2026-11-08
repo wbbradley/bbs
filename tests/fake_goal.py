@@ -3,7 +3,7 @@
 It records every prompt's text in fake-goal-prompts.jsonl. A prompt carrying a
 goal block ("[bbs goal") runs the next action from FAKE_GOAL_SCRIPT, a
 comma-separated list; the position is kept in fake-goal-step so it survives a
-restart. Once the script runs out, it blocks the goal. Actions:
+restart. Once the script runs out, it makes no tool calls. Actions:
 
   tool           make one tool call that is not a goal update
   slow           take a fifth of a second, then make one tool call
@@ -12,7 +12,7 @@ restart. Once the script runs out, it blocks the goal. Actions:
   complete       mark the goal complete with evidence
   wait1s         wait for one second
   wait2s         wait for two seconds
-  block          block the goal
+  block          put a blocker in @crew and block the goal on it
   waitcancel     wait for session/cancel, then end the turn cancelled
 
 Every bbs_goal_update result is appended to fake-goal-results.jsonl.
@@ -68,7 +68,7 @@ def next_action():
     step = Path("fake-goal-step")
     n = int(step.read_text()) if step.exists() else 0
     step.write_text(str(n + 1))
-    return script[n] if n < len(script) else "block"
+    return script[n] if n < len(script) else "idle"
 
 
 def main():
@@ -96,11 +96,13 @@ def main():
                 calls += 1
                 update(session, {"sessionUpdate": "tool_call", "toolCallId": f"c{calls}",
                                  "title": name, "status": "completed"})
-                if name != "bbs_goal_update":
-                    return
+                if not name.startswith("bbs_"):
+                    return None
                 result = mcp.call("tools/call", {"name": name, "arguments": arguments})
-                with open("fake-goal-results.jsonl", "a") as f:
-                    f.write(json.dumps(result) + "\n")
+                if name == "bbs_goal_update":
+                    with open("fake-goal-results.jsonl", "a") as f:
+                        f.write(json.dumps(result) + "\n")
+                return result
 
             if action == "tool":
                 tool("ls", {})
@@ -116,7 +118,11 @@ def main():
             elif action == "wait2s":
                 tool("bbs_goal_update", {"status": "waiting", "for": "2s", "reason": "deploy"})
             elif action == "block":
-                tool("bbs_goal_update", {"status": "blocked", "reason": "which branch?"})
+                put = tool("bbs_blocker_put", {"group": "crew", "body": "Which branch?",
+                                               "request_key": f"block-{calls}"})
+                blocker = json.loads(put["content"][0]["text"])["blocker"]["id"]
+                tool("bbs_goal_update", {"status": "blocked", "blocker": blocker,
+                                         "reason": "which branch?"})
             elif action == "waitcancel":
                 update(session, {"sessionUpdate": "tool_call", "toolCallId": "w",
                                  "title": "waiting-cancel", "status": "in_progress"})
