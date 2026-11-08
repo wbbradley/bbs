@@ -2636,6 +2636,13 @@ fn validate_goal(goal: &proto::GoalReport, owner: Option<&str>) -> Result<proto:
         Some(_) => bail!("only a waiting goal has wake_at"),
         None => None,
     };
+    match goal.blocker_id {
+        Some(id) if status != proto::GoalStatus::Blocked => {
+            bail!("only a blocked goal has blocker_id, not #{id}")
+        }
+        Some(id) if id <= 0 => bail!("blocker_id must be positive"),
+        _ => {}
+    }
     Ok(proto::GoalReport {
         set_at: parse_time("set_at", &goal.set_at)?,
         wake_at,
@@ -2660,6 +2667,7 @@ fn goal_from_json(stored: &str) -> Option<proto::GoalReport> {
         evidence: text("evidence")?,
         wake_at: text("wake_at"),
         changed_by: text("changed_by")?,
+        blocker_id: v.get("blocker_id").and_then(serde_json::Value::as_i64),
     })
 }
 
@@ -2676,6 +2684,7 @@ fn goal_json(goal: &proto::GoalReport) -> String {
         "evidence": goal.evidence,
         "wake_at": goal.wake_at,
         "changed_by": goal.changed_by,
+        "blocker_id": goal.blocker_id,
     })
     .to_string()
 }
@@ -2947,10 +2956,11 @@ fn timer_proto(t: db::TimerRow) -> proto::Timer {
     }
 }
 
-/// Whether a change to a timer by `me` is news to its agent: it is unless
-/// the agent made it itself, or the agent is in focus mode and `me` is not
-/// its owner, who alone may reach it then (as `check_focus` rules for mail).
-fn tell_timer_agent(ctx: &Ctx, me: &db::Principal, target_id: i64) -> Result<bool> {
+/// Whether a change by `me` to something of an agent's (a timer, a blocker)
+/// is news to that agent: it is unless the agent made it itself, or the agent
+/// is in focus mode and `me` is not its owner, who alone may reach it then (as
+/// `check_focus` rules for mail).
+fn tell_agent(ctx: &Ctx, me: &db::Principal, target_id: i64) -> Result<bool> {
     if me.kind == db::Kind::Agent && me.id == target_id {
         return Ok(false);
     }
@@ -3071,7 +3081,7 @@ pub fn timer_remove(
         let me = ctx.actor()?;
         let timer = managed_timer(ctx, &me, req.id)?;
         db::delete_timer(ctx.conn, timer.id)?;
-        if tell_timer_agent(ctx, &me, timer.target_id)? {
+        if tell_agent(ctx, &me, timer.target_id)? {
             let schedule = match &timer.repeat {
                 Some(r) => format!("{r:?}"),
                 None => format!("once, due {}", notice_time(&timer.next_run)),
@@ -3203,7 +3213,7 @@ pub fn timer_update(
             timer.creator_kind = me.kind;
             timer.creator_id = me.id;
         }
-        if tell_timer_agent(ctx, &me, timer.target_id)? {
+        if tell_agent(ctx, &me, timer.target_id)? {
             let notice = format!(
                 "Timer #{} was edited by {}: {}.",
                 timer.id,
@@ -4096,6 +4106,7 @@ mod tests {
             evidence: String::new(),
             wake_at: None,
             changed_by: "runner".into(),
+            blocker_id: None,
         };
         let report = |conn: &mut Connection, g: Option<proto::GoalReport>| {
             report_goal(conn, &mateo, proto::ReportGoalRequest { goal: g })
@@ -4163,6 +4174,14 @@ mod tests {
                 "only a waiting",
             ),
             (bad(&|g| g.set_at = "yesterday".into()), "set_at"),
+            (bad(&|g| g.blocker_id = Some(7)), "only a blocked goal"),
+            (
+                bad(&|g| {
+                    g.status = proto::GoalStatus::Blocked.into();
+                    g.blocker_id = Some(0);
+                }),
+                "positive",
+            ),
         ] {
             let err = report(&mut conn, Some(g)).unwrap_err();
             assert!(format!("{err:#}").contains(want), "{want}: {err:#}");
@@ -4172,6 +4191,11 @@ mod tests {
         done.evidence = "v1.0 tagged".into();
         report(&mut conn, Some(done)).unwrap();
         assert_eq!(stored(&mut conn).0.unwrap().evidence, "v1.0 tagged");
+        // A blocked goal keeps the blocker it waits on.
+        let mut blocked = goal(proto::GoalStatus::Blocked);
+        blocked.blocker_id = Some(12);
+        report(&mut conn, Some(blocked)).unwrap();
+        assert_eq!(stored(&mut conn).0.unwrap().blocker_id, Some(12));
         // No goal clears the report but keeps its time: a runner reported.
         report(&mut conn, None).unwrap();
         let (g, at) = stored(&mut conn);

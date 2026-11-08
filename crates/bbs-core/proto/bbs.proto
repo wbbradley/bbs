@@ -301,6 +301,9 @@ message CancelBlockerRequest {
 message BlockerMutationResponse {
   Blocker blocker = 1;
   bool replayed = 2;
+  // The mail this write sent the blocker's creator: an answer, or a cancel
+  // notice when someone other than the creator cancels. A replayed cancel
+  // carries none.
   optional int64 message_id = 3;
 }
 
@@ -554,6 +557,9 @@ message GoalReport {
   string evidence = 8;               // COMPLETE: what shows it is met
   optional string wake_at = 9;       // WAITING with a time: RFC 3339
   string changed_by = 10;            // "agent", "owner" or "runner"
+  // BLOCKED: the first version (root) of the agent's blocker it waits on.
+  // Absent from runners before 0.22.0.
+  optional int64 blocker_id = 11;
 }
 // No goal clears the stored report; its time is still recorded, so clients
 // know a goal-capable runner drives the agent.

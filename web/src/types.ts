@@ -130,6 +130,8 @@ export interface GoalReport {
   wake_at: string | null;
   /** "agent", "owner" or "runner". */
   changed_by: string;
+  /** Blocked: the first version of the agent's blocker it waits on. */
+  blocker_id?: number | null;
 }
 
 export interface Human {

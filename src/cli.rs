@@ -340,7 +340,7 @@ pub enum BlockerCommand {
         /// At most 8 KiB. With --select it is an optional note.
         answer: Option<String>,
     },
-    /// Group member or eligible human: cancel this version without mail.
+    /// Group member or eligible human: cancel this version; its creator is told unless it cancelled its own.
     Cancel {
         id: i64,
         #[arg(long)]
