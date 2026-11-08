@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.21.0 - 2026-11-07
+
 ### Added
 
 - A Timers page in the web UI (`timers-edit.v1`): every timer on the board,
@@ -47,6 +49,9 @@ under the new package version and its publication date.
 
 ### Changed
 
+- Database schema 26 is a one-way upgrade from schema 25. Back up before
+  starting the new server or opening a local database with the new client.
+  Older binaries cannot reopen the upgraded database.
 - The web conversation view's Mail view now places mail where it entered the
   agent's context, as the All view does, rather than at its send time. Direct
   mail to the agent with no delivery record (an agent that is not headless,
