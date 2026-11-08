@@ -147,6 +147,22 @@ impl Tools {
         Ok(reply)
     }
 
+    /// `bbs_goal_get`: the runner's goal as it is now, with the instructions
+    /// that short goal prompts leave out.
+    fn goal_get(&self) -> Result<String> {
+        let Some(tool) = &self.goal else {
+            bail!("Goals are only available to agents run by `bbs headless run`.");
+        };
+        let state = super::state::AgentDir {
+            dir: tool.dir.clone(),
+        }
+        .load()?;
+        Ok(match state.goal {
+            Some(goal) => goal.describe(),
+            None => "You have no goal.".to_string(),
+        })
+    }
+
     /// Check that blocker `id` is the agent's own and still open; its root,
     /// which stays the same when the blocker is replaced.
     async fn own_open_blocker(&mut self, id: i64) -> Result<i64> {
@@ -227,6 +243,9 @@ impl Tools {
     }
 
     async fn call_once(&mut self, name: &str, args: &Value) -> Result<String> {
+        if name == "bbs_goal_get" {
+            return self.goal_get();
+        }
         if name == "bbs_goal_update" {
             return self.goal_update(args).await;
         }
@@ -596,10 +615,15 @@ pub fn tool_list() -> Value {
             "inputSchema": object(json!({ "agent": string("Agent name (default: you)") }), &[]),
         },
         {
+            "name": "bbs_goal_get",
+            "description": "Read the goal your runner keeps prompting you toward: its objective, status, turns used and the instructions for reporting progress. Goal prompts after the first are short; use this to reread the objective.",
+            "inputSchema": object(json!({}), &[]),
+        },
+        {
             "name": "bbs_goal_update",
-            "description": "Report progress on the goal your runner keeps prompting you toward: complete (with evidence), blocked (on a blocker you put with bbs_blocker_put; goal prompts resume when it is answered or cancelled) or waiting (with a reason and either until or for; you are prompted again then, or sooner if mail arrives). Takes effect when your turn ends.",
+            "description": "Report progress on the goal your runner keeps prompting you toward: complete (with evidence), blocked (on a blocker you put with bbs_blocker_put; goal prompts resume when it is answered or cancelled), waiting (with a reason and either until or for; you are prompted again then) or active (end a wait or block early, for example when mail you got while waiting ends it). Mail reaches you while you wait or are blocked, without goal prompts. Takes effect when your turn ends.",
             "inputSchema": object(json!({
-                "status": { "type": "string", "enum": ["complete", "blocked", "waiting"], "description": "The goal's new status" },
+                "status": { "type": "string", "enum": ["complete", "blocked", "waiting", "active"], "description": "The goal's new status" },
                 "evidence": string("complete: what shows the objective is met, such as checks you ran"),
                 "blocker": { "type": "integer", "description": "blocked: the id of your open blocker, from bbs_blocker_put" },
                 "reason": string("blocked or waiting: what you need, or what you are waiting for"),
@@ -645,6 +669,14 @@ mod search_tests {
             .unwrap();
         let reply = tools.call("bbs_goal_update", &args).await.unwrap();
         assert!(reply.starts_with("Waiting until "), "{reply}");
+        // bbs_goal_get restates the goal that short prompts leave out.
+        let got = tools.call("bbs_goal_get", &json!({})).await.unwrap();
+        assert!(got.starts_with("Objective (set by will, "), "{got}");
+        assert!(
+            got.contains("Ship\n\nStatus: active (0 of 5 goal turns used)"),
+            "{got}"
+        );
+        assert!(got.ends_with("Don't mark the goal complete just to end the loop."));
         let updates = super::super::goal::take_updates(dir.path()).unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].goal, goal.set_at);
@@ -654,6 +686,13 @@ mod search_tests {
                 .unwrap()
                 .iter()
                 .any(|t| t["name"] == "bbs_goal_update")
+        );
+        assert!(
+            tool_list()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "bbs_goal_get")
         );
     }
     #[tokio::test]

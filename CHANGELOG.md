@@ -8,6 +8,20 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- Goal prompts restate the objective and instructions only when the goal is
+  new, when the owner resumes it, or after a goal turn that used no tools.
+  Other goal prompts are a short reminder, so the goal no longer crowds out
+  other context. The new `bbs_goal_get` tool rereads the objective, status
+  and instructions.
+- Mail no longer ends a goal's wait. While a goal waits or is blocked, mail is
+  delivered without the goal block, with a line saying what the goal waits
+  for. `bbs_goal_update` now works while the goal waits or is blocked, and
+  its new `active` status ends the wait. A wait still ends at its time, and a
+  block when its blocker closes. A goal blocked by a runner before 0.22.0, with
+  no blocker, still resumes on mail.
+
 ## 0.22.0 - 2026-11-08
 
 ### Changed
