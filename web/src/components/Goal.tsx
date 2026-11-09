@@ -151,13 +151,13 @@ export function GoalDialog({
             : ""}
       </p>
       <label className="field">
-        <span>Objective</span>
+        <span>Objective, with what done looks like: merged, released, live, or a check that passes</span>
         <textarea
           className="textarea"
           rows={5}
           value={objective}
           onChange={(e) => setObjective(e.target.value)}
-          placeholder="Get the integration tests passing on main"
+          placeholder="Get the integration tests passing on main; done when the fix is merged and CI is green"
           autoFocus
         />
       </label>
