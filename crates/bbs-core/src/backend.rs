@@ -135,13 +135,31 @@ impl Remote {
     }
 }
 
-/// The server sends the service's error text as the status message.
+/// The server sends the service's error text as the status message. A
+/// compatibility refusal also names the version to upgrade to, from the
+/// server's hints.
 fn status_error(status: tonic::Status) -> anyhow::Error {
-    let message = if status.code() == tonic::Code::Unimplemented {
+    let mut message = if status.code() == tonic::Code::Unimplemented {
         "BBS v2 service is unavailable; coordinate a client/server upgrade".to_string()
     } else {
         status.message().to_string()
     };
+    if status.code() == tonic::Code::FailedPrecondition && message.starts_with("incompatible BBS") {
+        let version = |key| {
+            status
+                .metadata()
+                .get(key)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| semver::Version::parse(v).ok())
+        };
+        if let Some(target) = version("bbs-recommended-client-version") {
+            message.push_str(&format!(
+                "; the server recommends bbs {target}: cargo install --locked bbs-cli --version '~{target}'"
+            ));
+        } else if let Some(server) = version("bbs-server-version") {
+            message.push_str(&format!("; the server runs bbs {server}"));
+        }
+    }
     anyhow::Error::new(status).context(message)
 }
 
@@ -1158,6 +1176,27 @@ mod tests {
                 );
             }
         }
+        // A compatibility refusal names the version to upgrade to.
+        let refusal = |hints: &[(&'static str, &str)]| {
+            let mut status = tonic::Status::failed_precondition(
+                "incompatible BBS protocol: this server requires epoch 3 (bbs.v2); upgrade the client and server together",
+            );
+            for (key, value) in hints {
+                status.metadata_mut().insert(*key, value.parse().unwrap());
+            }
+            status_error(status).to_string()
+        };
+        let text = refusal(&[
+            ("bbs-server-version", "0.25.0"),
+            ("bbs-recommended-client-version", "0.25.1"),
+        ]);
+        assert!(
+            text.ends_with("; the server recommends bbs 0.25.1: cargo install --locked bbs-cli --version '~0.25.1'"),
+            "{text}"
+        );
+        let text = refusal(&[("bbs-server-version", "0.25.0")]);
+        assert!(text.ends_with("; the server runs bbs 0.25.0"), "{text}");
+        assert!(refusal(&[("bbs-server-version", "not semver")]).ends_with("together"));
     }
 
     struct PendingBody;

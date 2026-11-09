@@ -24,6 +24,8 @@ under the new package version and its publication date.
 - `bbs headless run` and its activity sharing stop, rather than retry
   forever, when the server refuses the client as incompatible (another
   protocol epoch, a missing capability or a client below the minimum).
+- A compatibility refusal names the version to upgrade to: the server's
+  recommended client version, else its own version.
 - The server and local mode run on the Hub model (schema 27): messages and
   deliveries refer to entity addresses, and every new human, agent and group
   gets an entity ID. Local behaviour is unchanged. A new database is created at
