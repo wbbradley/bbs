@@ -87,6 +87,10 @@ pub struct AgentRow {
     /// The newest validated goal report (JSON) and when the server got it.
     pub goal: Option<String>,
     pub goal_reported_at: Option<String>,
+    /// The newest activity event that starts, continues or ends a turn (prompt,
+    /// steer, tool, thought, text, turn_end, turn_error, cancel or stop); None
+    /// when there is none.
+    pub turn_event: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -595,7 +599,10 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                      WHERE agent_id = a.id
                      ORDER BY id DESC LIMIT 1))),
                 (SELECT max(last_at) FROM agent_human_conversations p WHERE p.agent_id = a.id),
-                a.focused_at, a.goal, a.goal_reported_at
+                a.focused_at, a.goal, a.goal_reported_at,
+                (SELECT event FROM activity
+                 WHERE agent_id = a.id AND event IN ('prompt', 'steer', 'tool', 'thought', 'text', 'turn_end', 'turn_error', 'cancel', 'stop')
+                 ORDER BY id DESC LIMIT 1)
          FROM agents a
          LEFT JOIN agent_owners o ON o.agent_id = a.id
          LEFT JOIN humans h ON h.id = o.human_id
@@ -620,6 +627,7 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                 focused_at: r.get(12)?,
                 goal: r.get(13)?,
                 goal_reported_at: r.get(14)?,
+                turn_event: r.get(15)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -1479,6 +1487,10 @@ pub struct AgentSummary {
     /// The newest validated goal report (JSON) and when the server got it.
     pub goal: Option<String>,
     pub goal_reported_at: Option<String>,
+    /// The newest activity event that starts, continues or ends a turn (prompt,
+    /// steer, tool, thought, text, turn_end, turn_error, cancel or stop); None
+    /// when there is none.
+    pub turn_event: Option<String>,
 }
 
 /// Unread mail through the human's inbox index; unseen activity per live
@@ -1512,14 +1524,17 @@ const AGENT_SUMMARIES: &str = "
                      WHERE agent_id = g.id
                      ORDER BY id DESC LIMIT 1))) AS last_sent,
                (SELECT max(p.last_at) FROM agent_human_conversations p
-                WHERE p.agent_id = g.id) AS human_conversation
+                WHERE p.agent_id = g.id) AS human_conversation,
+               (SELECT turn.event FROM activity turn
+                WHERE turn.agent_id = g.id AND turn.event IN ('prompt', 'steer', 'tool', 'thought', 'text', 'turn_end', 'turn_error', 'cancel', 'stop')
+                ORDER BY turn.id DESC LIMIT 1) AS turn_event
         FROM agents g
         LEFT JOIN activity_seen s ON s.human_id = ?1 AND s.agent_id = g.id
         LEFT JOIN unread u ON u.agent_id = g.id
         WHERE g.retired_at IS NULL)
     SELECT name, unread, unread_oldest, unseen, unseen_oldest, last_sent, effort,
            effort_reported_at, human_conversation, agent_id, focused_at, goal,
-           goal_reported_at FROM summaries
+           goal_reported_at, turn_event FROM summaries
     ORDER BY lower(name)";
 
 /// For each live agent, the direct messages it sent `human` that are unread,
@@ -1543,6 +1558,7 @@ pub fn agent_summaries(conn: &Connection, human: i64) -> Result<Vec<AgentSummary
                 focused_at: r.get(10)?,
                 goal: r.get(11)?,
                 goal_reported_at: r.get(12)?,
+                turn_event: r.get(13)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -2893,6 +2909,43 @@ mod tests {
                 .any(|l| l.starts_with("SEARCH activity USING INDEX activity_agent (agent_id=?)")),
             "{plan:#?}"
         );
+        // So does the turn-event lookup.
+        assert!(
+            plan.iter()
+                .any(|l| l.starts_with("SEARCH turn USING INDEX activity_agent (agent_id=?)")),
+            "{plan:#?}"
+        );
+    }
+
+    #[test]
+    fn turn_event_is_the_newest_event_that_starts_or_ends_a_turn() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO humans (id, name, created_at, active_at) VALUES (1, 'will', 't', 't');
+             INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at)
+               VALUES (1, 'Theo', 'h1', '/', 'host', 't', 't');",
+        )
+        .unwrap();
+        let turn = |conn: &Connection| {
+            let listed = list_agents(conn, false).unwrap()[0].turn_event.clone();
+            let summed = agent_summaries(conn, 1).unwrap()[0].turn_event.clone();
+            assert_eq!(listed, summed);
+            listed
+        };
+        assert_eq!(turn(&conn), None);
+        let post = |conn: &Connection, events: &[&str]| {
+            let rows: Vec<_> = events
+                .iter()
+                .map(|e| (e.to_string(), format!(r#"{{"event":"{e}"}}"#)))
+                .collect();
+            post_activity(conn, 1, "2026-11-09T00:00:00Z", &rows).unwrap();
+        };
+        post(&conn, &["mail", "prompt", "tool", "text"]);
+        assert_eq!(turn(&conn).as_deref(), Some("text"));
+        // Events after a turn ends, such as a goal report, don't count.
+        post(&conn, &["turn_end", "goal", "warning"]);
+        assert_eq!(turn(&conn).as_deref(), Some("turn_end"));
     }
 
     #[test]

@@ -765,6 +765,10 @@ message Agent {
   // When the server received the newest goal report, including one saying
   // there is no goal; absent when no goal-capable runner has reported.
   optional string goal_reported_at = 17;
+  // The newest activity event that starts, continues or ends a turn (prompt,
+  // steer, tool, thought, text, turn_end, turn_error, cancel or stop); absent
+  // when there is none or the server is older.
+  optional string turn_event = 18;
 }
 
 // The window is the most recent `backlog` (1 to 1000) messages that match every
@@ -887,6 +891,8 @@ message AgentSummary {
   // As Agent.goal and Agent.goal_reported_at.
   optional GoalReport goal = 13;
   optional string goal_reported_at = 14;
+  // As Agent.turn_event.
+  optional string turn_event = 15;
 }
 // Every live agent, by name.
 message AgentSummarySnapshot {

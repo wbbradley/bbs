@@ -178,7 +178,7 @@ function AgentLink({
         <span className="agent">{agent.name}</span>
         {qualify && agent.owner && <span className="faint">@{agent.owner}</span>}
       </span>
-      <FocusMark owner={agent.owner} since={agent.focused_at ?? null} />
+      <FocusMark owner={agent.owner} since={agent.focused_at ?? null} turnEvent={agent.turn_event} />
       {blockers > 0 && <span className="badge warn">⚑{blockers}</span>}
       {activity ? (
         agent.last_sent_at && (

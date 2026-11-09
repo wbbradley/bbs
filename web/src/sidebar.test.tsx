@@ -203,6 +203,20 @@ describe("the sidebar's agents", () => {
       }),
     );
     expect(rows()).toEqual(["Frank2h36m ago", "Jefenow", "Zed◎"]);
+    // Between turns, a focused agent waits for its owner; a new turn ends that.
+    act(() =>
+      api.stream("summary").push({
+        agents: [summary(focused, { focused_at: null }), summary(ZED, { focused_at: before(0), turn_event: "turn_end" })],
+      }),
+    );
+    expect(rows()).toEqual(["Frank2h36m ago", "Jefenow", "Zed⧖"]);
+    expect(screen.getByLabelText("In focus mode, waiting for ada").title).toMatch(/Idle: waiting for ada\.$/);
+    act(() =>
+      api.stream("summary").push({
+        agents: [summary(focused, { focused_at: null }), summary(ZED, { focused_at: before(0), turn_event: "prompt" })],
+      }),
+    );
+    expect(rows()).toEqual(["Frank2h36m ago", "Jefenow", "Zed◎"]);
   });
 
   it("keeps mixed-case names alphabetical when blockers, activity and listed order change", async () => {

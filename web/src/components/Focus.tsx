@@ -8,9 +8,39 @@ function focusTitle(owner: string | null, since: string): string {
   return `Focused ${ago(since)}: only ${owner ?? "its owner"}'s direct messages reach it, and it can message only ${owner ?? "its owner"}.`;
 }
 
-/** The mark beside a focused agent's name; nothing when it is not focused. */
-export function FocusMark({ owner, since }: { owner: string | null; since: string | null }) {
+/** Turn events after which the agent is between turns. */
+const BETWEEN_TURNS = ["turn_end", "turn_error", "cancel", "stop"];
+
+/** Whether the agent's newest turn event says it is between turns. */
+export function betweenTurns(turnEvent: string | null | undefined): boolean {
+  return !!turnEvent && BETWEEN_TURNS.includes(turnEvent);
+}
+
+/**
+ * The mark beside a focused agent's name; nothing when it is not focused.
+ * Between turns, a focused agent waits for its owner, so the mark says so.
+ */
+export function FocusMark({
+  owner,
+  since,
+  turnEvent,
+}: {
+  owner: string | null;
+  since: string | null;
+  turnEvent?: string | null;
+}) {
   if (!since) return null;
+  if (betweenTurns(turnEvent)) {
+    return (
+      <span
+        className="badge focus waiting"
+        title={`${focusTitle(owner, since)} Idle: waiting for ${owner ?? "its owner"}.`}
+        aria-label={`In focus mode, waiting for ${owner ?? "its owner"}`}
+      >
+        ⧖
+      </span>
+    );
+  }
   return (
     <span className="badge focus" title={focusTitle(owner, since)} aria-label="In focus mode">
       ◎

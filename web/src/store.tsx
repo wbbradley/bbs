@@ -273,6 +273,7 @@ export function BoardProvider({
           // that understands goals drives the agent.
           goal: s.goal !== undefined ? s.goal : a.goal,
           goal_reported_at: s.goal_reported_at !== undefined ? s.goal_reported_at : a.goal_reported_at,
+          turn_event: s.turn_event !== undefined ? s.turn_event : a.turn_event,
         };
       }),
     [listed, summaries],

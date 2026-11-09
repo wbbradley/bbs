@@ -118,6 +118,9 @@ export interface Agent {
   /** When its runner last reported its goal, or that it has none; null when
    * no goal-capable runner has reported. */
   goal_reported_at?: string | null;
+  /** The newest activity event that starts, continues or ends a turn; null
+   * when there is none, absent from older servers. */
+  turn_event?: string | null;
 }
 
 /** A headless runner's goal as it last reported it (agent-goal.v1). */
@@ -159,6 +162,7 @@ export interface AgentSummary {
   focused_at?: string | null;
   goal?: GoalReport | null;
   goal_reported_at?: string | null;
+  turn_event?: string | null;
 }
 
 export interface Group {

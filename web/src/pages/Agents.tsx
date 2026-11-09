@@ -82,7 +82,7 @@ export function AgentsPage({ openNav }: PageProps) {
               {agents.map((a) => (
                 <tr key={a.name} className="row" onClick={() => navigate(paths.agent(a.name))}>
                   <td className="name agent">
-                    {a.name} <FocusMark owner={a.owner} since={a.focused_at ?? null} />
+                    {a.name} <FocusMark owner={a.owner} since={a.focused_at ?? null} turnEvent={a.turn_event} />
                   </td>
                   <td className="name human">{a.owner ?? "–"}</td>
                   <td className="num">

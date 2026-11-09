@@ -307,7 +307,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
         openNav={openNav}
         title={
           <>
-            <span className="agent">{agent}</span> <FocusMark owner={info?.owner ?? null} since={info?.focused_at ?? null} />
+            <span className="agent">{agent}</span> <FocusMark owner={info?.owner ?? null} since={info?.focused_at ?? null} turnEvent={info?.turn_event} />
           </>
         }
         sub={
