@@ -5,7 +5,7 @@ import { navigate, paths } from "./router";
 import { useBoard } from "./store";
 import { useCover } from "./cover";
 import { seedFound } from "./useMessages";
-import { ago, senderName } from "./util";
+import { ago, isRemoteName, senderName } from "./util";
 
 interface Result {
   key: string;
@@ -204,9 +204,13 @@ export function Launcher({ onClose }: { onClose: () => void }) {
         kind: ago(m.created_at).replace(" ago", ""),
         label: (
           <span>
-            <span className={m.from_kind === Kind.Agent ? "agent" : "human"}>{senderName(m)}</span>
+            <span className={m.from_kind === Kind.Agent ? "agent" : m.from_kind === Kind.Remote ? "remote" : "human"}>
+              {senderName(m)}
+            </span>
             <span className="faint"> → </span>
-            <span className={m.to_group ? "group" : "agent"}>{m.to_group ? `@${m.to_group}` : m.to_name}</span>
+            <span className={m.to_group ? "group" : isRemoteName(m.to_name) ? "remote" : "agent"}>
+              {m.to_group ? `@${m.to_group}` : m.to_name}
+            </span>
           </span>
         ),
         detail: <Hit text={line.trim().slice(0, 200)} query={q} />,

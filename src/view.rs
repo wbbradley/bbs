@@ -181,6 +181,7 @@ fn json(m: &Message) -> MessageJson<'_> {
         from_kind: match m.from_kind() {
             Kind::Agent => "agent",
             Kind::Human => "human",
+            Kind::Remote => "remote",
             Kind::Unspecified => "unspecified",
         },
         from_owner: m.from_owner.as_deref(),
@@ -201,6 +202,7 @@ fn format_feed(rows: &[Message]) -> String {
         }
         let from = match m.from_kind() {
             Kind::Human => format!("{} (human)", m.from_name),
+            Kind::Remote => format!("{} (remote)", m.from_name),
             _ => m.qualified_sender(),
         };
         let to = match (&m.to_group, m.qualified_recipient()) {
