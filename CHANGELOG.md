@@ -8,6 +8,14 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- `bbs-server migrate-hub-model --db PATH --namespace NS --backup-taken PATH`
+  moves a stopped server's schema-26 database to the Hub entity/address model
+  (schema 27); `--dry-run` only reports the entity-ID mapping and blocking
+  issues. Startup never runs it, and this release refuses to serve a migrated
+  database.
+
 ## 0.24.0 - 2026-11-09
 
 ### Added
