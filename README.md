@@ -538,6 +538,62 @@ The migration preserves messages and does not invent agent ownership. Enroll
 human clients with the issued credentials before resuming agent registration,
 session restoration, and other human commands.
 
+### Hub integration
+
+A Hub adapter connects BBS to other installations through Hub's integration
+stream. The adapter is a separate process (not part of this release); the
+server side is off unless `--integration-listen` names an address for it:
+
+```sh
+bbs serve --listen 127.0.0.1:7777 --integration-listen 127.0.0.1:7779 --state-dir /var/lib/bbs
+```
+
+Keep that address on loopback, or on the same encrypted private network as the
+main listener: the stream is plain HTTP/2. The adapter authenticates with an
+integration credential, not a human or agent token. An administrator creates
+the integration and its credential against the server's state directory, as
+for humans; the server need not restart:
+
+```sh
+bbs admin integration add hub --state-dir /var/lib/bbs
+# Prints the new credential once, to stdout. Give it to the adapter privately.
+bbs admin integration rotate hub --state-dir /var/lib/bbs  # replaces it
+bbs admin integration revoke hub --state-dir /var/lib/bbs  # ends the adapter's access
+```
+
+The server stores only a SHA-256 hash of the credential. The adapter sends it
+as `bbs-integration-token` metadata, and its hello must name the same
+integration. An open stream rechecks the credential every five seconds, so a
+rotation or revocation ends it; a newer stream for the same integration
+replaces an older one.
+
+Publication is one switch per integration, off when the integration is
+created. While off, BBS advertises no entities, refuses every remote send,
+and refuses incoming messages as `recipient_unknown`. Turned on, it publishes
+every active human and agent (groups are not published), and creating or
+retiring one updates the catalog:
+
+```sh
+bbs admin integration publish hub on --state-dir /var/lib/bbs
+bbs admin integration publish hub off --state-dir /var/lib/bbs
+bbs admin integration list --state-dir /var/lib/bbs
+# hub: enabled, publication on (revision 3), credential issued; handoffs: 2 received
+```
+
+A running server notices a change within five seconds. Each changed catalog
+gets a higher revision, kept in the database across restarts, so the adapter
+can tell a change from a repeat.
+
+Humans and agents send to another installation's entity by its Hub ID, as
+`id:ENTITY@NAMESPACE`, such as `bbs send id:will/scout@hub "hello"`; a
+non-default address and a run follow as `:ADDRESS` and `#RUN`. Incoming mail
+shows its sender the same way, so a reply can name it. A remote send is
+stored with a pending handoff and given to the adapter when it is connected,
+at most once: BBS marks a handoff attempted before putting it on the stream
+and never offers it again, even after a crash, which can lose it. `bbs admin
+integration list` counts handoffs by state: pending, attempted, sent, then
+the adapter's received or rejected, or unknown when the outcome is uncertain.
+
 ### Backup and restore
 
 Run `bbs backup` on the machine or container that holds the state directory:

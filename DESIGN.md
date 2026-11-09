@@ -356,6 +356,97 @@ without write access to the `-shm` file. The rebuilt `messages` and
 `deliveries` tables keep an equivalent of every earlier index;
 `deliveries_direct` replaces `deliveries_human_dm`.
 
+## Hub integration stream
+
+BBS serves Hub's integration stream (`bbs.integration.v1`, D085) for a
+separate adapter process that federates with Hub. The proto and the
+`msgproto.v1` messages it imports are vendored unchanged in
+[crates/bbs-core/proto/hub](crates/bbs-core/proto/hub) and generated beside
+`bbs.proto`. [crates/bbs-core/src/service/integration.rs](crates/bbs-core/src/service/integration.rs)
+holds the rules and [crates/bbs-server/src/serve/integration.rs](crates/bbs-server/src/serve/integration.rs)
+runs the stream, on its own listener, `bbs serve --integration-listen`, off by
+default. Its tables (`integration_tokens`, the publication revision and
+digest on `bbs_integrations`, and the group-copy columns on `messages`) are
+part of the Hub model migration, schema 27. It does not use the `bbs.v2` epoch metadata; its hello carries its own
+protocol major, 1.
+
+**Credential.** `bbs admin integration add` creates a `bbs_integrations` row
+(enabled, publication off) and prints a 128-bit credential once;
+`integration_tokens` keeps its SHA-256 hash, one per integration, replaced by
+`rotate` and deleted by `revoke`. It is neither a human nor an agent token. The
+adapter sends it as `bbs-integration-token`; a failure counts against the
+peer's authentication-failure budget. The first frame must be a hello for the
+same integration with protocol major 1, within ten seconds; BBS answers with
+its hello, naming its namespace, and its catalog. A stream rechecks its
+credential every five seconds, and a newer stream for the integration
+supersedes it.
+
+**Bounds.** Frames are at most 4 MiB each way (gRPC enforces it before
+decoding). A frame with no or an unknown payload, a second hello, or a
+malformed result, observation, directory query or result ends the stream with
+`InvalidArgument`. An incoming message is checked as Hub's `checkMessage`
+does: at most 96 KiB encoded and 64 KiB of body, complete IDs (opaque IDs
+`[A-Za-z0-9_-]{1,128}`, entity IDs at most two such parts, 128 characters in
+all, D126), APPLICATION kind, authored time and deadline, a valid
+`in_reply_to`, a group copy with its original and original sender and no
+`in_reply_to`, and a sender in the message's own namespace, which must not be
+this installation's. Observations and directory results carry at most 100
+entities, descriptors at most 8 KiB, and labels, descriptions, aliases and
+reasons Hub's lengths.
+
+**Publication (D090).** Each integration has one switch,
+`bbs_integrations.publish_entities`, changed only by `bbs admin integration
+publish`. On, the catalog is every active native human and agent with its
+`native` address; off, it is empty. Groups are never published. The server
+recomputes the catalog after every committed change and every five seconds,
+which catches local administration, and sends it when it differs. A catalog
+whose SHA-256 differs from the stored `publication_digest` gets the next
+`publication_revision`, so revisions only grow, across restarts too, and a
+reconnect repeats the current one. A catalog over one frame is refused.
+
+**Outbound handoff (D072).** `Send` to `id:ENTITY@NAMESPACE[:ADDRESS][#RUN]`
+(Hub's explicit-ID reference) sends to a remote address. It needs an enabled
+integration with publication on: the one already reaching that address, else
+the only one configured. In one transaction it records the foreign entity and
+address (bound to the integration), the message with its frozen common
+`Message` bytes (seven-day deadline, plain text) and an `integration_outbox`
+row, `pending`; no delivery row. While publication is off, pending work stays
+pending. The stream hands work off one at a time: it waits for room on the
+stream, then in one database call claims the oldest pending row (`attempted`,
+committed), puts the offer on the stream, and marks it `sent`, or `unknown` if
+the stream closed. That send is the handoff boundary. The adapter's result
+moves `attempted`, `sent` or `unknown` to `received` (detail `already_known`
+for ALREADY_KNOWN) or `rejected` with its reason; a later result never
+replaces the first, and a result for a handoff never offered is ignored.
+Startup turns every `attempted` row into `unknown`. Nothing returns to
+`pending`, so a crash between claim and send loses the message rather than
+risk sending it twice. Expired pending work becomes `rejected` (`expired`).
+The state shows only in `bbs admin integration list`: no reply carries it.
+
+**Import.** An offer is validated as above, then a message with the same
+origin `(namespace, ID)` answers ALREADY_KNOWN when its stored bytes are
+identical and `message_conflict` otherwise, before any lifecycle or deadline
+check (Hub's order). A new message must be unexpired, `text/plain;
+charset=utf-8` and UTF-8, and its recipient this installation's namespace, no
+run, publication on, and an existing native human or agent address
+(`recipient_unknown`, which a group also gets); a retired one is
+`recipient_closed`, and an agent in focus mode `sender_not_permitted`. Then one
+transaction records the sender as a foreign entity and address (kind
+`group` for a group copy, else `unknown` until an observation says), the
+message with its exact bytes, `in_reply_to`, the group copy's original and
+original sender, and one direct delivery, and the result is RECEIVED. Results
+use Hub's transfer reason names. Observations update only foreign entities'
+kind, display name and lifecycle; they never touch native ones.
+
+Reads show a foreign sender, or a remote recipient in the feed, as its
+`id:ENTITY@NAMESPACE` reference, kind human when its entity says so and agent
+otherwise, with no owner. Directory queries are answered from the published
+catalog only (nothing while publication is off), by exact ID or in pages of at
+most 100 keyed by entity ID; BBS has no aliases or runs, so those return
+nothing. Another namespace is `namespace_unknown`. BBS sends no remote
+directory queries yet, so it ignores directory results. It answers each ping
+with a pong; HTTP/2 keepalive covers its own liveness.
+
 ## Web UI
 
 `bbs serve --web ADDR` also serves a browser UI for humans on its own HTTP/1.1
