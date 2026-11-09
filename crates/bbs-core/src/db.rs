@@ -14,7 +14,7 @@ pub mod notes;
 
 pub use hub_model::{
     EntityMapping, HUB_MODEL_SCHEMA_VERSION, HUB_MODEL_SOURCE_VERSION, HubKind, HubMigrationReport,
-    PreflightReport, hub_model_preflight, migrate_to_hub_model, validate_namespace,
+    PreflightReport, hub_model_preflight, lock_exclusive, migrate_to_hub_model, validate_namespace,
 };
 
 /// The schema every migrating open advances to.

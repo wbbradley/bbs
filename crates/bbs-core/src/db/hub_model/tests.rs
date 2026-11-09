@@ -4,7 +4,7 @@
 use rusqlite::types::Value;
 
 use super::*;
-use crate::db::{SCHEMA_VERSION, migrate};
+use crate::db::migrate;
 
 const T: &str = "2026-10-08T14:02:11.123456Z";
 
@@ -15,7 +15,19 @@ const T: &str = "2026-10-08T14:02:11.123456Z";
 fn fixture() -> Connection {
     let mut conn = Connection::open_in_memory().unwrap();
     conn.pragma_update(None, "foreign_keys", true).unwrap();
-    migrate(&mut conn).unwrap();
+    fill(&mut conn);
+    conn
+}
+
+/// The same board in a WAL database file, opened as bbs-server opens it.
+fn file_fixture(path: &std::path::Path) -> Connection {
+    let mut conn = crate::db::open(path).unwrap();
+    fill(&mut conn);
+    conn
+}
+
+fn fill(conn: &mut Connection) {
+    migrate(conn).unwrap();
     let sql = "
         INSERT INTO humans VALUES (1, 'will', 'T', 'T'), (2, 'ann.lee', 'T', 'T');
         INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at, retired_at) VALUES
@@ -61,7 +73,6 @@ scout 📨', 'T', NULL, NULL, NULL),
     "
     .replace("'T'", &format!("'{T}'"));
     conn.execute_batch(&sql).unwrap();
-    conn
 }
 
 fn rows(conn: &Connection, sql: &str) -> Vec<String> {
@@ -127,13 +138,6 @@ fn entity(conn: &Connection, kind: &str, id: i64) -> (String, String, String, St
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )
     .unwrap()
-}
-
-#[test]
-fn source_version_is_the_current_schema() {
-    // A new automatic migration must retarget the cutover first.
-    assert_eq!(SCHEMA_VERSION, HUB_MODEL_SOURCE_VERSION);
-    assert_eq!(HUB_MODEL_SCHEMA_VERSION, HUB_MODEL_SOURCE_VERSION + 1);
 }
 
 #[test]
@@ -546,4 +550,168 @@ fn startup_on_schema_26_is_unchanged() {
     let before = dump(&conn);
     migrate(&mut conn).unwrap();
     assert_eq!(dump(&conn), before);
+}
+
+/// Every message/delivery index before the cutover and its equivalent after.
+const INDEX_EQUIVALENTS: &[(&str, &str)] = &[
+    (
+        "sqlite_autoindex_deliveries_1",
+        "sqlite_autoindex_deliveries_1",
+    ),
+    ("messages_group", "messages_group"),
+    ("messages_sender", "messages_sender"),
+    ("messages_created", "messages_created"),
+    ("deliveries_inbox", "deliveries_inbox"),
+    ("deliveries_recipient", "deliveries_recipient"),
+    ("deliveries_human_dm", "deliveries_direct"),
+];
+
+fn indexes(conn: &Connection) -> Vec<(String, String)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name, tbl_name FROM sqlite_schema
+             WHERE type = 'index' AND tbl_name IN ('messages', 'deliveries') ORDER BY name",
+        )
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn plan_uses(conn: &Connection, index: &str, sql: &str) {
+    let plan = rows(conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+    assert!(
+        plan.iter().any(|row| row.contains(index)),
+        "{index}: {plan:?}"
+    );
+}
+
+#[test]
+fn every_message_and_delivery_index_has_an_equivalent() {
+    let mut conn = fixture();
+    let before = indexes(&conn);
+    let mut old: Vec<_> = INDEX_EQUIVALENTS
+        .iter()
+        .map(|(o, _)| o.to_string())
+        .collect();
+    old.sort();
+    assert_eq!(
+        before.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        old,
+        "a schema-26 index has no listed equivalent"
+    );
+    migrate_to_hub_model(&mut conn, "will").unwrap();
+    let after = indexes(&conn);
+    for (old_name, new_name) in INDEX_EQUIVALENTS {
+        let table = &before.iter().find(|(n, _)| n == old_name).unwrap().1;
+        assert!(
+            after.iter().any(|(n, t)| n == new_name && t == table),
+            "{old_name} -> {new_name} on {table}: {after:?}"
+        );
+    }
+    // The queries those indexes serve, on the new columns.
+    let a = address(&conn, "human", 1);
+    plan_uses(
+        &conn,
+        "deliveries_inbox",
+        &format!(
+            "SELECT message_id FROM deliveries WHERE recipient_address_id = {a}
+             AND recipient_run_id = '' AND archived_at IS NULL ORDER BY message_id LIMIT 50"
+        ),
+    );
+    plan_uses(
+        &conn,
+        "deliveries_recipient",
+        &format!(
+            "SELECT message_id FROM deliveries WHERE recipient_address_id = {a}
+             AND recipient_run_id = '' AND message_id < 1000 ORDER BY message_id DESC LIMIT 50"
+        ),
+    );
+    plan_uses(
+        &conn,
+        "deliveries_direct",
+        &format!(
+            "SELECT message_id FROM deliveries WHERE recipient_address_id = {a}
+             AND direct = 1 ORDER BY message_id DESC LIMIT 50"
+        ),
+    );
+    plan_uses(
+        &conn,
+        "messages_sender",
+        &format!(
+            "SELECT id FROM messages WHERE sender_address_id = {a} AND id < 1000 ORDER BY id DESC LIMIT 50"
+        ),
+    );
+    plan_uses(
+        &conn,
+        "messages_recipient",
+        &format!(
+            "SELECT id FROM messages WHERE recipient_address_id = {a} AND id < 1000 ORDER BY id DESC LIMIT 50"
+        ),
+    );
+    plan_uses(
+        &conn,
+        "messages_group",
+        "SELECT id FROM messages WHERE to_group_id = 10 ORDER BY id DESC LIMIT 50",
+    );
+    plan_uses(
+        &conn,
+        "messages_created",
+        "SELECT id FROM messages WHERE created_at >= '2026' ORDER BY created_at, id LIMIT 50",
+    );
+}
+
+#[test]
+fn refuses_while_another_connection_uses_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bbs.db");
+    drop(file_fixture(&path));
+    let snapshot = || dump(&crate::db::open(&path).unwrap());
+    let before = snapshot();
+    let cases: [(&str, &str); 3] = [
+        ("idle reader", "SELECT count(*) FROM messages"),
+        (
+            "idle writer",
+            "UPDATE humans SET active_at = active_at WHERE id = 1",
+        ),
+        (
+            "open read transaction",
+            "BEGIN; SELECT count(*) FROM messages",
+        ),
+    ];
+    for (case, setup) in cases {
+        let other = crate::db::open(&path).unwrap();
+        other.execute_batch(setup).unwrap();
+        let mut conn = crate::db::open(&path).unwrap();
+        let started = std::time::Instant::now();
+        let err = migrate_to_hub_model(&mut conn, "will")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stop bbs-server"), "{case}: {err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{case}"
+        );
+        assert!(foreign_keys_on(&conn), "{case}");
+        // The other connection still works, and nothing changed.
+        other
+            .query_row("SELECT count(*) FROM humans", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        drop((conn, other));
+        assert_eq!(snapshot(), before, "{case}");
+    }
+
+    // Alone, it migrates; a server opening the database meanwhile cannot read
+    // until the migrating connection closes.
+    let mut conn = crate::db::open(&path).unwrap();
+    migrate_to_hub_model(&mut conn, "will").unwrap();
+    let late = Connection::open(&path).unwrap();
+    late.busy_timeout(std::time::Duration::ZERO).unwrap();
+    assert!(
+        late.query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
+            .is_err()
+    );
+    drop(conn);
+    assert_eq!(schema_version(&late).unwrap(), HUB_MODEL_SCHEMA_VERSION);
 }

@@ -13,16 +13,28 @@
 //!   later ones; different names that map to one ID (`a.b`, `a-b`) block.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-use super::schema_version;
+use super::{MIGRATIONS, is_busy, schema_version};
 
 /// The only schema the cutover starts from.
 pub const HUB_MODEL_SOURCE_VERSION: usize = 26;
 /// The schema the cutover produces.
-pub const HUB_MODEL_SCHEMA_VERSION: usize = 27;
+pub const HUB_MODEL_SCHEMA_VERSION: usize = HUB_MODEL_SOURCE_VERSION + 1;
+
+// A regular migration must not take the cutover's schema number: adding one
+// to MIGRATIONS breaks the build until the cutover is retargeted.
+const _: () = assert!(
+    MIGRATIONS.len() == HUB_MODEL_SOURCE_VERSION,
+    "retarget the Hub model migration to the new MIGRATIONS list"
+);
+const _: () = assert!(MIGRATIONS.len() < HUB_MODEL_SCHEMA_VERSION);
+
+/// How long the cutover waits for other connections before refusing.
+const LOCK_WAIT: Duration = Duration::from_millis(200);
 
 const HUB_MODEL_SQL: &str = include_str!("../../migrations/0027_hub_model.sql");
 const MAX_ENTITY_ID: usize = 128;
@@ -143,14 +155,51 @@ pub fn hub_model_preflight(conn: &Connection, namespace: &str) -> Result<Preflig
     }
 }
 
+/// Take an exclusive lock on the database and keep it until `conn` closes,
+/// refusing quickly if any other connection uses the database.
+///
+/// In WAL mode every connection that has read or written keeps the WAL index
+/// open, which prevents the exclusive lock even while that connection is idle.
+/// A connection opened afterwards cannot read until this one closes. In a
+/// rollback-journal database, idle connections hold no lock, so only active
+/// ones are detected; bbs-server always uses WAL.
+pub fn lock_exclusive(conn: &Connection) -> Result<()> {
+    if !conn.is_autocommit() {
+        bail!("locking the database requires a connection without an active transaction");
+    }
+    let previous: i64 = conn.pragma_query_value(None, "busy_timeout", |r| r.get(0))?;
+    conn.busy_timeout(LOCK_WAIT)?;
+    let _: String =
+        conn.pragma_update_and_check(None, "locking_mode", "EXCLUSIVE", |r| r.get(0))?;
+    // In EXCLUSIVE locking mode the lock taken here outlives the transaction.
+    let result = conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;");
+    conn.busy_timeout(Duration::from_millis(previous.max(0) as u64))?;
+    let Err(err) = result else { return Ok(()) };
+    if !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    let _: rusqlite::Result<String> =
+        conn.pragma_update_and_check(None, "locking_mode", "NORMAL", |r| r.get(0));
+    if is_busy(&err) {
+        bail!(
+            "another connection is using this database; stop bbs-server and every other \
+             bbs process using it first"
+        );
+    }
+    Err(err).context("locking the database")
+}
+
 /// Run the cutover from schema 26 to 27 in one transaction. Refuses, leaving
-/// the database unchanged at schema 26, on any preflight issue or failed check.
+/// the database unchanged at schema 26, unless it gets exclusive access (see
+/// [`lock_exclusive`]; the lock lasts until `conn` closes), and on any
+/// preflight issue or failed check.
 pub fn migrate_to_hub_model(conn: &mut Connection, namespace: &str) -> Result<HubMigrationReport> {
     validate_namespace(namespace)?;
-    require_source_version(conn)?;
     if !conn.is_autocommit() {
         bail!("the Hub model migration requires a connection without an active transaction");
     }
+    lock_exclusive(conn)?;
+    require_source_version(conn)?;
     // As in `migrate`: SQLite ignores this pragma inside a transaction.
     let foreign_keys: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
     conn.pragma_update(None, "foreign_keys", false)?;

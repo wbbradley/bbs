@@ -178,7 +178,10 @@ INSERT INTO hub_migration_assert SELECT (SELECT count(*) FROM deliveries_replace
 -- Do not rename OLD messages: SQLite could rewrite dependent foreign keys.
 -- auto_replies, blocker_events and agent_drain_targets keep referencing
 -- messages(id) by name, and the IDs are unchanged. Dropping the old tables
--- also drops their indexes (0001, 0008, 0013); the new ones follow.
+-- also drops their indexes (0001, 0008, 0013); each has an equivalent below:
+-- messages_sender, messages_group, messages_created, deliveries_inbox and
+-- deliveries_recipient keep their names on the new columns, and
+-- deliveries_direct replaces deliveries_human_dm.
 DROP TABLE deliveries;
 DROP TABLE messages;
 ALTER TABLE messages_replacement RENAME TO messages;
@@ -192,7 +195,13 @@ CREATE INDEX messages_group ON messages(to_group_id, id);
 CREATE INDEX messages_reply ON messages(in_reply_to_namespace, in_reply_to_message_id, id)
   WHERE in_reply_to_message_id IS NOT NULL;
 CREATE INDEX deliveries_inbox ON deliveries(recipient_address_id, recipient_run_id, archived_at, message_id);
-CREATE INDEX deliveries_history ON deliveries(recipient_address_id, recipient_run_id, message_id);
+-- Each recipient's delivered mail in message order (the feed's --mine);
+-- Hub's candidate calls this deliveries_history.
+CREATE INDEX deliveries_recipient ON deliveries(recipient_address_id, recipient_run_id, message_id);
+-- Replaces deliveries_human_dm, which only held direct deliveries to humans.
+-- The recipient's kind is now on its entity, not the delivery, so this covers
+-- direct deliveries to every recipient.
+CREATE INDEX deliveries_direct ON deliveries(recipient_address_id, message_id) WHERE direct = 1;
 
 CREATE TABLE integration_outbox (
   id INTEGER PRIMARY KEY,
