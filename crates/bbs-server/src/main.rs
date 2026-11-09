@@ -44,8 +44,9 @@ enum Command {
         #[arg(long)]
         namespace: String,
         /// A backup of this database at schema 26, such as `bbs backup`
-        /// writes, taken with the server stopped: its messages and deliveries
-        /// must match the database's. Required unless --dry-run.
+        /// writes, taken with the server stopped: its messages, deliveries,
+        /// blocker events and activity must match the database's. Required
+        /// unless --dry-run.
         #[arg(long, value_name = "PATH")]
         backup_taken: Option<PathBuf>,
         /// Only report the entity-ID mapping and blocking issues; write

@@ -11,7 +11,7 @@ use crate::db;
 
 /// Run the cutover, or with `dry_run` only its preflight, and return the
 /// report to print. A real run needs `backup_taken`: a schema-26 database
-/// other than `db_path` with the same messages and deliveries, and exclusive
+/// other than `db_path` that matches it (see `Stats`), and exclusive
 /// access to `db_path`. `dry_run` opens `db_path` read-only; run it on a
 /// backup copy, since a read-only open of a live WAL database can fail.
 pub fn run(
@@ -65,26 +65,31 @@ pub fn run(
     Ok(out)
 }
 
-/// What a backup must share with the database: its newest message and its
-/// message and delivery counts.
+/// What a backup must share with the database: its newest message, blocker
+/// event and activity row, and its message and delivery counts.
 #[derive(Debug, PartialEq, Eq)]
 struct Stats {
     max_message_id: Option<i64>,
     messages: i64,
     deliveries: i64,
+    max_blocker_event_id: Option<i64>,
+    max_activity_id: Option<i64>,
 }
 
 impl Stats {
     fn read(conn: &Connection) -> Result<Stats> {
         Ok(conn.query_row(
             "SELECT (SELECT max(id) FROM messages), (SELECT count(*) FROM messages),
-                    (SELECT count(*) FROM deliveries)",
+                    (SELECT count(*) FROM deliveries), (SELECT max(id) FROM blocker_events),
+                    (SELECT max(id) FROM activity)",
             [],
             |r| {
                 Ok(Stats {
                     max_message_id: r.get(0)?,
                     messages: r.get(1)?,
                     deliveries: r.get(2)?,
+                    max_blocker_event_id: r.get(3)?,
+                    max_activity_id: r.get(4)?,
                 })
             },
         )?)
@@ -93,13 +98,16 @@ impl Stats {
 
 impl std::fmt::Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let max = self
-            .max_message_id
-            .map_or("none".to_owned(), |id| id.to_string());
+        let id = |id: Option<i64>| id.map_or("none".to_owned(), |id| id.to_string());
         write!(
             f,
-            "newest message {max}, {} messages, {} deliveries",
-            self.messages, self.deliveries
+            "newest message {}, {} messages, {} deliveries, newest blocker event {}, \
+             newest activity {}",
+            id(self.max_message_id),
+            self.messages,
+            self.deliveries,
+            id(self.max_blocker_event_id),
+            id(self.max_activity_id),
         )
     }
 }
@@ -192,10 +200,52 @@ mod tests {
              INSERT INTO agent_owners VALUES (1, 1);
              INSERT INTO messages (id, from_kind, from_id, body, created_at)
                  VALUES (1, 'human', 1, 'hi', 't');
-             INSERT INTO deliveries VALUES (1, 'agent', 1, NULL, 1);",
+             INSERT INTO deliveries VALUES (1, 'agent', 1, NULL, 1);
+             INSERT INTO bbs_groups (id, name, created_at) VALUES (1, 'team', 't');
+             INSERT INTO blockers (id, group_id, creator_id, body, created_at, request_key)
+                 VALUES (1, 1, 1, 'question', 't', 'q1');
+             INSERT INTO blocker_events (id, blocker_id, kind, actor_kind, actor_id, created_at)
+                 VALUES (1, 1, 'created', 'agent', 1, 't');
+             INSERT INTO activity VALUES (1, 1, 't', 'mail', '{}');",
         )
         .unwrap();
         path
+    }
+
+    /// A backup missing a row written after it is refused, leaving v26.
+    fn assert_stale_backup_refused(later: &str, expected: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = board(dir.path(), "bbs.db");
+        let backup = dir.path().join("backup.db");
+        db::backup(&path, &backup).unwrap();
+        db::open(&path).unwrap().execute_batch(later).unwrap();
+        let before = snapshot(&path);
+        let err = run(&path, "will", Some(&backup), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "{err}");
+        assert_eq!(snapshot(&path), before);
+        assert_eq!(version(&path), 26);
+    }
+
+    #[test]
+    fn refuses_a_backup_missing_a_newer_blocker_event() {
+        assert_stale_backup_refused(
+            "INSERT INTO blockers (id, group_id, creator_id, body, created_at, request_key)
+                 VALUES (2, 1, 1, 'another', 't', 'q2');
+             INSERT INTO blocker_events (id, blocker_id, kind, actor_kind, actor_id, created_at)
+                 VALUES (2, 2, 'created', 'agent', 1, 't');",
+            "newest blocker event 1, newest activity 1; database: newest message 1, \
+             1 messages, 1 deliveries, newest blocker event 2",
+        );
+    }
+
+    #[test]
+    fn refuses_a_backup_missing_a_newer_activity_row() {
+        assert_stale_backup_refused(
+            "INSERT INTO activity VALUES (2, 1, 't', 'mail', '{}');",
+            "newest blocker event 1, newest activity 2)",
+        );
     }
 
     fn snapshot(path: &Path) -> Vec<String> {
@@ -273,7 +323,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("does not match this database (backup: newest message 1, 1 messages, 1 deliveries; database: newest message 2, 2 messages, 2 deliveries)"),
+            err.contains("does not match this database (backup: newest message 1, 1 messages, 1 deliveries, newest blocker event 1, newest activity 1; database: newest message 2, 2 messages, 2 deliveries,"),
             "{err}"
         );
         assert_eq!(snapshot(&path), before);
