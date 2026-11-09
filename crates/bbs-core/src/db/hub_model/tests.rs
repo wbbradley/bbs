@@ -388,6 +388,37 @@ fn migration_preserves_history_and_maps_names() {
     );
 }
 
+/// Every table, index and trigger, with its SQL.
+fn schema(conn: &Connection) -> Vec<String> {
+    rows(
+        conn,
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema
+         WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+    )
+}
+
+#[test]
+fn cutover_and_new_database_have_the_same_schema() {
+    let mut cut = fixture();
+    migrate_to_hub_model(&mut cut, "will").unwrap();
+    let mut new = Connection::open_in_memory().unwrap();
+    crate::db::migrate_in(&mut new, Some("will")).unwrap();
+    assert_eq!(schema_version(&cut).unwrap(), crate::db::SCHEMA_VERSION);
+    assert_eq!(schema_version(&new).unwrap(), crate::db::SCHEMA_VERSION);
+    assert_eq!(schema(&cut), schema(&new));
+    // Including the integration stream's tables and columns.
+    for conn in [&cut, &new] {
+        for sql in [
+            "SELECT integration_id, token_hash FROM integration_tokens",
+            "SELECT publication_revision, publication_digest FROM bbs_integrations",
+            "SELECT group_copy_namespace, group_copy_message_id,
+                    group_copy_sender_address_id, group_copy_sender_run_id FROM messages",
+        ] {
+            conn.prepare(sql).unwrap();
+        }
+    }
+}
+
 #[test]
 fn preflight_writes_nothing_and_matches_migration() {
     let conn = fixture();

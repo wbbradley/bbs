@@ -87,7 +87,18 @@ CREATE TABLE bbs_integrations (
   id TEXT PRIMARY KEY NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
   -- D090: one publication switch, not a per-entity/address allowlist.
-  publish_entities INTEGER NOT NULL DEFAULT 0 CHECK(publish_entities IN (0, 1))
+  publish_entities INTEGER NOT NULL DEFAULT 0 CHECK(publish_entities IN (0, 1)),
+  -- The last publication snapshot sent: its revision, which only grows, and a
+  -- digest of its entities, so a changed catalog gets a new revision and a
+  -- repeat keeps the old one.
+  publication_revision INTEGER NOT NULL DEFAULT 0,
+  publication_digest TEXT
+);
+-- One credential per integration, stored hashed like human tokens. Revoking
+-- deletes the row; the integration and its history stay.
+CREATE TABLE integration_tokens (
+  integration_id TEXT PRIMARY KEY NOT NULL REFERENCES bbs_integrations(id),
+  token_hash TEXT NOT NULL UNIQUE
 );
 CREATE TABLE address_delivery_bindings (
   address_id INTEGER PRIMARY KEY REFERENCES entity_addresses(id),
@@ -154,6 +165,12 @@ CREATE TABLE messages_replacement (
   control TEXT,
   timer_id INTEGER,
   auto_reply INTEGER,
+  -- An imported group copy (D127): the message sent to the group and who sent
+  -- it, at the exact address replies go to. The copy's own sender is the group.
+  group_copy_namespace TEXT,
+  group_copy_message_id TEXT,
+  group_copy_sender_address_id INTEGER REFERENCES entity_addresses(id),
+  group_copy_sender_run_id TEXT,
   UNIQUE(origin_namespace, origin_message_id),
   CHECK((in_reply_to_namespace IS NULL) = (in_reply_to_message_id IS NULL))
 );

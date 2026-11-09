@@ -24,6 +24,7 @@ const ACTIVE_AT_DEBOUNCE: chrono::Duration = chrono::Duration::seconds(60);
 mod blockers;
 pub use blockers::{answer_blocker, cancel_blocker, get_blocker, list_blockers, put_blocker};
 mod drain;
+pub mod integration;
 pub use drain::{
     NOTICE as DRAIN_NOTICE, agent_drain, agent_drain_with_changes, check_agent_drains,
     report_drain, report_drain_with_changes,
@@ -1825,6 +1826,15 @@ pub fn send(
         validate_body(body)?;
         if let Some(control) = req.control {
             return send_control(ctx, &me, to, body, control);
+        }
+        if let Some(reference) = to.strip_prefix("id:") {
+            let (id, to) = integration::send_remote(ctx, &me, reference, body)?;
+            return Ok(proto::SendResponse {
+                to,
+                recipients: None,
+                id: Some(id),
+                skipped: Vec::new(),
+            });
         }
 
         if let Some(group) = to.strip_prefix('@') {
