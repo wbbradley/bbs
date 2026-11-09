@@ -135,16 +135,18 @@ fn snapshot(ctx: &Ctx<'_>, human: i64) -> Result<proto::AgentDrainResponse> {
     // current side driver (ACP may not have one). Current-generation work and
     // older failed/cancelled/interrupted work still require explicit quiescence;
     // neither an ended flag nor an absent driver proves it has stopped.
-    let agents = ctx.conn.prepare(&format!("SELECT t.agent_id, a.name, t.completed,
-        (SELECT count(*) FROM deliveries d WHERE d.recipient_address_id = {} AND d.recipient_run_id = '' AND d.message_id <= ?2 AND d.archived_at IS NULL),
-        EXISTS(SELECT 1 FROM side_requests s WHERE s.agent_id = t.agent_id
-          AND (s.status = 'open' OR (s.id > t.side_completed_through
-            AND NOT (s.status = 'completed' AND EXISTS (
-              SELECT 1 FROM side_state state WHERE state.agent_id = s.agent_id
-                AND s.generation IS NOT NULL AND state.generation != s.generation)))))
-        FROM agent_drain_targets t JOIN agents a ON a.id = t.agent_id WHERE t.human_id = ?1 ORDER BY lower(a.name)",
-        db::address_sql(EntityKind::Agent, "t.agent_id")))?
-        .query_map(params![human, watermark], |r| Ok(proto::AgentDrainTarget { agent_id: r.get(0)?, name: r.get(1)?, completed: r.get(2)?, unread: r.get(3)?, side_pending: r.get(4)? }))?
+    let agents = ctx
+        .conn
+        .prepare(&targets_sql())?
+        .query_map(params![human, watermark], |r| {
+            Ok(proto::AgentDrainTarget {
+                agent_id: r.get(0)?,
+                name: r.get(1)?,
+                completed: r.get(2)?,
+                unread: r.get(3)?,
+                side_pending: r.get(4)?,
+            })
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(proto::AgentDrainResponse {
         frozen: true,
@@ -215,10 +217,44 @@ fn reconcile(ctx: &Ctx<'_>) -> Result<usize> {
     Ok(changed)
 }
 
+/// Each target agent of human ?1's drain: its id, name, completion, unread
+/// mail up to the watermark ?2, and whether side work is pending.
+fn targets_sql() -> String {
+    format!("SELECT t.agent_id, a.name, t.completed,
+        (SELECT count(*) FROM deliveries d WHERE d.recipient_address_id = {} AND d.recipient_run_id = '' AND d.message_id <= ?2 AND d.archived_at IS NULL),
+        EXISTS(SELECT 1 FROM side_requests s WHERE s.agent_id = t.agent_id
+          AND (s.status = 'open' OR (s.id > t.side_completed_through
+            AND NOT (s.status = 'completed' AND EXISTS (
+              SELECT 1 FROM side_state state WHERE state.agent_id = s.agent_id
+                AND s.generation IS NOT NULL AND state.generation != s.generation)))))
+        FROM agent_drain_targets t JOIN agents a ON a.id = t.agent_id WHERE t.human_id = ?1 ORDER BY lower(a.name)",
+        db::address_sql(EntityKind::Agent, "t.agent_id"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::service;
+
+    #[test]
+    fn target_unread_walks_the_inbox_index() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::migrate(&mut conn).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", targets_sql()))
+            .unwrap()
+            .query_map(params![1, 1], |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|l| l.contains(
+                "deliveries_inbox (recipient_address_id=? AND recipient_run_id=? AND archived_at=? AND message_id<?)"
+            )),
+            "{plan:#?}"
+        );
+        assert!(!plan.iter().any(|l| l.starts_with("SCAN d")), "{plan:#?}");
+    }
 
     struct Board {
         conn: Connection,

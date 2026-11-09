@@ -1712,7 +1712,15 @@ pub fn mark_read_from(
     now: &str,
 ) -> Result<usize> {
     Ok(conn.execute(
-        &format!(
+        &mark_read_from_sql(me.kind, from.kind),
+        params![now, me.kind.as_str(), me.id, from.id],
+    )?)
+}
+
+/// [`mark_read_from`]'s update: ?1 the time, ?2 and ?3 the reader's kind and
+/// id, ?4 the sender's id.
+fn mark_read_from_sql(me: Kind, from: Kind) -> String {
+    format!(
             "UPDATE deliveries SET archived_at = ?1
              WHERE recipient_address_id = {} AND recipient_run_id = '' AND archived_at IS NULL
                AND message_id IN (SELECT id FROM messages WHERE sender_address_id = {})
@@ -1722,11 +1730,9 @@ pub fn mark_read_from(
                  OR message_id <= coalesce((
                  SELECT r.watermark FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
                  WHERE o.agent_id = ?3), 9223372036854775807))",
-            address_sql(me.kind.into(), "?3"),
-            address_sql(from.kind.into(), "?4"),
-        ),
-        params![now, me.kind.as_str(), me.id, from.id],
-    )?)
+            address_sql(me.into(), "?3"),
+            address_sql(from.into(), "?4"),
+        )
 }
 
 /// What a human has yet to look at from one agent, and when it last sent.
@@ -1872,7 +1878,14 @@ static FOCUS_ALLOWS: LazyLock<String> = LazyLock::new(|| {
 });
 
 pub fn has_unread(conn: &Connection, me: &Principal) -> Result<bool> {
-    let sql = format!(
+    let sql = has_unread_sql(me.kind);
+    let n: i64 = conn.query_row(&sql, params![me.kind.as_str(), me.id], |r| r.get(0))?;
+    Ok(n != 0)
+}
+
+/// [`has_unread`]'s query: ?1 and ?2 the reader's kind and id.
+fn has_unread_sql(kind: Kind) -> String {
+    format!(
         "SELECT EXISTS (SELECT 1 FROM deliveries
          WHERE recipient_address_id = {} AND recipient_run_id = '' AND archived_at IS NULL
          AND EXISTS (SELECT 1 FROM messages m WHERE m.id = deliveries.message_id
@@ -1883,11 +1896,9 @@ pub fn has_unread(conn: &Connection, me: &Principal) -> Result<bool> {
            OR message_id <= coalesce((
            SELECT r.watermark FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
            WHERE o.agent_id = ?2), 9223372036854775807)))",
-        address_sql(me.kind.into(), "?2"),
+        address_sql(kind.into(), "?2"),
         *FOCUS_ALLOWS,
-    );
-    let n: i64 = conn.query_row(&sql, params![me.kind.as_str(), me.id], |r| r.get(0))?;
-    Ok(n != 0)
+    )
 }
 
 /// Fetch unread messages oldest-first and mark them archived.
@@ -1897,21 +1908,7 @@ pub fn take_unread(
     limit: Option<u32>,
     now: &str,
 ) -> Result<Vec<MessageView>> {
-    // A drain's final notice must follow older mail even if the wall clock
-    // moved backwards. Later owner Cancel commands bypass the watermark;
-    // the service validates their ownership before insertion. Preserve
-    // timestamp ordering outside a restart barrier.
-    let sql = format!(
-        "{} AND d.archived_at IS NULL AND {}
-         AND (?1 != 'agent' OR m.control = 'cancel' OR m.id <= coalesce((
-           SELECT r.watermark FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
-           WHERE o.agent_id = ?2), 9223372036854775807))
-         ORDER BY CASE WHEN ?1 = 'agent' AND EXISTS (
-           SELECT 1 FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
-           WHERE o.agent_id = ?2) THEN m.id END, m.created_at, m.id LIMIT ?3",
-        inbox_select(me.kind),
-        *FOCUS_ALLOWS,
-    );
+    let sql = take_unread_sql(me.kind);
     let limit = limit.map_or(i64::MAX, i64::from);
     let msgs: Vec<MessageView> = conn
         .prepare(&sql)?
@@ -1926,6 +1923,25 @@ pub fn take_unread(
         archive.execute(params![now, m.id, me.id])?;
     }
     Ok(msgs)
+}
+
+/// [`take_unread`]'s query: ?1 and ?2 the reader's kind and id, ?3 the limit.
+fn take_unread_sql(kind: Kind) -> String {
+    // A drain's final notice must follow older mail even if the wall clock
+    // moved backwards. Later owner Cancel commands bypass the watermark;
+    // the service validates their ownership before insertion. Preserve
+    // timestamp ordering outside a restart barrier.
+    format!(
+        "{} AND d.archived_at IS NULL AND {}
+         AND (?1 != 'agent' OR m.control = 'cancel' OR m.id <= coalesce((
+           SELECT r.watermark FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
+           WHERE o.agent_id = ?2), 9223372036854775807))
+         ORDER BY CASE WHEN ?1 = 'agent' AND EXISTS (
+           SELECT 1 FROM agent_drains r JOIN agent_owners o ON o.human_id = r.human_id
+           WHERE o.agent_id = ?2) THEN m.id END, m.created_at, m.id LIMIT ?3",
+        inbox_select(kind),
+        *FOCUS_ALLOWS,
+    )
 }
 
 pub fn archived_since(
@@ -4000,6 +4016,54 @@ mod tests {
                     && err.contains("migrate it again with this release"),
                 "{err}"
             );
+        }
+    }
+
+    /// The query plan of `sql`, every parameter bound to 1.
+    fn plan_of(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let n = stmt.parameter_count();
+        stmt.query_map(
+            rusqlite::params_from_iter(vec![rusqlite::types::Value::Integer(1); n]),
+            |r| r.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn inbox_queries_walk_the_recipients_inbox_index() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let inbox =
+            "deliveries_inbox (recipient_address_id=? AND recipient_run_id=? AND archived_at=?";
+        let mut cases = Vec::new();
+        for kind in [Kind::Agent, Kind::Human] {
+            cases.push(("take_unread", take_unread_sql(kind)));
+            cases.push(("has_unread", has_unread_sql(kind)));
+            for from in [Kind::Agent, Kind::Human] {
+                cases.push(("mark_read_from", mark_read_from_sql(kind, from)));
+            }
+        }
+        cases.push(("agent_summaries", AGENT_SUMMARIES.to_string()));
+        for (name, sql) in cases {
+            let plan = plan_of(&conn, &sql);
+            assert!(plan.iter().any(|l| l.contains(inbox)), "{name}: {plan:#?}");
+            assert!(
+                !plan.iter().any(|l| l.starts_with("SCAN d")
+                    || l.starts_with("SCAN deliveries")
+                    || l.starts_with("SCAN m")
+                    || l.starts_with("SCAN messages")),
+                "{name}: {plan:#?}"
+            );
+            if name == "mark_read_from" {
+                assert!(
+                    plan.iter()
+                        .any(|l| l.contains("messages_sender (sender_address_id=?)")),
+                    "{name}: {plan:#?}"
+                );
+            }
         }
     }
 }
