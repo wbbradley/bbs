@@ -1,6 +1,8 @@
 //! Ported from Hub's scripts/validate_design.py BBS checks, against the real
 //! 26-migration chain.
 
+use std::collections::BTreeMap;
+
 use rusqlite::types::Value;
 
 use super::*;
@@ -269,13 +271,27 @@ fn migration_preserves_history_and_maps_names() {
         ("human", 2, "ann-lee", "human", "ann.lee", "active"),
         ("group", 10, "team", "group", "team", "active"),
         ("group", 11, "old", "group", "old", "retired"),
-        ("agent", 1, "will/scout", "agent", "scout", "retired"),
-        ("agent", 2, "will/scout-2", "agent", "scout", "active"),
+        (
+            "agent",
+            1,
+            "will/scout-retired-2026-10-08",
+            "agent",
+            "scout",
+            "retired",
+        ),
+        ("agent", 2, "will/scout", "agent", "scout", "active"),
         ("agent", 3, "ann-lee/a-b", "agent", "a.b", "active"),
         ("agent", 4, "lonely", "agent", "lonely", "active"),
-        ("agent", 5, "will/probe", "agent", "probe", "retired"),
+        (
+            "agent",
+            5,
+            "will/probe-retired-2026-10-08",
+            "agent",
+            "probe",
+            "retired",
+        ),
         ("agent", 6, "will/probe-2", "agent", "probe-2", "active"),
-        ("agent", 7, "will/Probe-3", "agent", "Probe", "active"),
+        ("agent", 7, "will/Probe", "agent", "Probe", "active"),
     ];
     for (column, id, entity_id, kind, display, lifecycle) in expected {
         assert_eq!(
@@ -320,9 +336,9 @@ fn migration_preserves_history_and_maps_names() {
         renamed,
         [
             (HubKind::Human, 2, "ann-lee"),
-            (HubKind::Agent, 2, "will/scout-2"),
+            (HubKind::Agent, 1, "will/scout-retired-2026-10-08"),
             (HubKind::Agent, 3, "ann-lee/a-b"),
-            (HubKind::Agent, 7, "will/Probe-3"),
+            (HubKind::Agent, 5, "will/probe-retired-2026-10-08"),
         ]
     );
 
@@ -714,4 +730,210 @@ fn refuses_while_another_connection_uses_the_database() {
     );
     drop(conn);
     assert_eq!(schema_version(&late).unwrap(), HUB_MODEL_SCHEMA_VERSION);
+}
+
+/// Preflight one owner's agents, `(id, name, retired_at)`, under human `will`:
+/// each agent's entity ID, and the blocking issues.
+fn scope(agents: &[(i64, &str, Option<&str>)]) -> (BTreeMap<i64, String>, Vec<String>) {
+    let mut conn = Connection::open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    conn.execute("INSERT INTO humans VALUES (1, 'will', 't', 't')", [])
+        .unwrap();
+    for &(id, name, retired_at) in agents {
+        conn.execute(
+            "INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at, retired_at)
+             VALUES (?1, ?2, 'k' || ?1, '/', 'h', 't', 't', ?3)",
+            params![id, name, retired_at],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO agent_owners VALUES (?1, 1)", [id])
+            .unwrap();
+    }
+    let report = hub_model_preflight(&conn, "will").unwrap();
+    let ids = report
+        .mappings
+        .iter()
+        .filter(|m| m.kind == HubKind::Agent)
+        .map(|m| (m.native_id, m.entity_id.clone()))
+        .collect();
+    (ids, report.issues)
+}
+
+fn ids(expected: &[(i64, &str)]) -> BTreeMap<i64, String> {
+    expected.iter().map(|&(id, e)| (id, e.to_owned())).collect()
+}
+
+#[test]
+fn single_use_names_keep_plain_ids() {
+    let (got, issues) = scope(&[
+        (1, "solo", None),
+        (2, "gone", Some("2026-10-15T10:11:12.000000Z")),
+        // Never needs a date, so it need not parse.
+        (3, "odd", Some("not a time")),
+    ]);
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(
+        got,
+        ids(&[(1, "will/solo"), (2, "will/gone"), (3, "will/odd")])
+    );
+}
+
+#[test]
+fn reused_name_live_agent_keeps_plain_id() {
+    let (got, issues) = scope(&[
+        (1, "k3", Some("2026-10-15T10:11:12.123456Z")),
+        (2, "K3", Some("2026-10-16T08:00:00.000000Z")),
+        (3, "k3", None),
+    ]);
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(
+        got,
+        ids(&[
+            (1, "will/k3-retired-2026-10-15"),
+            (2, "will/K3-retired-2026-10-16"),
+            (3, "will/k3"),
+        ])
+    );
+}
+
+#[test]
+fn reused_name_all_retired_newest_keeps_plain_id() {
+    // Newest by retired_at, not by id.
+    let (got, issues) = scope(&[
+        (1, "k3", Some("2026-10-17T09:00:00.000000Z")),
+        (2, "k3", Some("2026-10-15T09:00:00.000000Z")),
+    ]);
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(
+        got,
+        ids(&[(1, "will/k3"), (2, "will/k3-retired-2026-10-15")])
+    );
+    // A tie goes to the highest id. Offsets are read as UTC.
+    let (got, issues) = scope(&[
+        (1, "k3", Some("2026-10-16T09:00:00.000000Z")),
+        (2, "k3", Some("2026-10-15T23:30:00.000000Z")),
+        (3, "k3", Some("2026-10-16T11:00:00.000000+02:00")),
+    ]);
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(
+        got,
+        ids(&[
+            (1, "will/k3-retired-2026-10-16"),
+            (2, "will/k3-retired-2026-10-15"),
+            (3, "will/k3"),
+        ])
+    );
+}
+
+#[test]
+fn dated_id_collisions_fall_back_to_minute_second_then_counter() {
+    // Like the sid series: many retired in quick succession.
+    let (got, issues) = scope(&[
+        (1, "sid", Some("2026-10-15T10:00:00.000000Z")),
+        (2, "sid", Some("2026-10-15T11:30:00.000000Z")),
+        (3, "sid", Some("2026-10-15T12:00:01.500000Z")),
+        (4, "sid", Some("2026-10-15T12:00:59.000000Z")),
+        (5, "sid", Some("2026-10-15T12:30:05.900000Z")),
+        (6, "sid", Some("2026-10-15T12:30:05.100000Z")),
+        (7, "sid", Some("2026-10-15T12:30:05.500000Z")),
+        (8, "sid", Some("2026-10-16T09:00:00.000000Z")),
+        (9, "sid", None),
+    ]);
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(
+        got,
+        ids(&[
+            // Same day: minutes.
+            (1, "will/sid-retired-2026-10-15-1000"),
+            (2, "will/sid-retired-2026-10-15-1130"),
+            // Same minute: seconds.
+            (3, "will/sid-retired-2026-10-15-120001"),
+            (4, "will/sid-retired-2026-10-15-120059"),
+            // Same second: counters in id order, not time order.
+            (5, "will/sid-retired-2026-10-15-123005-2"),
+            (6, "will/sid-retired-2026-10-15-123005-3"),
+            (7, "will/sid-retired-2026-10-15-123005-4"),
+            (8, "will/sid-retired-2026-10-16"),
+            (9, "will/sid"),
+        ])
+    );
+}
+
+#[test]
+fn literal_names_equal_to_dated_ids_push_the_fallback() {
+    // Resolved, not blocked: the retired agent moves to the next level.
+    let (got, issues) = scope(&[
+        (1, "k3", Some("2026-10-15T10:11:12.000000Z")),
+        (2, "k3", None),
+        (3, "K3-Retired-2026-10-15", None),
+    ]);
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(
+        got,
+        ids(&[
+            (1, "will/k3-retired-2026-10-15-1011"),
+            (2, "will/k3"),
+            (3, "will/K3-Retired-2026-10-15"),
+        ])
+    );
+    // Every dated form taken: the counter resolves it, skipping taken ones.
+    let (got, issues) = scope(&[
+        (1, "k3", Some("2026-10-15T10:11:12.000000Z")),
+        (2, "k3", None),
+        (3, "k3-retired-2026-10-15", None),
+        (4, "k3-retired-2026-10-15-1011", None),
+        (5, "k3-retired-2026-10-15-101112", None),
+        (6, "k3-retired-2026-10-15-101112-2", None),
+    ]);
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(got[&1], "will/k3-retired-2026-10-15-101112-3");
+}
+
+#[test]
+fn dated_id_longer_than_128_blocks() {
+    // `will/` + name + `-retired-YYYY-MM-DD` (19 characters).
+    let fits = "n".repeat(128 - 5 - 19);
+    let (got, issues) = scope(&[
+        (1, &fits, Some("2026-10-15T10:11:12.000000Z")),
+        (2, &fits, None),
+    ]);
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(got[&1].len(), 128);
+    let long = "n".repeat(128 - 5 - 19 + 1);
+    let (_, issues) = scope(&[
+        (1, &long, Some("2026-10-15T10:11:12.000000Z")),
+        (2, &long, None),
+    ]);
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert!(
+        issues[0].starts_with(&format!(
+            "agent 1 `{long}` maps to `will/{long}-retired-2026-10-15`, longer than 128"
+        )),
+        "{issues:?}"
+    );
+}
+
+#[test]
+fn unparseable_retired_at_blocks_a_dated_id() {
+    let (_, issues) = scope(&[(1, "k3", Some("yesterday")), (2, "k3", None)]);
+    assert_eq!(
+        issues,
+        [
+            "reused name `will/k3` needs dated IDs, but these retired_at values are not \
+             RFC3339 times: agent 1 `k3` retired_at \"yesterday\""
+        ]
+    );
+    // All retired: choosing the newest needs every time.
+    let (_, issues) = scope(&[
+        (1, "k3", Some("2026-10-15T10:11:12.000000Z")),
+        (2, "k3", Some("2026-13-01T00:00:00Z")),
+    ]);
+    assert!(issues[0].contains("agent 2 `k3` retired_at"), "{issues:?}");
+    // And the migration refuses.
+    assert_blocked(
+        "INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at, retired_at)
+             VALUES (8, 'scout', 'k8', '/', 'h', 't', 't', 'garbage');
+         INSERT INTO agent_owners VALUES (8, 1)",
+        "agent 8 `scout` retired_at \"garbage\"",
+    );
 }

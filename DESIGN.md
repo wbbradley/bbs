@@ -328,12 +328,15 @@ backup.
 The Hub model cutover
 ([0027_hub_model.sql](crates/bbs-core/migrations/0027_hub_model.sql)) is not
 an automatic migration. Only `bbs-server migrate-hub-model` runs it, from
-schema 26 with a backup named by `--backup-taken` whose messages and
-deliveries match the database. It takes an exclusive lock first and refuses
-while any other connection uses the database, so stop the server. It computes
-every human, agent and group's entity ID from its name, refuses on any
-collision or malformed history, and checks row counts and foreign keys before
-commit. `--dry-run` lists the mapping and issues without writing; run it on a
+schema 26 with a backup named by `--backup-taken` whose messages,
+deliveries, blocker events and activity match the database. It takes an
+exclusive lock first and refuses while any other connection uses the database,
+so stop the server. It computes every human, agent and group's entity ID from
+its name: an owned agent is `owner/name`, and when an owner reused a name, the
+live (else the most recently retired) agent keeps it and the others get
+`owner/name-retired-YYYY-MM-DD`, with time and counter fallbacks when those
+clash. It refuses on any other collision or malformed history, and checks row
+counts and foreign keys before commit. `--dry-run` lists the mapping and issues without writing; run it on a
 backup copy, because its read-only open of a live WAL database can fail
 without write access to the `-shm` file. The rebuilt `messages` and
 `deliveries` tables keep an equivalent of every earlier index;

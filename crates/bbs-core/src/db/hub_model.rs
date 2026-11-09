@@ -8,14 +8,17 @@
 //! - `.` becomes `-`; any other character outside `[A-Za-z0-9_-]` blocks.
 //! - Humans, groups and ownerless agents get a top-level ID. They share one
 //!   space, compared case-insensitively; any clash blocks.
-//! - An owned agent gets `owner/name`. Within one owner, a name reused over
-//!   time keeps its base ID for the oldest agent and gets `-2`, `-3`, ... for
-//!   later ones; different names that map to one ID (`a.b`, `a-b`) block.
+//! - An owned agent gets `owner/name`. Within one owner, different names that
+//!   map to one ID (`a.b`, `a-b`) block. A reused name keeps the plain ID for
+//!   the live agent (else the most recently retired one), and every other
+//!   agent gets `owner/name-retired-YYYY-MM-DD` (BBS blocker 1407; see
+//!   `map_owner_scope` and `assign_dated`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, TransactionBehavior, params};
 
 use super::{MIGRATIONS, is_busy, schema_version};
@@ -72,7 +75,7 @@ pub struct EntityMapping {
 
 impl EntityMapping {
     /// Whether the ID's name part differs from the BBS name: a `.` became `-`
-    /// or a reused name got a numeric suffix.
+    /// or a retired agent got a dated ID.
     pub fn renamed(&self) -> bool {
         self.entity_id.rsplit('/').next() != Some(self.name.as_str())
     }
@@ -116,7 +119,7 @@ pub struct HubMigrationReport {
     pub groups: usize,
     pub messages: i64,
     pub deliveries: i64,
-    /// Mappings that needed `.` to `-` or a numeric suffix.
+    /// Mappings that needed `.` to `-` or a dated ID.
     pub renamed: Vec<EntityMapping>,
 }
 
@@ -322,18 +325,22 @@ fn map_entities(conn: &Connection, issues: &mut Vec<String>) -> Result<Vec<Entit
         let (id, name, archived) = row?;
         top_level.push((HubKind::Group, id, name, archived));
     }
-    let mut owned: BTreeMap<i64, Vec<(i64, String, bool)>> = BTreeMap::new();
+    let mut owned: BTreeMap<i64, Vec<Agent>> = BTreeMap::new();
     let mut stmt = conn.prepare(
-        "SELECT a.id, a.name, a.retired_at IS NOT NULL, o.human_id
+        "SELECT a.id, a.name, a.retired_at, o.human_id
          FROM agents a LEFT JOIN agent_owners o ON o.agent_id = a.id ORDER BY a.id",
     )?;
     for row in stmt.query_map([], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<i64>>(3)?))
     })? {
-        let (id, name, retired, owner) = row?;
+        let (id, name, retired_at, owner): (i64, String, Option<String>, _) = row?;
         match owner {
-            Some(owner) => owned.entry(owner).or_default().push((id, name, retired)),
-            None => top_level.push((HubKind::Agent, id, name, retired)),
+            Some(owner) => owned.entry(owner).or_default().push(Agent {
+                id,
+                name,
+                retired_at,
+            }),
+            None => top_level.push((HubKind::Agent, id, name, retired_at.is_some())),
         }
     }
 
@@ -364,62 +371,248 @@ fn map_entities(conn: &Connection, issues: &mut Vec<String>) -> Result<Vec<Entit
         }
     }
 
-    // Owned agents: per owner scope, in creation (id) order.
+    // Owned agents: per owner scope (see `map_owner_scope`).
     for (owner, agents) in owned {
         let Some(owner_name) = owner_names.get(&owner) else {
             // Also a foreign-key issue; no scope to place these agents in.
             issues.push(format!("agents owned by missing human {owner}"));
             continue;
         };
-        let mut by_key: BTreeMap<String, Vec<(i64, String, bool)>> = BTreeMap::new();
-        for agent in agents {
-            by_key
-                .entry(map_name(&agent.1).to_lowercase())
-                .or_default()
-                .push(agent);
-        }
-        let base_keys: HashSet<String> = by_key.keys().cloned().collect();
-        let mut assigned = HashSet::new();
-        for (key, agents) in by_key {
-            let originals: BTreeSet<String> = agents.iter().map(|a| a.1.to_lowercase()).collect();
-            if originals.len() > 1 {
-                let records: Vec<_> = agents
-                    .iter()
-                    .map(|(id, name, _)| describe(HubKind::Agent, *id, name))
-                    .collect();
-                issues.push(format!(
-                    "different agent names map to `{owner_name}/{key}`: {}",
-                    records.join(", ")
-                ));
-            }
-            for (i, (id, name, retired)) in agents.into_iter().enumerate() {
-                let base = map_name(&name);
-                let mut segment = base.clone();
-                if i > 0 {
-                    // A reused name: the next suffix no other agent here holds.
-                    segment = (2..)
-                        .map(|n| format!("{base}-{n}"))
-                        .find(|s| {
-                            let k = s.to_lowercase();
-                            !base_keys.contains(&k) && !assigned.contains(&k)
-                        })
-                        .expect("an unbounded range finds a free suffix");
-                }
-                assigned.insert(segment.to_lowercase());
-                let m = EntityMapping {
-                    kind: HubKind::Agent,
-                    native_id: id,
-                    name,
-                    entity_id: format!("{owner_name}/{segment}"),
-                    retired,
-                };
-                check_id(&m, &segment, issues);
-                mappings.push(m);
-            }
+        for (agent, segment) in map_owner_scope(owner_name, agents, issues) {
+            let m = EntityMapping {
+                kind: HubKind::Agent,
+                native_id: agent.id,
+                entity_id: format!("{owner_name}/{segment}"),
+                retired: agent.retired_at.is_some(),
+                name: agent.name,
+            };
+            check_id(&m, &segment, issues);
+            mappings.push(m);
         }
     }
     mappings.sort_by_key(|m| (m.kind, m.native_id));
     Ok(mappings)
+}
+
+/// An owned agent as the mapping reads it.
+struct Agent {
+    id: i64,
+    name: String,
+    retired_at: Option<String>,
+}
+
+/// A retired agent that needs a dated ID, and the fallback level it reached.
+struct Dated {
+    index: usize,
+    base: String,
+    retired_at: DateTime<Utc>,
+    level: DateLevel,
+}
+
+/// Dated-ID fallbacks, in the order they are tried (BBS blocker 1407).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DateLevel {
+    /// `name-retired-YYYY-MM-DD`
+    Day,
+    /// `name-retired-YYYY-MM-DD-HHMM`
+    Minute,
+    /// `name-retired-YYYY-MM-DD-HHMMSS`
+    Second,
+    /// `name-retired-YYYY-MM-DD-HHMMSS-N`, N from 2, in agents.id order.
+    Counter,
+}
+
+impl DateLevel {
+    fn next(self) -> DateLevel {
+        match self {
+            DateLevel::Day => DateLevel::Minute,
+            DateLevel::Minute => DateLevel::Second,
+            DateLevel::Second | DateLevel::Counter => DateLevel::Counter,
+        }
+    }
+}
+
+impl Dated {
+    /// The ID at this level; the Counter level's ID before its counter.
+    fn segment(&self) -> String {
+        let format = match self.level {
+            DateLevel::Day => "%Y-%m-%d",
+            DateLevel::Minute => "%Y-%m-%d-%H%M",
+            DateLevel::Second | DateLevel::Counter => "%Y-%m-%d-%H%M%S",
+        };
+        format!("{}-retired-{}", self.base, self.retired_at.format(format))
+    }
+}
+
+/// `retired_at` as BBS writes it: RFC3339 (UTC, microseconds), read as UTC.
+fn parse_retired_at(text: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// Entity-ID name segments for one owner's agents (BBS blocker 1407).
+///
+/// Agents are grouped by mapped name, case-insensitively. Different original
+/// names in one group (`a.b`, `a-b`) block. A name used by one agent keeps
+/// its plain ID. For a reused name, the live agent keeps the plain ID, or if
+/// none is live the most recently retired one (ties: highest id); every
+/// other agent gets a dated ID (see [`assign_dated`]).
+fn map_owner_scope(
+    owner_name: &str,
+    agents: Vec<Agent>,
+    issues: &mut Vec<String>,
+) -> Vec<(Agent, String)> {
+    let mut by_key: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, agent) in agents.iter().enumerate() {
+        by_key
+            .entry(map_name(&agent.name).to_lowercase())
+            .or_default()
+            .push(i);
+    }
+    // Every group's plain ID is taken by exactly one of its agents.
+    let plain_ids: HashSet<String> = by_key.keys().cloned().collect();
+    let mut segments: Vec<Option<String>> = vec![None; agents.len()];
+    let mut dated = Vec::new();
+    for (key, group) in &by_key {
+        let plain = |i: usize| map_name(&agents[i].name);
+        let describe_all = || {
+            group
+                .iter()
+                .map(|&i| describe(HubKind::Agent, agents[i].id, &agents[i].name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let originals: BTreeSet<String> = group
+            .iter()
+            .map(|&i| agents[i].name.to_lowercase())
+            .collect();
+        let live: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|&i| agents[i].retired_at.is_none())
+            .collect();
+        let mut times = Vec::new();
+        let mut unparseable = Vec::new();
+        for &i in group {
+            if let Some(text) = &agents[i].retired_at {
+                match parse_retired_at(text) {
+                    Some(t) => times.push((i, t)),
+                    None => unparseable.push(format!(
+                        "{} retired_at {text:?}",
+                        describe(HubKind::Agent, agents[i].id, &agents[i].name)
+                    )),
+                }
+            }
+        }
+        let holder = if originals.len() > 1 {
+            issues.push(format!(
+                "different agent names map to `{owner_name}/{key}`: {}",
+                describe_all()
+            ));
+            None
+        } else if group.len() == 1 {
+            Some(group[0])
+        } else if live.len() > 1 {
+            issues.push(format!(
+                "more than one live agent maps to `{owner_name}/{key}`: {}",
+                describe_all()
+            ));
+            None
+        } else if !unparseable.is_empty() {
+            issues.push(format!(
+                "reused name `{owner_name}/{key}` needs dated IDs, but these retired_at \
+                 values are not RFC3339 times: {}",
+                unparseable.join(", ")
+            ));
+            None
+        } else if let Some(&i) = live.first() {
+            Some(i)
+        } else {
+            times
+                .iter()
+                .max_by_key(|&&(i, t)| (t, agents[i].id))
+                .map(|&(i, _)| i)
+        };
+        let Some(holder) = holder else {
+            // Blocked: report plain IDs only.
+            for &i in group {
+                segments[i] = Some(plain(i));
+            }
+            continue;
+        };
+        segments[holder] = Some(plain(holder));
+        for (i, retired_at) in times {
+            if i != holder {
+                dated.push(Dated {
+                    index: i,
+                    base: plain(i),
+                    retired_at,
+                    level: DateLevel::Day,
+                });
+            }
+        }
+    }
+    for (index, segment) in assign_dated(&plain_ids, dated, &agents) {
+        segments[index] = Some(segment);
+    }
+    agents
+        .into_iter()
+        .zip(segments)
+        .map(|(agent, segment)| (agent, segment.expect("every agent gets a segment")))
+        .collect()
+}
+
+/// Dated IDs for retired agents of reused names, unique case-insensitively
+/// among themselves and against every plain ID in the scope.
+///
+/// Every agent starts at `Day`. In rounds, every agent whose ID equals a plain
+/// ID or another dated agent's ID moves to the next level, all at once, until
+/// no ID clashes; so the result depends only on the inputs, not on order.
+/// Agents that reach `Counter` then get `-2`, `-3`, ... in agents.id order,
+/// each the lowest counter no ID already holds.
+fn assign_dated(
+    plain_ids: &HashSet<String>,
+    mut dated: Vec<Dated>,
+    agents: &[Agent],
+) -> Vec<(usize, String)> {
+    loop {
+        let ids: Vec<String> = dated.iter().map(|d| d.segment().to_lowercase()).collect();
+        let mut uses: HashMap<&str, usize> = HashMap::new();
+        for id in &ids {
+            *uses.entry(id.as_str()).or_default() += 1;
+        }
+        let clashing: Vec<usize> = (0..dated.len())
+            .filter(|&n| dated[n].level != DateLevel::Counter)
+            .filter(|&n| plain_ids.contains(&ids[n]) || uses[ids[n].as_str()] > 1)
+            .collect();
+        if clashing.is_empty() {
+            break;
+        }
+        for n in clashing {
+            dated[n].level = dated[n].level.next();
+        }
+    }
+    let mut taken: HashSet<String> = plain_ids.clone();
+    let mut out = Vec::new();
+    for d in dated.iter().filter(|d| d.level != DateLevel::Counter) {
+        taken.insert(d.segment().to_lowercase());
+        out.push((d.index, d.segment()));
+    }
+    let mut counted: Vec<&Dated> = dated
+        .iter()
+        .filter(|d| d.level == DateLevel::Counter)
+        .collect();
+    counted.sort_by_key(|d| agents[d.index].id);
+    for d in counted {
+        let segment = (2..)
+            .map(|n| format!("{}-{n}", d.segment()))
+            .find(|s| !taken.contains(&s.to_lowercase()))
+            .expect("an unbounded range finds a free counter");
+        taken.insert(segment.to_lowercase());
+        out.push((d.index, segment));
+    }
+    out
 }
 
 /// Legacy references without foreign keys that the cutover cannot resolve.
