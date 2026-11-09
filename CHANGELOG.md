@@ -30,6 +30,8 @@ under the new package version and its publication date.
   bbs.v2, epoch 3`); it printed the epoch as a package version.
 - `bbs admin` refuses to create a database: start the server (with its
   `--namespace`) or run `bbs init` first, so the namespace is chosen there.
+- Registering an agent whose Hub ID, `owner/name`, would exceed 128
+  characters fails with an error saying so.
 - The server and local mode run on the Hub model (schema 27): messages and
   deliveries refer to entity addresses, and every new human, agent and group
   gets an entity ID. Local behaviour is unchanged. A new database is created at

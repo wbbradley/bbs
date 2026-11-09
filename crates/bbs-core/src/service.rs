@@ -3497,6 +3497,50 @@ mod tests {
         (conn, will, agents)
     }
 
+    #[test]
+    fn agent_names_too_long_for_a_hub_id_are_refused_whole() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::migrate(&mut conn).unwrap();
+        let owner = "o".repeat(64);
+        ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: owner.clone(),
+            },
+        )
+        .unwrap();
+        let caller = Caller {
+            human: Some(owner.clone()),
+            ..Default::default()
+        };
+        let register_named = |conn: &mut Connection, name: String| {
+            register(
+                conn,
+                &caller,
+                proto::RegisterRequest {
+                    name: Some(name),
+                    ..Default::default()
+                },
+            )
+        };
+        // 64 + `/` + 63 is the longest an owned ID can be.
+        register_named(&mut conn, "a".repeat(63)).unwrap();
+        let err = register_named(&mut conn, "b".repeat(64))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is too long: its Hub ID")
+                && err.contains(
+                    "with its owner's ID, would be 129 characters, over the limit of 128"
+                ),
+            "{err}"
+        );
+        let agents: i64 = conn
+            .query_row("SELECT count(*) FROM agents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(agents, 1);
+    }
+
     fn search_req(query: &str) -> proto::SearchRequest {
         proto::SearchRequest {
             query: query.into(),

@@ -278,7 +278,17 @@ pub(crate) fn create_entity(
         .find(|id| !taken.contains(&id.to_lowercase()))
         .expect("an unbounded range finds a free counter");
     if entity_id.len() > MAX_ENTITY_ID {
-        bail!("entity ID `{entity_id}` is longer than {MAX_ENTITY_ID} characters");
+        let owned = if owner.is_some() {
+            ", with its owner's ID,"
+        } else {
+            ""
+        };
+        bail!(
+            "{} name {name:?} is too long: its Hub ID `{entity_id}`{owned} would be {} \
+             characters, over the limit of {MAX_ENTITY_ID}; choose a shorter name",
+            kind.as_str(),
+            entity_id.len()
+        );
     }
     conn.execute(
         "INSERT INTO entities (namespace, entity_id, kind, display_name, lifecycle, created_at)
