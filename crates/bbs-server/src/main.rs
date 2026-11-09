@@ -34,7 +34,8 @@ enum Command {
     },
     /// Operator only: move a stopped server's schema-26 database to the Hub
     /// model (schema 27). This binary cannot serve the result. Stop the
-    /// server and back up the database first.
+    /// server and back up the database first; it refuses while any other
+    /// connection uses the database.
     MigrateHubModel {
         /// The database to migrate (normally STATE_DIR/bbs.db).
         #[arg(long, value_name = "PATH")]
@@ -43,10 +44,14 @@ enum Command {
         #[arg(long)]
         namespace: String,
         /// A backup of this database at schema 26, such as `bbs backup`
-        /// writes. Required unless --dry-run.
+        /// writes, taken with the server stopped: its messages and deliveries
+        /// must match the database's. Required unless --dry-run.
         #[arg(long, value_name = "PATH")]
         backup_taken: Option<PathBuf>,
-        /// Only report the entity-ID mapping and blocking issues; write nothing.
+        /// Only report the entity-ID mapping and blocking issues; write
+        /// nothing. Meant for a backup copy: it opens --db read-only, which
+        /// can fail on a live WAL database without write access to its -shm
+        /// file.
         #[arg(long)]
         dry_run: bool,
     },

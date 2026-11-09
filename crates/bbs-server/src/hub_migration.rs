@@ -10,8 +10,10 @@ use rusqlite::{Connection, OpenFlags};
 use crate::db;
 
 /// Run the cutover, or with `dry_run` only its preflight, and return the
-/// report to print. A real run needs `backup_taken`: an existing schema-26
-/// database other than `db_path`.
+/// report to print. A real run needs `backup_taken`: a schema-26 database
+/// other than `db_path` with the same messages and deliveries, and exclusive
+/// access to `db_path`. `dry_run` opens `db_path` read-only; run it on a
+/// backup copy, since a read-only open of a live WAL database can fail.
 pub fn run(
     db_path: &Path,
     namespace: &str,
@@ -32,11 +34,21 @@ pub fn run(
     let Some(backup) = backup_taken else {
         bail!("refusing to migrate without --backup-taken PATH naming a backup of this database");
     };
-    check_backup(db_path, backup)?;
+    let backup_stats = check_backup(db_path, backup)?;
     // No create flag: a mistyped path must not become a new empty database.
     let mut conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .with_context(|| format!("opening {}", db_path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))?;
+    // Lock first, so nothing writes between the comparison and the cutover.
+    db::lock_exclusive(&conn)?;
+    let current = Stats::read(&conn)?;
+    if backup_stats != current {
+        bail!(
+            "--backup-taken: {} does not match this database (backup: {backup_stats}; \
+             database: {current}); take a fresh backup with the server stopped",
+            backup.display()
+        );
+    }
     let report = db::migrate_to_hub_model(&mut conn, namespace)?;
     let mut out = format!(
         "migrated {} to the Hub model (schema v{}) in namespace {namespace}\n\
@@ -53,9 +65,49 @@ pub fn run(
     Ok(out)
 }
 
+/// What a backup must share with the database: its newest message and its
+/// message and delivery counts.
+#[derive(Debug, PartialEq, Eq)]
+struct Stats {
+    max_message_id: Option<i64>,
+    messages: i64,
+    deliveries: i64,
+}
+
+impl Stats {
+    fn read(conn: &Connection) -> Result<Stats> {
+        Ok(conn.query_row(
+            "SELECT (SELECT max(id) FROM messages), (SELECT count(*) FROM messages),
+                    (SELECT count(*) FROM deliveries)",
+            [],
+            |r| {
+                Ok(Stats {
+                    max_message_id: r.get(0)?,
+                    messages: r.get(1)?,
+                    deliveries: r.get(2)?,
+                })
+            },
+        )?)
+    }
+}
+
+impl std::fmt::Display for Stats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let max = self
+            .max_message_id
+            .map_or("none".to_owned(), |id| id.to_string());
+        write!(
+            f,
+            "newest message {max}, {} messages, {} deliveries",
+            self.messages, self.deliveries
+        )
+    }
+}
+
 /// A cheap guard that a backup exists: a readable schema-26 SQLite file that
-/// is not the database being migrated.
-fn check_backup(db_path: &Path, backup: &Path) -> Result<()> {
+/// is not the database being migrated. Returns what the caller compares with
+/// the locked database.
+fn check_backup(db_path: &Path, backup: &Path) -> Result<Stats> {
     let canonical = |p: &Path| {
         p.canonicalize()
             .with_context(|| format!("--backup-taken: cannot read {}", p.display()))
@@ -84,7 +136,7 @@ fn check_backup(db_path: &Path, backup: &Path) -> Result<()> {
             db::HUB_MODEL_SOURCE_VERSION
         );
     }
-    Ok(())
+    Stats::read(&conn).with_context(|| format!("--backup-taken: reading {}", backup.display()))
 }
 
 fn mappings_text(out: &mut String, title: &str, mappings: &[db::EntityMapping]) {
@@ -199,6 +251,64 @@ mod tests {
         // A missing database is never created.
         assert!(run(&missing, "will", Some(&stale), false).is_err());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn refuses_a_backup_behind_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = board(dir.path(), "bbs.db");
+        let backup = dir.path().join("backup.db");
+        db::backup(&path, &backup).unwrap();
+        // A message and its delivery written after the backup.
+        db::open(&path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO messages (id, from_kind, from_id, body, created_at)
+                     VALUES (2, 'human', 1, 'later', 't');
+                 INSERT INTO deliveries VALUES (2, 'agent', 1, NULL, 1);",
+            )
+            .unwrap();
+        let before = snapshot(&path);
+        let err = run(&path, "will", Some(&backup), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not match this database (backup: newest message 1, 1 messages, 1 deliveries; database: newest message 2, 2 messages, 2 deliveries)"),
+            "{err}"
+        );
+        assert_eq!(snapshot(&path), before);
+        // Deliveries alone also count.
+        let backup2 = dir.path().join("backup2.db");
+        db::backup(&path, &backup2).unwrap();
+        db::open(&path)
+            .unwrap()
+            .execute("DELETE FROM deliveries WHERE message_id = 2", [])
+            .unwrap();
+        let err = run(&path, "will", Some(&backup2), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
+        assert_eq!(version(&path), 26);
+    }
+
+    #[test]
+    fn refuses_while_the_server_has_the_database_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = board(dir.path(), "bbs.db");
+        let backup = dir.path().join("backup.db");
+        db::backup(&path, &backup).unwrap();
+        let server = db::open(&path).unwrap();
+        server
+            .query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        let before = snapshot(&path);
+        let err = run(&path, "will", Some(&backup), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stop bbs-server"), "{err}");
+        drop(server);
+        assert_eq!(snapshot(&path), before);
+        assert_eq!(version(&path), 26);
     }
 
     #[test]
