@@ -254,7 +254,9 @@ mod tests {
         // Retired: no further writes, even of the same body.
         assert!(b.put(&will, old_id, "will on old mateo").is_err());
         assert!(b.put(&will, old_id, "new text").is_err());
-        // A new Mateo is a new id with no note.
+        // A new Mateo (possible for agents retired before the cutover) is a
+        // new id with no note.
+        crate::db::date_retired_entity_ids(&b.conn);
         let (_, new_id) = agent(&mut b.conn, &will, "Mateo");
         assert_ne!(new_id, old_id);
         assert!(

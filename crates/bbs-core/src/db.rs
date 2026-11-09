@@ -388,12 +388,13 @@ pub fn find_human(conn: &Connection, name: &str) -> Result<Option<Principal>> {
 }
 
 pub fn insert_human(conn: &Connection, name: &str, now: &str) -> Result<i64> {
+    let entity_id = hub_model::new_entity_id(conn, EntityKind::Human, name, None)?;
     conn.execute(
         "INSERT INTO humans (name, created_at, active_at) VALUES (?1, ?2, ?2)",
         params![name, now],
     )?;
     let id = conn.last_insert_rowid();
-    hub_model::create_entity(conn, EntityKind::Human, id, name, None, now)?;
+    hub_model::create_entity(conn, EntityKind::Human, id, &entity_id, name, now)?;
     Ok(id)
 }
 
@@ -697,6 +698,7 @@ pub struct NewAgent<'a> {
 }
 
 pub fn insert_agent(conn: &Connection, a: &NewAgent) -> Result<i64> {
+    let entity_id = hub_model::new_entity_id(conn, EntityKind::Agent, a.name, Some(a.owner_id))?;
     let status_at = a.status.map(|_| a.now);
     conn.execute(
         "INSERT INTO agents (name, token, status, status_at, pwd, hostname, created_at, active_at)
@@ -710,7 +712,7 @@ pub fn insert_agent(conn: &Connection, a: &NewAgent) -> Result<i64> {
         "INSERT INTO agent_owners (agent_id, human_id) VALUES (?1, ?2)",
         params![id, a.owner_id],
     )?;
-    hub_model::create_entity(conn, EntityKind::Agent, id, a.name, Some(a.owner_id), a.now)?;
+    hub_model::create_entity(conn, EntityKind::Agent, id, &entity_id, a.name, a.now)?;
     Ok(id)
 }
 
@@ -795,12 +797,13 @@ pub fn insert_group(
     description: Option<&str>,
     now: &str,
 ) -> Result<i64> {
+    let entity_id = hub_model::new_entity_id(conn, EntityKind::Group, name, None)?;
     conn.execute(
         "INSERT INTO bbs_groups (name, description, created_at) VALUES (?1, ?2, ?3)",
         params![name, description, now],
     )?;
     let id = conn.last_insert_rowid();
-    hub_model::create_entity(conn, EntityKind::Group, id, name, None, now)?;
+    hub_model::create_entity(conn, EntityKind::Group, id, &entity_id, name, now)?;
     Ok(id)
 }
 
@@ -1055,6 +1058,24 @@ const SENDER_JOINS: &str = "
 
 /// The sender's kind, with [`SENDER_JOINS`].
 const SENDER_KIND: &str = "CASE WHEN sb.agent_id IS NULL THEN 'human' ELSE 'agent' END";
+
+/// Whether a new agent named `name` under human `owner` would get a free Hub
+/// ID: none of the owner's agents, live or retired, maps to it.
+pub fn agent_name_available(conn: &Connection, name: &str, owner: i64) -> Result<bool> {
+    hub_model::agent_name_available(conn, name, owner)
+}
+
+/// Move every retired entity off its plain ID, as the cutover does for records
+/// retired before it, so tests can reuse a retired native name.
+#[cfg(test)]
+pub(crate) fn date_retired_entity_ids(conn: &Connection) {
+    conn.execute(
+        "UPDATE entities SET entity_id = entity_id || '-retired-2026-10-01'
+         WHERE lifecycle = 'retired' AND entity_id NOT LIKE '%-retired-%'",
+        [],
+    )
+    .unwrap();
+}
 
 /// A native record's entity and native address; None when it has none.
 pub fn native_address(conn: &Connection, kind: EntityKind, id: i64) -> Result<Option<AddressRef>> {
@@ -2752,6 +2773,19 @@ mod tests {
         }
     }
 
+    fn agent_err(conn: &Connection, owner: i64, name: &str) -> String {
+        let a = NewAgent {
+            name,
+            token: &crate::auth::new_token(),
+            owner_id: owner,
+            status: None,
+            pwd: "/",
+            hostname: "h",
+            now: "t",
+        };
+        format!("{:#}", insert_agent(conn, &a).unwrap_err())
+    }
+
     fn agent(conn: &Connection, owner: i64, name: &str) -> Principal {
         let a = NewAgent {
             name,
@@ -3017,22 +3051,23 @@ mod tests {
             .unwrap();
         assert!(index_sql.contains("CREATE UNIQUE INDEX"));
         assert!(index_sql.contains("WHERE archived_at IS NULL"));
-        let new_id = insert_group(&conn, "acme", None, "2026-10-15").unwrap();
-        assert_ne!(new_id, 1);
-        // The archived group keeps its entity ID; the new one gets its own.
-        let entity = |id| {
-            native_address(&conn, EntityKind::Group, id)
+        // The archived group keeps its entity ID, so its name is refused.
+        assert_eq!(
+            native_address(&conn, EntityKind::Group, 1)
                 .unwrap()
                 .unwrap()
                 .entity
-                .entity_id
-        };
-        assert_eq!(
-            (entity(1), entity(new_id)),
-            ("acme".into(), "acme-2".into())
+                .entity_id,
+            "acme"
         );
-        assert!(group_member_ids(&conn, new_id).unwrap().is_empty());
-        assert!(insert_group(&conn, "acme", None, "2026-10-15").is_err());
+        assert_eq!(
+            format!(
+                "{:#}",
+                insert_group(&conn, "acme", None, "2026-10-15").unwrap_err()
+            ),
+            "group name acme is unavailable: acme belongs to an archived group; \
+             Hub IDs are never reused. Choose another name."
+        );
         assert!(
             conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
                 .unwrap()
@@ -3809,18 +3844,33 @@ mod tests {
         );
         let first = agent(&conn, ann.id, "a.b");
         assert_eq!(id(entity(EntityKind::Agent, first.id)), "ann-lee/a-b");
-        // Retiring keeps the ID; a reused name gets the next free counter,
-        // ignoring case, and never takes the retired agent's ID.
+        // A live agent's ID is refused, including after `.` maps to `-`.
+        assert_eq!(
+            agent_err(&conn, ann.id, "a-b"),
+            "agent name a-b is unavailable: ann-lee/a-b belongs to an agent; \
+             Hub IDs are never reused. Choose another name."
+        );
+        // Retiring keeps the ID, and it is never reused, in any case.
         retire_agent(&conn, first.id, "t").unwrap();
-        let second = agent(&conn, ann.id, "a.b");
-        retire_agent(&conn, second.id, "t").unwrap();
-        let third = agent(&conn, ann.id, "A.B");
         assert_eq!(
             entity(EntityKind::Agent, first.id),
             ("ann-lee/a-b".into(), "retired".into(), "a.b".into())
         );
-        assert_eq!(id(entity(EntityKind::Agent, second.id)), "ann-lee/a-b-2");
-        assert_eq!(id(entity(EntityKind::Agent, third.id)), "ann-lee/A-B-3");
+        for name in ["a.b", "A.B", "a-b"] {
+            assert_eq!(
+                agent_err(&conn, ann.id, name),
+                format!(
+                    "agent name {name} is unavailable: ann-lee/a-b belongs to a retired agent; \
+                     Hub IDs are never reused. Choose another name."
+                )
+            );
+        }
+        assert!(!agent_name_available(&conn, "A.b", ann.id).unwrap());
+        assert!(agent_name_available(&conn, "a.c", ann.id).unwrap());
+        // Another owner's agent of the same name has its own ID.
+        let bo = human(&conn, "bo");
+        let other = agent(&conn, bo.id, "a.b");
+        assert_eq!(id(entity(EntityKind::Agent, other.id)), "bo/a-b");
         let retired: String = conn
             .query_row(
                 &format!(
@@ -3832,9 +3882,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retired, "retired");
-        // Humans and groups share the top level.
-        let group = insert_group(&conn, "ann-lee", None, "t").unwrap();
-        assert_eq!(id(entity(EntityKind::Group, group)), "ann-lee-2");
+        // Humans and groups share the top level, so a group cannot take a
+        // person's ID, and a person cannot take a group's.
+        for name in ["ann-lee", "Ann.Lee"] {
+            assert_eq!(
+                format!("{:#}", insert_group(&conn, name, None, "t").unwrap_err()),
+                format!(
+                    "group name {name} is unavailable: ann-lee belongs to a human; \
+                     Hub IDs are never reused. Choose another name."
+                )
+            );
+        }
+        let group = insert_group(&conn, "crew", None, "t").unwrap();
+        assert_eq!(id(entity(EntityKind::Group, group)), "crew");
+        assert!(
+            format!("{:#}", insert_human(&conn, "CREW", "t").unwrap_err())
+                .contains("crew belongs to a group;")
+        );
         archive_group(&conn, group, "t").unwrap();
         assert_eq!(entity(EntityKind::Group, group).1, "retired");
         let handlers: Vec<String> = conn
@@ -3876,14 +3940,15 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(ids(&conn), ["will/scout-retired-2026-10-08", "will/scout"]);
-        agent(&conn, 1, "scout");
+        assert!(agent_err(&conn, 1, "scout").contains("will/scout belongs to a retired agent;"));
+        assert!(
+            agent_err(&conn, 1, "scout-retired-2026-10-08")
+                .contains("will/scout-retired-2026-10-08 belongs to a retired agent;")
+        );
+        agent(&conn, 1, "scout2");
         assert_eq!(
             ids(&conn),
-            [
-                "will/scout-retired-2026-10-08",
-                "will/scout",
-                "will/scout-2"
-            ]
+            ["will/scout-retired-2026-10-08", "will/scout", "will/scout2"]
         );
     }
 

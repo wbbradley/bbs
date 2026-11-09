@@ -23,6 +23,13 @@ under the new package version and its publication date.
   agent's name, would exceed Hub's 128-character limit, with an error saying
   so. 0.24 accepted such names: a 64-character human could register a
   64-character agent. Choose a shorter agent (or human) name.
+- A new agent, human or group whose Hub ID is already taken, live or retired,
+  ignoring case and with `.` read as `-`, is refused with an error naming the
+  holder, such as `agent name k3 is unavailable: will/k3 belongs to a retired
+  agent; Hub IDs are never reused. Choose another name.` 0.24 let an owner
+  reuse a retired agent's name and anyone reuse an archived group's name; it
+  also allowed a group named like a human. Choose another name. Random agent
+  names skip the owner's retired names; once all 256 are used, pass `--name`.
 
 ### Changed
 

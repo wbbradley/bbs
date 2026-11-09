@@ -205,8 +205,9 @@ grants no write. `bbs group delete` archives rather than deletes: it records
 grant no access, accept no joins or broadcasts, and disappear from listings,
 while the human feed and archived mail keep their history. Unread mail already
 delivered from an archived group, including the archival notice, can still be
-read. Active group names are unique through a partial index, so a new group may
-reuse an archived name with a new ID. The schema 6 migration rebuilds the groups
+read. Active group names are unique through a partial index; since the Hub model
+a new group also cannot take an archived group's entity ID (see below), so an
+archived name is never reused. The schema 6 migration rebuilds the groups
 table to replace all-time name uniqueness, preserving IDs and dependent rows.
 
 Humans may give a group a one-line description at registration or later with
@@ -333,9 +334,11 @@ by `entity_local_bindings`) with one default address, `native`. Messages store
 sender and recipient addresses and an origin `(namespace, message ID)`; new
 messages get a random ID. Deliveries store the recipient address with an empty
 run. Records created after the cutover get entity IDs from the same name
-mapping; since IDs never change, a name whose ID is taken (an agent reusing a
-retired agent's name, a group named like a human) gets the lowest free `-N`
-from 2. Retiring an agent or archiving a group retires its entity and address.
+mapping. IDs never change and are never reused, so creating a record whose ID
+any entity holds, live or retired, ignoring case, is refused with an error
+naming the holder: an agent reusing a retired agent's name, `a.b` beside
+`a-b`, a group named like a human or an archived group. Random agent names skip
+names their owner cannot use. Retiring an agent or archiving a group retires its entity and address.
 
 The Hub model cutover is not an automatic migration: on existing data only
 `bbs-server migrate-hub-model` runs it, from

@@ -1052,6 +1052,7 @@ mod tests {
         .unwrap();
         // Archived history is outside a queue based on current active groups.
         assert!(list(&mut b, &will, None, true).blockers.is_empty());
+        crate::db::date_retired_entity_ids(&b.conn);
         service::group_register(
             &mut b.conn,
             &will,
@@ -1237,6 +1238,7 @@ mod tests {
         )
         .unwrap();
         check(&mut b, [1, 0, 1]);
+        crate::db::date_retired_entity_ids(&b.conn);
         service::group_register(
             &mut b.conn,
             &b.humans[0],
@@ -1264,6 +1266,7 @@ mod tests {
         let mut b = Board::memory();
         b.put(0, "original agent", None, "old");
         service::bye(&mut b.conn, &b.agents[0]).unwrap();
+        crate::db::date_retired_entity_ids(&b.conn);
         let registered = service::register(
             &mut b.conn,
             &b.humans[0],
@@ -2073,6 +2076,7 @@ mod tests {
             },
         )
         .unwrap();
+        crate::db::date_retired_entity_ids(&b.conn);
         service::group_register(
             &mut b.conn,
             &b.humans[0],

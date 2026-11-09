@@ -357,11 +357,24 @@ fn requested_names_are_validated_and_reserved(mode: Mode) {
         count, 1,
         "failed requests must not register fallback identities"
     );
+    // A retired agent's Hub ID, will/Jeffrey, is never reused, in any case.
     bbs.ok(&["--token", &token, "bye"]);
-    let (name, replacement) = bbs.register_with(&["register", "--name", "Jeffrey"]);
-    assert_eq!(name, "Jeffrey");
-    assert_ne!(replacement, token);
+    for retired in ["Jeffrey", "JEFFREY"] {
+        let err = bbs.err(&["register", "--name", retired]);
+        assert!(
+            err.contains(&format!(
+                "agent name {retired} is unavailable: will/Jeffrey belongs to a retired agent; \
+                 Hub IDs are never reused. Choose another name."
+            )),
+            "{err}"
+        );
+    }
+    // `.` maps to `-`, so these two names share one Hub ID.
     bbs.register_with(&["register", "--name", "Agent_1.test-2"]);
+    assert!(
+        bbs.err(&["register", "--name", "Agent_1-test-2"])
+            .contains("will/Agent_1-test-2 belongs to an agent")
+    );
 }
 
 fn concurrent_registration_reserves_one_name(mode: Mode) {
@@ -1245,45 +1258,26 @@ fn deleting_groups_archives_history_and_removes_access(mode: Mode) {
     assert!(retirement.contains("@other"));
     assert!(!retirement.contains("@acme"), "{retirement}");
 
-    // Reusing a name creates a new scope and never restores old membership.
-    bbs.ok(&["group", "register", "acme"]);
+    // An archived group's name stays its Hub ID: it is never registered again,
+    // and its history stays readable.
+    let err = bbs.err(&["group", "register", "acme"]);
     assert!(
-        bbs.err(&["group", "register", "acme"])
-            .contains("already exists")
+        err.starts_with(
+            "bbs: group name acme is unavailable: acme belongs to an archived group; \
+             Hub IDs are never reused. Choose another name."
+        ),
+        "{err}"
     );
-    assert!(!bbs.ok(&["--token", &tb, "group", "list"]).contains("acme"));
+    assert!(bbs.ok(&["group", "list"]).contains("@other"));
+    assert!(!bbs.ok(&["group", "list"]).contains("acme"));
     assert!(
         bbs.err(&["--token", &tb, "send", "--to", "@acme", "denied"])
-            .contains("not a member")
-    );
-    let (c, tc) = bbs.register();
-    bbs.ok(&["--token", &tc, "group", "join", "acme"]);
-    bbs.ok(&["send", "--to", "@acme", "new broadcast"]);
-    assert!(bbs.ok(&["--token", &tc, "read"]).contains("new broadcast"));
-    assert!(!bbs.ok(&["--token", &tb, "read"]).contains("new broadcast"));
-    assert!(
-        !bbs.ok(&["--token", &tc, "read", "--archived"])
-            .contains("retained broadcast")
-    );
-    assert!(
-        bbs.err(&["--token", &tb, "send", "--to", &c, "denied"])
-            .contains("not in any of your groups")
+            .contains("no such group")
     );
     assert!(
         bbs.ok(&["--token", &tb, "read", "--archived"])
             .contains("retained broadcast")
     );
-    let (old_id, new_id): (i64, i64) = db
-        .query_row(
-            "SELECT min(id), max(id) FROM bbs_groups WHERE name = 'acme'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_ne!(old_id, new_id);
-    bbs.ok(&["group", "delete", "acme"]);
-    bbs.ok(&["group", "register", "acme"]);
-    assert!(bbs.ok(&["group", "list"]).contains("@acme: (no agents)\n"));
 }
 
 fn group_archive_rolls_back_notice_on_failure(mode: Mode) {
@@ -1431,13 +1425,13 @@ fn groups_carry_human_written_descriptions(mode: Mode) {
             .contains("cannot be used with")
     );
 
-    // Reusing an archived name starts without the old description.
+    // An archived group keeps its description; its name is not registered again.
     bbs.ok(&["group", "delete", "infra"]);
-    bbs.ok(&["group", "register", "infra"]);
     assert!(
-        bbs.ok(&["group", "list"])
-            .starts_with("@infra: (no agents)\n@plain")
+        bbs.err(&["group", "register", "infra"])
+            .contains("infra belongs to an archived group")
     );
+    assert!(bbs.ok(&["group", "list"]).starts_with("@plain"));
     let stored: Vec<Option<String>> = bbs
         .db()
         .prepare("SELECT description FROM bbs_groups WHERE name = 'infra' ORDER BY id")
@@ -1446,7 +1440,7 @@ fn groups_carry_human_written_descriptions(mode: Mode) {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(stored, [Some("Fleet, deploys: and on-call".into()), None]);
+    assert_eq!(stored, [Some("Fleet, deploys: and on-call".into())]);
 }
 
 fn joining_notifies_the_group(mode: Mode) {
@@ -1597,7 +1591,8 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
             .contains("@acme has no agent writers.")
     );
 
-    // Retiring drops the grant: a new agent with that name lacks it.
+    // Retiring drops the grant, and its name is never registered again: a
+    // new agent lacks the grant.
     bbs.grant_write("acme", &a);
     bbs.ok(&["--token", &tb, "read"]);
     bbs.ok(&["--token", &ta, "bye"]);
@@ -1609,7 +1604,11 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
         .query_row("SELECT COUNT(*) FROM group_writers", [], |r| r.get(0))
         .unwrap();
     assert_eq!(writers, 0);
-    let (_, ta) = bbs.register_with(&["register", "--name", &a]);
+    assert!(
+        bbs.err(&["register", "--name", &a])
+            .contains("belongs to a retired agent")
+    );
+    let (_, ta) = bbs.register();
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
     assert!(
         bbs.err(&["--token", &ta, "send", "--to", "@acme", "x"])
@@ -3079,23 +3078,22 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
     assert!(group.iter().all(|r| r["group"] == "acme"), "{group:?}");
     assert!(bodies(&group).contains(&"acme from A"));
 
-    // A reused group name covers every incarnation, archived or active.
+    // An archived group's history stays viewable by name.
     bbs.ok(&["group", "register", "temp"]);
     bbs.ok(&["send", "--to", "@temp", "first temp"]);
-    bbs.ok(&["group", "delete", "temp"]);
-    bbs.ok(&["group", "register", "temp"]);
     bbs.ok(&["send", "--to", "@temp", "second temp"]);
+    bbs.ok(&["group", "delete", "temp"]);
     let temp = view_json(&bbs, &["--group", "temp", "--from", "will"]);
     assert_eq!(
         bodies(&temp),
         [
             "first temp",
-            "Human \"will\" archived group @temp.",
-            "second temp"
+            "second temp",
+            "Human \"will\" archived group @temp."
         ]
     );
     let last = view_json(&bbs, &["--group", "temp", "--limit", "1"]);
-    assert_eq!(bodies(&last), ["second temp"]);
+    assert_eq!(bodies(&last), ["Human \"will\" archived group @temp."]);
 
     let from = view_json(&bbs, &["--from", &a.to_lowercase()]);
     assert!(from.iter().all(|r| r["from"] == a.as_str()), "{from:?}");

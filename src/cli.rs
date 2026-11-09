@@ -73,7 +73,8 @@ pub enum Command {
     },
     /// Update this agent's status note.
     Status { text: String },
-    /// Retire this agent, freeing its name and invalidating its token.
+    /// Retire this agent and invalidate its token. Its owner cannot reuse its
+    /// name: Hub IDs are never reused.
     Bye,
     /// Retire another agent and announce it to its groups (humans only).
     Retire { agent: String },

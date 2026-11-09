@@ -16,15 +16,15 @@
 //!   `map_owner_scope` and `assign_dated`).
 //!
 //! Records created after the cutover get IDs from the same name mapping (see
-//! [`create_entity`]). IDs never change, so one whose ID is taken gets a
-//! counter instead of blocking.
+//! [`new_entity_id`]). IDs never change and are never reused, so a name whose
+//! ID is taken is refused.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{MIGRATIONS, is_busy, schema_version};
 use crate::entity::{EntityKind, NATIVE_ADDRESS};
@@ -230,21 +230,16 @@ pub fn namespace(conn: &Connection) -> Result<String> {
     Ok(conn.query_row("SELECT namespace FROM bbs_installation", [], |r| r.get(0))?)
 }
 
-/// Give a native record created at schema 27 its entity, native address and
-/// delivery handler, with an ID from the cutover's name mapping: `owner/name`
-/// under its owner's entity ID for an owned agent, else top level. IDs are
-/// immutable, so a reused or clashing name (an agent named like its retired
-/// predecessor, a group named like a human) takes the lowest free `-N`, N
-/// from 2, compared case-insensitively. Returns the entity ID.
-pub(crate) fn create_entity(
+/// The entity ID a new native record named `name` would get, from the
+/// cutover's name mapping: `owner/name` under its owner's entity ID for an
+/// owned agent, else top level. Refuses a name outside Hub's grammar or too
+/// long.
+fn plain_entity_id(
     conn: &Connection,
     kind: EntityKind,
-    native_id: i64,
     name: &str,
     owner: Option<i64>,
-    now: &str,
 ) -> Result<String> {
-    let namespace = namespace(conn)?;
     let segment = map_name(name);
     if !valid_segment(&segment) {
         bail!(
@@ -252,7 +247,7 @@ pub(crate) fn create_entity(
             kind.as_str()
         );
     }
-    let base = match owner {
+    let entity_id = match owner {
         Some(owner) => {
             let parent: String = conn
                 .query_row(
@@ -266,17 +261,6 @@ pub(crate) fn create_entity(
         }
         None => segment,
     };
-    // LIKE ignores ASCII case; `_` matching any character only widens the set.
-    let mut stmt = conn.prepare_cached(
-        "SELECT lower(entity_id) FROM entities WHERE namespace = ?1 AND entity_id LIKE ?2 || '%'",
-    )?;
-    let taken: HashSet<String> = stmt
-        .query_map(params![namespace, base], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let entity_id = std::iter::once(base.clone())
-        .chain((2..).map(|n| format!("{base}-{n}")))
-        .find(|id| !taken.contains(&id.to_lowercase()))
-        .expect("an unbounded range finds a free counter");
     if entity_id.len() > MAX_ENTITY_ID {
         let owned = if owner.is_some() {
             ", with its owner's ID,"
@@ -290,6 +274,75 @@ pub(crate) fn create_entity(
             entity_id.len()
         );
     }
+    Ok(entity_id)
+}
+
+/// Who holds `entity_id` in `namespace`, compared case-insensitively, as
+/// "will/k3 belongs to a retired agent"; None when it is free.
+fn holder(conn: &Connection, namespace: &str, entity_id: &str) -> Result<Option<String>> {
+    let held: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT entity_id, kind, lifecycle FROM entities
+             WHERE namespace = ?1 AND lower(entity_id) = lower(?2)",
+            params![namespace, entity_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(held.map(|(id, kind, lifecycle)| {
+        let what = match (kind.as_str(), lifecycle == "retired") {
+            ("agent", true) => "a retired agent".to_string(),
+            ("group", true) => "an archived group".to_string(),
+            ("agent", false) => "an agent".to_string(),
+            ("human", _) => "a human".to_string(),
+            ("group", false) => "a group".to_string(),
+            (other, _) => format!("a {other}"),
+        };
+        format!("{id} belongs to {what}")
+    }))
+}
+
+/// Whether a new agent named `name` under human `owner` would get a free
+/// entity ID.
+pub(crate) fn agent_name_available(conn: &Connection, name: &str, owner: i64) -> Result<bool> {
+    let entity_id = match plain_entity_id(conn, EntityKind::Agent, name, Some(owner)) {
+        Ok(id) => id,
+        Err(_) => return Ok(false),
+    };
+    Ok(holder(conn, &namespace(conn)?, &entity_id)?.is_none())
+}
+
+/// The plain entity ID (see `plain_entity_id`) a new record named `name`
+/// would get. IDs are immutable and never reused, so a name whose ID any
+/// entity holds, live or retired, ignoring case, is refused. Call this before
+/// inserting the native record, then pass the ID to [`create_entity`].
+pub(crate) fn new_entity_id(
+    conn: &Connection,
+    kind: EntityKind,
+    name: &str,
+    owner: Option<i64>,
+) -> Result<String> {
+    let entity_id = plain_entity_id(conn, kind, name, owner)?;
+    if let Some(conflict) = holder(conn, &namespace(conn)?, &entity_id)? {
+        bail!(
+            "{} name {name} is unavailable: {conflict}; Hub IDs are never reused. \
+             Choose another name.",
+            kind.as_str()
+        );
+    }
+    Ok(entity_id)
+}
+
+/// Give a native record created at schema 27 its entity `entity_id` (from
+/// [`new_entity_id`]), native address and delivery handler.
+pub(crate) fn create_entity(
+    conn: &Connection,
+    kind: EntityKind,
+    native_id: i64,
+    entity_id: &str,
+    name: &str,
+    now: &str,
+) -> Result<()> {
+    let namespace = namespace(conn)?;
     conn.execute(
         "INSERT INTO entities (namespace, entity_id, kind, display_name, lifecycle, created_at)
          VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
@@ -314,7 +367,7 @@ pub(crate) fn create_entity(
         "INSERT INTO address_delivery_bindings (address_id, handler) VALUES (?1, ?2)",
         params![conn.last_insert_rowid(), handler],
     )?;
-    Ok(entity_id)
+    Ok(())
 }
 
 /// The `entity_local_bindings` column holding a native record of `kind`.

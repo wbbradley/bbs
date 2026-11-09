@@ -337,14 +337,17 @@ pub fn add_human(
     })
 }
 
-fn pick_name(conn: &Connection) -> Result<String> {
+/// A pool name no live agent or human holds and whose Hub ID under `owner`
+/// is free: never one of the owner's retired agents' names.
+fn pick_name(conn: &Connection, owner: i64) -> Result<String> {
     let taken = db::taken_names(conn)?;
     let last_used = db::name_last_used(conn)?;
-    let free: Vec<&str> = NAMES
-        .iter()
-        .copied()
-        .filter(|n| !taken.contains(&n.to_lowercase()))
-        .collect();
+    let mut free = Vec::new();
+    for name in NAMES {
+        if !taken.contains(&name.to_lowercase()) && db::agent_name_available(conn, name, owner)? {
+            free.push(name);
+        }
+    }
     let never_used: Vec<&str> = free
         .iter()
         .copied()
@@ -357,7 +360,13 @@ fn pick_name(conn: &Connection) -> Result<String> {
     free.iter()
         .min_by_key(|n| last_used.get(&n.to_lowercase()))
         .map(|n| n.to_string())
-        .with_context(|| format!("name pool exhausted: all {} names are in use", NAMES.len()))
+        .with_context(|| {
+            format!(
+                "name pool exhausted: all {} names are in use or were your retired agents' \
+                 (Hub IDs are never reused); choose a name with --name",
+                NAMES.len()
+            )
+        })
 }
 
 fn new_token(conn: &Connection) -> Result<String> {
@@ -394,7 +403,7 @@ pub fn register(
                 }
                 name
             }
-            None => pick_name(ctx.conn)?,
+            None => pick_name(ctx.conn, owner.id)?,
         };
         // Keep the reserved-name error above: restarting an existing headless
         // agent uses it to take over its token without creating a new identity.
@@ -4808,7 +4817,7 @@ mod tests {
         assert!(whoami(&mut conn, &will).unwrap().owner.is_none());
 
         // Registration isolation: a retired name's keys do not follow its
-        // re-registration.
+        // re-registration (possible for agents retired before the cutover).
         retire_agent(
             &mut conn,
             &will,
@@ -4817,6 +4826,7 @@ mod tests {
             },
         )
         .unwrap();
+        db::date_retired_entity_ids(&conn);
         let token = register(
             &mut conn,
             &will,
@@ -6113,6 +6123,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 0);
+        db::date_retired_entity_ids(&conn);
         let token = register(
             &mut conn,
             &will,
@@ -6207,6 +6218,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mateo_rows, 0);
+        db::date_retired_entity_ids(&conn);
         let token = register(
             &mut conn,
             &will,
