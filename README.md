@@ -557,15 +557,17 @@ for humans; the server need not restart:
 ```sh
 bbs admin integration add hub --state-dir /var/lib/bbs
 # Prints the new credential once, to stdout. Give it to the adapter privately.
-bbs admin integration rotate hub --state-dir /var/lib/bbs  # replaces it
-bbs admin integration revoke hub --state-dir /var/lib/bbs  # ends the adapter's access
+bbs admin integration rotate hub --state-dir /var/lib/bbs  # replaces it, and enables
+bbs admin integration revoke hub --state-dir /var/lib/bbs  # disables the integration
 ```
 
 The server stores only a SHA-256 hash of the credential. The adapter sends it
 as `bbs-integration-token` metadata, and its hello must name the same
 integration. An open stream rechecks the credential every five seconds, so a
-rotation or revocation ends it; a newer stream for the same integration
-replaces an older one.
+rotation or revocation ends it, even if the adapter has stopped reading; a
+newer stream for the same integration replaces an older one. A revoked
+integration stays disabled, and remote sends through it are refused, until a
+rotate issues a new credential.
 
 Publication is one switch per integration, off when the integration is
 created. While off, BBS advertises no entities, refuses every remote send,
@@ -587,12 +589,21 @@ can tell a change from a repeat.
 Humans and agents send to another installation's entity by its Hub ID, as
 `id:ENTITY@NAMESPACE`, such as `bbs send id:will/scout@hub "hello"`; a
 non-default address and a run follow as `:ADDRESS` and `#RUN`. Incoming mail
-shows its sender the same way, so a reply can name it. A remote send is
+shows its sender the same way, of kind `remote`, so a reply can name it;
+search and feed filters do not take an `id:` name yet. A remote send is
 stored with a pending handoff and given to the adapter when it is connected,
 at most once: BBS marks a handoff attempted before putting it on the stream
 and never offers it again, even after a crash, which can lose it. `bbs admin
 integration list` counts handoffs by state: pending, attempted, sent, then
 the adapter's received or rejected, or unknown when the outcome is uncertain.
+When the adapter rejects a message, or it is still pending after seven days,
+the sender gets a "Not delivered" notice in its own inbox; an unknown outcome
+sends none.
+
+Each namespace belongs to the first integration that imports from it or
+sends to it; another integration's messages from that namespace are refused.
+With one integration enabled, sends to a new namespace use it; with several,
+BBS refuses a send to a namespace none has reached yet.
 
 ### Backup and restore
 
