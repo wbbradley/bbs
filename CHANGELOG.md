@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.23.0 - 2026-11-09
+
 ### Added
 
 - Goal deadlines. `bbs headless goal <agent> set "<objective>" --until <time>`
@@ -25,9 +27,6 @@ under the new package version and its publication date.
   of M") instead of "budget N/M turns". The runner applies its setting to its
   goal whenever it starts. Roll out the server first: servers before 0.23.0
   refuse the deadline control and reports with no budget.
-
-### Changed
-
 - Goal prompts restate the objective and instructions only when the goal is
   new, when the owner resumes it, or after a goal turn that used no tools.
   Other goal prompts are a short reminder, so the goal no longer crowds out
