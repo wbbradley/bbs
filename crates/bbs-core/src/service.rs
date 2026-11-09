@@ -197,6 +197,7 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
             Some("goal-pause") => Some(proto::Control::GoalPause.into()),
             Some("goal-resume") => Some(proto::Control::GoalResume.into()),
             Some("goal-clear") => Some(proto::Control::GoalClear.into()),
+            Some("goal-deadline") => Some(proto::Control::GoalDeadline.into()),
             _ => None,
         },
         timer_id: m.timer_id,
@@ -940,6 +941,13 @@ fn send_control(
         Ok(proto::Control::GoalPause) => "goal-pause",
         Ok(proto::Control::GoalResume) => "goal-resume",
         Ok(proto::Control::GoalClear) => "goal-clear",
+        Ok(proto::Control::GoalDeadline) => {
+            // The body is the deadline, or `none` to clear it.
+            if body != "none" {
+                parse_time("deadline", body)?;
+            }
+            "goal-deadline"
+        }
         _ => bail!("unknown control {control}"),
     };
     if me.kind != db::Kind::Human {
@@ -2622,10 +2630,7 @@ fn validate_goal(goal: &proto::GoalReport, owner: Option<&str>) -> Result<proto:
     if status == proto::GoalStatus::Complete && goal.evidence.trim().is_empty() {
         bail!("a complete goal needs evidence");
     }
-    if goal.budget == 0 {
-        bail!("a goal's budget is at least one turn");
-    }
-    if goal.iteration > goal.budget {
+    if goal.budget > 0 && goal.iteration > goal.budget {
         bail!("a goal cannot use more than its budget of turns");
     }
     if !GOAL_CHANGERS.contains(&goal.changed_by.as_str()) {
@@ -2636,6 +2641,11 @@ fn validate_goal(goal: &proto::GoalReport, owner: Option<&str>) -> Result<proto:
         Some(_) => bail!("only a waiting goal has wake_at"),
         None => None,
     };
+    let deadline = goal
+        .deadline
+        .as_deref()
+        .map(|at| parse_time("deadline", at))
+        .transpose()?;
     match goal.blocker_id {
         Some(id) if status != proto::GoalStatus::Blocked => {
             bail!("only a blocked goal has blocker_id, not #{id}")
@@ -2646,6 +2656,7 @@ fn validate_goal(goal: &proto::GoalReport, owner: Option<&str>) -> Result<proto:
     Ok(proto::GoalReport {
         set_at: parse_time("set_at", &goal.set_at)?,
         wake_at,
+        deadline,
         ..goal.clone()
     })
 }
@@ -2668,6 +2679,7 @@ fn goal_from_json(stored: &str) -> Option<proto::GoalReport> {
         wake_at: text("wake_at"),
         changed_by: text("changed_by")?,
         blocker_id: v.get("blocker_id").and_then(serde_json::Value::as_i64),
+        deadline: text("deadline"),
     })
 }
 
@@ -2685,6 +2697,7 @@ fn goal_json(goal: &proto::GoalReport) -> String {
         "wake_at": goal.wake_at,
         "changed_by": goal.changed_by,
         "blocker_id": goal.blocker_id,
+        "deadline": goal.deadline,
     })
     .to_string()
 }
@@ -4107,6 +4120,7 @@ mod tests {
             wake_at: None,
             changed_by: "runner".into(),
             blocker_id: None,
+            deadline: None,
         };
         let report = |conn: &mut Connection, g: Option<proto::GoalReport>| {
             report_goal(conn, &mateo, proto::ReportGoalRequest { goal: g })
@@ -4165,7 +4179,7 @@ mod tests {
                 bad(&|g| g.status = proto::GoalStatus::Complete.into()),
                 "evidence",
             ),
-            (bad(&|g| g.budget = 0), "budget"),
+            (bad(&|g| g.deadline = Some("friday".into())), "deadline"),
             (bad(&|g| g.iteration = 51), "more than its budget"),
             (bad(&|g| g.set_by = "mallory".into()), "owner"),
             (bad(&|g| g.changed_by = "someone".into()), "changed_by"),
@@ -4191,6 +4205,18 @@ mod tests {
         done.evidence = "v1.0 tagged".into();
         report(&mut conn, Some(done)).unwrap();
         assert_eq!(stored(&mut conn).0.unwrap().evidence, "v1.0 tagged");
+        // No turn budget, and a deadline, read back in stored form.
+        let mut open_ended = goal(proto::GoalStatus::Expired);
+        open_ended.budget = 0;
+        open_ended.iteration = 120;
+        open_ended.deadline = Some("2026-11-10T18:00:00Z".into());
+        report(&mut conn, Some(open_ended)).unwrap();
+        let g = stored(&mut conn).0.unwrap();
+        assert_eq!(
+            (g.status(), g.budget, g.iteration),
+            (proto::GoalStatus::Expired, 0, 120)
+        );
+        assert_eq!(g.deadline.as_deref(), Some("2026-11-10T18:00:00.000000Z"));
         // A blocked goal keeps the blocker it waits on.
         let mut blocked = goal(proto::GoalStatus::Blocked);
         blocked.blocker_id = Some(12);
@@ -4232,6 +4258,20 @@ mod tests {
             .messages;
         let got: Vec<_> = mail.iter().filter_map(|m| m.control).collect();
         assert_eq!(got, kinds.map(i32::from).to_vec());
+        // A deadline control carries a time, or nothing to clear it.
+        assert!(control(&mut conn, "friday", proto::Control::GoalDeadline).is_err());
+        for body in ["2026-11-10T18:00:00Z", "none"] {
+            control(&mut conn, body, proto::Control::GoalDeadline).unwrap();
+        }
+        let mail = read(&mut conn, &mateo, proto::ReadRequest::default())
+            .unwrap()
+            .messages;
+        let got: Vec<_> = mail.iter().map(|m| (m.control, m.body.as_str())).collect();
+        let deadline = Some(proto::Control::GoalDeadline.into());
+        assert_eq!(
+            got,
+            [(deadline, "2026-11-10T18:00:00Z"), (deadline, "none")]
+        );
         // Retirement clears the report.
         report(&mut conn, Some(goal(proto::GoalStatus::Active))).unwrap();
         bye(&mut conn, &mateo).unwrap();

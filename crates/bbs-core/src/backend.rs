@@ -499,7 +499,8 @@ impl Backend {
                 Ok(proto::Control::GoalSet
                     | proto::Control::GoalPause
                     | proto::Control::GoalResume
-                    | proto::Control::GoalClear)
+                    | proto::Control::GoalClear
+                    | proto::Control::GoalDeadline)
             )
         });
         match self {

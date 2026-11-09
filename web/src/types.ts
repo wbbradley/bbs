@@ -9,6 +9,8 @@ export const Control = {
   GoalPause: 4,
   GoalResume: 5,
   GoalClear: 6,
+  /** Body: an RFC 3339 deadline, or "none". */
+  GoalDeadline: 7,
 } as const;
 export const GoalStatus = {
   Active: 1,
@@ -18,6 +20,7 @@ export const GoalStatus = {
   Paused: 5,
   Limited: 6,
   Stalled: 7,
+  Expired: 8,
 } as const;
 export const BlockerStatus = { Open: 1, Answered: 2, Cancelled: 3, Superseded: 4 } as const;
 export const BlockerChoiceMode = { SelectOne: 1, SelectMany: 2 } as const;
@@ -132,6 +135,8 @@ export interface GoalReport {
   changed_by: string;
   /** Blocked: the first version of the agent's blocker it waits on. */
   blocker_id?: number | null;
+  /** When the goal expires, RFC 3339; absent for no deadline. */
+  deadline?: string | null;
 }
 
 export interface Human {

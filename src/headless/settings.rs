@@ -37,7 +37,8 @@ pub struct Settings {
     /// Turns that may fail in a row before `run` stops.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turn_errors: Option<NonZeroU32>,
-    /// Goal prompts per goal before the runner stops it as limited.
+    /// Goal prompts per goal before the runner stops it as limited; no limit
+    /// when unset. A goal's deadline is the usual bound.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal_turn_budget: Option<NonZeroU32>,
     /// The longest an agent may wait on its goal, like "24h".
@@ -216,9 +217,9 @@ impl Settings {
         }
     }
 
+    /// The turn budget for goals, or 0 for none.
     pub fn goal_turn_budget(&self) -> u32 {
-        self.goal_turn_budget
-            .map_or(super::goal::DEFAULT_BUDGET, NonZeroU32::get)
+        self.goal_turn_budget.map_or(0, NonZeroU32::get)
     }
 
     pub fn goal_max_wait(&self) -> Result<Duration> {
@@ -299,7 +300,7 @@ env = { RUST_LOG = "warn" }
         let s = parse("[headless.harness.omp]\ncommand = [\"omp\", \"acp\"]\n").unwrap();
         assert_eq!(s.harness(None).unwrap().0, "omp");
         assert_eq!(s.min_turn_interval().unwrap(), DEFAULT_MIN_TURN_INTERVAL);
-        assert_eq!(s.goal_turn_budget(), super::super::goal::DEFAULT_BUDGET);
+        assert_eq!(s.goal_turn_budget(), 0, "no turn budget unless set");
         assert_eq!(
             s.goal_max_wait().unwrap(),
             super::super::goal::DEFAULT_MAX_WAIT

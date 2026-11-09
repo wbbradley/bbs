@@ -467,6 +467,9 @@ enum Control {
   CONTROL_GOAL_PAUSE = 4;
   CONTROL_GOAL_RESUME = 5;
   CONTROL_GOAL_CLEAR = 6;
+  // Set the goal's deadline to the RFC 3339 time in `body`, or clear it with
+  // `none`. Servers before 0.23.0 refuse it as an unknown control.
+  CONTROL_GOAL_DEADLINE = 7;
 }
 
 message SendRequest {
@@ -539,12 +542,13 @@ message ReportEffortResponse {}
 enum GoalStatus {
   GOAL_STATUS_UNSPECIFIED = 0;
   GOAL_STATUS_ACTIVE = 1;    // the runner sends prompts toward it
-  GOAL_STATUS_WAITING = 2;   // the agent waits until wake_at, or for mail
-  GOAL_STATUS_BLOCKED = 3;   // the agent needs a person or agent; waits for mail
+  GOAL_STATUS_WAITING = 2;   // the agent waits until wake_at, or until it ends the wait
+  GOAL_STATUS_BLOCKED = 3;   // the agent waits on its blocker
   GOAL_STATUS_COMPLETE = 4;  // the agent met it, with evidence
   GOAL_STATUS_PAUSED = 5;    // the owner paused it (or cancelled a turn)
   GOAL_STATUS_LIMITED = 6;   // the runner stopped at the turn budget
   GOAL_STATUS_STALLED = 7;   // the runner stopped after turns with no progress
+  GOAL_STATUS_EXPIRED = 8;   // the deadline passed (runners from 0.23.0)
 }
 message GoalReport {
   string objective = 1;              // 1 to 4096 bytes, as the owner set it
@@ -552,7 +556,7 @@ message GoalReport {
   string set_by = 3;                 // the human who set it: the agent's owner
   string set_at = 4;                 // RFC 3339
   uint32 iteration = 5;              // goal prompts sent
-  uint32 budget = 6;                 // the most goal prompts before LIMITED
+  uint32 budget = 6;                 // the most goal prompts before LIMITED; 0: no limit
   string reason = 7;                 // why the status last changed; may be empty
   string evidence = 8;               // COMPLETE: what shows it is met
   optional string wake_at = 9;       // WAITING with a time: RFC 3339
@@ -560,6 +564,9 @@ message GoalReport {
   // BLOCKED: the first version (root) of the agent's blocker it waits on.
   // Absent from runners before 0.22.0.
   optional int64 blocker_id = 11;
+  // When the goal expires, RFC 3339; absent for a goal with no deadline.
+  // Servers before 0.23.0 drop it, and refuse a budget of 0.
+  optional string deadline = 12;
 }
 // No goal clears the stored report; its time is still recorded, so clients
 // know a goal-capable runner drives the agent.

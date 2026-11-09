@@ -8,6 +8,24 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- Goal deadlines. `bbs headless goal <agent> set "<objective>" --until <time>`
+  or `--for <duration>`, and `bbs headless goal <agent> deadline <time |
+  duration | none>`, send the new `CONTROL_GOAL_DEADLINE`. When the deadline
+  passes, a goal still in progress stops with the new status `expired`, even
+  while waiting or blocked; a later deadline resumes it. The web Goal dialog
+  takes an optional deadline, and the goal strip shows it with a "+1 day"
+  button. `GoalReport` carries `deadline`.
+
+### Changed
+
+- Goals have no turn limit unless `goal_turn_budget` is set; `GoalReport`
+  reports a budget of 0 for none, and goal headers read "turn N" (or "turn N
+  of M") instead of "budget N/M turns". The runner applies its setting to its
+  goal whenever it starts. Roll out the server first: servers before 0.23.0
+  refuse the deadline control and reports with no budget.
+
 ### Changed
 
 - Goal prompts restate the objective and instructions only when the goal is

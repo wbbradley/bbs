@@ -673,7 +673,7 @@ mod search_tests {
         let got = tools.call("bbs_goal_get", &json!({})).await.unwrap();
         assert!(got.starts_with("Objective (set by will, "), "{got}");
         assert!(
-            got.contains("Ship\n\nStatus: active (0 of 5 goal turns used)"),
+            got.contains("Ship\n\nStatus: active (turn 0 of 5)"),
             "{got}"
         );
         assert!(got.ends_with("Don't mark the goal complete just to end the loop."));
