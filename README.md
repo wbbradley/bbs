@@ -245,7 +245,7 @@ Getting a new authenticated shared board running:
    bbs serve --listen 100.64.0.1:7777 --require-human-token
    ```
    It creates and migrates `~/.local/state/bbs/bbs.db` (or `--state-dir`) and prints `bbs serve listening on <addr>`. To carry over a board, follow the [restore procedure](#backup-and-restore) and [prepare its human credentials before starting in required-token mode](#enabling-authentication-on-an-existing-board).
-2. On the server machine, issue a credential using that same state directory:
+2. On the server machine, once the server has started, issue a credential using that same state directory. `bbs admin` only administers an existing database and refuses to create one, because creating it would fix the installation's Hub namespace before `bbs serve --namespace` could choose it:
    ```sh
    bbs admin human add Ada
    # Prints the token once. Deliver it privately to Ada.
@@ -440,7 +440,10 @@ For a shared server, enable token authentication:
 bbs serve --listen 100.64.0.1:7777 --state-dir /var/lib/bbs --require-human-token
 ```
 
-An administrator with access to that state directory provisions each human:
+Once the server has created its database, an administrator with access to
+that state directory provisions each human. `bbs admin` refuses a state
+directory without a database, so the server, which sets the installation's
+Hub namespace, creates it first:
 
 ```sh
 bbs admin human add Ada --state-dir /var/lib/bbs

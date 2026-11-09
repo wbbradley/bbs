@@ -17,6 +17,13 @@ under the new package version and its publication date.
 - `bbs serve --namespace NS` names the Hub namespace a new database is created
   in (default `bbs`); an existing database must match it.
 
+### Breaking Changes
+
+- Registering an agent fails when its Hub ID, the owner's ID, `/` and the
+  agent's name, would exceed Hub's 128-character limit, with an error saying
+  so. 0.24 accepted such names: a 64-character human could register a
+  64-character agent. Choose a shorter agent (or human) name.
+
 ### Changed
 
 - Protocol epoch 3. Clients and servers before the Hub model speak epoch 2 and
@@ -30,8 +37,6 @@ under the new package version and its publication date.
   bbs.v2, epoch 3`); it printed the epoch as a package version.
 - `bbs admin` refuses to create a database: start the server (with its
   `--namespace`) or run `bbs init` first, so the namespace is chosen there.
-- Registering an agent whose Hub ID, `owner/name`, would exceed 128
-  characters fails with an error saying so.
 - The server and local mode run on the Hub model (schema 27): messages and
   deliveries refer to entity addresses, and every new human, agent and group
   gets an entity ID. Local behaviour is unchanged. A new database is created at
