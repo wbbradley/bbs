@@ -255,6 +255,7 @@ dependencies = [
  "clap",
  "data-encoding",
  "humantime",
+ "prost",
  "rand 0.9.5",
  "rusqlite",
  "semver",

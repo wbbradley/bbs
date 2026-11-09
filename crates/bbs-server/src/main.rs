@@ -73,6 +73,11 @@ struct Serve {
     /// Secure; an http one serves sign-in and sessions in plain text.
     #[arg(long, value_name = "URL", requires = "web")]
     web_origin: Option<String>,
+    /// Also serve Hub's integration stream for an adapter on this address
+    /// (for example 127.0.0.1:7779). It authenticates with an integration
+    /// credential from `bbs admin integration add`. Off when not given.
+    #[arg(long, value_name = "ADDR")]
+    integration_listen: Option<std::net::SocketAddr>,
     /// Directory holding bbs.db (default: ~/.local/state/bbs).
     #[arg(long)]
     state_dir: Option<PathBuf>,
@@ -137,6 +142,7 @@ async fn run(args: Serve) -> Result<()> {
             addr,
             origin: args.web_origin,
         }),
+        args.integration_listen,
         &dir,
         args.namespace.as_deref(),
         args.require_human_token,

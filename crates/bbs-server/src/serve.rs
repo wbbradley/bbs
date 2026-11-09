@@ -24,6 +24,7 @@ use crate::proto::{self, Kind};
 use crate::protocol::Policy;
 use crate::service::{self, Caller, TimerLimits, Watched};
 
+mod integration;
 mod web;
 
 /// Keepalive pings let a vanished client free its waiter slot within ~30s.
@@ -48,6 +49,7 @@ pub struct Web {
 pub async fn run(
     listen: SocketAddr,
     web: Option<Web>,
+    integration: Option<SocketAddr>,
     dir: &Path,
     namespace: Option<&str>,
     require_human_token: bool,
@@ -61,6 +63,7 @@ pub async fn run(
         conn,
         listen,
         web,
+        integration,
         dir,
         require_human_token,
         protocol,
@@ -73,6 +76,7 @@ async fn serve(
     conn: Connection,
     listen: SocketAddr,
     web: Option<Web>,
+    integration: Option<SocketAddr>,
     dir: &Path,
     require_human_token: bool,
     protocol: Policy,
@@ -95,6 +99,23 @@ async fn serve(
         }
         None => None,
     };
+    let integration = match integration {
+        Some(addr) => Some(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding {addr}"))?,
+        ),
+        None => None,
+    };
+    // Handoffs a stopped server left attempted are uncertain: they become
+    // unknown, and nothing offers them again.
+    let interrupted = service::integration::interrupt_attempted(&conn)?;
+    if interrupted > 0 {
+        tracing::warn!(
+            interrupted,
+            "integration handoffs interrupted by the last stop are now unknown"
+        );
+    }
     let state = Arc::new(State {
         conn: Mutex::new(conn),
         notify: watch::Sender::new(0),
@@ -135,6 +156,24 @@ async fn serve(
         }
         None => None,
     };
+    type Listener = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+    let mut integration: Option<Listener> = match integration {
+        Some(listener) => {
+            let integration_addr = listener.local_addr()?;
+            println!("bbs serve integration stream on {integration_addr}");
+            tracing::info!(%integration_addr, "serving the integration stream");
+            let server = tonic::transport::Server::builder()
+                .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+                .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
+                .add_service(integration::service(state.clone()))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), {
+                    let state = state.clone();
+                    async move { state.stopping().await }
+                });
+            Some(Box::pin(async move { Ok(server.await?) }))
+        }
+        None => None,
+    };
     tracing::info!(%addr, state_dir = %dir.display(), "serving");
     tokio::select! {
         result = &mut server => result?,
@@ -148,6 +187,15 @@ async fn serve(
             result?;
             anyhow::bail!("the web UI stopped serving");
         }
+        result = async {
+            match integration.as_mut() {
+                Some(integration) => integration.await,
+                None => std::future::pending().await,
+            }
+        } => {
+            result?;
+            anyhow::bail!("the integration listener stopped serving");
+        }
         result = signal => {
             result?;
             health.set_not_serving::<BbsServer<Server>>().await;
@@ -160,9 +208,16 @@ async fn serve(
                         None => Ok(()),
                     }
                 };
-                let (grpc, web) = tokio::join!(&mut server, web);
+                let integration = async {
+                    match integration.as_mut() {
+                        Some(integration) => integration.await,
+                        None => Ok(()),
+                    }
+                };
+                let (grpc, web, integration) = tokio::join!(&mut server, web, integration);
                 grpc?;
-                web
+                web?;
+                integration
             };
             match tokio::time::timeout(SHUTDOWN_GRACE, drained).await {
                 Ok(result) => result?,
@@ -414,6 +469,11 @@ impl State {
                     Status::unauthenticated(err.to_string())
                 } else if err.downcast_ref::<service::SyncPageTooLarge>().is_some() {
                     Status::resource_exhausted(err.to_string())
+                } else if err
+                    .downcast_ref::<service::integration::InvalidFrame>()
+                    .is_some()
+                {
+                    Status::invalid_argument(err.to_string())
                 } else {
                     Status::failed_precondition(format!("{err:#}"))
                 }
