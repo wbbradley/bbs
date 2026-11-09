@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use rusqlite::types::Value;
 
 use super::*;
-use crate::db::migrate;
+use crate::db::{migrate, migrate_legacy};
 
 const T: &str = "2026-10-08T14:02:11.123456Z";
 
@@ -29,7 +29,7 @@ fn file_fixture(path: &std::path::Path) -> Connection {
 }
 
 fn fill(conn: &mut Connection) {
-    migrate(conn).unwrap();
+    migrate_legacy(conn).unwrap();
     let sql = "
         INSERT INTO humans VALUES (1, 'will', 'T', 'T'), (2, 'ann.lee', 'T', 'T');
         INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at, retired_at) VALUES
@@ -335,10 +335,10 @@ fn migration_preserves_history_and_maps_names() {
     assert_eq!(
         renamed,
         [
-            (HubKind::Human, 2, "ann-lee"),
-            (HubKind::Agent, 1, "will/scout-retired-2026-10-08"),
-            (HubKind::Agent, 3, "ann-lee/a-b"),
-            (HubKind::Agent, 5, "will/probe-retired-2026-10-08"),
+            (EntityKind::Human, 2, "ann-lee"),
+            (EntityKind::Agent, 1, "will/scout-retired-2026-10-08"),
+            (EntityKind::Agent, 3, "ann-lee/a-b"),
+            (EntityKind::Agent, 5, "will/probe-retired-2026-10-08"),
         ]
     );
 
@@ -364,13 +364,22 @@ fn migration_preserves_history_and_maps_names() {
             .is_err()
     );
 
-    // Startup and a second cutover both refuse the migrated database.
-    let err = migrate(&mut conn).unwrap_err().to_string();
-    assert!(
-        err.contains("this database was migrated to the Hub model")
-            && err.contains("this binary does not support it"),
-        "{err}"
+    // Startup serves the migrated database, in its namespace, unchanged; a
+    // second cutover refuses it.
+    assert_eq!(
+        rows(&conn, "SELECT namespace FROM bbs_installation"),
+        [format!("{:?}", [Value::Text("will".into())])]
     );
+    let before = dump(&conn);
+    migrate(&mut conn).unwrap();
+    crate::db::migrate_in(&mut conn, Some("will")).unwrap();
+    assert!(
+        crate::db::migrate_in(&mut conn, Some("work"))
+            .unwrap_err()
+            .to_string()
+            .contains("namespace is \"will\", not \"work\"")
+    );
+    assert_eq!(dump(&conn), before);
     assert!(
         migrate_to_hub_model(&mut conn, "will")
             .unwrap_err()
@@ -561,11 +570,24 @@ fn bad_namespace_refuses() {
 }
 
 #[test]
-fn startup_on_schema_26_is_unchanged() {
+fn startup_refuses_schema_26_unchanged() {
     let mut conn = fixture();
     let before = dump(&conn);
-    migrate(&mut conn).unwrap();
+    let err = migrate(&mut conn).unwrap_err().to_string();
+    assert!(
+        err.contains("at BBS schema v26, before the Hub model")
+            && err.contains("bbs-server migrate-hub-model"),
+        "{err}"
+    );
+    // An older schema is refused too, rather than migrated part way.
+    conn.pragma_update(None, "user_version", 20).unwrap();
+    let older = dump(&conn);
+    let err = migrate(&mut conn).unwrap_err().to_string();
+    assert!(err.contains("open it once with bbs 0.24"), "{err}");
+    assert_eq!(dump(&conn), older);
+    conn.pragma_update(None, "user_version", 26).unwrap();
     assert_eq!(dump(&conn), before);
+    assert!(foreign_keys_on(&conn));
 }
 
 /// Every message/delivery index before the cutover and its equivalent after.
@@ -736,7 +758,7 @@ fn refuses_while_another_connection_uses_the_database() {
 /// each agent's entity ID, and the blocking issues.
 fn scope(agents: &[(i64, &str, Option<&str>)]) -> (BTreeMap<i64, String>, Vec<String>) {
     let mut conn = Connection::open_in_memory().unwrap();
-    migrate(&mut conn).unwrap();
+    migrate_legacy(&mut conn).unwrap();
     conn.execute("INSERT INTO humans VALUES (1, 'will', 't', 't')", [])
         .unwrap();
     for &(id, name, retired_at) in agents {
@@ -753,7 +775,7 @@ fn scope(agents: &[(i64, &str, Option<&str>)]) -> (BTreeMap<i64, String>, Vec<St
     let ids = report
         .mappings
         .iter()
-        .filter(|m| m.kind == HubKind::Agent)
+        .filter(|m| m.kind == EntityKind::Agent)
         .map(|m| (m.native_id, m.entity_id.clone()))
         .collect();
     (ids, report.issues)

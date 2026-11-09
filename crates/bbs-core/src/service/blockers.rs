@@ -385,8 +385,13 @@ pub fn answer_blocker(
             row.id, row.group, row.body, answer.text
         );
         super::validate_body(&body)?;
-        let message_id = db::insert_message(ctx.conn, &actor, None, &body, &ctx.now_s)?;
-        db::insert_delivery(ctx.conn, message_id, Kind::Agent, row.creator.id)?;
+        let message_id = db::insert_message(
+            ctx.conn,
+            &actor,
+            db::To::Direct(Kind::Agent, row.creator.id),
+            &body,
+            &ctx.now_s,
+        )?;
         db::record_human_conversation(ctx.conn, row.creator.id, actor.id, &ctx.now_s)?;
         store::event(
             ctx.conn,
@@ -449,8 +454,13 @@ pub fn cancel_blocker(
             } else {
                 head
             };
-            let id = db::insert_message(ctx.conn, &actor, None, &body, &ctx.now_s)?;
-            db::insert_delivery(ctx.conn, id, Kind::Agent, row.creator.id)?;
+            let id = db::insert_message(
+                ctx.conn,
+                &actor,
+                db::To::Direct(Kind::Agent, row.creator.id),
+                &body,
+                &ctx.now_s,
+            )?;
             if actor.kind == Kind::Human {
                 db::record_human_conversation(ctx.conn, row.creator.id, actor.id, &ctx.now_s)?;
             }
@@ -1042,6 +1052,7 @@ mod tests {
         .unwrap();
         // Archived history is outside a queue based on current active groups.
         assert!(list(&mut b, &will, None, true).blockers.is_empty());
+        crate::db::date_retired_entity_ids(&b.conn);
         service::group_register(
             &mut b.conn,
             &will,
@@ -1227,6 +1238,7 @@ mod tests {
         )
         .unwrap();
         check(&mut b, [1, 0, 1]);
+        crate::db::date_retired_entity_ids(&b.conn);
         service::group_register(
             &mut b.conn,
             &b.humans[0],
@@ -1254,6 +1266,7 @@ mod tests {
         let mut b = Board::memory();
         b.put(0, "original agent", None, "old");
         service::bye(&mut b.conn, &b.agents[0]).unwrap();
+        crate::db::date_retired_entity_ids(&b.conn);
         let registered = service::register(
             &mut b.conn,
             &b.humans[0],
@@ -1398,10 +1411,17 @@ mod tests {
         assert_eq!(answered.message_id, again.message_id);
         assert_eq!(b.messages(), before + 1);
         assert_eq!(b.list().active_count, 0);
-        let recipient: i64 = b.conn.query_row(
-            "SELECT recipient_id FROM deliveries WHERE message_id = ?1 AND recipient_kind = 'agent'",
-            [answered.message_id.unwrap()], |r| r.get(0),
-        ).unwrap();
+        let recipient: i64 = b
+            .conn
+            .query_row(
+                "SELECT b.agent_id FROM deliveries d
+             JOIN entity_addresses a ON a.id = d.recipient_address_id
+             JOIN entity_local_bindings b ON b.entity_id = a.entity_id
+             WHERE d.message_id = ?1 AND b.agent_id IS NOT NULL",
+                [answered.message_id.unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(recipient, b.ids[1]);
         let history = get_blocker(
             &mut b.conn,
@@ -1609,7 +1629,9 @@ mod tests {
             .conn
             .prepare(
                 "SELECT m.body FROM messages m JOIN deliveries d ON d.message_id = m.id
-                 WHERE d.recipient_kind = 'agent' AND d.recipient_id = ?1
+                 JOIN entity_addresses a ON a.id = d.recipient_address_id
+                 JOIN entity_local_bindings b ON b.entity_id = a.entity_id
+                 WHERE b.agent_id = ?1
                    AND m.body LIKE 'Blocker #% was cancelled by %' ORDER BY m.id",
             )
             .unwrap();
@@ -1661,7 +1683,9 @@ mod tests {
         let sender: String = b
             .conn
             .query_row(
-                "SELECT from_kind FROM messages WHERE id = ?1",
+                "SELECT CASE WHEN b.agent_id IS NULL THEN 'human' ELSE 'agent' END
+                 FROM messages m JOIN entity_addresses a ON a.id = m.sender_address_id
+                 JOIN entity_local_bindings b ON b.entity_id = a.entity_id WHERE m.id = ?1",
                 [notice],
                 |r| r.get(0),
             )
@@ -2052,6 +2076,7 @@ mod tests {
             },
         )
         .unwrap();
+        crate::db::date_retired_entity_ids(&b.conn);
         service::group_register(
             &mut b.conn,
             &b.humans[0],

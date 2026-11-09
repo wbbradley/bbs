@@ -24,7 +24,7 @@ type Client = BbsClient<
 
 fn with_contract(mut req: Request<()>) -> Result<Request<()>, tonic::Status> {
     req.metadata_mut()
-        .insert("bbs-protocol-epoch", "2".parse().unwrap());
+        .insert("bbs-protocol-epoch", "3".parse().unwrap());
     req.metadata_mut().insert(
         "bbs-client-version",
         env!("CARGO_PKG_VERSION").parse().unwrap(),
@@ -123,7 +123,7 @@ fn as_human<T>(name: &str, msg: T) -> Request<T> {
 fn contract<T>(msg: T) -> Request<T> {
     let mut req = Request::new(msg);
     req.metadata_mut()
-        .insert("bbs-protocol-epoch", "2".parse().unwrap());
+        .insert("bbs-protocol-epoch", "3".parse().unwrap());
     req.metadata_mut().insert(
         "bbs-client-version",
         env!("CARGO_PKG_VERSION").parse().unwrap(),
@@ -168,7 +168,7 @@ async fn incompatible_requests_do_not_touch_state_or_claim_stream_slots() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(err.metadata().get("bbs-protocol-epoch").unwrap(), "2");
+    assert_eq!(err.metadata().get("bbs-protocol-epoch").unwrap(), "3");
     let mut request = contract(proto::RegisterRequest {
         name: Some("MustNotExist".into()),
         ..Default::default()
@@ -248,7 +248,7 @@ async fn incompatible_requests_do_not_touch_state_or_claim_stream_slots() {
         .wait_for_mail(as_agent(&agent.token, proto::WaitRequest { limit: None }))
         .await
         .unwrap();
-    assert_eq!(idle.metadata().get("bbs-protocol-epoch").unwrap(), "2");
+    assert_eq!(idle.metadata().get("bbs-protocol-epoch").unwrap(), "3");
 }
 
 #[tokio::test]
@@ -265,7 +265,7 @@ async fn minimum_policy_preserves_public_diagnostics_and_error_hints() {
     );
     let mut raw = server.raw_client().await;
     let info = raw.server_info(proto::Empty {}).await.unwrap().into_inner();
-    assert_eq!(info.protocol_epoch, Some(2));
+    assert_eq!(info.protocol_epoch, Some(3));
     assert_eq!(info.release.unwrap().version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.minimum_client_version.as_deref(), Some("9999.0.0"));
     assert_eq!(info.recommended_client_version.as_deref(), Some("9999.1.0"));
@@ -352,7 +352,12 @@ async fn register_as(
         .await
         .unwrap();
     let req = proto::RegisterRequest {
-        name: name.map(str::to_string),
+        // Registration requires a name; default to a fresh one.
+        name: Some(name.map(str::to_string).unwrap_or_else(|| {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("Agent{n}")
+        })),
         note: Some("testing".into()),
         pwd: "/tmp".into(),
         hostname: "test".into(),
@@ -389,6 +394,20 @@ async fn serve_round_trip_and_wait_for_mail() {
         .group_register(as_human("will", register))
         .await
         .unwrap();
+
+    // The server refuses a registration without a name, as old clients sent.
+    for name in [None, Some(String::new())] {
+        let req = proto::RegisterRequest {
+            name,
+            ..Default::default()
+        };
+        let status = client.register(as_human("will", req)).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().starts_with("an agent name is required"),
+            "{status:?}"
+        );
+    }
 
     let a = register_as(&mut client, "will", Some("Jeffrey")).await;
     let b = register_as(&mut client, "ada", None).await;
@@ -2098,4 +2117,67 @@ async fn search_is_advertised_and_returns_bounded_hits_over_the_wire() {
         .into_inner();
     assert_eq!(unread.messages.len(), 1);
     assert_eq!(unread.messages[0].body, body);
+}
+
+/// An epoch-2 client (before the Hub model) stops at its first request.
+#[tokio::test]
+async fn epoch_two_clients_are_refused() {
+    let server = Server::start("epoch-two");
+    let mut raw = server.raw_client().await;
+    let mut request = contract(proto::EnsureHumanRequest { name: "old".into() });
+    request
+        .metadata_mut()
+        .insert("bbs-protocol-epoch", "2".parse().unwrap());
+    let err = raw.ensure_human(request).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("requires epoch 3"), "{err}");
+    assert_eq!(err.metadata().get("bbs-protocol-epoch").unwrap(), "3");
+}
+
+/// `bbs serve` with `args` in `home`, expected to exit at once; its stderr.
+fn serve_fails(home: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_bbs"))
+        .args(["serve", "--listen", "127.0.0.1:0"])
+        .args(args)
+        .env("HOME", home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    String::from_utf8(output.stderr).unwrap()
+}
+
+#[test]
+fn a_new_database_takes_the_namespace_and_a_legacy_one_is_refused() {
+    let server = Server::start_options("namespace", false, &["--namespace", "acme"]);
+    let path = server.home.join(".local/state/bbs/bbs.db");
+    let namespace: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT namespace FROM bbs_installation", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(namespace, "acme");
+    let err = serve_fails(&server.home, &["--namespace", "other"]);
+    assert!(err.contains(r#"namespace is "acme", not "other""#), "{err}");
+
+    // A schema-26 board is never migrated on start.
+    let home = server.home.join("legacy");
+    let state = home.join(".local/state/bbs");
+    std::fs::create_dir_all(&state).unwrap();
+    let mut db = bbs_core::db::open(&state.join("bbs.db")).unwrap();
+    bbs_core::db::migrate_legacy(&mut db).unwrap();
+    db.execute(
+        "INSERT INTO humans (name, created_at, active_at) VALUES ('will', 't', 't')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let err = serve_fails(&home, &[]);
+    assert!(
+        err.contains("schema v26, before the Hub model") && err.contains("migrate-hub-model"),
+        "{err}"
+    );
+    let version: i64 = rusqlite::Connection::open(state.join("bbs.db"))
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 26);
 }

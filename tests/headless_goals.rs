@@ -16,7 +16,7 @@ struct Rig {
 
 fn req<T>(message: T) -> Request<T> {
     let mut r = Request::new(message);
-    for (key, value) in [("bbs-protocol-epoch", "2"), ("bbs-human", "tester")] {
+    for (key, value) in [("bbs-protocol-epoch", "3"), ("bbs-human", "tester")] {
         r.metadata_mut().insert(key, value.parse().unwrap());
     }
     r

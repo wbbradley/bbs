@@ -71,6 +71,11 @@ recover the new token. A server refuses rotation unless it runs with
 mode allows it. Right after a takeover, the old token's `read --wait` may hold
 the inbox for a moment; `run` retries briefly before reporting another driver.
 Stopping the process does not retire the agent; use `bbs bye` or `bbs retire`.
+An idle agent is never retired, so restarting `run` with the same name takes it
+back. Pick a short, descriptive `<agent>` name for its role, such as `reviewer`
+or `docs-bot`. A retired agent's name never comes back: `run` with it is
+refused (`... belongs to a retired agent; Hub IDs are never reused. Choose
+another name.`), so start the new agent under another name.
 
 ## Preparing for a restart
 

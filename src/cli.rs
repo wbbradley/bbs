@@ -64,16 +64,18 @@ pub enum Command {
     },
     /// Register a new agent and print its name and token.
     Register {
-        /// Requested agent name; fail if already reserved (case-insensitive).
+        /// The agent's name, short and descriptive; fails if already reserved
+        /// (case-insensitive) or ever used by one of your agents.
         #[arg(long)]
-        name: Option<String>,
+        name: String,
         /// Initial status note.
         #[arg(long)]
         note: Option<String>,
     },
     /// Update this agent's status note.
     Status { text: String },
-    /// Retire this agent, freeing its name and invalidating its token.
+    /// Retire this agent and invalidate its token. Its owner cannot reuse its
+    /// name: Hub IDs are never reused.
     Bye,
     /// Retire another agent and announce it to its groups (humans only).
     Retire { agent: String },

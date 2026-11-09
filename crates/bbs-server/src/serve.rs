@@ -49,13 +49,14 @@ pub async fn run(
     listen: SocketAddr,
     web: Option<Web>,
     dir: &Path,
+    namespace: Option<&str>,
     require_human_token: bool,
     protocol: Policy,
     timer_limits: TimerLimits,
 ) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut conn = db::open(&dir.join("bbs.db"))?;
-    db::migrate(&mut conn)?;
+    db::migrate_in(&mut conn, namespace)?;
     serve(
         conn,
         listen,
@@ -1618,7 +1619,10 @@ mod tests {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT count(*) FROM deliveries WHERE recipient_kind = 'human'",
+                "SELECT count(*) FROM deliveries d
+                     JOIN entity_addresses a ON a.id = d.recipient_address_id
+                     JOIN entity_local_bindings b ON b.entity_id = a.entity_id
+                     WHERE b.human_id IS NOT NULL",
                 [],
                 |r| r.get(0),
             )
@@ -2612,7 +2616,7 @@ mod tests {
         let mut req = Request::new(message);
         req.metadata_mut().insert(key, value.parse().unwrap());
         req.metadata_mut()
-            .insert("bbs-protocol-epoch", "2".parse().unwrap());
+            .insert("bbs-protocol-epoch", "3".parse().unwrap());
         req
     }
 

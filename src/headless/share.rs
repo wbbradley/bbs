@@ -108,9 +108,10 @@ async fn connection(
     }
 }
 
-/// Whether retrying cannot help: an older server, or a token that is gone.
+/// Whether retrying cannot help: an older server, an incompatible protocol, or
+/// a token that is gone.
 fn permanent(err: &anyhow::Error) -> bool {
-    if format!("{err:#}").contains(AGENT_ACTIVITY) {
+    if format!("{err:#}").contains(AGENT_ACTIVITY) || crate::protocol::is_incompatible(err) {
         return true;
     }
     err.chain()
@@ -208,5 +209,15 @@ mod tests {
         assert!(permanent(&dead));
         let down = anyhow::Error::new(tonic::Status::unavailable("server is shutting down"));
         assert!(!permanent(&down));
+        // A server at another protocol epoch refuses every request.
+        let status = tonic::Status::failed_precondition(
+            "incompatible BBS protocol: this server requires epoch 4 (bbs.v2); upgrade the client and server together",
+        );
+        let message = status.message().to_string();
+        assert!(permanent(&anyhow::Error::new(status).context(message)));
+        let info = anyhow::anyhow!(
+            "incompatible BBS ServerInfo: expected protocol epoch 3; coordinate a client/server upgrade"
+        );
+        assert!(permanent(&info));
     }
 }

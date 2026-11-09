@@ -150,8 +150,14 @@ impl Bbs {
         self.register_with(&["register", "--note", "testing"])
     }
 
+    /// Register with `args`, adding a fresh `--name` when they have none.
     fn register_with(&self, args: &[&str]) -> (String, String) {
-        let out = self.ok(args);
+        let name = fresh_name();
+        let mut args = args.to_vec();
+        if !args.contains(&"--name") {
+            args.extend(["--name", &name]);
+        }
+        let out = self.ok(&args);
         let name = out.split('"').nth(1).unwrap().to_string();
         let token = out
             .split("--token ")
@@ -247,13 +253,15 @@ fn version_reports_identity_without_side_effects() {
             assert!(
                 ["clean", "dirty", "unknown"].contains(&report["provenance"].as_str().unwrap())
             );
-            assert_eq!(report["protocol"]["epoch"], 2);
+            assert_eq!(report["protocol"]["epoch"], 3);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
-            assert_eq!(report["schema_version"], bbs_core::db::SCHEMA_VERSION);
+            assert_eq!(report["schema_version"], 27);
             assert_eq!(report["config_format"], 4);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {
             assert!(stdout.starts_with(&format!("bbs {} (", env!("CARGO_PKG_VERSION"))));
+            assert!(stdout.contains("\nprotocol bbs.v2, epoch 3: "), "{stdout}");
+            assert!(stdout.contains("\nschema 27, "), "{stdout}");
         }
     }
     assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
@@ -328,11 +336,16 @@ fn requested_names_are_validated_and_reserved(mode: Mode) {
             .contains("in use by an agent")
     );
     assert!(
-        bbs.err(&["--as", "missing", "register"])
+        bbs.err(&["--as", "missing", "register", "--name", "Lost"])
             .contains("unknown human")
     );
+    // A name is required.
+    assert!(bbs.err(&["register"]).contains("--name <NAME>"));
+    assert!(
+        bbs.err(&["register", "--name="])
+            .contains("an agent name is required: register with a short, descriptive name")
+    );
     for invalid in [
-        "",
         "@Jeffrey",
         "Jeffrey@will",
         "two words",
@@ -355,11 +368,24 @@ fn requested_names_are_validated_and_reserved(mode: Mode) {
         count, 1,
         "failed requests must not register fallback identities"
     );
+    // A retired agent's Hub ID, will/Jeffrey, is never reused, in any case.
     bbs.ok(&["--token", &token, "bye"]);
-    let (name, replacement) = bbs.register_with(&["register", "--name", "Jeffrey"]);
-    assert_eq!(name, "Jeffrey");
-    assert_ne!(replacement, token);
+    for retired in ["Jeffrey", "JEFFREY"] {
+        let err = bbs.err(&["register", "--name", retired]);
+        assert!(
+            err.contains(&format!(
+                "agent name {retired} is unavailable: will/Jeffrey belongs to a retired agent; \
+                 Hub IDs are never reused. Choose another name."
+            )),
+            "{err}"
+        );
+    }
+    // `.` maps to `-`, so these two names share one Hub ID.
     bbs.register_with(&["register", "--name", "Agent_1.test-2"]);
+    assert!(
+        bbs.err(&["register", "--name", "Agent_1-test-2"])
+            .contains("will/Agent_1-test-2 belongs to an agent")
+    );
 }
 
 fn concurrent_registration_reserves_one_name(mode: Mode) {
@@ -724,7 +750,7 @@ fn init_writes_and_merges_config() {
     let bbs = Bbs::new("config");
     assert!(!config_path(&bbs).exists(), "plain init writes no config");
     // Bind a session, so a compaction hook would re-inject its identity.
-    let register_out = bbs.ok(&["register"]);
+    let register_out = bbs.ok(&["register", "--name", &fresh_name()]);
     hook(
         &bbs,
         serde_json::json!({
@@ -789,7 +815,7 @@ fn remote_backend_round_trip() {
     assert!(out.contains("Human: will"), "{out}");
 
     bbs.ok(&["group", "register", "acme"]);
-    let register_out = bbs.ok(&["register"]);
+    let register_out = bbs.ok(&["register", "--name", &fresh_name()]);
     let (a, ta) = bbs.register();
     let b = register_out.split('"').nth(1).unwrap();
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
@@ -1042,10 +1068,29 @@ fn humans_retire_agents(mode: Mode) {
     assert!(bbs.err(&["retire", &a]).contains("no live agent"));
 }
 
-fn stale_agents_are_retired_on_register(mode: Mode) {
-    let bbs = Bbs::with_mode("stale", mode);
-    let (a, ta) = bbs.register();
-    bbs.ok(&["send", "--to", &a, "old news"]);
+fn idle_agents_stay_live_and_restart_with_their_identity(mode: Mode) {
+    let bbs = Bbs::with_mode("idle", mode);
+    // A harness that exits at once: `run` fails after settling the token.
+    headless_config(&bbs, &["true"]);
+    let (zed, old) = bbs.register_with(&["register", "--name", "Zed"]);
+    bbs.ok(&["send", "--to", &zed, "old news"]);
+    let identity = || -> (i64, String) {
+        bbs.db()
+            .query_row(
+                "SELECT a.id, e.entity_id FROM agents a
+                 JOIN entity_local_bindings b ON b.agent_id = a.id
+                 JOIN entities e ON e.id = b.entity_id
+                 WHERE a.name = 'Zed' AND a.retired_at IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    let before = identity();
+    assert_eq!(before.1, "will/Zed");
+
+    // Idle well past a week, then another registration: Zed stays live, with
+    // its token and unread mail.
     bbs.db()
         .execute(
             "UPDATE agents SET active_at = '2000-01-01T00:00:00.000000Z'",
@@ -1053,19 +1098,34 @@ fn stale_agents_are_retired_on_register(mode: Mode) {
         )
         .unwrap();
     bbs.register();
+    assert_eq!(bbs.ok(&["--token", &old, "whoami"]), "Zed\n");
+
+    // A restart with no saved token takes the existing agent back.
+    let err = bbs.err(&["headless", "run", "Zed"]);
+    if matches!(mode, Mode::Remote) {
+        // The test server runs in trust mode, where owners cannot be verified.
+        assert!(err.contains("--require-human-token"), "{err}");
+    } else {
+        let new = headless_state(&bbs, "Zed")["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(new, old);
+        assert_eq!(identity(), before);
+        assert!(bbs.ok(&["--token", &new, "read"]).contains("old news"));
+    }
+
+    // After an explicit retirement a new run is refused: Hub IDs are never
+    // reused.
+    bbs.ok(&["retire", "Zed"]);
+    let err = bbs.err(&["headless", "run", "Zed"]);
     assert!(
-        bbs.err(&["--token", &ta, "read"])
-            .contains("unknown or retired token")
+        err.contains(
+            "agent name Zed is unavailable: will/Zed belongs to a retired agent; \
+             Hub IDs are never reused. Choose another name."
+        ),
+        "{err}"
     );
-    let unread: i64 = bbs
-        .db()
-        .query_row(
-            "SELECT COUNT(*) FROM deliveries WHERE archived_at IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(unread, 0);
 }
 
 fn human_name_is_reserved_and_permissions_enforced(mode: Mode) {
@@ -1243,45 +1303,26 @@ fn deleting_groups_archives_history_and_removes_access(mode: Mode) {
     assert!(retirement.contains("@other"));
     assert!(!retirement.contains("@acme"), "{retirement}");
 
-    // Reusing a name creates a new scope and never restores old membership.
-    bbs.ok(&["group", "register", "acme"]);
+    // An archived group's name stays its Hub ID: it is never registered again,
+    // and its history stays readable.
+    let err = bbs.err(&["group", "register", "acme"]);
     assert!(
-        bbs.err(&["group", "register", "acme"])
-            .contains("already exists")
+        err.starts_with(
+            "bbs: group name acme is unavailable: acme belongs to an archived group; \
+             Hub IDs are never reused. Choose another name."
+        ),
+        "{err}"
     );
-    assert!(!bbs.ok(&["--token", &tb, "group", "list"]).contains("acme"));
+    assert!(bbs.ok(&["group", "list"]).contains("@other"));
+    assert!(!bbs.ok(&["group", "list"]).contains("acme"));
     assert!(
         bbs.err(&["--token", &tb, "send", "--to", "@acme", "denied"])
-            .contains("not a member")
-    );
-    let (c, tc) = bbs.register();
-    bbs.ok(&["--token", &tc, "group", "join", "acme"]);
-    bbs.ok(&["send", "--to", "@acme", "new broadcast"]);
-    assert!(bbs.ok(&["--token", &tc, "read"]).contains("new broadcast"));
-    assert!(!bbs.ok(&["--token", &tb, "read"]).contains("new broadcast"));
-    assert!(
-        !bbs.ok(&["--token", &tc, "read", "--archived"])
-            .contains("retained broadcast")
-    );
-    assert!(
-        bbs.err(&["--token", &tb, "send", "--to", &c, "denied"])
-            .contains("not in any of your groups")
+            .contains("no such group")
     );
     assert!(
         bbs.ok(&["--token", &tb, "read", "--archived"])
             .contains("retained broadcast")
     );
-    let (old_id, new_id): (i64, i64) = db
-        .query_row(
-            "SELECT min(id), max(id) FROM bbs_groups WHERE name = 'acme'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_ne!(old_id, new_id);
-    bbs.ok(&["group", "delete", "acme"]);
-    bbs.ok(&["group", "register", "acme"]);
-    assert!(bbs.ok(&["group", "list"]).contains("@acme: (no agents)\n"));
 }
 
 fn group_archive_rolls_back_notice_on_failure(mode: Mode) {
@@ -1429,13 +1470,13 @@ fn groups_carry_human_written_descriptions(mode: Mode) {
             .contains("cannot be used with")
     );
 
-    // Reusing an archived name starts without the old description.
+    // An archived group keeps its description; its name is not registered again.
     bbs.ok(&["group", "delete", "infra"]);
-    bbs.ok(&["group", "register", "infra"]);
     assert!(
-        bbs.ok(&["group", "list"])
-            .starts_with("@infra: (no agents)\n@plain")
+        bbs.err(&["group", "register", "infra"])
+            .contains("infra belongs to an archived group")
     );
+    assert!(bbs.ok(&["group", "list"]).starts_with("@plain"));
     let stored: Vec<Option<String>> = bbs
         .db()
         .prepare("SELECT description FROM bbs_groups WHERE name = 'infra' ORDER BY id")
@@ -1444,7 +1485,7 @@ fn groups_carry_human_written_descriptions(mode: Mode) {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(stored, [Some("Fleet, deploys: and on-call".into()), None]);
+    assert_eq!(stored, [Some("Fleet, deploys: and on-call".into())]);
 }
 
 fn joining_notifies_the_group(mode: Mode) {
@@ -1595,7 +1636,8 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
             .contains("@acme has no agent writers.")
     );
 
-    // Retiring drops the grant: a new agent with that name lacks it.
+    // Retiring drops the grant, and its name is never registered again: a
+    // new agent lacks the grant.
     bbs.grant_write("acme", &a);
     bbs.ok(&["--token", &tb, "read"]);
     bbs.ok(&["--token", &ta, "bye"]);
@@ -1607,7 +1649,11 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
         .query_row("SELECT COUNT(*) FROM group_writers", [], |r| r.get(0))
         .unwrap();
     assert_eq!(writers, 0);
-    let (_, ta) = bbs.register_with(&["register", "--name", &a]);
+    assert!(
+        bbs.err(&["register", "--name", &a])
+            .contains("belongs to a retired agent")
+    );
+    let (_, ta) = bbs.register();
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
     assert!(
         bbs.err(&["--token", &ta, "send", "--to", "@acme", "x"])
@@ -1816,7 +1862,7 @@ fn active_at_writes_are_debounced(mode: Mode) {
 
 fn claude_code_hooks_bind_and_restore_identity(mode: Mode) {
     let bbs = Bbs::with_mode("hook", mode);
-    let register_out = bbs.ok(&["register"]);
+    let register_out = bbs.ok(&["register", "--name", &fresh_name()]);
     let (a, ta) = (
         register_out.split('"').nth(1).unwrap().to_string(),
         register_out
@@ -1872,14 +1918,14 @@ fn claude_code_hooks_bind_and_restore_identity(mode: Mode) {
     );
 
     // Re-registering in the same session retires the old identity.
-    let second = bbs.ok(&["register"]);
+    let second = bbs.ok(&["register", "--name", &fresh_name()]);
     hook(&bbs, post_tool("bbs register", &second));
     assert!(bbs.err(&["--token", &ta, "read"]).contains("retired"));
 }
 
 fn codex_hooks_bind_from_string_tool_response(mode: Mode) {
     let bbs = Bbs::with_mode("codex", mode);
-    let register_out = bbs.ok(&["register"]);
+    let register_out = bbs.ok(&["register", "--name", &fresh_name()]);
     let token = register_out
         .split("--token ")
         .nth(1)
@@ -2177,27 +2223,14 @@ fn read_wait_fails_if_retired_while_waiting(mode: Mode) {
     assert!(err.contains("retired"), "{err}");
 }
 
-#[test]
-fn old_schema_is_migrated_on_open_even_concurrently() {
-    let home = std::env::temp_dir().join(format!("bbs-test-{}-migrate", std::process::id()));
-    let _ = std::fs::remove_dir_all(&home);
-    let state = home.join(".local/state/bbs");
-    std::fs::create_dir_all(&state).unwrap();
-    let db = rusqlite::Connection::open(state.join("bbs.db")).unwrap();
-    db.execute_batch(include_str!("../crates/bbs-core/migrations/0001_init.sql"))
-        .unwrap();
-    db.execute_batch(
-        "PRAGMA user_version = 1;
-         INSERT INTO humans (name, created_at, active_at) VALUES ('will', 'x', 'x');",
-    )
-    .unwrap();
-    drop(db);
-
-    let children: Vec<_> = (0..8)
+/// `bbs agents` on a local board in `home`, run `n` times at once; each
+/// one's output.
+fn agents_concurrently(home: &std::path::Path, n: usize) -> Vec<std::process::Output> {
+    let children: Vec<_> = (0..n)
         .map(|_| {
             Command::new(env!("CARGO_BIN_EXE_bbs"))
                 .arg("agents")
-                .env("HOME", &home)
+                .env("HOME", home)
                 .env("USER", "will")
                 .env_remove("BBS_SERVER")
                 .stdout(Stdio::null())
@@ -2206,20 +2239,70 @@ fn old_schema_is_migrated_on_open_even_concurrently() {
                 .unwrap()
         })
         .collect();
-    for child in children {
-        let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let db = rusqlite::Connection::open(state.join("bbs.db")).unwrap();
-    let version: i64 = db
-        .pragma_query_value(None, "user_version", |r| r.get(0))
+    children
+        .into_iter()
+        .map(|child| child.wait_with_output().unwrap())
+        .collect()
+}
+
+fn user_version(db: &rusqlite::Connection) -> i64 {
+    db.pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn old_schema_is_refused_unchanged() {
+    // Schema 1 is too old to cut over; schema 26 needs the operator cutover.
+    let cases: [(i64, &str); 2] = [
+        (
+            1,
+            "too old to migrate to the Hub model (v27) directly; open it once with bbs 0.24",
+        ),
+        (
+            26,
+            "before the Hub model (v27); this release does not migrate it automatically",
+        ),
+    ];
+    for (version, expected) in cases {
+        let home =
+            std::env::temp_dir().join(format!("bbs-test-{}-migrate-{version}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let state = home.join(".local/state/bbs");
+        std::fs::create_dir_all(&state).unwrap();
+        let path = state.join("bbs.db");
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        if version == 1 {
+            db.execute_batch(include_str!("../crates/bbs-core/migrations/0001_init.sql"))
+                .unwrap();
+            db.execute_batch("PRAGMA user_version = 1;").unwrap();
+        } else {
+            bbs_core::db::migrate_legacy(&mut db).unwrap();
+        }
+        db.execute(
+            "INSERT INTO humans (name, created_at, active_at) VALUES ('will', 'x', 'x')",
+            [],
+        )
         .unwrap();
-    assert!(version >= 4, "schema still at v{version}");
-    std::fs::remove_dir_all(&home).unwrap();
+        drop(db);
+        let before = std::fs::read(&path).unwrap();
+        for out in agents_concurrently(&home, 2) {
+            assert!(!out.status.success());
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(err.contains(expected), "{err}");
+            assert!(
+                err.contains(&format!(
+                    "bbs-server migrate-hub-model --db {} --namespace bbs",
+                    path.display()
+                )),
+                "{err}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(user_version(&db), version);
+        drop(db);
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 }
 
 fn view_is_for_humans_only(mode: Mode) {
@@ -3040,23 +3123,22 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
     assert!(group.iter().all(|r| r["group"] == "acme"), "{group:?}");
     assert!(bodies(&group).contains(&"acme from A"));
 
-    // A reused group name covers every incarnation, archived or active.
+    // An archived group's history stays viewable by name.
     bbs.ok(&["group", "register", "temp"]);
     bbs.ok(&["send", "--to", "@temp", "first temp"]);
-    bbs.ok(&["group", "delete", "temp"]);
-    bbs.ok(&["group", "register", "temp"]);
     bbs.ok(&["send", "--to", "@temp", "second temp"]);
+    bbs.ok(&["group", "delete", "temp"]);
     let temp = view_json(&bbs, &["--group", "temp", "--from", "will"]);
     assert_eq!(
         bodies(&temp),
         [
             "first temp",
-            "Human \"will\" archived group @temp.",
-            "second temp"
+            "second temp",
+            "Human \"will\" archived group @temp."
         ]
     );
     let last = view_json(&bbs, &["--group", "temp", "--limit", "1"]);
-    assert_eq!(bodies(&last), ["second temp"]);
+    assert_eq!(bodies(&last), ["Human \"will\" archived group @temp."]);
 
     let from = view_json(&bbs, &["--from", &a.to_lowercase()]);
     assert!(from.iter().all(|r| r["from"] == a.as_str()), "{from:?}");
@@ -3278,11 +3360,21 @@ fn view_json_follow_survives_full_windows_and_bursts(mode: Mode) {
         .unwrap();
     let mut sql = String::from("BEGIN;");
     for i in 0..5 {
+        let address = |column: &str, id: i64| {
+            format!(
+                "(SELECT a.id FROM entity_local_bindings b JOIN entity_addresses a
+                  ON a.entity_id = b.entity_id AND a.address_id = 'native' WHERE b.{column} = {id})"
+            )
+        };
+        let (from, to) = (address("human_id", will), address("agent_id", agent));
         sql.push_str(&format!(
-            "INSERT INTO messages (from_kind, from_id, body, created_at)
-             VALUES ('human', {will}, 'burst {i}', '2026-10-15T00:00:00.000000Z');
-             INSERT INTO deliveries (message_id, recipient_kind, recipient_id)
-             VALUES (last_insert_rowid(), 'agent', {agent});"
+            "INSERT INTO messages (origin_namespace, origin_message_id, sender_address_id,
+                 recipient_address_id, body, created_at, authored_at)
+             SELECT namespace, 'burst-{i}', {from}, {to}, 'burst {i}',
+                 '2026-10-15T00:00:00.000000Z', '2026-10-15T00:00:00.000000Z'
+             FROM bbs_installation;
+             INSERT INTO deliveries (message_id, recipient_address_id, direct)
+             VALUES (last_insert_rowid(), {to}, 1);"
         ));
     }
     sql.push_str("COMMIT;");
@@ -3384,6 +3476,15 @@ fn headless_refuses_the_old_settings_file() {
     let err = bbs.err(&["headless", "run", "Zed"]);
     assert!(err.contains("headless.toml is no longer read"), "{err}");
     assert!(err.contains("under [headless]"), "{err}");
+}
+
+/// A name no other test agent has: registration requires one.
+fn fresh_name() -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    format!(
+        "Agent{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 fn headless_state(bbs: &Bbs, agent: &str) -> serde_json::Value {
@@ -4752,7 +4853,7 @@ both_modes!(
     bye_retires_token_and_name,
     bye_notifies_and_leaves_groups,
     humans_retire_agents,
-    stale_agents_are_retired_on_register,
+    idle_agents_stay_live_and_restart_with_their_identity,
     human_name_is_reserved_and_permissions_enforced,
     whoami_reports_agent_or_human,
     humans_remove_agents_from_groups,

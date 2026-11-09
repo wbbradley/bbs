@@ -1,5 +1,7 @@
--- Hub model (schema 27). NOT in db::MIGRATIONS: startup never runs it. Only
--- db::migrate_to_hub_model runs it, from schema 26, as an operator cutover.
+-- Hub model (schema 27). NOT in db::MIGRATIONS: startup runs it only to
+-- create a new database, right after 1-26 in the same transaction, with no
+-- records. On existing data only db::migrate_to_hub_model runs it, from schema
+-- 26, as an operator cutover.
 --
 -- The runner, inside one BEGIN IMMEDIATE transaction with foreign_keys
 -- disabled beforehand, first creates and fills:
@@ -39,6 +41,14 @@ INSERT INTO hub_migration_assert SELECT NOT EXISTS (
     (d.recipient_kind = 'human' AND NOT EXISTS (SELECT 1 FROM humans WHERE id = d.recipient_id)) OR
     (d.recipient_kind = 'agent' AND NOT EXISTS (SELECT 1 FROM agents WHERE id = d.recipient_id))
 );
+
+-- The installation's own namespace: every native entity's, and the origin of
+-- every native message. One row.
+CREATE TABLE bbs_installation (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  namespace TEXT NOT NULL CHECK(length(namespace) > 0)
+);
+INSERT INTO bbs_installation(id, namespace) SELECT 1, namespace FROM hub_migration_context;
 
 CREATE TABLE entities (
   id INTEGER PRIMARY KEY,

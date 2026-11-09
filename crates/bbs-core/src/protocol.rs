@@ -7,7 +7,11 @@ use tonic::{Response, Status};
 
 use crate::{proto, release};
 
-pub const EPOCH: u32 = 2;
+/// The wire service's protobuf package; the epoch versions the contract within it.
+pub const PACKAGE: &str = "bbs.v2";
+pub const EPOCH: u32 = 3;
+/// `EPOCH` as its metadata value.
+const EPOCH_TEXT: &str = "3";
 pub const CAPABILITIES: &[&str] = &[
     "named-agents.v1",
     "owner-attribution.v1",
@@ -112,7 +116,7 @@ impl Policy {
             "bbs-server-version",
             MetadataValue::from_static(release::VERSION),
         );
-        metadata.insert("bbs-protocol-epoch", MetadataValue::from_static("2"));
+        metadata.insert("bbs-protocol-epoch", MetadataValue::from_static(EPOCH_TEXT));
         if let Some(version) = &self.minimum {
             metadata.insert(
                 "bbs-minimum-client-version",
@@ -173,10 +177,10 @@ impl Policy {
                 })
                 .transpose()
         };
-        if get("bbs-protocol-epoch")? != Some("2") {
-            return Err(Status::failed_precondition(
-                "incompatible BBS protocol: this server requires epoch 2 (bbs.v2); upgrade the client and server together",
-            ));
+        if get("bbs-protocol-epoch")? != Some(EPOCH_TEXT) {
+            return Err(Status::failed_precondition(format!(
+                "incompatible BBS protocol: this server requires epoch {EPOCH} ({PACKAGE}); upgrade the client and server together"
+            )));
         }
         if let Some(required) = get("bbs-required-capabilities")? {
             for capability in required.split(',') {
@@ -260,7 +264,7 @@ pub fn client_metadata(metadata: &mut MetadataMap, capabilities: &[&str]) {
         "bbs-client-version",
         MetadataValue::from_static(release::VERSION),
     );
-    metadata.insert("bbs-protocol-epoch", MetadataValue::from_static("2"));
+    metadata.insert("bbs-protocol-epoch", MetadataValue::from_static(EPOCH_TEXT));
     if !capabilities.is_empty() {
         metadata.insert(
             "bbs-required-capabilities",
@@ -270,6 +274,14 @@ pub fn client_metadata(metadata: &mut MetadataMap, capabilities: &[&str]) {
                 .expect("capability constants are ASCII"),
         );
     }
+}
+
+/// Whether `err` says this client and the server cannot work together: a
+/// different epoch, a missing capability, a client below the server's
+/// minimum, or such a ServerInfo. Retrying cannot help; only an upgrade can.
+pub fn is_incompatible(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.to_string().starts_with("incompatible BBS"))
 }
 
 /// Discovery is diagnostic, never permission to omit request-level requirements.
@@ -327,7 +339,17 @@ mod tests {
             m
         };
         policy.validate(&valid()).unwrap();
-        for epoch in [None, Some("1"), Some("3"), Some("02"), Some("garbage")] {
+        assert_eq!(EPOCH_TEXT, EPOCH.to_string());
+        assert_eq!(proto::bbs_server::SERVICE_NAME, format!("{PACKAGE}.Bbs"));
+        // Epoch 2 clients predate the Hub model and stop here.
+        for epoch in [
+            None,
+            Some("1"),
+            Some("2"),
+            Some("4"),
+            Some("03"),
+            Some("garbage"),
+        ] {
             let mut m = valid();
             m.remove("bbs-protocol-epoch");
             if let Some(epoch) = epoch {
@@ -335,7 +357,7 @@ mod tests {
             }
             let error = policy.validate(&m).unwrap_err();
             assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-            assert_eq!(error.metadata().get("bbs-protocol-epoch").unwrap(), "2");
+            assert_eq!(error.metadata().get("bbs-protocol-epoch").unwrap(), "3");
         }
         for key in REQUEST_KEYS {
             let mut m = valid();
@@ -384,7 +406,7 @@ mod tests {
             (Some("0.3.0"), true),
         ] {
             let mut m = MetadataMap::new();
-            m.insert("bbs-protocol-epoch", "2".parse().unwrap());
+            m.insert("bbs-protocol-epoch", "3".parse().unwrap());
             if let Some(version) = version {
                 m.insert("bbs-client-version", version.parse().unwrap());
             }
@@ -398,7 +420,7 @@ mod tests {
             .is_err()
         );
         let mut m = MetadataMap::new();
-        m.insert("bbs-protocol-epoch", "2".parse().unwrap());
+        m.insert("bbs-protocol-epoch", "3".parse().unwrap());
         Policy::default().validate(&m).unwrap();
     }
 
@@ -409,7 +431,7 @@ mod tests {
         info.capabilities.push("future.v1".into());
         validate_info(&info).unwrap();
         info.protocol_epoch = None;
-        assert!(validate_info(&info).is_err());
+        assert!(is_incompatible(&validate_info(&info).unwrap_err()));
         info.protocol_epoch = Some(EPOCH);
         info.release = None;
         assert!(validate_info(&info).is_err());

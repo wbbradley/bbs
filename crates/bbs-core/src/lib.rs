@@ -7,7 +7,7 @@ pub mod backend;
 pub mod blocker_choices;
 pub mod blocker_limits;
 pub mod db;
-pub mod names;
+pub mod entity;
 pub mod proto;
 pub mod protocol;
 pub mod release;

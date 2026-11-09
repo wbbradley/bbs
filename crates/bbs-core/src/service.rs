@@ -8,16 +8,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rand::seq::IndexedRandom;
 use rusqlite::{Connection, TransactionBehavior};
 
 use crate::auth::{self, AuthenticationError};
 use crate::db;
-use crate::names::NAMES;
 use crate::proto;
 use crate::timer::Schedule;
 
-const RETIRE_AFTER_DAYS: i64 = 7;
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Group descriptions are one line, counted in characters (also a schema CHECK).
 const MAX_GROUP_DESCRIPTION_CHARS: usize = 200;
@@ -337,29 +334,6 @@ pub fn add_human(
     })
 }
 
-fn pick_name(conn: &Connection) -> Result<String> {
-    let taken = db::taken_names(conn)?;
-    let last_used = db::name_last_used(conn)?;
-    let free: Vec<&str> = NAMES
-        .iter()
-        .copied()
-        .filter(|n| !taken.contains(&n.to_lowercase()))
-        .collect();
-    let never_used: Vec<&str> = free
-        .iter()
-        .copied()
-        .filter(|n| !last_used.contains_key(&n.to_lowercase()))
-        .collect();
-    if let Some(name) = never_used.choose(&mut rand::rng()) {
-        return Ok(name.to_string());
-    }
-    // Every free name has been used before: recycle the least recently used one.
-    free.iter()
-        .min_by_key(|n| last_used.get(&n.to_lowercase()))
-        .map(|n| n.to_string())
-        .with_context(|| format!("name pool exhausted: all {} names are in use", NAMES.len()))
-}
-
 fn new_token(conn: &Connection) -> Result<String> {
     loop {
         let token = auth::new_token();
@@ -379,23 +353,16 @@ pub fn register(
             bail!("already registered; `bbs bye` first to register again");
         }
         let owner = ctx.human()?;
-        if let Some(name) = &req.name {
-            validate_principal_name(name, "agent")?;
-        }
-        let cutoff = fmt_time(ctx.now - chrono::Duration::days(RETIRE_AFTER_DAYS));
-        for id in db::stale_agent_ids(ctx.conn, &cutoff)? {
-            db::retire_agent(ctx.conn, id, &ctx.now_s)?;
-            tracing::info!(agent_id = id, "retired stale agent");
-        }
-        let name = match req.name {
-            Some(name) => {
-                if db::taken_names(ctx.conn)?.contains(&name.to_ascii_lowercase()) {
-                    bail!("agent name {name:?} is already reserved");
-                }
-                name
-            }
-            None => pick_name(ctx.conn)?,
+        let Some(name) = req.name.filter(|n| !n.is_empty()) else {
+            bail!(
+                "an agent name is required: register with a short, descriptive name, \
+                 such as `bbs register --name reviewer`"
+            );
         };
+        validate_principal_name(&name, "agent")?;
+        if db::taken_names(ctx.conn)?.contains(&name.to_ascii_lowercase()) {
+            bail!("agent name {name:?} is already reserved");
+        }
         // Keep the reserved-name error above: restarting an existing headless
         // agent uses it to take over its token without creating a new identity.
         let frozen: bool = ctx.conn.query_row(
@@ -859,7 +826,7 @@ fn broadcast(
     gid: i64,
     body: &str,
 ) -> Result<(usize, usize, Vec<String>)> {
-    let msg = db::insert_message(ctx.conn, me, Some(gid), body, &ctx.now_s)?;
+    let msg = db::insert_message(ctx.conn, me, db::To::Group(gid), body, &ctx.now_s)?;
     let mut count = 0;
     let mut visible = 0;
     let focused = db::focused_members(ctx.conn, gid)?;
@@ -962,9 +929,14 @@ fn send_control(
     if db::agent_owner_id(ctx.conn, target.id)? != Some(me.id) {
         bail!("{} is not your agent", target.name);
     }
-    let msg = db::insert_message(ctx.conn, me, None, body, &ctx.now_s)?;
+    let msg = db::insert_message(
+        ctx.conn,
+        me,
+        db::To::Direct(db::Kind::Agent, target.id),
+        body,
+        &ctx.now_s,
+    )?;
     db::set_message_control(ctx.conn, msg, control)?;
-    db::insert_delivery(ctx.conn, msg, db::Kind::Agent, target.id)?;
     tracing::info!(
         from = me.name,
         to = target.name,
@@ -1824,9 +1796,14 @@ pub fn auto_reply(
                 replayed: true,
             });
         }
-        let msg = db::insert_message(ctx.conn, &me, None, &req.body, &ctx.now_s)?;
+        let msg = db::insert_message(
+            ctx.conn,
+            &me,
+            db::To::Direct(db::Kind::Human, owner),
+            &req.body,
+            &ctx.now_s,
+        )?;
         db::set_message_auto_reply(ctx.conn, msg)?;
-        db::insert_delivery(ctx.conn, msg, db::Kind::Human, owner)?;
         db::record_human_conversation(ctx.conn, me.id, owner, &ctx.now_s)?;
         db::insert_auto_reply(ctx.conn, me.id, &req.key, msg)?;
         tracing::info!(from = me.name, bytes = req.body.len(), "sent auto reply");
@@ -1906,8 +1883,13 @@ pub fn send(
             bail!("{} is not in any of your groups", target.name);
         }
         check_focus(ctx, &me, Some(&target))?;
-        let msg = db::insert_message(ctx.conn, &me, None, body, &ctx.now_s)?;
-        db::insert_delivery(ctx.conn, msg, target.kind, target.id)?;
+        let msg = db::insert_message(
+            ctx.conn,
+            &me,
+            db::To::Direct(target.kind, target.id),
+            body,
+            &ctx.now_s,
+        )?;
         match (me.kind, target.kind) {
             (db::Kind::Human, db::Kind::Agent) => {
                 db::record_human_conversation(ctx.conn, target.id, me.id, &ctx.now_s)?;
@@ -1971,8 +1953,13 @@ pub fn set_focus(
             // Tell the agent, as a direct message from its owner, so its
             // harness and model both know why mail stops or resumes.
             let notice = focus_notice(&me.name, req.focused);
-            let msg = db::insert_message(ctx.conn, &me, None, &notice, &ctx.now_s)?;
-            db::insert_delivery(ctx.conn, msg, db::Kind::Agent, agent.id)?;
+            db::insert_message(
+                ctx.conn,
+                &me,
+                db::To::Direct(db::Kind::Agent, agent.id),
+                &notice,
+                &ctx.now_s,
+            )?;
             db::record_human_conversation(ctx.conn, agent.id, me.id, &ctx.now_s)?;
             tracing::info!(
                 by = me.name,
@@ -2988,8 +2975,13 @@ fn tell_agent(ctx: &Ctx, me: &db::Principal, target_id: i64) -> Result<bool> {
 
 /// Send a timer's agent `body` from `me`, marked as from that timer.
 fn timer_notice(ctx: &Ctx, me: &db::Principal, timer: &db::TimerRow, body: &str) -> Result<()> {
-    let msg = db::insert_message(ctx.conn, me, None, body, &ctx.now_s)?;
-    db::insert_delivery(ctx.conn, msg, db::Kind::Agent, timer.target_id)?;
+    let msg = db::insert_message(
+        ctx.conn,
+        me,
+        db::To::Direct(db::Kind::Agent, timer.target_id),
+        body,
+        &ctx.now_s,
+    )?;
     db::set_message_timer(ctx.conn, msg, timer.id)
 }
 
@@ -3295,8 +3287,13 @@ pub fn fire_timers(
         if skip {
             tracing::info!(id = timer.id, "timer skipped: target in focus mode");
         } else {
-            let msg = db::insert_message(&tx, &timer.creator, None, &timer.body, &now_s)?;
-            db::insert_delivery(&tx, msg, db::Kind::Agent, timer.target_id)?;
+            let msg = db::insert_message(
+                &tx,
+                &timer.creator,
+                db::To::Direct(db::Kind::Agent, timer.target_id),
+                &timer.body,
+                &now_s,
+            )?;
             db::set_message_timer(&tx, msg, timer.id)?;
         }
         match schedule.and_then(|s| s.next_after(now)) {
@@ -3467,6 +3464,176 @@ mod tests {
         (conn, will, agents)
     }
 
+    /// A schema-26 board cut over by the operator keeps its unread mail,
+    /// summaries, focus holds, restart barrier and the history of a retired
+    /// agent whose name was reused.
+    #[test]
+    fn a_cut_over_board_keeps_reads_summaries_focus_drains_and_history() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::migrate_legacy(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO humans VALUES (1, 'will', 't', 't');
+             INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at, retired_at)
+             VALUES (1, 'scout', 'k1', '/', 'h', 't', 't', '2026-10-01T00:00:00.000000Z'),
+                    (2, 'scout', 'k2', '/', 'h', 't', '2099-01-01T00:00:00.000000Z', NULL),
+                    (3, 'lonely', 'k3', '/', 'h', 't', '2099-01-01T00:00:00.000000Z', NULL);
+             INSERT INTO agent_owners VALUES (1, 1), (2, 1), (3, 1);
+             INSERT INTO messages (id, from_kind, from_id, body, created_at) VALUES
+                 (1, 'human', 1, 'old hello', '2026-09-01T00:00:01.000000Z'),
+                 (2, 'agent', 1, 'old reply', '2026-09-01T00:00:02.000000Z'),
+                 (3, 'human', 1, 'owner note', '2026-11-01T00:00:03.000000Z'),
+                 (4, 'agent', 2, 'scout reports', '2026-11-01T00:00:04.000000Z'),
+                 (5, 'agent', 3, 'from lonely', '2026-11-01T00:00:05.000000Z'),
+                 (6, 'human', 1, 'after the barrier', '2026-11-01T00:00:06.000000Z');
+             INSERT INTO deliveries VALUES
+                 (1, 'agent', 1, '2026-09-01T00:00:01.000000Z', 1),
+                 (2, 'human', 1, '2026-09-01T00:00:02.000000Z', 1),
+                 (3, 'agent', 2, NULL, 1), (4, 'human', 1, NULL, 1),
+                 (5, 'agent', 2, NULL, 1), (6, 'agent', 2, NULL, 1);
+             INSERT INTO agent_drains VALUES (1, 5, '2099-01-01T00:00:00.000000Z', 'draining');
+             INSERT INTO agent_drain_targets (human_id, agent_id, final_message_id)
+                 VALUES (1, 2, 5);",
+        )
+        .unwrap();
+        db::migrate_to_hub_model(&mut conn, "will").unwrap();
+        db::migrate(&mut conn).unwrap();
+        let will = Caller {
+            human: Some("will".into()),
+            ..Default::default()
+        };
+        let scout = Caller {
+            token: Some("k2".into()),
+            ..Default::default()
+        };
+        // Tokens saved before the cutover keep authenticating with no new
+        // registration, whatever their name.
+        assert_eq!(whoami(&mut conn, &scout).unwrap().name, "scout");
+        let lonely = Caller {
+            token: Some("k3".into()),
+            ..Default::default()
+        };
+        assert_eq!(whoami(&mut conn, &lonely).unwrap().name, "lonely");
+        let focus = |conn: &mut Connection, focused| {
+            let req = proto::SetFocusRequest {
+                agent: "scout".into(),
+                focused,
+            };
+            set_focus(conn, &will, req).unwrap();
+        };
+        let take = |conn: &mut Connection| -> Vec<String> {
+            read(conn, &scout, proto::ReadRequest::default())
+                .unwrap()
+                .messages
+                .into_iter()
+                .map(|m| m.body)
+                .collect()
+        };
+        // Will's summary counts the live scout's unread report only.
+        let summary = agent_summary(&mut conn, &will, Default::default()).unwrap();
+        let unread: Vec<_> = summary
+            .agents
+            .iter()
+            .map(|a| (a.agent.as_str(), a.unread_messages))
+            .collect();
+        assert_eq!(unread, [("lonely", 0), ("scout", 1)]);
+        // Focus holds lonely's mail; the barrier holds everything after it.
+        focus(&mut conn, true);
+        assert_eq!(take(&mut conn), ["owner note"]);
+        let drain = drain::agent_drain(&mut conn, &will, Default::default()).unwrap();
+        let targets: Vec<_> = drain
+            .agents
+            .iter()
+            .map(|t| (t.name.as_str(), t.unread))
+            .collect();
+        assert_eq!((drain.watermark, targets), (5, vec![("scout", 1)]));
+        focus(&mut conn, false);
+        assert_eq!(take(&mut conn), ["from lonely"]);
+        let resume = proto::AgentDrainRequest {
+            action: "resume".into(),
+        };
+        drain::agent_drain(&mut conn, &will, resume).unwrap();
+        let after = take(&mut conn);
+        assert_eq!(after[0], "after the barrier");
+        assert_eq!(after.len(), 3, "and both focus notices: {after:?}");
+        // Both scouts' history, under the name they share.
+        let history = feed(
+            &mut conn,
+            &will,
+            proto::FeedRequest {
+                backlog: 10,
+                from: Some("scout".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let sent: Vec<_> = history
+            .messages
+            .iter()
+            .map(|m| (m.id, m.from_name.as_str(), m.body.as_str()))
+            .collect();
+        assert_eq!(
+            sent,
+            [(2, "scout", "old reply"), (4, "scout", "scout reports")]
+        );
+        let retired = feed(
+            &mut conn,
+            &will,
+            proto::FeedRequest {
+                backlog: 10,
+                with: Some("scout".into()),
+                until: Some("2026-10-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let bodies: Vec<_> = retired.messages.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["old hello", "old reply"]);
+    }
+
+    #[test]
+    fn agent_names_too_long_for_a_hub_id_are_refused_whole() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::migrate(&mut conn).unwrap();
+        let owner = "o".repeat(64);
+        ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: owner.clone(),
+            },
+        )
+        .unwrap();
+        let caller = Caller {
+            human: Some(owner.clone()),
+            ..Default::default()
+        };
+        let register_named = |conn: &mut Connection, name: String| {
+            register(
+                conn,
+                &caller,
+                proto::RegisterRequest {
+                    name: Some(name),
+                    ..Default::default()
+                },
+            )
+        };
+        // 64 + `/` + 63 is the longest an owned ID can be.
+        register_named(&mut conn, "a".repeat(63)).unwrap();
+        let err = register_named(&mut conn, "b".repeat(64))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is too long: its Hub ID")
+                && err.contains(
+                    "with its owner's ID, would be 129 characters, over the limit of 128"
+                ),
+            "{err}"
+        );
+        let agents: i64 = conn
+            .query_row("SELECT count(*) FROM agents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(agents, 1);
+    }
+
     fn search_req(query: &str) -> proto::SearchRequest {
         proto::SearchRequest {
             query: query.into(),
@@ -3488,9 +3655,7 @@ mod tests {
         body: &str,
         time: &str,
     ) -> i64 {
-        let id = db::insert_message(conn, from, None, body, time).unwrap();
-        db::insert_delivery(conn, id, to.kind, to.id).unwrap();
-        id
+        db::insert_message(conn, from, db::To::Direct(to.kind, to.id), body, time).unwrap()
     }
 
     #[test]
@@ -3592,7 +3757,7 @@ mod tests {
         .id
         .unwrap();
         db::set_message_control(&conn, control, "cancel").unwrap();
-        let before: Vec<_> = conn.prepare("SELECT message_id, recipient_id, archived_at FROM deliveries ORDER BY message_id, recipient_id")
+        let before: Vec<_> = conn.prepare("SELECT message_id, recipient_address_id, archived_at FROM deliveries ORDER BY message_id, recipient_address_id")
             .unwrap().query_map([], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,i64>(1)?, row.get::<_,Option<String>>(2)?)))
             .unwrap().collect::<Result<Vec<_>,_>>().unwrap();
         let got = search(&mut conn, &mateo, search_req("équipe")).unwrap();
@@ -3603,7 +3768,7 @@ mod tests {
             Some("Eve")
         );
         assert_eq!(got.hits[2].message.as_ref().unwrap().from_name, "ada");
-        let after: Vec<_> = conn.prepare("SELECT message_id, recipient_id, archived_at FROM deliveries ORDER BY message_id, recipient_id")
+        let after: Vec<_> = conn.prepare("SELECT message_id, recipient_address_id, archived_at FROM deliveries ORDER BY message_id, recipient_address_id")
             .unwrap().query_map([], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,i64>(1)?, row.get::<_,Option<String>>(2)?)))
             .unwrap().collect::<Result<Vec<_>,_>>().unwrap();
         assert_eq!(before, after, "search never marks anybody's mail read");
@@ -4317,7 +4482,10 @@ mod tests {
         // Mateo's stamp matches the stored message's server time.
         let stored: String = conn
             .query_row(
-                "SELECT created_at FROM messages WHERE from_kind = 'agent' ORDER BY id DESC",
+                "SELECT m.created_at FROM messages m
+                 JOIN entity_addresses a ON a.id = m.sender_address_id
+                 JOIN entity_local_bindings b ON b.entity_id = a.entity_id
+                 WHERE b.agent_id IS NOT NULL ORDER BY m.id DESC",
                 [],
                 |r| r.get(0),
             )
@@ -4615,7 +4783,7 @@ mod tests {
         assert!(whoami(&mut conn, &will).unwrap().owner.is_none());
 
         // Registration isolation: a retired name's keys do not follow its
-        // re-registration.
+        // re-registration (possible for agents retired before the cutover).
         retire_agent(
             &mut conn,
             &will,
@@ -4624,6 +4792,7 @@ mod tests {
             },
         )
         .unwrap();
+        db::date_retired_entity_ids(&conn);
         let token = register(
             &mut conn,
             &will,
@@ -5920,6 +6089,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 0);
+        db::date_retired_entity_ids(&conn);
         let token = register(
             &mut conn,
             &will,
@@ -6014,6 +6184,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mateo_rows, 0);
+        db::date_retired_entity_ids(&conn);
         let token = register(
             &mut conn,
             &will,

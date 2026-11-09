@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::db;
+use bbs_core::entity::EntityKind;
 
 /// Run the cutover, or with `dry_run` only its preflight, and return the
 /// report to print. A real run needs `backup_taken`: a schema-26 database
@@ -167,9 +168,9 @@ fn preflight_text(report: &db::PreflightReport) -> String {
         "Hub model preflight (dry run, nothing written), namespace {}\n\
          humans {}, agents {}, groups {}, messages {}, deliveries {}\n",
         report.namespace,
-        report.count(db::HubKind::Human),
-        report.count(db::HubKind::Agent),
-        report.count(db::HubKind::Group),
+        report.count(EntityKind::Human),
+        report.count(EntityKind::Agent),
+        report.count(EntityKind::Group),
         report.messages,
         report.deliveries,
     );
@@ -192,7 +193,7 @@ mod tests {
     fn board(dir: &Path, name: &str) -> std::path::PathBuf {
         let path = dir.join(name);
         let mut conn = db::open(&path).unwrap();
-        db::migrate(&mut conn).unwrap();
+        db::migrate_legacy(&mut conn).unwrap();
         conn.execute_batch(
             "INSERT INTO humans VALUES (1, 'will', 't', 't');
              INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at)
@@ -384,7 +385,7 @@ mod tests {
         assert!(out.contains("messages 1, deliveries 1"), "{out}");
         assert_eq!(version(&path), 27);
         assert_eq!(version(&backup), 26);
-        let err = db::migrate(&mut db::open(&path).unwrap()).unwrap_err();
-        assert!(err.to_string().contains("migrated to the Hub model"));
+        // The server opens it now, in the migrated namespace.
+        db::migrate_in(&mut db::open(&path).unwrap(), Some("will")).unwrap();
     }
 }

@@ -1,9 +1,10 @@
-//! The Hub model cutover: schema 26 to 27, run only by an operator.
+//! The Hub model (schema 27) and the cutover to it from schema 26.
 //!
-//! Startup never applies it (it is not in `MIGRATIONS`), and a binary that only
-//! knows schema 26 refuses a migrated database. The cutover moves messages and
-//! deliveries onto Hub's entity/address model and gives every human, agent and
-//! group one entity ID, computed here from its BBS name (BBS blocker 1396):
+//! A new database is created at schema 27 (see `db::migrate`). An existing
+//! one moves only when an operator runs the cutover; startup never does. The
+//! cutover moves messages and deliveries onto Hub's entity/address model and
+//! gives every human, agent and group one entity ID, computed here from its
+//! BBS name (BBS blocker 1396):
 //!
 //! - `.` becomes `-`; any other character outside `[A-Za-z0-9_-]` blocks.
 //! - Humans, groups and ownerless agents get a top-level ID. They share one
@@ -13,15 +14,20 @@
 //!   the live agent (else the most recently retired one), and every other
 //!   agent gets `owner/name-retired-YYYY-MM-DD` (BBS blocker 1407; see
 //!   `map_owner_scope` and `assign_dated`).
+//!
+//! Records created after the cutover get IDs from the same name mapping (see
+//! [`new_entity_id`]). IDs never change and are never reused, so a name whose
+//! ID is taken is refused.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{MIGRATIONS, is_busy, schema_version};
+use crate::entity::{EntityKind, NATIVE_ADDRESS};
 
 /// The only schema the cutover starts from.
 pub const HUB_MODEL_SOURCE_VERSION: usize = 26;
@@ -44,27 +50,10 @@ const MAX_ENTITY_ID: usize = 128;
 /// How many offending records one preflight issue lists.
 const MAX_EXAMPLES: usize = 20;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum HubKind {
-    Human,
-    Agent,
-    Group,
-}
-
-impl HubKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            HubKind::Human => "human",
-            HubKind::Agent => "agent",
-            HubKind::Group => "group",
-        }
-    }
-}
-
 /// One native record and the entity ID the cutover gives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityMapping {
-    pub kind: HubKind,
+    pub kind: EntityKind,
     pub native_id: i64,
     /// The BBS name, kept as the entity's display name.
     pub name: String,
@@ -98,7 +87,7 @@ impl PreflightReport {
         !self.issues.is_empty()
     }
 
-    pub fn count(&self, kind: HubKind) -> usize {
+    pub fn count(&self, kind: EntityKind) -> usize {
         self.mappings.iter().filter(|m| m.kind == kind).count()
     }
 
@@ -223,6 +212,178 @@ pub fn migrate_to_hub_model(conn: &mut Connection, namespace: &str) -> Result<Hu
     result
 }
 
+/// Bring a new, empty database from schema 26 to 27 in `namespace`, inside
+/// the caller's transaction: `db::migrate` applies 1-26, sets schema 26, then
+/// calls this.
+pub(super) fn create_in(tx: &Connection, namespace: &str) -> Result<()> {
+    validate_namespace(namespace)?;
+    let preflight = preflight(tx, namespace)?;
+    if preflight.is_blocked() || !preflight.mappings.is_empty() || preflight.messages > 0 {
+        bail!("a new database must be empty before it reaches the Hub model");
+    }
+    apply(tx, &preflight)?;
+    Ok(())
+}
+
+/// The installation's namespace (schema 27).
+pub fn namespace(conn: &Connection) -> Result<String> {
+    Ok(conn.query_row("SELECT namespace FROM bbs_installation", [], |r| r.get(0))?)
+}
+
+/// The entity ID a new native record named `name` would get, from the
+/// cutover's name mapping: `owner/name` under its owner's entity ID for an
+/// owned agent, else top level. Refuses a name outside Hub's grammar or too
+/// long.
+fn plain_entity_id(
+    conn: &Connection,
+    kind: EntityKind,
+    name: &str,
+    owner: Option<i64>,
+) -> Result<String> {
+    let segment = map_name(name);
+    if !valid_segment(&segment) {
+        bail!(
+            "{} name {name:?} maps to `{segment}`, which is not a valid Hub ID segment",
+            kind.as_str()
+        );
+    }
+    let entity_id = match owner {
+        Some(owner) => {
+            let parent: String = conn
+                .query_row(
+                    "SELECT e.entity_id FROM entities e
+                     JOIN entity_local_bindings b ON b.entity_id = e.id WHERE b.human_id = ?1",
+                    [owner],
+                    |r| r.get(0),
+                )
+                .with_context(|| format!("no entity for human {owner}"))?;
+            format!("{parent}/{segment}")
+        }
+        None => segment,
+    };
+    if entity_id.len() > MAX_ENTITY_ID {
+        let owned = if owner.is_some() {
+            ", with its owner's ID,"
+        } else {
+            ""
+        };
+        bail!(
+            "{} name {name:?} is too long: its Hub ID `{entity_id}`{owned} would be {} \
+             characters, over the limit of {MAX_ENTITY_ID}; choose a shorter name",
+            kind.as_str(),
+            entity_id.len()
+        );
+    }
+    Ok(entity_id)
+}
+
+/// Who holds `entity_id` in `namespace`, compared case-insensitively, as
+/// "will/k3 belongs to a retired agent"; None when it is free.
+fn holder(conn: &Connection, namespace: &str, entity_id: &str) -> Result<Option<String>> {
+    let held: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT entity_id, kind, lifecycle FROM entities
+             WHERE namespace = ?1 AND lower(entity_id) = lower(?2)",
+            params![namespace, entity_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(held.map(|(id, kind, lifecycle)| {
+        let what = match (kind.as_str(), lifecycle == "retired") {
+            ("agent", true) => "a retired agent".to_string(),
+            ("group", true) => "an archived group".to_string(),
+            ("agent", false) => "an agent".to_string(),
+            ("human", _) => "a human".to_string(),
+            ("group", false) => "a group".to_string(),
+            (other, _) => format!("a {other}"),
+        };
+        format!("{id} belongs to {what}")
+    }))
+}
+
+/// The plain entity ID (see `plain_entity_id`) a new record named `name`
+/// would get. IDs are immutable and never reused, so a name whose ID any
+/// entity holds, live or retired, ignoring case, is refused. Call this before
+/// inserting the native record, then pass the ID to [`create_entity`].
+pub(crate) fn new_entity_id(
+    conn: &Connection,
+    kind: EntityKind,
+    name: &str,
+    owner: Option<i64>,
+) -> Result<String> {
+    let entity_id = plain_entity_id(conn, kind, name, owner)?;
+    if let Some(conflict) = holder(conn, &namespace(conn)?, &entity_id)? {
+        bail!(
+            "{} name {name} is unavailable: {conflict}; Hub IDs are never reused. \
+             Choose another name.",
+            kind.as_str()
+        );
+    }
+    Ok(entity_id)
+}
+
+/// Give a native record created at schema 27 its entity `entity_id` (from
+/// [`new_entity_id`]), native address and delivery handler.
+pub(crate) fn create_entity(
+    conn: &Connection,
+    kind: EntityKind,
+    native_id: i64,
+    entity_id: &str,
+    name: &str,
+    now: &str,
+) -> Result<()> {
+    let namespace = namespace(conn)?;
+    conn.execute(
+        "INSERT INTO entities (namespace, entity_id, kind, display_name, lifecycle, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
+        params![namespace, entity_id, kind.as_str(), name, now],
+    )?;
+    let entity = conn.last_insert_rowid();
+    let column = binding_column(kind);
+    conn.execute(
+        &format!("INSERT INTO entity_local_bindings (entity_id, {column}) VALUES (?1, ?2)"),
+        params![entity, native_id],
+    )?;
+    conn.execute(
+        "INSERT INTO entity_addresses (entity_id, address_id, label, lifecycle, is_default)
+         VALUES (?1, ?2, 'BBS', 'active', 1)",
+        params![entity, NATIVE_ADDRESS],
+    )?;
+    let handler = match kind {
+        EntityKind::Group => "fanout",
+        EntityKind::Human | EntityKind::Agent => "inbox",
+    };
+    conn.execute(
+        "INSERT INTO address_delivery_bindings (address_id, handler) VALUES (?1, ?2)",
+        params![conn.last_insert_rowid(), handler],
+    )?;
+    Ok(())
+}
+
+/// The `entity_local_bindings` column holding a native record of `kind`.
+pub(crate) fn binding_column(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Human => "human_id",
+        EntityKind::Agent => "agent_id",
+        EntityKind::Group => "group_id",
+    }
+}
+
+/// Mark a retired agent's or archived group's entity and addresses retired.
+pub(crate) fn retire_entity(conn: &Connection, kind: EntityKind, native_id: i64) -> Result<()> {
+    let column = binding_column(kind);
+    let entity = format!("(SELECT entity_id FROM entity_local_bindings WHERE {column} = ?1)");
+    conn.execute(
+        &format!("UPDATE entities SET lifecycle = 'retired' WHERE id = {entity}"),
+        [native_id],
+    )?;
+    conn.execute(
+        &format!("UPDATE entity_addresses SET lifecycle = 'retired' WHERE entity_id = {entity}"),
+        [native_id],
+    )?;
+    Ok(())
+}
+
 fn count(conn: &Connection, table: &str) -> Result<i64> {
     Ok(conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
 }
@@ -286,7 +447,7 @@ fn valid_segment(segment: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-fn describe(kind: HubKind, id: i64, name: &str) -> String {
+fn describe(kind: EntityKind, id: i64, name: &str) -> String {
     format!("{} {id} `{name}`", kind.as_str())
 }
 
@@ -317,13 +478,13 @@ fn map_entities(conn: &Connection, issues: &mut Vec<String>) -> Result<Vec<Entit
     for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
         let (id, name) = row?;
         owner_names.insert(id, map_name(&name));
-        top_level.push((HubKind::Human, id, name, false));
+        top_level.push((EntityKind::Human, id, name, false));
     }
     let mut stmt =
         conn.prepare("SELECT id, name, archived_at IS NOT NULL FROM bbs_groups ORDER BY id")?;
     for row in stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))? {
         let (id, name, archived) = row?;
-        top_level.push((HubKind::Group, id, name, archived));
+        top_level.push((EntityKind::Group, id, name, archived));
     }
     let mut owned: BTreeMap<i64, Vec<Agent>> = BTreeMap::new();
     let mut stmt = conn.prepare(
@@ -340,7 +501,7 @@ fn map_entities(conn: &Connection, issues: &mut Vec<String>) -> Result<Vec<Entit
                 name,
                 retired_at,
             }),
-            None => top_level.push((HubKind::Agent, id, name, retired_at.is_some())),
+            None => top_level.push((EntityKind::Agent, id, name, retired_at.is_some())),
         }
     }
 
@@ -380,7 +541,7 @@ fn map_entities(conn: &Connection, issues: &mut Vec<String>) -> Result<Vec<Entit
         };
         for (agent, segment) in map_owner_scope(owner_name, agents, issues) {
             let m = EntityMapping {
-                kind: HubKind::Agent,
+                kind: EntityKind::Agent,
                 native_id: agent.id,
                 entity_id: format!("{owner_name}/{segment}"),
                 retired: agent.retired_at.is_some(),
@@ -479,7 +640,7 @@ fn map_owner_scope(
         let describe_all = || {
             group
                 .iter()
-                .map(|&i| describe(HubKind::Agent, agents[i].id, &agents[i].name))
+                .map(|&i| describe(EntityKind::Agent, agents[i].id, &agents[i].name))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -500,7 +661,7 @@ fn map_owner_scope(
                     Some(t) => times.push((i, t)),
                     None => unparseable.push(format!(
                         "{} retired_at {text:?}",
-                        describe(HubKind::Agent, agents[i].id, &agents[i].name)
+                        describe(EntityKind::Agent, agents[i].id, &agents[i].name)
                     )),
                 }
             }
@@ -688,9 +849,9 @@ fn apply(tx: &Connection, preflight: &PreflightReport) -> Result<HubMigrationRep
     tx.execute_batch("DROP TABLE temp.hub_migration_context")?;
     tx.pragma_update(None, "user_version", HUB_MODEL_SCHEMA_VERSION as i64)?;
     Ok(HubMigrationReport {
-        humans: preflight.count(HubKind::Human),
-        agents: preflight.count(HubKind::Agent),
-        groups: preflight.count(HubKind::Group),
+        humans: preflight.count(EntityKind::Human),
+        agents: preflight.count(EntityKind::Agent),
+        groups: preflight.count(EntityKind::Group),
         messages,
         deliveries,
         renamed: preflight.renamed(),

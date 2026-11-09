@@ -1310,8 +1310,18 @@ async fn report_drain(
     }
 }
 
+/// Whether a failed mail wait must end the run: a credential error, a protocol
+/// incompatibility (an upgraded server refuses this client for good), or an
+/// inbox another process still holds after `SLOT_RETRIES` tries.
+fn mail_wait_fatal(err: &anyhow::Error, slot_retries: u32) -> bool {
+    let text = format!("{err:#}");
+    text.contains("token")
+        || crate::protocol::is_incompatible(err)
+        || (text.contains("already running") && slot_retries >= SLOT_RETRIES)
+}
+
 /// Keep one mail wait open for the agent and forward each batch. Retries on
-/// connection errors; stops on a credential error.
+/// connection errors; stops on a credential error or an incompatible server.
 async fn wait_for_mail(
     config: Config,
     dir: PathBuf,
@@ -1328,6 +1338,10 @@ async fn wait_for_mail(
         if backend.is_none() {
             match Backend::open(&config, &dir, caller.clone()).await {
                 Ok(b) => backend = Some(b),
+                Err(err) if crate::protocol::is_incompatible(&err) => {
+                    let _ = tx.send(Err(err));
+                    return;
+                }
                 Err(err) => {
                     tracing::warn!("headless mail wait: {err:#}");
                     tokio::time::sleep(MAIL_RETRY).await;
@@ -1344,13 +1358,12 @@ async fn wait_for_mail(
                 }
             }
             Err(err) => {
-                let text = format!("{err:#}");
-                let busy = text.contains("already running");
-                if text.contains("token") || (busy && slot_retries >= SLOT_RETRIES) {
+                if mail_wait_fatal(&err, slot_retries) {
                     let _ = tx.send(Err(err));
                     return;
                 }
-                if busy {
+                let text = format!("{err:#}");
+                if text.contains("already running") {
                     slot_retries += 1;
                 }
                 tracing::warn!("headless mail wait: {text}");
@@ -1364,6 +1377,24 @@ async fn wait_for_mail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mail_waits_end_on_incompatible_servers_and_dead_tokens() {
+        // As the client reports a server's epoch rejection.
+        let status = tonic::Status::failed_precondition(
+            "incompatible BBS protocol: this server requires epoch 4 (bbs.v2); upgrade the client and server together",
+        );
+        let message = status.message().to_string();
+        let epoch = anyhow::Error::new(status).context(message);
+        assert!(mail_wait_fatal(&epoch, 0));
+        let token = anyhow::anyhow!("unknown or retired token");
+        assert!(mail_wait_fatal(&token, 0));
+        let busy = anyhow::anyhow!("another `bbs read --wait` is already running for Mateo");
+        assert!(!mail_wait_fatal(&busy, SLOT_RETRIES - 1));
+        assert!(mail_wait_fatal(&busy, SLOT_RETRIES));
+        let down = anyhow::Error::new(tonic::Status::unavailable("connection refused"));
+        assert!(!mail_wait_fatal(&down, 0));
+    }
 
     fn message(id: i64, kind: proto::Kind, name: &str, body: &str) -> proto::Message {
         proto::Message {
