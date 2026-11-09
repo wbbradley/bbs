@@ -245,6 +245,31 @@ pub enum AdminCommand {
         #[command(subcommand)]
         command: AdminHumanCommand,
     },
+    /// Manage Hub integrations: the adapter's credential and the publication
+    /// switch. Add and rotate print a new credential once to stdout.
+    Integration {
+        #[command(subcommand)]
+        command: AdminIntegrationCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminIntegrationCommand {
+    /// Create an integration, with publication off, and issue its credential.
+    Add { id: String },
+    /// Replace the integration's credential; a stream on the old one ends.
+    Rotate { id: String },
+    /// Revoke the integration's credential; a stream on it ends.
+    Revoke { id: String },
+    /// Publish every active human and agent to the integration (on), or
+    /// none, refusing remote sends (off).
+    Publish {
+        id: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// List integrations, their publication and their handoffs by state.
+    List,
 }
 
 #[derive(Subcommand, Debug)]

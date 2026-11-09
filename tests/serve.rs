@@ -2181,3 +2181,114 @@ fn a_new_database_takes_the_namespace_and_a_legacy_one_is_refused() {
         .unwrap();
     assert_eq!(version, 26);
 }
+
+/// `bbs serve --integration-listen` with an adapter stream, administered by a
+/// separate `bbs admin integration` process as an operator would.
+#[tokio::test]
+async fn the_integration_stream_follows_local_administration() {
+    use bbs_core::hub_proto::integration as pb;
+    use pb::adapter_frame::Payload as In;
+    use pb::bbs_frame::Payload as Out;
+
+    let home = std::env::temp_dir().join(format!("bbs-serve-{}-integration", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let state = home.join(".local/state/bbs");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bbs"))
+        .args(["serve", "--listen", "127.0.0.1:0"])
+        .args(["--integration-listen", "127.0.0.1:0"])
+        .env("HOME", &home)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Keep reading stdout open: the server prints after its first line.
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    line.clear();
+    out.read_line(&mut line).unwrap();
+    assert!(
+        line.starts_with("bbs serve integration stream on "),
+        "{line}"
+    );
+    let addr = line.trim().rsplit(' ').next().unwrap().to_string();
+    let admin = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_bbs"))
+            .arg("admin")
+            .args(args)
+            .arg("--state-dir")
+            .arg(&state)
+            .env_remove("HOME")
+            .env("BBS_SERVER", "invalid:1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    let token = admin(&["integration", "add", "hub"]);
+    admin(&["human", "add", "will"]);
+
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(pb::AdapterFrame {
+        payload: Some(In::Hello(pb::AdapterHello {
+            integration_id: "hub".into(),
+            protocol_major: 1,
+            build: "test".into(),
+        })),
+    })
+    .await
+    .unwrap();
+    let mut req = Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    req.metadata_mut()
+        .insert("bbs-integration-token", token.parse().unwrap());
+    let mut stream = pb::integration_client::IntegrationClient::new(channel)
+        .connect(req)
+        .await
+        .unwrap()
+        .into_inner();
+    let mut next = async || {
+        tokio::time::timeout(Duration::from_secs(10), stream.message())
+            .await
+            .unwrap()
+            .map(|f| f.unwrap().payload.unwrap())
+    };
+    assert!(matches!(next().await.unwrap(), Out::Hello(_)));
+    let Out::Published(off) = next().await.unwrap() else {
+        panic!("expected the catalog");
+    };
+    assert!(off.entities.is_empty());
+
+    // The server notices the switch at its next recheck.
+    assert_eq!(
+        admin(&["integration", "publish", "hub", "on"]),
+        "Integration hub publishes every active human and agent."
+    );
+    let Out::Published(on) = next().await.unwrap() else {
+        panic!("expected a new catalog");
+    };
+    assert_eq!(on.revision, off.revision + 1);
+    assert_eq!(on.entities.len(), 1);
+    assert_eq!(
+        admin(&["integration", "list"]),
+        format!(
+            "hub: enabled, publication on (revision {}), credential issued; handoffs: none",
+            on.revision
+        )
+    );
+    admin(&["integration", "revoke", "hub"]);
+    let err = next().await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated, "{err:?}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&home);
+}
