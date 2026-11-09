@@ -7,6 +7,8 @@ use tonic::{Response, Status};
 
 use crate::{proto, release};
 
+/// The wire service's protobuf package; the epoch versions the contract within it.
+pub const PACKAGE: &str = "bbs.v2";
 pub const EPOCH: u32 = 3;
 /// `EPOCH` as its metadata value.
 const EPOCH_TEXT: &str = "3";
@@ -176,9 +178,9 @@ impl Policy {
                 .transpose()
         };
         if get("bbs-protocol-epoch")? != Some(EPOCH_TEXT) {
-            return Err(Status::failed_precondition(
-                "incompatible BBS protocol: this server requires epoch 3 (bbs.v2); upgrade the client and server together",
-            ));
+            return Err(Status::failed_precondition(format!(
+                "incompatible BBS protocol: this server requires epoch {EPOCH} ({PACKAGE}); upgrade the client and server together"
+            )));
         }
         if let Some(required) = get("bbs-required-capabilities")? {
             for capability in required.split(',') {
@@ -338,6 +340,7 @@ mod tests {
         };
         policy.validate(&valid()).unwrap();
         assert_eq!(EPOCH_TEXT, EPOCH.to_string());
+        assert_eq!(proto::bbs_server::SERVICE_NAME, format!("{PACKAGE}.Bbs"));
         // Epoch 2 clients predate the Hub model and stop here.
         for epoch in [
             None,
