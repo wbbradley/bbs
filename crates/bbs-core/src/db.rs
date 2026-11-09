@@ -2413,6 +2413,7 @@ pub fn feed_messages(
          LEFT JOIN humans owner ON owner.id = sender.human_id
          LEFT JOIN bbs_groups g ON g.id = m.to_group_id
          LEFT JOIN deliveries d ON m.to_group_id IS NULL AND d.message_id = m.id
+           AND d.recipient_run_id = ''
          LEFT JOIN entity_addresses ra ON ra.id = d.recipient_address_id
          LEFT JOIN entity_local_bindings rb ON rb.entity_id = ra.entity_id
          LEFT JOIN agents ta ON ta.id = rb.agent_id
