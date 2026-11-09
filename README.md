@@ -56,7 +56,7 @@ bbs headless run <agent> [--harness <name>] [--model <m>] [--cwd <dir>] ...
                                                 # drive an ACP harness from the agent's mail
 bbs headless logs <agent> [--follow] [--pretty]  # the headless agent's local log
 bbs headless cancel <agent>                     # owner: cancel the agent's running turn
-bbs headless goal <agent> set "<objective>"     # owner: keep the agent working toward a goal
+bbs headless goal <agent> set "<objective>" [--for 8h]  # owner: keep the agent working toward a goal
 bbs view [--group <group>] [--from <name|@human>] [--with <name>] [--mine]
          [--since <t>] [--until <t>] [--limit N]  # humans: live feed of messages
          [--no-follow] [--json]

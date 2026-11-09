@@ -4130,7 +4130,8 @@ fn headless_stops_after_repeated_turn_errors(mode: Mode) {
     assert!(headless_state(&bbs, "Zed")["session_id"].is_null());
 }
 
-/// A runner driving tests/fake_goal.py with `script`; the agent is Zed.
+/// A runner driving tests/fake_goal.py with `script`; the agent is Zed. A
+/// `budget` of 0 sets no turn budget.
 fn goal_runner(test: &str, script: &str, budget: u32) -> (Bbs, RunGuard) {
     let bbs = Bbs::new(test);
     let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_goal.py");
@@ -4139,9 +4140,14 @@ fn goal_runner(test: &str, script: &str, budget: u32) -> (Bbs, RunGuard) {
     std::fs::write(
         dir.join("config.toml"),
         format!(
-            "[headless]\nmin_turn_interval = \"0s\"\ngoal_turn_budget = {budget}\n\
+            "[headless]\nmin_turn_interval = \"0s\"\n{}\
              [headless.harness.fake]\ncommand = [\"python3\", {fake:?}]\n\
-             env = {{ FAKE_GOAL_SCRIPT = {script:?} }}\n"
+             env = {{ FAKE_GOAL_SCRIPT = {script:?} }}\n",
+            if budget > 0 {
+                format!("goal_turn_budget = {budget}\n")
+            } else {
+                String::new()
+            }
         ),
     )
     .unwrap();
@@ -4205,10 +4211,10 @@ fn headless_goal_continues_waits_across_a_restart_and_completes() {
     assert_eq!(
         headers,
         [
-            "[bbs goal · new · budget 1/50 turns]",
-            "[bbs goal · continuation 2 · budget 2/50 turns]",
-            "[bbs goal · continuation 3 · budget 3/50 turns]",
-            "[bbs goal · resumed after wait · budget 4/50 turns]",
+            "[bbs goal · new · turn 1 of 50]",
+            "[bbs goal · continuation · turn 2 of 50]",
+            "[bbs goal · continuation · turn 3 of 50]",
+            "[bbs goal · resumed after wait · turn 4 of 50]",
         ]
     );
     assert!(
@@ -4276,7 +4282,7 @@ fn headless_goal_stalls_on_idle_turns_and_is_limited_by_its_budget() {
     eventually("a fresh budget", || {
         goal_prompts(&bbs)
             .get(4)
-            .filter(|p| p.contains("budget 1/4 turns"))
+            .filter(|p| p.contains("turn 1 of 4"))
             .map(|_| ())
     });
     bbs.ok(&["headless", "goal", "Zed", "clear"]);
@@ -4425,7 +4431,7 @@ fn headless_goal_waits_through_mail_until_the_agent_ends_the_wait() {
     let prompts = goal_prompts(&bbs);
     assert_eq!(prompts.len(), 4, "{prompts:#?}");
     assert!(
-        prompts[3].starts_with("[bbs goal · continuation 2 · budget 2/50 turns]\n"),
+        prompts[3].starts_with("[bbs goal · continuation · turn 2 of 50]\n"),
         "{}",
         prompts[3]
     );
@@ -4435,6 +4441,49 @@ fn headless_goal_waits_through_mail_until_the_agent_ends_the_wait() {
         prompts[3]
     );
     assert!(prompts[3].contains("bbs_goal_get"), "{}", prompts[3]);
+}
+
+#[test]
+fn headless_goal_expires_at_its_deadline_and_a_later_one_resumes_it() {
+    let (bbs, _run) = goal_runner("goal-deadline", "wait1h,complete", 0);
+    bbs.ok(&[
+        "headless",
+        "goal",
+        "Zed",
+        "set",
+        "Ship the release",
+        "--for",
+        "2s",
+    ]);
+    wait_goal_status(&bbs, "waiting");
+    // The deadline comes before the hour-long wait ends.
+    wait_goal_status(&bbs, "expired");
+    let state = headless_state(&bbs, "Zed");
+    assert_eq!(state["goal"]["budget"], 0, "no turn budget unless set");
+    assert!(
+        state["goal"]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("its deadline ")
+    );
+    let err = bbs.err(&["headless", "goal", "Zed", "deadline", "yesterday"]);
+    assert!(err.contains("not an RFC 3339 time"), "{err}");
+    // A later deadline resumes it, restating the goal in full.
+    bbs.ok(&["headless", "goal", "Zed", "deadline", "1h"]);
+    wait_goal_status(&bbs, "complete");
+    let prompts = goal_prompts(&bbs);
+    assert_eq!(prompts.len(), 2, "{prompts:#?}");
+    let header = prompts[0]
+        .lines()
+        .find(|l| l.starts_with("[bbs goal"))
+        .unwrap();
+    assert!(header.starts_with("[bbs goal · new · turn 1"), "{header}");
+    assert!(
+        prompts[1].starts_with("[bbs goal · resumed by owner · turn 2 · due ")
+            && prompts[1].contains("Ship the release"),
+        "{}",
+        prompts[1]
+    );
 }
 
 #[test]

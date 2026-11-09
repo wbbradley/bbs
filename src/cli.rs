@@ -454,10 +454,19 @@ pub enum GoalAction {
     Set {
         /// What the agent should achieve, as it will read it (at most 4096 bytes).
         objective: String,
+        /// Stop the goal as expired at this RFC 3339 time.
+        #[arg(long, conflicts_with = "for_")]
+        until: Option<String>,
+        /// Stop the goal as expired after this long, like "8h" or "2d".
+        #[arg(long = "for")]
+        for_: Option<String>,
     },
+    /// Set the goal's deadline: an RFC 3339 time, a duration from now like "8h",
+    /// or "none". A later deadline resumes an expired goal.
+    Deadline { when: String },
     /// Stop prompting toward the goal until it is resumed.
     Pause,
-    /// Prompt toward a paused, blocked, stalled or limited goal again.
+    /// Prompt toward a paused, blocked, stalled, limited or expired goal again.
     Resume,
     /// Remove the goal.
     Clear,

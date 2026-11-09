@@ -12,7 +12,21 @@ const NAMES: Record<number, string> = {
   [GoalStatus.Paused]: "paused",
   [GoalStatus.Limited]: "limited",
   [GoalStatus.Stalled]: "stalled",
+  [GoalStatus.Expired]: "expired",
 };
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** "turn 3", or "turn 3 of 50" under a turn budget (0 is none). */
+export function goalProgress(goal: GoalReport): string {
+  return goal.budget > 0 ? `turn ${goal.iteration} of ${goal.budget}` : `turn ${goal.iteration}`;
+}
+
+/** A day past the deadline, or past now if it has passed or there is none. */
+export function extendedDeadline(goal: GoalReport, now = Date.now()): string {
+  const from = Math.max(now, goal.deadline ? Date.parse(goal.deadline) : 0);
+  return new Date(from + DAY_MS).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
 
 /** The objective's limit, as the server checks it. */
 const MAX_OBJECTIVE = 4096;
@@ -52,6 +66,8 @@ export function GoalDialog({
   onNotice: (message: string) => void;
 }) {
   const [objective, setObjective] = useState("");
+  // A local date and time from the picker; empty for no deadline.
+  const [deadline, setDeadline] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const bytes = new TextEncoder().encode(objective.trim()).length;
@@ -59,8 +75,11 @@ export function GoalDialog({
     setBusy(true);
     setError(null);
     try {
+      const due = deadline ? new Date(deadline) : null;
+      if (due && !(due.getTime() > Date.now())) throw new Error("The deadline must be in the future.");
       await control(agent, Control.GoalSet, objective.trim());
-      onNotice(`Asked ${agent}'s runner to work toward the new goal.`);
+      if (due) await control(agent, Control.GoalDeadline, due.toISOString().replace(/\.\d{3}Z$/, "Z"));
+      onNotice(`Asked ${agent}'s runner to work toward the new goal${due ? `, due ${fullTime(due.toISOString())}` : ""}.`);
       onClose();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -85,7 +104,7 @@ export function GoalDialog({
     >
       <p className="muted" style={{ marginTop: 0 }}>
         The runner prompts {agent} toward this, turn after turn, until it marks the goal complete, blocks or waits,
-        or you pause it.{current ? " This replaces the current goal." : ""}
+        the deadline passes, or you pause it.{current ? " This replaces the current goal." : ""}
       </p>
       <label className="field">
         <span>Objective</span>
@@ -97,6 +116,10 @@ export function GoalDialog({
           placeholder="Get the integration tests passing on main"
           autoFocus
         />
+      </label>
+      <label className="field">
+        <span>Deadline (optional)</span>
+        <input className="input" type="datetime-local" value={deadline} onChange={(e) => setDeadline(e.target.value)} />
       </label>
       {bytes > MAX_OBJECTIVE && <div className="notice error">At most {MAX_OBJECTIVE} bytes.</div>}
       {error && <div className="notice error">{error}</div>}
@@ -143,7 +166,8 @@ export function GoalStrip({
       <span className="goal-text">
         <span className="goal-status">goal · {status}</span>{" "}
         <span className="muted">
-          {goal.iteration}/{goal.budget} turns
+          {goalProgress(goal)}
+          {goal.deadline && <> · due {clock(goal.deadline)}</>}
         </span>{" "}
         <span className="goal-objective">{goal.objective}</span>
         {why && <span className="muted"> — {why}</span>}
@@ -154,6 +178,19 @@ export function GoalStrip({
           {running && (
             <button className="btn small" disabled={busy} onClick={() => act(Control.GoalPause, "Pause your goal.", `Asked ${agent}'s runner to pause its goal.`)}>
               Pause
+            </button>
+          )}
+          {(running || goal.status === GoalStatus.Expired) && (
+            <button
+              className="btn small"
+              disabled={busy}
+              title="Move the deadline a day later; an expired goal resumes"
+              onClick={() => {
+                const due = extendedDeadline(goal);
+                act(Control.GoalDeadline, due, `Asked ${agent}'s runner to move its goal's deadline to ${fullTime(due)}.`);
+              }}
+            >
+              +1 day
             </button>
           )}
           {stopped && (

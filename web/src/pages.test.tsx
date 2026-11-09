@@ -224,7 +224,7 @@ describe("goals", () => {
     expect(screen.queryByRole("button", { name: "Goal" })).toBeNull();
     const strip = document.querySelector(".attention.goal")!;
     expect(strip.textContent).toContain("goal · blocked");
-    expect(strip.textContent).toContain("4/50 turns");
+    expect(strip.textContent).toContain("turn 4 of 50");
     expect(strip.textContent).toContain("Ship the release");
     expect(strip.textContent).toContain("which branch?");
     fireEvent.click(screen.getByRole("button", { name: "Pause" }));

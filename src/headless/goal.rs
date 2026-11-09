@@ -24,8 +24,6 @@ use crate::config::Config;
 use crate::proto;
 use crate::service::Caller;
 
-/// Goal prompts per goal before the runner stops it as `limited`.
-pub const DEFAULT_BUDGET: u32 = 50;
 /// The longest wait an agent may ask for.
 pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 /// Goal turns in a row with no tool calls before the runner stops the goal.
@@ -46,6 +44,7 @@ pub enum Status {
     Paused,
     Limited,
     Stalled,
+    Expired,
 }
 
 impl Status {
@@ -58,6 +57,7 @@ impl Status {
             Status::Paused => proto::GoalStatus::Paused,
             Status::Limited => proto::GoalStatus::Limited,
             Status::Stalled => proto::GoalStatus::Stalled,
+            Status::Expired => proto::GoalStatus::Expired,
         }
     }
 }
@@ -117,7 +117,13 @@ pub struct Goal {
     pub status: Status,
     /// Goal prompts sent.
     pub iteration: u32,
+    /// The most goal prompts before the goal stops as limited; 0 for none.
+    /// The runner's `goal_turn_budget` setting, applied whenever it starts.
+    #[serde(default)]
     pub budget: u32,
+    /// When the goal expires (RFC 3339); None for no deadline.
+    #[serde(default)]
+    pub deadline: Option<String>,
     #[serde(default)]
     pub reason: String,
     #[serde(default)]
@@ -204,6 +210,7 @@ impl Goal {
             status: Status::Active,
             iteration: 0,
             budget,
+            deadline: None,
             reason: String::new(),
             evidence: String::new(),
             wake_at: None,
@@ -239,12 +246,16 @@ impl Goal {
         true
     }
 
-    /// The owner resumed it. A goal stopped at its budget gets a fresh one.
+    /// The owner resumed it. A goal stopped at its budget gets a fresh one;
+    /// an expired goal needs a later deadline first.
     pub fn resume(&mut self) -> Result<()> {
         match self.status {
             Status::Active => bail!("the goal is already active"),
             Status::Complete => bail!("the goal is complete; set a new one instead"),
             Status::Limited => self.iteration = 0,
+            Status::Expired if self.past_deadline(Utc::now()) => {
+                bail!("the goal's deadline has passed; set a later one, which resumes it")
+            }
             _ => {}
         }
         self.set(Status::Active, Changer::Owner, "resumed by owner");
@@ -264,7 +275,65 @@ impl Goal {
 
     /// The wait's time came. Returns whether it changed.
     pub fn wake(&mut self) -> bool {
-        self.status == Status::Waiting && self.end_wait(false, None)
+        self.wake_time().is_some_and(|t| t <= Utc::now()) && self.end_wait(false, None)
+    }
+
+    fn past_deadline(&self, now: DateTime<Utc>) -> bool {
+        self.deadline
+            .as_deref()
+            .and_then(parse_time)
+            .is_some_and(|d| d <= now)
+    }
+
+    /// The deadline passed: a goal still in progress stops as expired.
+    /// Returns whether it changed.
+    pub fn expire(&mut self) -> bool {
+        if !matches!(
+            self.status,
+            Status::Active | Status::Waiting | Status::Blocked
+        ) || !self.past_deadline(Utc::now())
+        {
+            return false;
+        }
+        let reason = format!(
+            "its deadline {} passed",
+            self.deadline.as_deref().unwrap_or_default()
+        );
+        self.set(Status::Expired, Changer::Runner, &reason);
+        true
+    }
+
+    /// The owner set the deadline, or cleared it with None. A later deadline
+    /// resumes an expired goal. Returns whether the goal resumed.
+    pub fn set_deadline(&mut self, deadline: Option<String>) -> bool {
+        self.deadline = deadline;
+        if self.status != Status::Expired || self.past_deadline(Utc::now()) {
+            return false;
+        }
+        self.set(
+            Status::Active,
+            Changer::Owner,
+            "the owner moved the deadline",
+        );
+        self.idle_turns = 0;
+        self.ended = None;
+        self.next = Next::Restated;
+        true
+    }
+
+    /// When the runner next has to look at the goal: the wait's end or the
+    /// deadline, whichever comes first.
+    pub fn next_time(&self) -> Option<DateTime<Utc>> {
+        let deadline = matches!(
+            self.status,
+            Status::Active | Status::Waiting | Status::Blocked
+        )
+        .then(|| self.deadline.as_deref().and_then(parse_time))
+        .flatten();
+        match (self.wake_time(), deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// The blocker a blocked goal waits on, by its root.
@@ -361,7 +430,7 @@ impl Goal {
         } else if tools.is_some() {
             self.idle_turns = 0;
         }
-        if self.iteration >= self.budget {
+        if self.budget > 0 && self.iteration >= self.budget {
             let reason = format!("used its budget of {} turns", self.budget);
             self.set(Status::Limited, Changer::Runner, &reason);
         }
@@ -372,7 +441,7 @@ impl Goal {
     /// limited instead. Waits and blocks end turns early, so the check after
     /// each turn alone would miss them. Returns whether it stopped.
     pub fn spent(&mut self) -> bool {
-        if self.status != Status::Active || self.iteration < self.budget {
+        if self.status != Status::Active || self.budget == 0 || self.iteration < self.budget {
             return false;
         }
         let reason = format!("used its budget of {} turns", self.budget);
@@ -399,14 +468,12 @@ impl Goal {
     }
 
     fn render(&self) -> String {
-        let budget = format!("budget {}/{} turns", self.iteration, self.budget);
+        let tail = self.progress();
         let header = match self.next {
-            Next::New => format!("[bbs goal · new · {budget}]"),
-            Next::Resumed => format!("[bbs goal · resumed after wait · {budget}]"),
-            Next::Restated => format!("[bbs goal · resumed by owner · {budget}]"),
-            Next::Continue | Next::Sharper => {
-                format!("[bbs goal · continuation {} · {budget}]", self.iteration)
-            }
+            Next::New => format!("[bbs goal · new · {tail}]"),
+            Next::Resumed => format!("[bbs goal · resumed after wait · {tail}]"),
+            Next::Restated => format!("[bbs goal · resumed by owner · {tail}]"),
+            Next::Continue | Next::Sharper => format!("[bbs goal · continuation · {tail}]"),
         };
         let date = self.set_at.get(..10).unwrap_or(&self.set_at);
         let lead = match (self.next, &self.ended) {
@@ -457,16 +524,25 @@ impl Goal {
         )
     }
 
+    /// "turn 3", "turn 3 of 50", and " · due <deadline>" when it has one.
+    fn progress(&self) -> String {
+        let mut text = format!("turn {}", self.iteration);
+        if self.budget > 0 {
+            text.push_str(&format!(" of {}", self.budget));
+        }
+        if let Some(deadline) = &self.deadline {
+            text.push_str(&format!(" · due {deadline}"));
+        }
+        text
+    }
+
     /// The goal for `bbs_goal_get`: objective, state and instructions.
     pub fn describe(&self) -> String {
         let status = serde_json::to_value(self.status)
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default();
-        let mut state = format!(
-            "Status: {status} ({} of {} goal turns used)",
-            self.iteration, self.budget
-        );
+        let mut state = format!("Status: {status} ({})", self.progress());
         if let Some(until) = self.wake_time().and(self.wake_at.as_deref()) {
             state.push_str(&format!(", waiting until {until}"));
         }
@@ -510,6 +586,7 @@ impl Goal {
             set_at: self.set_at.clone(),
             iteration: self.iteration,
             budget: self.budget,
+            deadline: self.deadline.clone(),
             reason: self.reason.clone(),
             evidence: self.evidence.clone(),
             wake_at: self.wake_at.clone(),
@@ -773,7 +850,7 @@ mod tests {
         assert!(g.resume().is_ok());
         assert!(
             g.prompt()
-                .starts_with("[bbs goal · resumed by owner · budget 1/3 turns]\n")
+                .starts_with("[bbs goal · resumed by owner · turn 1 of 3]\n")
         );
     }
 
@@ -784,21 +861,21 @@ mod tests {
         assert_eq!(
             first,
             format!(
-                "[bbs goal · new · budget 1/3 turns]\nObjective (set by will, 2026-11-05):\n\
+                "[bbs goal · new · turn 1 of 3]\nObjective (set by will, 2026-11-05):\n\
                  Ship the release\n\nStart working on it now.\n{INSTRUCTIONS}"
             )
         );
         assert!(g.turn_ended(Some(2)));
         let next = g.prompt();
         assert!(
-            next.starts_with("[bbs goal · continuation 2 · budget 2/3 turns]\n"),
+            next.starts_with("[bbs goal · continuation · turn 2 of 3]\n"),
             "{next}"
         );
         // A turn that did work gets a short reminder, without the objective.
         assert_eq!(
             next,
             format!(
-                "[bbs goal · continuation 2 · budget 2/3 turns]\nYour last turn ended without \
+                "[bbs goal · continuation · turn 2 of 3]\nYour last turn ended without \
                  updating the goal, so the goal is still active. {REMINDER}"
             )
         );
@@ -817,9 +894,8 @@ mod tests {
         assert_eq!((g.status, g.iteration), (Status::Active, 0));
         let restated = g.prompt();
         assert!(
-            restated.starts_with(
-                "[bbs goal · resumed by owner · budget 1/3 turns]\nObjective (set by will"
-            ),
+            restated
+                .starts_with("[bbs goal · resumed by owner · turn 1 of 3]\nObjective (set by will"),
             "{restated}"
         );
     }
@@ -926,7 +1002,7 @@ mod tests {
         assert_eq!((g.status, g.next), (Status::Active, Next::Resumed));
         let text = g.prompt();
         assert!(
-            text.starts_with("[bbs goal · resumed after wait · budget 1/3 turns]"),
+            text.starts_with("[bbs goal · resumed after wait · turn 1 of 3]"),
             "{text}"
         );
         assert!(text.contains(
@@ -1020,6 +1096,66 @@ mod tests {
         assert!(!g.mail_arrived());
         // Not active, waiting or blocked: ignored.
         assert!(!g.apply(&update(&g, UpdateKind::Active {})));
+    }
+
+    #[test]
+    fn deadlines_expire_goals_in_progress_and_a_later_one_resumes() {
+        let mut g = goal();
+        g.budget = 0;
+        // No budget: the goal is never limited.
+        for _ in 0..5 {
+            assert!(!g.spent());
+            g.prompt();
+            assert!(g.turn_ended(Some(1)));
+        }
+        assert_eq!((g.status, g.iteration), (Status::Active, 5));
+        assert!(
+            g.prompt()
+                .starts_with("[bbs goal · continuation · turn 6]\n")
+        );
+        // A future deadline shows in the header and sets the next look.
+        assert!(!g.set_deadline(Some("2099-01-01T00:00:00Z".into())));
+        assert!(!g.expire());
+        assert_eq!(g.next_time(), parse_time("2099-01-01T00:00:00Z"));
+        assert!(
+            g.describe()
+                .contains("Status: active (turn 6 · due 2099-01-01T00:00:00Z)")
+        );
+        // A wait ends at the earlier of its time and the deadline.
+        let wait = UpdateKind::Waiting {
+            wake_at: "2098-01-01T00:00:00Z".into(),
+            reason: "r".into(),
+        };
+        assert!(g.apply(&update(&g, wait)));
+        assert_eq!(g.next_time(), parse_time("2098-01-01T00:00:00Z"));
+        assert!(!g.wake(), "the wait's time has not come");
+        g.deadline = Some("2097-01-01T00:00:00Z".into());
+        assert_eq!(g.next_time(), parse_time("2097-01-01T00:00:00Z"));
+        // The deadline passes while waiting: the goal expires.
+        g.deadline = Some("2026-01-01T00:00:00Z".into());
+        assert!(g.expire());
+        assert_eq!(
+            (g.status, g.changed_by, g.reason.as_str()),
+            (
+                Status::Expired,
+                Changer::Runner,
+                "its deadline 2026-01-01T00:00:00Z passed"
+            )
+        );
+        assert_eq!(g.report().status(), proto::GoalStatus::Expired);
+        assert!(g.next_time().is_none(), "an expired goal has no timer");
+        assert!(!g.expire());
+        // Resuming needs a later deadline, which resumes it by itself.
+        assert!(format!("{:#}", g.resume().unwrap_err()).contains("deadline has passed"));
+        assert!(g.set_deadline(Some("2099-01-01T00:00:00Z".into())));
+        assert_eq!((g.status, g.next), (Status::Active, Next::Restated));
+        assert!(
+            g.prompt()
+                .starts_with("[bbs goal · resumed by owner · turn 7 · due 2099")
+        );
+        // Clearing the deadline leaves the goal running.
+        assert!(!g.set_deadline(None));
+        assert_eq!((g.status, g.next_time()), (Status::Active, None));
     }
 
     #[test]

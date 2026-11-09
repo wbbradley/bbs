@@ -22,7 +22,7 @@ mod state;
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 use crate::backend::Backend;
 use crate::cli::{GoalAction, HeadlessCommand};
@@ -104,7 +104,34 @@ async fn cancel(dir: &Path, as_human: Option<&str>, agent: String) -> Result<()>
 /// Ask the agent's running `bbs headless run` to change its goal.
 async fn goal(dir: &Path, as_human: Option<&str>, agent: String, action: GoalAction) -> Result<()> {
     let (body, kind, verb) = match action {
-        GoalAction::Set { objective } => (objective, proto::Control::GoalSet, "set"),
+        GoalAction::Set {
+            objective,
+            until,
+            for_,
+        } => {
+            // Check the deadline before sending anything.
+            let deadline = until.or(for_).map(|w| deadline_body(&w)).transpose()?;
+            let to = control(dir, as_human, agent, objective, proto::Control::GoalSet).await?;
+            if let Some(body) = deadline {
+                control(
+                    dir,
+                    as_human,
+                    to.clone(),
+                    body.clone(),
+                    proto::Control::GoalDeadline,
+                )
+                .await?;
+                println!("Asked {to}'s runner to set its goal, due {body}.");
+            } else {
+                println!("Asked {to}'s runner to set its goal.");
+            }
+            return Ok(());
+        }
+        GoalAction::Deadline { when } => (
+            deadline_body(&when)?,
+            proto::Control::GoalDeadline,
+            "change the deadline of",
+        ),
         GoalAction::Pause => (
             "Pause your goal.".into(),
             proto::Control::GoalPause,
@@ -124,4 +151,26 @@ async fn goal(dir: &Path, as_human: Option<&str>, agent: String, action: GoalAct
     let to = control(dir, as_human, agent, body, kind).await?;
     println!("Asked {to}'s runner to {verb} its goal.");
     Ok(())
+}
+
+/// A goal deadline control's body: an RFC 3339 time, a duration from now
+/// ("8h"), or "none".
+fn deadline_body(when: &str) -> Result<String> {
+    let when = when.trim();
+    if when.eq_ignore_ascii_case("none") {
+        return Ok("none".into());
+    }
+    let at = match chrono::DateTime::parse_from_rfc3339(when) {
+        Ok(at) => at.with_timezone(&chrono::Utc),
+        Err(_) => {
+            let span = humantime::parse_duration(when).with_context(|| {
+                format!("{when:?} is not an RFC 3339 time, a duration such as 8h, or none")
+            })?;
+            chrono::Utc::now() + chrono::Duration::from_std(span).context("that is too long")?
+        }
+    };
+    if at <= chrono::Utc::now() {
+        bail!("the deadline {when} is not in the future");
+    }
+    Ok(at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }

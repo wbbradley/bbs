@@ -276,6 +276,16 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     );
     let mut effort_control = effort::Control::default();
     let _ = effort_reports.send(effort_control.report(agent_harness.effort_state()));
+    // The turn budget is this runner's setting, not the goal's; a deadline
+    // may have passed while the runner was stopped.
+    let goal_started = state.goal.clone();
+    if let Some(g) = state.goal.as_mut() {
+        g.budget = goal_budget;
+        g.expire();
+    }
+    if state.goal != goal_started {
+        agent_dir.save(&state)?;
+    }
     let (goal_reports, goal_reporting) =
         if server_has(&config, dir, crate::backend::AGENT_GOAL).await {
             let (reports, task) = goal::reporter(
@@ -392,7 +402,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
         let wake = state
             .goal
             .as_ref()
-            .and_then(Goal::wake_time)
+            .and_then(Goal::next_time)
             .map(|t| Instant::now() + (t - chrono::Utc::now()).to_std().unwrap_or_default());
         if turn.is_none()
             && outbox.is_empty()
@@ -415,7 +425,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 && !alone
                 && let Some(g) = state.goal.as_mut()
             {
-                if g.spent() {
+                if g.expire() || g.spent() {
                     goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
                 } else {
                     if !active_mail.is_empty() {
@@ -660,7 +670,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             }
             _ = tokio::time::sleep_until(ready_at), if throttled => {}
             _ = tokio::time::sleep_until(wake.unwrap_or(ready_at)), if wake.is_some() && turn.is_none() => {
-                if let Some(g) = state.goal.as_mut() && g.wake() {
+                if let Some(g) = state.goal.as_mut() && (g.expire() || g.wake()) {
                     goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
                 }
             }
@@ -873,6 +883,14 @@ fn goal_control(
             None => refused("goal not resumed: there is no goal"),
         },
         proto::Control::GoalClear => (goal.take().is_some(), None),
+        proto::Control::GoalDeadline => match goal.as_mut() {
+            Some(g) => {
+                let deadline = (message.body != "none").then(|| message.body.clone());
+                g.set_deadline(deadline);
+                (true, None)
+            }
+            None => refused("goal deadline not set: there is no goal"),
+        },
         _ => (false, None),
     }
 }

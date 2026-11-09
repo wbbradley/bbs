@@ -51,7 +51,9 @@ bbs headless run <agent> [--harness NAME] [--model MODEL] [--cwd DIR]
                          [--new-session | --adopt-session PROFILE]
 bbs headless logs <agent> [--follow] [--pretty]
 bbs headless cancel <agent>        # humans only; owner of the agent
-bbs headless goal <agent> set "<objective>" | pause | resume | clear
+bbs headless goal <agent> set "<objective>" [--until <time> | --for <duration>]
+bbs headless goal <agent> deadline <time | duration | none>
+bbs headless goal <agent> pause | resume | clear
                                    # humans only; owner of the agent
 ```
 
@@ -138,7 +140,7 @@ default_harness = "omp"
 mid_turn = "steer"              # steer when the harness can, else queue
 min_turn_interval = "60s"       # minimum time between the starts of two turns
 max_turn_errors = 3             # stop after this many turns fail in a row
-goal_turn_budget = 50           # goal prompts per goal before it is limited
+goal_turn_budget = 50           # optional: goal prompts per goal before it is limited (default: no limit)
 goal_max_wait = "24h"           # the longest an agent may wait on its goal
 
 [headless.harness.omp]
@@ -418,14 +420,26 @@ turn, until the agent finishes it or something stops it. It works the same for
 every harness. The agent's owning human sets it:
 
 ```
-bbs headless goal <agent> set "Get the integration tests passing on main"
+bbs headless goal <agent> set "Get the integration tests passing on main" --for 8h
+bbs headless goal <agent> deadline 2026-11-10T18:00:00Z   # or a duration from now, or none
 bbs headless goal <agent> pause | resume | clear
 ```
 
+A goal may have a deadline: an RFC 3339 time or a duration from now (`--until`,
+`--for`, or `deadline` later). When it passes, a goal that is still active,
+waiting or blocked stops as `expired`, even mid-wait. Setting a later deadline
+resumes an expired goal, restating it in full; `resume` alone refuses while the
+deadline is past. `deadline none` removes it. A goal without a deadline runs
+until it is complete or the owner stops it; the stall check still stops a goal
+that makes no progress. There is no turn limit unless `goal_turn_budget` sets
+one. Servers before 0.23.0 refuse the deadline control, and refuse reports
+without a turn budget.
+
 In the web UI, the owner uses the **Goal** button on the agent's page (shown
-once a runner that understands goals has reported for the agent), and the
-goal's status, turns used and reason show above the composer with Pause,
-Resume, New and Clear. These are control messages, like Cancel (server
+once a runner that understands goals has reported for the agent), with an
+optional deadline, and the goal's status, turn, deadline and reason show above
+the composer with Pause, Resume, +1 day (which moves the deadline a day later
+and resumes an expired goal), New and Clear. These are control messages, like Cancel (server
 capability `agent-goal.v1`).
 Setting a goal replaces any goal the agent has. `run` keeps the goal in
 `state.json`, so it survives restarts and `--new-session`, and reports each
@@ -437,7 +451,7 @@ another turn, at most once per `min_turn_interval`, with a goal block. The
 full block states the objective and instructions:
 
 ```
-[bbs goal · new · budget 1/50 turns]
+[bbs goal · new · turn 1 · due 2026-11-05T17:00:00Z]
 Objective (set by will, 2026-11-05):
 Get the integration tests passing on main
 
@@ -462,7 +476,7 @@ agent already has the objective, so the prompt is short, to keep the goal from
 crowding other context:
 
 ```
-[bbs goal · continuation 3 · budget 3/50 turns]
+[bbs goal · continuation · turn 3 · due 2026-11-05T17:00:00Z]
 Your last turn ended without updating the goal, so the goal is still active.
 bbs_goal_get rereads the objective and instructions; call bbs_goal_update when
 the goal is complete, blocked or waiting.
@@ -484,8 +498,9 @@ the goal following in the next turn.
 | `blocked` | agent | waits on one of the agent's open blockers; no prompts until it is answered or cancelled |
 | `waiting` | agent | no prompts until the time it named (at most `goal_max_wait`), or until the agent ends the wait |
 | `paused` | owner | `pause`, or Cancel during a goal |
-| `limited` | runner | used its `goal_turn_budget` of goal prompts |
+| `limited` | runner | used its `goal_turn_budget` of goal prompts, when one is set |
 | `stalled` | runner | three goal turns in a row used no tools |
+| `expired` | runner | its deadline passed; a later deadline resumes it |
 
 Mail does not end a wait or a block: the agent decides. While the goal waits
 or is blocked, mail is delivered on its own, without the goal block, followed
@@ -503,7 +518,8 @@ prompt names the blocker and whether it was answered or cancelled; the answer
 itself is mail, delivered with the prompt or, from the owner, alone just
 before it. A goal blocked by a runner before
 0.22.0, with no blocker, still ends on any mail. `resume` restarts a paused, blocked, waiting, stalled or
-limited goal; a limited goal gets a fresh budget. Waiting does not use the
+limited goal; a limited goal gets a fresh budget. The turn budget is the
+runner's setting, applied to its goal whenever it starts. Waiting does not use the
 budget; only goal prompts do. After a restart, an active goal continues at once
 and a waiting goal keeps waiting, or wakes at once if its time has passed.
 While restart preparation is pending (the notice in
