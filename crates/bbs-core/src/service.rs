@@ -3497,6 +3497,124 @@ mod tests {
         (conn, will, agents)
     }
 
+    /// A schema-26 board cut over by the operator keeps its unread mail,
+    /// summaries, focus holds, restart barrier and the history of a retired
+    /// agent whose name was reused.
+    #[test]
+    fn a_cut_over_board_keeps_reads_summaries_focus_drains_and_history() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::migrate_legacy(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO humans VALUES (1, 'will', 't', 't');
+             INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at, retired_at)
+             VALUES (1, 'scout', 'k1', '/', 'h', 't', 't', '2026-10-01T00:00:00.000000Z'),
+                    (2, 'scout', 'k2', '/', 'h', 't', '2099-01-01T00:00:00.000000Z', NULL),
+                    (3, 'lonely', 'k3', '/', 'h', 't', '2099-01-01T00:00:00.000000Z', NULL);
+             INSERT INTO agent_owners VALUES (1, 1), (2, 1), (3, 1);
+             INSERT INTO messages (id, from_kind, from_id, body, created_at) VALUES
+                 (1, 'human', 1, 'old hello', '2026-09-01T00:00:01.000000Z'),
+                 (2, 'agent', 1, 'old reply', '2026-09-01T00:00:02.000000Z'),
+                 (3, 'human', 1, 'owner note', '2026-11-01T00:00:03.000000Z'),
+                 (4, 'agent', 2, 'scout reports', '2026-11-01T00:00:04.000000Z'),
+                 (5, 'agent', 3, 'from lonely', '2026-11-01T00:00:05.000000Z'),
+                 (6, 'human', 1, 'after the barrier', '2026-11-01T00:00:06.000000Z');
+             INSERT INTO deliveries VALUES
+                 (1, 'agent', 1, '2026-09-01T00:00:01.000000Z', 1),
+                 (2, 'human', 1, '2026-09-01T00:00:02.000000Z', 1),
+                 (3, 'agent', 2, NULL, 1), (4, 'human', 1, NULL, 1),
+                 (5, 'agent', 2, NULL, 1), (6, 'agent', 2, NULL, 1);
+             INSERT INTO agent_drains VALUES (1, 5, '2099-01-01T00:00:00.000000Z', 'draining');
+             INSERT INTO agent_drain_targets (human_id, agent_id, final_message_id)
+                 VALUES (1, 2, 5);",
+        )
+        .unwrap();
+        db::migrate_to_hub_model(&mut conn, "will").unwrap();
+        db::migrate(&mut conn).unwrap();
+        let will = Caller {
+            human: Some("will".into()),
+            ..Default::default()
+        };
+        let scout = Caller {
+            token: Some("k2".into()),
+            ..Default::default()
+        };
+        let focus = |conn: &mut Connection, focused| {
+            let req = proto::SetFocusRequest {
+                agent: "scout".into(),
+                focused,
+            };
+            set_focus(conn, &will, req).unwrap();
+        };
+        let take = |conn: &mut Connection| -> Vec<String> {
+            read(conn, &scout, proto::ReadRequest::default())
+                .unwrap()
+                .messages
+                .into_iter()
+                .map(|m| m.body)
+                .collect()
+        };
+        // Will's summary counts the live scout's unread report only.
+        let summary = agent_summary(&mut conn, &will, Default::default()).unwrap();
+        let unread: Vec<_> = summary
+            .agents
+            .iter()
+            .map(|a| (a.agent.as_str(), a.unread_messages))
+            .collect();
+        assert_eq!(unread, [("lonely", 0), ("scout", 1)]);
+        // Focus holds lonely's mail; the barrier holds everything after it.
+        focus(&mut conn, true);
+        assert_eq!(take(&mut conn), ["owner note"]);
+        let drain = drain::agent_drain(&mut conn, &will, Default::default()).unwrap();
+        let targets: Vec<_> = drain
+            .agents
+            .iter()
+            .map(|t| (t.name.as_str(), t.unread))
+            .collect();
+        assert_eq!((drain.watermark, targets), (5, vec![("scout", 1)]));
+        focus(&mut conn, false);
+        assert_eq!(take(&mut conn), ["from lonely"]);
+        let resume = proto::AgentDrainRequest {
+            action: "resume".into(),
+        };
+        drain::agent_drain(&mut conn, &will, resume).unwrap();
+        let after = take(&mut conn);
+        assert_eq!(after[0], "after the barrier");
+        assert_eq!(after.len(), 3, "and both focus notices: {after:?}");
+        // Both scouts' history, under the name they share.
+        let history = feed(
+            &mut conn,
+            &will,
+            proto::FeedRequest {
+                backlog: 10,
+                from: Some("scout".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let sent: Vec<_> = history
+            .messages
+            .iter()
+            .map(|m| (m.id, m.from_name.as_str(), m.body.as_str()))
+            .collect();
+        assert_eq!(
+            sent,
+            [(2, "scout", "old reply"), (4, "scout", "scout reports")]
+        );
+        let retired = feed(
+            &mut conn,
+            &will,
+            proto::FeedRequest {
+                backlog: 10,
+                with: Some("scout".into()),
+                until: Some("2026-10-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let bodies: Vec<_> = retired.messages.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["old hello", "old reply"]);
+    }
+
     #[test]
     fn agent_names_too_long_for_a_hub_id_are_refused_whole() {
         let mut conn = Connection::open_in_memory().unwrap();
