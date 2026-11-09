@@ -28,6 +28,8 @@ under the new package version and its publication date.
   recommended client version, else its own version.
 - `bbs version` prints the wire package and the epoch separately (`protocol
   bbs.v2, epoch 3`); it printed the epoch as a package version.
+- `bbs admin` refuses to create a database: start the server (with its
+  `--namespace`) or run `bbs init` first, so the namespace is chosen there.
 - The server and local mode run on the Hub model (schema 27): messages and
   deliveries refer to entity addresses, and every new human, agent and group
   gets an entity ID. Local behaviour is unchanged. A new database is created at
