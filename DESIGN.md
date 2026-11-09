@@ -28,7 +28,8 @@ server's minimum, and `bbs version` agree.
   operations over a SQLite connection using protobuf request and response types.
   Each operation runs in an immediate transaction, establishes a timestamp,
   resolves any required caller, validates the operation, and commits. Caller
-  activity updates are debounced. Registration also retires stale agents.
+  activity updates are debounced. Idle agents are never retired
+  automatically, so restarting one keeps its entity ID and history.
 - [crates/bbs-core/src/backend.rs](crates/bbs-core/src/backend.rs) selects
   `Backend::Local` or `Backend::Remote`. Local calls the service in-process;
   remote sends the same operations over gRPC. Streaming waits differ because
@@ -253,8 +254,7 @@ fails with `FailedPrecondition`, like other service errors, and names the
 group's writers among its members. When a change leaves the group with no
 writer among its members (the last one leaves, is removed, retires by `bye` or
 a human, or loses write), the notice ends with `@team now has no agent
-writers.` Silent retirements (stale agents and agents replaced in a session
-binding) post nothing, as with other notices.
+writers.` Silent retirements (agents replaced in a session binding) post nothing, as with other notices.
 
 ## Message delivery and streams
 

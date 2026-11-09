@@ -556,15 +556,6 @@ pub fn touch_agent(conn: &Connection, id: i64, now: &str, stale_before: &str) ->
     Ok(())
 }
 
-pub fn stale_agent_ids(conn: &Connection, cutoff: &str) -> Result<Vec<i64>> {
-    let mut stmt =
-        conn.prepare("SELECT id FROM agents WHERE retired_at IS NULL AND active_at < ?1")?;
-    let ids = stmt
-        .query_map(params![cutoff], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
-    Ok(ids)
-}
-
 /// Retire an agent: free its name, archive its unread mail, drop its memberships
 /// and write grants.
 pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {

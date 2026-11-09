@@ -1057,10 +1057,29 @@ fn humans_retire_agents(mode: Mode) {
     assert!(bbs.err(&["retire", &a]).contains("no live agent"));
 }
 
-fn stale_agents_are_retired_on_register(mode: Mode) {
-    let bbs = Bbs::with_mode("stale", mode);
-    let (a, ta) = bbs.register();
-    bbs.ok(&["send", "--to", &a, "old news"]);
+fn idle_agents_stay_live_and_restart_with_their_identity(mode: Mode) {
+    let bbs = Bbs::with_mode("idle", mode);
+    // A harness that exits at once: `run` fails after settling the token.
+    headless_config(&bbs, &["true"]);
+    let (zed, old) = bbs.register_with(&["register", "--name", "Zed"]);
+    bbs.ok(&["send", "--to", &zed, "old news"]);
+    let identity = || -> (i64, String) {
+        bbs.db()
+            .query_row(
+                "SELECT a.id, e.entity_id FROM agents a
+                 JOIN entity_local_bindings b ON b.agent_id = a.id
+                 JOIN entities e ON e.id = b.entity_id
+                 WHERE a.name = 'Zed' AND a.retired_at IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    let before = identity();
+    assert_eq!(before.1, "will/Zed");
+
+    // Idle well past a week, then another registration: Zed stays live, with
+    // its token and unread mail.
     bbs.db()
         .execute(
             "UPDATE agents SET active_at = '2000-01-01T00:00:00.000000Z'",
@@ -1068,19 +1087,34 @@ fn stale_agents_are_retired_on_register(mode: Mode) {
         )
         .unwrap();
     bbs.register();
+    assert_eq!(bbs.ok(&["--token", &old, "whoami"]), "Zed\n");
+
+    // A restart with no saved token takes the existing agent back.
+    let err = bbs.err(&["headless", "run", "Zed"]);
+    if matches!(mode, Mode::Remote) {
+        // The test server runs in trust mode, where owners cannot be verified.
+        assert!(err.contains("--require-human-token"), "{err}");
+    } else {
+        let new = headless_state(&bbs, "Zed")["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(new, old);
+        assert_eq!(identity(), before);
+        assert!(bbs.ok(&["--token", &new, "read"]).contains("old news"));
+    }
+
+    // After an explicit retirement a new run is refused: Hub IDs are never
+    // reused.
+    bbs.ok(&["retire", "Zed"]);
+    let err = bbs.err(&["headless", "run", "Zed"]);
     assert!(
-        bbs.err(&["--token", &ta, "read"])
-            .contains("unknown or retired token")
+        err.contains(
+            "agent name Zed is unavailable: will/Zed belongs to a retired agent; \
+             Hub IDs are never reused. Choose another name."
+        ),
+        "{err}"
     );
-    let unread: i64 = bbs
-        .db()
-        .query_row(
-            "SELECT COUNT(*) FROM deliveries WHERE archived_at IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(unread, 0);
 }
 
 fn human_name_is_reserved_and_permissions_enforced(mode: Mode) {
@@ -4799,7 +4833,7 @@ both_modes!(
     bye_retires_token_and_name,
     bye_notifies_and_leaves_groups,
     humans_retire_agents,
-    stale_agents_are_retired_on_register,
+    idle_agents_stay_live_and_restart_with_their_identity,
     human_name_is_reserved_and_permissions_enforced,
     whoami_reports_agent_or_human,
     humans_remove_agents_from_groups,

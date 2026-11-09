@@ -17,7 +17,6 @@ use crate::names::NAMES;
 use crate::proto;
 use crate::timer::Schedule;
 
-const RETIRE_AFTER_DAYS: i64 = 7;
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Group descriptions are one line, counted in characters (also a schema CHECK).
 const MAX_GROUP_DESCRIPTION_CHARS: usize = 200;
@@ -390,11 +389,6 @@ pub fn register(
         let owner = ctx.human()?;
         if let Some(name) = &req.name {
             validate_principal_name(name, "agent")?;
-        }
-        let cutoff = fmt_time(ctx.now - chrono::Duration::days(RETIRE_AFTER_DAYS));
-        for id in db::stale_agent_ids(ctx.conn, &cutoff)? {
-            db::retire_agent(ctx.conn, id, &ctx.now_s)?;
-            tracing::info!(agent_id = id, "retired stale agent");
         }
         let name = match req.name {
             Some(name) => {
