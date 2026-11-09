@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use bbs_core::{protocol, release, service};
-use bbs_server::serve;
+use bbs_server::{hub_migration, serve};
 
 /// Serve the BBS over gRPC, owning the database in the state directory.
 #[derive(Parser)]
@@ -31,6 +31,24 @@ enum Command {
         /// Print the `bbs-release.json` a published release attaches.
         #[arg(long, conflicts_with = "json")]
         manifest: bool,
+    },
+    /// Operator only: move a stopped server's schema-26 database to the Hub
+    /// model (schema 27). This binary cannot serve the result. Stop the
+    /// server and back up the database first.
+    MigrateHubModel {
+        /// The database to migrate (normally STATE_DIR/bbs.db).
+        #[arg(long, value_name = "PATH")]
+        db: PathBuf,
+        /// The installation's Hub namespace: 1-63 characters, [a-z][a-z0-9-]*.
+        #[arg(long)]
+        namespace: String,
+        /// A backup of this database at schema 26, such as `bbs backup`
+        /// writes. Required unless --dry-run.
+        #[arg(long, value_name = "PATH")]
+        backup_taken: Option<PathBuf>,
+        /// Only report the entity-ID mapping and blocking issues; write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -126,6 +144,13 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Some(Command::Version { json, manifest }) => release::print(json, manifest),
+        Some(Command::MigrateHubModel {
+            db,
+            namespace,
+            backup_taken,
+            dry_run,
+        }) => hub_migration::run(&db, &namespace, backup_taken.as_deref(), dry_run)
+            .map(|report| print!("{report}")),
         None => {
             init_logging();
             run(cli.serve).await

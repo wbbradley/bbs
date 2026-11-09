@@ -325,6 +325,14 @@ upgrading, stop the old server and back up before running the new binary's
 administrator commands. Rollback across a migration requires a pre-upgrade
 backup.
 
+The Hub model cutover
+([0027_hub_model.sql](crates/bbs-core/migrations/0027_hub_model.sql)) is not
+an automatic migration. Only `bbs-server migrate-hub-model` runs it, from
+schema 26 with a backup named by `--backup-taken`. It computes every human,
+agent and group's entity ID from its name, refuses on any collision or
+malformed history (`--dry-run` lists them), and checks row counts and foreign
+keys before commit. A binary without Hub model support refuses schema 27.
+
 ## Web UI
 
 `bbs serve --web ADDR` also serves a browser UI for humans on its own HTTP/1.1
