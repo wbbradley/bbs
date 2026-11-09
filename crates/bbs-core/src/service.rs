@@ -2089,6 +2089,7 @@ pub fn list_agents(
                 focused_at: a.focused_at,
                 goal: a.goal.as_deref().and_then(goal_from_json),
                 goal_reported_at: a.goal_reported_at,
+                turn_event: a.turn_event,
             })
             .collect();
         Ok(proto::ListAgentsResponse { humans, agents })
@@ -2873,6 +2874,7 @@ pub fn agent_summary(
                 focused_at: s.focused_at,
                 goal: s.goal.as_deref().and_then(goal_from_json),
                 goal_reported_at: s.goal_reported_at,
+                turn_event: s.turn_event,
             })
             .collect();
         Ok(proto::AgentSummarySnapshot {

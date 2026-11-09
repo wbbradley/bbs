@@ -275,6 +275,9 @@ kbd {
   padding: 3px 0;
   font-weight: 700;
 }
+.badge.focus.waiting {
+  color: var(--warning);
+}
 .badge.quiet {
   background: transparent;
   color: var(--faint);

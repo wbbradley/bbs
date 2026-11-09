@@ -10,6 +10,11 @@ under the new package version and its publication date.
 
 ### Added
 
+- A focused agent between turns shows an amber ⧖ instead of the green ◎ in the
+  web sidebar, the Agents page and its page header: it is waiting for its
+  owner. `Agent` and `AgentSummary` carry `turn_event`, the agent's newest
+  activity event that starts, continues or ends a turn; older servers omit it
+  and the web keeps ◎.
 - The goal dialog asks for what done looks like (merged, released, live, or a
   check that passes) in the objective.
 - The web goal strip has an Edit button. It opens the goal dialog filled in with
