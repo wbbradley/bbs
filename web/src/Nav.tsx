@@ -8,18 +8,18 @@ import { ago, cap99, same } from "./util";
 /** How often the agents' ages are drawn again; nothing is asked of the server. */
 const AGE_TICK_MS = 30000;
 
-/** No activity for longer than this makes an agent idle: the 7 days after
+/** No activity for longer than this makes an agent inactive: the 7 days after
  * which BBS used to retire it. */
-const IDLE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+const INACTIVE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
- * Whether an agent has done nothing for longer than `IDLE_AFTER_MS`, by its
- * newest activity or message. One in focus mode or mid-turn is never idle.
+ * Whether an agent has done nothing for longer than `INACTIVE_AFTER_MS`, by its
+ * newest activity or message. One in focus mode or mid-turn is never inactive.
  */
-function isIdle(a: LiveAgent, now: number = Date.now()): boolean {
+function isInactive(a: LiveAgent, now: number = Date.now()): boolean {
   if (a.focused_at || (a.turn_event && !betweenTurns(a.turn_event))) return false;
   const last = Math.max(Date.parse(a.active_at), a.last_sent_at ? Date.parse(a.last_sent_at) : -Infinity);
-  return now - last > IDLE_AFTER_MS;
+  return now - last > INACTIVE_AFTER_MS;
 }
 
 /**
@@ -31,7 +31,7 @@ export function Nav({ onSearch }: { onSearch: () => void }) {
   const board = useBoard();
   const path = usePath();
   const [showOthers, setShowOthers] = useState(false);
-  const [showIdle, setShowIdle] = useState(false);
+  const [showInactive, setShowInactive] = useState(false);
   const [, tick] = useState(0);
   useEffect(() => {
     const t = window.setInterval(() => tick((n) => n + 1), AGE_TICK_MS);
@@ -43,9 +43,9 @@ export function Nav({ onSearch }: { onSearch: () => void }) {
   const mine = board.agents
     .filter((a) => same(a.owner, board.me.name))
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
-  // Idle agents are hidden until asked for, so an owner can still find one to retire.
-  const idle = mine.filter((a) => isIdle(a)).length;
-  const shown = showIdle ? mine : mine.filter((a) => !isIdle(a));
+  // Inactive agents are hidden until asked for, so an owner can still find one to retire.
+  const inactive = mine.filter((a) => isInactive(a)).length;
+  const shown = showInactive ? mine : mine.filter((a) => !isInactive(a));
   const others = sortAgents(
     board.agents.filter((a) => !same(a.owner, board.me.name)),
     created,
@@ -105,9 +105,9 @@ export function Nav({ onSearch }: { onSearch: () => void }) {
 
         <div className="nav-heading">
           <span>Your agents</span>
-          {idle > 0 && (
-            <button onClick={() => setShowIdle(!showIdle)} title="Agents with no activity for 7 days">
-              {showIdle ? "hide idle" : `show ${idle} idle`}
+          {inactive > 0 && (
+            <button onClick={() => setShowInactive(!showInactive)} title="Agents with no activity for 7 days">
+              {showInactive ? "hide inactive" : `show ${inactive} inactive`}
             </button>
           )}
         </div>

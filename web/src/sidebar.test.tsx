@@ -219,7 +219,7 @@ describe("the sidebar's agents", () => {
     expect(rows()).toEqual(["Frank2h36m ago", "Jefenow", "Zed◎"]);
   });
 
-  it("hide your agents idle for over 7 days until asked, unless focused or mid-turn", async () => {
+  it("hide your agents inactive for over 7 days until asked, unless focused or mid-turn", async () => {
     listings(new Map([[0, page([])]]));
     const DAY = 24 * 3600;
     const old = before(8 * DAY);
@@ -228,34 +228,34 @@ describe("the sidebar's agents", () => {
     const focused = agent(22, "Focused", "ada", { active_at: old, focused_at: old });
     const busy = agent(23, "Busy", "ada", { active_at: old, turn_event: "tool_call" });
     const done = agent(24, "Done", "ada", { active_at: old, turn_event: "turn_end" });
-    // Others' agents are never hidden for idleness.
+    // Others' agents are never hidden for inactivity.
     const theirs = agent(25, "Theirs", "bob", { active_at: old });
     api.auto.set("list_agents", () => ({ agents: [stale, recent, focused, busy, done, theirs], humans: [] }));
     await show();
     expect(rows()).toEqual(["Busy", "Focused◎", "Recent"]);
 
-    fireEvent.click(screen.getByText("show 2 idle"));
+    fireEvent.click(screen.getByText("show 2 inactive"));
     expect(rows()).toEqual(["Busy", "Done", "Focused◎", "Recent", "Stale8d ago"]);
-    fireEvent.click(screen.getByText("hide idle"));
+    fireEvent.click(screen.getByText("hide inactive"));
     expect(rows()).toEqual(["Busy", "Focused◎", "Recent"]);
 
-    // A message from an idle agent shows it again at once.
+    // A message from an inactive agent shows it again at once.
     act(() => api.stream("summary").push({ agents: [summary({ ...stale, last_sent_at: before(0) })] }));
     expect(rows()).toEqual(["Busy", "Focused◎", "Recent", "Stalenow"]);
-    expect(screen.getByText("show 1 idle")).toBeTruthy();
-    fireEvent.click(screen.getByText("show 1 idle"));
+    expect(screen.getByText("show 1 inactive")).toBeTruthy();
+    fireEvent.click(screen.getByText("show 1 inactive"));
     expect(rows()).toEqual(["Busy", "Done", "Focused◎", "Recent", "Stalenow"]);
     fireEvent.click(screen.getByText("show 1"));
     expect(rows()).toContain("Theirs@bob");
   });
 
-  it("say so when every one of your agents is idle", async () => {
+  it("say so when every one of your agents is inactive", async () => {
     listings(new Map([[0, page([])]]));
     api.auto.set("list_agents", () => ({ agents: [agent(20, "Stale", "ada", { active_at: before(8 * 24 * 3600) })], humans: [] }));
     await show();
     expect(rows()).toEqual([]);
     expect(screen.getByText("none active")).toBeTruthy();
-    fireEvent.click(screen.getByText("show 1 idle"));
+    fireEvent.click(screen.getByText("show 1 inactive"));
     expect(rows()).toEqual(["Stale"]);
   });
 

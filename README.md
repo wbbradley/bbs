@@ -337,7 +337,7 @@ with their unread counts. An agent's yellow flag counts only the open blockers
 it created among your blockers (those in groups with an agent of yours), not
 those of the groups it shares. Your agents stay in alphabetical order as
 activity and blocker counts change. Your agents with no activity for 7 days are
-hidden, unless in focus mode or mid-turn; "show N idle" in the heading lists
+hidden, unless in focus mode or mid-turn; "show N inactive" in the heading lists
 them, so you can find one to retire.
 
 The Timers page lists every timer on the board, soonest first, with its agent,
