@@ -1,0 +1,179 @@
+syntax = "proto3";
+
+package msgproto.v1;
+
+option go_package = "github.com/neuralwatt/hub/gen/msgproto/v1;msgprotov1";
+
+// REVIEW DRAFT. Shared semantics, not an implementation of the home or
+// federation service. IDs are opaque, nonempty strings. Namespace aliases
+// resolve before submission. Do not use labels as authentication or identity.
+message EntityRef {
+  string namespace = 1;
+  string entity_id = 2;
+}
+
+// A stable delivery address plus optional execution context. Normal headless
+// and interactive use has no run_id. Runs do not allocate address records.
+message AddressRef {
+  EntityRef entity = 1;
+  string address_id = 2;
+  optional string run_id = 3;
+}
+
+// Unique within the origin namespace. Explicit retries preserve the whole
+// immutable message, not just this ID. This does not require automatic retry.
+message MessageRef {
+  string namespace = 1;
+  string message_id = 2;
+}
+
+message RunRef {
+  EntityRef entity = 1;
+  string run_id = 2;
+}
+
+enum RunLifecycle {
+  RUN_LIFECYCLE_UNSPECIFIED = 0;
+  RUN_LIFECYCLE_ACTIVE = 1;
+  RUN_LIFECYCLE_CLOSED = 2;
+}
+
+message RunDescriptor {
+  RunRef run = 1;
+  RunLifecycle lifecycle = 2;
+  string label = 3;
+  int64 created_at_unix_micros = 4;
+  int64 last_active_at_unix_micros = 5;
+  optional int64 closed_at_unix_micros = 6;
+  string close_reason = 7;
+}
+
+enum Lifecycle {
+  LIFECYCLE_UNSPECIFIED = 0;
+  LIFECYCLE_ACTIVE = 1;
+  LIFECYCLE_RETIRED = 2;
+}
+
+enum Availability {
+  AVAILABILITY_UNSPECIFIED = 0;
+  AVAILABILITY_ONLINE = 1;
+  AVAILABILITY_OFFLINE = 2;
+  AVAILABILITY_UNKNOWN = 3;
+}
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  OPERATION_SEND = 1;
+  OPERATION_READ = 2;
+  OPERATION_HISTORY = 3;
+}
+
+message AddressDescriptor {
+  // No run_id in the stable address catalog.
+  AddressRef address = 1;
+  string label = 2;
+  Lifecycle lifecycle = 3;
+  Availability availability = 4;
+  repeated Operation supported_operations = 5;
+  // Evaluated for the query's requester. Never treat this snapshot as a grant.
+  repeated Operation allowed_operations = 6;
+  repeated string content_types = 7;
+  uint32 max_body_bytes = 8;
+  bool supports_run_selector = 9;
+  bool is_default = 10;
+}
+
+message EntityDescriptor {
+  EntityRef entity = 1;
+  // Descriptive/extensible: agent, human, service, group, device, etc.
+  // Kind does not confer a login, inbox, or a permission. Groups are later.
+  string kind = 2;
+  string display_name = 3;
+  repeated string aliases = 4;
+  string description = 5;
+  Lifecycle lifecycle = 6;
+  repeated AddressDescriptor addresses = 7;
+}
+
+enum MessageKind {
+  MESSAGE_KIND_UNSPECIFIED = 0;
+  MESSAGE_KIND_APPLICATION = 1;
+  MESSAGE_KIND_DELIVERY_ERROR = 2;
+}
+
+message DeliveryError {
+  MessageRef failed_message = 1;
+  // Stable machine-readable code, e.g. recipient_closed, expired,
+  // permission_denied, unsupported_content. Details are diagnostic only.
+  string reason = 2;
+  string detail = 3;
+}
+
+// Transport-independent immutable message. Receipt, read state, signatures,
+// retry schedules, and relay observations are not message contents.
+message Message {
+  MessageRef id = 1;
+  AddressRef sender = 2;
+  AddressRef recipient = 3;
+  int64 authored_at_unix_micros = 4;
+  // Required for new federated submissions; native legacy history may lack it.
+  optional int64 expires_at_unix_micros = 5;
+  string content_type = 6;
+  bytes body = 7; // At most 64 KiB; endpoint capabilities may be narrower.
+  // V1 replies target the original sender's exact address (including run).
+  // No caller-selected alternate return address.
+  reserved 8;
+  reserved "reply_to";
+  MessageRef in_reply_to = 9;
+  MessageKind kind = 10;
+  DeliveryError delivery_error = 11;
+  // Set on a group's copy of a message sent to the group (D127). The copy's
+  // sender is the group; this names what was sent to the group and who sent
+  // it, at the exact address replies go to. For a notice, the original
+  // sender is the group itself.
+  GroupCopy group_copy = 12;
+}
+
+message GroupCopy {
+  MessageRef original = 1;
+  AddressRef original_sender = 2;
+}
+
+// Exact serialized Message bytes, decoded using the shared schema and kept
+// unchanged for duplicate/conflict checks. This is not a signed Hub envelope.
+// Unknown required semantics or unsupported encodings must fail validation.
+message EncodedMessage {
+  uint32 format_major = 1; // This draft defines 1 only.
+  bytes message_bytes = 2;
+}
+
+// A destination directory evaluates permissions for this entity/run. The
+// source home vouches for it. Never forward the private client's bearer token.
+message Requester {
+  EntityRef entity = 1;
+  optional string run_id = 2;
+}
+
+message DirectoryQuery {
+  string query_id = 1;
+  Requester requester = 2;
+  string namespace = 3;
+  // Empty: list. Nonempty: resolve this alias. IDs remain authoritative.
+  string alias = 4;
+  uint32 page_size = 5;
+  bytes page_token = 6;
+  int64 deadline_unix_micros = 7;
+  string entity_id = 8; // Exact lookup; mutually exclusive with alias.
+  // With entity_id: list active runs instead of listing entities.
+  bool list_runs = 9;
+}
+
+message DirectoryResult {
+  string query_id = 1;
+  repeated EntityDescriptor entities = 2;
+  bytes next_page_token = 3;
+  // Empty on success. An offline lookup is not an empty successful directory.
+  string error_code = 4;
+  string detail = 5;
+  repeated RunDescriptor runs = 6;
+}
