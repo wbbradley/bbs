@@ -2566,6 +2566,18 @@ mod tests {
         assert!(input(event::Event::FocusGained).is_none());
     }
 
+    fn agent_row<'a>(name: &'a str, token: &'a str, owner_id: i64) -> crate::db::NewAgent<'a> {
+        crate::db::NewAgent {
+            name,
+            token,
+            owner_id,
+            status: None,
+            pwd: "/",
+            hostname: "h",
+            now: "t",
+        }
+    }
+
     fn board() -> (
         tempfile::TempDir,
         rusqlite::Connection,
@@ -2575,12 +2587,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = crate::db::open(&dir.path().join("bbs.db")).unwrap();
         crate::db::migrate(&mut conn).unwrap();
-        conn.execute_batch(
-            "INSERT INTO humans (id, name, created_at, active_at) VALUES (1, 'ada', 't', 't');
-             INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at)
-             VALUES (1, 'Mateo', 'a', '/', 'h', 't', 't')",
-        )
-        .unwrap();
+        let ada = crate::db::insert_human(&conn, "ada", "t").unwrap();
+        crate::db::insert_agent(&conn, &agent_row("Mateo", "a", ada)).unwrap();
+        // Mateo is nobody's agent; tests that need an owner add one.
+        conn.execute("DELETE FROM agent_owners", []).unwrap();
         let events = vec![("text".into(), r#"{"event":"text","text":"history"}"#.into()); 500];
         crate::db::post_activity(&conn, 1, "t", &events).unwrap();
         let opener = Opener {
@@ -2841,11 +2851,9 @@ mod tests {
             testing::{SCHEMES, with_scheme},
         };
         let (_dir, conn, opener, _) = board();
-        conn.execute_batch(
-            "INSERT INTO agents (id,name,token,pwd,hostname,created_at,active_at)
-             VALUES (2,'Zed','b','/','h','t','t')",
-        )
-        .unwrap();
+        let zed = crate::db::insert_agent(&conn, &agent_row("Zed", "b", 1)).unwrap();
+        conn.execute("DELETE FROM agent_owners WHERE agent_id = ?1", [zed])
+            .unwrap();
         let mut backend = Backend::open(&opener.config, &opener.dir, opener.caller)
             .await
             .unwrap();

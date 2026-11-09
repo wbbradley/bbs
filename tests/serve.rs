@@ -2099,3 +2099,66 @@ async fn search_is_advertised_and_returns_bounded_hits_over_the_wire() {
     assert_eq!(unread.messages.len(), 1);
     assert_eq!(unread.messages[0].body, body);
 }
+
+/// An epoch-2 client (before the Hub model) stops at its first request.
+#[tokio::test]
+async fn epoch_two_clients_are_refused() {
+    let server = Server::start("epoch-two");
+    let mut raw = server.raw_client().await;
+    let mut request = contract(proto::EnsureHumanRequest { name: "old".into() });
+    request
+        .metadata_mut()
+        .insert("bbs-protocol-epoch", "2".parse().unwrap());
+    let err = raw.ensure_human(request).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("requires epoch 3"), "{err}");
+    assert_eq!(err.metadata().get("bbs-protocol-epoch").unwrap(), "3");
+}
+
+/// `bbs serve` with `args` in `home`, expected to exit at once; its stderr.
+fn serve_fails(home: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_bbs"))
+        .args(["serve", "--listen", "127.0.0.1:0"])
+        .args(args)
+        .env("HOME", home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    String::from_utf8(output.stderr).unwrap()
+}
+
+#[test]
+fn a_new_database_takes_the_namespace_and_a_legacy_one_is_refused() {
+    let server = Server::start_options("namespace", false, &["--namespace", "acme"]);
+    let path = server.home.join(".local/state/bbs/bbs.db");
+    let namespace: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT namespace FROM bbs_installation", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(namespace, "acme");
+    let err = serve_fails(&server.home, &["--namespace", "other"]);
+    assert!(err.contains(r#"namespace is "acme", not "other""#), "{err}");
+
+    // A schema-26 board is never migrated on start.
+    let home = server.home.join("legacy");
+    let state = home.join(".local/state/bbs");
+    std::fs::create_dir_all(&state).unwrap();
+    let mut db = bbs_core::db::open(&state.join("bbs.db")).unwrap();
+    bbs_core::db::migrate_legacy(&mut db).unwrap();
+    db.execute(
+        "INSERT INTO humans (name, created_at, active_at) VALUES ('will', 't', 't')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let err = serve_fails(&home, &[]);
+    assert!(
+        err.contains("schema v26, before the Hub model") && err.contains("migrate-hub-model"),
+        "{err}"
+    );
+    let version: i64 = rusqlite::Connection::open(state.join("bbs.db"))
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 26);
+}

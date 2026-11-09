@@ -33,9 +33,9 @@ enum Command {
         manifest: bool,
     },
     /// Operator only: move a stopped server's schema-26 database to the Hub
-    /// model (schema 27). This binary cannot serve the result. Stop the
-    /// server and back up the database first; it refuses while any other
-    /// connection uses the database.
+    /// model (schema 27), which this binary serves and refuses to start
+    /// without. Stop the server and back up the database first; it refuses
+    /// while any other connection uses the database.
     MigrateHubModel {
         /// The database to migrate (normally STATE_DIR/bbs.db).
         #[arg(long, value_name = "PATH")]
@@ -76,6 +76,10 @@ struct Serve {
     /// Directory holding bbs.db (default: ~/.local/state/bbs).
     #[arg(long)]
     state_dir: Option<PathBuf>,
+    /// The installation's Hub namespace, [a-z][a-z0-9-]*: a new database is
+    /// created in it (default: bbs), and an existing one must match it.
+    #[arg(long)]
+    namespace: Option<String>,
     /// Require authenticated human accounts and strong, owned agent credentials.
     #[arg(long)]
     require_human_token: bool,
@@ -134,6 +138,7 @@ async fn run(args: Serve) -> Result<()> {
             origin: args.web_origin,
         }),
         &dir,
+        args.namespace.as_deref(),
         args.require_human_token,
         protocol::Policy::new(args.minimum_client_version, args.recommended_client_version)?,
         service::TimerLimits {

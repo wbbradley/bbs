@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{Caller, Ctx, fmt_time, with_ctx};
+use crate::entity::EntityKind;
 use crate::{db, proto};
 
 /// The message every owned agent gets when its human starts restart preparation.
@@ -55,8 +56,13 @@ pub fn agent_drain_with_changes(
                     let deadline = fmt_time(ctx.now + chrono::Duration::minutes(20));
                     ctx.conn.execute("INSERT INTO agent_drains(human_id, watermark, deadline, status) VALUES (?1, 0, ?2, 'draining')", params![me.id, deadline])?;
                     for id in ids {
-                        let message = db::insert_message(ctx.conn, &me, None, NOTICE, &ctx.now_s)?;
-                        db::insert_delivery(ctx.conn, message, db::Kind::Agent, id)?;
+                        let message = db::insert_message(
+                            ctx.conn,
+                            &me,
+                            db::To::Direct(db::Kind::Agent, id),
+                            NOTICE,
+                            &ctx.now_s,
+                        )?;
                         ctx.conn.execute("INSERT INTO agent_drain_targets(human_id, agent_id, final_message_id) VALUES (?1, ?2, ?3)", params![me.id, id, message])?;
                     }
                     ctx.conn.execute("UPDATE agent_drains SET watermark = (SELECT coalesce(max(id), 0) FROM messages) WHERE human_id = ?1", [me.id])?;
@@ -129,14 +135,15 @@ fn snapshot(ctx: &Ctx<'_>, human: i64) -> Result<proto::AgentDrainResponse> {
     // current side driver (ACP may not have one). Current-generation work and
     // older failed/cancelled/interrupted work still require explicit quiescence;
     // neither an ended flag nor an absent driver proves it has stopped.
-    let agents = ctx.conn.prepare("SELECT t.agent_id, a.name, t.completed,
-        (SELECT count(*) FROM deliveries d WHERE d.recipient_kind = 'agent' AND d.recipient_id = t.agent_id AND d.message_id <= ?2 AND d.archived_at IS NULL),
+    let agents = ctx.conn.prepare(&format!("SELECT t.agent_id, a.name, t.completed,
+        (SELECT count(*) FROM deliveries d WHERE d.recipient_address_id = {} AND d.recipient_run_id = '' AND d.message_id <= ?2 AND d.archived_at IS NULL),
         EXISTS(SELECT 1 FROM side_requests s WHERE s.agent_id = t.agent_id
           AND (s.status = 'open' OR (s.id > t.side_completed_through
             AND NOT (s.status = 'completed' AND EXISTS (
               SELECT 1 FROM side_state state WHERE state.agent_id = s.agent_id
                 AND s.generation IS NOT NULL AND state.generation != s.generation)))))
-        FROM agent_drain_targets t JOIN agents a ON a.id = t.agent_id WHERE t.human_id = ?1 ORDER BY lower(a.name)")?
+        FROM agent_drain_targets t JOIN agents a ON a.id = t.agent_id WHERE t.human_id = ?1 ORDER BY lower(a.name)",
+        db::address_sql(EntityKind::Agent, "t.agent_id")))?
         .query_map(params![human, watermark], |r| Ok(proto::AgentDrainTarget { agent_id: r.get(0)?, name: r.get(1)?, completed: r.get(2)?, unread: r.get(3)?, side_pending: r.get(4)? }))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(proto::AgentDrainResponse {
@@ -192,8 +199,13 @@ fn reconcile(ctx: &Ctx<'_>) -> Result<usize> {
             )
         };
         let human = db::find_human(ctx.conn, &name)?.expect("human joined above");
-        let message = db::insert_message(ctx.conn, &human, None, &body, &ctx.now_s)?;
-        db::insert_delivery(ctx.conn, message, db::Kind::Human, id)?;
+        db::insert_message(
+            ctx.conn,
+            &human,
+            db::To::Direct(db::Kind::Human, id),
+            &body,
+            &ctx.now_s,
+        )?;
         ctx.conn.execute(
             "UPDATE agent_drains SET status = ?2 WHERE human_id = ?1",
             params![id, status],
@@ -295,7 +307,10 @@ mod tests {
         fn notifications(&self) -> i64 {
             self.conn
                 .query_row(
-                    "SELECT count(*) FROM deliveries WHERE recipient_kind = 'human'",
+                    "SELECT count(*) FROM deliveries d
+                     JOIN entity_addresses a ON a.id = d.recipient_address_id
+                     JOIN entity_local_bindings b ON b.entity_id = a.entity_id
+                     WHERE b.human_id IS NOT NULL",
                     [],
                     |r| r.get(0),
                 )

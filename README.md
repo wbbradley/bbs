@@ -696,6 +696,15 @@ proof. Install by pinned revision to get the release itself.
 
 ### Coordinated upgrades
 
+The release after 0.24.0 moves to the Hub entity/address model (schema 27)
+and protocol epoch 3. It creates new databases at schema 27 but never
+migrates an existing one: stop the server and every local-mode user of the
+database, take a [backup](#backup-and-restore), run `bbs-server
+migrate-hub-model --db PATH --namespace NS --backup-taken BACKUP` (try
+`--dry-run` on a copy first), then start the new server and install the
+matching client everywhere; epoch 2 clients and servers refuse epoch 3 ones.
+A database older than schema 26 needs bbs 0.24 to reach 26 first.
+
 Version 0.21.0 upgraded the server database, and any local-mode database it
 opens, to schema 26. Versions 0.22.0 through 0.24.0 keep schema 26, so
 0.21.0 and later binaries open the same database. Roll a 0.23.0 server out before

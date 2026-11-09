@@ -859,7 +859,7 @@ fn broadcast(
     gid: i64,
     body: &str,
 ) -> Result<(usize, usize, Vec<String>)> {
-    let msg = db::insert_message(ctx.conn, me, Some(gid), body, &ctx.now_s)?;
+    let msg = db::insert_message(ctx.conn, me, db::To::Group(gid), body, &ctx.now_s)?;
     let mut count = 0;
     let mut visible = 0;
     let focused = db::focused_members(ctx.conn, gid)?;
@@ -962,9 +962,14 @@ fn send_control(
     if db::agent_owner_id(ctx.conn, target.id)? != Some(me.id) {
         bail!("{} is not your agent", target.name);
     }
-    let msg = db::insert_message(ctx.conn, me, None, body, &ctx.now_s)?;
+    let msg = db::insert_message(
+        ctx.conn,
+        me,
+        db::To::Direct(db::Kind::Agent, target.id),
+        body,
+        &ctx.now_s,
+    )?;
     db::set_message_control(ctx.conn, msg, control)?;
-    db::insert_delivery(ctx.conn, msg, db::Kind::Agent, target.id)?;
     tracing::info!(
         from = me.name,
         to = target.name,
@@ -1824,9 +1829,14 @@ pub fn auto_reply(
                 replayed: true,
             });
         }
-        let msg = db::insert_message(ctx.conn, &me, None, &req.body, &ctx.now_s)?;
+        let msg = db::insert_message(
+            ctx.conn,
+            &me,
+            db::To::Direct(db::Kind::Human, owner),
+            &req.body,
+            &ctx.now_s,
+        )?;
         db::set_message_auto_reply(ctx.conn, msg)?;
-        db::insert_delivery(ctx.conn, msg, db::Kind::Human, owner)?;
         db::record_human_conversation(ctx.conn, me.id, owner, &ctx.now_s)?;
         db::insert_auto_reply(ctx.conn, me.id, &req.key, msg)?;
         tracing::info!(from = me.name, bytes = req.body.len(), "sent auto reply");
@@ -1906,8 +1916,13 @@ pub fn send(
             bail!("{} is not in any of your groups", target.name);
         }
         check_focus(ctx, &me, Some(&target))?;
-        let msg = db::insert_message(ctx.conn, &me, None, body, &ctx.now_s)?;
-        db::insert_delivery(ctx.conn, msg, target.kind, target.id)?;
+        let msg = db::insert_message(
+            ctx.conn,
+            &me,
+            db::To::Direct(target.kind, target.id),
+            body,
+            &ctx.now_s,
+        )?;
         match (me.kind, target.kind) {
             (db::Kind::Human, db::Kind::Agent) => {
                 db::record_human_conversation(ctx.conn, target.id, me.id, &ctx.now_s)?;
@@ -1971,8 +1986,13 @@ pub fn set_focus(
             // Tell the agent, as a direct message from its owner, so its
             // harness and model both know why mail stops or resumes.
             let notice = focus_notice(&me.name, req.focused);
-            let msg = db::insert_message(ctx.conn, &me, None, &notice, &ctx.now_s)?;
-            db::insert_delivery(ctx.conn, msg, db::Kind::Agent, agent.id)?;
+            db::insert_message(
+                ctx.conn,
+                &me,
+                db::To::Direct(db::Kind::Agent, agent.id),
+                &notice,
+                &ctx.now_s,
+            )?;
             db::record_human_conversation(ctx.conn, agent.id, me.id, &ctx.now_s)?;
             tracing::info!(
                 by = me.name,
@@ -2988,8 +3008,13 @@ fn tell_agent(ctx: &Ctx, me: &db::Principal, target_id: i64) -> Result<bool> {
 
 /// Send a timer's agent `body` from `me`, marked as from that timer.
 fn timer_notice(ctx: &Ctx, me: &db::Principal, timer: &db::TimerRow, body: &str) -> Result<()> {
-    let msg = db::insert_message(ctx.conn, me, None, body, &ctx.now_s)?;
-    db::insert_delivery(ctx.conn, msg, db::Kind::Agent, timer.target_id)?;
+    let msg = db::insert_message(
+        ctx.conn,
+        me,
+        db::To::Direct(db::Kind::Agent, timer.target_id),
+        body,
+        &ctx.now_s,
+    )?;
     db::set_message_timer(ctx.conn, msg, timer.id)
 }
 
@@ -3295,8 +3320,13 @@ pub fn fire_timers(
         if skip {
             tracing::info!(id = timer.id, "timer skipped: target in focus mode");
         } else {
-            let msg = db::insert_message(&tx, &timer.creator, None, &timer.body, &now_s)?;
-            db::insert_delivery(&tx, msg, db::Kind::Agent, timer.target_id)?;
+            let msg = db::insert_message(
+                &tx,
+                &timer.creator,
+                db::To::Direct(db::Kind::Agent, timer.target_id),
+                &timer.body,
+                &now_s,
+            )?;
             db::set_message_timer(&tx, msg, timer.id)?;
         }
         match schedule.and_then(|s| s.next_after(now)) {
@@ -3488,9 +3518,7 @@ mod tests {
         body: &str,
         time: &str,
     ) -> i64 {
-        let id = db::insert_message(conn, from, None, body, time).unwrap();
-        db::insert_delivery(conn, id, to.kind, to.id).unwrap();
-        id
+        db::insert_message(conn, from, db::To::Direct(to.kind, to.id), body, time).unwrap()
     }
 
     #[test]
@@ -3592,7 +3620,7 @@ mod tests {
         .id
         .unwrap();
         db::set_message_control(&conn, control, "cancel").unwrap();
-        let before: Vec<_> = conn.prepare("SELECT message_id, recipient_id, archived_at FROM deliveries ORDER BY message_id, recipient_id")
+        let before: Vec<_> = conn.prepare("SELECT message_id, recipient_address_id, archived_at FROM deliveries ORDER BY message_id, recipient_address_id")
             .unwrap().query_map([], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,i64>(1)?, row.get::<_,Option<String>>(2)?)))
             .unwrap().collect::<Result<Vec<_>,_>>().unwrap();
         let got = search(&mut conn, &mateo, search_req("équipe")).unwrap();
@@ -3603,7 +3631,7 @@ mod tests {
             Some("Eve")
         );
         assert_eq!(got.hits[2].message.as_ref().unwrap().from_name, "ada");
-        let after: Vec<_> = conn.prepare("SELECT message_id, recipient_id, archived_at FROM deliveries ORDER BY message_id, recipient_id")
+        let after: Vec<_> = conn.prepare("SELECT message_id, recipient_address_id, archived_at FROM deliveries ORDER BY message_id, recipient_address_id")
             .unwrap().query_map([], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,i64>(1)?, row.get::<_,Option<String>>(2)?)))
             .unwrap().collect::<Result<Vec<_>,_>>().unwrap();
         assert_eq!(before, after, "search never marks anybody's mail read");
@@ -4317,7 +4345,10 @@ mod tests {
         // Mateo's stamp matches the stored message's server time.
         let stored: String = conn
             .query_row(
-                "SELECT created_at FROM messages WHERE from_kind = 'agent' ORDER BY id DESC",
+                "SELECT m.created_at FROM messages m
+                 JOIN entity_addresses a ON a.id = m.sender_address_id
+                 JOIN entity_local_bindings b ON b.entity_id = a.entity_id
+                 WHERE b.agent_id IS NOT NULL ORDER BY m.id DESC",
                 [],
                 |r| r.get(0),
             )

@@ -13,13 +13,19 @@ under the new package version and its publication date.
 - `bbs-server migrate-hub-model --db PATH --namespace NS --backup-taken PATH`
   moves a stopped server's schema-26 database to the Hub entity/address model
   (schema 27); `--dry-run` only reports the entity-ID mapping and blocking
-  issues. Startup never runs it, and this release refuses to serve a migrated
-  database.
+  issues. Startup never runs it on existing data.
+- `bbs serve --namespace NS` names the Hub namespace a new database is created
+  in (default `bbs`); an existing database must match it.
 
 ### Changed
 
 - Protocol epoch 3. Clients and servers before the Hub model speak epoch 2 and
   refuse each other at the first request; upgrade them together.
+- The server and local mode run on the Hub model (schema 27): messages and
+  deliveries refer to entity addresses, and every new human, agent and group
+  gets an entity ID. Local behaviour is unchanged. A new database is created at
+  schema 27; an existing one at schema 26 or older is refused, unchanged, until
+  an operator runs `bbs-server migrate-hub-model`.
 
 ## 0.24.0 - 2026-11-09
 

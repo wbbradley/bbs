@@ -2177,8 +2177,35 @@ fn read_wait_fails_if_retired_while_waiting(mode: Mode) {
     assert!(err.contains("retired"), "{err}");
 }
 
+/// `bbs agents` on a local board in `home`, run `n` times at once; each
+/// one's output.
+fn agents_concurrently(home: &std::path::Path, n: usize) -> Vec<std::process::Output> {
+    let children: Vec<_> = (0..n)
+        .map(|_| {
+            Command::new(env!("CARGO_BIN_EXE_bbs"))
+                .arg("agents")
+                .env("HOME", home)
+                .env("USER", "will")
+                .env_remove("BBS_SERVER")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    children
+        .into_iter()
+        .map(|child| child.wait_with_output().unwrap())
+        .collect()
+}
+
+fn user_version(db: &rusqlite::Connection) -> i64 {
+    db.pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap()
+}
+
 #[test]
-fn old_schema_is_migrated_on_open_even_concurrently() {
+fn old_schema_is_refused_unchanged() {
     let home = std::env::temp_dir().join(format!("bbs-test-{}-migrate", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     let state = home.join(".local/state/bbs");
@@ -2192,33 +2219,13 @@ fn old_schema_is_migrated_on_open_even_concurrently() {
     )
     .unwrap();
     drop(db);
-
-    let children: Vec<_> = (0..8)
-        .map(|_| {
-            Command::new(env!("CARGO_BIN_EXE_bbs"))
-                .arg("agents")
-                .env("HOME", &home)
-                .env("USER", "will")
-                .env_remove("BBS_SERVER")
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap()
-        })
-        .collect();
-    for child in children {
-        let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+    for out in agents_concurrently(&home, 2) {
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("bbs-server migrate-hub-model"), "{err}");
     }
     let db = rusqlite::Connection::open(state.join("bbs.db")).unwrap();
-    let version: i64 = db
-        .pragma_query_value(None, "user_version", |r| r.get(0))
-        .unwrap();
-    assert!(version >= 4, "schema still at v{version}");
+    assert_eq!(user_version(&db), 1);
     std::fs::remove_dir_all(&home).unwrap();
 }
 
@@ -3278,11 +3285,21 @@ fn view_json_follow_survives_full_windows_and_bursts(mode: Mode) {
         .unwrap();
     let mut sql = String::from("BEGIN;");
     for i in 0..5 {
+        let address = |column: &str, id: i64| {
+            format!(
+                "(SELECT a.id FROM entity_local_bindings b JOIN entity_addresses a
+                  ON a.entity_id = b.entity_id AND a.address_id = 'native' WHERE b.{column} = {id})"
+            )
+        };
+        let (from, to) = (address("human_id", will), address("agent_id", agent));
         sql.push_str(&format!(
-            "INSERT INTO messages (from_kind, from_id, body, created_at)
-             VALUES ('human', {will}, 'burst {i}', '2026-10-15T00:00:00.000000Z');
-             INSERT INTO deliveries (message_id, recipient_kind, recipient_id)
-             VALUES (last_insert_rowid(), 'agent', {agent});"
+            "INSERT INTO messages (origin_namespace, origin_message_id, sender_address_id,
+                 recipient_address_id, body, created_at, authored_at)
+             SELECT namespace, 'burst-{i}', {from}, {to}, 'burst {i}',
+                 '2026-10-15T00:00:00.000000Z', '2026-10-15T00:00:00.000000Z'
+             FROM bbs_installation;
+             INSERT INTO deliveries (message_id, recipient_address_id, direct)
+             VALUES (last_insert_rowid(), {to}, 1);"
         ));
     }
     sql.push_str("COMMIT;");

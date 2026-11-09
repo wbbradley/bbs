@@ -309,25 +309,36 @@ skill](integrations/skills/bbs/SKILL.md).
 
 ## Schema and migrations
 
-The current schema version is 26, tracked in SQLite `user_version`. Every command
-that opens a database, other than `bbs backup`, migrates it first: `bbs serve`,
-`bbs admin human ...`, and every local-mode command. Migrations apply in one
-immediate transaction. Because SQLite ignores the foreign-key pragma inside a
-transaction, the runner disables enforcement before opening it, runs
-`PRAGMA foreign_key_check` before commit, and restores the previous setting
-afterwards; migration SQL must not toggle the pragma itself.
+The current schema version is 27, the Hub entity/address model, tracked in
+SQLite `user_version`. Every command that opens a database, other than `bbs
+backup`, checks it first: `bbs serve`, `bbs admin human ...`, and every
+local-mode command. A new database (version 0, such as an empty file) is
+created at schema 27 in one immediate transaction: migrations 1-26, then
+[0027_hub_model.sql](crates/bbs-core/migrations/0027_hub_model.sql) with no
+records, in the namespace `bbs serve --namespace` names (default `bbs`),
+which `bbs_installation` keeps. Concurrent openers serialize on the write lock
+and re-check the version under it. Because SQLite ignores the foreign-key
+pragma inside a transaction, the runner disables enforcement before opening
+it, runs `PRAGMA foreign_key_check` before commit, and restores the previous
+setting afterwards; migration SQL must not toggle the pragma itself. An
+existing database at any other version is refused unchanged: schema 26 needs
+the operator cutover below, and older schemas need bbs 0.24 to reach 26 first.
+`bbs serve --namespace` on an existing database must match its namespace.
 
-A binary refuses a schema newer than it supports. Running a newer
-administrator binary against a running older server therefore migrates the live
-database underneath it, and the older server then cannot restart. Run local
-administration only with a binary at the server's schema version; when
-upgrading, stop the old server and back up before running the new binary's
-administrator commands. Rollback across a migration requires a pre-upgrade
-backup.
+A binary refuses a schema newer than it supports. Rollback across the cutover
+requires the pre-cutover backup.
 
-The Hub model cutover
-([0027_hub_model.sql](crates/bbs-core/migrations/0027_hub_model.sql)) is not
-an automatic migration. Only `bbs-server migrate-hub-model` runs it, from
+Every human, agent and group is an entity (`entities`, bound to its native row
+by `entity_local_bindings`) with one default address, `native`. Messages store
+sender and recipient addresses and an origin `(namespace, message ID)`; new
+messages get a random ID. Deliveries store the recipient address with an empty
+run. Records created after the cutover get entity IDs from the same name
+mapping; since IDs never change, a name whose ID is taken (an agent reusing a
+retired agent's name, a group named like a human) gets the lowest free `-N`
+from 2. Retiring an agent or archiving a group retires its entity and address.
+
+The Hub model cutover is not an automatic migration: on existing data only
+`bbs-server migrate-hub-model` runs it, from
 schema 26 with a backup named by `--backup-taken` whose messages,
 deliveries, blocker events and activity match the database. It takes an
 exclusive lock first and refuses while any other connection uses the database,
@@ -340,8 +351,7 @@ counts and foreign keys before commit. `--dry-run` lists the mapping and issues 
 backup copy, because its read-only open of a live WAL database can fail
 without write access to the `-shm` file. The rebuilt `messages` and
 `deliveries` tables keep an equivalent of every earlier index;
-`deliveries_direct` replaces `deliveries_human_dm`. A binary without Hub model
-support refuses schema 27.
+`deliveries_direct` replaces `deliveries_human_dm`.
 
 ## Web UI
 

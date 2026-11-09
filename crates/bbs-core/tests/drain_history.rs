@@ -261,7 +261,10 @@ fn history_reconciliation_notifies_once_and_keeps_held_mail_paused() {
     let notices: i64 = b
         .conn
         .query_row(
-            "SELECT count(*) FROM deliveries WHERE recipient_kind = 'human'",
+            "SELECT count(*) FROM deliveries d
+                     JOIN entity_addresses a ON a.id = d.recipient_address_id
+                     JOIN entity_local_bindings b ON b.entity_id = a.entity_id
+                     WHERE b.human_id IS NOT NULL",
             [],
             |r| r.get(0),
         )
