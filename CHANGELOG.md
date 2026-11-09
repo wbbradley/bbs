@@ -42,6 +42,9 @@ under the new package version and its publication date.
 
 ### Changed
 
+- The web sidebar hides your agents with no activity for 7 days, since they
+  are no longer retired; "show N inactive" beside "Your agents" lists them. An
+  agent in focus mode or mid-turn is never hidden.
 - Protocol epoch 3. Clients and servers before the Hub model speak epoch 2 and
   refuse each other at the first request; upgrade them together.
 - `bbs headless run` and its activity sharing stop, rather than retry
