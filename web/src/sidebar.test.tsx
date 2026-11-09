@@ -5,6 +5,7 @@ vi.mock("./api", () => import("./test/fakeApi"));
 
 import * as api from "./test/fakeApi";
 import { Nav } from "./Nav";
+import { paths } from "./router";
 import { countCreators, sortAgents, useBoard, type LiveAgent } from "./store";
 import { Board } from "./test/setup";
 import type { Agent, AgentSummary, Blocker, ListBlockersResponse } from "./types";
@@ -247,6 +248,22 @@ describe("the sidebar's agents", () => {
     expect(rows()).toEqual(["Busy", "Done", "Focused◎", "Recent", "Stalenow"]);
     fireEvent.click(screen.getByText("show 1"));
     expect(rows()).toContain("Theirs@bob");
+  });
+
+  it("keep an inactive agent with unread mail, open blockers or an open page", async () => {
+    const old = before(8 * 24 * 3600);
+    const mail = agent(20, "Mail", "ada", { active_at: old });
+    const asking = agent(21, "Asking", "ada", { active_at: old });
+    const viewed = agent(22, "Viewed", "ada", { active_at: old });
+    const quiet = agent(23, "Quiet", "ada", { active_at: old });
+    listings(new Map([[0, page([blocker(by(asking))])]]));
+    api.auto.set("list_agents", () => ({ agents: [mail, asking, viewed, quiet], humans: [] }));
+    history.pushState(null, "", paths.agent("Viewed"));
+    await show();
+    act(() => api.stream("summary").push({ agents: [summary(mail, { unread_messages: 1 })] }));
+    expect(rows().map((r) => r.replace(/[^A-Za-z].*$/, ""))).toEqual(["Asking", "Mail", "Viewed"]);
+    expect(screen.getByText("show 1 inactive")).toBeTruthy();
+    history.pushState(null, "", "/");
   });
 
   it("say so when every one of your agents is inactive", async () => {

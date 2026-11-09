@@ -43,9 +43,12 @@ export function Nav({ onSearch }: { onSearch: () => void }) {
   const mine = board.agents
     .filter((a) => same(a.owner, board.me.name))
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
-  // Inactive agents are hidden until asked for, so an owner can still find one to retire.
-  const inactive = mine.filter((a) => isInactive(a)).length;
-  const shown = showInactive ? mine : mine.filter((a) => !isInactive(a));
+  // Inactive agents are hidden until asked for, so an owner can still find one to
+  // retire. One with unread mail or open blockers, or whose page is open, stays.
+  const hidden = (a: LiveAgent) =>
+    isInactive(a) && a.unread === 0 && created(a) === 0 && !same(path, paths.agent(a.name));
+  const inactive = mine.filter(hidden).length;
+  const shown = showInactive ? mine : mine.filter((a) => !hidden(a));
   const others = sortAgents(
     board.agents.filter((a) => !same(a.owner, board.me.name)),
     created,
