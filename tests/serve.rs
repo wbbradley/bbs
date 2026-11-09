@@ -24,7 +24,7 @@ type Client = BbsClient<
 
 fn with_contract(mut req: Request<()>) -> Result<Request<()>, tonic::Status> {
     req.metadata_mut()
-        .insert("bbs-protocol-epoch", "2".parse().unwrap());
+        .insert("bbs-protocol-epoch", "3".parse().unwrap());
     req.metadata_mut().insert(
         "bbs-client-version",
         env!("CARGO_PKG_VERSION").parse().unwrap(),
@@ -123,7 +123,7 @@ fn as_human<T>(name: &str, msg: T) -> Request<T> {
 fn contract<T>(msg: T) -> Request<T> {
     let mut req = Request::new(msg);
     req.metadata_mut()
-        .insert("bbs-protocol-epoch", "2".parse().unwrap());
+        .insert("bbs-protocol-epoch", "3".parse().unwrap());
     req.metadata_mut().insert(
         "bbs-client-version",
         env!("CARGO_PKG_VERSION").parse().unwrap(),
@@ -168,7 +168,7 @@ async fn incompatible_requests_do_not_touch_state_or_claim_stream_slots() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(err.metadata().get("bbs-protocol-epoch").unwrap(), "2");
+    assert_eq!(err.metadata().get("bbs-protocol-epoch").unwrap(), "3");
     let mut request = contract(proto::RegisterRequest {
         name: Some("MustNotExist".into()),
         ..Default::default()
@@ -248,7 +248,7 @@ async fn incompatible_requests_do_not_touch_state_or_claim_stream_slots() {
         .wait_for_mail(as_agent(&agent.token, proto::WaitRequest { limit: None }))
         .await
         .unwrap();
-    assert_eq!(idle.metadata().get("bbs-protocol-epoch").unwrap(), "2");
+    assert_eq!(idle.metadata().get("bbs-protocol-epoch").unwrap(), "3");
 }
 
 #[tokio::test]
@@ -265,7 +265,7 @@ async fn minimum_policy_preserves_public_diagnostics_and_error_hints() {
     );
     let mut raw = server.raw_client().await;
     let info = raw.server_info(proto::Empty {}).await.unwrap().into_inner();
-    assert_eq!(info.protocol_epoch, Some(2));
+    assert_eq!(info.protocol_epoch, Some(3));
     assert_eq!(info.release.unwrap().version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.minimum_client_version.as_deref(), Some("9999.0.0"));
     assert_eq!(info.recommended_client_version.as_deref(), Some("9999.1.0"));

@@ -63,13 +63,13 @@ operation requires:
 
 | Metadata | Meaning |
 | --- | --- |
-| `bbs-protocol-epoch` | Must be `2`; any other or missing value is rejected |
+| `bbs-protocol-epoch` | Must be `3`; any other or missing value is rejected |
 | `bbs-required-capabilities` | Comma-separated capabilities the request depends on |
 | `bbs-client-version` | Client SemVer, checked against an optional server minimum |
 
 The server validates this metadata on every RPC except `ServerInfo` and health,
 before authentication or database work. A missing or different epoch (any value
-other than exactly `2`), an unavailable capability, or, when a minimum is
+other than exactly `3`), an unavailable capability, or, when a minimum is
 configured, a missing or lower client version fails with `FailedPrecondition`.
 Non-UTF-8, duplicated, or oversized metadata, a malformed capability list, or a
 client version that is not SemVer fails with `InvalidArgument`. Clients require

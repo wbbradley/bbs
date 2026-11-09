@@ -157,7 +157,7 @@ impl Drop for Rig {
 fn req<T>(msg: T) -> Request<T> {
     let mut r = Request::new(msg);
     for (k, v) in [
-        ("bbs-protocol-epoch", "2"),
+        ("bbs-protocol-epoch", "3"),
         ("bbs-human", "tester"),
         ("bbs-client-version", env!("CARGO_PKG_VERSION")),
     ] {

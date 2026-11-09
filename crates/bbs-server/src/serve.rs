@@ -2612,7 +2612,7 @@ mod tests {
         let mut req = Request::new(message);
         req.metadata_mut().insert(key, value.parse().unwrap());
         req.metadata_mut()
-            .insert("bbs-protocol-epoch", "2".parse().unwrap());
+            .insert("bbs-protocol-epoch", "3".parse().unwrap());
         req
     }
 

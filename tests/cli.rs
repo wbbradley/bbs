@@ -247,7 +247,7 @@ fn version_reports_identity_without_side_effects() {
             assert!(
                 ["clean", "dirty", "unknown"].contains(&report["provenance"].as_str().unwrap())
             );
-            assert_eq!(report["protocol"]["epoch"], 2);
+            assert_eq!(report["protocol"]["epoch"], 3);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
             assert_eq!(report["schema_version"], bbs_core::db::SCHEMA_VERSION);
             assert_eq!(report["config_format"], 4);

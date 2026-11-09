@@ -1145,11 +1145,11 @@ mod tests {
             let mut original = tonic::Status::new(code, "test failure");
             original
                 .metadata_mut()
-                .insert("bbs-protocol-epoch", "2".parse().unwrap());
+                .insert("bbs-protocol-epoch", "3".parse().unwrap());
             let error = status_error(original);
             let status = error.downcast_ref::<tonic::Status>().unwrap();
             assert_eq!(status.code(), code);
-            assert_eq!(status.metadata().get("bbs-protocol-epoch").unwrap(), "2");
+            assert_eq!(status.metadata().get("bbs-protocol-epoch").unwrap(), "3");
             if code == tonic::Code::Unimplemented {
                 assert!(
                     error
@@ -1449,7 +1449,7 @@ mod tests {
         );
         for ((path, headers), (method, capabilities)) in observed.iter().zip(expected) {
             assert_eq!(path, &format!("/bbs.v2.Bbs/{method}"));
-            assert_eq!(headers["bbs-protocol-epoch"], "2");
+            assert_eq!(headers["bbs-protocol-epoch"], "3");
             assert_eq!(headers["bbs-client-version"], crate::release::VERSION);
             assert_eq!(
                 headers

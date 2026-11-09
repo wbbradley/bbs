@@ -16,6 +16,11 @@ under the new package version and its publication date.
   issues. Startup never runs it, and this release refuses to serve a migrated
   database.
 
+### Changed
+
+- Protocol epoch 3. Clients and servers before the Hub model speak epoch 2 and
+  refuse each other at the first request; upgrade them together.
+
 ## 0.24.0 - 2026-11-09
 
 ### Added
