@@ -89,23 +89,26 @@ def check(image, bbs):
         state = Path(temporary, ".local/state/bbs")
         database = state / "bbs.db"
         token = run(bbs, "admin", "--state-dir", str(state), "human", "add", "webtester", env=env).strip()
+        # The binary creates the sender, with its entity and native address.
+        run(bbs, "human", "add", "sender", env=env)
         now = datetime.now(timezone.utc)
+        address = """(SELECT a.id FROM humans h
+            JOIN entity_local_bindings b ON b.human_id = h.id
+            JOIN entity_addresses a ON a.entity_id = b.entity_id AND a.address_id = 'native'
+            WHERE h.name = ?)"""
         with closing(sqlite3.connect(database)) as conn, conn:
-            recipient = conn.execute("SELECT id FROM humans WHERE name = 'tester'").fetchone()[0]
-            sender = conn.execute(
-                "INSERT INTO humans (name, created_at, active_at) VALUES ('sender', ?1, ?1)",
-                (now.isoformat(),),
-            ).lastrowid
             for number in range(200):
                 body = f"container-regression-{number:03d}\n" + "x" * 60000
                 sent = (now + timedelta(microseconds=number)).isoformat()
                 message = conn.execute(
-                    "INSERT INTO messages (from_kind, from_id, body, created_at) VALUES ('human', ?, ?, ?)",
-                    (sender, body, sent),
+                    f"""INSERT INTO messages (origin_namespace, origin_message_id,
+                            sender_address_id, recipient_address_id, body, created_at, authored_at)
+                        SELECT namespace, ?, {address}, {address}, ?, ?, ? FROM bbs_installation""",
+                    (f"container-{number}", "sender", "tester", body, sent, sent),
                 ).lastrowid
                 conn.execute(
-                    "INSERT INTO deliveries (message_id, recipient_kind, recipient_id) VALUES (?, 'human', ?)",
-                    (message, recipient),
+                    f"INSERT INTO deliveries (message_id, recipient_address_id, direct) VALUES (?, {address}, 1)",
+                    (message, "tester"),
                 )
         # The fixture belongs to the host user; the image runs as uid 999.
         state.chmod(0o777)
