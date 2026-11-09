@@ -9,7 +9,13 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 
 pub mod blockers;
+mod hub_model;
 pub mod notes;
+
+pub use hub_model::{
+    EntityMapping, HUB_MODEL_SCHEMA_VERSION, HUB_MODEL_SOURCE_VERSION, HubKind, HubMigrationReport,
+    PreflightReport, hub_model_preflight, migrate_to_hub_model, validate_namespace,
+};
 
 /// The schema every migrating open advances to.
 pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
@@ -200,10 +206,26 @@ fn schema_version(conn: &Connection) -> Result<usize> {
     Ok(v as usize)
 }
 
+/// Refuse a schema this binary cannot serve.
+fn check_supported(version: usize) -> Result<()> {
+    if version == HUB_MODEL_SCHEMA_VERSION {
+        bail!(
+            "this database was migrated to the Hub model (schema v{version}); \
+             this binary does not support it"
+        );
+    }
+    if version > MIGRATIONS.len() {
+        bail!("BBS schema v{version} is newer than this binary supports");
+    }
+    Ok(())
+}
+
 /// Bring the schema up to date. Every command calls this on open; concurrent
 /// callers serialize on the write lock and re-check the version under it.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    if schema_version(conn)? == MIGRATIONS.len() {
+    let version = schema_version(conn)?;
+    check_supported(version)?;
+    if version == MIGRATIONS.len() {
         return Ok(());
     }
     if !conn.is_autocommit() {
@@ -217,9 +239,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     let result = (|| -> Result<()> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = schema_version(&tx)?;
-        if current > MIGRATIONS.len() {
-            bail!("BBS schema v{current} is newer than this binary supports");
-        }
+        check_supported(current)?;
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
             tx.execute_batch(sql)
                 .with_context(|| format!("applying migration {}", i + 1))?;
