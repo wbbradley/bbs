@@ -28,8 +28,12 @@ under the new package version and its publication date.
   holder, such as `agent name k3 is unavailable: will/k3 belongs to a retired
   agent; Hub IDs are never reused. Choose another name.` 0.24 let an owner
   reuse a retired agent's name and anyone reuse an archived group's name; it
-  also allowed a group named like a human. Choose another name. Random agent
-  names skip the owner's retired names; once all 256 are used, pass `--name`.
+  also allowed a group named like a human. Choose another name.
+- `bbs register` requires `--name`, and the server refuses a registration
+  without a name (`an agent name is required: register with a short,
+  descriptive name, such as bbs register --name reviewer`). 0.24 picked a
+  random name from a pool of 256. The `/bbs` skill now has the agent choose a
+  short, descriptive name when the user gives none.
 - Idle agents are no longer retired. 0.24 retired agents idle for 7 days at
   the next registration; now an agent stays live, with its name, token, mail
   and Hub ID, until `bbs bye`, `bbs retire` or a session binding replaces it,

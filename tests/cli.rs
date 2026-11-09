@@ -150,8 +150,14 @@ impl Bbs {
         self.register_with(&["register", "--note", "testing"])
     }
 
+    /// Register with `args`, adding a fresh `--name` when they have none.
     fn register_with(&self, args: &[&str]) -> (String, String) {
-        let out = self.ok(args);
+        let name = fresh_name();
+        let mut args = args.to_vec();
+        if !args.contains(&"--name") {
+            args.extend(["--name", &name]);
+        }
+        let out = self.ok(&args);
         let name = out.split('"').nth(1).unwrap().to_string();
         let token = out
             .split("--token ")
@@ -330,11 +336,16 @@ fn requested_names_are_validated_and_reserved(mode: Mode) {
             .contains("in use by an agent")
     );
     assert!(
-        bbs.err(&["--as", "missing", "register"])
+        bbs.err(&["--as", "missing", "register", "--name", "Lost"])
             .contains("unknown human")
     );
+    // A name is required.
+    assert!(bbs.err(&["register"]).contains("--name <NAME>"));
+    assert!(
+        bbs.err(&["register", "--name="])
+            .contains("an agent name is required: register with a short, descriptive name")
+    );
     for invalid in [
-        "",
         "@Jeffrey",
         "Jeffrey@will",
         "two words",
@@ -739,7 +750,7 @@ fn init_writes_and_merges_config() {
     let bbs = Bbs::new("config");
     assert!(!config_path(&bbs).exists(), "plain init writes no config");
     // Bind a session, so a compaction hook would re-inject its identity.
-    let register_out = bbs.ok(&["register"]);
+    let register_out = bbs.ok(&["register", "--name", &fresh_name()]);
     hook(
         &bbs,
         serde_json::json!({
@@ -804,7 +815,7 @@ fn remote_backend_round_trip() {
     assert!(out.contains("Human: will"), "{out}");
 
     bbs.ok(&["group", "register", "acme"]);
-    let register_out = bbs.ok(&["register"]);
+    let register_out = bbs.ok(&["register", "--name", &fresh_name()]);
     let (a, ta) = bbs.register();
     let b = register_out.split('"').nth(1).unwrap();
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
@@ -1851,7 +1862,7 @@ fn active_at_writes_are_debounced(mode: Mode) {
 
 fn claude_code_hooks_bind_and_restore_identity(mode: Mode) {
     let bbs = Bbs::with_mode("hook", mode);
-    let register_out = bbs.ok(&["register"]);
+    let register_out = bbs.ok(&["register", "--name", &fresh_name()]);
     let (a, ta) = (
         register_out.split('"').nth(1).unwrap().to_string(),
         register_out
@@ -1907,14 +1918,14 @@ fn claude_code_hooks_bind_and_restore_identity(mode: Mode) {
     );
 
     // Re-registering in the same session retires the old identity.
-    let second = bbs.ok(&["register"]);
+    let second = bbs.ok(&["register", "--name", &fresh_name()]);
     hook(&bbs, post_tool("bbs register", &second));
     assert!(bbs.err(&["--token", &ta, "read"]).contains("retired"));
 }
 
 fn codex_hooks_bind_from_string_tool_response(mode: Mode) {
     let bbs = Bbs::with_mode("codex", mode);
-    let register_out = bbs.ok(&["register"]);
+    let register_out = bbs.ok(&["register", "--name", &fresh_name()]);
     let token = register_out
         .split("--token ")
         .nth(1)
@@ -3465,6 +3476,15 @@ fn headless_refuses_the_old_settings_file() {
     let err = bbs.err(&["headless", "run", "Zed"]);
     assert!(err.contains("headless.toml is no longer read"), "{err}");
     assert!(err.contains("under [headless]"), "{err}");
+}
+
+/// A name no other test agent has: registration requires one.
+fn fresh_name() -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    format!(
+        "Agent{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 fn headless_state(bbs: &Bbs, agent: &str) -> serde_json::Value {

@@ -301,16 +301,6 @@ fn holder(conn: &Connection, namespace: &str, entity_id: &str) -> Result<Option<
     }))
 }
 
-/// Whether a new agent named `name` under human `owner` would get a free
-/// entity ID.
-pub(crate) fn agent_name_available(conn: &Connection, name: &str, owner: i64) -> Result<bool> {
-    let entity_id = match plain_entity_id(conn, EntityKind::Agent, name, Some(owner)) {
-        Ok(id) => id,
-        Err(_) => return Ok(false),
-    };
-    Ok(holder(conn, &namespace(conn)?, &entity_id)?.is_none())
-}
-
 /// The plain entity ID (see `plain_entity_id`) a new record named `name`
 /// would get. IDs are immutable and never reused, so a name whose ID any
 /// entity holds, live or retired, ignoring case, is refused. Call this before

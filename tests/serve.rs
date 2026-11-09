@@ -352,7 +352,12 @@ async fn register_as(
         .await
         .unwrap();
     let req = proto::RegisterRequest {
-        name: name.map(str::to_string),
+        // Registration requires a name; default to a fresh one.
+        name: Some(name.map(str::to_string).unwrap_or_else(|| {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("Agent{n}")
+        })),
         note: Some("testing".into()),
         pwd: "/tmp".into(),
         hostname: "test".into(),
@@ -389,6 +394,20 @@ async fn serve_round_trip_and_wait_for_mail() {
         .group_register(as_human("will", register))
         .await
         .unwrap();
+
+    // The server refuses a registration without a name, as old clients sent.
+    for name in [None, Some(String::new())] {
+        let req = proto::RegisterRequest {
+            name,
+            ..Default::default()
+        };
+        let status = client.register(as_human("will", req)).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().starts_with("an agent name is required"),
+            "{status:?}"
+        );
+    }
 
     let a = register_as(&mut client, "will", Some("Jeffrey")).await;
     let b = register_as(&mut client, "ada", None).await;

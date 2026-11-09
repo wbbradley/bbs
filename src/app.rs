@@ -262,7 +262,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
         },
         Command::Register { name, note } => {
             let req = proto::RegisterRequest {
-                name,
+                name: Some(name),
                 note,
                 pwd: std::env::current_dir()
                     .map(|p| p.display().to_string())
@@ -738,7 +738,7 @@ mod tests {
         assert!(wants(&["bbs", "agents"]));
         assert!(wants(&["bbs", "group", "register", "g"]));
         assert!(!wants(&["bbs", "--token", "t", "agents"]));
-        assert!(!wants(&["bbs", "register"]));
+        assert!(!wants(&["bbs", "register", "--name", "a"]));
     }
 
     #[test]

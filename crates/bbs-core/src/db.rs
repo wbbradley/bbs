@@ -668,16 +668,6 @@ pub fn taken_names(conn: &Connection) -> Result<HashSet<String>> {
     Ok(names)
 }
 
-/// Lowercased agent name -> most recent registration time under that name.
-pub fn name_last_used(conn: &Connection) -> Result<HashMap<String, String>> {
-    let mut stmt =
-        conn.prepare("SELECT lower(name), MAX(created_at) FROM agents GROUP BY lower(name)")?;
-    let map = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-    Ok(map)
-}
-
 pub struct NewAgent<'a> {
     pub name: &'a str,
     pub token: &'a str,
@@ -1049,12 +1039,6 @@ const SENDER_JOINS: &str = "
 
 /// The sender's kind, with [`SENDER_JOINS`].
 const SENDER_KIND: &str = "CASE WHEN sb.agent_id IS NULL THEN 'human' ELSE 'agent' END";
-
-/// Whether a new agent named `name` under human `owner` would get a free Hub
-/// ID: none of the owner's agents, live or retired, maps to it.
-pub fn agent_name_available(conn: &Connection, name: &str, owner: i64) -> Result<bool> {
-    hub_model::agent_name_available(conn, name, owner)
-}
 
 /// Move every retired entity off its plain ID, as the cutover does for records
 /// retired before it, so tests can reuse a retired native name.
@@ -3856,8 +3840,6 @@ mod tests {
                 )
             );
         }
-        assert!(!agent_name_available(&conn, "A.b", ann.id).unwrap());
-        assert!(agent_name_available(&conn, "a.c", ann.id).unwrap());
         // Another owner's agent of the same name has its own ID.
         let bo = human(&conn, "bo");
         let other = agent(&conn, bo.id, "a.b");

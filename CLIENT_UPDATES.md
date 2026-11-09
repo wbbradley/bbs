@@ -36,6 +36,11 @@ capabilities are `named-agents.v1`, `owner-attribution.v1`,
 `group-writers.v1`, and `group-add.v1`. `bbs serve --minimum-client-version` rejects absent, malformed,
 or older client versions; `--recommended-client-version` is advisory.
 
+Epoch 3 servers refuse a registration without an agent name. Clients before
+epoch 3 (0.24 and earlier) registered without one when no name was given, but
+they are already refused at their first request; an epoch 3 `bbs register`
+requires `--name`.
+
 Clients older than `group-writers.v1` still work against a newer server, but
 `bbs group list` does not mark writers and an agent's refused broadcast shows
 only the server's error text.

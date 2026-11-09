@@ -8,12 +8,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rand::seq::IndexedRandom;
 use rusqlite::{Connection, TransactionBehavior};
 
 use crate::auth::{self, AuthenticationError};
 use crate::db;
-use crate::names::NAMES;
 use crate::proto;
 use crate::timer::Schedule;
 
@@ -336,38 +334,6 @@ pub fn add_human(
     })
 }
 
-/// A pool name no live agent or human holds and whose Hub ID under `owner`
-/// is free: never one of the owner's retired agents' names.
-fn pick_name(conn: &Connection, owner: i64) -> Result<String> {
-    let taken = db::taken_names(conn)?;
-    let last_used = db::name_last_used(conn)?;
-    let mut free = Vec::new();
-    for name in NAMES {
-        if !taken.contains(&name.to_lowercase()) && db::agent_name_available(conn, name, owner)? {
-            free.push(name);
-        }
-    }
-    let never_used: Vec<&str> = free
-        .iter()
-        .copied()
-        .filter(|n| !last_used.contains_key(&n.to_lowercase()))
-        .collect();
-    if let Some(name) = never_used.choose(&mut rand::rng()) {
-        return Ok(name.to_string());
-    }
-    // Every free name has been used before: recycle the least recently used one.
-    free.iter()
-        .min_by_key(|n| last_used.get(&n.to_lowercase()))
-        .map(|n| n.to_string())
-        .with_context(|| {
-            format!(
-                "name pool exhausted: all {} names are in use or were your retired agents' \
-                 (Hub IDs are never reused); choose a name with --name",
-                NAMES.len()
-            )
-        })
-}
-
 fn new_token(conn: &Connection) -> Result<String> {
     loop {
         let token = auth::new_token();
@@ -387,18 +353,16 @@ pub fn register(
             bail!("already registered; `bbs bye` first to register again");
         }
         let owner = ctx.human()?;
-        if let Some(name) = &req.name {
-            validate_principal_name(name, "agent")?;
-        }
-        let name = match req.name {
-            Some(name) => {
-                if db::taken_names(ctx.conn)?.contains(&name.to_ascii_lowercase()) {
-                    bail!("agent name {name:?} is already reserved");
-                }
-                name
-            }
-            None => pick_name(ctx.conn, owner.id)?,
+        let Some(name) = req.name.filter(|n| !n.is_empty()) else {
+            bail!(
+                "an agent name is required: register with a short, descriptive name, \
+                 such as `bbs register --name reviewer`"
+            );
         };
+        validate_principal_name(&name, "agent")?;
+        if db::taken_names(ctx.conn)?.contains(&name.to_ascii_lowercase()) {
+            bail!("agent name {name:?} is already reserved");
+        }
         // Keep the reserved-name error above: restarting an existing headless
         // agent uses it to take over its token without creating a new identity.
         let frozen: bool = ctx.conn.query_row(

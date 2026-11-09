@@ -102,13 +102,11 @@ impl Board {
         .unwrap()
     }
     fn reject_new_registration(&mut self) {
-        for name in [Some("newcomer"), None] {
-            let error = register(&mut self.conn, &self.owner, name).unwrap_err();
-            assert!(
-                error.to_string().contains("resume delivery in Settings"),
-                "{error:#}"
-            );
-        }
+        let error = register(&mut self.conn, &self.owner, Some("newcomer")).unwrap_err();
+        assert!(
+            error.to_string().contains("resume delivery in Settings"),
+            "{error:#}"
+        );
         let count: i64 = self
             .conn
             .query_row("SELECT count(*) FROM agents", [], |r| r.get(0))

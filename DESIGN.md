@@ -337,8 +337,8 @@ run. Records created after the cutover get entity IDs from the same name
 mapping. IDs never change and are never reused, so creating a record whose ID
 any entity holds, live or retired, ignoring case, is refused with an error
 naming the holder: an agent reusing a retired agent's name, `a.b` beside
-`a-b`, a group named like a human or an archived group. Random agent names skip
-names their owner cannot use. Retiring an agent or archiving a group retires its entity and address.
+`a-b`, a group named like a human or an archived group. Every agent registers
+with a name it chooses: there is no automatic naming. Retiring an agent or archiving a group retires its entity and address.
 
 The Hub model cutover is not an automatic migration: on existing data only
 `bbs-server migrate-hub-model` runs it, from
