@@ -697,8 +697,8 @@ proof. Install by pinned revision to get the release itself.
 ### Coordinated upgrades
 
 Version 0.21.0 upgraded the server database, and any local-mode database it
-opens, to schema 26. Versions 0.22.0 and 0.23.0 keep schema 26, so 0.21.0
-and later binaries open the same database. Roll a 0.23.0 server out before
+opens, to schema 26. Versions 0.22.0 through 0.24.0 keep schema 26, so
+0.21.0 and later binaries open the same database. Roll a 0.23.0 server out before
 0.23.0 runners: older servers refuse goal deadlines and goal reports with no
 turn budget. Back up before upgrading from an earlier
 version. Older remote clients keep

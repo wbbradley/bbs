@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.24.0 - 2026-11-09
+
 ### Added
 
 - A focused agent between turns shows an amber ⧖ instead of the green ◎ in the
