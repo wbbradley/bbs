@@ -145,7 +145,12 @@ pub struct MessageView {
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))?;
-    enable_wal(&conn)?;
+    // A database `migrate` will refuse stays exactly as it is, without WAL
+    // files, so its owner can still back it up and migrate it.
+    let version = schema_version(&conn)?;
+    if version == 0 || version == SCHEMA_VERSION {
+        enable_wal(&conn)?;
+    }
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(conn)
 }
@@ -229,32 +234,63 @@ pub fn migrate_in(conn: &mut Connection, namespace: Option<&str>) -> Result<()> 
     if schema_version(conn)? == 0 {
         create(conn, namespace.unwrap_or(DEFAULT_NAMESPACE))?;
     }
-    check_supported(schema_version(conn)?)?;
-    if let Some(namespace) = namespace {
-        let stored = hub_model::namespace(conn)?;
-        if namespace != stored {
-            bail!("this database's namespace is {stored:?}, not {namespace:?}");
-        }
+    check_supported(conn, schema_version(conn)?)?;
+    let has_namespace: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'bbs_installation')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_namespace {
+        bail!(
+            "this schema-v{SCHEMA_VERSION} database has no installation namespace \
+             (bbs_installation): an earlier development build of `bbs-server migrate-hub-model` \
+             made it. Restore the schema-v{HUB_MODEL_SOURCE_VERSION} backup taken before that \
+             and migrate it again with this release"
+        );
+    }
+    let stored = hub_model::namespace(conn)?;
+    if let Some(namespace) = namespace
+        && namespace != stored
+    {
+        bail!("this database's namespace is {stored:?}, not {namespace:?}");
     }
     Ok(())
 }
 
 /// Refuse a schema this binary cannot serve.
-fn check_supported(version: usize) -> Result<()> {
+fn check_supported(conn: &Connection, version: usize) -> Result<()> {
     if version > SCHEMA_VERSION {
         bail!("BBS schema v{version} is newer than this binary supports");
     }
+    let path = conn
+        .path()
+        .filter(|p| !p.is_empty())
+        .unwrap_or("STATE_DIR/bbs.db");
+    let state_dir = Path::new(path)
+        .parent()
+        .map_or("STATE_DIR".into(), |p| p.display().to_string());
+    let version_text = crate::release::VERSION;
+    let steps = format!(
+        "Stop every process using it (`bbs serve`, local `bbs` commands, headless runs and \
+         `bbs connect`), then run:\n\
+         \x20 bbs backup {state_dir}/pre-hub.db --state-dir {state_dir}\n\
+         \x20 cargo install --locked bbs-server --version {version_text}   # if bbs-server is not installed\n\
+         \x20 bbs-server migrate-hub-model --db {path} --namespace bbs --backup-taken {state_dir}/pre-hub.db\n\
+         --namespace is this installation's permanent Hub namespace, [a-z][a-z0-9-]*; \
+         keep `bbs`, the default for new databases, unless it will federate under another name. \
+         Add --dry-run first to see the entity IDs it will assign."
+    );
     if version == HUB_MODEL_SOURCE_VERSION {
         bail!(
-            "this database is at BBS schema v{version}, before the Hub model; stop every bbs \
-             process using it, back it up, and run `bbs-server migrate-hub-model` to move it to \
-             schema v{SCHEMA_VERSION}"
+            "{path} is at BBS schema v{version}, before the Hub model (v{SCHEMA_VERSION}); \
+             this release does not migrate it automatically. {steps}"
         );
     }
     if version < HUB_MODEL_SOURCE_VERSION {
         bail!(
-            "this database is at BBS schema v{version}; open it once with bbs 0.24 to reach \
-             schema v{HUB_MODEL_SOURCE_VERSION}, then run `bbs-server migrate-hub-model`"
+            "{path} is at BBS schema v{version}, too old to migrate to the Hub model \
+             (v{SCHEMA_VERSION}) directly; open it once with bbs 0.24 to reach schema \
+             v{HUB_MODEL_SOURCE_VERSION}. Then: {steps}"
         );
     }
     Ok(())
@@ -3906,5 +3942,63 @@ mod tests {
         assert!(!has_unread(&conn, &scout).unwrap());
         assert_eq!(archived_since(&conn, &scout, None, None).unwrap().len(), 1);
         assert_eq!(mark_read_from(&conn, &will, &scout, "t3").unwrap(), 1);
+    }
+
+    #[test]
+    fn a_refused_legacy_database_is_left_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bbs.db");
+        let mut conn = Connection::open(&path).unwrap();
+        migrate_legacy(&mut conn).unwrap();
+        conn.execute_batch("INSERT INTO humans VALUES (1, 'will', 't', 't')")
+            .unwrap();
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+        let mut conn = open(&path).unwrap();
+        let err = migrate(&mut conn).unwrap_err().to_string();
+        drop(conn);
+        // It says exactly what to run on this file.
+        let db = path.display().to_string();
+        let state = dir.path().display().to_string();
+        for expected in [
+            format!("{db} is at BBS schema v26, before the Hub model (v27)"),
+            format!("bbs backup {state}/pre-hub.db --state-dir {state}"),
+            format!(
+                "cargo install --locked bbs-server --version {}",
+                crate::release::VERSION
+            ),
+            format!(
+                "bbs-server migrate-hub-model --db {db} --namespace bbs --backup-taken {state}/pre-hub.db"
+            ),
+            "keep `bbs`, the default for new databases".into(),
+        ] {
+            assert!(err.contains(&expected), "{expected}\n{err}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        files.sort();
+        assert_eq!(files, ["bbs.db"]);
+    }
+
+    #[test]
+    fn a_hub_model_database_without_its_namespace_is_refused() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch("DROP TABLE bbs_installation").unwrap();
+        for namespace in [None, Some("bbs")] {
+            let err = migrate_in(&mut conn, namespace).unwrap_err().to_string();
+            assert!(
+                err.contains("has no installation namespace (bbs_installation)")
+                    && err.contains("migrate it again with this release"),
+                "{err}"
+            );
+        }
     }
 }

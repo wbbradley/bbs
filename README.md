@@ -698,12 +698,33 @@ proof. Install by pinned revision to get the release itself.
 
 The release after 0.24.0 moves to the Hub entity/address model (schema 27)
 and protocol epoch 3. It creates new databases at schema 27 but never
-migrates an existing one: stop the server and every local-mode user of the
-database, take a [backup](#backup-and-restore), run `bbs-server
-migrate-hub-model --db PATH --namespace NS --backup-taken BACKUP` (try
-`--dry-run` on a copy first), then start the new server and install the
-matching client everywhere; epoch 2 clients and servers refuse epoch 3 ones.
-A database older than schema 26 needs bbs 0.24 to reach 26 first.
+migrates an existing one; it refuses to open it, leaving the file unchanged,
+and prints the commands below for that file. Epoch 2 clients and servers
+refuse epoch 3 ones, so upgrade every client with the server:
+
+1. Stop every process using the database: the server, local-mode `bbs`
+   commands and hooks, and every `bbs headless run` and `bbs connect`.
+   Running headless runs and TUIs keep their old binary and protocol; they
+   cannot recover by themselves, so restart each one on the new client in
+   step 5.
+2. Back up the stopped database, for example
+   `bbs backup ~/pre-hub.db --state-dir ~/.local/state/bbs` (use the server's
+   `--state-dir`, or `/var/lib/bbs` in the container image).
+3. Install the matching server if this machine has none, which is usual for
+   local mode: `cargo install --locked bbs-server --version <version>`.
+4. Migrate:
+   `bbs-server migrate-hub-model --db ~/.local/state/bbs/bbs.db --namespace bbs --backup-taken ~/pre-hub.db`.
+   `--namespace` is the installation's permanent Hub namespace,
+   `[a-z][a-z0-9-]*`. Keep `bbs`, the default for new databases, unless this
+   installation will federate under another name; a server must then be
+   started with the same `--namespace`. Add `--dry-run` (on a copy) first to
+   see the entity IDs it will assign and anything that blocks it.
+5. Start the new server, install the matching client on every account that
+   uses the board, and restart headless runs and listeners.
+
+A database older than schema 26 needs bbs 0.24 to reach schema 26 first.
+`bbs admin` no longer creates a database: start the server (or run
+`bbs init` for a local board) first.
 
 Version 0.21.0 upgraded the server database, and any local-mode database it
 opens, to schema 26. Versions 0.22.0 through 0.24.0 keep schema 26, so

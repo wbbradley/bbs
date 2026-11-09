@@ -2208,27 +2208,57 @@ fn user_version(db: &rusqlite::Connection) -> i64 {
 
 #[test]
 fn old_schema_is_refused_unchanged() {
-    let home = std::env::temp_dir().join(format!("bbs-test-{}-migrate", std::process::id()));
-    let _ = std::fs::remove_dir_all(&home);
-    let state = home.join(".local/state/bbs");
-    std::fs::create_dir_all(&state).unwrap();
-    let db = rusqlite::Connection::open(state.join("bbs.db")).unwrap();
-    db.execute_batch(include_str!("../crates/bbs-core/migrations/0001_init.sql"))
+    // Schema 1 is too old to cut over; schema 26 needs the operator cutover.
+    let cases: [(i64, &str); 2] = [
+        (
+            1,
+            "too old to migrate to the Hub model (v27) directly; open it once with bbs 0.24",
+        ),
+        (
+            26,
+            "before the Hub model (v27); this release does not migrate it automatically",
+        ),
+    ];
+    for (version, expected) in cases {
+        let home =
+            std::env::temp_dir().join(format!("bbs-test-{}-migrate-{version}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let state = home.join(".local/state/bbs");
+        std::fs::create_dir_all(&state).unwrap();
+        let path = state.join("bbs.db");
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        if version == 1 {
+            db.execute_batch(include_str!("../crates/bbs-core/migrations/0001_init.sql"))
+                .unwrap();
+            db.execute_batch("PRAGMA user_version = 1;").unwrap();
+        } else {
+            bbs_core::db::migrate_legacy(&mut db).unwrap();
+        }
+        db.execute(
+            "INSERT INTO humans (name, created_at, active_at) VALUES ('will', 'x', 'x')",
+            [],
+        )
         .unwrap();
-    db.execute_batch(
-        "PRAGMA user_version = 1;
-         INSERT INTO humans (name, created_at, active_at) VALUES ('will', 'x', 'x');",
-    )
-    .unwrap();
-    drop(db);
-    for out in agents_concurrently(&home, 2) {
-        assert!(!out.status.success());
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("bbs-server migrate-hub-model"), "{err}");
+        drop(db);
+        let before = std::fs::read(&path).unwrap();
+        for out in agents_concurrently(&home, 2) {
+            assert!(!out.status.success());
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(err.contains(expected), "{err}");
+            assert!(
+                err.contains(&format!(
+                    "bbs-server migrate-hub-model --db {} --namespace bbs",
+                    path.display()
+                )),
+                "{err}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(user_version(&db), version);
+        drop(db);
+        std::fs::remove_dir_all(&home).unwrap();
     }
-    let db = rusqlite::Connection::open(state.join("bbs.db")).unwrap();
-    assert_eq!(user_version(&db), 1);
-    std::fs::remove_dir_all(&home).unwrap();
 }
 
 fn view_is_for_humans_only(mode: Mode) {

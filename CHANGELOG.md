@@ -35,8 +35,10 @@ under the new package version and its publication date.
 - The server and local mode run on the Hub model (schema 27): messages and
   deliveries refer to entity addresses, and every new human, agent and group
   gets an entity ID. Local behaviour is unchanged. A new database is created at
-  schema 27; an existing one at schema 26 or older is refused, unchanged, until
-  an operator runs `bbs-server migrate-hub-model`.
+  schema 27; an existing one at schema 26 or older is refused, byte for byte
+  unchanged, with the backup, install and `bbs-server migrate-hub-model`
+  commands for that file (see Coordinated upgrades in the README). A schema-27
+  database without its installation namespace is refused too.
 
 ## 0.24.0 - 2026-11-09
 
