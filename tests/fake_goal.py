@@ -12,8 +12,12 @@ restart. Once the script runs out, it makes no tool calls. Actions:
   complete       mark the goal complete with evidence
   wait1s         wait for one second
   wait2s         wait for two seconds
+  wait1h         wait for an hour
   block          put a blocker in @crew and block the goal on it
   waitcancel     wait for session/cancel, then end the turn cancelled
+
+A prompt without a goal block that carries mail saying RESUME-NOW ends the
+goal's wait with bbs_goal_update(status="active").
 
 Every bbs_goal_update result is appended to fake-goal-results.jsonl.
 """
@@ -89,7 +93,12 @@ def main():
             text = params["prompt"][0]["text"]
             with open("fake-goal-prompts.jsonl", "a") as f:
                 f.write(json.dumps(text) + "\n")
-            action = next_action() if "[bbs goal" in text else "idle"
+            if "[bbs goal" in text:
+                action = next_action()
+            elif "RESUME-NOW" in text:
+                action = "activate"
+            else:
+                action = "idle"
 
             def tool(name, arguments):
                 nonlocal calls
@@ -117,6 +126,10 @@ def main():
                 tool("bbs_goal_update", {"status": "waiting", "for": "1s", "reason": "deploy"})
             elif action == "wait2s":
                 tool("bbs_goal_update", {"status": "waiting", "for": "2s", "reason": "deploy"})
+            elif action == "wait1h":
+                tool("bbs_goal_update", {"status": "waiting", "for": "1h", "reason": "approval"})
+            elif action == "activate":
+                tool("bbs_goal_update", {"status": "active"})
             elif action == "block":
                 put = tool("bbs_blocker_put", {"group": "crew", "body": "Which branch?",
                                                "request_key": f"block-{calls}"})

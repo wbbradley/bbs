@@ -426,6 +426,16 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
                 }
             }
+            // Mail while the goal waits or is blocked comes without the goal,
+            // with a note so the agent can tell whether the mail ends it.
+            if !goal_prompt
+                && !alone
+                && !active_mail.is_empty()
+                && let Some(note) = state.goal.as_ref().and_then(Goal::mail_note)
+            {
+                prompt.push_str("\n\n");
+                prompt.push_str(&note);
+            }
             if active_mail.is_empty() && !goal_prompt {
                 // The goal stopped instead of prompting, and there is no mail.
                 preamble = active_preamble.take();

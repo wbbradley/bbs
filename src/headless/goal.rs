@@ -84,6 +84,8 @@ pub enum Next {
     Sharper,
     /// A wait or block ended.
     Resumed,
+    /// The owner resumed a stopped goal: restate it in full.
+    Restated,
 }
 
 /// The wait or block a resumed goal came out of, for its prompt.
@@ -162,6 +164,8 @@ pub enum UpdateKind {
         wake_at: String,
         reason: String,
     },
+    /// End a wait or block now.
+    Active {},
 }
 
 /// The newest set time handed out, in microseconds since the epoch.
@@ -246,15 +250,16 @@ impl Goal {
         self.set(Status::Active, Changer::Owner, "resumed by owner");
         self.idle_turns = 0;
         self.ended = None;
-        self.next = Next::Continue;
+        self.next = Next::Restated;
         Ok(())
     }
 
-    /// Mail arrived: a waiting goal resumes, as does a goal blocked without
-    /// a blocker. A goal blocked on a blocker waits for that blocker to close.
-    /// Returns whether it changed.
+    /// Mail arrived. Mail does not end a wait or a block on a blocker: the
+    /// agent reads it and decides. Only a goal blocked by a runner before
+    /// blockers were required, with no blocker, resumes. Returns whether it
+    /// changed.
     pub fn mail_arrived(&mut self) -> bool {
-        self.waits_on().is_none() && self.end_wait(true, None)
+        self.status == Status::Blocked && self.blocker.is_none() && self.end_wait(true, None)
     }
 
     /// The wait's time came. Returns whether it changed.
@@ -302,12 +307,27 @@ impl Goal {
             .flatten()
     }
 
-    /// Apply the agent's update, if it is for this goal while active.
+    /// Apply the agent's update, if it is for this goal while active,
+    /// waiting or blocked.
     pub fn apply(&mut self, update: &Update) -> bool {
-        if update.goal != self.set_at || self.status != Status::Active {
+        if update.goal != self.set_at
+            || !matches!(
+                self.status,
+                Status::Active | Status::Waiting | Status::Blocked
+            )
+        {
             return false;
         }
         match &update.kind {
+            UpdateKind::Active {} => {
+                if self.status == Status::Active {
+                    return false;
+                }
+                self.set(Status::Active, Changer::Agent, "the agent ended the wait");
+                self.idle_turns = 0;
+                self.ended = None;
+                self.next = Next::Continue;
+            }
             UpdateKind::Complete { evidence } => {
                 self.set(Status::Complete, Changer::Agent, "");
                 self.evidence = evidence.clone();
@@ -383,6 +403,7 @@ impl Goal {
         let header = match self.next {
             Next::New => format!("[bbs goal · new · {budget}]"),
             Next::Resumed => format!("[bbs goal · resumed after wait · {budget}]"),
+            Next::Restated => format!("[bbs goal · resumed by owner · {budget}]"),
             Next::Continue | Next::Sharper => {
                 format!("[bbs goal · continuation {} · {budget}]", self.iteration)
             }
@@ -390,6 +411,7 @@ impl Goal {
         let date = self.set_at.get(..10).unwrap_or(&self.set_at);
         let lead = match (self.next, &self.ended) {
             (Next::New, _) => "Start working on it now.".to_string(),
+            (Next::Restated, _) => format!("{} resumed the goal; continue toward it.", self.set_by),
             (Next::Sharper, _) => "Your last turn used no tools and made no progress on the goal. \
                  Take a concrete action now (run a command, edit a file, or call bbs_goal_update)."
                 .to_string(),
@@ -422,11 +444,62 @@ impl Goal {
             _ => "Your last turn ended without updating the goal, so the goal is still active."
                 .to_string(),
         };
+        // The objective and instructions are restated only when the goal is
+        // new, the owner resumed it, or the agent looks idle. Otherwise the
+        // agent has them in context, and bbs_goal_get rereads them.
+        if matches!(self.next, Next::Continue | Next::Resumed) {
+            return format!("{header}\n{lead} {REMINDER}");
+        }
         format!(
             "{header}\nObjective (set by {}, {date}):\n{}\n\n{lead}\n{INSTRUCTIONS}",
             self.set_by,
             self.objective.trim_end(),
         )
+    }
+
+    /// The goal for `bbs_goal_get`: objective, state and instructions.
+    pub fn describe(&self) -> String {
+        let status = serde_json::to_value(self.status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let mut state = format!(
+            "Status: {status} ({} of {} goal turns used)",
+            self.iteration, self.budget
+        );
+        if let Some(until) = self.wake_time().and(self.wake_at.as_deref()) {
+            state.push_str(&format!(", waiting until {until}"));
+        }
+        if let Some(id) = self.waits_on() {
+            state.push_str(&format!(", blocked on blocker #{id}"));
+        }
+        if !self.reason.is_empty() {
+            state.push_str(&format!(": {}", self.reason));
+        }
+        let date = self.set_at.get(..10).unwrap_or(&self.set_at);
+        format!(
+            "Objective (set by {}, {date}):\n{}\n\n{state}\n{INSTRUCTIONS}",
+            self.set_by,
+            self.objective.trim_end(),
+        )
+    }
+
+    /// A line for a prompt that carries mail but no goal block, while the
+    /// goal waits or is blocked, so the agent can tell whether the mail ends it.
+    pub fn mail_note(&self) -> Option<String> {
+        let reason = self.reason.trim_end_matches(['.', '?', '!']);
+        match (self.status, &self.wake_at, self.waits_on()) {
+            (Status::Waiting, Some(until), _) => Some(format!(
+                "(bbs goal: waiting until {until} for: {reason}. If this mail ends the wait, \
+                 call bbs_goal_update(status=\"active\"); otherwise handle it and end your turn.)"
+            )),
+            (Status::Blocked, _, Some(id)) => Some(format!(
+                "(bbs goal: blocked on blocker #{id}: {reason}. Goal prompts resume when it is \
+                 answered or cancelled. If this mail ends the block, call \
+                 bbs_goal_update(status=\"active\").)"
+            )),
+            _ => None,
+        }
     }
 
     pub fn report(&self) -> proto::GoalReport {
@@ -461,7 +534,13 @@ then call bbs_goal_update(status=\"blocked\", blocker=<its id>, reason=\"...\").
 resume when that blocker is answered or cancelled.
 - If you need to wait for a time or an outcome: call \
 bbs_goal_update(status=\"waiting\", until=\"...\" or for=\"...\", reason=\"...\").
+- Mail reaches you while you wait or are blocked, without goal prompts. If it ends the wait, call \
+bbs_goal_update(status=\"active\").
 Don't mark the goal complete just to end the loop.";
+
+/// The line that ends a short goal prompt.
+const REMINDER: &str = "bbs_goal_get rereads the objective and instructions; call bbs_goal_update \
+when the goal is complete, blocked or waiting.";
 
 /// Check the agent's `bbs_goal_update` arguments against `goal`; the update
 /// to hand to the runner and the agent's confirmation.
@@ -470,8 +549,10 @@ pub fn tool_update(
     args: &serde_json::Value,
     max_wait: Duration,
 ) -> Result<(Update, String)> {
-    let Some(goal) = goal.filter(|g| g.status == Status::Active) else {
-        bail!("You have no active goal to update.");
+    let Some(goal) =
+        goal.filter(|g| matches!(g.status, Status::Active | Status::Waiting | Status::Blocked))
+    else {
+        bail!("You have no active, waiting or blocked goal to update.");
     };
     let text = |key: &str| {
         args[key]
@@ -546,12 +627,23 @@ pub fn tool_update(
             };
             let wake_at = rfc3339(until);
             let reply = format!(
-                "Waiting until {wake_at}. You will be prompted then, or sooner if mail arrives. \
-                 End your turn."
+                "Waiting until {wake_at}; you will be prompted then. Mail still reaches you \
+                 meanwhile: if it ends the wait, call bbs_goal_update(status=\"active\"). End \
+                 your turn."
             );
             (UpdateKind::Waiting { wake_at, reason }, reply)
         }
-        other => bail!("status must be complete, blocked or waiting, not {other:?}"),
+        "active" => {
+            if goal.status == Status::Active {
+                bail!("The goal is already active.");
+            }
+            (
+                UpdateKind::Active {},
+                "Goal active again. Continue toward it; goal prompts resume after this turn."
+                    .to_string(),
+            )
+        }
+        other => bail!("status must be complete, blocked, waiting or active, not {other:?}"),
     };
     Ok((
         Update {
@@ -681,7 +773,7 @@ mod tests {
         assert!(g.resume().is_ok());
         assert!(
             g.prompt()
-                .starts_with("[bbs goal · continuation 1 · budget 1/3 turns]\n")
+                .starts_with("[bbs goal · resumed by owner · budget 1/3 turns]\n")
         );
     }
 
@@ -702,12 +794,19 @@ mod tests {
             next.starts_with("[bbs goal · continuation 2 · budget 2/3 turns]\n"),
             "{next}"
         );
-        assert!(next.contains("Your last turn ended without updating the goal"));
-        assert!(next.ends_with("Don't mark the goal complete just to end the loop."));
-        // An idle turn sharpens the next prompt.
+        // A turn that did work gets a short reminder, without the objective.
+        assert_eq!(
+            next,
+            format!(
+                "[bbs goal · continuation 2 · budget 2/3 turns]\nYour last turn ended without \
+                 updating the goal, so the goal is still active. {REMINDER}"
+            )
+        );
+        // An idle turn restates the goal in full, with a sharper lead.
         assert!(g.turn_ended(Some(0)));
         let sharp = g.prompt();
         assert!(sharp.contains("Your last turn used no tools"), "{sharp}");
+        assert!(sharp.contains("Ship the release") && sharp.ends_with(INSTRUCTIONS));
         // The third prompt used the budget.
         assert!(g.turn_ended(Some(1)));
         assert_eq!(g.status, Status::Limited);
@@ -716,9 +815,12 @@ mod tests {
         // Resuming a limited goal starts a fresh budget.
         g.resume().unwrap();
         assert_eq!((g.status, g.iteration), (Status::Active, 0));
+        let restated = g.prompt();
         assert!(
-            g.prompt()
-                .starts_with("[bbs goal · continuation 1 · budget 1/3 turns]")
+            restated.starts_with(
+                "[bbs goal · resumed by owner · budget 1/3 turns]\nObjective (set by will"
+            ),
+            "{restated}"
         );
     }
 
@@ -803,14 +905,22 @@ mod tests {
         assert!(g.apply(&update(&g, waiting)));
         assert_eq!(g.status, Status::Waiting);
         assert_eq!(g.wake_time(), parse_time("2026-11-06T09:00:00Z"));
-        // Not active: ignored.
+        // Mail does not end the wait; the agent is told, and decides.
+        assert!(!g.mail_arrived());
+        assert_eq!(
+            g.mail_note().as_deref(),
+            Some(
+                "(bbs goal: waiting until 2026-11-06T09:00:00Z for: CI runs at 0800Z. If this \
+                 mail ends the wait, call bbs_goal_update(status=\"active\"); otherwise handle \
+                 it and end your turn.)"
+            )
+        );
         let done = update(
             &g,
             UpdateKind::Complete {
                 evidence: "tagged".into(),
             },
         );
-        assert!(!g.apply(&done));
         // The time comes.
         assert!(g.wake());
         assert_eq!((g.status, g.next), (Status::Active, Next::Resumed));
@@ -822,6 +932,11 @@ mod tests {
         assert!(text.contains(
             "You were waiting until 2026-11-06T09:00:00Z for: CI runs at 0800Z. That time has come."
         ));
+        assert!(
+            !text.contains("Ship the release"),
+            "a resume is short: {text}"
+        );
+        assert!(g.mail_note().is_none(), "no note while active");
         // Blocked on a blocker: mail does not end it, but the blocker closing does.
         assert!(g.apply(&update(
             &g,
@@ -832,6 +947,11 @@ mod tests {
         )));
         assert_eq!(g.waits_on(), Some(12));
         assert_eq!(g.report().blocker_id, Some(12));
+        assert!(
+            g.mail_note()
+                .unwrap()
+                .starts_with("(bbs goal: blocked on blocker #12: which branch. Goal prompts")
+        );
         assert!(!g.wake(), "a block has no time");
         assert!(
             !g.mail_arrived(),
@@ -873,6 +993,24 @@ mod tests {
         assert!(g.mail_arrived());
         let text = g.prompt();
         assert!(text.contains("You were blocked: which branch? New mail arrived."));
+        // The agent ends a wait itself, from a mail turn; active again is a no-op.
+        let wait = UpdateKind::Waiting {
+            wake_at: "2026-11-07T09:00:00Z".into(),
+            reason: "John's approval".into(),
+        };
+        assert!(g.apply(&update(&g, wait)));
+        assert!(g.apply(&update(&g, UpdateKind::Active {})));
+        assert_eq!(
+            (g.status, g.changed_by, g.next, g.wake_at.as_deref()),
+            (Status::Active, Changer::Agent, Next::Continue, None)
+        );
+        assert!(!g.apply(&update(&g, UpdateKind::Active {})));
+        // Complete straight from a wait.
+        let wait = UpdateKind::Waiting {
+            wake_at: "2026-11-07T09:00:00Z".into(),
+            reason: "CI".into(),
+        };
+        assert!(g.apply(&update(&g, wait)));
         assert!(g.apply(&done));
         assert_eq!(
             (g.status, g.evidence.as_str()),
@@ -880,6 +1018,8 @@ mod tests {
         );
         assert!(g.resume().is_err());
         assert!(!g.mail_arrived());
+        // Not active, waiting or blocked: ignored.
+        assert!(!g.apply(&update(&g, UpdateKind::Active {})));
     }
 
     #[test]
@@ -891,7 +1031,7 @@ mod tests {
         assert!(!g.mail_arrived(), "mail does not resume a paused goal");
         g.resume().unwrap();
         assert!(g.resume().is_err());
-        assert_eq!(g.next, Next::Continue);
+        assert_eq!(g.next, Next::Restated);
     }
 
     #[test]
@@ -928,7 +1068,8 @@ mod tests {
         assert!(
             err(json!({"status": "waiting", "reason": "r", "for": "soon"})).contains("duration")
         );
-        assert!(err(json!({"status": "done"})).contains("complete, blocked or waiting"));
+        assert!(err(json!({"status": "done"})).contains("complete, blocked, waiting or active"));
+        assert!(err(json!({"status": "active"})).contains("already active"));
         let (u, reply) =
             ok(json!({"status": "waiting", "reason": "deploy", "for": "30m"})).unwrap();
         assert!(reply.starts_with("Waiting until "), "{reply}");
@@ -939,7 +1080,27 @@ mod tests {
         assert!((wake - Utc::now()).num_minutes() >= 29);
         let (u, _) = ok(json!({"status": "complete", "evidence": "v1 tagged"})).unwrap();
         assert_eq!(u.goal, g.set_at);
-        // No goal, or one that is not active.
+        // While waiting, the agent may end the wait or report anything else.
+        let mut waiting = goal();
+        assert!(waiting.apply(&update(
+            &waiting,
+            UpdateKind::Waiting {
+                wake_at: "2099-01-01T00:00:00Z".into(),
+                reason: "r".into(),
+            }
+        )));
+        let (u, reply) = tool_update(Some(&waiting), &json!({"status": "active"}), max).unwrap();
+        assert_eq!(u.kind, UpdateKind::Active {});
+        assert!(reply.starts_with("Goal active again."), "{reply}");
+        assert!(
+            tool_update(
+                Some(&waiting),
+                &json!({"status": "complete", "evidence": "done"}),
+                max
+            )
+            .is_ok()
+        );
+        // No goal, or one that is not active, waiting or blocked.
         assert!(tool_update(None, &json!({"status": "blocked", "reason": "r"}), max).is_err());
         let mut paused = goal();
         paused.pause("p");

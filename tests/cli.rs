@@ -4395,6 +4395,49 @@ fn headless_goal_resumes_when_someone_else_cancels_its_blocker() {
 }
 
 #[test]
+fn headless_goal_waits_through_mail_until_the_agent_ends_the_wait() {
+    let (bbs, _run, tp) = crew_goal_runner("goal-quiet-wait", "wait1h,complete");
+    wait_goal_status(&bbs, "waiting");
+    // Other mail arrives without the goal, with a note, and the wait goes on.
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "unrelated news"]);
+    eventually("the mail prompt", || goal_prompts(&bbs).get(1).map(|_| ()));
+    let mail = &goal_prompts(&bbs)[1];
+    assert!(mail.contains("unrelated news"), "{mail}");
+    assert!(!mail.contains("[bbs goal"), "{mail}");
+    assert!(
+        mail.contains("(bbs goal: waiting until ") && mail.contains(" for: approval. If this mail"),
+        "{mail}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(goal_prompts(&bbs).len(), 2);
+    assert_eq!(goal_status(&bbs).as_deref(), Some("waiting"));
+    // Mail the agent judges to end the wait: it says so, and the goal goes on
+    // with a short prompt, without restating the objective.
+    bbs.ok(&[
+        "--token",
+        &tp,
+        "send",
+        "--to",
+        "Zed",
+        "approved: RESUME-NOW",
+    ]);
+    wait_goal_status(&bbs, "complete");
+    let prompts = goal_prompts(&bbs);
+    assert_eq!(prompts.len(), 4, "{prompts:#?}");
+    assert!(
+        prompts[3].starts_with("[bbs goal · continuation 2 · budget 2/50 turns]\n"),
+        "{}",
+        prompts[3]
+    );
+    assert!(
+        !prompts[3].contains("Answer the question"),
+        "{}",
+        prompts[3]
+    );
+    assert!(prompts[3].contains("bbs_goal_get"), "{}", prompts[3]);
+}
+
+#[test]
 fn headless_goal_prompts_hold_for_restart_preparation() {
     let script = vec!["slow"; 100].join(",");
     let (bbs, _run) = goal_runner("goal-hold", &script, 200);
