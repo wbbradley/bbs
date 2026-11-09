@@ -10,9 +10,20 @@ under the new package version and its publication date.
 
 ### Added
 
+- The goal dialog asks for what done looks like (merged, released, live, or a
+  check that passes) in the objective.
 - The web goal strip has an Edit button. It opens the goal dialog filled in with
   the current objective and deadline. Changing only the deadline moves it and
   keeps the goal's turns and status; changing the objective sets a new goal.
+
+### Changed
+
+- The conversation view puts its controls (effort, the All/Mail/Activity filter,
+  Compact, Note, Aside, Goal, Focus, Cancel turn, Retire) on their own row below
+  the agent's name and status, so they wrap less.
+- Goal instructions and the `waiting` reply tell the agent to end a wait early
+  when anything ends it, such as mail or a result it was watching for, not only
+  mail.
 
 ## 0.23.0 - 2026-11-09
 

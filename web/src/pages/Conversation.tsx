@@ -321,51 +321,55 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
             "not live"
           ) : undefined
         }
-      >
-        {info && <EffortControl agent={agent} report={info.effort} owned={owned} />}
-        <div className="segmented" title="What the timeline shows">
-          {(["all", "messages", "activity"] as Show[]).map((s) => (
-            <button key={s} className={show === s ? "on" : ""} onClick={() => setShow(s)}>
-              {s === "all" ? "All" : s === "messages" ? "Mail" : "Activity"}
+        controls={
+          <>
+            {info && <EffortControl agent={agent} report={info.effort} owned={owned} />}
+            <div className="segmented" title="What the timeline shows">
+              {(["all", "messages", "activity"] as Show[]).map((s) => (
+                <button key={s} className={show === s ? "on" : ""} onClick={() => setShow(s)}>
+                  {s === "all" ? "All" : s === "messages" ? "Mail" : "Activity"}
+                </button>
+              ))}
+            </div>
+            <button
+              className={`btn small${compact ? " primary" : ""}`}
+              onClick={() => setPrefs({ compact: !compact })}
+              title="Compact view hides tool calls and others' mail"
+            >
+              Compact
             </button>
-          ))}
-        </div>
-        <button
-          className={`btn small${compact ? " primary" : ""}`}
-          onClick={() => setPrefs({ compact: !compact })}
-          title="Compact view hides tool calls and others' mail"
-        >
-          Compact
-        </button>
-        {noteId !== null && board.has("agent-notes.v1") && (
-          <button className={`btn small${noteOpen ? " primary" : ""}`} onClick={toggleNote}>
-            Note{board.notes.get(noteId)?.body ? " •" : ""}
-          </button>
-        )}
-        {owned && board.has("side-questions.v1") && (
-          <button className="btn small" onClick={() => setSideOpen(true)} title="/btw: ask on the side">
-            Aside
-          </button>
-        )}
-        {owned && info && !info.goal && info.goal_reported_at && board.has("agent-goal.v1") && (
-          <button className="btn small" onClick={() => setGoalOpen("new")} title="Give the agent a goal to work toward across turns">
-            Goal
-          </button>
-        )}
-        {owned && info && board.has("agent-focus.v1") && (
-          <FocusToggle agent={agent} since={info.focused_at ?? null} onNotice={setNotice} />
-        )}
-        {owned && turn.running && (
-          <button className="btn small danger" onClick={cancelTurn}>
-            Cancel turn
-          </button>
-        )}
-        {owned && (
-          <button className="btn small ghost danger" onClick={retire} title="Retire this agent">
-            Retire
-          </button>
-        )}
-      </PageHeader>
+            {noteId !== null && board.has("agent-notes.v1") && (
+              <button className={`btn small${noteOpen ? " primary" : ""}`} onClick={toggleNote}>
+                Note{board.notes.get(noteId)?.body ? " •" : ""}
+              </button>
+            )}
+            {owned && board.has("side-questions.v1") && (
+              <button className="btn small" onClick={() => setSideOpen(true)} title="/btw: ask on the side">
+                Aside
+              </button>
+            )}
+            {owned && info && !info.goal && info.goal_reported_at && board.has("agent-goal.v1") && (
+              <button className="btn small" onClick={() => setGoalOpen("new")} title="Give the agent a goal to work toward across turns">
+                Goal
+              </button>
+            )}
+            {owned && info && board.has("agent-focus.v1") && (
+              <FocusToggle agent={agent} since={info.focused_at ?? null} onNotice={setNotice} />
+            )}
+            {owned && turn.running && (
+              <button className="btn small danger" onClick={cancelTurn}>
+                Cancel turn
+              </button>
+            )}
+            <span className="spacer" />
+            {owned && (
+              <button className="btn small ghost danger" onClick={retire} title="Retire this agent">
+                Retire
+              </button>
+            )}
+          </>
+        }
+      />
       <div className="split">
         <div className="conversation">
           <Timeline

@@ -464,8 +464,9 @@ Start working on it now.
   reason="..."). Goal prompts resume when that blocker is answered or cancelled.
 - If you need to wait for a time or an outcome: call
   bbs_goal_update(status="waiting", until="..." or for="...", reason="...").
-- Mail reaches you while you wait or are blocked, without goal prompts. If it
-  ends the wait, call bbs_goal_update(status="active").
+- Mail reaches you while you wait or are blocked, without goal prompts. If
+  anything ends the wait early, such as mail or a result you were watching for,
+  call bbs_goal_update(status="active").
 Don't mark the goal complete just to end the loop.
 ```
 

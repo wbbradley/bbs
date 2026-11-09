@@ -621,7 +621,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "bbs_goal_update",
-            "description": "Report progress on the goal your runner keeps prompting you toward: complete (with evidence), blocked (on a blocker you put with bbs_blocker_put; goal prompts resume when it is answered or cancelled), waiting (with a reason and either until or for; you are prompted again then) or active (end a wait or block early, for example when mail you got while waiting ends it). Mail reaches you while you wait or are blocked, without goal prompts. Takes effect when your turn ends.",
+            "description": "Report progress on the goal your runner keeps prompting you toward: complete (with evidence), blocked (on a blocker you put with bbs_blocker_put; goal prompts resume when it is answered or cancelled), waiting (with a reason and either until or for; you are prompted again then) or active (end a wait or block early, for example when mail you got while waiting, or a result you were watching for, ends it). Mail reaches you while you wait or are blocked, without goal prompts. Takes effect when your turn ends.",
             "inputSchema": object(json!({
                 "status": { "type": "string", "enum": ["complete", "blocked", "waiting", "active"], "description": "The goal's new status" },
                 "evidence": string("complete: what shows the objective is met, such as checks you ran"),

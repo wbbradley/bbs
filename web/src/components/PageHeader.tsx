@@ -4,11 +4,14 @@ export function PageHeader({
   title,
   sub,
   openNav,
+  controls,
   children,
 }: {
   title: ReactNode;
   sub?: ReactNode;
   openNav: () => void;
+  /** Controls on their own row below the title. */
+  controls?: ReactNode;
   children?: ReactNode;
 }) {
   return (
@@ -20,6 +23,7 @@ export function PageHeader({
       {sub && <span className="sub">{sub}</span>}
       <span className="spacer" />
       {children}
+      {controls && <div className="page-controls">{controls}</div>}
     </header>
   );
 }
