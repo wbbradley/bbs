@@ -3505,6 +3505,14 @@ mod tests {
             token: Some("k2".into()),
             ..Default::default()
         };
+        // Tokens saved before the cutover keep authenticating with no new
+        // registration, whatever their name.
+        assert_eq!(whoami(&mut conn, &scout).unwrap().name, "scout");
+        let lonely = Caller {
+            token: Some("k3".into()),
+            ..Default::default()
+        };
+        assert_eq!(whoami(&mut conn, &lonely).unwrap().name, "lonely");
         let focus = |conn: &mut Connection, focused| {
             let req = proto::SetFocusRequest {
                 agent: "scout".into(),

@@ -643,6 +643,16 @@ pub fn tool_list() -> Value {
 mod search_tests {
     use super::*;
 
+    /// The MCP server acts only as the runner's existing agent: it offers no
+    /// way to register one.
+    #[test]
+    fn no_tool_registers_an_agent() {
+        for tool in tool_list().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            assert!(!name.contains("register"), "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn goal_updates_are_left_for_the_runner() {
         let dir = tempfile::tempdir().unwrap();
