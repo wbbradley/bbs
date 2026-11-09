@@ -274,6 +274,14 @@ pub fn client_metadata(metadata: &mut MetadataMap, capabilities: &[&str]) {
     }
 }
 
+/// Whether `err` says this client and the server cannot work together: a
+/// different epoch, a missing capability, a client below the server's
+/// minimum, or such a ServerInfo. Retrying cannot help; only an upgrade can.
+pub fn is_incompatible(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.to_string().starts_with("incompatible BBS"))
+}
+
 /// Discovery is diagnostic, never permission to omit request-level requirements.
 pub fn validate_info(info: &proto::ServerInfoResponse) -> Result<()> {
     if info.protocol_epoch != Some(EPOCH) {
@@ -420,7 +428,7 @@ mod tests {
         info.capabilities.push("future.v1".into());
         validate_info(&info).unwrap();
         info.protocol_epoch = None;
-        assert!(validate_info(&info).is_err());
+        assert!(is_incompatible(&validate_info(&info).unwrap_err()));
         info.protocol_epoch = Some(EPOCH);
         info.release = None;
         assert!(validate_info(&info).is_err());
