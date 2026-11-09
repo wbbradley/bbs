@@ -8,6 +8,12 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- The web goal strip has an Edit button. It opens the goal dialog filled in with
+  the current objective and deadline. Changing only the deadline moves it and
+  keeps the goal's turns and status; changing the objective sets a new goal.
+
 ## 0.23.0 - 2026-11-09
 
 ### Added

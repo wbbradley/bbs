@@ -58,7 +58,8 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const [side, setSide] = useState<SideReport | null>(null);
   const [sideError, setSideError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [goalOpen, setGoalOpen] = useState(false);
+  // The goal dialog, for a new goal or for editing the current one.
+  const [goalOpen, setGoalOpen] = useState<"new" | "edit" | null>(null);
   const [visible, setVisible] = useState(document.visibilityState === "visible");
   const [, tick] = useState(0);
   const composer = useRef<ComposerHandle>(null);
@@ -347,7 +348,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
           </button>
         )}
         {owned && info && !info.goal && info.goal_reported_at && board.has("agent-goal.v1") && (
-          <button className="btn small" onClick={() => setGoalOpen(true)} title="Give the agent a goal to work toward across turns">
+          <button className="btn small" onClick={() => setGoalOpen("new")} title="Give the agent a goal to work toward across turns">
             Goal
           </button>
         )}
@@ -401,7 +402,8 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
                     agent={agent}
                     goal={info.goal}
                     owned={owned}
-                    onEdit={() => setGoalOpen(true)}
+                    onEdit={() => setGoalOpen("edit")}
+                    onNew={() => setGoalOpen("new")}
                     onNotice={setNotice}
                   />
                 )}
@@ -446,7 +448,13 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
         )}
       </div>
       {goalOpen && (
-        <GoalDialog agent={agent} current={info?.goal ?? null} onClose={() => setGoalOpen(false)} onNotice={setNotice} />
+        <GoalDialog
+          agent={agent}
+          current={info?.goal ?? null}
+          edit={goalOpen === "edit"}
+          onClose={() => setGoalOpen(null)}
+          onNotice={setNotice}
+        />
       )}
       {answering && pendingInput && (
         // A new request is a new form: nothing chosen for another carries over.
