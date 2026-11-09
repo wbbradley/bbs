@@ -53,21 +53,53 @@ async function control(agent: string, control: number, body: string) {
   await rpc("send", { to: agent, body, control });
 }
 
-/** The owner's dialog for giving the agent a goal, replacing any it has. */
+/** An RFC 3339 time as a datetime-local picker value, in local time. */
+export function pickerValue(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const t = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}T${pad(t.getHours())}:${pad(t.getMinutes())}`;
+}
+
+/**
+ * The controls that turn the dialog into a goal. Editing a goal with the same
+ * objective only moves its deadline, keeping its turns and status; a changed
+ * objective sets a new goal. `due` is the picked deadline, null for none.
+ */
+export function goalControls(
+  current: GoalReport | null,
+  objective: string,
+  due: string | null,
+  deadlineChanged: boolean,
+): [number, string][] {
+  if (current && objective === current.objective) {
+    return deadlineChanged ? [[Control.GoalDeadline, due ?? "none"]] : [];
+  }
+  return due ? [[Control.GoalSet, objective], [Control.GoalDeadline, due]] : [[Control.GoalSet, objective]];
+}
+
+/**
+ * The owner's dialog for giving the agent a goal, replacing any it has, or
+ * with `edit`, for changing the current one.
+ */
 export function GoalDialog({
   agent,
   current,
+  edit = false,
   onClose,
   onNotice,
 }: {
   agent: string;
   current: GoalReport | null;
+  edit?: boolean;
   onClose: () => void;
   onNotice: (message: string) => void;
 }) {
-  const [objective, setObjective] = useState("");
+  const editing = edit ? current : null;
+  const [objective, setObjective] = useState(editing?.objective ?? "");
   // A local date and time from the picker; empty for no deadline.
-  const [deadline, setDeadline] = useState("");
+  const initialDeadline = pickerValue(editing?.deadline);
+  const [deadline, setDeadline] = useState(initialDeadline);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const bytes = new TextEncoder().encode(objective.trim()).length;
@@ -75,11 +107,18 @@ export function GoalDialog({
     setBusy(true);
     setError(null);
     try {
-      const due = deadline ? new Date(deadline) : null;
-      if (due && !(due.getTime() > Date.now())) throw new Error("The deadline must be in the future.");
-      await control(agent, Control.GoalSet, objective.trim());
-      if (due) await control(agent, Control.GoalDeadline, due.toISOString().replace(/\.\d{3}Z$/, "Z"));
-      onNotice(`Asked ${agent}'s runner to work toward the new goal${due ? `, due ${fullTime(due.toISOString())}` : ""}.`);
+      const deadlineChanged = deadline !== initialDeadline;
+      const date = deadline ? new Date(deadline) : null;
+      const due = date ? date.toISOString().replace(/\.\d{3}Z$/, "Z") : null;
+      const steps = goalControls(editing, objective.trim(), due, deadlineChanged);
+      const sendsDeadline = steps.some(([kind, body]) => kind === Control.GoalDeadline && body !== "none");
+      if (date && sendsDeadline && !(date.getTime() > Date.now())) throw new Error("The deadline must be in the future.");
+      for (const [kind, body] of steps) await control(agent, kind, body);
+      const when = due ? `, due ${fullTime(due)}` : "";
+      if (steps.length === 0) onNotice("Nothing changed.");
+      else if (steps[0][0] === Control.GoalSet)
+        onNotice(`Asked ${agent}'s runner to work toward the ${editing ? "edited" : "new"} goal${when}.`);
+      else onNotice(`Asked ${agent}'s runner to ${due ? `move its goal's deadline to ${fullTime(due)}` : "drop its goal's deadline"}.`);
       onClose();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -89,7 +128,7 @@ export function GoalDialog({
   };
   return (
     <Dialog
-      title={`Goal for ${agent}`}
+      title={editing ? `Edit ${agent}'s goal` : `Goal for ${agent}`}
       onClose={onClose}
       actions={
         <>
@@ -97,14 +136,19 @@ export function GoalDialog({
             Cancel
           </button>
           <button className="btn primary" disabled={busy || !objective.trim() || bytes > MAX_OBJECTIVE} onClick={set}>
-            Set goal
+            {editing ? "Save" : "Set goal"}
           </button>
         </>
       }
     >
       <p className="muted" style={{ marginTop: 0 }}>
         The runner prompts {agent} toward this, turn after turn, until it marks the goal complete, blocks or waits,
-        the deadline passes, or you pause it.{current ? " This replaces the current goal." : ""}
+        the deadline passes, or you pause it.
+        {editing
+          ? " Changing only the deadline keeps the goal's turns and status; changing the objective starts it over."
+          : current
+            ? " This replaces the current goal."
+            : ""}
       </p>
       <label className="field">
         <span>Objective</span>
@@ -136,12 +180,14 @@ export function GoalStrip({
   goal,
   owned,
   onEdit,
+  onNew,
   onNotice,
 }: {
   agent: string;
   goal: GoalReport;
   owned: boolean;
   onEdit: () => void;
+  onNew: () => void;
   onNotice: (message: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -198,7 +244,10 @@ export function GoalStrip({
               Resume
             </button>
           )}
-          <button className="btn small" disabled={busy} onClick={onEdit}>
+          <button className="btn small" disabled={busy} onClick={onEdit} title="Change the objective or deadline">
+            Edit
+          </button>
+          <button className="btn small" disabled={busy} onClick={onNew}>
             New
           </button>
           <button className="btn small ghost" disabled={busy} onClick={() => act(Control.GoalClear, "Clear your goal.", `Asked ${agent}'s runner to clear its goal.`)}>
