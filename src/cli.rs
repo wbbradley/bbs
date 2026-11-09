@@ -257,9 +257,11 @@ pub enum AdminCommand {
 pub enum AdminIntegrationCommand {
     /// Create an integration, with publication off, and issue its credential.
     Add { id: String },
-    /// Replace the integration's credential; a stream on the old one ends.
+    /// Replace the integration's credential, enabling it; a stream on the old
+    /// one ends.
     Rotate { id: String },
-    /// Revoke the integration's credential; a stream on it ends.
+    /// Revoke the integration's credential and disable it: a stream on it
+    /// ends, and remote sends through it are refused until a rotate.
     Revoke { id: String },
     /// Publish every active human and agent to the integration (on), or
     /// none, refusing remote sends (off).

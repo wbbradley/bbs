@@ -34,22 +34,33 @@ pub fn insert(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Store the hash of an integration's credential, replacing any earlier one.
+/// Store the hash of an integration's credential, replacing any earlier one,
+/// and enable the integration.
 pub fn set_token(conn: &Connection, id: &str, hash: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO integration_tokens (integration_id, token_hash) VALUES (?1, ?2)
          ON CONFLICT(integration_id) DO UPDATE SET token_hash = excluded.token_hash",
         params![id, hash],
     )?;
+    conn.execute(
+        "UPDATE bbs_integrations SET enabled = 1 WHERE id = ?1",
+        [id],
+    )?;
     Ok(())
 }
 
-/// Delete an integration's credential; returns whether it had one.
+/// Delete an integration's credential and disable it; returns whether it had
+/// a credential.
 pub fn revoke_token(conn: &Connection, id: &str) -> Result<bool> {
-    Ok(conn.execute(
+    let had = conn.execute(
         "DELETE FROM integration_tokens WHERE integration_id = ?1",
         [id],
-    )? > 0)
+    )? > 0;
+    conn.execute(
+        "UPDATE bbs_integrations SET enabled = 0 WHERE id = ?1",
+        [id],
+    )?;
+    Ok(had)
 }
 
 /// The enabled integration whose credential hashes to `hash`.
@@ -117,12 +128,60 @@ pub fn publishes(conn: &Connection, id: &str) -> Result<Option<bool>> {
         .optional()?)
 }
 
-/// The enabled integrations, by id.
-pub fn enabled(conn: &Connection) -> Result<Vec<(String, bool)>> {
+/// Integrations a remote send may use: enabled, with a live credential. Each
+/// with its publication switch, by id.
+pub fn usable(conn: &Connection) -> Result<Vec<(String, bool)>> {
     Ok(conn
-        .prepare("SELECT id, publish_entities FROM bbs_integrations WHERE enabled = 1 ORDER BY id")?
+        .prepare(
+            "SELECT i.id, i.publish_entities FROM bbs_integrations i
+             JOIN integration_tokens t ON t.integration_id = i.id
+             WHERE i.enabled = 1 ORDER BY i.id",
+        )?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?)
+}
+
+/// The integration another installation's `namespace` is bound to: the first
+/// that imported from it or sent to it.
+pub fn namespace_integration(conn: &Connection, namespace: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT integration_id FROM integration_namespaces WHERE namespace = ?1",
+            [namespace],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Bind `namespace` to `integration` unless it is bound already.
+pub fn bind_namespace(conn: &Connection, namespace: &str, integration: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO integration_namespaces (namespace, integration_id) VALUES (?1, ?2)
+         ON CONFLICT(namespace) DO NOTHING",
+        params![namespace, integration],
+    )?;
+    Ok(())
+}
+
+/// Bumped by every change to a native entity (migration 27's triggers).
+pub fn catalog_epoch(conn: &Connection) -> Result<i64> {
+    Ok(
+        conn.query_row("SELECT catalog_epoch FROM bbs_installation", [], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
+/// Whether a known foreign entity was last observed retired.
+pub fn foreign_retired(conn: &Connection, namespace: &str, entity_id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT lifecycle = 'retired' FROM entities WHERE namespace = ?1 AND entity_id = ?2",
+            params![namespace, entity_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// The revision of `id`'s publication snapshot with entities digesting to
@@ -276,15 +335,15 @@ pub fn foreign_entity(
     Ok(id)
 }
 
-/// A foreign entity's address `address_id`, recorded on first sight and
-/// reached through `integration` unless an earlier integration already
-/// reaches it. Returns its `entity_addresses` row and that integration.
+/// A foreign entity's address `address_id`, recorded on first sight as
+/// reached through `integration`, its namespace's integration. Returns its
+/// `entity_addresses` row.
 pub fn foreign_address(
     conn: &Connection,
     entity: i64,
     address_id: &str,
     integration: &str,
-) -> Result<(i64, String)> {
+) -> Result<i64> {
     conn.execute(
         "INSERT INTO entity_addresses (entity_id, address_id, label, lifecycle, is_default)
          VALUES (?1, ?2, '', 'active', 0)
@@ -306,29 +365,10 @@ pub fn foreign_address(
         [address],
         |r| r.get(0),
     )?;
-    match bound {
-        Some(bound) => Ok((address, bound)),
-        None => bail!("address {address} is native"),
+    if bound.is_none() {
+        bail!("address {address} is native");
     }
-}
-
-/// The integration that reaches an existing foreign address, if it is known.
-pub fn foreign_route(
-    conn: &Connection,
-    namespace: &str,
-    entity_id: &str,
-    address_id: &str,
-) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT d.integration_id FROM entities e
-             JOIN entity_addresses a ON a.entity_id = e.id AND a.address_id = ?3
-             JOIN address_delivery_bindings d ON d.address_id = a.id AND d.handler = 'integration'
-             WHERE e.namespace = ?1 AND e.entity_id = ?2",
-            params![namespace, entity_id, address_id],
-            |r| r.get(0),
-        )
-        .optional()?)
+    Ok(address)
 }
 
 /// Record what an integration observed about a foreign entity: its kind,
@@ -537,6 +577,82 @@ pub fn outbox_state(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?)
+}
+
+/// Pending handoffs whose message's deadline is at or before `now`.
+pub fn expired_pending(conn: &Connection, now: &str) -> Result<Vec<i64>> {
+    Ok(conn
+        .prepare(
+            "SELECT o.id FROM integration_outbox o JOIN messages m ON m.id = o.message_id
+             WHERE o.state = 'pending' AND m.expires_at <= ?1 ORDER BY o.id",
+        )?
+        .query_map([now], |r| r.get(0))?
+        .collect::<Result<_, _>>()?)
+}
+
+/// What a delivery notice for outbox row `id` needs: the message's native
+/// ID, sender address, origin ID, send time and remote recipient's reference.
+pub struct Failed {
+    pub message: i64,
+    pub sender_address: i64,
+    pub origin_namespace: String,
+    pub origin_message_id: String,
+    pub created_at: String,
+    pub recipient: String,
+}
+
+pub fn failed(conn: &Connection, id: i64) -> Result<Failed> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT m.id, m.sender_address_id, m.origin_namespace, m.origin_message_id,
+                    m.created_at, {}
+             FROM integration_outbox o JOIN messages m ON m.id = o.message_id
+             JOIN entity_addresses xa ON xa.id = m.recipient_address_id
+             JOIN entities xe ON xe.id = xa.entity_id
+             WHERE o.id = ?1",
+            super::remote_display_sql("xe", "xa", "m.recipient_run_id")
+        ),
+        [id],
+        |r| {
+            Ok(Failed {
+                message: r.get(0)?,
+                sender_address: r.get(1)?,
+                origin_namespace: r.get(2)?,
+                origin_message_id: r.get(3)?,
+                created_at: r.get(4)?,
+                recipient: r.get(5)?,
+            })
+        },
+    )?)
+}
+
+/// Tell the sender of a failed remote message, in its own inbox: a
+/// `delivery_error` message from its own address to itself, in reply to the
+/// failed message, with one delivery. Returns the notice's native ID.
+pub fn insert_notice(
+    conn: &Connection,
+    failed: &Failed,
+    message_id: &str,
+    body: &str,
+    now: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO messages (origin_namespace, origin_message_id, sender_address_id,
+             recipient_address_id, body, created_at, authored_at, in_reply_to_namespace,
+             in_reply_to_message_id, kind)
+         SELECT namespace, ?1, ?2, ?2, ?3, ?4, ?4, ?5, ?6, 'delivery_error' FROM bbs_installation",
+        params![
+            message_id,
+            failed.sender_address,
+            body,
+            now,
+            failed.origin_namespace,
+            failed.origin_message_id
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    insert_delivery(conn, id, failed.sender_address)?;
+    Ok(id)
 }
 
 /// Handoffs a stopped server left attempted become unknown: they may or may

@@ -46,7 +46,11 @@ INSERT INTO hub_migration_assert SELECT NOT EXISTS (
 -- every native message. One row.
 CREATE TABLE bbs_installation (
   id INTEGER PRIMARY KEY CHECK(id = 1),
-  namespace TEXT NOT NULL CHECK(length(namespace) > 0)
+  namespace TEXT NOT NULL CHECK(length(namespace) > 0),
+  -- Bumped by any change to a native entity (see the triggers below), so the
+  -- integration stream rebuilds its publication catalog only when it may
+  -- have changed, whichever process made the change.
+  catalog_epoch INTEGER NOT NULL DEFAULT 0
 );
 INSERT INTO bbs_installation(id, namespace) SELECT 1, namespace FROM hub_migration_context;
 
@@ -99,6 +103,12 @@ CREATE TABLE bbs_integrations (
 CREATE TABLE integration_tokens (
   integration_id TEXT PRIMARY KEY NOT NULL REFERENCES bbs_integrations(id),
   token_hash TEXT NOT NULL UNIQUE
+);
+-- Each other installation's namespace is reached through one integration:
+-- the first that imports from it or sends to it. Others are refused.
+CREATE TABLE integration_namespaces (
+  namespace TEXT PRIMARY KEY NOT NULL,
+  integration_id TEXT NOT NULL REFERENCES bbs_integrations(id)
 );
 CREATE TABLE address_delivery_bindings (
   address_id INTEGER PRIMARY KEY REFERENCES entity_addresses(id),
@@ -241,6 +251,13 @@ CREATE TABLE integration_outbox (
   UNIQUE(integration_id, handoff_id)
 );
 CREATE INDEX integration_outbox_pending ON integration_outbox(integration_id, id) WHERE state = 'pending';
+
+CREATE TRIGGER entities_catalog_insert AFTER INSERT ON entities
+WHEN NEW.namespace = (SELECT namespace FROM bbs_installation)
+BEGIN UPDATE bbs_installation SET catalog_epoch = catalog_epoch + 1; END;
+CREATE TRIGGER entities_catalog_update AFTER UPDATE ON entities
+WHEN NEW.namespace = (SELECT namespace FROM bbs_installation)
+BEGIN UPDATE bbs_installation SET catalog_epoch = catalog_epoch + 1; END;
 
 DROP VIEW hub_native_addresses;
 DROP TABLE hub_native_map;

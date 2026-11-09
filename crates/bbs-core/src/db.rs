@@ -124,6 +124,9 @@ pub struct MessageView {
     pub id: i64,
     pub created_at: String,
     pub from_kind: Kind,
+    /// The sender is another installation's entity; `from_kind` is then
+    /// meaningless and `from_name` is its `id:ENTITY@NAMESPACE` reference.
+    pub from_remote: bool,
     pub from_name: String,
     pub from_owner: Option<String>,
     pub reader_owner: Option<String>,
@@ -249,6 +252,17 @@ pub fn migrate_in(conn: &mut Connection, namespace: Option<&str>) -> Result<()> 
              and migrate it again with this release"
         );
     }
+    let missing = missing_integration_schema(conn)?;
+    if !missing.is_empty() {
+        bail!(
+            "this schema-v{SCHEMA_VERSION} database lacks the integration schema ({}): an \
+             earlier development build of the Hub model made it. If `bbs-server \
+             migrate-hub-model` made it, restore the schema-v{HUB_MODEL_SOURCE_VERSION} backup \
+             taken before that and migrate it again with this release; if it was created \
+             new, move it aside and let this release create it",
+            missing.join(", ")
+        );
+    }
     let stored = hub_model::namespace(conn)?;
     if let Some(namespace) = namespace
         && namespace != stored
@@ -256,6 +270,35 @@ pub fn migrate_in(conn: &mut Connection, namespace: Option<&str>) -> Result<()> 
         bail!("this database's namespace is {stored:?}, not {namespace:?}");
     }
     Ok(())
+}
+
+/// The tables and columns of the Hub model's integration schema that this
+/// schema-27 database lacks; early development builds of migration 27 had
+/// none of them.
+fn missing_integration_schema(conn: &Connection) -> Result<Vec<String>> {
+    const REQUIRED: &[(&str, &str)] = &[
+        ("bbs_installation", "catalog_epoch"),
+        ("bbs_integrations", "publication_revision"),
+        ("bbs_integrations", "publication_digest"),
+        ("integration_tokens", "token_hash"),
+        ("integration_namespaces", "integration_id"),
+        ("messages", "group_copy_namespace"),
+        ("messages", "group_copy_message_id"),
+        ("messages", "group_copy_sender_address_id"),
+        ("messages", "group_copy_sender_run_id"),
+    ];
+    let mut missing = Vec::new();
+    for (table, column) in REQUIRED {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            params![table, column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            missing.push(format!("{table}.{column}"));
+        }
+    }
+    Ok(missing)
 }
 
 /// Refuse a schema this binary cannot serve.
@@ -1040,10 +1083,10 @@ const SENDER_JOINS: &str = "
     LEFT JOIN agents fa ON fa.id = sb.agent_id
     LEFT JOIN humans fh ON fh.id = sb.human_id";
 
-/// The sender's kind, with [`SENDER_JOINS`]: a foreign sender is a human when
-/// its entity says so, else shown as an agent.
+/// The sender's kind, with [`SENDER_JOINS`]: `remote` for another
+/// installation's entity, whatever an adapter says it is.
 const SENDER_KIND: &str = "CASE WHEN sb.agent_id IS NOT NULL THEN 'agent'
-    WHEN sb.human_id IS NOT NULL OR se.kind = 'human' THEN 'human' ELSE 'agent' END";
+    WHEN sb.human_id IS NOT NULL THEN 'human' ELSE 'remote' END";
 
 /// The sender's name, with [`SENDER_JOINS`]: a native name, or a foreign
 /// sender's exact address as `id:ENTITY@NAMESPACE` (see
@@ -1057,7 +1100,7 @@ static SENDER_NAME: LazyLock<String> = LazyLock::new(|| {
 
 /// SQL for [`crate::entity::remote_display`] of entity `e`, address `a` and
 /// the run expression `run`.
-fn remote_display_sql(e: &str, a: &str, run: &str) -> String {
+pub(crate) fn remote_display_sql(e: &str, a: &str, run: &str) -> String {
     format!(
         "'id:' || {e}.entity_id || '@' || {e}.namespace
          || CASE WHEN {a}.address_id = '{NATIVE_ADDRESS}' THEN '' ELSE ':' || {a}.address_id END
@@ -1721,6 +1764,7 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         } else {
             Kind::Agent
         },
+        from_remote: from_kind == "remote",
         from_name: r.get(3)?,
         from_owner: r.get(6)?,
         reader_owner: r.get(7)?,
@@ -2489,6 +2533,7 @@ pub fn feed_messages(
                 } else {
                     Kind::Agent
                 },
+                from_remote: from_kind == "remote",
                 from_name: r.get(3)?,
                 from_owner: r.get(8)?,
                 reader_owner: None,

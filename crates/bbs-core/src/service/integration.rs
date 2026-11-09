@@ -63,6 +63,19 @@ impl std::fmt::Display for InvalidFrame {
 
 impl std::error::Error for InvalidFrame {}
 
+/// A peer this server cannot serve, such as another protocol major: the
+/// stream ends with `FailedPrecondition` and this message.
+#[derive(Debug)]
+pub struct Unsupported(pub String);
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unsupported {}
+
 fn invalid(detail: impl Into<String>) -> anyhow::Error {
     InvalidFrame(detail.into()).into()
 }
@@ -96,11 +109,12 @@ pub fn check_hello(integration: &str, hello: &pb::AdapterHello) -> Result<()> {
         .into());
     }
     if hello.protocol_major != PROTOCOL_MAJOR {
-        bail!(
+        return Err(Unsupported(format!(
             "unsupported_protocol: integration protocol major {} is not supported; this \
              server speaks {PROTOCOL_MAJOR}",
             hello.protocol_major
-        );
+        ))
+        .into());
     }
     if hello.build.len() > MAX_LABEL_BYTES {
         return Err(invalid(format!(
@@ -168,14 +182,36 @@ fn descriptor(namespace: &str, p: store::Published, allowed: bool) -> mp::Entity
     }
 }
 
+/// What the catalog depends on: the native entities' epoch (bumped by any
+/// change to one, from any process) and `integration`'s publication switch.
+/// Cheap; the stream rebuilds the catalog only when this changes. A disabled
+/// (revoked) integration fails as its credential would.
+pub fn catalog_key(conn: &Connection, integration: &str) -> Result<(i64, bool)> {
+    let publish = store::publishes(conn, integration)?.ok_or(AuthenticationError(
+        "invalid or revoked integration credential",
+    ))?;
+    Ok((store::catalog_epoch(conn)?, publish))
+}
+
+/// A publication snapshot, or why there is none.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Catalog {
+    Snapshot(pb::PublishedCatalog),
+    /// Over one frame: chunked catalogs are later work, so it is not sent and
+    /// gets no revision.
+    TooLarge {
+        entities: usize,
+        bytes: usize,
+    },
+}
+
 /// `integration`'s current publication snapshot: every active native human
 /// and agent when its switch is on, else none. A snapshot that differs from
 /// the last one gets the next revision, kept in the database so it only grows
 /// across restarts; a repeat keeps its revision.
-pub fn catalog(conn: &mut Connection, integration: &str) -> Result<pb::PublishedCatalog> {
+pub fn catalog(conn: &mut Connection, integration: &str) -> Result<Catalog> {
     with_ctx(conn, &NO_CALLER, |ctx| {
-        let publish = store::publishes(ctx.conn, integration)?
-            .with_context(|| format!("integration {integration} is not enabled"))?;
+        let (_, publish) = catalog_key(ctx.conn, integration)?;
         let namespace = db::namespace(ctx.conn)?;
         let entities: Vec<mp::EntityDescriptor> = if publish {
             store::published(ctx.conn, "", -1)?
@@ -189,21 +225,21 @@ pub fn catalog(conn: &mut Connection, integration: &str) -> Result<pb::Published
             revision: 0,
             entities,
         };
-        let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(snapshot.encode_to_vec()));
-        snapshot.revision = store::publication_revision(ctx.conn, integration, &digest)?;
-        // Chunked catalogs are later work: refuse rather than truncate.
-        let size = pb::BbsFrame {
+        // The revision's varint adds at most ten bytes.
+        let bytes = pb::BbsFrame {
             payload: Some(pb::bbs_frame::Payload::Published(snapshot.clone())),
         }
-        .encoded_len();
-        if size > MAX_FRAME_BYTES {
-            bail!(
-                "frame_too_large: the publication catalog of {} entities encodes to {size} \
-                 bytes, over the {MAX_FRAME_BYTES}-byte frame limit",
-                snapshot.entities.len()
-            );
+        .encoded_len()
+            + 10;
+        if bytes > MAX_FRAME_BYTES {
+            return Ok(Catalog::TooLarge {
+                entities: snapshot.entities.len(),
+                bytes,
+            });
         }
-        Ok(snapshot)
+        let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(snapshot.encode_to_vec()));
+        snapshot.revision = store::publication_revision(ctx.conn, integration, &digest)?;
+        Ok(Catalog::Snapshot(snapshot))
     })
 }
 
@@ -226,12 +262,15 @@ pub fn claim(conn: &mut Connection, integration: &str) -> Result<Option<(i64, pb
                 .transpose()?
                 .unwrap_or(false);
             let Some(bytes) = work.encoded.filter(|_| !expired) else {
-                let detail = if expired {
-                    "expired: its delivery deadline passed before the adapter took it"
+                let (reason, detail) = if expired {
+                    (
+                        "expired",
+                        "its delivery deadline passed before the adapter took it",
+                    )
                 } else {
-                    "invalid_message: the message has no frozen encoding"
+                    ("invalid_message", "the message has no frozen encoding")
                 };
-                store::set_outbox_state(ctx.conn, work.id, &["pending"], "rejected", Some(detail))?;
+                fail(ctx, work.id, &["pending"], reason, detail)?;
                 continue;
             };
             if !store::set_outbox_state(ctx.conn, work.id, &["pending"], "attempted", None)? {
@@ -270,6 +309,80 @@ pub fn handed_off(conn: &Connection, outbox: i64, sent: bool) -> Result<()> {
     Ok(())
 }
 
+/// Claimed handoffs that never reached the transport, because their stream
+/// ended first, become unknown: never offered again, never reported as
+/// failed.
+pub fn mark_unknown(conn: &Connection, outbox: &[i64], detail: &str) -> Result<()> {
+    for &id in outbox {
+        store::set_outbox_state(conn, id, &["attempted"], "unknown", Some(detail))?;
+    }
+    Ok(())
+}
+
+/// Reject pending handoffs whose deadline has passed by `now`, telling their
+/// senders. The server runs this at startup and periodically. Returns how
+/// many expired.
+pub fn expire(conn: &mut Connection, now: DateTime<Utc>) -> Result<usize> {
+    with_ctx(conn, &NO_CALLER, |ctx| {
+        let mut n = 0;
+        for id in store::expired_pending(ctx.conn, &fmt_time(now))? {
+            if fail(
+                ctx,
+                id,
+                &["pending"],
+                "expired",
+                "its delivery deadline passed before the adapter took it",
+            )? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    })
+}
+
+/// A sender's generic, safe account of a failure reason: Hub's codes, never
+/// the adapter's free text.
+fn failure_text(reason: &str) -> &'static str {
+    match reason {
+        "recipient_unknown" => "the recipient is unknown",
+        "recipient_closed" => "the recipient is closed",
+        "expired" => "it expired before it could be delivered",
+        "sender_not_permitted" => "the recipient does not accept messages from you",
+        "frame_too_large" => "it was too large",
+        "unsupported_content" => "its content is not supported",
+        _ => "it was refused",
+    }
+}
+
+/// Move outbox row `id` from one of `from` to `rejected`, with `reason` and
+/// `detail` recorded, and tell the sender: a delivery notice in its own
+/// inbox. Returns whether the row moved.
+fn fail(ctx: &Ctx, id: i64, from: &[&str], reason: &str, detail: &str) -> Result<bool> {
+    let recorded = if detail.is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason}: {detail}")
+    };
+    if !store::set_outbox_state(ctx.conn, id, from, "rejected", Some(&recorded))? {
+        return Ok(false);
+    }
+    let failed = store::failed(ctx.conn, id)?;
+    let body = format!(
+        "Not delivered: your message to {} (sent {}) was not delivered: {}.",
+        failed.recipient,
+        failed.created_at,
+        failure_text(reason)
+    );
+    store::insert_notice(ctx.conn, &failed, &db::new_message_id(), &body, &ctx.now_s)?;
+    tracing::info!(
+        message = failed.message,
+        to = failed.recipient,
+        reason,
+        "remote send failed"
+    );
+    Ok(true)
+}
+
 /// Handoffs a stopped server left attempted become unknown (see
 /// [`store::interrupt_attempted`]). The server runs this once at startup.
 pub fn interrupt_attempted(conn: &Connection) -> Result<usize> {
@@ -284,9 +397,9 @@ fn check_text(what: &str, text: &str, max: usize) -> Result<()> {
 }
 
 /// Record the adapter's informative result for one of `integration`'s
-/// handoffs: received (or already known) or rejected. A result for a handoff
-/// never offered is ignored, and the first result stands. Returns whether
-/// the handoff's state changed.
+/// handoffs: received (or already known), or rejected, which sends the sender
+/// a delivery notice. A result for a handoff never offered is ignored, and
+/// the first result stands. Returns whether the handoff's state changed.
 pub fn record_result(
     conn: &mut Connection,
     integration: &str,
@@ -299,16 +412,8 @@ pub fn record_result(
     check_text("outgoing_result detail", &result.detail, MAX_DETAIL_BYTES)?;
     let (state, detail) = match pb::HandoffDisposition::try_from(result.disposition) {
         Ok(pb::HandoffDisposition::Received) => ("received", None),
-        Ok(pb::HandoffDisposition::AlreadyKnown) => ("received", Some("already_known".to_string())),
-        Ok(pb::HandoffDisposition::Rejected) => (
-            "rejected",
-            Some(match (result.reason.as_str(), result.detail.as_str()) {
-                ("", "") => "rejected".to_string(),
-                (reason, "") => reason.to_string(),
-                ("", detail) => detail.to_string(),
-                (reason, detail) => format!("{reason}: {detail}"),
-            }),
-        ),
+        Ok(pb::HandoffDisposition::AlreadyKnown) => ("received", Some("already_known")),
+        Ok(pb::HandoffDisposition::Rejected) => ("rejected", None),
         _ => return Err(invalid("outgoing_result has no disposition")),
     };
     with_ctx(conn, &NO_CALLER, |ctx| {
@@ -321,13 +426,16 @@ pub fn record_result(
             );
             return Ok(false);
         };
-        store::set_outbox_state(
-            ctx.conn,
-            id,
-            &["attempted", "sent", "unknown"],
-            state,
-            detail.as_deref(),
-        )
+        let from = &["attempted", "sent", "unknown"];
+        if state == "rejected" {
+            let reason = if result.reason.is_empty() {
+                "rejected"
+            } else {
+                &result.reason
+            };
+            return fail(ctx, id, from, reason, &result.detail);
+        }
+        store::set_outbox_state(ctx.conn, id, from, state, detail)
     })
 }
 
@@ -350,38 +458,43 @@ pub(super) fn send_remote(
     if namespace == local {
         bail!("id:{reference} is in this installation's namespace ({local}); send to its name");
     }
-    let integration = match store::foreign_route(ctx.conn, namespace, entity_id, address_id)? {
-        Some(integration) => integration,
-        None => {
-            let enabled = store::enabled(ctx.conn)?;
-            match enabled.as_slice() {
-                [] => bail!(
-                    "remote sends need an integration, and none is configured; an \
-                     administrator adds one with `bbs admin integration add`"
-                ),
-                [(id, _)] => id.clone(),
-                _ => bail!(
-                    "several integrations are configured and none has reached \
-                     id:{reference} yet; BBS cannot choose one"
-                ),
-            }
-        }
+    // Every refusal comes before any row is written.
+    let usable = store::usable(ctx.conn)?;
+    let integration = match store::namespace_integration(ctx.conn, namespace)? {
+        Some(bound) => bound,
+        None => match usable.as_slice() {
+            [] => bail!(
+                "remote sends are off: no integration is enabled; an administrator adds \
+                 one with `bbs admin integration add`"
+            ),
+            [(id, _)] => id.clone(),
+            _ => bail!(
+                "several integrations are enabled and none reaches namespace {namespace} \
+                 yet; BBS cannot choose one"
+            ),
+        },
     };
-    match store::publishes(ctx.conn, &integration)? {
-        Some(true) => {}
-        Some(false) => bail!(
+    match usable.iter().find(|(id, _)| *id == integration) {
+        Some((_, true)) => {}
+        Some((_, false)) => bail!(
             "remote sends are off: integration {integration} does not publish this \
              installation's entities; an administrator turns that on with `bbs admin \
              integration publish {integration} on`"
         ),
-        None => bail!("remote sends are off: integration {integration} is disabled"),
+        None => bail!(
+            "remote sends are off: integration {integration}, which reaches namespace \
+             {namespace}, is disabled or has no credential"
+        ),
+    }
+    if store::foreign_retired(ctx.conn, namespace, entity_id)? {
+        bail!("id:{reference} is retired, as the integration last observed it");
     }
     super::check_focus(ctx, me, None)?;
     let sender = db::native_address(ctx.conn, me.kind.into(), me.id)?
         .context("the sender has no native address")?;
+    store::bind_namespace(ctx.conn, namespace, &integration)?;
     let entity = store::foreign_entity(ctx.conn, namespace, entity_id, "unknown", &ctx.now_s)?;
-    let (recipient, integration) =
-        store::foreign_address(ctx.conn, entity, address_id, &integration)?;
+    let recipient = store::foreign_address(ctx.conn, entity, address_id, &integration)?;
     let message_id = db::new_message_id();
     let expires = ctx.now + DELIVERY_LIFETIME;
     let run = remote.run.as_deref();
@@ -519,6 +632,14 @@ fn check_message(m: &mp::Message) -> Result<(), Refusal> {
                 "a group copy has no in_reply_to; replies use group_copy",
             ));
         }
+        let original = copy.original.as_ref().unwrap();
+        let by = copy.original_sender.as_ref().unwrap();
+        if by.entity.as_ref().unwrap().namespace != original.namespace {
+            return Err(refuse(
+                "invalid_message",
+                "a group copy's original sender must be in its original message's namespace",
+            ));
+        }
     }
     let (id, sender) = (m.id.as_ref().unwrap(), m.sender.as_ref().unwrap());
     if sender.entity.as_ref().unwrap().namespace != id.namespace {
@@ -611,6 +732,28 @@ fn import_in(
             format!("messages from {local} originate only at its home"),
         )));
     }
+    if m.group_copy
+        .as_ref()
+        .is_some_and(|c| c.original.as_ref().unwrap().namespace == local)
+    {
+        return Ok(Err(refuse(
+            "invalid_message",
+            format!("a group copy cannot name one of {local}'s entities as its original sender"),
+        )));
+    }
+    // A namespace is reached through one integration (see `send_remote`), so
+    // the duplicate check below is that integration's.
+    if let Some(bound) = store::namespace_integration(ctx.conn, &id.namespace)?
+        && bound != integration
+    {
+        return Ok(Err(refuse(
+            "route_not_authorized",
+            format!(
+                "namespace {} is reached through another integration",
+                id.namespace
+            ),
+        )));
+    }
     // Hub's order: a duplicate is answered before any lifecycle or deadline
     // check, so an identical retry reports the original acceptance.
     if let Some(stored) = store::origin_bytes(ctx.conn, &id.namespace, &id.message_id)? {
@@ -640,53 +783,35 @@ fn import_in(
     let Ok(body) = std::str::from_utf8(&m.body) else {
         return Ok(Err(refuse("unsupported_content", "the body is not UTF-8")));
     };
+    if body.trim().is_empty() {
+        return Ok(Err(refuse("invalid_message", "the body is empty")));
+    }
 
+    // Whether the recipient is unpublished, absent, a group or retired is
+    // never told apart: each is `recipient_unknown`, with one detail.
+    let unknown = || Ok(Err(refuse("recipient_unknown", "no such recipient")));
     let recipient = m.recipient.as_ref().unwrap();
     let to = recipient.entity.as_ref().unwrap();
-    if to.namespace != local {
-        return Ok(Err(refuse(
-            "recipient_unknown",
-            format!("this installation is {local}, not {}", to.namespace),
-        )));
-    }
-    if recipient.run_id.is_some() {
-        return Ok(Err(refuse(
-            "recipient_unknown",
-            "BBS addresses take no run selector",
-        )));
-    }
-    if store::publishes(ctx.conn, integration)? != Some(true) {
-        return Ok(Err(refuse(
-            "recipient_unknown",
-            "this installation publishes no entities",
-        )));
+    if to.namespace != local
+        || recipient.run_id.is_some()
+        || store::publishes(ctx.conn, integration)? != Some(true)
+    {
+        return unknown();
     }
     let Some(target) =
         store::native_target(ctx.conn, &local, &to.entity_id, &recipient.address_id)?
     else {
-        return Ok(Err(refuse(
-            "recipient_unknown",
-            format!("no address {}:{}", to.entity_id, recipient.address_id),
-        )));
+        return unknown();
     };
-    if target.group_id.is_some() {
-        return Ok(Err(refuse(
-            "recipient_unknown",
-            "BBS groups are not published",
-        )));
-    }
-    if !target.active {
-        return Ok(Err(refuse(
-            "recipient_closed",
-            format!("{} is retired", to.entity_id),
-        )));
+    if target.group_id.is_some() || !target.active {
+        return unknown();
     }
     if let Some(agent) = target.agent_id
         && db::focused_at(ctx.conn, agent)?.is_some()
     {
         return Ok(Err(refuse(
             "sender_not_permitted",
-            format!("{} is in focus mode with its owner", to.entity_id),
+            "the recipient is not accepting messages",
         )));
     }
 
@@ -698,30 +823,30 @@ fn import_in(
     } else {
         "unknown"
     };
+    store::bind_namespace(ctx.conn, &id.namespace, integration)?;
     let entity =
         store::foreign_entity(ctx.conn, &from.namespace, &from.entity_id, kind, &ctx.now_s)?;
-    let (sender_address, _) =
-        store::foreign_address(ctx.conn, entity, &sender.address_id, integration)?;
+    let sender_address = store::foreign_address(ctx.conn, entity, &sender.address_id, integration)?;
     let copy = match &m.group_copy {
         Some(copy) => {
             let original = copy.original.as_ref().unwrap();
             let by = copy.original_sender.as_ref().unwrap();
             let by_entity = by.entity.as_ref().unwrap();
-            // The original sender may be one of ours, or unknown here; the
-            // copy is stored either way, with its exact bytes.
-            let address = if by_entity.namespace == local {
-                store::native_target(ctx.conn, &local, &by_entity.entity_id, &by.address_id)?
-                    .map(|t| t.address)
-            } else {
-                let e = store::foreign_entity(
-                    ctx.conn,
-                    &by_entity.namespace,
-                    &by_entity.entity_id,
-                    "unknown",
-                    &ctx.now_s,
-                )?;
-                Some(store::foreign_address(ctx.conn, e, &by.address_id, integration)?.0)
-            };
+            // Another installation's entity (checked above), possibly unknown
+            // here until now.
+            let e = store::foreign_entity(
+                ctx.conn,
+                &by_entity.namespace,
+                &by_entity.entity_id,
+                "unknown",
+                &ctx.now_s,
+            )?;
+            let address = Some(store::foreign_address(
+                ctx.conn,
+                e,
+                &by.address_id,
+                integration,
+            )?);
             Some((
                 original.namespace.as_str(),
                 original.message_id.as_str(),
@@ -805,9 +930,14 @@ fn check_descriptor(d: &mp::EntityDescriptor) -> Result<()> {
 }
 
 /// Record what the adapter observed about foreign entities: kind, display
-/// name and lifecycle. Descriptors in this installation's own namespace are
-/// ignored: observations never change native identities.
-pub fn observe(conn: &mut Connection, observed: &pb::ObservedEntities) -> Result<()> {
+/// name and lifecycle. Descriptors in this installation's own namespace, or
+/// in one another integration reaches, are ignored: observations never change
+/// native identities.
+pub fn observe(
+    conn: &mut Connection,
+    integration: &str,
+    observed: &pb::ObservedEntities,
+) -> Result<()> {
     if observed.entities.len() > MAX_ENTITIES {
         return Err(invalid(format!(
             "observed carries over {MAX_ENTITIES} entities"
@@ -820,7 +950,10 @@ pub fn observe(conn: &mut Connection, observed: &pb::ObservedEntities) -> Result
         let local = db::namespace(ctx.conn)?;
         for d in &observed.entities {
             let e = d.entity.as_ref().unwrap();
-            if e.namespace == local {
+            if e.namespace == local
+                || store::namespace_integration(ctx.conn, &e.namespace)?
+                    .is_some_and(|bound| bound != integration)
+            {
                 continue;
             }
             store::observe(
@@ -961,7 +1094,8 @@ pub fn admin_add(conn: &mut Connection, id: &str) -> Result<String> {
     })
 }
 
-/// Replace an integration's credential; open streams on the old one end.
+/// Replace an integration's credential, enabling it; open streams on the old
+/// one end.
 pub fn admin_rotate(conn: &mut Connection, id: &str) -> Result<String> {
     with_ctx(conn, &NO_CALLER, |ctx| {
         require_integration(ctx, id)?;
@@ -971,7 +1105,8 @@ pub fn admin_rotate(conn: &mut Connection, id: &str) -> Result<String> {
     })
 }
 
-/// Revoke an integration's credential; open streams end.
+/// Revoke an integration's credential and disable it until a rotate; open
+/// streams end, and remote sends through it are refused.
 pub fn admin_revoke(conn: &mut Connection, id: &str) -> Result<bool> {
     with_ctx(conn, &NO_CALLER, |ctx| {
         require_integration(ctx, id)?;

@@ -397,6 +397,8 @@ fn schema(conn: &Connection) -> Vec<String> {
     )
 }
 
+/// Both paths run this binary's migration 27, so this cannot catch a
+/// database an earlier build of migration 27 made; the next test does.
 #[test]
 fn cutover_and_new_database_have_the_same_schema() {
     let mut cut = fixture();
@@ -417,6 +419,31 @@ fn cutover_and_new_database_have_the_same_schema() {
             conn.prepare(sql).unwrap();
         }
     }
+}
+
+#[test]
+fn a_schema_27_database_without_the_integration_schema_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bbs.db");
+    let mut conn = crate::db::open(&path).unwrap();
+    migrate(&mut conn).unwrap();
+    // What an earlier build of migration 27 left: no integration tables or
+    // group-copy columns.
+    conn.execute_batch(
+        "DROP TABLE integration_tokens;
+         DROP TABLE integration_namespaces;
+         ALTER TABLE messages DROP COLUMN group_copy_sender_run_id;",
+    )
+    .unwrap();
+    drop(conn);
+    let before = std::fs::read(&path).unwrap();
+    let mut conn = crate::db::open(&path).unwrap();
+    let err = migrate(&mut conn).unwrap_err().to_string();
+    assert!(err.contains("lacks the integration schema"), "{err}");
+    assert!(err.contains("integration_tokens.token_hash"), "{err}");
+    assert!(err.contains("messages.group_copy_sender_run_id"), "{err}");
+    drop(conn);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
 #[test]

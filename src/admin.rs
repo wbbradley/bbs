@@ -45,9 +45,12 @@ fn integration(conn: &mut rusqlite::Connection, command: &AdminIntegrationComman
         AdminIntegrationCommand::Rotate { id } => println!("{}", admin::admin_rotate(conn, id)?),
         AdminIntegrationCommand::Revoke { id } => {
             if admin::admin_revoke(conn, id)? {
-                println!("Revoked the credential for integration {id}.");
+                println!(
+                    "Revoked the credential for integration {id}; it is disabled until \
+                     `bbs admin integration rotate {id}` issues a new one."
+                );
             } else {
-                println!("Integration {id} had no credential.");
+                println!("Integration {id} had no credential; it is disabled.");
             }
         }
         AdminIntegrationCommand::Publish { id, state } => {

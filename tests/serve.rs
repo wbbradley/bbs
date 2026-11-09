@@ -2284,9 +2284,20 @@ async fn the_integration_stream_follows_local_administration() {
             on.revision
         )
     );
-    admin(&["integration", "revoke", "hub"]);
+    assert_eq!(
+        admin(&["integration", "revoke", "hub"]),
+        "Revoked the credential for integration hub; it is disabled until \
+         `bbs admin integration rotate hub` issues a new one."
+    );
     let err = next().await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated, "{err:?}");
+    assert_eq!(
+        admin(&["integration", "list"]),
+        format!(
+            "hub: disabled, publication on (revision {}), credential none; handoffs: none",
+            on.revision
+        )
+    );
 
     let _ = child.kill();
     let _ = child.wait();

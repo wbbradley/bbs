@@ -129,6 +129,7 @@ async fn serve(
         clock: Arc::new(Utc::now),
     });
     tokio::spawn(run_timers(state.clone()));
+    tokio::spawn(integration::sweep(state.clone()));
     let (health, health_service) = tonic_health::server::health_reporter();
     health.set_serving::<BbsServer<Server>>().await;
     let server = tonic::transport::Server::builder()
@@ -165,7 +166,11 @@ async fn serve(
             let server = tonic::transport::Server::builder()
                 .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
                 .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
-                .add_service(integration::service(state.clone()))
+                .max_concurrent_streams(Some(integration::MAX_STREAMS_PER_CONNECTION))
+                .add_service(integration::service(
+                    state.clone(),
+                    Some(&dir.join("bbs.db")),
+                )?)
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), {
                     let state = state.clone();
                     async move { state.stopping().await }
@@ -469,11 +474,6 @@ impl State {
                     Status::unauthenticated(err.to_string())
                 } else if err.downcast_ref::<service::SyncPageTooLarge>().is_some() {
                     Status::resource_exhausted(err.to_string())
-                } else if err
-                    .downcast_ref::<service::integration::InvalidFrame>()
-                    .is_some()
-                {
-                    Status::invalid_argument(err.to_string())
                 } else {
                     Status::failed_precondition(format!("{err:#}"))
                 }

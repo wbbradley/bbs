@@ -1,5 +1,5 @@
 //! An in-process fake adapter drives the integration stream end to end over
-//! a real gRPC connection to an in-memory board.
+//! a real gRPC connection to a board in a temporary directory.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -9,7 +9,8 @@ use chrono::Utc;
 use prost::Message as _;
 use rusqlite::Connection;
 use tokio::time::timeout;
-use tonic::transport::Channel;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{Channel, Endpoint};
 
 use super::super::{Policy, TimerLimits};
 use super::*;
@@ -22,6 +23,7 @@ const WAIT: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_millis(300);
 
 struct Rig {
+    _dir: tempfile::TempDir,
     state: Arc<State>,
     addr: SocketAddr,
     /// The integration `hub`'s credential.
@@ -39,7 +41,10 @@ fn human() -> Caller {
 
 impl Rig {
     async fn new() -> Rig {
-        let mut conn = Connection::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bbs.db");
+        // As the server opens it: WAL, foreign keys on.
+        let mut conn = db::open(&path).unwrap();
         db::migrate(&mut conn).unwrap();
         service::ensure_human(
             &mut conn,
@@ -74,7 +79,8 @@ impl Rig {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tonic::transport::Server::builder()
-            .add_service(service(state.clone()))
+            .max_concurrent_streams(Some(MAX_STREAMS_PER_CONNECTION))
+            .add_service(service(state.clone(), Some(&path)).unwrap())
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::TcpListenerStream::new(listener),
                 {
@@ -84,6 +90,7 @@ impl Rig {
             );
         tokio::spawn(server);
         Rig {
+            _dir: dir,
             state,
             addr,
             token,
@@ -126,12 +133,85 @@ impl Rig {
             .unwrap()
     }
 
-    async fn connect_with(&self, token: &str, hello: pb::AdapterHello) -> Result<Adapter, Status> {
-        let channel = Channel::from_shared(format!("http://{}", self.addr))
-            .unwrap()
-            .connect()
-            .await
+    /// Wait for message `message`'s handoff to reach `state`: the stream
+    /// records a send once the transport takes the frame.
+    async fn settle(&self, message: i64, state: &str) {
+        for _ in 0..100 {
+            if self.outbox(message).0 == state {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(self.outbox(message).0, state);
+    }
+
+    /// Handoffs by state.
+    fn states(&self) -> HashMap<String, i64> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT state, count(*) FROM integration_outbox GROUP BY state")
             .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn count(&self, sql: &str) -> i64 {
+        self.conn().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// Wait until no handoff is left attempted (the stream records its
+    /// claims in the background), then count them by state.
+    async fn settled(&self) -> HashMap<String, i64> {
+        for _ in 0..100 {
+            let states = self.states();
+            if !states.contains_key("attempted") {
+                return states;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("handoffs left attempted: {:?}", self.states());
+    }
+
+    /// Queue `n` remote sends of `size`-byte bodies to `id:ada@hub`.
+    fn backlog(&self, n: usize, size: usize) {
+        for i in 0..n {
+            let body = format!("{i:05}{}", "x".repeat(size - 5));
+            self.send("id:ada@hub", &body).unwrap();
+        }
+    }
+
+    /// Read as agent `scout`.
+    fn read(&self) -> Vec<proto::Message> {
+        service::read(
+            &mut self.conn(),
+            &Caller {
+                token: Some(self.agent.clone()),
+                ..Default::default()
+            },
+            proto::ReadRequest::default(),
+        )
+        .unwrap()
+        .messages
+    }
+
+    async fn connect_with(&self, token: &str, hello: pb::AdapterHello) -> Result<Adapter, Status> {
+        self.connect_on(
+            Channel::from_shared(format!("http://{}", self.addr)).unwrap(),
+            token,
+            hello,
+        )
+        .await
+    }
+
+    async fn connect_on(
+        &self,
+        endpoint: Endpoint,
+        token: &str,
+        hello: pb::AdapterHello,
+    ) -> Result<Adapter, Status> {
+        let channel = endpoint.connect().await.unwrap();
         let mut client = IntegrationClient::new(channel)
             .max_decoding_message_size(8 << 20)
             .max_encoding_message_size(8 << 20);
@@ -152,11 +232,20 @@ impl Rig {
 
     /// Connect as `hub`, and take BBS's hello and first catalog.
     async fn connect(&self) -> (Adapter, pb::PublishedCatalog) {
-        let mut adapter = self.connect_with(&self.token, hello("hub")).await.unwrap();
+        self.connect_as(&self.token, "hub").await
+    }
+
+    /// Connect as integration `id`, and take BBS's hello and first catalog.
+    async fn connect_as(&self, token: &str, id: &str) -> (Adapter, pb::PublishedCatalog) {
+        let adapter = self.connect_with(token, hello(id)).await.unwrap();
+        Self::greeted(adapter, id).await
+    }
+
+    async fn greeted(mut adapter: Adapter, id: &str) -> (Adapter, pb::PublishedCatalog) {
         let Out::Hello(hello) = adapter.next().await.unwrap() else {
             panic!("expected hello");
         };
-        assert_eq!(hello.integration_id, "hub");
+        assert_eq!(hello.integration_id, id);
         assert_eq!(hello.protocol_major, 1);
         assert_eq!(hello.namespace, "bbs");
         let Out::Published(catalog) = adapter.next().await.unwrap() else {
@@ -337,6 +426,12 @@ async fn publication_off_advertises_nothing_and_refuses_sends() {
 
     let err = rig.send("id:ada@hub", "hello").unwrap_err();
     assert!(err.to_string().contains("remote sends are off"), "{err:#}");
+    // The refusal wrote nothing.
+    assert_eq!(
+        rig.count("SELECT count(*) FROM entities WHERE namespace = 'hub'"),
+        0
+    );
+    assert_eq!(rig.count("SELECT count(*) FROM messages"), 0);
     let result = adapter
         .offer(
             "h1",
@@ -459,8 +554,8 @@ async fn outbound_sends_are_claimed_once_and_record_results() {
     to.run_id = Some("r1".into());
     assert_eq!(m2.recipient, Some(to));
     assert_ne!(offer1.handoff_id, offer2.handoff_id);
-    assert_eq!(rig.outbox(first).0, "sent");
-    assert_eq!(rig.outbox(second).0, "sent");
+    rig.settle(first, "sent").await;
+    rig.settle(second, "sent").await;
     // The offered bytes are the ones BBS stored.
     let stored =
         db::integration::origin_bytes(&rig.conn(), "bbs", &m1.id.as_ref().unwrap().message_id)
@@ -513,6 +608,43 @@ async fn outbound_sends_are_claimed_once_and_record_results() {
         )
     );
 
+    // The rejection, not the receipt, tells the sender, in a generic form
+    // that leaves out the adapter's detail.
+    let mail = rig.read();
+    assert_eq!(mail.len(), 1, "{mail:?}");
+    assert_eq!(mail[0].from_name, "scout");
+    assert_eq!(
+        mail[0].body,
+        format!(
+            "Not delivered: your message to id:bob@hub:slack#r1 (sent {}) was not \
+             delivered: the recipient is unknown.",
+            rig.conn()
+                .query_row(
+                    "SELECT created_at FROM messages WHERE id = ?1",
+                    [second],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap()
+        )
+    );
+    let notice: (String, String, String) = rig
+        .conn()
+        .query_row(
+            "SELECT kind, in_reply_to_namespace, in_reply_to_message_id FROM messages
+             WHERE id = ?1",
+            [mail[0].id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        notice,
+        (
+            "delivery_error".into(),
+            "bbs".into(),
+            m2.id.as_ref().unwrap().message_id.clone()
+        )
+    );
+
     // Nothing is offered twice: not on this stream, nor after a reconnect.
     adapter.quiet().await;
     let (mut again, _) = rig.connect().await;
@@ -537,7 +669,8 @@ async fn outbound_sends_are_claimed_once_and_record_results() {
         names,
         [
             ("scout", Some("id:ada@hub")),
-            ("scout", Some("id:bob@hub:slack#r1"))
+            ("scout", Some("id:bob@hub:slack#r1")),
+            ("scout", Some("scout"))
         ]
     );
 }
@@ -572,7 +705,9 @@ async fn a_claim_interrupted_before_its_send_is_never_replayed() {
     let next = rig.send("id:ada@hub", "next").unwrap().id.unwrap();
     let (_, m) = adapter.outgoing().await;
     assert_eq!(m.body, b"next");
-    assert_eq!(rig.outbox(next).0, "sent");
+    rig.settle(next, "sent").await;
+    // Unknown is not a failure: the sender got no notice.
+    assert!(rig.read().is_empty());
 }
 
 #[tokio::test]
@@ -600,7 +735,7 @@ async fn imports_reach_the_inbox_with_the_foreign_sender_shown() {
     assert_eq!(read.messages.len(), 1);
     let got = &read.messages[0];
     assert_eq!(got.from_name, "id:bob@hub#r9");
-    assert_eq!(got.from_kind(), proto::Kind::Agent);
+    assert_eq!(got.from_kind(), proto::Kind::Remote);
     assert_eq!(got.from_owner, None);
     assert_eq!(got.body, "hello from hub");
     assert_eq!(got.to_name.as_deref(), Some("scout"));
@@ -626,7 +761,31 @@ async fn imports_reach_the_inbox_with_the_foreign_sender_shown() {
         )
         .unwrap();
     assert_eq!(reply, ("bbs".into(), "abc".into()));
-    // The adapter's observation names the sender a human; the history says so.
+    // Filtering by a remote entity is refused plainly, not as an unknown name.
+    let err = service::search(
+        &mut rig.conn(),
+        &human(),
+        proto::SearchRequest {
+            query: "hello".into(),
+            from: Some("id:bob@hub#r9".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("not supported yet"), "{err:#}");
+    let err = service::feed(
+        &mut rig.conn(),
+        &human(),
+        proto::FeedRequest {
+            backlog: 10,
+            with: Some("id:bob@hub".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("not supported yet"), "{err:#}");
+    // The adapter's observation names the sender a human; the history still
+    // says remote: what the adapter claims never makes it one of ours.
     adapter
         .send(In::Observed(pb::ObservedEntities {
             entities: vec![mp::EntityDescriptor {
@@ -652,7 +811,16 @@ async fn imports_reach_the_inbox_with_the_foreign_sender_shown() {
         },
     )
     .unwrap();
-    assert_eq!(feed.messages[0].from_kind(), proto::Kind::Human);
+    assert_eq!(feed.messages[0].from_kind(), proto::Kind::Remote);
+    let kind: String = rig
+        .conn()
+        .query_row(
+            "SELECT kind FROM entities WHERE namespace = 'hub' AND entity_id = 'bob'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "human");
 
     // A group copy: from the group, keeping what was sent and by whom.
     let mut copy = message("c1", "team", "will", "to the team");
@@ -691,6 +859,28 @@ async fn imports_reach_the_inbox_with_the_foreign_sender_shown() {
     });
     rejected(
         &adapter.offer("h3", bad.encode_to_vec()).await,
+        "invalid_message",
+    );
+    // An original sender outside the original's namespace, or one of ours,
+    // is malformed.
+    let mut elsewhere = copy.clone();
+    elsewhere.id.as_mut().unwrap().message_id = "c3".into();
+    elsewhere.group_copy.as_mut().unwrap().original_sender = address("acme", "carol");
+    rejected(
+        &adapter.offer("h4", elsewhere.encode_to_vec()).await,
+        "invalid_message",
+    );
+    let mut native = copy.clone();
+    native.id.as_mut().unwrap().message_id = "c4".into();
+    native.group_copy = Some(mp::GroupCopy {
+        original: Some(mp::MessageRef {
+            namespace: "bbs".into(),
+            message_id: "orig".into(),
+        }),
+        original_sender: address("bbs", "will/scout"),
+    });
+    rejected(
+        &adapter.offer("h5", native.encode_to_vec()).await,
         "invalid_message",
     );
 }
@@ -737,10 +927,19 @@ async fn duplicates_match_and_conflicts_are_refused() {
 }
 
 #[tokio::test]
-async fn retired_and_unknown_targets_are_refused() {
+async fn retired_unknown_and_group_targets_are_refused_alike() {
     let rig = Rig::new().await;
     rig.publish(true);
     let (mut adapter, _) = rig.connect().await;
+    service::group_register(
+        &mut rig.conn(),
+        &human(),
+        proto::GroupRegisterRequest {
+            group: "team".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     service::retire_agent(
         &mut rig.conn(),
         &human(),
@@ -755,20 +954,24 @@ async fn retired_and_unknown_targets_are_refused() {
             message("m1", "bob", "will/scout", "hi").encode_to_vec(),
         )
         .await;
-    rejected(&to_retired, "recipient_closed");
+    // Retired, absent, a registered group, another namespace: one answer,
+    // which tells none of them apart.
+    let mut results = vec![to_retired];
     for (n, to) in ["will/nobody", "team"].into_iter().enumerate() {
         let id = format!("u{n}");
-        let result = adapter
-            .offer(&id, message(&id, "bob", to, "hi").encode_to_vec())
-            .await;
-        rejected(&result, "recipient_unknown");
+        results.push(
+            adapter
+                .offer(&id, message(&id, "bob", to, "hi").encode_to_vec())
+                .await,
+        );
     }
     let mut elsewhere = message("m2", "bob", "will", "hi");
     elsewhere.recipient = address("acme", "will");
-    rejected(
-        &adapter.offer("h2", elsewhere.encode_to_vec()).await,
-        "recipient_unknown",
-    );
+    results.push(adapter.offer("h2", elsewhere.encode_to_vec()).await);
+    for result in &results {
+        rejected(result, "recipient_unknown");
+        assert_eq!(result.detail, "no such recipient");
+    }
     // Nothing was stored.
     let messages: i64 = rig
         .conn()
@@ -825,6 +1028,9 @@ async fn malformed_and_oversize_offers_are_refused() {
     let mut expired = ok();
     expired.expires_at_unix_micros = Some(1);
     cases.push(("expired", expired.encode_to_vec(), "expired"));
+    let mut empty = ok();
+    empty.body = b" \n\t".to_vec();
+    cases.push(("blank-body", empty.encode_to_vec(), "invalid_message"));
     let mut error = ok();
     error.kind = mp::MessageKind::DeliveryError as i32;
     cases.push((
@@ -954,4 +1160,353 @@ fn entity_ids_of(result: &mp::DirectoryResult) -> Vec<String> {
         .iter()
         .map(|e| e.entity.as_ref().unwrap().entity_id.clone())
         .collect()
+}
+
+/// Read the adapter's side of the stream until it ends, a frame every
+/// `pause`; returns the outgoing offers received and the ending status.
+async fn drain(adapter: &mut Adapter, pause: Duration) -> (i64, Status) {
+    let mut offers = 0;
+    loop {
+        tokio::time::sleep(pause).await;
+        match timeout(Duration::from_secs(10), adapter.rx.message())
+            .await
+            .expect("a frame within ten seconds")
+        {
+            Ok(Some(pb::BbsFrame {
+                payload: Some(Out::Outgoing(_)),
+            })) => offers += 1,
+            Ok(Some(frame)) => panic!("unexpected frame: {frame:?}"),
+            Ok(None) => panic!("the stream ended without a status"),
+            Err(status) => return (offers, status),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_revoke_mid_backlog_counts_as_sent_only_what_reached_the_adapter() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    rig.backlog(400, 1024);
+    let (mut adapter, _) = rig.connect().await;
+    for _ in 0..50 {
+        adapter.outgoing().await;
+    }
+    assert!(integration::admin_revoke(&mut rig.conn(), "hub").unwrap());
+    // A slow reader: the stream ends at the recheck, well before the backlog
+    // is through.
+    let (rest, status) = drain(&mut adapter, Duration::from_millis(20)).await;
+    assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+    let received = 50 + rest;
+    assert!(received < 400, "{received}");
+    let states = rig.settled().await;
+    assert_eq!(states.get("sent").copied(), Some(received), "{states:?}");
+    assert_eq!(states.values().sum::<i64>(), 400, "{states:?}");
+    // Unknown is recorded, not reported: no notices.
+    assert!(rig.read().is_empty());
+}
+
+#[tokio::test]
+async fn a_revoke_ends_a_stream_whose_adapter_stopped_reading() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    rig.backlog(100, 4096);
+    let endpoint = Channel::from_shared(format!("http://{}", rig.addr))
+        .unwrap()
+        .initial_stream_window_size(65_535)
+        .initial_connection_window_size(65_535);
+    let adapter = rig
+        .connect_on(endpoint, &rig.token, hello("hub"))
+        .await
+        .unwrap();
+    let (mut adapter, _) = Rig::greeted(adapter, "hub").await;
+    // The adapter reads nothing more: the transport's windows and the
+    // stream's queue fill, and the session waits for room.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(rig.states().get("pending").copied().unwrap_or(0) > 0);
+    assert!(integration::admin_revoke(&mut rig.conn(), "hub").unwrap());
+    // The session ends anyway: what it had queued becomes unknown.
+    let mut states = rig.states();
+    for _ in 0..500 {
+        if states.contains_key("unknown") && !states.contains_key("attempted") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        states = rig.states();
+    }
+    assert!(states.contains_key("unknown"), "{states:?}");
+    assert!(!states.contains_key("attempted"), "{states:?}");
+    // Once the adapter reads again, it gets exactly what was counted sent,
+    // then the status.
+    let (received, status) = drain(&mut adapter, Duration::ZERO).await;
+    assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+    let states = rig.settled().await;
+    assert_eq!(
+        states.get("sent").copied().unwrap_or(0),
+        received,
+        "{states:?}"
+    );
+    assert!(received < 100);
+}
+
+#[tokio::test]
+async fn revoking_disables_remote_sends_until_a_new_credential() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    assert!(integration::admin_revoke(&mut rig.conn(), "hub").unwrap());
+    assert_eq!(
+        rig.count("SELECT enabled FROM bbs_integrations WHERE id = 'hub'"),
+        0
+    );
+    let err = rig.send("id:ada@hub", "hi").unwrap_err();
+    assert!(
+        err.to_string().contains("no integration is enabled"),
+        "{err:#}"
+    );
+    assert_eq!(rig.count("SELECT count(*) FROM messages"), 0);
+    // Once bound, the namespace's integration is named instead.
+    let token = integration::admin_rotate(&mut rig.conn(), "hub").unwrap();
+    let (mut adapter, _) = rig.connect_as(&token, "hub").await;
+    rig.send("id:ada@hub", "bound").unwrap();
+    adapter.outgoing().await;
+    assert!(integration::admin_revoke(&mut rig.conn(), "hub").unwrap());
+    let err = rig.send("id:ada@hub", "hi").unwrap_err();
+    assert!(
+        err.to_string().contains("is disabled or has no credential"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn sends_to_our_namespace_or_a_retired_entity_are_refused_before_any_write() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut adapter, _) = rig.connect().await;
+    let err = rig.send("id:will@bbs", "hi").unwrap_err();
+    assert!(
+        err.to_string().contains("this installation's namespace"),
+        "{err:#}"
+    );
+    adapter
+        .send(In::Observed(pb::ObservedEntities {
+            entities: vec![mp::EntityDescriptor {
+                entity: Some(mp::EntityRef {
+                    namespace: "hub".into(),
+                    entity_id: "ada".into(),
+                }),
+                kind: "human".into(),
+                display_name: "Ada".into(),
+                lifecycle: mp::Lifecycle::Retired as i32,
+                ..Default::default()
+            }],
+            observed_at_unix_micros: 1,
+        }))
+        .await;
+    adapter.send(In::Ping(pb::Ping { nonce: 1 })).await;
+    adapter.next().await.unwrap();
+    let err = rig.send("id:ada@hub:slack", "hi").unwrap_err();
+    assert!(err.to_string().contains("is retired"), "{err:#}");
+    assert_eq!(rig.count("SELECT count(*) FROM messages"), 0);
+    assert_eq!(rig.count("SELECT count(*) FROM entity_addresses a JOIN entities e ON e.id = a.entity_id WHERE e.namespace = 'hub'"), 0);
+    adapter.quiet().await;
+}
+
+#[tokio::test]
+async fn focus_mode_holds_remote_sends_and_imports() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut adapter, _) = rig.connect().await;
+    service::set_focus(
+        &mut rig.conn(),
+        &human(),
+        proto::SetFocusRequest {
+            agent: "scout".into(),
+            focused: true,
+        },
+    )
+    .unwrap();
+    assert!(rig.send("id:ada@hub", "hi").is_err());
+    assert_eq!(rig.count("SELECT count(*) FROM integration_outbox"), 0);
+    assert_eq!(
+        rig.count("SELECT count(*) FROM entities WHERE namespace = 'hub'"),
+        0
+    );
+    let result = adapter
+        .offer(
+            "h1",
+            message("m1", "bob", "will/scout", "hi").encode_to_vec(),
+        )
+        .await;
+    rejected(&result, "sender_not_permitted");
+    assert_eq!(result.detail, "the recipient is not accepting messages");
+    adapter.quiet().await;
+}
+
+#[tokio::test]
+async fn work_queued_while_publication_is_off_waits_for_it() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let held = rig.send("id:ada@hub", "held").unwrap().id.unwrap();
+    rig.publish(false);
+    let (mut adapter, catalog) = rig.connect().await;
+    assert!(catalog.entities.is_empty());
+    adapter.quiet().await;
+    assert_eq!(rig.outbox(held).0, "pending");
+    rig.publish(true);
+    let Out::Published(on) = adapter.next().await.unwrap() else {
+        panic!("expected the catalog");
+    };
+    assert!(!on.entities.is_empty());
+    let (_, m) = adapter.outgoing().await;
+    assert_eq!(m.body, b"held");
+    rig.settle(held, "sent").await;
+}
+
+#[tokio::test]
+async fn a_newer_stream_supersedes_an_older_one() {
+    let rig = Rig::new().await;
+    let (mut old, _) = rig.connect().await;
+    let (mut new, _) = rig.connect().await;
+    assert_eq!(old.next().await.unwrap_err().code(), tonic::Code::Aborted);
+    new.send(In::Ping(pb::Ping { nonce: 3 })).await;
+    let Out::Pong(pong) = new.next().await.unwrap() else {
+        panic!("expected pong");
+    };
+    assert_eq!(pong.nonce, 3);
+}
+
+/// The notice `message` got, if any.
+fn notice_body(rig: &Rig, message: i64) -> Option<String> {
+    let created: String = rig
+        .conn()
+        .query_row(
+            "SELECT created_at FROM messages WHERE id = ?1",
+            [message],
+            |r| r.get(0),
+        )
+        .unwrap();
+    rig.read().into_iter().find_map(|m| {
+        m.body
+            .contains(&format!("(sent {created})"))
+            .then_some(m.body)
+    })
+}
+
+fn expire_now(rig: &Rig, message: i64) {
+    rig.conn()
+        .execute(
+            "UPDATE messages SET expires_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            [message],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pending_work_expires_after_seven_days_and_tells_its_sender() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    // The periodic sweep, by the clock.
+    let late = rig.send("id:ada@hub", "late").unwrap().id.unwrap();
+    let now = Utc::now();
+    assert_eq!(
+        integration::expire(&mut rig.conn(), now + chrono::Duration::days(6)).unwrap(),
+        0
+    );
+    assert_eq!(rig.outbox(late).0, "pending");
+    assert_eq!(
+        integration::expire(&mut rig.conn(), now + chrono::Duration::days(8)).unwrap(),
+        1
+    );
+    let (state, detail) = rig.outbox(late);
+    assert_eq!(state, "rejected");
+    assert!(detail.unwrap().starts_with("expired: "));
+    let body = notice_body(&rig, late).unwrap();
+    assert!(
+        body.ends_with("was not delivered: it expired before it could be delivered."),
+        "{body}"
+    );
+
+    // The server's sweep runs at once on start.
+    let swept = rig.send("id:ada@hub", "swept").unwrap().id.unwrap();
+    expire_now(&rig, swept);
+    tokio::spawn(sweep(rig.state.clone()));
+    rig.settle(swept, "rejected").await;
+    assert!(notice_body(&rig, swept).is_some());
+
+    // Work that expires before the sweep reaches it is refused at the claim.
+    let claimed = rig.send("id:ada@hub", "claimed").unwrap().id.unwrap();
+    expire_now(&rig, claimed);
+    let fresh = rig.send("id:ada@hub", "fresh").unwrap().id.unwrap();
+    let (mut adapter, _) = rig.connect().await;
+    let (_, m) = adapter.outgoing().await;
+    assert_eq!(m.body, b"fresh");
+    adapter.quiet().await;
+    assert_eq!(rig.outbox(claimed).0, "rejected");
+    assert!(notice_body(&rig, claimed).is_some());
+    rig.settle(fresh, "sent").await;
+    assert!(notice_body(&rig, fresh).is_none());
+}
+
+#[tokio::test]
+async fn each_namespace_belongs_to_the_first_integration_to_use_it() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let other = integration::admin_add(&mut rig.conn(), "other").unwrap();
+    integration::admin_publish(&mut rig.conn(), "other", true).unwrap();
+    // Two integrations, and neither reaches `hub` yet: BBS cannot choose.
+    let err = rig.send("id:ada@hub", "hi").unwrap_err();
+    assert!(err.to_string().contains("several integrations"), "{err:#}");
+
+    let (mut hub, _) = rig.connect().await;
+    let (mut acme, _) = rig.connect_as(&other, "other").await;
+    let first = message("m1", "bob", "will/scout", "from hub");
+    received(&hub.offer("h1", first.encode_to_vec()).await);
+    // `hub` is now bound to integration `hub`: another integration cannot
+    // speak for it, even repeating the same message.
+    rejected(
+        &acme.offer("a1", first.encode_to_vec()).await,
+        "route_not_authorized",
+    );
+    let mut from_acme = message("m1", "eve", "will/scout", "from acme");
+    from_acme.id.as_mut().unwrap().namespace = "acme".into();
+    from_acme.sender = address("acme", "eve");
+    received(&acme.offer("a2", from_acme.encode_to_vec()).await);
+    rejected(
+        &hub.offer("h2", from_acme.encode_to_vec()).await,
+        "route_not_authorized",
+    );
+
+    // Sends follow the bindings.
+    rig.send("id:ada@hub", "to hub").unwrap();
+    rig.send("id:eve@acme", "to acme").unwrap();
+    let (_, m) = hub.outgoing().await;
+    assert_eq!(m.body, b"to hub");
+    let (_, m) = acme.outgoing().await;
+    assert_eq!(m.body, b"to acme");
+    hub.quiet().await;
+    acme.quiet().await;
+    assert_eq!(rig.count("SELECT count(*) FROM integration_namespaces"), 2);
+}
+
+#[tokio::test]
+async fn an_oversize_catalog_is_not_sent_and_does_not_hold_up_the_outbox() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut adapter, before) = rig.connect().await;
+    // Two entities of about 3 MB each: over one 4 MiB frame.
+    rig.conn()
+        .execute(
+            "UPDATE entities SET display_name = replace(hex(zeroblob(1500000)), '0', 'x')
+             WHERE namespace = 'bbs'",
+            [],
+        )
+        .unwrap();
+    let sent = rig.send("id:ada@hub", "still flows").unwrap().id.unwrap();
+    let (_, m) = adapter.outgoing().await;
+    assert_eq!(m.body, b"still flows");
+    adapter.quiet().await;
+    rig.settle(sent, "sent").await;
+    // No revision was spent on it.
+    let revision: i64 =
+        rig.count("SELECT publication_revision FROM bbs_integrations WHERE id = 'hub'");
+    assert_eq!(revision as u64, before.revision);
 }

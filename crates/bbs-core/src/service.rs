@@ -179,7 +179,11 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
     proto::Message {
         id: m.id,
         created_at: m.created_at,
-        from_kind: proto_kind(m.from_kind).into(),
+        from_kind: if m.from_remote {
+            proto::Kind::Remote.into()
+        } else {
+            proto_kind(m.from_kind).into()
+        },
         from_name: m.from_name,
         from_owner: m.from_owner,
         reader_owner: m.reader_owner,
@@ -2117,6 +2121,12 @@ fn message_principals(
     name: Option<&str>,
 ) -> Result<Option<Vec<(db::Kind, i64)>>> {
     name.map(|name| {
+        if name.starts_with("id:") {
+            bail!(
+                "{name} is another installation's entity; filtering by one is not \
+                 supported yet"
+            );
+        }
         let ids = db::principals_named(conn, name)?;
         if ids.is_empty() {
             bail!("no agent or human named {name:?}");
