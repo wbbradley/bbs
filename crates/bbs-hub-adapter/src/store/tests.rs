@@ -137,21 +137,26 @@ fn a_handoff_is_claimed_before_it_is_sent_and_settles_once() {
         store.state(Direction::Outbound, c.id).unwrap().unwrap(),
         ("rejected".into(), "recipient_unknown".into())
     );
-    let unreported = store.unreported(0, 10).unwrap();
+    let unreported = store.unreported(0, 1, 10).unwrap();
     assert_eq!(unreported.len(), 1);
     assert_eq!(unreported[0].handoff_id, "bbs-h1");
     assert_eq!(unreported[0].detail, "no such recipient");
     // Owed until the transport takes it, however often it was read.
-    assert_eq!(store.unreported(0, 10).unwrap(), unreported);
-    assert!(store.unreported(unreported[0].id, 10).unwrap().is_empty());
+    assert_eq!(store.unreported(0, 1, 10).unwrap(), unreported);
+    assert!(
+        store
+            .unreported(unreported[0].id, 1, 10)
+            .unwrap()
+            .is_empty()
+    );
     // Taken, it is kept a while for a new stream, then purged.
     store.mark_reported(unreported[0].id, 30).unwrap();
     store.purge_settled(i64::MIN, 31).unwrap();
-    assert_eq!(store.unreported(0, 10).unwrap(), unreported);
+    assert_eq!(store.unreported(0, 31, 10).unwrap(), unreported);
     store
         .purge_settled(i64::MIN, 30 + REPORT_KEEP_MICROS)
         .unwrap();
-    assert!(store.unreported(0, 10).unwrap().is_empty());
+    assert!(store.unreported(0, 1, 10).unwrap().is_empty());
 }
 
 /// Theo's repro (C1): a stream's cursor only moves forward, so report IDs
@@ -163,17 +168,17 @@ fn report_ids_are_never_reused() {
     store
         .owe_report("bbs-h1", "received", "", "", None, 1)
         .unwrap();
-    let first = store.unreported(0, 10).unwrap();
+    let first = store.unreported(0, 1, 10).unwrap();
     let after = first[0].id;
     store.mark_reported(after, 2).unwrap();
     store
         .purge_settled(i64::MIN, 2 + REPORT_KEEP_MICROS)
         .unwrap();
-    assert!(store.unreported(0, 10).unwrap().is_empty());
+    assert!(store.unreported(0, 1, 10).unwrap().is_empty());
     store
         .owe_report("bbs-h2", "received", "", "", None, 3)
         .unwrap();
-    let next = store.unreported(after, 10).unwrap();
+    let next = store.unreported(after, 1, 10).unwrap();
     assert_eq!(next.len(), 1, "the same stream's cursor finds the new one");
     assert_eq!(next[0].handoff_id, "bbs-h2");
 }
@@ -189,16 +194,16 @@ fn a_taken_result_is_kept_no_longer_than_its_deadline() {
     store
         .owe_report("bbs-h2", "received", "", "", None, 1)
         .unwrap();
-    let owed = store.unreported(0, 10).unwrap();
+    let owed = store.unreported(0, 1, 10).unwrap();
     // Untaken past its deadline: still owed.
     store.purge_settled(i64::MIN, 200).unwrap();
-    assert_eq!(store.unreported(0, 10).unwrap().len(), 2);
+    assert_eq!(store.unreported(0, 200, 10).unwrap().len(), 2);
     store.mark_reported(owed[0].id, 50).unwrap();
     store.mark_reported(owed[1].id, 50).unwrap();
     store.purge_settled(i64::MIN, 99).unwrap();
-    assert_eq!(store.unreported(0, 10).unwrap().len(), 2);
+    assert_eq!(store.unreported(0, 99, 10).unwrap().len(), 2);
     store.purge_settled(i64::MIN, 100).unwrap();
-    let left = store.unreported(0, 10).unwrap();
+    let left = store.unreported(0, 100, 10).unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].handoff_id, "bbs-h2");
 }
@@ -213,7 +218,7 @@ fn results_the_adapter_settles_itself_are_owed_too() {
     store
         .owe_report("bbs-h10", "received", "already_known", "", None, 2)
         .unwrap();
-    let owed = store.unreported(0, 10).unwrap();
+    let owed = store.unreported(0, 1, 10).unwrap();
     assert_eq!(
         owed.iter()
             .map(|o| (o.handoff_id.as_str(), o.state.as_str(), o.reason.as_str()))
@@ -225,7 +230,7 @@ fn results_the_adapter_settles_itself_are_owed_too() {
     );
     store.mark_reported(owed[0].id, 3).unwrap();
     assert_eq!(
-        store.unreported(owed[0].id, 10).unwrap()[0].handoff_id,
+        store.unreported(owed[0].id, 1, 10).unwrap()[0].handoff_id,
         "bbs-h10"
     );
 }
@@ -394,7 +399,7 @@ fn pending_work_past_its_deadline_is_rejected_as_expired() {
         store.state(Direction::Outbound, 1).unwrap().unwrap(),
         ("rejected".into(), "expired".into())
     );
-    assert_eq!(store.unreported(0, 10).unwrap()[0].handoff_id, "bbs-h1");
+    assert_eq!(store.unreported(0, 1, 10).unwrap()[0].handoff_id, "bbs-h1");
     // Claimed work is not expired: it is no longer pending.
     assert!(store.expire(Direction::Outbound, 5_000).unwrap().is_empty());
 
@@ -703,7 +708,10 @@ fn a_duplicate_waits_for_its_original_result() {
     assert!(matches!(dup(&store, "bbs-dup"), Intake::Duplicate(p) if p.state == "sent"));
     // Offered again by BBS before the result: still one waiter.
     assert!(matches!(dup(&store, "bbs-dup"), Intake::Duplicate(_)));
-    assert!(store.unreported(0, 10).unwrap().is_empty(), "no answer yet");
+    assert!(
+        store.unreported(0, 1, 10).unwrap().is_empty(),
+        "no answer yet"
+    );
     assert!(
         store
             .outbound_result(
@@ -716,7 +724,7 @@ fn a_duplicate_waits_for_its_original_result() {
             )
             .unwrap()
     );
-    let owed = store.unreported(0, 10).unwrap();
+    let owed = store.unreported(0, 1, 10).unwrap();
     assert_eq!(
         owed.iter()
             .map(|o| (o.handoff_id.as_str(), o.state.as_str(), o.reason.as_str()))
@@ -773,5 +781,42 @@ fn a_duplicate_waits_for_its_original_result() {
             .relay_unreported("conn-2", &mut queued, 10)
             .unwrap()
             .is_empty()
+    );
+}
+
+/// Sending a taken result again does not restart its while: a link that
+/// keeps dropping stops resending it an hour after it was first taken,
+/// even one with no deadline (a result the adapter settled itself). Rows
+/// past their while are not sent before the sweep purges them.
+#[test]
+fn a_result_is_resent_only_for_a_while_after_it_was_first_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    store
+        .owe_report("bbs-h1", "rejected", "invalid_message", "", None, 1)
+        .unwrap();
+    store
+        .owe_report("bbs-h2", "received", "", "", Some(500), 1)
+        .unwrap();
+    let owed = store.unreported(0, 2, 10).unwrap();
+    for o in &owed {
+        store.mark_reported(o.id, 10).unwrap();
+    }
+    // Taken again on a later stream: the first take stands.
+    for o in &owed {
+        store
+            .mark_reported(o.id, 10 + REPORT_KEEP_MICROS - 1)
+            .unwrap();
+    }
+    assert_eq!(store.unreported(0, 499, 10).unwrap().len(), 2);
+    let left = store.unreported(0, 500, 10).unwrap();
+    assert_eq!(left.len(), 1, "past its deadline");
+    assert_eq!(left[0].handoff_id, "bbs-h1");
+    assert!(
+        store
+            .unreported(0, 10 + REPORT_KEEP_MICROS, 10)
+            .unwrap()
+            .is_empty(),
+        "past its while, though not yet purged"
     );
 }

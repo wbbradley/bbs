@@ -1069,14 +1069,18 @@ impl Store {
     }
 
     /// Results for BBS after report `after`, oldest first: those still owed,
-    /// and those taken recently enough to send again. Each Outcome's ID is
-    /// its report's.
-    pub fn unreported(&self, after: i64, limit: usize) -> Result<Vec<Outcome>> {
+    /// and those first taken recently enough, and before their deadline, to
+    /// send again (what [`Store::purge_settled`] would keep). Each Outcome's
+    /// ID is its report's. Report IDs follow the order results land in, so
+    /// a stream's cursor misses none.
+    pub fn unreported(&self, after: i64, now: i64, limit: usize) -> Result<Vec<Outcome>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, bbs_handoff_id, '', state, reason, detail
-             FROM reports WHERE id > ?1 ORDER BY id LIMIT ?2",
+             FROM reports WHERE id > ?1 AND (taken_at IS NULL
+                 OR (taken_at + ?3 > ?2 AND coalesce(expires_at, ?2 + 1) > ?2))
+             ORDER BY id LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![after, limit as i64], |r| {
+        let rows = stmt.query_map(params![after, now, REPORT_KEEP_MICROS, limit as i64], |r| {
             Ok(Outcome {
                 id: r.get(0)?,
                 handoff_id: r.get(1)?,
@@ -1099,10 +1103,11 @@ impl Store {
         )? as usize)
     }
 
-    /// The transport took report `id`: kept a while from now, then purged.
+    /// The transport took report `id`: kept a while from the first time it
+    /// was taken (sending it again starts no new while), then purged.
     pub fn mark_reported(&self, id: i64, now: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE reports SET taken_at = ?2 WHERE id = ?1",
+            "UPDATE reports SET taken_at = coalesce(taken_at, ?2) WHERE id = ?1",
             params![id, now],
         )?;
         Ok(())

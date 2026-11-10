@@ -506,7 +506,7 @@ fn owe(shared: &Shared, r: pb::HandoffResult) -> Option<pb::HandoffResult> {
 async fn report(shared: &Arc<Shared>, tx: &link::Sender<pb::AdapterFrame>) -> Result<()> {
     let mut after = 0;
     loop {
-        let owed = shared.store().unreported(after, 32)?;
+        let owed = shared.store().unreported(after, now_micros(), 32)?;
         if owed.is_empty() {
             tokio::select! {
                 _ = shared.report_kick.notified() => {}
@@ -767,7 +767,7 @@ mod tests {
                     .outbound_result(&c.handoff_id, "conn-1", "received", "", "", now_micros())
                     .unwrap()
             );
-            let owed = store.unreported(0, 10).unwrap();
+            let owed = store.unreported(0, now_micros(), 10).unwrap();
             assert_eq!(
                 owed.iter()
                     .map(|o| (o.handoff_id.as_str(), o.reason.as_str()))

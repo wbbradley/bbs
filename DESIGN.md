@@ -622,8 +622,10 @@ only on the stream the transfer was attempted on and only over attempted, sent
 or unknown, becomes BBS's result for the handoff. Every result for BBS, the
 relay's or the adapter's own refusal, is stored until the transport takes its
 frame; one still queued when the stream drops is sent on the next, and one
-taken is kept an hour (never past its handoff's deadline) and sent again on a
-new stream, in case BBS ended the old one before acting on it. BBS keeps a
+taken is kept an hour from the first time it was taken (never past its
+handoff's deadline; sending it again does not extend that) and sent again on
+a new stream within that hour, in case BBS ended the old one before acting
+on it. BBS keeps a
 handoff's first result and ignores the rest, and ignores a result for a
 handoff it never offered.
 
