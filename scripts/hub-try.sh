@@ -51,7 +51,7 @@ bbs="$bin/bbs" adapter_bin="$bin/bbs-hub-adapter"
 home="$dir/home"
 mkdir -p "$home" "$dir/bbs" "$dir/adapter"
 export HOME="$home"
-unset BBS_SERVER
+unset BBS_SERVER BBS_LOG HUB_AS HUB_TOKEN_DIR
 
 relay_pid="" server_pid="" adapter_pid=""
 # shellcheck disable=SC2329 # run by the EXIT trap
@@ -104,8 +104,8 @@ echo "hub-try: BBS on $bbs_addr (integration stream on $integration_addr)"
 # Human will (this config's human), agent will/scout, integration hub.
 "$bbs" init --server "$bbs_addr" --human will >/dev/null
 if [[ ! -f "$dir/scout.token" ]]; then
-  "$bbs" register --name scout --note "a test agent" |
-    sed -n 's/.*bbs --token \([^ ]*\) .*/\1/p' >"$dir/scout.token"
+  (umask 077; "$bbs" register --name scout --note "a test agent" |
+    sed -n 's/.*bbs --token \([^ ]*\) .*/\1/p' >"$dir/scout.token")
   [[ -s "$dir/scout.token" ]] || { echo "hub-try: registering scout printed no token" >&2; exit 1; }
 fi
 if [[ ! -f "$dir/adapter/integration.token" ]]; then
@@ -148,6 +148,7 @@ cat >"$dir/env.sh" <<EOF
 # will@hub on the test relay. HOME is inside $dir, so your own BBS and Hub
 # configs are never used.
 export HOME="$home"
+unset BBS_LOG HUB_AS HUB_TOKEN_DIR
 export BBS_SERVER="$bbs_addr"
 export HUB_ADDR="$hub_addr"
 export HUB_TOKEN="\$(cat "$relay_dir/will.token")"
