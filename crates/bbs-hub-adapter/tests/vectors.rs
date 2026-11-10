@@ -329,8 +329,14 @@ fn every_interop_vector() {
         }
         passed += 1;
     }
-    assert_eq!(passed, file.vectors.len());
-    assert!(transfers > 0);
+    // Every vector is checked above (a failure panics); the counts pin the
+    // vendored file, so a re-vendored one with vectors added or lost is
+    // noticed here.
+    assert_eq!(
+        (passed, transfers),
+        (15, 11),
+        "the vendored interop vectors (hub#17 head 9472d72)"
+    );
     eprintln!("interop vectors: {passed} passed ({transfers} transfers)");
 }
 

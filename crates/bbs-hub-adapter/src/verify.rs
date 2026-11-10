@@ -394,6 +394,270 @@ mod tests {
         }
     }
 
+    const AUTHORITY: u8 = 1;
+    const INSTALLATION: u8 = 2;
+
+    fn key(b: u8) -> SigningKey {
+        SigningKey::from_bytes(&[b; 32])
+    }
+
+    /// A store trusting `hub` under authority key 1.
+    fn trusting() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("adapter.db"), 0).unwrap();
+        store
+            .put_binding(
+                &crate::store::Binding {
+                    namespace: "hub".into(),
+                    authority_key: key(AUTHORITY).verifying_key().to_bytes().to_vec(),
+                    revision: 1,
+                    disabled: false,
+                },
+                0,
+            )
+            .unwrap();
+        (dir, store)
+    }
+
+    fn cred_with(authority: u8, namespace: &str, subject: u8, perms: &[i32]) -> mp::SignedRecord {
+        sign::sign(
+            &key(authority),
+            mp::RecordKind::InstallationCredential,
+            mp::InstallationCredential {
+                namespace: namespace.into(),
+                installation_id: "hub-1".into(),
+                public_key: key(subject).verifying_key().to_bytes().to_vec(),
+                permissions: perms.to_vec(),
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    const ASSERT: i32 = mp::InstallationPermission::AssertSenders as i32;
+    const HOST: i32 = mp::InstallationPermission::HostNamespace as i32;
+
+    fn hub_message() -> mp::Message {
+        let address = |ns: &str, id: &str| {
+            Some(mp::AddressRef {
+                entity: Some(mp::EntityRef {
+                    namespace: ns.into(),
+                    entity_id: id.into(),
+                }),
+                address_id: "native".into(),
+                run_id: None,
+            })
+        };
+        mp::Message {
+            id: Some(mp::MessageRef {
+                namespace: "hub".into(),
+                message_id: "m1".into(),
+            }),
+            sender: address("hub", "will"),
+            recipient: address("bbs", "will"),
+            authored_at_unix_micros: 1,
+            expires_at_unix_micros: Some(crate::now_micros() + 60_000_000),
+            content_type: "text/plain; charset=utf-8".into(),
+            body: b"hi".to_vec(),
+            kind: mp::MessageKind::Application as i32,
+            ..Default::default()
+        }
+    }
+
+    fn envelope_of(signer: u8, cred: mp::SignedRecord, m: &mp::Message) -> Vec<u8> {
+        mp::SignedEnvelope {
+            message: Some(sign::sign(
+                &key(signer),
+                mp::RecordKind::Message,
+                m.encode_to_vec(),
+            )),
+            credential: Some(cred),
+        }
+        .encode_to_vec()
+    }
+
+    fn code_of<T: std::fmt::Debug>(r: Result<T, Reason>) -> &'static str {
+        r.expect_err("refused").code
+    }
+
+    /// Each way a credential fails trust gets Hub's reason.
+    #[test]
+    fn credentials_are_refused_with_hubs_reasons() {
+        let (_dir, store) = trusting();
+        credential(
+            &store,
+            &cred_with(AUTHORITY, "hub", INSTALLATION, &[ASSERT, HOST]),
+        )
+        .unwrap();
+        // No binding, or a disabled one: namespace_unknown.
+        assert_eq!(
+            code_of(credential(
+                &store,
+                &cred_with(AUTHORITY, "lab", INSTALLATION, &[ASSERT])
+            )),
+            NAMESPACE_UNKNOWN
+        );
+        store
+            .put_binding(
+                &crate::store::Binding {
+                    namespace: "off".into(),
+                    authority_key: key(AUTHORITY).verifying_key().to_bytes().to_vec(),
+                    revision: 1,
+                    disabled: true,
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            code_of(credential(
+                &store,
+                &cred_with(AUTHORITY, "off", INSTALLATION, &[ASSERT])
+            )),
+            NAMESPACE_UNKNOWN
+        );
+        // Signed by another key than the namespace's authority.
+        assert_eq!(
+            code_of(credential(
+                &store,
+                &cred_with(9, "hub", INSTALLATION, &[ASSERT])
+            )),
+            INVALID_CREDENTIAL
+        );
+        // A broken signature, a repeated or an unknown permission.
+        let mut broken = cred_with(AUTHORITY, "hub", INSTALLATION, &[ASSERT]);
+        broken.signature[0] ^= 1;
+        assert_eq!(code_of(credential(&store, &broken)), INVALID_CREDENTIAL);
+        assert_eq!(
+            code_of(credential(
+                &store,
+                &cred_with(AUTHORITY, "hub", INSTALLATION, &[ASSERT, ASSERT])
+            )),
+            INVALID_CREDENTIAL
+        );
+        assert_eq!(
+            code_of(credential(
+                &store,
+                &cred_with(AUTHORITY, "hub", INSTALLATION, &[99])
+            )),
+            INVALID_CREDENTIAL
+        );
+        // A revoked subject key: key_revoked.
+        let revoked = key(INSTALLATION).verifying_key().to_bytes();
+        store
+            .put_revocation("hub", &revoked, &mp::SignedRecord::default(), 0)
+            .unwrap();
+        assert_eq!(
+            code_of(credential(
+                &store,
+                &cred_with(AUTHORITY, "hub", INSTALLATION, &[ASSERT])
+            )),
+            KEY_REVOKED
+        );
+    }
+
+    /// An envelope needs its credential to assert senders, its message
+    /// signed by the credential's subject, and a sender in the credential's
+    /// namespace.
+    #[test]
+    fn envelopes_are_refused_with_hubs_reasons() {
+        let (_dir, store) = trusting();
+        let m = hub_message();
+        let good = cred_with(AUTHORITY, "hub", INSTALLATION, &[ASSERT]);
+        let ok = envelope(&store, &envelope_of(INSTALLATION, good.clone(), &m)).unwrap();
+        assert_eq!(ok.bytes, m.encode_to_vec());
+        // Missing ASSERT_SENDERS.
+        let host_only = cred_with(AUTHORITY, "hub", INSTALLATION, &[HOST]);
+        assert_eq!(
+            code_of(envelope(&store, &envelope_of(INSTALLATION, host_only, &m))),
+            NOT_AUTHORIZED
+        );
+        // Signed by a key the credential does not name.
+        assert_eq!(
+            code_of(envelope(&store, &envelope_of(7, good.clone(), &m))),
+            INVALID_SIGNATURE
+        );
+        // A sender outside the credential's namespace.
+        let mut foreign = m.clone();
+        foreign
+            .sender
+            .as_mut()
+            .unwrap()
+            .entity
+            .as_mut()
+            .unwrap()
+            .namespace = "lab".into();
+        assert_eq!(
+            code_of(envelope(
+                &store,
+                &envelope_of(INSTALLATION, good.clone(), &foreign)
+            )),
+            NOT_AUTHORIZED
+        );
+        // Trust failures surface as the credential's.
+        let stranger = cred_with(AUTHORITY, "lab", INSTALLATION, &[ASSERT]);
+        assert_eq!(
+            code_of(envelope(&store, &envelope_of(INSTALLATION, stranger, &m))),
+            NAMESPACE_UNKNOWN
+        );
+        store
+            .put_revocation(
+                "hub",
+                &key(INSTALLATION).verifying_key().to_bytes(),
+                &mp::SignedRecord::default(),
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            code_of(envelope(&store, &envelope_of(INSTALLATION, good, &m))),
+            KEY_REVOKED
+        );
+    }
+
+    /// A revocation must be signed by its namespace's trusted authority.
+    #[test]
+    fn revocations_need_the_namespace_authority() {
+        let (_dir, store) = trusting();
+        let revoke = |signer: u8, namespace: &str, public_key: Vec<u8>| {
+            sign::sign(
+                &key(signer),
+                mp::RecordKind::InstallationRevocation,
+                mp::InstallationRevocation {
+                    namespace: namespace.into(),
+                    public_key,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+        };
+        let subject = key(INSTALLATION).verifying_key().to_bytes().to_vec();
+        let r = revocation(&store, &revoke(AUTHORITY, "hub", subject.clone())).unwrap();
+        assert_eq!(
+            (r.namespace.as_str(), r.public_key.clone()),
+            ("hub", subject.clone())
+        );
+        // Another signer, an untrusted namespace, a bad key, a broken
+        // signature, or another record kind.
+        assert_eq!(
+            code_of(revocation(&store, &revoke(9, "hub", subject.clone()))),
+            INVALID_SIGNATURE
+        );
+        assert_eq!(
+            code_of(revocation(
+                &store,
+                &revoke(AUTHORITY, "lab", subject.clone())
+            )),
+            INVALID_SIGNATURE
+        );
+        assert_eq!(
+            code_of(revocation(&store, &revoke(AUTHORITY, "hub", vec![1; 31]))),
+            INVALID_CREDENTIAL
+        );
+        let mut broken = revoke(AUTHORITY, "hub", subject);
+        broken.signature[0] ^= 1;
+        assert_eq!(code_of(revocation(&store, &broken)), INVALID_SIGNATURE);
+        let cred = cred_with(AUTHORITY, "hub", INSTALLATION, &[ASSERT]);
+        assert_eq!(code_of(revocation(&store, &cred)), INVALID_SIGNATURE);
+    }
+
     #[test]
     fn ids_follow_hub() {
         assert!(valid_id("a-B_9"));

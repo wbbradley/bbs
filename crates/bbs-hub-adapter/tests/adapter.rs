@@ -1426,3 +1426,62 @@ async fn stopping_ends_the_relay_session() {
         assert!(matches!(f, F::Heartbeat(_)), "{f:?}");
     }
 }
+
+/// A trust page's bad bindings (malformed, or an authority key of small
+/// order) are skipped, not the page: its good bindings and revocations
+/// still apply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_binding_does_not_spoil_its_trust_page() {
+    let mut w = World::new().await;
+    let adapter = Running::start(
+        settings(free_addr(), w.relay.addr, "unused", "bbs"),
+        &w.store,
+    );
+    let mut peer = w.relay.open().await;
+    let F::TrustQuery(q) = peer.next().await else {
+        panic!("a trust query");
+    };
+    let mut identity = vec![0; 32];
+    identity[0] = 1;
+    let revoked = key(9).verifying_key().to_bytes().to_vec();
+    let revocation = sign::sign(
+        &key(HUB_AUTHORITY),
+        mp::RecordKind::InstallationRevocation,
+        mp::InstallationRevocation {
+            namespace: "hub".into(),
+            public_key: revoked.clone(),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    peer.send(F::TrustPage(mp::TrustPage {
+        query_id: q.query_id,
+        bindings: vec![
+            mp::NamespaceBinding {
+                namespace: "weak".into(),
+                authority_public_key: identity,
+                revision: 1,
+                disabled: false,
+            },
+            mp::NamespaceBinding {
+                namespace: "short".into(),
+                authority_public_key: vec![1; 31],
+                revision: 1,
+                disabled: false,
+            },
+            binding("hub", HUB_AUTHORITY),
+            binding("bbs", BBS_AUTHORITY),
+        ],
+        revocations: vec![revocation],
+        ..Default::default()
+    }))
+    .await;
+    let claim = peer.route().await;
+    peer.route_result(claim, true).await;
+    adapter.stop().await.unwrap();
+    let store = w.store();
+    assert!(store.binding("hub").unwrap().is_some());
+    assert!(store.binding("weak").unwrap().is_none());
+    assert!(store.binding("short").unwrap().is_none());
+    assert!(store.revoked("hub", &revoked).unwrap());
+}

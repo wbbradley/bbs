@@ -96,19 +96,23 @@ fn varint(b: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
-/// One field's tag: its number and wire type, and the tag's length.
+/// How deeply groups may nest within one field value, as protowire's
+/// `DefaultRecursionLimit` allows (Go's `ConsumeFieldValue`).
+const GROUP_LIMIT: usize = 10_000;
+
+/// One field's tag: its number and wire type, and the tag's length. Field
+/// numbers run from 1 to 2^31-1, as protowire's `ConsumeTag` accepts.
 fn tag(b: &[u8]) -> Option<(u32, u8, usize)> {
     let (v, n) = varint(b)?;
     let num = v >> 3;
-    if num == 0 || num > (1 << 29) - 1 {
+    if num == 0 || num > i32::MAX as u64 {
         return None;
     }
     Some((num as u32, (v & 7) as u8, n))
 }
 
-/// The length of a field's value (after its tag) of wire type `typ`,
-/// including a whole group for a start-group tag, or None when malformed.
-fn value_len(num: u32, typ: u8, b: &[u8], depth: usize) -> Option<usize> {
+/// The length of a scalar or length-delimited value of wire type `typ`.
+fn scalar_len(typ: u8, b: &[u8]) -> Option<usize> {
     match typ {
         VARINT => varint(b).map(|(_, n)| n),
         I64 => (b.len() >= 8).then_some(8),
@@ -118,21 +122,40 @@ fn value_len(num: u32, typ: u8, b: &[u8], depth: usize) -> Option<usize> {
             let end = n.checked_add(usize::try_from(len).ok()?)?;
             (end <= b.len()).then_some(end)
         }
-        SGROUP => {
-            if depth > MAX_DEPTH {
-                return None;
-            }
-            let mut at = 0;
-            loop {
-                let (inner, t, n) = tag(&b[at..])?;
-                at += n;
-                if t == EGROUP {
-                    return (inner == num).then_some(at);
-                }
-                at += value_len(inner, t, &b[at..], depth + 1)?;
-            }
-        }
         _ => None,
+    }
+}
+
+/// The length of a field's value (after its tag) of wire type `typ`,
+/// including a whole group for a start-group tag, or None when malformed.
+/// Groups are skipped without recursion, nested up to [`GROUP_LIMIT`]
+/// below the first, each ended by its own number.
+fn value_len(num: u32, typ: u8, b: &[u8]) -> Option<usize> {
+    if typ != SGROUP {
+        return scalar_len(typ, b);
+    }
+    let mut open = vec![num];
+    let mut at = 0;
+    loop {
+        let (inner, t, n) = tag(&b[at..])?;
+        at += n;
+        match t {
+            EGROUP => {
+                if open.pop()? != inner {
+                    return None;
+                }
+                if open.is_empty() {
+                    return Some(at);
+                }
+            }
+            SGROUP => {
+                if open.len() > GROUP_LIMIT {
+                    return None;
+                }
+                open.push(inner);
+            }
+            _ => at += scalar_len(t, &b[at..])?,
+        }
     }
 }
 
@@ -175,7 +198,7 @@ fn walk(mut b: &[u8], md: &MessageDescriptor, depth: usize) -> Result<(), WireEr
             return fail(format!("{name}: malformed tag"));
         };
         b = &b[n..];
-        let Some(vlen) = value_len(num, typ, b, depth) else {
+        let Some(vlen) = value_len(num, typ, b) else {
             return fail(format!("{name}: malformed field {num}"));
         };
         let val = &b[..vlen];
@@ -275,7 +298,7 @@ pub fn field(mut b: &[u8], num: u32) -> Option<&[u8]> {
     while !b.is_empty() {
         let (n, typ, l) = tag(b)?;
         b = &b[l..];
-        let vl = value_len(n, typ, b, 0)?;
+        let vl = value_len(n, typ, b)?;
         if n == num && typ == LEN {
             return Some(len_body(&b[..vl]));
         }
@@ -466,16 +489,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_deep_nesting() {
-        // An unknown group nested 20 deep.
-        let mut b = Vec::new();
-        for _ in 0..20 {
-            b.extend_from_slice(&[0x93, 0x06]);
-        }
-        for _ in 0..20 {
-            b.extend_from_slice(&[0x94, 0x06]);
-        }
-        assert!(check(&b).is_err());
+    fn unknown_groups_nest_as_deep_as_go_allows() {
+        // Unknown field 98 as nested groups: Go's protowire skips them up to
+        // its recursion limit (10,000 below the first), so 20 deep is fine,
+        // and so is the limit itself; one more is refused.
+        let nested = |depth: usize| {
+            let mut b = Vec::new();
+            for _ in 0..depth {
+                b.extend_from_slice(&[0x93, 0x06]);
+            }
+            for _ in 0..depth {
+                b.extend_from_slice(&[0x94, 0x06]);
+            }
+            b
+        };
+        check(&nested(20)).unwrap();
+        check(&nested(GROUP_LIMIT + 1)).unwrap();
+        assert!(check(&nested(GROUP_LIMIT + 2)).is_err());
+        // A group must end with its own number, and an end alone is malformed.
+        assert!(check(&[0x93, 0x06, 0xa4, 0x06]).is_err());
+        assert!(check(&[0x94, 0x06]).is_err());
+    }
+
+    #[test]
+    fn field_numbers_run_to_two_to_the_31() {
+        let field = |num: u64| {
+            let mut b = Vec::new();
+            prost::encoding::encode_varint(num << 3, &mut b);
+            b.push(1);
+            b
+        };
+        // Unknown varint fields: the largest number Go accepts, then past it.
+        check(&field((1 << 31) - 1)).unwrap();
+        check(&field(1 << 29)).unwrap();
+        assert!(check(&field(1 << 31)).is_err());
+        assert!(check(&field(0)).is_err());
     }
 
     #[test]
