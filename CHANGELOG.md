@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.25.0 - 2026-11-10
+
 ### Added
 
 - `bbs-server migrate-hub-model --db PATH --namespace NS --backup-taken PATH`

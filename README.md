@@ -1006,7 +1006,7 @@ proof. Install by pinned revision to get the release itself.
 
 ### Coordinated upgrades
 
-The release after 0.24.0 moves to the Hub entity/address model (schema 27)
+Version 0.25.0 moves to the Hub entity/address model (schema 27)
 and protocol epoch 3. It creates new databases at schema 27 but never
 migrates an existing one; it refuses to open it, leaving the file unchanged,
 and prints the commands below for that file. Epoch 2 clients and servers
