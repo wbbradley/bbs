@@ -537,7 +537,10 @@ BBS's integration credential must be owner-only; neither is logged.
 **Signing and decoding.** Records are signed exactly as Hub's `internal/sign`
 does: Ed25519 over `"msgproto/v1/" || label || 0 || U32BE(1) || key ||
 U64BE(len) || payload`, the payload being the retained bytes, never a
-re-encoding. Untrusted bytes are bounded, then walked against the vendored
+re-encoding. Verification is plain (cofactorless) Ed25519 as Go's
+`crypto/ed25519` does it, except that a small-order public key is refused
+outright, since it lets anyone forge: as a record's signer it is
+`invalid_signature`, as a credential's subject `invalid_credential`. Untrusted bytes are bounded, then walked against the vendored
 descriptors before prost decodes them, as Hub's `internal/wire` does:
 malformed encoding, a wire-type mismatch, a repeated singular field,
 conflicting oneof members, invalid UTF-8, a reserved field number or nesting

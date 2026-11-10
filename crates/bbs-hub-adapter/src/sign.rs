@@ -65,6 +65,8 @@ pub enum VerifyError {
     Major,
     KeyLength,
     SignatureLength,
+    /// The signer key is a small-order point (see [`small_order`]).
+    SmallKey,
     Signature,
 }
 
@@ -75,9 +77,24 @@ impl std::fmt::Display for VerifyError {
             VerifyError::Major => "unsupported record format_major",
             VerifyError::KeyLength => "signer public key must be 32 bytes",
             VerifyError::SignatureLength => "signature must be 64 bytes",
+            VerifyError::SmallKey => "signer public key has small order",
             VerifyError::Signature => "invalid signature",
         })
     }
+}
+
+/// Whether `key` encodes a point of small order (8-torsion). Under such a
+/// key, R = identity and S = 0 verify for any message, and plain Ed25519
+/// verification does not refuse that, so Hub refuses the key itself, as a
+/// signer and as a credential's subject. A key that is not a point at all
+/// is not small order (it fails verification instead), as in Hub's
+/// `sign.SmallOrder`.
+pub fn small_order(key: &[u8]) -> bool {
+    let Ok(key) = <&[u8; 32]>::try_from(key) else {
+        return false;
+    };
+    // is_weak decompresses the point and asks is_small_order().
+    VerifyingKey::from_bytes(key).is_ok_and(|k| k.is_weak())
 }
 
 /// Check a record's framing and signature and that it has the expected
@@ -103,9 +120,15 @@ pub fn verify(r: &mp::SignedRecord, want: mp::RecordKind) -> Result<(), VerifyEr
     // A key that is not a valid point fails like a bad signature, as Go's
     // ed25519.Verify returns false for it.
     let key = VerifyingKey::from_bytes(key).map_err(|_| VerifyError::Signature)?;
+    // Refused before verification, as Hub does: plain Ed25519 accepts a
+    // forgery under a small-order key.
+    if key.is_weak() {
+        return Err(VerifyError::SmallKey);
+    }
     let message = input(label, r.format_major, &r.signer_public_key, &r.payload);
-    // dalek's verify, not verify_strict: it accepts and refuses what Go's
-    // ed25519.Verify does.
+    // dalek's plain verify, not verify_strict, for parity with Go's
+    // ed25519.Verify (RFC 8032, cofactorless; S must be reduced). Its one
+    // gap, small-order keys, is closed explicitly above.
     key.verify(&message, &ed25519_dalek::Signature::from_bytes(signature))
         .map_err(|_| VerifyError::Signature)
 }
@@ -125,8 +148,65 @@ pub fn hash(r: &mp::SignedRecord) -> Option<[u8; 32]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    fn unhex(s: &str) -> [u8; 32] {
+        let b: Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect();
+        b.try_into().unwrap()
+    }
+
+    /// Small-order points: the identity (order 1), (0, -1) (order 2) and a
+    /// point of order 8.
+    pub(crate) fn small_order_keys() -> [[u8; 32]; 3] {
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        [
+            identity,
+            unhex("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            unhex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"),
+        ]
+    }
+
+    #[test]
+    fn small_order_keys_are_refused_as_signers() {
+        let normal = SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes();
+        assert!(!small_order(&normal));
+        assert!(!small_order(&[0; 31]), "not 32 bytes");
+        // Not a point: verification fails it, as in Hub.
+        let not_a_point = unhex("0200000000000000000000000000000000000000000000000000000000000000");
+        assert!(VerifyingKey::from_bytes(&not_a_point).is_err());
+        assert!(!small_order(&not_a_point));
+        for key in small_order_keys() {
+            assert!(small_order(&key), "{key:02x?}");
+            // The universal forgery: R = identity, S = 0, for any message.
+            let mut signature = [0; 64];
+            signature[0] = 1;
+            let rec = mp::SignedRecord {
+                format_major: FORMAT_MAJOR,
+                kind: mp::RecordKind::Message as i32,
+                signer_public_key: key.to_vec(),
+                payload: b"anything at all".to_vec(),
+                signature: signature.to_vec(),
+            };
+            // Plain verification accepts it; only the explicit check refuses.
+            let input = input("message", FORMAT_MAJOR, &key, &rec.payload);
+            assert!(
+                VerifyingKey::from_bytes(&key)
+                    .unwrap()
+                    .verify(&input, &ed25519_dalek::Signature::from_bytes(&signature))
+                    .is_ok(),
+                "{key:02x?}"
+            );
+            assert_eq!(
+                verify(&rec, mp::RecordKind::Message),
+                Err(VerifyError::SmallKey)
+            );
+        }
+    }
 
     #[test]
     fn signs_and_verifies_and_rejects_changes() {

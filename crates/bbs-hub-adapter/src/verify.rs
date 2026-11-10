@@ -163,6 +163,12 @@ fn credential_fields(rec: &mp::SignedRecord) -> Result<(Credential, Vec<i32>), R
             "credential fields are incomplete",
         ));
     }
+    if sign::small_order(&c.public_key) {
+        return Err(reason(
+            INVALID_CREDENTIAL,
+            "credential subject key has small order",
+        ));
+    }
     let out = Credential {
         namespace: c.namespace,
         installation_id: c.installation_id,
@@ -328,6 +334,66 @@ pub fn revocation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use prost::Message as _;
+
+    fn credential_for(authority: &SigningKey, subject: [u8; 32]) -> mp::SignedRecord {
+        sign::sign(
+            authority,
+            mp::RecordKind::InstallationCredential,
+            mp::InstallationCredential {
+                namespace: "hub".into(),
+                installation_id: "hub-1".into(),
+                public_key: subject.to_vec(),
+                permissions: vec![mp::InstallationPermission::AssertSenders as i32],
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    /// A credential naming a small-order subject is `invalid_credential`,
+    /// checked before trust as in Hub; a record signed by such a key is
+    /// `invalid_signature`.
+    #[test]
+    fn small_order_keys_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("adapter.db"), 0).unwrap();
+        let authority = SigningKey::from_bytes(&[1; 32]);
+        let good = SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes();
+        // No binding for `hub` yet: the subject check comes first.
+        assert_eq!(
+            credential(&store, &credential_for(&authority, good))
+                .unwrap_err()
+                .code,
+            NAMESPACE_UNKNOWN
+        );
+        for key in crate::sign::tests::small_order_keys() {
+            let cred = credential_for(&authority, key);
+            let err = credential(&store, &cred).unwrap_err();
+            assert_eq!(err.code, INVALID_CREDENTIAL, "{err}");
+            assert!(err.detail.contains("small order"), "{err}");
+            assert_eq!(own_credential(&cred).unwrap_err().code, INVALID_CREDENTIAL);
+
+            let mut signature = [0; 64];
+            signature[0] = 1;
+            let forged = mp::SignedRecord {
+                format_major: sign::FORMAT_MAJOR,
+                kind: mp::RecordKind::Message as i32,
+                signer_public_key: key.to_vec(),
+                payload: b"forged".to_vec(),
+                signature: signature.to_vec(),
+            };
+            let as_subject = Credential {
+                namespace: "hub".into(),
+                installation_id: "hub-1".into(),
+                public_key: key.to_vec(),
+                assert_senders: true,
+                host_namespace: false,
+            };
+            let err = subject(&forged, mp::RecordKind::Message, &as_subject).unwrap_err();
+            assert_eq!(err.code, INVALID_SIGNATURE, "{err}");
+        }
+    }
 
     #[test]
     fn ids_follow_hub() {
