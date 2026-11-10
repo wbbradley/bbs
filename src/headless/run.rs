@@ -969,13 +969,14 @@ async fn check_blocker(
         }) else {
             return Ok(Some((answered, None)));
         };
-        // The mail shares the outcome's time and the archive lists oldest
-        // first, so an archived one is at the front. Not there: still unread.
+        // The mail shares the outcome's time, so the archive since then holds
+        // it once archived. Not there: still unread. No limit, since any
+        // number of archived messages may share that time.
         let archived = backend
             .read(proto::ReadRequest {
                 archived: true,
                 since: Some(outcome.created_at),
-                limit: Some(16),
+                limit: None,
             })
             .await?
             .messages
