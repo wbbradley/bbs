@@ -433,7 +433,7 @@ pub fn cancel_blocker(
             Some(&req.request_key),
         )?;
         // Tell the creator, as an answer would, unless it cancelled its own.
-        // The notice is not recorded on the outcome, so a replay returns none.
+        // A replay returns no notice; reads find it by the cancel's time.
         let mut message_id = None;
         if db::agent_is_live(ctx.conn, row.creator.id)?
             && super::tell_agent(ctx, &actor, row.creator.id)?
@@ -1667,6 +1667,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sender, "human");
+        // The outcome names the notice, so the creator's runner can wait for
+        // it; with no notice it names none.
+        let mail = |b: &mut Board, id: i64| {
+            get_blocker(
+                &mut b.conn,
+                &b.agents[0],
+                proto::GetBlockerRequest {
+                    id,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .current
+            .unwrap()
+            .outcome
+            .unwrap()
+            .message_id
+        };
+        assert_eq!(mail(&mut b, c.id), Some(notice));
+        assert_eq!(mail(&mut b, own.id), None);
         // In focus mode only the owner reaches the creator.
         service::set_focus(
             &mut b.conn,
@@ -1680,6 +1700,7 @@ mod tests {
         let d = b.put(0, "Tag it?", None, "d");
         let by = b.agents[1].clone();
         assert!(cancel(&mut b, &by, d.id, "c-d").message_id.is_none());
+        assert_eq!(mail(&mut b, d.id), None);
         let e = b.put(0, "Merge it?", None, "e");
         let by = b.humans[0].clone();
         assert!(cancel(&mut b, &by, e.id, "c-e").message_id.is_some());

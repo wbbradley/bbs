@@ -302,8 +302,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     if let Some(g) = &state.goal {
         log.event("goal", goal_record(Some(g)));
     }
-    // The blocker may have closed while the runner was stopped.
-    if check_blocker(&mut state.goal, &config, dir, &token, &mut log).await {
+    // The blocker may have closed while the runner was stopped. Its mail, if
+    // unread, comes in the first batch, which checks again.
+    if check_blocker(&mut state.goal, &config, dir, &token, 0, &mut log).await {
         goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
     }
     let mut delivery =
@@ -521,7 +522,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     }
                     // An answer or a cancel notice arrives as mail.
                     if !batch.is_empty() {
-                        goal_dirty |= check_blocker(&mut state.goal, &config, dir, &token, &mut log).await;
+                        goal_dirty |= check_blocker(&mut state.goal, &config, dir, &token, received_through, &mut log).await;
                     }
                     if goal_dirty {
                         goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
@@ -585,7 +586,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 }
                 // The blocker may have closed during the turn, before the
                 // block took effect, or the agent cancelled it itself.
-                if check_blocker(&mut state.goal, &config, dir, &token, &mut log).await {
+                if check_blocker(&mut state.goal, &config, dir, &token, received_through, &mut log).await {
                     goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
                 }
                 goal_prompt = false;
@@ -902,11 +903,18 @@ const BLOCKER_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// was answered or cancelled, and if so resume the goal. Returns whether the
 /// goal changed. A failed check leaves the goal blocked: the next mail or
 /// turn checks again, and the owner can resume it.
+///
+/// The server sends the answer or cancel notice in the transaction that
+/// closes the blocker, so the check can see the close before the mail wait
+/// delivers that mail. The goal resumes only once the mail is received
+/// (`received_through`, the newest message ID received), so the agent gets
+/// it with or before the resumed goal; the mail's arrival checks again.
 async fn check_blocker(
     goal: &mut Option<Goal>,
     config: &Config,
     dir: &Path,
     token: &str,
+    received_through: i64,
     log: &mut Log,
 ) -> bool {
     let Some(id) = goal.as_ref().and_then(Goal::waits_on) else {
@@ -939,11 +947,18 @@ async fn check_blocker(
             return false;
         }
     };
-    let answered = match found.current.map(|c| c.status()) {
-        Some(proto::BlockerStatus::BlockerAnswered) => true,
-        Some(proto::BlockerStatus::BlockerCancelled) => false,
+    let Some(current) = found.current else {
+        return false;
+    };
+    let answered = match current.status() {
+        proto::BlockerStatus::BlockerAnswered => true,
+        proto::BlockerStatus::BlockerCancelled => false,
         _ => return false,
     };
+    let mail = current.outcome.and_then(|o| o.message_id);
+    if mail.is_some_and(|id| id > received_through) {
+        return false;
+    }
     goal.as_mut()
         .is_some_and(|g| g.blocker_closed(id, answered))
 }
