@@ -46,6 +46,13 @@ fn the_store_is_owner_only_and_used_by_one_adapter() {
     assert!(err.contains("accessible to other users"), "{err}");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     open(&dir);
+    // SQLite's WAL files must be as private as the store. A running adapter
+    // keeps its WAL open; status and backup check it.
+    let _running = open(&dir);
+    let wal = dir.path().join("adapter.db-wal");
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = Store::open_read_only(&path).err().unwrap().to_string();
+    assert!(err.contains("accessible to other users"), "{err}");
 }
 
 /// A store from an earlier schema is refused with what to do, not migrated.
