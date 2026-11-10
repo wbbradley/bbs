@@ -582,10 +582,14 @@ impl Adapter {
             }
         }
         let _ = sweeper.await;
-        if let Some(s) = lock(&shared.bbs).take() {
+        // Taken out of their slots first: a slot is never held while a
+        // queue lock is taken.
+        let bbs_link = lock(&shared.bbs).take();
+        if let Some(s) = bbs_link {
             s.close();
         }
-        if let Some(r) = lock(&shared.relay).take() {
+        let relay_link = lock(&shared.relay).take();
+        if let Some(r) = relay_link {
             r.tx.close();
         }
         boundary.abort();
