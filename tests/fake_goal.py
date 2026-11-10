@@ -17,7 +17,10 @@ restart. Once the script runs out, it makes no tool calls. Actions:
   waitcancel     wait for session/cancel, then end the turn cancelled
 
 A prompt without a goal block that carries mail saying RESUME-NOW ends the
-goal's wait with bbs_goal_update(status="active").
+goal's wait with bbs_goal_update(status="active"). One whose mail says
+READ-INBOX reports an in-progress tool call, waits until the test writes to
+the fake-go FIFO, then reads its inbox with `bbs read`, as an agent might from
+its shell, into fake-read.txt.
 
 Every bbs_goal_update result is appended to fake-goal-results.jsonl.
 """
@@ -44,6 +47,7 @@ class Mcp:
     def __init__(self, spec):
         env = dict(os.environ)
         env.update({e["name"]: e["value"] for e in spec["env"]})
+        self.command, self.env = spec["command"], env
         self.proc = subprocess.Popen(
             [spec["command"]] + spec["args"],
             stdin=subprocess.PIPE,
@@ -97,6 +101,8 @@ def main():
                 action = next_action()
             elif "RESUME-NOW" in text:
                 action = "activate"
+            elif "READ-INBOX" in text:
+                action = "readinbox"
             else:
                 action = "idle"
 
@@ -136,6 +142,15 @@ def main():
                 blocker = json.loads(put["content"][0]["text"])["blocker"]["id"]
                 tool("bbs_goal_update", {"status": "blocked", "blocker": blocker,
                                          "reason": "which branch?"})
+            elif action == "readinbox":
+                update(session, {"sessionUpdate": "tool_call", "toolCallId": "r",
+                                 "title": "read-inbox", "status": "in_progress"})
+                with open("fake-go") as go:
+                    go.read()
+                token = mcp.env["BBS_HEADLESS_TOKEN"]
+                inbox = subprocess.run([mcp.command, "--token", token, "read"], env=mcp.env,
+                                       capture_output=True, text=True, check=True)
+                Path("fake-read.txt").write_text(inbox.stdout)
             elif action == "waitcancel":
                 update(session, {"sessionUpdate": "tool_call", "toolCallId": "w",
                                  "title": "waiting-cancel", "status": "in_progress"})

@@ -180,6 +180,8 @@ message BlockerOutcome {
   Principal actor = 2;
   string created_at = 3;
   optional string answer = 4;
+  // The mail this outcome sent the creator: the answer, or a cancel notice
+  // (none when the creator cancelled its own, or from an older server).
   optional int64 message_id = 5;
   // Option IDs the human picked, in the blocker's declared option order.
   repeated string selected = 6;
