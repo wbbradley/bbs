@@ -84,7 +84,16 @@ fn start_relay(checkout: &Path, dir: &Path) -> Relay {
 impl Relay {
     /// Run the Hub CLI as will@hub.
     fn hub(&self, args: &[&str]) -> String {
-        let token = std::fs::read_to_string(self.dir.join("will.token")).unwrap();
+        self.hub_with("will.token", args)
+    }
+
+    /// Run the Hub CLI as Hub's administrator.
+    fn admin(&self, args: &[&str]) -> String {
+        self.hub_with("admin.token", args)
+    }
+
+    fn hub_with(&self, token_file: &str, args: &[&str]) -> String {
+        let token = std::fs::read_to_string(self.dir.join(token_file)).unwrap();
         let out = Command::new(self.dir.join("hub"))
             .args(args)
             .env("HUB_ADDR", &self.addr)
@@ -99,6 +108,22 @@ impl Relay {
         assert!(out.status.success(), "hub {args:?}: {text}");
         text
     }
+}
+
+/// The message with `body` in will@hub's inbox, as `hub read --json` shows
+/// it, once it arrives. Reading consumes will's other unread mail.
+async fn hub_message(relay: &Relay, body: &str) -> serde_json::Value {
+    let mut found = None;
+    eventually(&format!("Hub delivers {body:?} to will"), || {
+        found = relay
+            .hub(&["read", "--json"])
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|m| m["body"] == body);
+        found.is_some()
+    })
+    .await;
+    found.unwrap()
 }
 
 async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
@@ -287,6 +312,91 @@ async fn messages_and_directory_round_trip_with_go_hub() {
         )
         .unwrap();
     assert_eq!(reply_to, origin);
+
+    // BBS replies to Go's message: to its exact sender, answering it.
+    let (go_id, go_origin): (i64, String) = db::open(&bbs_db)
+        .unwrap()
+        .query_row(
+            "SELECT id, origin_message_id FROM messages WHERE body = 'hello from go'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let replied = remote
+        .send(proto::SendRequest {
+            body: "bbs answers go".into(),
+            reply_to: Some(go_id),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(replied.to, "id:will@hub");
+    let hub_reply = hub_message(&relay, "bbs answers go").await;
+    assert_eq!(hub_reply["in_reply_to"], format!("hub:{go_origin}"));
+    assert_eq!(hub_reply["to"], "will@hub");
+
+    // A Hub group with a BBS member: BBS gets a copy of will's message to
+    // the group, shown as from will via the group, and a reply reaches will
+    // directly, answering his message to the group.
+    relay.admin(&["entity", "register", "release", "--kind", "group"]);
+    relay.hub(&["group", "join", "release"]);
+    relay.admin(&["group", "add", "release", "id:will/scout@bbs"]);
+    relay.hub(&["send", "release", "release notes"]);
+    eventually("BBS imports the group copy", || count("release notes") == 1).await;
+    let mail = remote
+        .read(proto::ReadRequest::default())
+        .await
+        .unwrap()
+        .messages;
+    let copy = mail.iter().find(|m| m.body == "release notes").unwrap();
+    assert_eq!(copy.from_name, "id:will@hub");
+    assert_eq!(copy.from_kind(), proto::Kind::Remote);
+    assert_eq!(copy.via.as_deref(), Some("id:release@hub"));
+    assert_eq!(copy.reported, None);
+    assert_eq!(copy.group_notice, None);
+    // Adding scout was announced to the group: a notice, with no sender to
+    // reply to.
+    let notice = mail
+        .iter()
+        .find(|m| m.group_notice == Some(true))
+        .expect("the membership notice");
+    assert_eq!(notice.from_name, "id:release@hub");
+    let err = remote
+        .send(proto::SendRequest {
+            body: "to a notice".into(),
+            reply_to: Some(notice.id),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a group notice has no sender to reply to"),
+        "{err:#}"
+    );
+    let original: String = db::open(&bbs_db)
+        .unwrap()
+        .query_row(
+            "SELECT group_copy_namespace || ':' || group_copy_message_id FROM messages
+             WHERE id = ?1",
+            [copy.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let replied = remote
+        .send(proto::SendRequest {
+            body: "bbs answers the group copy".into(),
+            reply_to: Some(copy.id),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(replied.to, "id:will@hub");
+    let hub_reply = hub_message(&relay, "bbs answers the group copy").await;
+    assert_eq!(hub_reply["in_reply_to"], original);
+    assert_eq!(hub_reply["to"], "will@hub");
+    assert_eq!(hub_reply["from"], "will/scout@bbs");
+    assert!(hub_reply.get("via").is_none(), "{hub_reply}");
 
     // BBS's directory of namespace hub, through the adapter and the relay,
     // signed by Go Hub and verified here.
