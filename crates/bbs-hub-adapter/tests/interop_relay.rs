@@ -187,6 +187,7 @@ async fn messages_and_directory_round_trip_with_go_hub() {
             bbs_endpoint: format!("http://{integration}"),
             relay_endpoint: format!("http://{}", relay.addr),
             token,
+            token_file: None,
             key,
             credential,
         },

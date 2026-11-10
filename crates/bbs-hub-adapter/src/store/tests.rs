@@ -121,8 +121,63 @@ fn a_handoff_is_claimed_before_it_is_sent_and_settles_once() {
     // Owed until the transport takes it, however often it was read.
     assert_eq!(store.unreported(0, 10).unwrap(), unreported);
     assert!(store.unreported(unreported[0].id, 10).unwrap().is_empty());
-    store.mark_reported(unreported[0].id).unwrap();
+    // Taken, it is kept a while for a new stream, then purged.
+    store.mark_reported(unreported[0].id, 30).unwrap();
+    store.purge_settled(i64::MIN, 31).unwrap();
+    assert_eq!(store.unreported(0, 10).unwrap(), unreported);
+    store
+        .purge_settled(i64::MIN, 30 + REPORT_KEEP_MICROS)
+        .unwrap();
     assert!(store.unreported(0, 10).unwrap().is_empty());
+}
+
+/// Theo's repro (C1): a stream's cursor only moves forward, so report IDs
+/// must never be reused, even once every report has been purged.
+#[test]
+fn report_ids_are_never_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    store
+        .owe_report("bbs-h1", "received", "", "", None, 1)
+        .unwrap();
+    let first = store.unreported(0, 10).unwrap();
+    let after = first[0].id;
+    store.mark_reported(after, 2).unwrap();
+    store
+        .purge_settled(i64::MIN, 2 + REPORT_KEEP_MICROS)
+        .unwrap();
+    assert!(store.unreported(0, 10).unwrap().is_empty());
+    store
+        .owe_report("bbs-h2", "received", "", "", None, 3)
+        .unwrap();
+    let next = store.unreported(after, 10).unwrap();
+    assert_eq!(next.len(), 1, "the same stream's cursor finds the new one");
+    assert_eq!(next[0].handoff_id, "bbs-h2");
+}
+
+/// A taken result is kept until its handoff's deadline at the latest.
+#[test]
+fn a_taken_result_is_kept_no_longer_than_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    store
+        .owe_report("bbs-h1", "received", "", "", Some(100), 1)
+        .unwrap();
+    store
+        .owe_report("bbs-h2", "received", "", "", None, 1)
+        .unwrap();
+    let owed = store.unreported(0, 10).unwrap();
+    // Untaken past its deadline: still owed.
+    store.purge_settled(i64::MIN, 200).unwrap();
+    assert_eq!(store.unreported(0, 10).unwrap().len(), 2);
+    store.mark_reported(owed[0].id, 50).unwrap();
+    store.mark_reported(owed[1].id, 50).unwrap();
+    store.purge_settled(i64::MIN, 99).unwrap();
+    assert_eq!(store.unreported(0, 10).unwrap().len(), 2);
+    store.purge_settled(i64::MIN, 100).unwrap();
+    let left = store.unreported(0, 10).unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].handoff_id, "bbs-h2");
 }
 
 #[test]
@@ -130,10 +185,10 @@ fn results_the_adapter_settles_itself_are_owed_too() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(&dir);
     store
-        .owe_report("bbs-h9", "rejected", "invalid_message", "bad", 1)
+        .owe_report("bbs-h9", "rejected", "invalid_message", "bad", None, 1)
         .unwrap();
     store
-        .owe_report("bbs-h10", "received", "already_known", "", 2)
+        .owe_report("bbs-h10", "received", "already_known", "", None, 2)
         .unwrap();
     let owed = store.unreported(0, 10).unwrap();
     assert_eq!(
@@ -145,8 +200,11 @@ fn results_the_adapter_settles_itself_are_owed_too() {
             ("bbs-h10", "received", "already_known")
         ]
     );
-    store.mark_reported(owed[0].id).unwrap();
-    assert_eq!(store.unreported(0, 10).unwrap()[0].handoff_id, "bbs-h10");
+    store.mark_reported(owed[0].id, 3).unwrap();
+    assert_eq!(
+        store.unreported(owed[0].id, 10).unwrap()[0].handoff_id,
+        "bbs-h10"
+    );
 }
 
 #[test]
@@ -185,6 +243,10 @@ fn an_attempted_handoff_is_unknown_after_a_restart_and_never_offered_again() {
     assert_eq!(c.handoff_id, "h2");
     assert_eq!(store.claim_outbound("conn-2", 30, seal).unwrap(), None);
     assert_eq!(store.claim_inbound(30).unwrap(), None);
+    // An unknown import is offered to BBS again when BBS reconnects (BBS
+    // answers already known if it has it); an unknown outbound send never.
+    assert_eq!(store.reoffer_inbound(30).unwrap(), 1);
+    assert_eq!(store.claim_inbound(31).unwrap().unwrap().handoff_id, "in-1");
     // An unknown handoff can still learn its result, without another try.
     assert!(
         store
@@ -241,7 +303,10 @@ fn duplicates_and_conflicts_store_nothing_new() {
             10,
         )
         .unwrap();
-    assert_eq!(dup, Intake::Duplicate);
+    let Intake::Duplicate(prior) = dup else {
+        panic!("{dup:?}");
+    };
+    assert_eq!(prior.state, "pending");
     let conflict = store
         .intake_outbound(
             "bbs-other",
@@ -254,11 +319,16 @@ fn duplicates_and_conflicts_store_nothing_new() {
         )
         .unwrap();
     assert_eq!(conflict, Intake::Conflict);
-    // A reused BBS handoff ID for another message conflicts too.
+    // A reused BBS handoff ID for another message, and the same handoff
+    // offered again.
     let reused = store
         .intake_outbound("bbs-h1", "h9", &origin("m2"), "hub", b"other", 1_000, 10)
         .unwrap();
-    assert_eq!(reused, Intake::Conflict);
+    assert_eq!(reused, Intake::HandoffReused);
+    let repeated = store
+        .intake_outbound("bbs-h1", "h9", &origin("m1"), "hub", b"bytes 1", 1_000, 10)
+        .unwrap();
+    assert!(matches!(repeated, Intake::Repeated(p) if p.state == "pending"));
 
     let inbound = |id: &str, bytes: &[u8]| {
         store
@@ -275,7 +345,7 @@ fn duplicates_and_conflicts_store_nothing_new() {
             .unwrap()
     };
     assert_eq!(inbound("x", b"one"), Intake::New);
-    assert_eq!(inbound("x", b"one"), Intake::Duplicate);
+    assert!(matches!(inbound("x", b"one"), Intake::Duplicate(_)));
     assert_eq!(inbound("x", b"two"), Intake::Conflict);
     assert_eq!(
         store.counts(Direction::Outbound).unwrap(),
@@ -326,6 +396,37 @@ fn pending_work_past_its_deadline_is_rejected_as_expired() {
     assert_eq!(
         (o.state.as_str(), o.reason.as_str()),
         ("rejected", "expired")
+    );
+    // Its result is owed to that relay stream only.
+    assert!(store.relay_unreported("conn-2", 0, 10).unwrap().is_empty());
+    let owed = store.relay_unreported("conn-1", 0, 10).unwrap();
+    assert_eq!(owed.len(), 1);
+    store.mark_relay_reported(owed[0].id).unwrap();
+    assert!(store.relay_unreported("conn-1", 0, 10).unwrap().is_empty());
+}
+
+/// Sent work with no result by its deadline becomes unknown; settled rows
+/// go once retention allows.
+#[test]
+fn sent_work_lapses_and_settled_work_is_purged() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(&dir);
+    outbound(&store, 1, 100);
+    outbound(&store, 2, 1_000);
+    let c = store.claim_outbound("conn-1", 20, seal).unwrap().unwrap();
+    store.mark_sent(Direction::Outbound, c.id, 21).unwrap();
+    assert_eq!(store.lapse(Direction::Outbound, 99).unwrap(), 0);
+    assert_eq!(store.lapse(Direction::Outbound, 100).unwrap(), 1);
+    assert_eq!(
+        store.state(Direction::Outbound, c.id).unwrap().unwrap(),
+        ("unknown".into(), "no_result_by_deadline".into())
+    );
+    // Settled at 100; the pending row is never purged.
+    assert_eq!(store.purge_settled(100, 200).unwrap(), (0, 0));
+    assert_eq!(store.purge_settled(101, 200).unwrap(), (1, 0));
+    assert_eq!(
+        store.counts(Direction::Outbound).unwrap(),
+        vec![("pending".into(), 1)]
     );
 }
 
@@ -421,9 +522,14 @@ fn catalogs_only_move_forward() {
         revision,
         entities: Vec::new(),
     };
-    assert!(store.put_catalog(&catalog(3), 1).unwrap());
-    assert!(!store.put_catalog(&catalog(3), 1).unwrap());
-    assert!(!store.put_catalog(&catalog(2), 1).unwrap());
-    assert!(store.put_catalog(&catalog(4), 1).unwrap());
+    assert!(store.put_catalog(&catalog(3), true, 1).unwrap());
+    assert!(!store.put_catalog(&catalog(3), false, 1).unwrap());
+    assert!(!store.put_catalog(&catalog(2), false, 1).unwrap());
+    assert!(store.put_catalog(&catalog(4), false, 1).unwrap());
     assert_eq!(store.catalog_revision().unwrap(), Some(4));
+    // A new stream's snapshot is taken whatever its revision: BBS's
+    // database may have been reset.
+    assert!(store.put_catalog(&catalog(1), true, 2).unwrap());
+    assert_eq!(store.catalog_revision().unwrap(), Some(1));
+    assert!(store.put_catalog(&catalog(2), false, 2).unwrap());
 }

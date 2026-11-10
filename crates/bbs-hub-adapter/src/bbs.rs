@@ -1,14 +1,17 @@
 //! The integration stream to BBS (`bbs.integration.v1`, D085): the adapter
 //! connects with its integration credential, exchanges hellos, and then
 //!
-//! - keeps BBS's publication catalog (its revision only grows);
+//! - keeps BBS's publication catalog (its revision only grows on a stream;
+//!   each stream's first catalog is taken as is, so a reset BBS is followed);
 //! - takes BBS's outbound handoffs, checks them, and stores them for the
 //!   relay; the relay's result goes back to BBS as the handoff's result.
 //!   Every result owed to BBS is stored until the transport takes it, and
 //!   sent again on the next stream if it did not; BBS keeps the first
 //!   result for a handoff and ignores any other;
-//! - offers verified messages from Hub to BBS as imports, one at a time,
-//!   claimed before they are queued; BBS's result goes back to the relay;
+//! - offers verified messages from Hub to BBS as imports, each claimed
+//!   before it is queued (up to [`QUEUE`] at once); BBS's result goes back
+//!   to the relay on the stream the message came on. Imports sent to an
+//!   earlier stream, whose results were lost with it, are offered again;
 //! - asks BBS to answer Hub's directory queries for this namespace.
 
 use std::sync::{Arc, PoisonError};
@@ -20,12 +23,12 @@ use bbs_core::hub_proto::integration::integration_client::IntegrationClient;
 use bbs_core::hub_proto::msgproto_v1 as mp;
 use pb::adapter_frame::Payload as Out;
 use pb::bbs_frame::Payload as In;
-use tonic::Request;
 use tonic::transport::Endpoint;
+use tonic::{Code, Request, Status};
 
-use crate::adapter::{Shared, bounded, code};
+use crate::adapter::{Shared, bounded, code, handoff_result};
 use crate::link::{self, Claim, Item};
-use crate::store::{Direction, Intake};
+use crate::store::{Direction, Intake, Outcome};
 use crate::verify::{self, Reason, reason};
 use crate::{new_id, now_micros, wire};
 
@@ -33,8 +36,8 @@ use crate::{new_id, now_micros, wire};
 pub const PROTOCOL_MAJOR: u32 = 1;
 /// The gRPC metadata carrying the integration credential.
 pub const TOKEN_METADATA: &str = "bbs-integration-token";
-/// Frames queued for BBS before senders wait.
-const QUEUE: usize = 16;
+/// Imports queued for BBS before dispatch waits.
+pub const QUEUE: usize = 16;
 
 /// A BBS this adapter cannot serve: retrying cannot help.
 #[derive(Debug)]
@@ -56,17 +59,52 @@ fn frame(payload: Out) -> pb::AdapterFrame {
 
 /// Keep a stream to BBS, reconnecting with backoff. Returns only for a BBS
 /// this adapter cannot serve.
+///
+/// When BBS refuses the credential, its file is read again (an operator may
+/// have rotated it). When BBS ends the stream as superseded, another adapter
+/// has connected with the same integration: this one waits the longest
+/// backoff before trying again, so the two do not take turns knocking each
+/// other off.
 pub(crate) async fn run(shared: Arc<Shared>) -> Result<()> {
     let mut backoff = shared.opts.backoff_min;
+    let mut token = shared.s.token.clone();
     loop {
         let start = Instant::now();
-        match session(&shared).await {
-            Ok(()) => tracing::info!("BBS stream ended"),
-            Err(err) if err.downcast_ref::<Incompatible>().is_some() => return Err(err),
-            Err(err) => tracing::warn!(bbs = shared.s.bbs_endpoint, "BBS stream: {err:#}"),
-        }
+        let ended = session(&shared, &token).await;
         if start.elapsed() > Duration::from_secs(60) {
             backoff = shared.opts.backoff_min;
+        }
+        match ended {
+            Ok(()) => tracing::info!("BBS stream ended"),
+            Err(err) if err.downcast_ref::<Incompatible>().is_some() => return Err(err),
+            Err(err) => match err.downcast_ref::<Status>().map(Status::code) {
+                Some(Code::Unauthenticated) => {
+                    tracing::error!(
+                        bbs = shared.s.bbs_endpoint,
+                        "BBS refused the integration credential: {err:#}"
+                    );
+                    if let Some(path) = &shared.s.token_file {
+                        match crate::keys::read_token(path) {
+                            Ok(t) if t != token => {
+                                tracing::info!("read a new integration credential");
+                                token = t;
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::error!("reading the integration credential: {e:#}"),
+                        }
+                    }
+                }
+                Some(Code::Aborted) => {
+                    tracing::error!(
+                        integration = shared.s.integration_id,
+                        "BBS ended this stream for a newer one with the same integration: \
+                         is another adapter running for it? Waiting {:?} before trying again",
+                        shared.opts.backoff_max
+                    );
+                    backoff = shared.opts.backoff_max;
+                }
+                _ => tracing::warn!(bbs = shared.s.bbs_endpoint, "BBS stream: {err:#}"),
+            },
         }
         let half = backoff / 2;
         let jitter = Duration::from_micros(rand::random_range(0..=half.as_micros() as u64));
@@ -75,7 +113,7 @@ pub(crate) async fn run(shared: Arc<Shared>) -> Result<()> {
     }
 }
 
-async fn session(shared: &Arc<Shared>) -> Result<()> {
+async fn session(shared: &Arc<Shared>, token: &str) -> Result<()> {
     let channel = Endpoint::from_shared(shared.s.bbs_endpoint.clone())?
         .connect_timeout(Duration::from_secs(10))
         .http2_keep_alive_interval(Duration::from_secs(20))
@@ -85,7 +123,7 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
         .await
         .context("connecting")?;
     let (tx, frames) = link::channel::<pb::AdapterFrame>(QUEUE, shared.settle());
-    tx.try_send(frame(Out::Hello(pb::AdapterHello {
+    let _ = tx.try_send_control(frame(Out::Hello(pb::AdapterHello {
         integration_id: shared.s.integration_id.clone(),
         protocol_major: PROTOCOL_MAJOR,
         build: crate::build(),
@@ -94,14 +132,11 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
         .max_decoding_message_size(wire::MAX_FRAME)
         .max_encoding_message_size(wire::MAX_FRAME);
     let mut req = Request::new(frames);
-    req.metadata_mut().insert(
-        TOKEN_METADATA,
-        shared
-            .s
-            .token
-            .parse()
-            .map_err(|_| anyhow::anyhow!("the integration credential is not valid metadata"))?,
-    );
+    let mut value: tonic::metadata::MetadataValue<_> = token
+        .parse()
+        .map_err(|_| anyhow::anyhow!("the integration credential is not valid metadata"))?;
+    value.set_sensitive(true);
+    req.metadata_mut().insert(TOKEN_METADATA, value);
     let result = async {
         let mut inbound = client
             .connect(req)
@@ -122,6 +157,15 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
             "BBS connected"
         );
         *shared.bbs.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx.clone());
+        let reoffered = shared.store().reoffer_inbound(now_micros());
+        match reoffered {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                imports = n,
+                "offering again imports whose results were lost with an earlier stream"
+            ),
+            Err(err) => tracing::error!("re-offering imports: {err:#}"),
+        }
         shared.bbs_kick.notify_one();
         tokio::select! {
             r = read(shared, &tx, inbound) => r,
@@ -170,11 +214,12 @@ async fn read(
     tx: &link::Sender<pb::AdapterFrame>,
     mut inbound: tonic::Streaming<pb::BbsFrame>,
 ) -> Result<()> {
+    let mut snapshot = true;
     while let Some(f) = inbound.message().await? {
         let reply = match f.payload {
             Some(In::Hello(_)) => bail!("BBS repeated its hello"),
             Some(In::Published(catalog)) => {
-                on_catalog(shared, &catalog);
+                on_catalog(shared, &catalog, std::mem::take(&mut snapshot));
                 None
             }
             Some(In::Outgoing(offer)) => {
@@ -208,7 +253,7 @@ async fn read(
             }
         };
         if let Some(reply) = reply {
-            let Some(permit) = tx.reserve().await else {
+            let Some(permit) = tx.reserve_control().await else {
                 return Ok(());
             };
             if permit
@@ -225,9 +270,10 @@ async fn read(
     Ok(())
 }
 
-/// Keep a newer publication catalog. Its entities must all be in this
-/// namespace; one that is not is ignored whole.
-fn on_catalog(shared: &Shared, catalog: &pb::PublishedCatalog) {
+/// Keep a newer publication catalog, or a stream's first (`snapshot`)
+/// whatever its revision. Its entities must all be in this namespace; one
+/// that is not is ignored whole.
+fn on_catalog(shared: &Shared, catalog: &pb::PublishedCatalog, snapshot: bool) {
     let foreign = catalog.entities.iter().find(|d| {
         d.entity
             .as_ref()
@@ -240,7 +286,18 @@ fn on_catalog(shared: &Shared, catalog: &pb::PublishedCatalog) {
         );
         return;
     }
-    match shared.store().put_catalog(catalog, now_micros()) {
+    let before = shared.store().catalog_revision().ok().flatten();
+    let kept = shared.store().put_catalog(catalog, snapshot, now_micros());
+    if let (Ok(true), Some(b)) = (&kept, before)
+        && catalog.revision < b
+    {
+        tracing::warn!(
+            was = b,
+            now = catalog.revision,
+            "BBS's catalog revision went back (was its database reset?); taking its snapshot"
+        );
+    }
+    match kept {
         Ok(true) => tracing::info!(
             revision = catalog.revision,
             entities = catalog.entities.len(),
@@ -333,15 +390,44 @@ fn on_outgoing(shared: &Shared, offer: &pb::MessageOffer) -> Option<pb::HandoffR
             reason(verify::EXPIRED, "the delivery deadline has passed"),
         ));
     }
-    match shared
+    let intake = shared
         .store()
-        .intake_outbound(id, &new_id(), &origin, &to, bytes, expires, now)
-    {
+        .intake_outbound(id, &new_id(), &origin, &to, bytes, expires, now);
+    match intake {
         Ok(Intake::New) => {
             tracing::info!(handoff = id, to, "took a remote send");
             None
         }
-        Ok(Intake::Duplicate) => Some(pb::HandoffResult {
+        // The same handoff offered again: its result, if it has one, is
+        // reported again; otherwise the relay's follows.
+        Ok(Intake::Repeated(prior)) => prior.settled().then(|| {
+            handoff_result(&Outcome {
+                id: prior.id,
+                handoff_id: id.clone(),
+                connection: String::new(),
+                state: prior.state,
+                reason: prior.reason,
+                detail: prior.detail,
+            })
+        }),
+        // A handoff ID BBS used before, for another message: no result can
+        // be given under that ID without settling the first one.
+        Ok(Intake::HandoffReused) => {
+            tracing::error!(
+                handoff = id,
+                "BBS reused a handoff ID for a different message; ignoring the offer"
+            );
+            None
+        }
+        // The same message under a new handoff ID: answered as the first
+        // was, rejected if it was, else already known.
+        Ok(Intake::Duplicate(prior)) if prior.state == "rejected" => Some(pb::HandoffResult {
+            handoff_id: id.clone(),
+            disposition: pb::HandoffDisposition::Rejected as i32,
+            reason: code(&prior.reason),
+            detail: bounded(&prior.detail, 1024),
+        }),
+        Ok(Intake::Duplicate(_)) => Some(pb::HandoffResult {
             handoff_id: id.clone(),
             disposition: pb::HandoffDisposition::AlreadyKnown as i32,
             ..Default::default()
@@ -381,10 +467,10 @@ fn owe(shared: &Shared, r: pb::HandoffResult) -> Option<pb::HandoffResult> {
     } else {
         ("rejected", r.reason.as_str())
     };
-    match shared
+    let owed = shared
         .store()
-        .owe_report(&r.handoff_id, state, why, &r.detail, now_micros())
-    {
+        .owe_report(&r.handoff_id, state, why, &r.detail, None, now_micros());
+    match owed {
         Ok(()) => {
             shared.report_kick.notify_one();
             None
@@ -396,9 +482,10 @@ fn owe(shared: &Shared, r: pb::HandoffResult) -> Option<pb::HandoffResult> {
     }
 }
 
-/// Report results owed to BBS in order. Each stays owed until the
-/// transport takes its frame; one still queued when the stream closes is
-/// reported again on the next.
+/// Report results for BBS in order, on control slots. Each stays owed until
+/// the transport takes its frame; one still queued when the stream closes,
+/// or taken shortly before it ended, is reported again on the next. The
+/// cursor only moves forward on a stream, and report IDs are never reused.
 async fn report(shared: &Arc<Shared>, tx: &link::Sender<pb::AdapterFrame>) -> Result<()> {
     let mut after = 0;
     loop {
@@ -411,11 +498,11 @@ async fn report(shared: &Arc<Shared>, tx: &link::Sender<pb::AdapterFrame>) -> Re
             continue;
         }
         for o in owed {
-            let Some(permit) = tx.reserve().await else {
+            let Some(permit) = tx.reserve_control().await else {
                 return Ok(());
             };
             let item = Item {
-                frame: frame(Out::OutgoingResult(crate::adapter::handoff_result(&o))),
+                frame: frame(Out::OutgoingResult(handoff_result(&o))),
                 claim: Some(Claim::Report(o.id)),
             };
             if permit.send(item).is_err() {
@@ -451,18 +538,18 @@ fn on_incoming_result(shared: &Shared, r: &pb::HandoffResult) {
     } else {
         String::new()
     };
-    match shared
+    let recorded = shared
         .store()
-        .inbound_result(&r.handoff_id, state, &why, &detail, now_micros())
-    {
-        Ok(Some(outcome)) => {
+        .inbound_result(&r.handoff_id, state, &why, &detail, now_micros());
+    match recorded {
+        Ok(Some(_)) => {
             tracing::info!(
                 handoff = r.handoff_id,
                 state,
                 reason = why,
                 "BBS answered an import"
             );
-            shared.report_inbound(&outcome);
+            shared.relay_report_kick.notify_one();
         }
         Ok(None) => tracing::debug!(
             handoff = r.handoff_id,
@@ -472,15 +559,16 @@ fn on_incoming_result(shared: &Shared, r: &pb::HandoffResult) {
     }
 }
 
-/// Offer pending imports to BBS one at a time: wait for room, claim the
-/// oldest (committed as attempted), then queue it. It becomes sent when the
-/// transport takes it.
+/// Offer pending imports to BBS: wait for room (up to [`QUEUE`] queued),
+/// claim the oldest (committed as attempted), then queue it. It becomes
+/// sent when the transport takes it.
 async fn dispatch(shared: &Arc<Shared>, tx: &link::Sender<pb::AdapterFrame>) -> Result<()> {
     loop {
         let Some(permit) = tx.reserve().await else {
             return Ok(());
         };
-        let claimed = shared.store().claim_inbound(now_micros())?;
+        let claimed = shared.store().claim_inbound(now_micros());
+        let claimed = claimed?;
         let Some(c) = claimed else {
             drop(permit);
             tokio::select! {
@@ -525,6 +613,7 @@ mod tests {
                 bbs_endpoint: "http://127.0.0.1:1".into(),
                 relay_endpoint: "http://127.0.0.1:1".into(),
                 token: "t".into(),
+                token_file: None,
                 key: SigningKey::from_bytes(&[4; 32]),
                 credential: mp::SignedRecord::default(),
             },
@@ -652,11 +741,56 @@ mod tests {
         );
     }
 
+    /// One BBS stream as the reporter sees it: a link and its reporting
+    /// loop, whose frames the test takes as a transport would.
+    struct Stream {
+        tx: link::Sender<pb::AdapterFrame>,
+        frames: link::Frames<pb::AdapterFrame>,
+        reporter: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    impl Stream {
+        fn open(s: &Arc<Shared>) -> Stream {
+            let (tx, frames) = link::channel::<pb::AdapterFrame>(QUEUE, s.settle());
+            let reporter = tokio::spawn({
+                let (s, tx) = (s.clone(), tx.clone());
+                async move { report(&s, &tx).await }
+            });
+            Stream {
+                tx,
+                frames,
+                reporter,
+            }
+        }
+
+        async fn take(&mut self, s: &Shared) -> pb::HandoffResult {
+            use tokio_stream::StreamExt as _;
+            let taken = tokio::time::timeout(Duration::from_secs(5), self.frames.next())
+                .await
+                .expect("a result in time")
+                .unwrap();
+            s.apply_boundary();
+            match taken.payload {
+                Some(Out::OutgoingResult(r)) => r,
+                other => panic!("a result, not {other:?}"),
+            }
+        }
+
+        /// Drop the stream as a transport would, whatever is queued.
+        fn drop_stream(self, s: &Shared) {
+            self.reporter.abort();
+            drop(self.frames);
+            s.apply_boundary();
+            assert!(self.tx.is_closed());
+        }
+    }
+
     /// A result still queued when its stream drops is owed, and the next
-    /// stream reports it; one the transport took is owed no longer.
-    #[tokio::test]
+    /// stream reports it; one the transport took is owed no longer. Then
+    /// Theo's repro (C1): after the first result is taken, a second one on
+    /// the same stream is sent too.
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_result_queued_when_the_stream_drops_is_reported_on_the_next() {
-        use tokio_stream::StreamExt as _;
         let dir = tempfile::tempdir().unwrap();
         let a = adapter(&dir);
         let s = &a.shared;
@@ -664,35 +798,145 @@ mod tests {
         late.expires_at_unix_micros = Some(now_micros() - 1);
         let refused = on_outgoing(s, &offer("h1", late.encode_to_vec())).unwrap();
         assert!(owe(s, refused).is_none(), "stored, not sent at once");
-        let owed = || s.store().unreported(0, 10).unwrap().len();
+        let owed = || s.store().owed_reports().unwrap();
         assert_eq!(owed(), 1);
 
         // The first stream queues it, then drops before the transport takes it.
-        let (tx, frames) = link::channel::<pb::AdapterFrame>(QUEUE, s.settle());
-        let _ = tokio::time::timeout(Duration::from_millis(300), report(s, &tx)).await;
-        drop(frames);
-        assert!(tx.is_closed());
+        let first = Stream::open(s);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!first.tx.is_idle(), "queued");
+        first.drop_stream(s);
         assert_eq!(owed(), 1, "still owed");
 
         // The next stream reports it again; taken, it is owed no longer.
-        let (tx, mut frames) = link::channel::<pb::AdapterFrame>(QUEUE, s.settle());
-        let taken = tokio::select! {
-            r = report(s, &tx) => panic!("reporting stopped: {r:?}"),
-            f = frames.next() => f.unwrap(),
-        };
-        let Some(Out::OutgoingResult(r)) = taken.payload else {
-            panic!("a result, not {taken:?}");
-        };
+        let mut second = Stream::open(s);
+        let r = second.take(s).await;
         assert_eq!(
             (r.handoff_id.as_str(), r.disposition, r.reason.as_str()),
             ("h1", pb::HandoffDisposition::Rejected as i32, "expired")
         );
         assert_eq!(owed(), 0);
 
+        // The same stream: a second result, owed after the first was taken.
+        let mut known = message("m2");
+        known.expires_at_unix_micros = Some(now_micros() - 1);
+        let refused = on_outgoing(s, &offer("h2", known.encode_to_vec())).unwrap();
+        assert!(owe(s, refused).is_none());
+        assert_eq!(second.take(s).await.handoff_id, "h2");
+        assert_eq!(owed(), 0);
+        second.drop_stream(s);
+
+        // A new stream sends both again (taken recently: BBS may have ended
+        // the old stream before acting on them; it ignores repeats).
+        let mut third = Stream::open(s);
+        assert_eq!(third.take(s).await.handoff_id, "h1");
+        assert_eq!(third.take(s).await.handoff_id, "h2");
+        third.drop_stream(s);
+
         // An invalid handoff ID, which BBS refuses on any stream, is not kept.
         let bad = on_outgoing(s, &offer("bad id!", vec![])).unwrap();
         assert!(owe(s, bad).is_some());
         assert_eq!(owed(), 0);
+    }
+
+    /// Theo's repro (C2): import results recorded while a transport keeps
+    /// taking claims from a link must not deadlock (the store is never taken
+    /// inside a queue lock, nor a queue lock inside the store's).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn results_and_a_polling_transport_never_deadlock() {
+        use tokio_stream::StreamExt as _;
+        const N: usize = 3000;
+        let dir = tempfile::tempdir().unwrap();
+        let a = adapter(&dir);
+        let s = a.shared.clone();
+        {
+            let mut store = s.store();
+            for n in 0..N {
+                store
+                    .intake_inbound(
+                        &format!("in-{n}"),
+                        &format!("relay-{n}"),
+                        "conn-1",
+                        &mp::MessageRef {
+                            namespace: "hub".into(),
+                            message_id: format!("m{n}"),
+                        },
+                        b"m",
+                        b"e",
+                        now_micros() + 60_000_000,
+                        now_micros(),
+                    )
+                    .unwrap();
+                store.claim_inbound(now_micros()).unwrap().unwrap();
+            }
+        }
+        let (tx, mut frames) = link::channel::<Vec<u8>>(64, s.settle());
+        let run = async {
+            let transport = tokio::spawn(async move {
+                let mut n = 0;
+                while frames.next().await.is_some() {
+                    n += 1;
+                }
+                n
+            });
+            let applier = tokio::spawn({
+                let s = s.clone();
+                async move {
+                    loop {
+                        s.apply_boundary();
+                        tokio::task::yield_now().await;
+                    }
+                }
+            });
+            let queuing = tokio::spawn({
+                let tx = tx.clone();
+                async move {
+                    for id in 1..=N as i64 {
+                        let permit = tx.reserve_control().await.unwrap();
+                        let item = Item {
+                            frame: vec![0; 8],
+                            claim: Some(Claim::RelayResult(id)),
+                        };
+                        assert!(permit.send(item).is_ok());
+                    }
+                }
+            });
+            let answering = tokio::task::spawn_blocking({
+                let s = s.clone();
+                move || {
+                    for n in 0..N {
+                        on_incoming_result(
+                            &s,
+                            &pb::HandoffResult {
+                                handoff_id: format!("in-{n}"),
+                                disposition: pb::HandoffDisposition::Received as i32,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+            });
+            queuing.await.unwrap();
+            answering.await.unwrap();
+            while !tx.is_idle() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tx.close();
+            let taken = transport.await.unwrap();
+            applier.abort();
+            taken
+        };
+        let taken = tokio::time::timeout(Duration::from_secs(60), run)
+            .await
+            .expect("no deadlock");
+        assert_eq!(taken, N);
+        s.apply_boundary();
+        let store = s.store();
+        assert_eq!(
+            store.counts(Direction::Inbound).unwrap(),
+            vec![("received".to_string(), N as i64)]
+        );
+        assert!(store.relay_unreported("conn-1", 0, 10).unwrap().is_empty());
     }
 
     #[test]

@@ -97,6 +97,15 @@ pub fn small_order(key: &[u8]) -> bool {
     VerifyingKey::from_bytes(key).is_ok_and(|k| k.is_weak())
 }
 
+/// Whether `key` is a usable Ed25519 public key: 32 bytes, a point, and not
+/// of small order.
+pub fn usable_key(key: &[u8]) -> bool {
+    <&[u8; 32]>::try_from(key)
+        .ok()
+        .and_then(|k| VerifyingKey::from_bytes(k).ok())
+        .is_some_and(|k| !k.is_weak())
+}
+
 /// Check a record's framing and signature and that it has the expected
 /// kind, in Hub's order. It does not decide whether the signer is
 /// authorized.

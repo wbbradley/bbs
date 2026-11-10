@@ -261,6 +261,15 @@ impl Relay {
 
     /// Take the next stream through hello, trust and route registration.
     async fn accept(&mut self) -> Peer {
+        let mut peer = self.open().await;
+        peer.trust().await;
+        let claim = peer.route().await;
+        peer.route_result(claim, true).await;
+        peer
+    }
+
+    /// Take the next stream through the hellos.
+    async fn open(&mut self) -> Peer {
         let (rx, tx) = timeout(WAIT, self.conns.recv())
             .await
             .expect("the adapter connects")
@@ -287,34 +296,6 @@ impl Relay {
             (1, "bbs-1")
         );
         peer.hello = hello;
-        let F::TrustQuery(q) = peer.next().await else {
-            panic!("trust is refreshed before the route is claimed");
-        };
-        peer.send(F::TrustPage(mp::TrustPage {
-            query_id: q.query_id,
-            bindings: vec![binding("hub", HUB_AUTHORITY), binding("bbs", BBS_AUTHORITY)],
-            ..Default::default()
-        }))
-        .await;
-        let F::RegisterRoute(reg) = peer.next().await else {
-            panic!("then the route is claimed");
-        };
-        let claim_rec = reg.claim.unwrap();
-        sign::verify(&claim_rec, mp::RecordKind::RouteClaim).unwrap();
-        let claim = mp::RouteClaim::decode(claim_rec.payload.as_slice()).unwrap();
-        assert_eq!(claim.namespace, "bbs");
-        assert_eq!(claim.connection_id, peer.hello.connection_id);
-        assert_eq!(
-            reg.credential.unwrap(),
-            credential(BBS_AUTHORITY, "bbs", "bbs-1", BBS_INSTALLATION)
-        );
-        peer.send(F::RouteResult(mp::RouteResult {
-            claim_id: claim.claim_id,
-            namespace: "bbs".into(),
-            accepted: true,
-            ..Default::default()
-        }))
-        .await;
         peer
     }
 }
@@ -324,6 +305,57 @@ fn frame(p: F) -> mp::FederationFrame {
 }
 
 impl Peer {
+    /// Answer the trust query that opens every stream.
+    async fn trust(&mut self) {
+        let F::TrustQuery(q) = self.next().await else {
+            panic!("trust is refreshed before the route is claimed");
+        };
+        self.send(F::TrustPage(mp::TrustPage {
+            query_id: q.query_id,
+            bindings: vec![binding("hub", HUB_AUTHORITY), binding("bbs", BBS_AUTHORITY)],
+            ..Default::default()
+        }))
+        .await;
+    }
+
+    /// Read the route claim, checked.
+    async fn route(&mut self) -> mp::RouteClaim {
+        let F::RegisterRoute(reg) = self.next().await else {
+            panic!("then the route is claimed");
+        };
+        let claim_rec = reg.claim.unwrap();
+        sign::verify(&claim_rec, mp::RecordKind::RouteClaim).unwrap();
+        let claim = mp::RouteClaim::decode(claim_rec.payload.as_slice()).unwrap();
+        assert_eq!(claim.namespace, "bbs");
+        assert_eq!(claim.connection_id, self.hello.connection_id);
+        assert_eq!(
+            reg.credential.unwrap(),
+            credential(BBS_AUTHORITY, "bbs", "bbs-1", BBS_INSTALLATION)
+        );
+        claim
+    }
+
+    async fn route_result(&self, claim: mp::RouteClaim, accepted: bool) {
+        self.send(F::RouteResult(mp::RouteResult {
+            claim_id: claim.claim_id,
+            namespace: "bbs".into(),
+            accepted,
+            error_code: if accepted { "" } else { "route_conflict" }.into(),
+            ..Default::default()
+        }))
+        .await;
+    }
+
+    /// The next frame, heartbeats included; None when the stream ends.
+    async fn next_any(&mut self) -> Option<F> {
+        timeout(WAIT, self.rx.message())
+            .await
+            .expect("a frame in time")
+            .ok()
+            .flatten()
+            .map(|f| f.payload.expect("a payload"))
+    }
+
     /// The next frame that is not a heartbeat.
     async fn next(&mut self) -> F {
         loop {
@@ -416,6 +448,8 @@ fn options() -> Options {
         backoff_max: Duration::from_millis(400),
         sweep: Duration::from_millis(200),
         poll: Duration::from_millis(100),
+        retention: None,
+        drain: Duration::from_secs(2),
     }
 }
 
@@ -427,6 +461,7 @@ fn settings(bbs: SocketAddr, relay: SocketAddr, token: &str, namespace: &str) ->
         bbs_endpoint: format!("http://{bbs}"),
         relay_endpoint: format!("http://{relay}"),
         token: token.into(),
+        token_file: None,
         key: key(BBS_INSTALLATION),
         credential: credential(BBS_AUTHORITY, "bbs", "bbs-1", BBS_INSTALLATION),
     }
@@ -439,7 +474,11 @@ struct Running {
 
 impl Running {
     fn start(settings: Settings, store: &std::path::Path) -> Running {
-        let adapter = Adapter::open(settings, store, options()).unwrap();
+        Running::start_with(settings, store, options())
+    }
+
+    fn start_with(settings: Settings, store: &std::path::Path, opts: Options) -> Running {
+        let adapter = Adapter::open(settings, store, opts).unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(adapter.run(async {
             let _ = stopped.await;
@@ -830,15 +869,18 @@ async fn an_attempted_send_is_not_replayed_after_a_restart() {
     adapter.stop().await.unwrap();
 }
 
-/// An import queued for BBS whose stream ends before the transport takes it
-/// provably never left: it is offered again, once, on the next stream. One
-/// left attempted by a stop is unknown and never offered again.
+/// Imports whose results were lost with a stream are offered again when BBS
+/// connects, and BBS imports each once: one a stop left attempted (unknown
+/// after the restart) and one sent to an earlier stream that ended before
+/// BBS answered. Pending work goes as usual; once all are settled, a new BBS
+/// stream offers nothing. (An import still queued when its stream ends is
+/// returned to pending by the link; see link.rs's tests.)
 #[tokio::test(flavor = "multi_thread")]
-async fn imports_follow_the_same_boundary() {
+async fn imports_lost_with_a_stream_are_offered_again() {
     let mut w = World::new().await;
     {
         let mut store = Store::open(&w.store, 1).unwrap();
-        for n in 1..=2 {
+        for n in 1..=3 {
             let bytes = hub_message(&format!("msg-{n}"), "will/scout", "hi").encode_to_vec();
             let origin = mp::MessageRef {
                 namespace: "hub".into(),
@@ -857,30 +899,48 @@ async fn imports_follow_the_same_boundary() {
                 )
                 .unwrap();
         }
+        // in-1: attempted when the last run stopped.
         store.claim_inbound(2).unwrap().unwrap();
+        // in-2: pending. in-3: sent to a stream that then ended.
+        let c = store.claim_inbound(3).unwrap().unwrap();
+        assert_eq!(c.handoff_id, "in-2");
+        store.requeue(Direction::Inbound, c.id, 3).unwrap();
+        store.claim_inbound(4).unwrap().unwrap();
+        store.claim_inbound(4).unwrap().unwrap();
+        store.mark_sent(Direction::Inbound, 3, 5).unwrap();
     }
     let adapter = w.adapter();
     let _peer = w.relay.accept().await;
-    let bbs = &w.bbs;
-    eventually("the import known unsent reaches BBS", || {
-        bbs.imported("msg-2").is_some()
+    let store_path = w.store.clone();
+    eventually("BBS answers all three", || {
+        let s = Store::open_read_only(&store_path).unwrap();
+        s.counts(Direction::Inbound).unwrap() == vec![("received".to_string(), 3)]
     })
     .await;
-    tokio::time::sleep(QUIET).await;
-    assert!(
-        bbs.imported("msg-1").is_none(),
-        "the attempted import is not replayed"
-    );
+    let copies = |n: u32| -> i64 {
+        w.bbs
+            .db()
+            .query_row(
+                "SELECT count(*) FROM deliveries d JOIN messages m ON m.id = d.message_id \
+                 WHERE m.origin_namespace = 'hub' AND m.origin_message_id = ?1",
+                [format!("msg-{n}")],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    for n in 1..=3 {
+        assert_eq!(copies(n), 1, "msg-{n} is delivered once");
+    }
     adapter.stop().await.unwrap();
-    let store = w.store();
-    assert_eq!(
-        store.state(Direction::Inbound, 1).unwrap().unwrap().0,
-        "unknown"
-    );
-    assert_eq!(
-        store.state(Direction::Inbound, 2).unwrap().unwrap().0,
-        "received"
-    );
+
+    // A new run and BBS stream: everything is settled, nothing is offered.
+    let adapter = w.adapter();
+    let _peer = w.relay.accept().await;
+    tokio::time::sleep(QUIET).await;
+    for n in 1..=3 {
+        assert_eq!(copies(n), 1, "msg-{n} still once");
+    }
+    adapter.stop().await.unwrap();
 }
 
 /// Hub's directory queries for this namespace are answered with BBS's
@@ -1070,4 +1130,299 @@ async fn a_bbs_in_another_namespace_stops_the_adapter() {
         .expect("the adapter stops by itself")
         .unwrap_err();
     assert!(err.to_string().contains("namespace"), "{err}");
+}
+
+// ---- relay stream liveness, queues and shutdown ---------------------------------
+
+/// `n` remote sends as BBS would have handed them off, stored before the
+/// adapter starts (BBS itself stays offline in these tests).
+fn stored_sends(store: &std::path::Path, n: u32) {
+    stored_sends_of(store, n, 1);
+}
+
+/// As [`stored_sends`], with `body` bytes of body each.
+fn stored_sends_of(store: &std::path::Path, n: u32, body: usize) {
+    let store = Store::open(store, 1).unwrap();
+    for i in 1..=n {
+        let message = mp::Message {
+            id: Some(mp::MessageRef {
+                namespace: "bbs".into(),
+                message_id: format!("m{i}"),
+            }),
+            sender: address("bbs", "will/scout"),
+            recipient: address("hub", "ann"),
+            body: vec![b'x'; body],
+            ..hub_message("x", "ann", "x")
+        };
+        store
+            .intake_outbound(
+                &format!("bbs-h{i}"),
+                &format!("h{i}"),
+                message.id.as_ref().unwrap(),
+                "hub",
+                &message.encode_to_vec(),
+                now_micros() + 3_600_000_000,
+                1,
+            )
+            .unwrap();
+    }
+}
+
+fn quick(peer_timeout: Duration) -> Options {
+    Options {
+        heartbeat: Duration::from_millis(100),
+        peer_timeout,
+        reply_timeout: Duration::from_millis(500),
+        ..options()
+    }
+}
+
+/// Heartbeats go out on schedule, and a relay that sends nothing for the
+/// peer timeout is cut; the adapter reconnects.
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeats_flow_and_a_silent_relay_is_cut() {
+    let mut w = World::new().await;
+    let adapter = Running::start_with(
+        settings(free_addr(), w.relay.addr, "unused", "bbs"),
+        &w.store,
+        quick(Duration::from_millis(800)),
+    );
+    let mut peer = w.relay.accept().await;
+    let mut beats = 0;
+    let start = tokio::time::Instant::now();
+    while let Some(f) = peer.next_any().await {
+        if matches!(f, F::Heartbeat(_)) {
+            beats += 1;
+        }
+    }
+    // The stream ended: the adapter cut the silent relay.
+    assert!(beats >= 3, "{beats} heartbeats");
+    assert!(start.elapsed() < Duration::from_secs(5), "cut in time");
+    let _again = w.relay.accept().await;
+    adapter.stop().await.unwrap();
+}
+
+/// A relay that keeps sending heartbeats but stops reading is cut once
+/// frames have waited the peer timeout (Hub's watch does the same). The
+/// transfers its transport never took go on the next stream; none taken on
+/// the first is sent again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_that_stops_reading_is_cut_and_untaken_transfers_go_next_time() {
+    const SENDS: u32 = 100;
+    let mut w = World::new().await;
+    stored_sends(&w.store, SENDS);
+    let adapter = Running::start_with(
+        settings(free_addr(), w.relay.addr, "unused", "bbs"),
+        &w.store,
+        quick(Duration::from_millis(1500)),
+    );
+    let mut first = w.relay.open().await;
+    let conn1 = first.hello.connection_id.clone();
+    first.trust().await;
+    let claim = first.route().await;
+    // Before the route is accepted (so before any transfer is queued),
+    // provoke results bigger than the flow-control window, then stop
+    // reading for good while still heartbeating.
+    for i in 0..1200 {
+        first
+            .send(F::Transfer(mp::Transfer {
+                handoff_id: format!("{i}{}", "!".repeat(3000)),
+                envelope: None,
+            }))
+            .await;
+    }
+    first.route_result(claim, true).await;
+    let beating = tokio::spawn({
+        let tx = first.tx.clone();
+        async move {
+            let mut nonce = 0;
+            loop {
+                nonce += 1;
+                if tx
+                    .send(Ok(frame(F::Heartbeat(mp::Heartbeat { nonce }))))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    });
+    let mut second = timeout(Duration::from_secs(15), w.relay.accept())
+        .await
+        .expect("the adapter cut the stream and reconnected");
+    beating.abort();
+    drop(first);
+    let mut again = Vec::new();
+    while let Some(f) = second.quiet().await {
+        if let F::Transfer(t) = f {
+            again.push(t.handoff_id);
+        }
+    }
+    adapter.stop().await.unwrap();
+    let store = w.store();
+    let mut sent_first = 0;
+    let mut sent_second = 0;
+    for id in 1..=SENDS as i64 {
+        let state = store.state(Direction::Outbound, id).unwrap().unwrap().0;
+        assert_eq!(state, "sent", "send {id}");
+    }
+    let conn_of: Vec<String> = (1..=SENDS)
+        .map(|i| {
+            rusqlite::Connection::open(&w.store)
+                .unwrap()
+                .query_row(
+                    "SELECT connection_id FROM outbound WHERE handoff_id = ?1",
+                    [format!("h{i}")],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        })
+        .collect();
+    for (i, conn) in conn_of.iter().enumerate() {
+        let handoff = format!("h{}", i + 1);
+        if *conn == conn1 {
+            sent_first += 1;
+            assert!(!again.contains(&handoff), "{handoff} was sent twice");
+        } else {
+            sent_second += 1;
+            assert!(
+                again.contains(&handoff),
+                "{handoff} went on the second stream"
+            );
+        }
+    }
+    assert_eq!(again.len(), sent_second, "each once");
+    assert!(sent_second > 0, "some transfers waited for the next stream");
+    assert_eq!(sent_first + sent_second, SENDS as usize);
+}
+
+/// Heartbeats go ahead of a full transfer queue: while the relay reads
+/// slowly through many large transfers (so flow control paces the
+/// transport and the queue stays full), heartbeats keep arriving among
+/// them.
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeats_go_ahead_of_a_full_transfer_queue() {
+    const SENDS: u32 = 150;
+    let mut w = World::new().await;
+    stored_sends_of(&w.store, SENDS, 50_000);
+    let adapter = Running::start_with(
+        settings(free_addr(), w.relay.addr, "unused", "bbs"),
+        &w.store,
+        quick(Duration::from_secs(10)),
+    );
+    let mut peer = w.relay.accept().await;
+    let mut transfers = 0;
+    let mut beats_before_last = 0;
+    while transfers < SENDS {
+        match peer.next_any().await.expect("the stream stays up") {
+            F::Transfer(_) => {
+                transfers += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            F::Heartbeat(_) => beats_before_last += 1,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // 150 transfers at 10 ms take 1.5 s, most of it with the relay's window
+    // full: about 15 heartbeat intervals.
+    assert!(beats_before_last >= 5, "{beats_before_last} heartbeats");
+    adapter.stop().await.unwrap();
+}
+
+/// A trust change is refreshed until it applies: a refresh the relay does
+/// not answer is retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn trust_changes_are_retried_until_applied() {
+    let mut w = World::new().await;
+    let adapter = Running::start_with(
+        settings(free_addr(), w.relay.addr, "unused", "bbs"),
+        &w.store,
+        quick(Duration::from_secs(10)),
+    );
+    let mut peer = w.relay.accept().await;
+    peer.send(F::TrustChanged(mp::TrustChanged {
+        namespace: "lab".into(),
+    }))
+    .await;
+    let F::TrustQuery(q1) = peer.next().await else {
+        panic!("a trust query");
+    };
+    assert_eq!(q1.namespace, "lab");
+    // Unanswered: it times out and is asked again.
+    let F::TrustQuery(q2) = peer.next().await else {
+        panic!("the trust query again");
+    };
+    assert_ne!(q1.query_id, q2.query_id);
+    peer.send(F::TrustPage(mp::TrustPage {
+        query_id: q2.query_id,
+        bindings: vec![binding("lab", 9)],
+        ..Default::default()
+    }))
+    .await;
+    let path = w.store.clone();
+    eventually("the lab binding", || {
+        Store::open_read_only(&path)
+            .unwrap()
+            .binding("lab")
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    assert!(peer.quiet().await.is_none(), "no more queries once applied");
+    adapter.stop().await.unwrap();
+}
+
+/// A refused route claim ends the stream; the adapter reconnects and claims
+/// again, and work flows once a claim is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_route_claim_is_retried_on_a_new_stream() {
+    let mut w = World::new().await;
+    stored_sends(&w.store, 1);
+    let adapter = Running::start(
+        settings(free_addr(), w.relay.addr, "unused", "bbs"),
+        &w.store,
+    );
+    let mut first = w.relay.open().await;
+    first.trust().await;
+    let claim = first.route().await;
+    first.route_result(claim, false).await;
+    // Nothing is handed to a stream whose route was refused.
+    while let Some(f) = first.next_any().await {
+        assert!(matches!(f, F::Heartbeat(_)), "{f:?}");
+    }
+    let mut second = w.relay.accept().await;
+    let F::Transfer(t) = second.next().await else {
+        panic!("the send goes once the route is accepted");
+    };
+    assert_eq!(t.handoff_id, "h1");
+    adapter.stop().await.unwrap();
+}
+
+/// Stopping ends the relay session: status no longer shows a registered
+/// route, and the stream ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_ends_the_relay_session() {
+    let mut w = World::new().await;
+    let adapter = Running::start(
+        settings(free_addr(), w.relay.addr, "unused", "bbs"),
+        &w.store,
+    );
+    let mut peer = w.relay.accept().await;
+    let path = w.store.clone();
+    eventually("the route is registered", || {
+        Store::open_read_only(&path)
+            .unwrap()
+            .session()
+            .unwrap()
+            .is_some_and(|(_, _, ready, ended)| ready && !ended)
+    })
+    .await;
+    adapter.stop().await.unwrap();
+    let (_, _, _, ended) = w.store().session().unwrap().unwrap();
+    assert!(ended, "the session is recorded as ended");
+    while let Some(f) = peer.next_any().await {
+        assert!(matches!(f, F::Heartbeat(_)), "{f:?}");
+    }
 }

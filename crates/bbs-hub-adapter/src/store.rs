@@ -7,9 +7,16 @@
 //! before it is queued for a stream, becomes `sent` when the transport takes
 //! its frame, and `received`/`rejected` on an informative result. A claim
 //! still queued when its stream closes provably never left and returns to
-//! `pending`; everything else attempted becomes `unknown` at the next start
-//! and is never offered again. Settled rows never change, and nothing
-//! returns to pending once sent (triggers).
+//! `pending`; everything else attempted becomes `unknown` at the next start.
+//! Settled rows never change (triggers). An outbound handoff never returns
+//! to pending once sent; an import sent or unknown is offered to BBS again
+//! when BBS reconnects, which BBS answers as already known if it has it.
+//! Sent work with no result by its deadline becomes `unknown`.
+//!
+//! Retention: settled rows (received, rejected, unknown) are deleted a fixed
+//! time after they settle ([`Store::purge_settled`]); BBS keeps the messages
+//! themselves. Results owed to BBS are kept until a transport takes them,
+//! then for a short while to be sent again on a new stream.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -20,8 +27,6 @@ use anyhow::{Context as _, Result, bail};
 use bbs_core::hub_proto::msgproto_v1 as mp;
 use prost::Message as _;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
-
-use crate::verify::Credential;
 
 const SCHEMA: &str = r#"
 CREATE TABLE identity (
@@ -39,17 +44,6 @@ CREATE TABLE bindings (
     disabled INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
-CREATE TABLE credentials (
-    record_hash BLOB PRIMARY KEY,
-    namespace TEXT NOT NULL,
-    installation_id TEXT NOT NULL,
-    public_key BLOB NOT NULL,
-    assert_senders INTEGER NOT NULL,
-    host_namespace INTEGER NOT NULL,
-    record BLOB NOT NULL,
-    first_seen INTEGER NOT NULL
-);
-CREATE INDEX credentials_namespace ON credentials (namespace);
 CREATE TABLE revocations (
     namespace TEXT NOT NULL,
     public_key BLOB NOT NULL,
@@ -73,7 +67,7 @@ CREATE TABLE relay_session (
     ended_at INTEGER
 );
 CREATE TABLE outbound (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     bbs_handoff_id TEXT NOT NULL UNIQUE,
     handoff_id TEXT NOT NULL UNIQUE,
     origin_namespace TEXT NOT NULL,
@@ -94,17 +88,24 @@ CREATE TABLE outbound (
 );
 CREATE INDEX outbound_pending ON outbound (expires_at, id) WHERE state = 'pending';
 CREATE INDEX outbound_attempted ON outbound (id) WHERE state = 'attempted';
--- Results owed to BBS for its handoffs, until the transport takes them.
+CREATE INDEX outbound_sent ON outbound (expires_at) WHERE state = 'sent';
+CREATE INDEX outbound_settled ON outbound (updated_at)
+    WHERE state IN ('received', 'rejected', 'unknown');
+-- Results for BBS's handoffs: owed until a transport takes one (taken_at),
+-- then kept a while to send again on a new stream. AUTOINCREMENT: a
+-- stream's reporting cursor only moves forward, so IDs are never reused.
 CREATE TABLE reports (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     bbs_handoff_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('received', 'rejected')),
     reason TEXT NOT NULL,
     detail TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    expires_at INTEGER,
+    created_at INTEGER NOT NULL,
+    taken_at INTEGER
 );
 CREATE TABLE inbound (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     handoff_id TEXT NOT NULL UNIQUE,
     relay_handoff_id TEXT NOT NULL,
     relay_connection TEXT NOT NULL,
@@ -117,6 +118,8 @@ CREATE TABLE inbound (
         ('pending', 'attempted', 'sent', 'received', 'rejected', 'unknown')),
     reason TEXT,
     detail TEXT,
+    -- Whether BBS's result went to the relay stream it came on.
+    reported INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     attempted_at INTEGER,
     updated_at INTEGER NOT NULL,
@@ -124,22 +127,35 @@ CREATE TABLE inbound (
 );
 CREATE INDEX inbound_pending ON inbound (expires_at, id) WHERE state = 'pending';
 CREATE INDEX inbound_attempted ON inbound (id) WHERE state = 'attempted';
+CREATE INDEX inbound_sent ON inbound (expires_at) WHERE state IN ('sent', 'unknown');
+CREATE INDEX inbound_settled ON inbound (updated_at)
+    WHERE state IN ('received', 'rejected', 'unknown');
+CREATE INDEX inbound_unreported ON inbound (relay_connection, id)
+    WHERE reported = 0 AND state IN ('received', 'rejected');
 CREATE TRIGGER outbound_settled BEFORE UPDATE OF state ON outbound
 WHEN OLD.state IN ('received', 'rejected')
     OR (OLD.state IN ('sent', 'unknown') AND NEW.state IN ('pending', 'attempted'))
 BEGIN SELECT RAISE(ABORT, 'a handoff never returns to pending once sent, nor changes once settled'); END;
 CREATE TRIGGER inbound_settled BEFORE UPDATE OF state ON inbound
 WHEN OLD.state IN ('received', 'rejected')
-    OR (OLD.state IN ('sent', 'unknown') AND NEW.state IN ('pending', 'attempted'))
-BEGIN SELECT RAISE(ABORT, 'a handoff never returns to pending once sent, nor changes once settled'); END;
+    OR (OLD.state IN ('sent', 'unknown') AND NEW.state = 'attempted')
+BEGIN SELECT RAISE(ABORT, 'an import never changes once settled, and is re-offered only from pending'); END;
 "#;
 
 const VERSION: i64 = 1;
 
 /// Owe BBS an outbound row's result (`?2` is now); the caller adds the row
 /// filter.
-const OWE_REPORT: &str = "INSERT INTO reports (bbs_handoff_id, state, reason, detail, created_at)
-     SELECT bbs_handoff_id, state, coalesce(reason, ''), coalesce(detail, ''), ?2 FROM outbound";
+const OWE_REPORT: &str = "INSERT INTO reports (bbs_handoff_id, state, reason, detail, expires_at,
+         created_at)
+     SELECT bbs_handoff_id, state, coalesce(reason, ''), coalesce(detail, ''), expires_at, ?2
+     FROM outbound";
+
+/// How long a result BBS's stream took is kept, to send again on a new
+/// stream should BBS have ended the old one before acting on it (BBS keeps a
+/// handoff's first result and ignores repeats). Never past the handoff's
+/// deadline.
+pub const REPORT_KEEP_MICROS: i64 = 3_600_000_000;
 
 /// Refuse a secret or private file that others may read or write.
 pub fn check_private(path: &Path) -> Result<()> {
@@ -166,14 +182,34 @@ pub struct Binding {
     pub disabled: bool,
 }
 
+/// A handoff already stored, as a new offer finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prior {
+    pub id: i64,
+    pub state: String,
+    pub reason: String,
+    pub detail: String,
+}
+
+impl Prior {
+    /// Whether it has a result: received or rejected.
+    pub fn settled(&self) -> bool {
+        self.state == "received" || self.state == "rejected"
+    }
+}
+
 /// What storing a new handoff found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intake {
     New,
     /// The same origin with identical bytes is already known.
-    Duplicate,
+    Duplicate(Prior),
     /// The same origin with different bytes.
     Conflict,
+    /// (Outbound) BBS offered this handoff ID before, with the same bytes.
+    Repeated(Prior),
+    /// (Outbound) BBS offered this handoff ID before, with other bytes.
+    HandoffReused,
 }
 
 /// A claimed handoff to queue: its row, handoff ID and the bytes to send
@@ -424,26 +460,6 @@ impl Store {
         Ok(self.binding(namespace)?.is_some_and(|b| !b.disabled))
     }
 
-    pub fn put_credential(&self, rec: &mp::SignedRecord, c: &Credential) -> Result<()> {
-        let hash = crate::sign::hash(rec).context("credential of unknown kind")?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO credentials (record_hash, namespace, installation_id,
-                 public_key, assert_senders, host_namespace, record, first_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                hash.as_slice(),
-                c.namespace,
-                c.installation_id,
-                c.public_key,
-                c.assert_senders,
-                c.host_namespace,
-                rec.encode_to_vec(),
-                crate::now_micros()
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn revoked(&self, namespace: &str, public_key: &[u8]) -> Result<bool> {
         Ok(self
             .conn
@@ -485,17 +501,22 @@ impl Store {
             .map(|r| r as u64))
     }
 
-    /// Keep a newer catalog snapshot; returns whether it was newer.
+    /// Keep a newer catalog snapshot; returns whether it was kept. The first
+    /// catalog on a BBS stream (`snapshot`) is kept whatever its revision,
+    /// so a BBS whose database was reset, restarting its revisions, is not
+    /// ignored; later ones on the stream only move forward.
     pub fn put_catalog(
         &self,
         catalog: &bbs_core::hub_proto::integration::PublishedCatalog,
+        snapshot: bool,
         now: i64,
     ) -> Result<bool> {
-        if self
-            .catalog_revision()?
-            .is_some_and(|r| catalog.revision <= r)
-        {
-            return Ok(false);
+        match self.catalog_revision()? {
+            Some(r) if catalog.revision == r && snapshot => {
+                // The same revision again: keep it, it may differ after a reset.
+            }
+            Some(r) if catalog.revision <= r && !snapshot => return Ok(false),
+            _ => {}
         }
         self.conn.execute(
             "INSERT INTO catalog (id, revision, entities, snapshot, received_at)
@@ -541,9 +562,10 @@ impl Store {
 
     // ---- handoffs ------------------------------------------------------------
 
-    /// Store a message BBS handed off for Hub, pending. A known origin is a
-    /// duplicate when its bytes match, else a conflict; either way nothing
-    /// new is stored.
+    /// Store a message BBS handed off for Hub, pending. A handoff ID BBS
+    /// used before is a repeat (same bytes) or a reuse (other bytes); a known
+    /// origin is a duplicate when its bytes match, else a conflict. In every
+    /// case but new, nothing new is stored.
     #[allow(clippy::too_many_arguments)]
     pub fn intake_outbound(
         &self,
@@ -555,20 +577,19 @@ impl Store {
         expires_at: i64,
         now: i64,
     ) -> Result<Intake> {
+        if let Some((bytes, prior)) = self.prior(
+            Direction::Outbound,
+            "bbs_handoff_id = ?1",
+            &[bbs_handoff_id],
+        )? {
+            return Ok(if bytes == message {
+                Intake::Repeated(prior)
+            } else {
+                Intake::HandoffReused
+            });
+        }
         if let Some(intake) = self.known(Direction::Outbound, origin, message)? {
             return Ok(intake);
-        }
-        if self
-            .conn
-            .query_row(
-                "SELECT 1 FROM outbound WHERE bbs_handoff_id = ?1",
-                [bbs_handoff_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some()
-        {
-            return Ok(Intake::Conflict);
         }
         self.conn.execute(
             "INSERT INTO outbound (bbs_handoff_id, handoff_id, origin_namespace, origin_message_id,
@@ -631,24 +652,94 @@ impl Store {
         origin: &mp::MessageRef,
         message: &[u8],
     ) -> Result<Option<Intake>> {
-        let stored: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                &format!(
-                    "SELECT message FROM {} WHERE origin_namespace = ?1 AND origin_message_id = ?2",
-                    dir.table()
-                ),
-                params![origin.namespace, origin.message_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(stored.map(|s| {
-            if s == message {
-                Intake::Duplicate
+        let found = self.prior(
+            dir,
+            "origin_namespace = ?1 AND origin_message_id = ?2",
+            &[&origin.namespace, &origin.message_id],
+        )?;
+        Ok(found.map(|(bytes, prior)| {
+            if bytes == message {
+                Intake::Duplicate(prior)
             } else {
                 Intake::Conflict
             }
         }))
+    }
+
+    fn prior(
+        &self,
+        dir: Direction,
+        filter: &str,
+        args: &[&str],
+    ) -> Result<Option<(Vec<u8>, Prior)>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT message, id, state, coalesce(reason, ''), coalesce(detail, '')
+                     FROM {} WHERE {filter}",
+                    dir.table()
+                ),
+                rusqlite::params_from_iter(args),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        Prior {
+                            id: r.get(1)?,
+                            state: r.get(2)?,
+                            reason: r.get(3)?,
+                            detail: r.get(4)?,
+                        },
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
+    /// Sent work with no result by its deadline: `unknown`. Returns how many.
+    pub fn lapse(&self, dir: Direction, now: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            &format!(
+                "UPDATE {} SET state = 'unknown', reason = 'no_result_by_deadline',
+                 updated_at = ?1 WHERE state = 'sent' AND expires_at <= ?1",
+                dir.table()
+            ),
+            [now],
+        )?)
+    }
+
+    /// Imports sent to an earlier BBS stream, or unknown, go back to pending
+    /// to be offered again: the result was lost with that stream, and BBS
+    /// answers a message it has as already known. Returns how many.
+    pub fn reoffer_inbound(&self, now: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE inbound SET state = 'pending', updated_at = ?1
+             WHERE state IN ('sent', 'unknown') AND expires_at > ?1",
+            [now],
+        )?)
+    }
+
+    /// Delete rows settled (received, rejected or unknown) before `before`,
+    /// and results for BBS kept past their time. Returns how many rows each
+    /// way.
+    pub fn purge_settled(&self, before: i64, now: i64) -> Result<(usize, usize)> {
+        let mut n = [0; 2];
+        for (i, dir) in [Direction::Outbound, Direction::Inbound].iter().enumerate() {
+            n[i] = self.conn.execute(
+                &format!(
+                    "DELETE FROM {} WHERE state IN ('received', 'rejected', 'unknown')
+                     AND updated_at < ?1",
+                    dir.table()
+                ),
+                [before],
+            )?;
+        }
+        self.conn.execute(
+            "DELETE FROM reports WHERE taken_at IS NOT NULL
+             AND (taken_at + ?2 <= ?1 OR coalesce(expires_at, ?1 + 1) <= ?1)",
+            params![now, REPORT_KEEP_MICROS],
+        )?;
+        Ok((n[0], n[1]))
     }
 
     /// Reject pending work whose deadline has passed by `now`, as expired.
@@ -856,26 +947,29 @@ impl Store {
     }
 
     /// Owe BBS a result for its handoff `bbs_handoff_id` that the adapter
-    /// settled itself (refused, or already known): kept until the transport
-    /// takes it, as a relay's result is.
+    /// settled itself (refused, already known, or a repeat's stored result),
+    /// kept as a relay's result is. `expires_at` is the message's deadline,
+    /// when it has one.
     pub fn owe_report(
         &self,
         bbs_handoff_id: &str,
         state: &str,
         reason: &str,
         detail: &str,
+        expires_at: Option<i64>,
         now: i64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO reports (bbs_handoff_id, state, reason, detail, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![bbs_handoff_id, state, reason, detail, now],
+            "INSERT INTO reports (bbs_handoff_id, state, reason, detail, expires_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![bbs_handoff_id, state, reason, detail, expires_at, now],
         )?;
         Ok(())
     }
 
-    /// Results owed to BBS after report `after`, oldest first; each
-    /// Outcome's ID is its report's.
+    /// Results for BBS after report `after`, oldest first: those still owed,
+    /// and those taken recently enough to send again. Each Outcome's ID is
+    /// its report's.
     pub fn unreported(&self, after: i64, limit: usize) -> Result<Vec<Outcome>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, bbs_handoff_id, '', state, reason, detail
@@ -894,10 +988,56 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// The transport took report `id`: it is owed no longer.
-    pub fn mark_reported(&self, id: i64) -> Result<()> {
+    /// How many results for BBS no transport has taken yet.
+    pub fn owed_reports(&self) -> Result<usize> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM reports WHERE taken_at IS NULL",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as usize)
+    }
+
+    /// The transport took report `id`: kept a while from now, then purged.
+    pub fn mark_reported(&self, id: i64, now: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE reports SET taken_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// BBS's import results not yet sent to relay stream `connection` (the
+    /// only stream Hub accepts them on), after row `after`, oldest first.
+    pub fn relay_unreported(
+        &self,
+        connection: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<Outcome>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, relay_handoff_id, relay_connection, state, coalesce(reason, ''),
+                 coalesce(detail, '')
+             FROM inbound WHERE relay_connection = ?1 AND reported = 0
+                 AND state IN ('received', 'rejected') AND id > ?2
+             ORDER BY id LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![connection, after, limit as i64], |r| {
+            Ok(Outcome {
+                id: r.get(0)?,
+                handoff_id: r.get(1)?,
+                connection: r.get(2)?,
+                state: r.get(3)?,
+                reason: r.get(4)?,
+                detail: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The relay's transport took import `id`'s result.
+    pub fn mark_relay_reported(&self, id: i64) -> Result<()> {
         self.conn
-            .execute("DELETE FROM reports WHERE id = ?1", [id])?;
+            .execute("UPDATE inbound SET reported = 1 WHERE id = ?1", [id])?;
         Ok(())
     }
 

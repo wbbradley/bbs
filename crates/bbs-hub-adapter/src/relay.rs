@@ -3,6 +3,13 @@
 //! from the relay (the configured trust source), a signed route claim, then
 //! transfers both ways, heartbeats and directory queries for this namespace.
 //!
+//! Outgoing frames use the link's three queues as Hub's peer does: a
+//! heartbeat ahead of everything, then control frames (results, replies,
+//! trust and route requests; 256 slots), then up to [`QUEUE`] transfers. A
+//! relay that stops reading (frames waiting longer than the peer timeout
+//! with none taken), or that is silent that long, is cut, as Hub's `watch`
+//! does.
+//!
 //! Frames travel as raw bytes through [`RawCodec`], so every received frame
 //! is validated strictly before it is decoded, and a transfer's envelope
 //! stays the exact bytes it arrived in (Hub's codec does the same). A frame
@@ -23,13 +30,14 @@ use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::Endpoint;
 use tonic::{Request, Status, Streaming};
 
-use crate::adapter::{RelayLink, Shared, bounded, code};
+use crate::adapter::{RelayLink, Shared, bounded, code, transfer_result};
 use crate::link::{self, Claim, Item};
 use crate::store::{Binding, Direction, Intake};
 use crate::verify::{self, reason};
 use crate::{new_id, now_micros, sign, wire};
 
-/// Frames queued for the relay before senders wait.
+/// Transfers queued for the relay before dispatch waits (Hub's
+/// `transferSlots`).
 const QUEUE: usize = 64;
 /// The most trust pages one refresh reads.
 const MAX_TRUST_PAGES: usize = 1000;
@@ -86,10 +94,12 @@ fn frame(payload: F) -> Vec<u8> {
 }
 
 /// Keep a stream to the relay, reconnecting with jittered exponential
-/// backoff (reset after a healthy minute).
+/// backoff (reset after a healthy minute). Returns once the adapter stops,
+/// after the session has ended.
 pub(crate) async fn run(shared: Arc<Shared>) {
     let mut backoff = shared.opts.backoff_min;
-    loop {
+    let mut stopping = shared.stopping.clone();
+    while !shared.is_stopping() {
         let start = Instant::now();
         match session(&shared).await {
             Ok(()) => tracing::info!("relay stream ended"),
@@ -100,7 +110,10 @@ pub(crate) async fn run(shared: Arc<Shared>) {
         }
         let half = backoff / 2;
         let jitter = Duration::from_micros(rand::random_range(0..=half.as_micros() as u64));
-        tokio::time::sleep(half + jitter).await;
+        tokio::select! {
+            _ = tokio::time::sleep(half + jitter) => {}
+            _ = stopping.wait_for(|s| *s) => {}
+        }
         backoff = (backoff * 2).min(shared.opts.backoff_max);
     }
 }
@@ -120,17 +133,19 @@ struct Session {
 }
 
 async fn session(shared: &Arc<Shared>) -> Result<()> {
+    let mut stopping = shared.stopping.clone();
     let channel = Endpoint::from_shared(shared.s.relay_endpoint.clone())?
         .connect_timeout(Duration::from_secs(10))
         .http2_keep_alive_interval(Duration::from_secs(20))
         .keep_alive_timeout(Duration::from_secs(10))
-        .keep_alive_while_idle(true)
-        .connect()
-        .await
-        .context("connecting")?;
+        .keep_alive_while_idle(true);
+    let channel = tokio::select! {
+        c = channel.connect() => c.context("connecting")?,
+        _ = stopping.wait_for(|s| *s) => return Ok(()),
+    };
     let connection = new_id();
     let (tx, frames) = link::channel::<Vec<u8>>(QUEUE, shared.settle());
-    tx.try_send(frame(F::Hello(mp::PeerHello {
+    let _ = tx.try_send_control(frame(F::Hello(mp::PeerHello {
         protocol_major: 1,
         installation_id: shared.s.installation_id.clone(),
         connection_id: connection.clone(),
@@ -141,15 +156,15 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
         .max_decoding_message_size(wire::MAX_FRAME)
         .max_encoding_message_size(wire::MAX_FRAME);
     grpc.ready().await.context("connecting")?;
-    let inbound = grpc
-        .streaming(
-            Request::new(frames),
-            tonic::codegen::http::uri::PathAndQuery::from_static("/msgproto.v1.Federation/Connect"),
-            RawCodec,
-        )
-        .await
-        .context("opening the federation stream")?
-        .into_inner();
+    let opened = grpc.streaming(
+        Request::new(frames),
+        tonic::codegen::http::uri::PathAndQuery::from_static("/msgproto.v1.Federation/Connect"),
+        RawCodec,
+    );
+    let mut inbound = tokio::select! {
+        r = opened => r.context("opening the federation stream")?.into_inner(),
+        _ = stopping.wait_for(|s| *s) => return Ok(()),
+    };
     let s = Arc::new(Session {
         shared: shared.clone(),
         tx: tx.clone(),
@@ -158,17 +173,36 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
         last_recv: Mutex::new(Instant::now()),
         tasks: Mutex::new(JoinSet::new()),
     });
-    let result = s.clone().serve(inbound).await;
-    // Nothing more goes out on this stream: queued claims return to pending.
+    let result = tokio::select! {
+        r = s.clone().serve(&mut inbound) => r,
+        _ = stopping.wait_for(|s| *s) => Ok(()),
+    };
     {
         let mut relay = shared.relay.lock().unwrap_or_else(PoisonError::into_inner);
         if relay.as_ref().is_some_and(|r| r.connection == connection) {
             *relay = None;
         }
     }
+    // Stopping: no new work, but what is queued gets a bounded while to go
+    // (CONTRACT.md: shutdown drains in-flight work up to 10 seconds).
+    if shared.is_stopping() {
+        let start = Instant::now();
+        while !tx.is_idle() && !tx.is_closed() && start.elapsed() < shared.opts.drain {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    // Nothing more goes out on this stream: queued claims return to pending.
     tx.close();
+    drop(inbound);
     let mut tasks = std::mem::take(&mut *s.tasks.lock().unwrap_or_else(PoisonError::into_inner));
     tasks.shutdown().await;
+    while let Some(r) = tasks.try_join_next() {
+        if let Err(e) = r
+            && e.is_panic()
+        {
+            tracing::error!("a relay stream task panicked: {e}");
+        }
+    }
     if let Err(err) = shared.store().session_ended(&connection, now_micros()) {
         tracing::error!("recording the relay session's end: {err:#}");
     }
@@ -176,7 +210,7 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
 }
 
 impl Session {
-    async fn serve(self: Arc<Self>, mut inbound: Streaming<Vec<u8>>) -> Result<()> {
+    async fn serve(self: Arc<Self>, inbound: &mut Streaming<Vec<u8>>) -> Result<()> {
         let timeout = self.shared.opts.reply_timeout;
         let first = tokio::time::timeout(timeout, inbound.message())
             .await
@@ -209,27 +243,64 @@ impl Session {
             r = self.clone().read(inbound) => r,
             r = self.clone().setup_and_dispatch() => r,
             r = self.clone().heartbeat() => r,
+            r = self.clone().report_results() => r,
         }
     }
 
+    /// Run per-frame work beside the reader, reaping what has finished.
     fn spawn(&self, work: impl std::future::Future<Output = ()> + Send + 'static) {
-        self.tasks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .spawn(work);
+        let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
+        while let Some(r) = tasks.try_join_next() {
+            if let Err(e) = r
+                && e.is_panic()
+            {
+                tracing::error!("a relay stream task panicked: {e}");
+            }
+        }
+        tasks.spawn(work);
     }
 
-    fn send(&self, payload: F) -> bool {
-        self.tx.try_send(frame(payload))
+    /// Queue a control frame that nothing waits on (an immediate transfer
+    /// result, a directory reply). With the control queue full it is
+    /// dropped, logged and counted, as Hub's peer drops it.
+    fn send(&self, payload: F) {
+        let what = match &payload {
+            F::TransferResult(_) => "a transfer result",
+            F::DirectoryAnswer(_) => "a directory answer",
+            F::DirectoryUnavailable(_) => "a directory refusal",
+            _ => "a frame",
+        };
+        if let Err(link::Refused::Full) = self.tx.try_send_control(frame(payload)) {
+            let n = self
+                .shared
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            tracing::warn!(
+                dropped = n,
+                "the relay stream's control queue is full; {what} was not sent"
+            );
+        }
     }
 
+    /// Send a request on a control slot, waiting for room, and wait for its
+    /// reply.
     async fn request(&self, id: &str, payload: F) -> Result<mp::FederationFrame> {
         let (tx, rx) = oneshot::channel();
         self.waiters
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id.to_string(), tx);
-        let reply = if self.send(payload) {
+        let sent = match self.tx.reserve_control().await {
+            Some(permit) => permit
+                .send(Item {
+                    frame: frame(payload),
+                    claim: None,
+                })
+                .is_ok(),
+            None => false,
+        };
+        let reply = if sent {
             Some(tokio::time::timeout(self.shared.opts.reply_timeout, rx).await)
         } else {
             None
@@ -239,8 +310,49 @@ impl Session {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(id);
         Ok(reply
-            .context("the relay stream is closed or full")?
+            .context("the relay stream is closed")?
             .context("no reply from the relay in time")??)
+    }
+
+    /// Send BBS's import results to the relay, on this stream only (Hub
+    /// accepts a result from no other), on control slots. Each is reported
+    /// once its frame is taken; one that cannot go before the stream ends is
+    /// dropped with it, as informative results are.
+    async fn report_results(self: Arc<Self>) -> Result<()> {
+        let mut after = 0;
+        loop {
+            let owed = self
+                .shared
+                .store()
+                .relay_unreported(&self.connection, after, 32);
+            let owed = owed?;
+            if owed.is_empty() {
+                tokio::select! {
+                    _ = self.shared.relay_report_kick.notified() => {}
+                    _ = tokio::time::sleep(self.shared.opts.poll) => {}
+                }
+                continue;
+            }
+            for o in owed {
+                let Some(permit) = self.tx.reserve_control().await else {
+                    return Ok(());
+                };
+                let item = Item {
+                    frame: frame(F::TransferResult(transfer_result(&o))),
+                    claim: Some(Claim::RelayResult(o.id)),
+                };
+                if permit.send(item).is_err() {
+                    return Ok(());
+                }
+                after = o.id;
+                tracing::info!(
+                    handoff = o.handoff_id,
+                    state = o.state,
+                    reason = o.reason,
+                    "reported an import's result to the relay"
+                );
+            }
+        }
     }
 
     fn deliver(&self, id: &str, f: mp::FederationFrame) {
@@ -311,11 +423,22 @@ impl Session {
         let now = now_micros();
         let store = self.shared.store();
         for b in &page.bindings {
+            // A bad binding is skipped, not the page: its revocations still
+            // apply.
             if !verify::valid_namespace(&b.namespace)
                 || b.authority_public_key.len() != 32
                 || b.revision == 0
             {
-                bail!("malformed binding for {:?}", b.namespace);
+                tracing::warn!(namespace = b.namespace, "skipping a malformed binding");
+                continue;
+            }
+            if !sign::usable_key(&b.authority_public_key) {
+                tracing::warn!(
+                    namespace = b.namespace,
+                    "skipping a binding whose authority key is not a usable Ed25519 key \
+                     (not a point, or of small order)"
+                );
+                continue;
             }
             let binding = Binding {
                 namespace: b.namespace.clone(),
@@ -404,7 +527,8 @@ impl Session {
                     .store()
                     .claim_outbound(&self.connection, now_micros(), |message| {
                         seal(shared, message)
-                    })?;
+                    });
+            let claimed = claimed?;
             let Some(c) = claimed else {
                 drop(permit);
                 tokio::select! {
@@ -441,6 +565,12 @@ impl Session {
             if silent > self.shared.opts.peer_timeout {
                 bail!("the relay was silent for {silent:?}");
             }
+            // Frames waiting this long with none taken: flow control is full,
+            // so the relay is not reading, whatever heartbeats it sends.
+            let stalled = self.tx.stalled_for();
+            if stalled > self.shared.opts.peer_timeout {
+                bail!("the relay is not reading: frames have waited {stalled:?} to be sent");
+            }
             nonce += 1;
             // Ahead of queued transfers, so a full queue never silences us.
             self.tx
@@ -448,7 +578,7 @@ impl Session {
         }
     }
 
-    async fn read(self: Arc<Self>, mut inbound: Streaming<Vec<u8>>) -> Result<()> {
+    async fn read(self: Arc<Self>, inbound: &mut Streaming<Vec<u8>>) -> Result<()> {
         while let Some(raw) = inbound.message().await? {
             *self
                 .last_recv
@@ -476,11 +606,19 @@ impl Session {
                         },
                     );
                 }
+                // Refreshed until it succeeds or the stream ends: a revocation
+                // must not wait for the next stream.
                 Some(F::TrustChanged(c)) => {
                     let s = self.clone();
                     self.spawn(async move {
-                        if let Err(err) = s.refresh_trust(&c.namespace).await {
-                            tracing::warn!("trust refresh after a change: {err:#}");
+                        let mut wait = s.shared.opts.backoff_min;
+                        while let Err(err) = s.refresh_trust(&c.namespace).await {
+                            tracing::warn!(
+                                namespace = c.namespace,
+                                "trust refresh after a change: {err:#}; retrying in {wait:?}"
+                            );
+                            tokio::time::sleep(wait).await;
+                            wait = (wait * 2).min(s.shared.opts.backoff_max);
                         }
                     });
                 }
@@ -489,8 +627,10 @@ impl Session {
                 }
                 Some(F::TransferResult(r)) => self.on_transfer_result(r),
                 Some(F::DirectoryQuery(q)) => {
-                    let s = self.clone();
-                    self.spawn(async move { s.on_directory_query(q).await });
+                    if let Some((rec, q)) = self.check_directory_query(q) {
+                        let s = self.clone();
+                        self.spawn(async move { s.answer_directory(rec, q).await });
+                    }
                 }
                 Some(other) => {
                     tracing::debug!("ignoring an unexpected frame from the relay: {other:?}")
@@ -527,7 +667,10 @@ impl Session {
         if !verify::valid_id(&t.handoff_id) {
             return reject(reason(verify::INVALID_MESSAGE, "invalid handoff ID"));
         }
-        let verified = verify::envelope(&shared.store(), &raw);
+        let verified = {
+            let store = shared.store();
+            verify::envelope(&store, &raw)
+        };
         let v = match verified {
             Ok(v) => v,
             Err(r) => return reject(r),
@@ -572,7 +715,15 @@ impl Session {
                 );
                 shared.bbs_kick.notify_one();
             }
-            Ok(Intake::Duplicate) => reply(mp::TransferDisposition::AlreadyKnown, "", ""),
+            // The same message again: answered as the first was, rejected
+            // if it was (expired, or refused by BBS), else already known.
+            Ok(Intake::Duplicate(prior)) if prior.state == "rejected" => {
+                let code_ = crate::adapter::relay_code(&prior.reason);
+                reply(mp::TransferDisposition::Rejected, &code_, &prior.detail)
+            }
+            Ok(Intake::Duplicate(_)) => reply(mp::TransferDisposition::AlreadyKnown, "", ""),
+            // Outbound only.
+            Ok(Intake::Repeated(_) | Intake::HandoffReused) => {}
             Ok(Intake::Conflict) => reject(reason(
                 verify::MESSAGE_CONFLICT,
                 format!(
@@ -604,14 +755,15 @@ impl Session {
         } else {
             String::new()
         };
-        match self.shared.store().outbound_result(
+        let recorded = self.shared.store().outbound_result(
             &r.handoff_id,
             &self.connection,
             state,
             &why,
             &detail,
             now_micros(),
-        ) {
+        );
+        match recorded {
             Ok(true) => {}
             Ok(false) => {
                 tracing::debug!(
@@ -642,23 +794,26 @@ impl Session {
         }));
     }
 
-    /// Answer a directory query for this namespace with BBS's answer,
-    /// signed and bound to the query (HOST_NAMESPACE).
-    async fn on_directory_query(self: Arc<Self>, fq: mp::FederatedDirectoryQuery) {
+    /// Check a directory query in Hub's order, refusing what fails. Returns
+    /// the query to answer: one for this namespace, before its deadline.
+    fn check_directory_query(
+        &self,
+        fq: mp::FederatedDirectoryQuery,
+    ) -> Option<(mp::SignedRecord, mp::DirectoryQuery)> {
         let shared = &self.shared;
-        let (Some(rec), Some(cred)) = (&fq.query, &fq.credential) else {
-            return;
+        let (Some(rec), Some(cred)) = (fq.query, &fq.credential) else {
+            return None;
         };
         let Ok(q) = verify::decode::<mp::DirectoryQuery>(&rec.payload, wire::MAX_DIRECTORY) else {
-            return;
+            return None;
         };
         if !verify::valid_id(&q.query_id) {
-            return;
+            return None;
         }
         let checked = {
             let store = shared.store();
             verify::credential(&store, cred).and_then(|c| {
-                verify::subject(rec, mp::RecordKind::DirectoryQuery, &c)?;
+                verify::subject(&rec, mp::RecordKind::DirectoryQuery, &c)?;
                 let who = q.requester.as_ref().and_then(|r| r.entity.as_ref());
                 if !c.assert_senders
                     || who.is_none_or(|e| {
@@ -680,19 +835,35 @@ impl Session {
             })
         };
         if let Err(r) = checked {
-            return self.unavailable(&q.query_id, r.code, &r.detail);
+            // A store failure takes Hub's fallback for a query that fails
+            // verification (asReason(err, RInvalidSignature)).
+            let code_ = if r.code == verify::STORAGE_UNAVAILABLE {
+                verify::INVALID_SIGNATURE
+            } else {
+                r.code
+            };
+            self.unavailable(&q.query_id, code_, &r.detail);
+            return None;
         }
-        let now = now_micros();
-        if now > q.deadline_unix_micros {
-            return; // late: the asker has given up
+        if now_micros() > q.deadline_unix_micros {
+            return None; // late: the asker has given up
         }
         if q.namespace != shared.s.namespace {
-            return self.unavailable(
+            self.unavailable(
                 &q.query_id,
                 verify::NAMESPACE_UNKNOWN,
                 &format!("this home does not serve {}", q.namespace),
             );
+            return None;
         }
+        Some((rec, q))
+    }
+
+    /// Answer a checked directory query for this namespace with BBS's
+    /// answer, signed and bound to the query (HOST_NAMESPACE).
+    async fn answer_directory(self: Arc<Self>, rec: mp::SignedRecord, q: mp::DirectoryQuery) {
+        let shared = &self.shared;
+        let now = now_micros();
         let deadline = q.deadline_unix_micros.min(now + 30_000_000);
         let query_id = q.query_id.clone();
         let Some(mut result) = shared.local_directory(q, deadline).await else {
@@ -703,7 +874,7 @@ impl Session {
             return;
         };
         result.query_id = query_id.clone();
-        let Some(hash) = sign::hash(rec) else {
+        let Some(hash) = sign::hash(&rec) else {
             return;
         };
         let mut answer = mp::DirectoryAnswer {

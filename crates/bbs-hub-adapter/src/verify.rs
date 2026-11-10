@@ -215,7 +215,7 @@ pub fn own_credential(rec: &mp::SignedRecord) -> Result<Credential, Reason> {
 }
 
 /// Check a credential record against its namespace's trusted binding and
-/// permanent revocations, and cache it.
+/// permanent revocations, in Hub's order.
 pub fn credential(store: &Store, rec: &mp::SignedRecord) -> Result<Credential, Reason> {
     sign::verify(rec, mp::RecordKind::InstallationCredential)
         .map_err(|e| reason(INVALID_CREDENTIAL, e.to_string()))?;
@@ -243,7 +243,6 @@ pub fn credential(store: &Store, rec: &mp::SignedRecord) -> Result<Credential, R
             format!("key revoked in namespace {}", c.namespace),
         ));
     }
-    store.put_credential(rec, &c).map_err(storage)?;
     Ok(c)
 }
 
