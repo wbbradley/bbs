@@ -4541,7 +4541,12 @@ fn headless_goal_resumes_when_someone_else_cancels_its_blocker() {
     goal_logged(&bbs, "turn_end", goal_prompts(&bbs).len());
     bbs.ok(&["--token", &tp, "blocker", "cancel", &id]);
     wait_goal_status(&bbs, "complete");
-    let prompt = &goal_prompts(&bbs)[1];
+    assert_cancel_resumes(&goal_prompts(&bbs)[1], &id);
+}
+
+/// The resumed goal's prompt after a blocker is cancelled: the notice, then
+/// the goal.
+fn assert_cancel_resumes(prompt: &str, id: &str) {
     assert!(
         prompt.contains(&format!("Blocker #{id} in @crew was cancelled by ")),
         "{prompt}"
@@ -4553,6 +4558,79 @@ fn headless_goal_resumes_when_someone_else_cancels_its_blocker() {
         )),
         "{prompt}"
     );
+}
+
+#[test]
+fn headless_goal_resumes_after_a_restart_when_its_blocker_mail_was_read() {
+    let (bbs, run, tp) = crew_goal_runner("goal-blocker-restart", "block,complete");
+    wait_goal_status(&bbs, "blocked");
+    let id = goal_blocker(&bbs);
+    run.stop();
+    bbs.ok(&["--token", &tp, "blocker", "cancel", &id]);
+    // Read while no runner is up, as when a runner stops before handling
+    // mail its wait took: the notice never arrives as new mail.
+    let tz = headless_state(&bbs, "Zed")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let read = bbs.ok(&["--token", &tz, "read"]);
+    assert!(read.contains("was cancelled by"), "{read}");
+    let _run = RunGuard::start(&bbs, "Zed");
+    wait_goal_status(&bbs, "complete");
+    assert_cancel_resumes(&goal_prompts(&bbs)[1], &id);
+}
+
+#[test]
+fn headless_goal_resumes_when_the_agent_reads_its_blocker_mail_itself() {
+    /// Continues a stopped process when dropped, so a failure cannot leave
+    /// the runner stopped.
+    struct Thaw(String);
+    impl Drop for Thaw {
+        fn drop(&mut self) {
+            let _ = Command::new("kill").args(["-CONT", &self.0]).status();
+        }
+    }
+    let (bbs, run, tp) = crew_goal_runner("goal-blocker-self-read", "block,complete");
+    wait_goal_status(&bbs, "blocked");
+    let id = goal_blocker(&bbs);
+    // The runner is stopped below, so it must not be writing its activity.
+    run.stop();
+    let config = bbs.home.join(".config/bbs/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("share_activity = false\n");
+    std::fs::write(&config, text).unwrap();
+    let run = RunGuard::start(&bbs, "Zed");
+    let go = bbs.home.join("fake-go");
+    assert!(Command::new("mkfifo").arg(&go).status().unwrap().success());
+    bbs.ok(&["--token", &tp, "send", "--to", "Zed", "READ-INBOX"]);
+    // The agent's turn is under way: after the block's two tool calls, its
+    // read waits for the go signal.
+    goal_logged(&bbs, "tool", 3);
+    // Stop the runner, so its mail wait cannot take the notice; the agent
+    // reads it instead, during the turn.
+    let pid = run.0.as_ref().unwrap().id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-STOP", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let thaw = Thaw(pid);
+    bbs.ok(&["--token", &tp, "blocker", "cancel", &id]);
+    std::fs::write(&go, "go").unwrap();
+    let read_path = bbs.home.join("fake-read.txt");
+    eventually("the agent's read", || {
+        std::fs::read_to_string(&read_path).ok()
+    });
+    let read = std::fs::read_to_string(&read_path).unwrap();
+    assert!(read.contains("was cancelled by"), "{read}");
+    drop(thaw);
+    wait_goal_status(&bbs, "complete");
+    let prompts = goal_prompts(&bbs);
+    assert!(prompts[1].contains("READ-INBOX"), "{}", prompts[1]);
+    assert_cancel_resumes(&prompts[2], &id);
+    drop(run);
 }
 
 #[test]
