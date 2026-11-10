@@ -42,6 +42,33 @@ const QUEUE: usize = 64;
 /// The most trust pages one refresh reads.
 const MAX_TRUST_PAGES: usize = 1000;
 
+/// A trust page the relay answered with an error code.
+#[derive(Debug)]
+struct TrustRefused(String);
+
+impl std::fmt::Display for TrustRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "trust page: {}", self.0)
+    }
+}
+
+impl std::error::Error for TrustRefused {}
+
+/// Whether a refresh that failed may succeed if asked again: anything but a
+/// trust page refused with a code that says it never will (only the
+/// relay's storage or load clears up).
+fn retryable(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<TrustRefused>().is_none_or(|r| {
+        [
+            verify::STORAGE_UNAVAILABLE,
+            "storage_full",
+            verify::QUEUE_FULL,
+            verify::HOME_OFFLINE,
+        ]
+        .contains(&r.0.as_str())
+    })
+}
+
 /// Raw frames: encoded by the caller, validated and decoded by
 /// [`wire::parse_frame`].
 #[derive(Clone, Copy, Default)]
@@ -130,6 +157,9 @@ struct Session {
     /// Per-frame work (directory answers, trust refreshes), which runs
     /// beside the reader and stops with the stream.
     tasks: Mutex<JoinSet<()>>,
+    /// Namespaces whose trust is being refreshed after a change, each with
+    /// whether it changed again since that refresh began.
+    refreshing: Mutex<HashMap<String, bool>>,
 }
 
 async fn session(shared: &Arc<Shared>) -> Result<()> {
@@ -172,6 +202,7 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
         waiters: Mutex::new(HashMap::new()),
         last_recv: Mutex::new(Instant::now()),
         tasks: Mutex::new(JoinSet::new()),
+        refreshing: Mutex::new(HashMap::new()),
     });
     let result = tokio::select! {
         r = s.clone().serve(&mut inbound) => r,
@@ -415,7 +446,7 @@ impl Session {
                 bail!("the relay answered a trust query with something else");
             };
             if !page.error_code.is_empty() {
-                bail!("trust page: {}", page.error_code);
+                return Err(TrustRefused(page.error_code).into());
             }
             self.apply_trust(&page)?;
             if page.next_page_token.is_empty() || !namespace.is_empty() {
@@ -613,22 +644,7 @@ impl Session {
                         },
                     );
                 }
-                // Refreshed until it succeeds or the stream ends: a revocation
-                // must not wait for the next stream.
-                Some(F::TrustChanged(c)) => {
-                    let s = self.clone();
-                    self.spawn(async move {
-                        let mut wait = s.shared.opts.backoff_min;
-                        while let Err(err) = s.refresh_trust(&c.namespace).await {
-                            tracing::warn!(
-                                namespace = c.namespace,
-                                "trust refresh after a change: {err:#}; retrying in {wait:?}"
-                            );
-                            tokio::time::sleep(wait).await;
-                            wait = (wait * 2).min(s.shared.opts.backoff_max);
-                        }
-                    });
-                }
+                Some(F::TrustChanged(c)) => self.trust_changed(c.namespace),
                 Some(F::Transfer(t)) => {
                     self.on_transfer(t, parsed.envelope.unwrap_or_default());
                 }
@@ -646,6 +662,55 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Refresh a namespace's trust after the relay says it changed, retried
+    /// until it applies or the stream ends (a revocation must not wait for
+    /// the next stream), unless the relay refuses it for good. One refresh
+    /// per namespace at a time: a change during one makes it run once more
+    /// when it ends, so the latest state wins.
+    fn trust_changed(self: &Arc<Self>, namespace: String) {
+        {
+            let mut refreshing = self
+                .refreshing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(again) = refreshing.get_mut(&namespace) {
+                *again = true;
+                return;
+            }
+            refreshing.insert(namespace.clone(), false);
+        }
+        let s = self.clone();
+        self.spawn(async move {
+            let mut wait = s.shared.opts.backoff_min;
+            loop {
+                match s.refresh_trust(&namespace).await {
+                    Err(err) if retryable(&err) => {
+                        tracing::warn!(
+                            namespace,
+                            "trust refresh after a change: {err:#}; retrying in {wait:?}"
+                        );
+                        tokio::time::sleep(wait).await;
+                        wait = (wait * 2).min(s.shared.opts.backoff_max);
+                        continue;
+                    }
+                    Err(err) => tracing::error!(
+                        namespace,
+                        "trust refresh after a change: {err:#}; not retrying"
+                    ),
+                    Ok(()) => {}
+                }
+                let mut refreshing = s.refreshing.lock().unwrap_or_else(PoisonError::into_inner);
+                match refreshing.get_mut(&namespace) {
+                    Some(again) if *again => *again = false,
+                    _ => {
+                        refreshing.remove(&namespace);
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     /// Admit one transfer for BBS: verify the envelope from its exact bytes,

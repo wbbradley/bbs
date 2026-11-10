@@ -1374,6 +1374,64 @@ async fn trust_changes_are_retried_until_applied() {
     adapter.stop().await.unwrap();
 }
 
+/// Trust changes for one namespace share one refresh: changes during it make
+/// it run once more, not once each. A page refused for good is not asked
+/// again; one refused for want of storage is.
+#[tokio::test(flavor = "multi_thread")]
+async fn trust_changes_coalesce_and_permanent_refusals_stop() {
+    let mut w = World::new().await;
+    let adapter = Running::start_with(
+        settings(free_addr(), w.relay.addr, "unused", "bbs"),
+        &w.store,
+        quick(Duration::from_secs(10)),
+    );
+    let mut peer = w.relay.accept().await;
+    let changed = |namespace: &str| {
+        F::TrustChanged(mp::TrustChanged {
+            namespace: namespace.into(),
+        })
+    };
+    let page = |q: mp::TrustQuery, error_code: &str| {
+        F::TrustPage(mp::TrustPage {
+            query_id: q.query_id,
+            bindings: if error_code.is_empty() {
+                vec![binding(&q.namespace, 9)]
+            } else {
+                vec![]
+            },
+            error_code: error_code.into(),
+            ..Default::default()
+        })
+    };
+    for _ in 0..3 {
+        peer.send(changed("lab")).await;
+    }
+    let F::TrustQuery(q) = peer.next().await else {
+        panic!("a trust query");
+    };
+    assert_eq!(q.namespace, "lab");
+    peer.send(page(q, "")).await;
+    // Changed again during the first: one more, for the latest state.
+    let F::TrustQuery(q) = peer.next().await else {
+        panic!("one more trust query");
+    };
+    assert_eq!(q.namespace, "lab");
+    peer.send(page(q, "")).await;
+    assert!(peer.quiet().await.is_none(), "not one per change");
+
+    peer.send(changed("gone")).await;
+    let F::TrustQuery(q) = peer.next().await else {
+        panic!("a trust query");
+    };
+    peer.send(page(q, "storage_unavailable")).await;
+    let F::TrustQuery(q) = peer.next().await else {
+        panic!("asked again after a passing failure");
+    };
+    peer.send(page(q, "namespace_unknown")).await;
+    assert!(peer.quiet().await.is_none(), "not asked again");
+    adapter.stop().await.unwrap();
+}
+
 /// A refused route claim ends the stream; the adapter reconnects and claims
 /// again, and work flows once a claim is accepted.
 #[tokio::test(flavor = "multi_thread")]

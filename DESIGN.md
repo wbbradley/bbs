@@ -661,7 +661,11 @@ signed `RouteClaim`, and heartbeats every 15 seconds, ahead of anything
 queued. It cuts a relay silent for 45 seconds, and one that has stopped
 reading: frames waiting 45 seconds with none taken mean flow control is full,
 whatever heartbeats the relay sends (Hub's `watch` does the same). A
-`TrustChanged` refresh is retried until it applies or the stream ends. On
+`TrustChanged` refresh is retried with backoff until it applies or the
+stream ends, unless the relay refuses the page with a code that will not
+clear (anything but `storage_unavailable`, `storage_full`, `queue_full` or
+`home_offline`), which is logged and not retried. A namespace has one
+refresh at a time: changes during it make it run once more when it ends. On
 shutdown the relay stream takes no new work, gives queued frames up to 10
 seconds to go (CONTRACT.md), and records its session ended. Both streams
 reconnect with jittered exponential backoff from 250 ms to 30 seconds. BBS
