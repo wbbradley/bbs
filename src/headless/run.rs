@@ -302,9 +302,23 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     if let Some(g) = &state.goal {
         log.event("goal", goal_record(Some(g)));
     }
-    // The blocker may have closed while the runner was stopped. Its mail, if
-    // unread, comes in the first batch, which checks again.
-    if check_blocker(&mut state.goal, &config, dir, &token, 0, &mut log).await {
+    let mut queue: Vec<proto::Message> = Vec::new();
+    // Blocker mail taken from the archive, which the mail wait may still
+    // deliver; that copy is dropped.
+    let mut taken: HashSet<i64> = HashSet::new();
+    // The blocker may have closed while the runner was stopped.
+    if check_blocker(
+        &mut state.goal,
+        &config,
+        dir,
+        &token,
+        0,
+        &mut taken,
+        &mut queue,
+        &mut log,
+    )
+    .await
+    {
         goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
     }
     let mut delivery =
@@ -331,7 +345,6 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     // Failed/ambiguous turns can leave fetched mail unprocessed. A later
     // successful turn cannot acknowledge that older work as completed.
     let mut drain_failed = false;
-    let mut queue: Vec<proto::Message> = Vec::new();
     let mut turn: Option<JoinHandle<Result<String>>> = None;
     let mut active_mail = Vec::new();
     let mut active_preamble = None;
@@ -471,6 +484,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             mail = mail_rx.recv() => match mail {
                 Some(Ok(mut batch)) => {
                     received_through = batch.iter().map(|m| m.id).max().unwrap_or(0).max(received_through);
+                    batch.retain(|m| !taken.remove(&m.id));
                     // Control messages act now and are not prompts. The server
                     // accepts them only from the agent's owner.
                     for message in &batch {
@@ -522,7 +536,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     }
                     // An answer or a cancel notice arrives as mail.
                     if !batch.is_empty() {
-                        goal_dirty |= check_blocker(&mut state.goal, &config, dir, &token, received_through, &mut log).await;
+                        goal_dirty |= check_blocker(&mut state.goal, &config, dir, &token, received_through, &mut taken, &mut queue, &mut log).await;
                     }
                     if goal_dirty {
                         goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
@@ -586,7 +600,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                 }
                 // The blocker may have closed during the turn, before the
                 // block took effect, or the agent cancelled it itself.
-                if check_blocker(&mut state.goal, &config, dir, &token, received_through, &mut log).await {
+                if check_blocker(&mut state.goal, &config, dir, &token, received_through, &mut taken, &mut queue, &mut log).await {
                     goal_changed(&state, &agent_dir, &mut log, goal_reports.as_ref());
                 }
                 goal_prompt = false;
@@ -906,36 +920,72 @@ const BLOCKER_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// The server sends the answer or cancel notice in the transaction that
 /// closes the blocker, so the check can see the close before the mail wait
-/// delivers that mail. The goal resumes only once the mail is received
-/// (`received_through`, the newest message ID received), so the agent gets
-/// it with or before the resumed goal; the mail's arrival checks again.
+/// delivers that mail. The goal resumes only with that mail received
+/// (`received_through`, the newest message ID the wait delivered) or queued.
+/// Mail still unread comes through the wait, whose arrival checks again.
+/// Mail already archived (by this runner's wait, still in transit; by an
+/// earlier runner; or by the agent reading it) is taken from the archive and
+/// queued, and recorded in `taken` so the wait's copy is dropped.
+#[allow(clippy::too_many_arguments)]
 async fn check_blocker(
     goal: &mut Option<Goal>,
     config: &Config,
     dir: &Path,
     token: &str,
     received_through: i64,
+    taken: &mut HashSet<i64>,
+    queue: &mut Vec<proto::Message>,
     log: &mut Log,
 ) -> bool {
     let Some(id) = goal.as_ref().and_then(Goal::waits_on) else {
         return false;
     };
+    // Some((answered, mail)) once the goal may resume: `mail` is the closing
+    // mail to queue, none when received or never sent.
     let ask = async {
         let caller = Caller {
             token: Some(token.to_string()),
             ..Default::default()
         };
-        Backend::open(config, dir, caller)
-            .await?
+        let mut backend = Backend::open(config, dir, caller).await?;
+        let found = backend
             .get_blocker(proto::GetBlockerRequest {
                 id,
                 limit: Some(1),
                 ..Default::default()
             })
-            .await
+            .await?;
+        let Some(current) = found.current else {
+            return Ok(None);
+        };
+        let answered = match current.status() {
+            proto::BlockerStatus::BlockerAnswered => true,
+            proto::BlockerStatus::BlockerCancelled => false,
+            _ => return Ok(None),
+        };
+        let Some(outcome) = current.outcome.filter(|o| {
+            o.message_id
+                .is_some_and(|m| m > received_through && !taken.contains(&m))
+        }) else {
+            return Ok(Some((answered, None)));
+        };
+        // The mail shares the outcome's time and the archive lists oldest
+        // first, so an archived one is at the front. Not there: still unread.
+        let archived = backend
+            .read(proto::ReadRequest {
+                archived: true,
+                since: Some(outcome.created_at),
+                limit: Some(16),
+            })
+            .await?
+            .messages
+            .into_iter()
+            .find(|m| Some(m.id) == outcome.message_id);
+        Ok::<_, anyhow::Error>(archived.map(|m| (answered, Some(m))))
     };
-    let found = match tokio::time::timeout(BLOCKER_CHECK_TIMEOUT, ask).await {
-        Ok(Ok(found)) => found,
+    let (answered, mail) = match tokio::time::timeout(BLOCKER_CHECK_TIMEOUT, ask).await {
+        Ok(Ok(Some(closed))) => closed,
+        Ok(Ok(None)) => return false,
         Ok(Err(err)) => {
             let message = format!("checking blocker #{id}: {err:#}");
             log.event("warning", json!({ "message": message }));
@@ -947,20 +997,14 @@ async fn check_blocker(
             return false;
         }
     };
-    let Some(current) = found.current else {
-        return false;
-    };
-    let answered = match current.status() {
-        proto::BlockerStatus::BlockerAnswered => true,
-        proto::BlockerStatus::BlockerCancelled => false,
-        _ => return false,
-    };
-    let mail = current.outcome.and_then(|o| o.message_id);
-    if mail.is_some_and(|id| id > received_through) {
-        return false;
+    let resumed = goal
+        .as_mut()
+        .is_some_and(|g| g.blocker_closed(id, answered));
+    if resumed && let Some(mail) = mail {
+        taken.insert(mail.id);
+        queue.push(mail);
     }
-    goal.as_mut()
-        .is_some_and(|g| g.blocker_closed(id, answered))
+    resumed
 }
 
 /// Apply the agent's updates when a turn ends; then, when its prompt carried

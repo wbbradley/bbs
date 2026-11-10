@@ -1687,6 +1687,17 @@ mod tests {
         };
         assert_eq!(mail(&mut b, c.id), Some(notice));
         assert_eq!(mail(&mut b, own.id), None);
+        // The outcome finds a notice by this prefix (see db::blockers::Outcome).
+        let body: String = b
+            .conn
+            .query_row("SELECT body FROM messages WHERE id = ?1", [notice], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            body.starts_with(&format!("Blocker #{} in @crew was cancelled by ", c.id)),
+            "{body}"
+        );
         // In focus mode only the owner reaches the creator.
         service::set_focus(
             &mut b.conn,
