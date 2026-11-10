@@ -4485,6 +4485,12 @@ fn headless_goal_resumes_when_someone_else_cancels_its_blocker() {
     let (bbs, _run, tp) = crew_goal_runner("goal-blocker-cancel", "block,complete");
     wait_goal_status(&bbs, "blocked");
     let id = goal_blocker(&bbs);
+    // The goal shows blocked when the blocking turn ends, before the runner
+    // checks the blocker once more. Cancel only after that check, so the
+    // runner learns of the cancel from the notice mail, which the resumed
+    // prompt then carries. A cancel that wins the race is seen by that check
+    // instead, and the notice follows in a later prompt.
+    goal_logged(&bbs, "turn_end", goal_prompts(&bbs).len());
     bbs.ok(&["--token", &tp, "blocker", "cancel", &id]);
     wait_goal_status(&bbs, "complete");
     let prompt = &goal_prompts(&bbs)[1];
