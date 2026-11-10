@@ -335,7 +335,7 @@ fn every_interop_vector() {
     assert_eq!(
         (passed, transfers),
         (15, 11),
-        "the vendored interop vectors (hub#17 head 9472d72)"
+        "the vendored interop vectors (Hub main 88c76ff)"
     );
     eprintln!("interop vectors: {passed} passed ({transfers} transfers)");
 }
