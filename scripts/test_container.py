@@ -82,6 +82,9 @@ def check_web(address, token):
 def check(image, bbs):
     image_user = run("docker", "image", "inspect", "--format", "{{.Config.User}}", image).strip()
     require(image_user == "999:999", f"expected image USER 999:999, got {image_user!r}")
+    # The Hub adapter runs as a sidecar from the same image.
+    adapter = run("docker", "run", "--rm", "--entrypoint", "bbs-hub-adapter", image, "--version").strip()
+    require(adapter.startswith("bbs-hub-adapter "), f"unexpected bbs-hub-adapter --version output {adapter!r}")
     with tempfile.TemporaryDirectory(prefix="bbs-container-test-") as temporary:
         env = {key: value for key, value in os.environ.items() if not key.startswith("BBS_")}
         env["HOME"] = temporary

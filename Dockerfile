@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends sqlite3 && rm -
  && useradd --system --uid 999 --user-group --create-home --home-dir /var/lib/bbs bbs
 COPY --from=build /src/target/release/bbs /usr/local/bin/bbs
 COPY --from=build /src/target/release/bbs-server /usr/local/bin/bbs-server
+COPY --from=build /src/target/release/bbs-hub-adapter /usr/local/bin/bbs-hub-adapter
 USER 999:999
 ENV HOME=/var/lib/bbs BBS_LOG_STDERR=1 SQLITE_TMPDIR=/var/lib/bbs
 VOLUME /var/lib/bbs
