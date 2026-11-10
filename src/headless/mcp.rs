@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::app::{
-    format_agents, format_groups, format_messages, parse_time, timer_line, timer_schedule,
+    format_agents, format_directory, format_groups, format_messages, parse_time, remote_directory,
+    timer_line, timer_schedule,
 };
 use crate::backend::Backend;
 use crate::config::Config;
@@ -26,6 +27,9 @@ const DEFAULT_PROTOCOL: &str = "2025-06-18";
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// ...from this far back, when it gives no start.
 const DEFAULT_HISTORY_SINCE: &str = "7d";
+/// Entities `bbs_directory` shows by default, and at most.
+const DEFAULT_DIRECTORY_LIMIT: usize = 50;
+const MAX_DIRECTORY_LIMIT: u64 = 200;
 
 pub async fn run(
     dir: &Path,
@@ -294,6 +298,29 @@ impl Tools {
                 &b.list_agents(proto::ListAgentsRequest { all: false })
                     .await?,
             ),
+            "bbs_directory" => {
+                let text = |key: &str| args[key].as_str().unwrap_or_default().trim().to_string();
+                let req = proto::RemoteDirectoryRequest {
+                    namespace: arg("namespace")?,
+                    alias: text("alias"),
+                    entity_id: text("id"),
+                    ..Default::default()
+                };
+                let limit = match args["limit"].as_u64() {
+                    None => DEFAULT_DIRECTORY_LIMIT,
+                    Some(n @ 1..=MAX_DIRECTORY_LIMIT) => n as usize,
+                    Some(_) => bail!("limit must be 1 to {MAX_DIRECTORY_LIMIT}"),
+                };
+                let (entities, more) = remote_directory(b, req.clone(), limit).await?;
+                let mut out = format_directory(&req, &entities);
+                if more {
+                    out.push_str(&format!(
+                        "(more exist; only the first {limit} are shown: narrow the lookup with \
+                         alias or id)\n"
+                    ));
+                }
+                out
+            }
             "bbs_status" => {
                 b.set_status(proto::SetStatusRequest { text: arg("text")? })
                     .await?;
@@ -495,7 +522,7 @@ pub fn tool_list() -> Value {
             "name": "bbs_send",
             "description": "Send a BBS message to an agent or a human, or to @group to broadcast to a group where you have write access (marked [w] in bbs_group_list; only a human can grant it). Use blocker tools for structured group help requests.",
             "inputSchema": object(json!({
-                "to": string("Agent or human name, or @group"),
+                "to": string("Agent or human name, @group, or id:ENTITY@NAMESPACE for an entity in another namespace (see bbs_directory)"),
                 "body": string("Message text (at most 64 KiB)"),
             }), &["to", "body"]),
         },
@@ -503,6 +530,16 @@ pub fn tool_list() -> Value {
             "name": "bbs_agents",
             "description": "List the agents in your groups, with their status notes and last activity.",
             "inputSchema": object(json!({}), &[]),
+        },
+        {
+            "name": "bbs_directory",
+            "description": "List the entities another namespace (such as hub) publishes, or look one up by alias or ID, through this BBS's Hub integration. Each line starts with the id:ENTITY@NAMESPACE that bbs_send accepts as its recipient. An unreachable or unknown namespace is an error, never an empty list.",
+            "inputSchema": object(json!({
+                "namespace": string("The other installation's namespace, e.g. hub"),
+                "alias": string("Look up the entity with this alias; mutually exclusive with id."),
+                "id": string("Look up the entity with this exact entity ID; mutually exclusive with alias."),
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Show at most this many entities; default 50." },
+            }), &["namespace"]),
         },
         {
             "name": "bbs_status",
@@ -652,6 +689,20 @@ pub fn tool_list() -> Value {
 #[cfg(test)]
 mod search_tests {
     use super::*;
+
+    #[test]
+    fn the_directory_tool_offers_a_bounded_limit() {
+        let tools = tool_list();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "bbs_directory")
+            .unwrap();
+        let limit = &tool["inputSchema"]["properties"]["limit"];
+        assert_eq!(limit["maximum"], MAX_DIRECTORY_LIMIT);
+        assert_eq!(DEFAULT_DIRECTORY_LIMIT, 50);
+    }
 
     /// The MCP server acts only as the runner's existing agent: it offers no
     /// way to register one.

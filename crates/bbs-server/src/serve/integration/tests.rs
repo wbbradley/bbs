@@ -75,6 +75,7 @@ impl Rig {
             auth_failures: std::sync::Mutex::new(HashMap::new()),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(Utc::now),
+            integrations: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1848,4 +1849,535 @@ async fn an_oversize_catalog_is_not_sent_and_does_not_hold_up_the_outbox() {
     let revision: i64 =
         rig.count("SELECT publication_revision FROM bbs_integrations WHERE id = 'hub'");
     assert_eq!(revision as u64, before.revision);
+}
+
+// ---- remote directories ------------------------------------------------------
+
+/// A client of the rig's main gRPC service, acting as `caller`.
+async fn client(rig: &Rig, caller: Caller) -> crate::backend::Backend {
+    use crate::proto::bbs_server::BbsServer;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(BbsServer::new(super::super::Server(rig.state.clone())))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    crate::backend::Backend::Remote(
+        crate::backend::Remote::connect(&addr, caller)
+            .await
+            .unwrap(),
+    )
+}
+
+fn agent(rig: &Rig) -> Caller {
+    Caller {
+        token: Some(rig.agent.clone()),
+        ..Default::default()
+    }
+}
+
+fn list(namespace: &str) -> proto::RemoteDirectoryRequest {
+    proto::RemoteDirectoryRequest {
+        namespace: namespace.into(),
+        ..Default::default()
+    }
+}
+
+/// Ask in the background; the test plays the adapter meanwhile.
+fn ask_remote(
+    mut b: crate::backend::Backend,
+    req: proto::RemoteDirectoryRequest,
+) -> tokio::task::JoinHandle<anyhow::Result<proto::RemoteDirectoryResponse>> {
+    tokio::spawn(async move { b.remote_directory(req).await })
+}
+
+/// The next frame, which must be a remote directory query.
+async fn remote_query(adapter: &mut Adapter) -> mp::DirectoryQuery {
+    match adapter.next().await.unwrap() {
+        Out::RemoteDirectoryQuery(q) => q,
+        other => panic!("expected a remote directory query, got {other:?}"),
+    }
+}
+
+fn descriptor(namespace: &str, id: &str, kind: &str) -> mp::EntityDescriptor {
+    mp::EntityDescriptor {
+        entity: Some(mp::EntityRef {
+            namespace: namespace.into(),
+            entity_id: id.into(),
+        }),
+        kind: kind.into(),
+        display_name: id.to_uppercase(),
+        aliases: vec![id.into()],
+        lifecycle: mp::Lifecycle::Active as i32,
+        ..Default::default()
+    }
+}
+
+fn code_of(err: &anyhow::Error) -> tonic::Code {
+    err.downcast_ref::<Status>()
+        .unwrap_or_else(|| panic!("not a status: {err:#}"))
+        .code()
+}
+
+/// The caller's query reaches the adapter as its own entity, and the
+/// verified page comes back, without descriptors from elsewhere.
+#[tokio::test]
+async fn remote_directories_are_asked_as_the_caller_and_answered() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut adapter, _) = rig.connect().await;
+    let asked = ask_remote(
+        client(&rig, human()).await,
+        proto::RemoteDirectoryRequest {
+            page_size: 500,
+            page_token: b"next".to_vec(),
+            ..list("hub")
+        },
+    );
+    let q = remote_query(&mut adapter).await;
+    let who = q.requester.clone().unwrap().entity.unwrap();
+    assert_eq!(
+        (who.namespace.as_str(), who.entity_id.as_str()),
+        ("bbs", "will")
+    );
+    assert_eq!(q.namespace, "hub");
+    assert_eq!((q.alias.as_str(), q.entity_id.as_str()), ("", ""));
+    assert_eq!(q.page_size, 100, "capped at the largest page");
+    assert_eq!(q.page_token, b"next");
+    let left = q.deadline_unix_micros - Utc::now().timestamp_micros();
+    assert!((4_000_000..=5_000_000).contains(&left), "{left}");
+    adapter
+        .send(In::RemoteDirectoryResult(mp::DirectoryResult {
+            query_id: q.query_id,
+            entities: vec![
+                descriptor("hub", "ada", "human"),
+                descriptor("acme", "mallory", "human"),
+                descriptor("hub", "echo", "agent"),
+            ],
+            next_page_token: b"more".to_vec(),
+            ..Default::default()
+        }))
+        .await;
+    let page = asked.await.unwrap().unwrap();
+    let ids: Vec<_> = page
+        .entities
+        .iter()
+        .map(|e| format!("{}@{} {} {}", e.entity_id, e.namespace, e.kind, e.lifecycle))
+        .collect();
+    assert_eq!(ids, ["ada@hub human active", "echo@hub agent active"]);
+    assert_eq!(page.entities[0].display_name, "ADA");
+    assert_eq!(page.next_page_token, b"more");
+
+    // An agent asks as its own entity; an alias is normalized.
+    let asked = ask_remote(
+        client(&rig, agent(&rig)).await,
+        proto::RemoteDirectoryRequest {
+            alias: "Ada".into(),
+            ..list("hub")
+        },
+    );
+    let q = remote_query(&mut adapter).await;
+    let who = q.requester.clone().unwrap().entity.unwrap();
+    assert_eq!(who.entity_id, "will/scout");
+    assert_eq!(q.alias, "ada");
+    adapter
+        .send(In::RemoteDirectoryResult(mp::DirectoryResult {
+            query_id: q.query_id,
+            ..Default::default()
+        }))
+        .await;
+    assert!(asked.await.unwrap().unwrap().entities.is_empty());
+    let q = rig.state.integrations.lock().unwrap()["hub"]
+        .queries()
+        .as_ref()
+        .unwrap()
+        .len();
+    assert_eq!(q, 0, "no waiter is left behind");
+}
+
+/// A remote home's failure is an error carrying its reason, never an empty
+/// directory.
+#[tokio::test]
+async fn remote_directory_failures_pass_through_as_errors() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut adapter, _) = rig.connect().await;
+    use tonic::Code::*;
+    for (reason, code) in [
+        ("namespace_unknown", NotFound),
+        ("entity_unknown", NotFound),
+        ("invalid_cursor", InvalidArgument),
+        ("invalid_argument", InvalidArgument),
+        ("invalid_address", InvalidArgument),
+        ("permission_denied", PermissionDenied),
+        ("route_not_authorized", PermissionDenied),
+        ("invalid_signature", PermissionDenied),
+        ("expired", DeadlineExceeded),
+        ("directory_timeout", DeadlineExceeded),
+        ("queue_full", ResourceExhausted),
+        // A remote home cannot judge the caller's own credentials.
+        ("invalid_token", Unavailable),
+        ("token_revoked", Unavailable),
+        ("token_unknown", Unavailable),
+        ("scope_denied", Unavailable),
+        ("home_offline", Unavailable),
+        ("relay_unavailable", Unavailable),
+        ("invalid_message", Unavailable),
+    ] {
+        let asked = ask_remote(client(&rig, human()).await, list("hub"));
+        let q = remote_query(&mut adapter).await;
+        adapter
+            .send(In::RemoteDirectoryResult(mp::DirectoryResult {
+                query_id: q.query_id,
+                error_code: reason.into(),
+                detail: "said the\nother home".into(),
+                entities: vec![descriptor("hub", "ada", "human")],
+                ..Default::default()
+            }))
+            .await;
+        let err = asked.await.unwrap().unwrap_err();
+        assert_eq!(code_of(&err), code, "{reason}");
+        assert_eq!(
+            err.to_string(),
+            format!("{reason}: said the other home"),
+            "{reason}"
+        );
+    }
+}
+
+/// An adapter that does not answer in time, or whose stream ends, fails
+/// the query as unavailable; its late answer is ignored.
+#[tokio::test]
+async fn unanswered_remote_directories_time_out() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut adapter, _) = rig.connect().await;
+    let asked = ask_remote(client(&rig, human()).await, list("hub"));
+    let q = remote_query(&mut adapter).await;
+    let err = timeout(Duration::from_secs(10), asked)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(code_of(&err), tonic::Code::DeadlineExceeded);
+    assert!(err.to_string().starts_with("directory_timeout:"), "{err:#}");
+    let waiting = rig.state.integrations.lock().unwrap()["hub"]
+        .queries()
+        .as_ref()
+        .unwrap()
+        .len();
+    assert_eq!(waiting, 0, "the timed-out waiter is gone");
+    adapter
+        .send(In::RemoteDirectoryResult(mp::DirectoryResult {
+            query_id: q.query_id,
+            ..Default::default()
+        }))
+        .await;
+    // The stream carries on.
+    adapter.send(In::Ping(pb::Ping { nonce: 7 })).await;
+    let Out::Pong(pong) = adapter.next().await.unwrap() else {
+        panic!("expected a pong");
+    };
+    assert_eq!(pong.nonce, 7);
+
+    // A stream that ends while a query waits fails it at once.
+    let asked = ask_remote(client(&rig, human()).await, list("hub"));
+    remote_query(&mut adapter).await;
+    drop(adapter);
+    let err = timeout(Duration::from_secs(3), asked)
+        .await
+        .expect("failed before the timeout")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(code_of(&err), tonic::Code::Unavailable);
+    assert!(err.to_string().starts_with("relay_unavailable:"), "{err:#}");
+}
+
+/// Refusals come before anything reaches an adapter.
+#[tokio::test]
+async fn remote_directories_are_refused_without_a_usable_integration() {
+    let rig = Rig::new().await;
+    let mut b = client(&rig, human()).await;
+    // Publication off: the caller has no entity Hub could know.
+    let err = b.remote_directory(list("hub")).await.unwrap_err();
+    assert_eq!(code_of(&err), tonic::Code::FailedPrecondition);
+    assert!(err.to_string().contains("does not publish"), "{err:#}");
+    // On, but no adapter connected.
+    rig.publish(true);
+    let err = b.remote_directory(list("hub")).await.unwrap_err();
+    assert_eq!(code_of(&err), tonic::Code::Unavailable);
+    assert!(err.to_string().contains("is not connected"), "{err:#}");
+    // This installation's own namespace, and bad selectors.
+    let (mut adapter, _) = rig.connect().await;
+    for req in [
+        list("bbs"),
+        list("Not A Namespace"),
+        proto::RemoteDirectoryRequest {
+            alias: "ada".into(),
+            entity_id: "ada".into(),
+            ..list("hub")
+        },
+        proto::RemoteDirectoryRequest {
+            alias: "no spaces".into(),
+            ..list("hub")
+        },
+        proto::RemoteDirectoryRequest {
+            entity_id: "a/b/c".into(),
+            ..list("hub")
+        },
+    ] {
+        let err = b.remote_directory(req.clone()).await.unwrap_err();
+        assert_eq!(
+            code_of(&err),
+            tonic::Code::InvalidArgument,
+            "{req:?}: {err:#}"
+        );
+    }
+    adapter.quiet().await;
+    // No integration enabled at all.
+    drop(adapter);
+    assert!(integration::admin_revoke(&mut rig.conn(), "hub").unwrap());
+    let err = b.remote_directory(list("hub")).await.unwrap_err();
+    assert_eq!(code_of(&err), tonic::Code::FailedPrecondition);
+    assert!(
+        err.to_string().contains("no integration is enabled"),
+        "{err:#}"
+    );
+}
+
+fn waiting(rig: &Rig) -> usize {
+    rig.state.integrations.lock().unwrap()["hub"]
+        .queries()
+        .as_ref()
+        .unwrap()
+        .len()
+}
+
+/// Hold `n` places among the stream's waiting queries for `caller`, as
+/// queries the adapter has not answered would.
+fn occupy(
+    rig: &Rig,
+    caller: &str,
+    n: usize,
+) -> Vec<oneshot::Receiver<Result<mp::DirectoryResult, Status>>> {
+    let sessions = rig.state.integrations.lock().unwrap();
+    let mut queries = sessions["hub"].queries();
+    let waiting = queries.as_mut().unwrap();
+    (0..n)
+        .map(|i| {
+            let (done, rx) = oneshot::channel();
+            waiting.insert(
+                format!("{caller}-{i}").replace('/', "-"),
+                Query {
+                    caller: caller.into(),
+                    done,
+                },
+            );
+            rx
+        })
+        .collect()
+}
+
+/// Too many queries waiting on the stream, or for one caller, is
+/// `RESOURCE_EXHAUSTED` before anything reaches the adapter; another caller
+/// still gets through.
+#[tokio::test]
+async fn remote_directory_queries_are_bounded_per_stream_and_per_caller() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut adapter, _) = rig.connect().await;
+    let mut will = client(&rig, human()).await;
+    let held = occupy(&rig, "will", MAX_REMOTE_QUERIES_PER_CALLER);
+    let err = will.remote_directory(list("hub")).await.unwrap_err();
+    assert_eq!(code_of(&err), tonic::Code::ResourceExhausted, "{err:#}");
+    assert!(err.to_string().starts_with("queue_full: "), "{err:#}");
+    // The agent is another caller.
+    let asked = ask_remote(client(&rig, agent(&rig)).await, list("hub"));
+    let q = remote_query(&mut adapter).await;
+    adapter
+        .send(In::RemoteDirectoryResult(mp::DirectoryResult {
+            query_id: q.query_id,
+            ..Default::default()
+        }))
+        .await;
+    asked.await.unwrap().unwrap();
+    drop(held);
+    // The stream's own bound, whoever asks.
+    let _held = occupy(&rig, "others", MAX_REMOTE_QUERIES - waiting(&rig));
+    let err = will.remote_directory(list("hub")).await.unwrap_err();
+    assert_eq!(code_of(&err), tonic::Code::ResourceExhausted, "{err:#}");
+    assert!(err.to_string().contains("integration hub"), "{err:#}");
+    adapter.quiet().await;
+}
+
+/// Answers find their own queries in whatever order they come, and what a
+/// page shows is cached as observed, at the server's clock.
+#[tokio::test]
+async fn remote_directory_answers_out_of_order_and_are_observed() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    // Observations count for a namespace bound to the integration.
+    db::integration::bind_namespace(&rig.conn(), "hub", "hub").unwrap();
+    let (mut adapter, _) = rig.connect().await;
+    let first = ask_remote(
+        client(&rig, human()).await,
+        proto::RemoteDirectoryRequest {
+            alias: "ada".into(),
+            ..list("hub")
+        },
+    );
+    let q1 = remote_query(&mut adapter).await;
+    let second = ask_remote(
+        client(&rig, agent(&rig)).await,
+        proto::RemoteDirectoryRequest {
+            entity_id: " echo ".into(),
+            ..list("hub")
+        },
+    );
+    let q2 = remote_query(&mut adapter).await;
+    assert_eq!(q2.entity_id, "echo", "trimmed");
+    for (q, id, kind) in [(&q2, "echo", "agent"), (&q1, "ada", "human")] {
+        adapter
+            .send(In::RemoteDirectoryResult(mp::DirectoryResult {
+                query_id: q.query_id.clone(),
+                entities: vec![descriptor("hub", id, kind)],
+                ..Default::default()
+            }))
+            .await;
+    }
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert_eq!(first.entities[0].entity_id, "ada");
+    assert_eq!(second.entities[0].entity_id, "echo");
+    assert_eq!(
+        rig.count(
+            "SELECT count(*) FROM entities WHERE namespace = 'hub'
+             AND ((entity_id = 'ada' AND kind = 'human' AND display_name = 'ADA')
+               OR (entity_id = 'echo' AND kind = 'agent'))"
+        ),
+        2
+    );
+}
+
+/// A malformed result fails only its own query; one naming no query is
+/// dropped; the stream and its handoffs carry on.
+#[tokio::test]
+async fn a_malformed_remote_directory_result_fails_only_its_query() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut adapter, _) = rig.connect().await;
+    let too_many = |id: String| mp::DirectoryResult {
+        query_id: id,
+        entities: (0..101)
+            .map(|i| descriptor("hub", &format!("e{i}"), "human"))
+            .collect(),
+        ..Default::default()
+    };
+    let long_token = |id: String| mp::DirectoryResult {
+        query_id: id,
+        next_page_token: vec![b'x'; 4097],
+        ..Default::default()
+    };
+    for malformed in [
+        &too_many as &dyn Fn(String) -> mp::DirectoryResult,
+        &long_token,
+    ] {
+        let asked = ask_remote(client(&rig, human()).await, list("hub"));
+        let q = remote_query(&mut adapter).await;
+        adapter
+            .send(In::RemoteDirectoryResult(malformed(q.query_id)))
+            .await;
+        let err = timeout(Duration::from_secs(3), asked)
+            .await
+            .expect("failed at once")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(code_of(&err), tonic::Code::Unavailable, "{err:#}");
+        assert!(err.to_string().starts_with("invalid_message: "), "{err:#}");
+    }
+    adapter
+        .send(In::RemoteDirectoryResult(mp::DirectoryResult {
+            query_id: "not an id".into(),
+            ..Default::default()
+        }))
+        .await;
+    // The stream carries on: a handoff still goes out.
+    let id = rig.send("id:ada@hub", "still here").unwrap().id.unwrap();
+    let (_, m) = adapter.outgoing().await;
+    assert_eq!(m.body, b"still here");
+    rig.settle(id, "sent").await;
+}
+
+/// A newer stream supersedes the one a query waits on: the query fails at
+/// once, and the new stream serves the next.
+#[tokio::test]
+async fn a_superseded_stream_fails_its_waiting_queries() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut old, _) = rig.connect().await;
+    let asked = ask_remote(client(&rig, human()).await, list("hub"));
+    let q = remote_query(&mut old).await;
+    let (mut new, _) = rig.connect().await;
+    let err = timeout(Duration::from_secs(3), asked)
+        .await
+        .expect("failed at once")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(code_of(&err), tonic::Code::Unavailable, "{err:#}");
+    assert!(err.to_string().starts_with("relay_unavailable:"), "{err:#}");
+    // The old stream's late answer reaches no one.
+    let _ = old
+        .tx
+        .send(pb::AdapterFrame {
+            payload: Some(In::RemoteDirectoryResult(mp::DirectoryResult {
+                query_id: q.query_id,
+                ..Default::default()
+            })),
+        })
+        .await;
+    let asked = ask_remote(client(&rig, human()).await, list("hub"));
+    let q = remote_query(&mut new).await;
+    new.send(In::RemoteDirectoryResult(mp::DirectoryResult {
+        query_id: q.query_id,
+        entities: vec![descriptor("hub", "ada", "human")],
+        ..Default::default()
+    }))
+    .await;
+    assert_eq!(asked.await.unwrap().unwrap().entities.len(), 1);
+}
+
+/// A focused agent may not query remote directories, as it may not send
+/// remotely; its owner still can.
+#[tokio::test]
+async fn a_focused_agent_may_not_query_remote_directories() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut adapter, _) = rig.connect().await;
+    service::set_focus(
+        &mut rig.conn(),
+        &human(),
+        proto::SetFocusRequest {
+            agent: "scout".into(),
+            focused: true,
+        },
+    )
+    .unwrap();
+    let err = client(&rig, agent(&rig))
+        .await
+        .remote_directory(list("hub"))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), tonic::Code::FailedPrecondition, "{err:#}");
+    assert!(err.to_string().contains("focus mode"), "{err:#}");
+    adapter.quiet().await;
+    let asked = ask_remote(client(&rig, human()).await, list("hub"));
+    let q = remote_query(&mut adapter).await;
+    adapter
+        .send(In::RemoteDirectoryResult(mp::DirectoryResult {
+            query_id: q.query_id,
+            ..Default::default()
+        }))
+        .await;
+    asked.await.unwrap().unwrap();
 }

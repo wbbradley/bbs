@@ -348,7 +348,160 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 format_agents(&r)
             }
         }
+        Command::Directory {
+            namespace,
+            alias,
+            id,
+            limit,
+            json,
+        } => {
+            let req = proto::RemoteDirectoryRequest {
+                namespace: namespace.trim().to_string(),
+                alias: alias.unwrap_or_default().trim().to_string(),
+                entity_id: id.unwrap_or_default().trim().to_string(),
+                ..Default::default()
+            };
+            let limit = (limit as usize).min(MAX_DIRECTORY_LIMIT);
+            let (entities, more) = remote_directory(backend, req.clone(), limit).await?;
+            if more {
+                eprintln!("(more exist; only the first {limit} are shown)");
+            }
+            if json {
+                directory_json(&entities)?
+            } else {
+                format_directory(&req, &entities)
+            }
+        }
     })
+}
+
+/// The most entities one `bbs directory` listing shows, and its default.
+pub(crate) const MAX_DIRECTORY_LIMIT: usize = 2000;
+/// The largest page a remote home is asked for.
+const DIRECTORY_PAGE: usize = 100;
+
+/// The pages of a remote directory listing, up to `limit` entities; true
+/// when there are more.
+pub(crate) async fn remote_directory(
+    backend: &mut Backend,
+    mut req: proto::RemoteDirectoryRequest,
+    limit: usize,
+) -> Result<(Vec<proto::RemoteEntity>, bool)> {
+    let mut entities = Vec::new();
+    loop {
+        let want = limit
+            .saturating_sub(entities.len())
+            .clamp(1, DIRECTORY_PAGE);
+        req.page_size = want as u32;
+        let page = backend.remote_directory(req.clone()).await?;
+        entities.extend(page.entities);
+        if entities.len() >= limit || page.next_page_token.is_empty() {
+            let more = entities.len() > limit || !page.next_page_token.is_empty();
+            entities.truncate(limit);
+            return Ok((entities, more));
+        }
+        req.page_token = page.next_page_token;
+    }
+}
+
+/// Whether `c` is invisible formatting another home could use to disguise
+/// text: bidirectional overrides, embeddings, isolates and marks, and
+/// zero-width characters.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{061C}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Remote text as shown: without invisible formatting characters.
+fn visible(text: &str) -> String {
+    text.chars().filter(|c| !invisible(*c)).collect()
+}
+
+/// Remote text shown on one line: control characters become spaces, and
+/// invisible formatting is dropped.
+fn one_line(text: &str) -> String {
+    visible(text)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// One line per entity: `id:ENTITY@NAMESPACE  kind  display name  [aliases]`,
+/// the first column as `bbs send --to` takes it.
+pub(crate) fn format_directory(
+    req: &proto::RemoteDirectoryRequest,
+    entities: &[proto::RemoteEntity],
+) -> String {
+    if entities.is_empty() {
+        let ns = &req.namespace;
+        return match (req.alias.as_str(), req.entity_id.as_str()) {
+            ("", "") => format!("No entities are published in {ns}.\n"),
+            (alias, "") => format!("No entity in {ns} has the alias {alias}.\n"),
+            (_, id) => format!("No entity {id} in {ns}.\n"),
+        };
+    }
+    let rows: Vec<[String; 3]> = entities
+        .iter()
+        .map(|e| {
+            let mut kind = one_line(&e.kind);
+            if e.lifecycle == "retired" {
+                kind.push_str(" (retired)");
+            }
+            let mut name = one_line(&e.display_name);
+            if !e.aliases.is_empty() {
+                let aliases: Vec<_> = e.aliases.iter().map(|a| one_line(a)).collect();
+                let _ = write!(name, "  [{}]", aliases.join(", "));
+            }
+            [format!("id:{}@{}", e.entity_id, e.namespace), kind, name]
+        })
+        .collect();
+    let width = |i: usize| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
+    let (id_w, kind_w) = (width(0), width(1));
+    let mut out = String::new();
+    for [id, kind, name] in rows {
+        let line = format!("{id:<id_w$}  {kind:<kind_w$}  {name}");
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// Remote text in JSON is escaped where it is a control character, but
+/// invisible formatting is dropped, as in text.
+#[derive(Serialize)]
+struct DirectoryJson<'a> {
+    /// As `bbs send --to` takes it: `id:ENTITY@NAMESPACE`.
+    id: String,
+    namespace: &'a str,
+    entity_id: &'a str,
+    kind: String,
+    display_name: String,
+    aliases: Vec<String>,
+    description: String,
+    /// "active", "retired", or "" when the remote home does not say.
+    lifecycle: &'a str,
+}
+
+pub(crate) fn directory_json(entities: &[proto::RemoteEntity]) -> Result<String> {
+    json_lines(entities.iter().map(|e| DirectoryJson {
+        id: format!("id:{}@{}", e.entity_id, e.namespace),
+        namespace: &e.namespace,
+        entity_id: &e.entity_id,
+        kind: visible(&e.kind),
+        display_name: visible(&e.display_name),
+        aliases: e.aliases.iter().map(|a| visible(a)).collect(),
+        description: visible(&e.description),
+        lifecycle: &e.lifecycle,
+    }))
 }
 
 /// Validate remote enrollment before saving credentials or changing config.
@@ -732,6 +885,63 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn directory_lines_lead_with_the_sendable_id() {
+        let entity = |id: &str, kind: &str, name: &str, aliases: &[&str], lifecycle: &str| {
+            proto::RemoteEntity {
+                namespace: "hub".into(),
+                entity_id: id.into(),
+                kind: kind.into(),
+                display_name: name.into(),
+                aliases: aliases.iter().map(|a| a.to_string()).collect(),
+                description: String::new(),
+                lifecycle: lifecycle.into(),
+            }
+        };
+        let req = proto::RemoteDirectoryRequest {
+            namespace: "hub".into(),
+            ..Default::default()
+        };
+        let entities = [
+            entity(
+                "will",
+                "human",
+                "Will\x1b[2J\u{202E}\u{200B} B.\u{2066}\u{FEFF}",
+                &["wi\u{200D}ll"],
+                "active",
+            ),
+            entity("echo", "agent", "Echo", &[], "retired"),
+        ];
+        assert_eq!(
+            format_directory(&req, &entities),
+            "id:will@hub  human            Will [2J B.  [will]\n\
+             id:echo@hub  agent (retired)  Echo\n"
+        );
+        assert_eq!(
+            format_directory(&req, &[]),
+            "No entities are published in hub.\n"
+        );
+        let alias = proto::RemoteDirectoryRequest {
+            alias: "ada".into(),
+            ..req.clone()
+        };
+        assert_eq!(
+            format_directory(&alias, &[]),
+            "No entity in hub has the alias ada.\n"
+        );
+        let json = directory_json(&entities[..1]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+        assert_eq!(v["id"], "id:will@hub");
+        assert_eq!(v["aliases"][0], "will");
+        assert_eq!(v["display_name"], "Will\x1b[2J B.");
+        assert!(
+            Cli::try_parse_from(["bbs", "directory", "hub", "--alias", "a", "--id", "b"]).is_err()
+        );
+        for bad in ["0", "2001"] {
+            assert!(Cli::try_parse_from(["bbs", "directory", "hub", "--limit", bad]).is_err());
+        }
+    }
 
     #[test]
     fn update_notice_is_for_humans_only() {

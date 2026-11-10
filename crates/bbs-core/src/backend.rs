@@ -46,6 +46,8 @@ pub const FEED_SYNC: &str = "feed-sync.v1";
 pub const AGENT_FOCUS: &str = "agent-focus.v1";
 pub const AGENT_GOAL: &str = "agent-goal.v1";
 pub const TIMERS_EDIT: &str = "timers-edit.v1";
+/// Listing and looking up another namespace's entities through Hub.
+pub const REMOTE_DIRECTORY: &str = "remote-directory.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -805,6 +807,22 @@ impl Backend {
             }
             Backend::Remote(r) => rpc!(r, timer_update, req, &[TIMERS, TIMERS_EDIT])
                 .map_err(|e| missing_rpc(e, TIMERS_EDIT)),
+        }
+    }
+
+    /// List or look up another namespace's entities through the server's
+    /// Hub integration; only a server has one.
+    pub async fn remote_directory(
+        &mut self,
+        req: proto::RemoteDirectoryRequest,
+    ) -> Result<proto::RemoteDirectoryResponse> {
+        match self {
+            Backend::Local(_) => bail!(
+                "remote directories need a BBS server with a Hub integration; a local board \
+                 has none (configure one with `bbs init --server`)"
+            ),
+            Backend::Remote(r) => rpc!(r, remote_directory, req, &[REMOTE_DIRECTORY])
+                .map_err(|e| missing_rpc(e, REMOTE_DIRECTORY)),
         }
     }
 

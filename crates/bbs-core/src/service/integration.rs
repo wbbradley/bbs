@@ -76,6 +76,18 @@ impl std::fmt::Display for Unsupported {
 
 impl std::error::Error for Unsupported {}
 
+/// A client request this server refuses as malformed: `InvalidArgument`.
+#[derive(Debug)]
+pub struct InvalidRequest(pub String);
+
+impl std::fmt::Display for InvalidRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidRequest {}
+
 fn invalid(detail: impl Into<String>) -> anyhow::Error {
     InvalidFrame(detail.into()).into()
 }
@@ -503,6 +515,39 @@ pub fn record_result(
     })
 }
 
+/// The integration that reaches another installation's `namespace`: the one
+/// bound to it, else the only usable one. It must publish this
+/// installation's entities, which are who `what` acts for.
+fn route(ctx: &Ctx, namespace: &str, what: &str) -> Result<String> {
+    let usable = store::usable(ctx.conn)?;
+    let integration = match store::namespace_integration(ctx.conn, namespace)? {
+        Some(bound) => bound,
+        None => match usable.as_slice() {
+            [] => bail!(
+                "{what} are off: no integration is enabled; an administrator adds \
+                 one with `bbs admin integration add`"
+            ),
+            [(id, _)] => id.clone(),
+            _ => bail!(
+                "several integrations are enabled and none reaches namespace {namespace} \
+                 yet; BBS cannot choose one"
+            ),
+        },
+    };
+    match usable.iter().find(|(id, _)| *id == integration) {
+        Some((_, true)) => Ok(integration),
+        Some((_, false)) => bail!(
+            "{what} are off: integration {integration} does not publish this \
+             installation's entities; an administrator turns that on with `bbs admin \
+             integration publish {integration} on`"
+        ),
+        None => bail!(
+            "{what} are off: integration {integration}, which reaches namespace \
+             {namespace}, is disabled or has no credential"
+        ),
+    }
+}
+
 /// Send a native message to a remote address: the message and its pending
 /// handoff are stored together, in the caller's transaction. Publication must
 /// be on for the integration that reaches the address.
@@ -523,33 +568,7 @@ pub(super) fn send_remote(
         bail!("id:{reference} is in this installation's namespace ({local}); send to its name");
     }
     // Every refusal comes before any row is written.
-    let usable = store::usable(ctx.conn)?;
-    let integration = match store::namespace_integration(ctx.conn, namespace)? {
-        Some(bound) => bound,
-        None => match usable.as_slice() {
-            [] => bail!(
-                "remote sends are off: no integration is enabled; an administrator adds \
-                 one with `bbs admin integration add`"
-            ),
-            [(id, _)] => id.clone(),
-            _ => bail!(
-                "several integrations are enabled and none reaches namespace {namespace} \
-                 yet; BBS cannot choose one"
-            ),
-        },
-    };
-    match usable.iter().find(|(id, _)| *id == integration) {
-        Some((_, true)) => {}
-        Some((_, false)) => bail!(
-            "remote sends are off: integration {integration} does not publish this \
-             installation's entities; an administrator turns that on with `bbs admin \
-             integration publish {integration} on`"
-        ),
-        None => bail!(
-            "remote sends are off: integration {integration}, which reaches namespace \
-             {namespace}, is disabled or has no credential"
-        ),
-    }
+    let integration = route(ctx, namespace, "remote sends")?;
     if store::foreign_retired(ctx.conn, namespace, entity_id)? {
         bail!("id:{reference} is retired, as the integration last observed it");
     }
@@ -1040,16 +1059,166 @@ pub fn observe(
     })
 }
 
-/// Check a directory result the adapter sent. BBS sends no remote directory
-/// queries yet, so a valid one is ignored.
-pub fn check_remote_directory(result: &mp::DirectoryResult) -> Result<()> {
+/// How long the adapter has to answer a remote directory query.
+pub const REMOTE_DIRECTORY_DEADLINE: chrono::Duration = chrono::Duration::seconds(5);
+/// The longest page token a client may pass back, and so the longest a
+/// remote home's answer may carry.
+const MAX_REMOTE_PAGE_TOKEN_BYTES: usize = 4096;
+
+/// A remote directory query for the adapter, and the integration to ask.
+#[derive(Debug)]
+pub struct RemoteQuery {
+    pub integration: String,
+    pub query: mp::DirectoryQuery,
+}
+
+/// Build the caller's directory query about another installation's
+/// namespace: checked, routed to its integration as remote sends are, with
+/// the caller's own entity as the requester and a deadline
+/// [`REMOTE_DIRECTORY_DEADLINE`] from now. Writes nothing.
+pub fn remote_directory_query(
+    conn: &mut Connection,
+    caller: &crate::service::Caller,
+    req: &crate::proto::RemoteDirectoryRequest,
+) -> Result<RemoteQuery> {
+    let bad = |detail: String| -> anyhow::Error { InvalidRequest(detail).into() };
+    let namespace = req.namespace.trim();
+    if db::validate_namespace(namespace).is_err() {
+        return Err(bad(format!(
+            "invalid namespace {namespace:?}: expected [a-z][a-z0-9-]*"
+        )));
+    }
+    let (alias, entity_id) = (req.alias.trim(), req.entity_id.trim());
+    if !alias.is_empty() && !entity_id.is_empty() {
+        return Err(bad("alias and entity_id are mutually exclusive".into()));
+    }
+    let alias = if alias.is_empty() {
+        String::new()
+    } else {
+        normalize_alias(alias).ok_or_else(|| bad(format!("invalid alias {:?}", req.alias)))?
+    };
+    if !entity_id.is_empty() && !entity::valid_entity_id(entity_id) {
+        return Err(bad(format!("invalid entity ID {:?}", req.entity_id)));
+    }
+    if req.page_token.len() > MAX_REMOTE_PAGE_TOKEN_BYTES {
+        return Err(bad("the page token is too long".into()));
+    }
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        // A focused agent reaches only its owner, here as for remote sends.
+        super::check_focus(ctx, &me, None)?;
+        let local = db::namespace(ctx.conn)?;
+        if namespace == local {
+            return Err(bad(format!(
+                "{namespace} is this installation's namespace; list its agents and humans \
+                 with `bbs agents`"
+            )));
+        }
+        let integration = route(ctx, namespace, "remote directories")?;
+        let requester = db::native_address(ctx.conn, me.kind.into(), me.id)?
+            .context("the caller has no native address")?;
+        let deadline = ctx.now + REMOTE_DIRECTORY_DEADLINE;
+        Ok(RemoteQuery {
+            integration,
+            query: mp::DirectoryQuery {
+                query_id: db::new_message_id(),
+                requester: Some(mp::Requester {
+                    entity: Some(mp::EntityRef {
+                        namespace: requester.entity.namespace,
+                        entity_id: requester.entity.entity_id,
+                    }),
+                    run_id: None,
+                }),
+                namespace: namespace.to_string(),
+                alias,
+                page_size: req.page_size.min(MAX_ENTITIES as u32),
+                page_token: req.page_token.clone(),
+                deadline_unix_micros: deadline.timestamp_micros(),
+                entity_id: entity_id.to_string(),
+                list_runs: false,
+            },
+        })
+    })
+}
+
+/// A remote directory page for the client: its entities in `namespace`,
+/// with any malformed descriptor, or one naming another namespace, left
+/// out. The result must carry no error code.
+pub fn remote_directory_page(
+    namespace: &str,
+    result: &mp::DirectoryResult,
+) -> crate::proto::RemoteDirectoryResponse {
+    let entities = result
+        .entities
+        .iter()
+        .filter(|d| {
+            let ok = check_descriptor(d).is_ok()
+                && d.entity.as_ref().is_some_and(|e| e.namespace == namespace);
+            if !ok {
+                tracing::warn!(namespace, "skipping a malformed remote directory entry");
+            }
+            ok
+        })
+        .map(|d| {
+            let e = d.entity.clone().unwrap_or_default();
+            crate::proto::RemoteEntity {
+                namespace: e.namespace,
+                entity_id: e.entity_id,
+                kind: d.kind.clone(),
+                display_name: d.display_name.clone(),
+                aliases: d.aliases.clone(),
+                description: d.description.clone(),
+                lifecycle: match mp::Lifecycle::try_from(d.lifecycle) {
+                    Ok(mp::Lifecycle::Active) => "active",
+                    Ok(mp::Lifecycle::Retired) => "retired",
+                    _ => "",
+                }
+                .to_string(),
+            }
+        })
+        .collect();
+    crate::proto::RemoteDirectoryResponse {
+        entities,
+        next_page_token: result.next_page_token.clone(),
+    }
+}
+
+/// The valid descriptors of a remote directory page in `namespace`, to
+/// cache as observations made at `now`.
+pub fn observable(
+    namespace: &str,
+    result: &mp::DirectoryResult,
+    now: chrono::DateTime<chrono::Utc>,
+) -> pb::ObservedEntities {
+    pb::ObservedEntities {
+        entities: result
+            .entities
+            .iter()
+            .filter(|d| {
+                check_descriptor(d).is_ok()
+                    && d.entity.as_ref().is_some_and(|e| e.namespace == namespace)
+            })
+            .cloned()
+            .collect(),
+        observed_at_unix_micros: now.timestamp_micros(),
+    }
+}
+
+/// Check a directory result the adapter sent for a remote directory query:
+/// why it is malformed, if it is. Only that query fails for it.
+pub fn check_remote_directory(result: &mp::DirectoryResult) -> Result<(), String> {
     if !entity::valid_id(&result.query_id) {
-        return Err(invalid("remote_directory_result has an invalid query_id"));
+        return Err("remote_directory_result has an invalid query_id".into());
     }
     if result.entities.len() > MAX_ENTITIES || result.runs.len() > MAX_ENTITIES {
-        return Err(invalid(format!(
+        return Err(format!(
             "remote_directory_result carries over {MAX_ENTITIES} entries"
-        )));
+        ));
+    }
+    if result.next_page_token.len() > MAX_REMOTE_PAGE_TOKEN_BYTES {
+        return Err(format!(
+            "remote_directory_result's page token is over {MAX_REMOTE_PAGE_TOKEN_BYTES} bytes"
+        ));
     }
     Ok(())
 }

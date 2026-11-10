@@ -12,7 +12,8 @@
 //!   before it is queued (up to [`QUEUE`] at once); BBS's result goes back
 //!   to the relay on the stream the message came on. Imports sent to an
 //!   earlier stream, whose results were lost with it, are offered again;
-//! - asks BBS to answer Hub's directory queries for this namespace.
+//! - asks BBS to answer Hub's directory queries for this namespace, and
+//!   asks the relay BBS's queries about other namespaces.
 
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ use bbs_core::hub_proto::integration::integration_client::IntegrationClient;
 use bbs_core::hub_proto::msgproto_v1 as mp;
 use pb::adapter_frame::Payload as Out;
 use pb::bbs_frame::Payload as In;
+use tokio::task::JoinSet;
 use tonic::transport::Endpoint;
 use tonic::{Code, Request, Status};
 
@@ -223,7 +225,11 @@ async fn read(
     mut inbound: tonic::Streaming<pb::BbsFrame>,
 ) -> Result<()> {
     let mut snapshot = true;
+    // BBS's remote directory queries, asked beside the reader; dropped,
+    // and so aborted, with it when the stream ends.
+    let mut queries = JoinSet::new();
     while let Some(f) = inbound.message().await? {
+        while queries.try_join_next().is_some() {}
         let reply = match f.payload {
             Some(In::Hello(_)) => bail!("BBS repeated its hello"),
             Some(In::Published(catalog)) => {
@@ -243,15 +249,33 @@ async fn read(
                 shared.directory_answered(result);
                 None
             }
-            // BBS asks no remote directory queries yet; answered plainly so
-            // a future BBS does not wait.
+            // Asked of the relay beside the reader, which never waits on it.
+            // The result goes back on this stream's control queue; the task
+            // ends with the stream, as BBS's waiting query does.
             Some(In::RemoteDirectoryQuery(q)) => {
-                Some(Out::RemoteDirectoryResult(mp::DirectoryResult {
-                    query_id: q.query_id,
-                    error_code: "unimplemented".to_string(),
-                    detail: "this adapter does not resolve remote directories yet".to_string(),
-                    ..Default::default()
-                }))
+                let (shared, tx) = (shared.clone(), tx.clone());
+                queries.spawn(async move {
+                    let query = q.query_id.clone();
+                    let result = crate::relay::remote_directory(&shared, q).await;
+                    tracing::info!(
+                        query,
+                        error = result.error_code,
+                        entities = result.entities.len(),
+                        "answered BBS's remote directory query"
+                    );
+                    let item = Item {
+                        frame: frame(Out::RemoteDirectoryResult(result)),
+                        claim: None,
+                    };
+                    let sent = match tx.reserve_control().await {
+                        Some(permit) => permit.send(item).is_ok(),
+                        None => false,
+                    };
+                    if !sent {
+                        tracing::info!(query, "BBS's stream ended before the result went");
+                    }
+                });
+                None
             }
             Some(In::Ping(p)) => Some(Out::Pong(pb::Pong { nonce: p.nonce })),
             Some(In::Pong(_)) => None,

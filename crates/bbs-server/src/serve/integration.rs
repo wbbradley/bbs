@@ -28,6 +28,7 @@ use tonic::{Request, Response, Status, Streaming};
 use super::{BoxStream, Policy, State};
 use crate::service::integration::{self, Catalog, InvalidFrame, TOKEN_METADATA, Unsupported};
 use bbs_core::hub_proto::integration as pb;
+use bbs_core::hub_proto::msgproto_v1 as mp;
 use pb::adapter_frame::Payload as In;
 use pb::bbs_frame::Payload as Out;
 use pb::integration_server::{Integration as IntegrationRpc, IntegrationServer};
@@ -46,8 +47,207 @@ pub(super) const MAX_STREAMS_PER_CONNECTION: u32 = 4;
 /// How often pending handoffs past their deadline are expired.
 const SWEEP: Duration = Duration::from_secs(60);
 
-/// Open streams by integration ID; setting one's flag supersedes it.
-type Sessions = Arc<Mutex<HashMap<String, Arc<watch::Sender<bool>>>>>;
+/// The most remote directory queries waiting on one stream, and the most
+/// of them one caller may have. Each sends one frame, on the stream's
+/// outbound queue with handoffs: a handoff waits behind at most the first
+/// bound of query frames (the queue's senders are served in turn), and a
+/// query waits for room only until its deadline.
+const MAX_REMOTE_QUERIES: usize = 128;
+const MAX_REMOTE_QUERIES_PER_CALLER: usize = 8;
+/// How long a remote directory query waits for the adapter's result: the
+/// deadline the query carries, and a margin for the way back.
+const REMOTE_WAIT: Duration = Duration::from_secs(6);
+
+/// Open streams by integration ID.
+pub(super) type Sessions = Arc<Mutex<HashMap<String, Arc<Link>>>>;
+
+/// Remote directory queries waiting for their results, by query ID.
+type Waiting = HashMap<String, Query>;
+
+/// A remote directory query waiting for its result.
+struct Query {
+    /// Who asked, as its requester entity ID.
+    caller: String,
+    done: oneshot::Sender<Result<mp::DirectoryResult, Status>>,
+}
+
+/// An open stream, as the server reaches it.
+pub(super) struct Link {
+    /// Set to end the stream for a newer one.
+    superseded: watch::Sender<bool>,
+    /// Weak, so the stream still ends when its session lets go of it.
+    tx: mpsc::WeakSender<Item>,
+    /// None once the stream has ended: no result can come.
+    queries: Mutex<Option<Waiting>>,
+}
+
+impl Link {
+    fn queries(&self) -> std::sync::MutexGuard<'_, Option<Waiting>> {
+        self.queries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The stream has ended: its waiting queries fail at once.
+    fn close(&self) {
+        self.queries().take();
+    }
+
+    /// The adapter's result for a remote directory query, or why it was
+    /// malformed; one nothing waits for (late, or never asked) is dropped.
+    fn answered(&self, query_id: &str, result: Result<mp::DirectoryResult, Status>) {
+        let waiter = self.queries().as_mut().and_then(|q| q.remove(query_id));
+        match waiter {
+            Some(w) => {
+                let _ = w.done.send(result);
+            }
+            None => tracing::debug!(
+                query = query_id,
+                "a late or unknown remote directory result"
+            ),
+        }
+    }
+}
+
+/// A query's place among its stream's waiting queries, given up when the
+/// asker stops waiting, however that happens.
+struct Waiter<'a> {
+    link: &'a Link,
+    id: String,
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        if let Some(q) = self.link.queries().as_mut() {
+            q.remove(&self.id);
+        }
+    }
+}
+
+/// Ask `integration`'s adapter a remote directory query, and wait up to
+/// [`REMOTE_WAIT`] for its result. A result with an error code is returned
+/// as is; failing to get one at all is `Unavailable`.
+pub(super) async fn remote_directory(
+    state: &State,
+    integration: &str,
+    query: mp::DirectoryQuery,
+) -> Result<mp::DirectoryResult, Status> {
+    let deadline = tokio::time::Instant::now() + REMOTE_WAIT;
+    let link = state
+        .integrations
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(integration)
+        .cloned()
+        .ok_or_else(|| {
+            Status::unavailable(format!(
+                "relay_unavailable: integration {integration} is not connected; is its \
+                 adapter running?"
+            ))
+        })?;
+    let caller = query
+        .requester
+        .as_ref()
+        .and_then(|r| r.entity.as_ref())
+        .map(|e| e.entity_id.clone())
+        .unwrap_or_default();
+    let (tx, rx) = oneshot::channel();
+    let waiter = {
+        let mut queries = link.queries();
+        let Some(waiting) = queries.as_mut() else {
+            return Err(Status::unavailable(format!(
+                "relay_unavailable: integration {integration}'s stream has ended"
+            )));
+        };
+        if waiting.len() >= MAX_REMOTE_QUERIES {
+            return Err(Status::resource_exhausted(format!(
+                "queue_full: too many remote directory queries are waiting on integration \
+                 {integration}"
+            )));
+        }
+        let mine = waiting.values().filter(|q| q.caller == caller).count();
+        if mine >= MAX_REMOTE_QUERIES_PER_CALLER {
+            return Err(Status::resource_exhausted(format!(
+                "queue_full: you have {mine} remote directory queries waiting; wait for \
+                 one to finish"
+            )));
+        }
+        waiting.insert(query.query_id.clone(), Query { caller, done: tx });
+        Waiter {
+            link: &link,
+            id: query.query_id.clone(),
+        }
+    };
+    let ended = || {
+        Status::unavailable(format!(
+            "relay_unavailable: integration {integration}'s stream ended before it answered"
+        ))
+    };
+    let timed_out = || {
+        Status::deadline_exceeded(format!(
+            "directory_timeout: integration {integration} did not answer in time"
+        ))
+    };
+    let item = Item {
+        frame: frame(Out::RemoteDirectoryQuery(query)),
+        claim: None,
+    };
+    let Some(tx) = link.tx.upgrade() else {
+        return Err(ended());
+    };
+    match tokio::time::timeout_at(deadline, tx.send(item)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Err(ended()),
+        Err(_) => return Err(timed_out()),
+    }
+    let result = match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(_)) => return Err(ended()),
+        Err(_) => return Err(timed_out()),
+    };
+    drop(waiter);
+    Ok(result)
+}
+
+/// The client's status for a remote directory result's error: Hub's reason
+/// code first, then its detail.
+pub(super) fn remote_status(namespace: &str, result: &mp::DirectoryResult) -> Status {
+    let code: String = result
+        .error_code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(64)
+        .collect();
+    let detail: String = result
+        .detail
+        .chars()
+        .take(1024)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let message = if detail.trim().is_empty() {
+        format!("{code}: the directory of {namespace} is unavailable")
+    } else {
+        format!("{code}: {}", detail.trim())
+    };
+    match code.as_str() {
+        "namespace_unknown" | "entity_unknown" => Status::not_found(message),
+        "invalid_argument" | "invalid_cursor" | "invalid_address" => {
+            Status::invalid_argument(message)
+        }
+        // Refused by the destination, or by this installation's adapter
+        // verifying the answer.
+        "permission_denied" | "route_not_authorized" | "invalid_signature" => {
+            Status::permission_denied(message)
+        }
+        "expired" | "directory_timeout" => Status::deadline_exceeded(message),
+        "queue_full" => Status::resource_exhausted(message),
+        // A remote home cannot judge the local caller's credentials (Hub's
+        // herr.Remote): its claims about a token or scope, scope_denied
+        // included, are UNAVAILABLE, as is everything else.
+        "invalid_token" | "token_revoked" | "token_unknown" | "scope_denied" => {
+            Status::unavailable(message)
+        }
+        _ => Status::unavailable(message),
+    }
+}
 
 /// A frame for the adapter, with the outbox row it hands off, if any.
 struct Item {
@@ -74,7 +274,6 @@ fn lock(queue: &Queue) -> std::sync::MutexGuard<'_, Outbound> {
 #[derive(Clone)]
 pub(super) struct Integration {
     state: Arc<State>,
-    sessions: Sessions,
     /// A read-only connection for credential checks, so unauthenticated
     /// peers never wait on, or hold, the shared one. None for in-memory
     /// databases.
@@ -99,7 +298,6 @@ pub(super) fn service(
     };
     Ok(IntegrationServer::new(Integration {
         state,
-        sessions: Arc::default(),
         auth,
         handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
     })
@@ -285,17 +483,30 @@ impl Drop for FrameStream {
 
 impl Integration {
     /// Register a new stream for `id`, ending any older one.
-    fn supersede(&self, id: &str) -> Arc<watch::Sender<bool>> {
-        let mine = Arc::new(watch::Sender::new(false));
-        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+    fn supersede(&self, id: &str, tx: &mpsc::Sender<Item>) -> Arc<Link> {
+        let mine = Arc::new(Link {
+            superseded: watch::Sender::new(false),
+            tx: tx.downgrade(),
+            queries: Mutex::new(Some(HashMap::new())),
+        });
+        let mut sessions = self
+            .state
+            .integrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(old) = sessions.insert(id.to_string(), mine.clone()) {
-            old.send_replace(true);
+            old.superseded.send_replace(true);
         }
         mine
     }
 
-    fn release(&self, id: &str, mine: &Arc<watch::Sender<bool>>) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+    fn release(&self, id: &str, mine: &Arc<Link>) {
+        mine.close();
+        let mut sessions = self
+            .state
+            .integrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if sessions.get(id).is_some_and(|s| Arc::ptr_eq(s, mine)) {
             sessions.remove(id);
         }
@@ -380,31 +591,32 @@ impl IntegrationRpc for Integration {
         let i = id.clone();
         let bbs_hello = call(&state, move |conn| integration::hello(conn, &i)).await?;
         drop(handshake);
-        let superseded = self.supersede(&id);
+        let (tx, rx) = mpsc::channel(OUTBOUND_FRAMES);
+        // Room for the hello is certain: the channel is new, and nothing
+        // else can reach it before it is registered below.
+        let _ = tx.try_send(Item {
+            frame: frame(Out::Hello(bbs_hello)),
+            claim: None,
+        });
+        let link = self.supersede(&id, &tx);
         tracing::info!(
             integration = id,
             build = hello.build,
             ?peer,
             "integration connected"
         );
-
-        let (tx, rx) = mpsc::channel(OUTBOUND_FRAMES);
-        // Room for the hello is certain: the channel is new.
-        let _ = tx.try_send(Item {
-            frame: frame(Out::Hello(bbs_hello)),
-            claim: None,
-        });
         let queue: Queue = Arc::new(Mutex::new(Outbound { rx, closed: false }));
         let (terminal, terminal_rx) = oneshot::channel();
         let this = self.clone();
         let session_queue = queue.clone();
         tokio::spawn(async move {
-            let mut ended = superseded.subscribe();
+            let mut ended = link.superseded.subscribe();
             let session = Session {
                 state: state.clone(),
                 id: id.clone(),
                 tx,
                 queue: session_queue.clone(),
+                link: link.clone(),
             };
             // Every way the stream ends is here, so each can cut short the
             // others, including a handoff waiting for room on the stream.
@@ -432,7 +644,7 @@ impl IntegrationRpc for Integration {
                     abandon(&session_queue, &state);
                 }
             }
-            this.release(&id, &superseded);
+            this.release(&id, &link);
         });
         Ok(Response::new(Box::pin(FrameStream {
             queue,
@@ -471,6 +683,7 @@ struct Session {
     id: String,
     tx: mpsc::Sender<Item>,
     queue: Queue,
+    link: Arc<Link>,
 }
 
 impl Session {
@@ -530,8 +743,23 @@ impl Session {
                     })
                     .await?,
                 )),
+                // A malformed result fails only its own query, if it
+                // names one; the stream and its handoffs carry on.
                 Some(In::RemoteDirectoryResult(result)) => {
-                    integration::check_remote_directory(&result).map_err(status)?;
+                    let query_id = result.query_id.clone();
+                    match integration::check_remote_directory(&result) {
+                        Ok(()) => self.link.answered(&query_id, Ok(result)),
+                        Err(why) => {
+                            tracing::warn!(integration = id, "{why}");
+                            self.link.answered(
+                                &query_id,
+                                Err(Status::unavailable(format!(
+                                    "invalid_message: integration {id}'s adapter sent a \
+                                     malformed answer: {why}"
+                                ))),
+                            );
+                        }
+                    }
                     None
                 }
                 Some(In::Ping(ping)) => Some(Out::Pong(pb::Pong { nonce: ping.nonce })),

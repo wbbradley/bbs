@@ -47,6 +47,9 @@ only the server's error text.
 
 `ServerInfo` returns `require_human_token`, release version and revision, protocol
 epoch, capabilities, and the optional minimum and recommended client versions.
+A client refuses a `ServerInfo` whose capability names exceed 8 KiB together
+(each is at most 128 bytes of `[A-Za-z0-9.-]`) as an incompatible server; there
+is no limit on how many it lists.
 Responses, errors, and opened streams carry compact server version, epoch, and
 policy hints. The client validates `ServerInfo` during `bbs init`, keeps typed gRPC
 status on errors, and reports `UNIMPLEMENTED` as a coordinated upgrade; successful

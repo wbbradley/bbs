@@ -177,6 +177,25 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List the entities another namespace (such as Hub) publishes, or look
+    /// one up, through the server's Hub integration. Each line starts with
+    /// the `id:ENTITY@NAMESPACE` that `bbs send --to` accepts.
+    Directory {
+        /// The other installation's namespace, e.g. hub.
+        namespace: String,
+        /// Look up the entity with this alias.
+        #[arg(long, conflicts_with = "id")]
+        alias: Option<String>,
+        /// Look up the entity with this exact ID.
+        #[arg(long, value_name = "ENTITY")]
+        id: Option<String>,
+        /// Show at most this many entities (at most 2000).
+        #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u32).range(1..=2000))]
+        limit: u32,
+        /// Print one JSON object per entity (JSONL) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Where `bbs setup` installs; existing settings and custom handlers are kept.

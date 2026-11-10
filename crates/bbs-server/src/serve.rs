@@ -127,6 +127,7 @@ async fn serve(
         auth_failures: Mutex::new(HashMap::new()),
         timer_limits,
         clock: Arc::new(Utc::now),
+        integrations: Default::default(),
     });
     tokio::spawn(run_timers(state.clone()));
     tokio::spawn(integration::sweep(state.clone()));
@@ -268,6 +269,8 @@ struct State {
     timer_limits: TimerLimits,
     /// The time timers fire by; tests set it.
     clock: Clock,
+    /// Open integration streams, so RPCs can ask their adapters.
+    integrations: integration::Sessions,
 }
 
 type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
@@ -474,6 +477,8 @@ impl State {
                     Status::unauthenticated(err.to_string())
                 } else if err.downcast_ref::<service::SyncPageTooLarge>().is_some() {
                     Status::resource_exhausted(err.to_string())
+                } else if let Some(e) = err.downcast_ref::<service::integration::InvalidRequest>() {
+                    Status::invalid_argument(e.to_string())
                 } else {
                     Status::failed_precondition(format!("{err:#}"))
                 }
@@ -1498,6 +1503,68 @@ impl Bbs for Server {
         })
         .await
     }
+
+    /// Checked and routed like a unary call, then asked of the integration's
+    /// adapter without holding the database, which may take seconds.
+    async fn remote_directory(
+        &self,
+        req: Request<proto::RemoteDirectoryRequest>,
+    ) -> Result<Response<proto::RemoteDirectoryResponse>, Status> {
+        const RPC: &str = "remote_directory";
+        self.0.protocol.validate(req.metadata())?;
+        let result = async {
+            let peer = req.remote_addr().map(|addr| addr.ip());
+            let caller = Arc::new(caller(&req, self.0.require_human_token));
+            self.0.enforce_auth_rate(peer, &caller).await?;
+            let req = req.into_inner();
+            let c = caller.clone();
+            let routed = self
+                .0
+                .call(move |conn| service::integration::remote_directory_query(conn, &c, &req))
+                .await;
+            let q = match routed {
+                Ok(q) => q,
+                Err(status) => {
+                    self.0.record_auth_failure(peer, &status);
+                    self.0.warn_failed(RPC, &caller, &status).await;
+                    return Err(status);
+                }
+            };
+            let namespace = q.query.namespace.clone();
+            let asked = integration::remote_directory(&self.0, &q.integration, q.query)
+                .await
+                .and_then(|r| match r.error_code.is_empty() {
+                    true => Ok(r),
+                    // Never an empty directory: the remote home's failure.
+                    false => Err(integration::remote_status(&namespace, &r)),
+                });
+            let result = match asked {
+                Ok(r) => r,
+                Err(status) => {
+                    self.0.warn_failed(RPC, &caller, &status).await;
+                    return Err(status);
+                }
+            };
+            // What the directory shows is cached as observed, as the
+            // adapter's own observations are; a failure costs nothing more.
+            let observed = service::integration::observable(&namespace, &result, (self.0.clock)());
+            if !observed.entities.is_empty() {
+                let integration = q.integration.clone();
+                let cached = self
+                    .0
+                    .call(move |conn| service::integration::observe(conn, &integration, &observed))
+                    .await;
+                if let Err(status) = cached {
+                    tracing::warn!("caching remote directory entries: {}", status.message());
+                }
+            }
+            Ok(Response::new(service::integration::remote_directory_page(
+                &namespace, &result,
+            )))
+        }
+        .await;
+        self.0.protocol.finish(result)
+    }
 }
 
 #[cfg(test)]
@@ -1545,6 +1612,7 @@ mod tests {
                 auth_failures: Mutex::new(HashMap::new()),
                 timer_limits: TimerLimits::default(),
                 clock: Arc::new(Utc::now),
+                integrations: Default::default(),
             });
             Self {
                 server: Server(state),
@@ -1815,6 +1883,7 @@ mod tests {
                 auth_failures: Mutex::new(HashMap::new()),
                 timer_limits: TimerLimits::default(),
                 clock: Arc::new(Utc::now),
+                integrations: Default::default(),
             });
             let snapshot = || {
                 let conn = state.conn.lock().unwrap();
@@ -2021,6 +2090,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::from([(peer.ip(), (Instant::now(), 20))])),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(Utc::now),
+            integrations: Default::default(),
         });
         let server = Server(state.clone());
         let request = || {
@@ -2171,6 +2241,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::new()),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(Utc::now),
+            integrations: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -2345,6 +2416,7 @@ mod tests {
                 auth_failures: Mutex::new(HashMap::new()),
                 timer_limits: TimerLimits::default(),
                 clock: Arc::new(Utc::now),
+                integrations: Default::default(),
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap().to_string();
@@ -2482,6 +2554,7 @@ mod tests {
                 auth_failures: Mutex::new(HashMap::new()),
                 timer_limits: TimerLimits::default(),
                 clock: Arc::new(Utc::now),
+                integrations: Default::default(),
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap().to_string();
@@ -2564,6 +2637,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::new()),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(Utc::now),
+            integrations: Default::default(),
         });
         let status = state
             .call(|_| -> Result<()> { Err(service::SyncPageTooLarge { message_id: 7 }.into()) })
@@ -2593,6 +2667,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::new()),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(Utc::now),
+            integrations: Default::default(),
         });
         let (started, active) = tokio::sync::oneshot::channel();
         let (finish, release) = std::sync::mpsc::channel();
@@ -2661,6 +2736,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::new()),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(Utc::now),
+            integrations: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2920,6 +2996,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::new()),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(move || *clock.lock().unwrap()),
+            integrations: Default::default(),
         });
         let mut changes = state.notify.subscribe();
         // Wait for the scheduler to commit what `done` checks for. It bumps

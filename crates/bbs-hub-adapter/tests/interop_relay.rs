@@ -287,6 +287,48 @@ async fn messages_and_directory_round_trip_with_go_hub() {
         .unwrap();
     assert_eq!(reply_to, origin);
 
+    // BBS's directory of namespace hub, through the adapter and the relay,
+    // signed by Go Hub and verified here.
+    let listing = remote
+        .remote_directory(proto::RemoteDirectoryRequest {
+            namespace: "hub".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let found: Vec<_> = listing
+        .entities
+        .iter()
+        .map(|e| (e.entity_id.as_str(), e.kind.as_str()))
+        .collect();
+    assert!(found.contains(&("will", "human")), "{found:?}");
+    assert!(found.contains(&("echo", "agent")), "{found:?}");
+    assert!(listing.entities.iter().all(|e| e.namespace == "hub"));
+    let will = remote
+        .remote_directory(proto::RemoteDirectoryRequest {
+            namespace: "hub".into(),
+            alias: "will".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<_> = will.entities.iter().map(|e| e.entity_id.as_str()).collect();
+    assert_eq!(ids, ["will"]);
+    // A namespace Hub does not know is an error, not an empty directory.
+    let err = remote
+        .remote_directory(proto::RemoteDirectoryRequest {
+            namespace: "nowhere".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    let status = err.downcast_ref::<tonic::Status>().expect("a status");
+    assert_eq!(status.code(), tonic::Code::NotFound, "{err:#}");
+    assert!(
+        err.to_string().starts_with("namespace_unknown: "),
+        "{err:#}"
+    );
+
     let _ = stop.send(());
     running.await.unwrap().unwrap();
     bbs.abort();

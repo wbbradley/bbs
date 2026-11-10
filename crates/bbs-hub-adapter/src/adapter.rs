@@ -6,8 +6,8 @@
 //!
 //! Lock order, outermost first: the store; then a link's queue (see
 //! [`crate::link`]); then the boundary's event list, a leaf. The `bbs`,
-//! `relay` and `directory` slots are only held to read or swap them, taking
-//! nothing else. Nothing takes the store inside a queue lock: what a
+//! `relay`, `directory` and `remote` slots are only held to read or swap
+//! them, taking nothing else. Nothing takes the store inside a queue lock: what a
 //! transport takes is recorded as an event and applied to the store by
 //! [`Shared::apply_boundary`], outside every queue lock (`Shared::store`
 //! checks this in debug builds).
@@ -117,8 +117,18 @@ pub(crate) struct RelayLink {
     pub connection: String,
 }
 
-/// The most directory queries waiting on BBS at once.
+/// The most directory queries waiting on BBS at once, and the most this
+/// adapter asks the relay at once (Hub's per-peer bound).
 pub(crate) const MAX_DIRECTORY_QUERIES: usize = 128;
+
+/// A directory query this adapter asked the relay, waiting for its answer.
+pub(crate) struct RemoteQuery {
+    /// The signed query record's hash, which its answer binds.
+    pub hash: [u8; 32],
+    /// The relay stream it was asked on, the only one its answer may come on.
+    pub connection: String,
+    pub done: oneshot::Sender<mp::federation_frame::Payload>,
+}
 
 pub(crate) struct Shared {
     pub s: Settings,
@@ -146,6 +156,9 @@ pub(crate) struct Shared {
     /// Hub directory queries waiting for BBS's answer, by the query ID BBS
     /// was given.
     pub directory: Mutex<HashMap<String, oneshot::Sender<mp::DirectoryResult>>>,
+    /// BBS's directory queries about other namespaces, waiting for the
+    /// relay, by the query ID the relay was given.
+    pub remote: Mutex<HashMap<String, RemoteQuery>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -504,8 +517,27 @@ impl Adapter {
                 stop,
                 dropped: std::sync::atomic::AtomicU64::new(0),
                 directory: Mutex::new(HashMap::new()),
+                remote: Mutex::new(HashMap::new()),
             }),
         })
+    }
+
+    /// Ask the relay a directory query as BBS's stream would, bypassing
+    /// BBS's own checks: for tests of the adapter's.
+    #[doc(hidden)]
+    pub fn remote_directory_asker(
+        &self,
+    ) -> impl Fn(
+        mp::DirectoryQuery,
+    ) -> std::pin::Pin<Box<dyn Future<Output = mp::DirectoryResult> + Send>>
+    + Send
+    + Sync
+    + 'static {
+        let shared = self.shared.clone();
+        move |q| {
+            let shared = shared.clone();
+            Box::pin(async move { crate::relay::remote_directory(&shared, q).await })
+        }
     }
 
     /// Open the adapter a configuration file describes.

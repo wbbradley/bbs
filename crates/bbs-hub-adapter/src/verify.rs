@@ -26,6 +26,10 @@ pub const STORAGE_UNAVAILABLE: &str = "storage_unavailable";
 pub const STORAGE_FULL: &str = "storage_full";
 pub const HOME_OFFLINE: &str = "home_offline";
 pub const QUEUE_FULL: &str = "queue_full";
+/// Directory results for a query this installation asked.
+pub const RELAY_UNAVAILABLE: &str = "relay_unavailable";
+pub const DIRECTORY_TIMEOUT: &str = "directory_timeout";
+pub const INVALID_ARGUMENT: &str = "invalid_argument";
 
 /// A refusal with its msgproto reason and a diagnostic detail.
 #[derive(Debug, Clone, PartialEq, Eq)]

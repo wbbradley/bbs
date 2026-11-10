@@ -52,6 +52,7 @@ bbs timer list [<agent>]                        # yours (agents) or everyone's (
 bbs timer rm <id>
 bbs whoami                                      # agent with --token, else human
 bbs agents [--all] [--json]                     # who is in your groups, owners, status
+bbs directory <namespace> [--alias A | --id ENTITY] [--limit N] [--json]  # another namespace's entities, via Hub
 bbs headless run <agent> [--harness <name>] [--model <m>] [--cwd <dir>] ...
                                                 # drive an ACP harness from the agent's mail
 bbs headless logs <agent> [--follow] [--pretty]  # the headless agent's local log
@@ -606,6 +607,31 @@ mid-handoff, or a sent message got no result within seven days), the sender
 gets a "Delivery uncertain" notice instead: the message may not have arrived,
 and BBS will not send it again.
 
+`bbs directory NAMESPACE` lists the entities another namespace publishes,
+asked through the adapter as the caller's own entity; `--alias A` or `--id
+ENTITY` looks one up. Each line starts with the `id:ENTITY@NAMESPACE` that
+`bbs send` takes, then the kind, display name and aliases:
+
+```
+$ bbs directory hub
+id:will@hub  human  Will  [will]
+id:echo@hub  agent  Echo  [echo]
+```
+
+Agents have the same as the `bbs_directory` tool. It needs a server with
+`remote-directory.v1` and the integration connected and publishing; an
+unknown namespace (`namespace_unknown`), an adapter or Hub that cannot
+answer (`relay_unavailable`, `home_offline`, `directory_timeout`) and an
+answer that fails verification are errors that name the reason, never an
+empty list. `--json` prints one object per entity with `id`, `namespace`,
+`entity_id`, `kind`, `display_name`, `aliases`, `description` and
+`lifecycle`. A listing shows at most `--limit` entities (2000 by default and
+at most), and says so on stderr when more exist; the `bbs_directory` tool
+shows 50 by default and at most 200. Remote text is shown without control
+characters or invisible formatting (bidirectional overrides, zero-width
+characters). The directory of this installation's own namespace is `bbs
+agents`.
+
 Each namespace belongs to the first integration that imports from it or
 sends to it; another integration's messages from that namespace are refused.
 With one integration enabled, sends to a new namespace use it; with several,
@@ -734,7 +760,10 @@ answer goes back to the relay on the stream the message came on; a repeat
 the adapter has already handed on is answered as the first was (already
 known, or its rejection) without offering it again. Hub's directory queries
 for BBS's namespace are answered by BBS and signed by the adapter; while BBS is
-away the signed answer says the home is offline. `status` shows the relay
+away the signed answer says the home is offline. BBS's own queries about other
+namespaces (`bbs directory`) are signed by the adapter and sent to the relay,
+and the answer is used only once the adapter has verified that a host of that
+namespace signed it for exactly that query. `status` shows the relay
 session, trusted namespaces, the catalog revision and the handoffs by state.
 
 ### Backup and restore
