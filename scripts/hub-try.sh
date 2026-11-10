@@ -196,6 +196,8 @@ Delivery takes a moment: if a read shows nothing yet, read again.
        bbs read
          [TIME] from id:will@hub (remote) to will (id N):
          hello from hub
+     N is the number in "(id N)". bbs reply takes only these BBS numbers, not
+     the ids hub read shows:
        bbs reply N "thanks"
        hub read
          [TIME] from will@bbs to will (id bbs:MSGID) (reply to HUB_MSGID):
@@ -213,15 +215,17 @@ Delivery takes a moment: if a read shows nothing yet, read again.
          will@bbs was added to release.
          [TIME] from id:will@hub via id:release@hub to will (id B):
          to the group
+     A and B are numbers, such as 4 and 5. The notice (A) has no sender, so
+     replying to it is refused:
+       bbs reply A "hi notice"
+         bbs: a group notice has no sender to reply to: ...
+     A reply to the copy (B) goes to will@hub directly, not to the group, and
+     answers his message to the group:
        bbs reply B "thanks, group"
        hub read
          (will@hub's own notices that he joined and will@bbs was added, then)
          [TIME] from will@bbs to will (id bbs:MSGID) (reply to HUB_MSGID):
          thanks, group
-     The reply goes to will@hub directly, not to the group, and answers his
-     message to the group. A notice has no sender, so replying is refused:
-       bbs reply A "hi notice"
-         bbs: a group notice has no sender to reply to: ...
 
 5. An agent's view. The agent's MCP tools and hooks read the same inbox:
 
