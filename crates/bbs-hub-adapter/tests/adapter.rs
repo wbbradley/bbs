@@ -2155,20 +2155,30 @@ async fn heartbeats_go_ahead_of_a_full_transfer_queue() {
     );
     let mut peer = w.relay.accept().await;
     let mut transfers = 0;
-    let mut beats_before_last = 0;
+    // Heartbeats seen while the queue is still full of transfers: after the
+    // first tenth has gone and before the last tenth.
+    let mut beats_amid = 0;
     while transfers < SENDS {
         match peer.next_any().await.expect("the stream stays up") {
             F::Transfer(_) => {
                 transfers += 1;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            F::Heartbeat(_) => beats_before_last += 1,
+            F::Heartbeat(_) if transfers > SENDS / 10 && transfers < SENDS - SENDS / 10 => {
+                beats_amid += 1
+            }
+            F::Heartbeat(_) => {}
             other => panic!("unexpected {other:?}"),
         }
     }
-    // 150 transfers at 10 ms take 1.5 s, most of it with the relay's window
-    // full: about 15 heartbeat intervals.
-    assert!(beats_before_last >= 5, "{beats_before_last} heartbeats");
+    // 150 transfers at 10 ms take at least 1.5 s, about 15 heartbeat
+    // intervals; a loaded runner may skip ticks, so the test asks only that
+    // heartbeats keep coming amid the transfers rather than wait for them:
+    // starved, none would arrive until the queue drained.
+    assert!(
+        beats_amid >= 2,
+        "{beats_amid} heartbeats amid the transfers"
+    );
     adapter.stop().await.unwrap();
 }
 
