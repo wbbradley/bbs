@@ -685,8 +685,9 @@ credential_file = "installation.cred"
 
 The relay here is on a tailnet, so this configuration also needs
 `allow_plaintext_network = true` at the top level (see below). Optionally,
-`retention_days` (default 0, which keeps everything) sets how many days a settled
-handoff stays in the adapter's store; BBS keeps the messages themselves.
+`retention_days` (default 0, which keeps everything; at most 36500) sets how many
+days a settled handoff stays in the adapter's store; BBS keeps the messages
+themselves.
 
 ```sh
 bbs-hub-adapter run --config /etc/bbs-hub-adapter/adapter.toml

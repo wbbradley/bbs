@@ -622,6 +622,10 @@ mod tests {
     use prost::Message as _;
 
     fn adapter(dir: &tempfile::TempDir) -> Adapter {
+        adapter_with(dir, Options::default())
+    }
+
+    fn adapter_with(dir: &tempfile::TempDir, opts: Options) -> Adapter {
         Adapter::open(
             Settings {
                 namespace: "bbs".into(),
@@ -635,7 +639,7 @@ mod tests {
                 credential: mp::SignedRecord::default(),
             },
             &dir.path().join("adapter.db"),
-            Options::default(),
+            opts,
         )
         .unwrap()
     }
@@ -1031,6 +1035,31 @@ mod tests {
                 .0,
             "pending",
             "offered again"
+        );
+    }
+
+    /// A retention too long to count back from now keeps settled handoffs,
+    /// rather than overflow and purge them all.
+    #[test]
+    fn an_overlong_retention_keeps_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = adapter_with(
+            &dir,
+            Options {
+                retention: Some(Duration::from_secs(u64::MAX)),
+                ..Options::default()
+            },
+        );
+        let s = &a.shared;
+        let mut late = message("m1");
+        late.expires_at_unix_micros = Some(now_micros() + 100_000);
+        assert!(on_outgoing(s, &offer("h1", late.encode_to_vec())).is_none());
+        std::thread::sleep(Duration::from_millis(150));
+        s.sweep();
+        s.sweep();
+        assert_eq!(
+            s.store().counts(Direction::Outbound).unwrap(),
+            vec![("rejected".to_string(), 1)]
         );
     }
 

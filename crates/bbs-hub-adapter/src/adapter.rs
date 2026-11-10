@@ -291,10 +291,12 @@ impl Shared {
             let lapsed = store
                 .lapse(Direction::Outbound, now)
                 .and_then(|o| Ok((o, store.lapse(Direction::Inbound, now)?)));
+            // A retention too long to subtract keeps everything.
             let before = self
                 .opts
                 .retention
-                .map_or(i64::MIN, |r| now - r.as_micros() as i64);
+                .and_then(|r| now.checked_sub(i64::try_from(r.as_micros()).ok()?))
+                .unwrap_or(i64::MIN);
             let purged = store.purge_settled(before, now);
             (out, inc, lapsed, purged)
         };

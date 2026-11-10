@@ -4,7 +4,7 @@
 //! ```toml
 //! namespace = "bbs"            # this installation's Hub namespace
 //! store = "adapter.db"         # the adapter's own SQLite store
-//! # retention_days = 0         # days to keep settled handoffs; 0 (default) keeps them
+//! # retention_days = 0         # days to keep settled handoffs (at most 36500); 0 keeps them
 //! # allow_plaintext_network = false
 //!
 //! [bbs]
@@ -33,6 +33,9 @@ use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
 use crate::verify::{valid_id, valid_namespace};
+
+/// The longest `retention_days` accepted: a century.
+pub const MAX_RETENTION_DAYS: u64 = 36_500;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +107,13 @@ impl Config {
                 self.namespace
             );
         }
+        if self.retention_days > MAX_RETENTION_DAYS {
+            bail!(
+                "retention_days {} is more than {MAX_RETENTION_DAYS} (a century); use 0 to keep \
+                 settled handoffs",
+                self.retention_days
+            );
+        }
         if !valid_id(&self.bbs.integration_id) {
             bail!(
                 "bbs.integration_id {:?} is not a valid ID",
@@ -148,7 +158,7 @@ impl Config {
     /// Settled handoffs' retention, as the adapter's options take it.
     pub fn retention(&self) -> Option<std::time::Duration> {
         (self.retention_days > 0)
-            .then(|| std::time::Duration::from_secs(self.retention_days * 24 * 3600))
+            .then(|| std::time::Duration::from_secs(self.retention_days.saturating_mul(24 * 3600)))
     }
 }
 
@@ -234,5 +244,21 @@ credential_file = "installation.cred"
         }
         assert!(with("ftp://x", local, true).check().is_err());
         assert_eq!(with(local, local, false).retention(), None);
+    }
+
+    /// An absurd retention is refused, not left to overflow.
+    #[test]
+    fn retention_is_bounded() {
+        let local = "http://127.0.0.1:7801";
+        let mut cfg = with(local, local, false);
+        cfg.retention_days = MAX_RETENTION_DAYS;
+        cfg.check().unwrap();
+        assert_eq!(
+            cfg.retention(),
+            Some(std::time::Duration::from_secs(MAX_RETENTION_DAYS * 86_400))
+        );
+        cfg.retention_days = 100_000_000;
+        let err = cfg.check().unwrap_err().to_string();
+        assert!(err.contains("retention_days"), "{err}");
     }
 }
