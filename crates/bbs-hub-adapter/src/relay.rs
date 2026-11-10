@@ -15,7 +15,7 @@
 //! stays the exact bytes it arrived in (Hub's codec does the same). A frame
 //! that is not a strict encoding ends the stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -317,14 +317,16 @@ impl Session {
     /// Send BBS's import results to the relay, on this stream only (Hub
     /// accepts a result from no other), on control slots. Each is reported
     /// once its frame is taken; one that cannot go before the stream ends is
-    /// dropped with it, as informative results are.
+    /// dropped with it, as informative results are. Results land in any
+    /// order, so this stream remembers what it queued rather than keep a
+    /// cursor.
     async fn report_results(self: Arc<Self>) -> Result<()> {
-        let mut after = 0;
+        let mut queued = HashSet::new();
         loop {
             let owed = self
                 .shared
                 .store()
-                .relay_unreported(&self.connection, after, 32);
+                .relay_unreported(&self.connection, &mut queued, 32);
             let owed = owed?;
             if owed.is_empty() {
                 tokio::select! {
@@ -344,7 +346,7 @@ impl Session {
                 if permit.send(item).is_err() {
                     return Ok(());
                 }
-                after = o.id;
+                queued.insert(o.id);
                 tracing::info!(
                     handoff = o.handoff_id,
                     state = o.state,

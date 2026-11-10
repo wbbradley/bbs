@@ -936,7 +936,12 @@ mod tests {
             store.counts(Direction::Inbound).unwrap(),
             vec![("received".to_string(), N as i64)]
         );
-        assert!(store.relay_unreported("conn-1", 0, 10).unwrap().is_empty());
+        assert!(
+            store
+                .relay_unreported("conn-1", &mut Default::default(), 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

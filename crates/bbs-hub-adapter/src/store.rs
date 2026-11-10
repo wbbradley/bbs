@@ -18,6 +18,7 @@
 //! themselves. Results owed to BBS are kept until a transport takes them,
 //! then for a short while to be sent again on a new stream.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1017,31 +1018,47 @@ impl Store {
     }
 
     /// BBS's import results not yet sent to relay stream `connection` (the
-    /// only stream Hub accepts them on), after row `after`, oldest first.
+    /// only stream Hub accepts them on), oldest first, up to `limit`, leaving
+    /// out the rows in `queued`: those already queued on that stream, which
+    /// are taken or go with it. There is no cursor: a result lands whenever
+    /// BBS answers, not in row order. Rows in `queued` reported since are
+    /// dropped from it.
     pub fn relay_unreported(
         &self,
         connection: &str,
-        after: i64,
+        queued: &mut HashSet<i64>,
         limit: usize,
     ) -> Result<Vec<Outcome>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, relay_handoff_id, relay_connection, state, coalesce(reason, ''),
                  coalesce(detail, '')
              FROM inbound WHERE relay_connection = ?1 AND reported = 0
-                 AND state IN ('received', 'rejected') AND id > ?2
-             ORDER BY id LIMIT ?3",
+                 AND state IN ('received', 'rejected')
+             ORDER BY id",
         )?;
-        let rows = stmt.query_map(params![connection, after, limit as i64], |r| {
-            Ok(Outcome {
-                id: r.get(0)?,
-                handoff_id: r.get(1)?,
-                connection: r.get(2)?,
-                state: r.get(3)?,
-                reason: r.get(4)?,
-                detail: r.get(5)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut rows = stmt.query([connection])?;
+        let mut owed = Vec::new();
+        let mut still = HashSet::new();
+        // Read on until `limit` are found and every queued row has been
+        // seen, so what is left in `queued` is still unreported.
+        while owed.len() < limit || still.len() < queued.len() {
+            let Some(r) = rows.next()? else { break };
+            let id = r.get(0)?;
+            if queued.contains(&id) {
+                still.insert(id);
+            } else if owed.len() < limit {
+                owed.push(Outcome {
+                    id,
+                    handoff_id: r.get(1)?,
+                    connection: r.get(2)?,
+                    state: r.get(3)?,
+                    reason: r.get(4)?,
+                    detail: r.get(5)?,
+                });
+            }
+        }
+        *queued = still;
+        Ok(owed)
     }
 
     /// The relay's transport took import `id`'s result.

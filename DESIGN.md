@@ -629,7 +629,9 @@ BBS's result (received, already known, or its refusal, such as
 is stored, and sent to the relay on the stream the transfer came on, as Hub
 accepts a result from no other stream, whenever it arrives on that stream's
 life; if that stream has gone, the informative result is dropped, never
-resent. Group copies
+resent. Results land in any order, so that stream's reporter keeps no
+cursor: it sends every unreported result it has not already queued. Group
+copies
 pass like any message: their sender is the group, which is never refused for
 being one, and BBS stores the original and original sender. A reply from Hub
 carries `in_reply_to` and the exact address it answers (D092), unchanged.

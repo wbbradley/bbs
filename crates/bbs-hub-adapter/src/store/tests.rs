@@ -421,11 +421,84 @@ fn pending_work_past_its_deadline_is_rejected_as_expired() {
         ("rejected", "expired")
     );
     // Its result is owed to that relay stream only.
-    assert!(store.relay_unreported("conn-2", 0, 10).unwrap().is_empty());
-    let owed = store.relay_unreported("conn-1", 0, 10).unwrap();
+    let mut queued = HashSet::new();
+    assert!(
+        store
+            .relay_unreported("conn-2", &mut queued, 10)
+            .unwrap()
+            .is_empty()
+    );
+    let owed = store.relay_unreported("conn-1", &mut queued, 10).unwrap();
     assert_eq!(owed.len(), 1);
     store.mark_relay_reported(owed[0].id).unwrap();
-    assert!(store.relay_unreported("conn-1", 0, 10).unwrap().is_empty());
+    assert!(
+        store
+            .relay_unreported("conn-1", &mut queued, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+fn import(store: &mut Store, n: u32) -> i64 {
+    store
+        .intake_inbound(
+            &format!("in-{n}"),
+            &format!("relay-{n}"),
+            "conn-1",
+            &origin(&format!("x{n}")),
+            format!("m{n}").as_bytes(),
+            b"e",
+            1_000,
+            10,
+        )
+        .unwrap();
+    store.claim_inbound(20).unwrap().unwrap().id
+}
+
+/// Theo's repro: import results land in any order, not row order. With
+/// imports 1 and 2 offered and 2 answered (and queued) first, 1's result
+/// must still be found on the same stream; what is queued is not found
+/// again, and leaves `queued` once reported.
+#[test]
+fn import_results_are_found_whatever_order_they_land_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(&dir);
+    let first = import(&mut store, 1);
+    let second = import(&mut store, 2);
+    let mut queued = HashSet::new();
+    let ids = |owed: Vec<Outcome>| owed.iter().map(|o| o.id).collect::<Vec<_>>();
+    store
+        .inbound_result("in-2", "received", "", "", 30)
+        .unwrap()
+        .unwrap();
+    let owed = store.relay_unreported("conn-1", &mut queued, 10).unwrap();
+    assert_eq!(ids(owed), vec![second]);
+    queued.insert(second);
+    store
+        .inbound_result("in-1", "rejected", "recipient_unknown", "", 31)
+        .unwrap()
+        .unwrap();
+    let owed = store.relay_unreported("conn-1", &mut queued, 10).unwrap();
+    assert_eq!(ids(owed), vec![first], "the earlier row's later result");
+    queued.insert(first);
+    assert_eq!(queued, HashSet::from([first, second]));
+    // The transport took the second: it leaves `queued`; the first stays.
+    store.mark_relay_reported(second).unwrap();
+    assert!(
+        store
+            .relay_unreported("conn-1", &mut queued, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(queued, HashSet::from([first]));
+    // A limit counts only rows not queued.
+    let third = import(&mut store, 3);
+    store
+        .inbound_result("in-3", "received", "", "", 32)
+        .unwrap()
+        .unwrap();
+    let owed = store.relay_unreported("conn-1", &mut queued, 1).unwrap();
+    assert_eq!(ids(owed), vec![third]);
 }
 
 /// Sent work with no result by its deadline becomes unknown; settled rows
