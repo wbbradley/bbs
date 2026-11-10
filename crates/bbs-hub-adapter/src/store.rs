@@ -175,17 +175,17 @@ BEGIN SELECT RAISE(ABORT, 'an import never changes once settled, and is re-offer
 /// migrated, the operator deletes it.
 const VERSION: i64 = 3;
 
-/// `path` with `.suffix` appended, as SQLite names its WAL files.
+/// `path` with `suffix` appended: `-wal` and `-shm`, as SQLite names its WAL
+/// files, or the adapter's own `.lock`.
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
-    name.push(".");
     name.push(suffix);
     PathBuf::from(name)
 }
 
 /// The store's WAL files, where they exist, must be as private as it is.
 fn check_sidecars(path: &Path) -> Result<()> {
-    for suffix in ["wal", "shm"] {
+    for suffix in ["-wal", "-shm"] {
         let p = sidecar(path, suffix);
         match std::fs::symlink_metadata(&p) {
             Ok(_) => {
@@ -397,7 +397,7 @@ impl Store {
             files::create_private_dir(dir)?;
         }
         let main = files::open_or_create_private(path)?;
-        let lock_path = sidecar(path, "lock");
+        let lock_path = sidecar(path, ".lock");
         let lock = files::open_or_create_private(&lock_path)?;
         if lock.try_lock().is_err() {
             bail!(
