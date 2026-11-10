@@ -188,10 +188,43 @@ struct InteropVector {
     frame_hex: String,
     #[serde(default)]
     message_hex: String,
-    #[serde(default)]
+    /// Present (`Some`) whenever the key is, even as `null`, which Hub
+    /// counts as present and invalid: an absent message is omitted.
+    #[serde(default, deserialize_with = "present")]
     message: Option<serde_json::Value>,
     #[serde(default)]
     reject: String,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(d).map(Some)
+}
+
+/// The vector schema's rules beyond its types, as Hub's checker applies
+/// them: `message` may not be null; only a transfer has a message or a
+/// verdict; and a transfer gives `message_hex` and `message` together or
+/// not at all.
+fn check_schema(v: &InteropVector, transfer: bool) -> Result<(), String> {
+    if v.message.as_ref().is_some_and(|m| m.is_null()) {
+        return Err(format!(
+            "{}: message is null; omit it when there is none",
+            v.name
+        ));
+    }
+    if !transfer {
+        if !v.message_hex.is_empty() || v.message.is_some() || !v.reject.is_empty() {
+            return Err(format!(
+                "{}: only a transfer has a message or a verdict",
+                v.name
+            ));
+        }
+    } else if v.message_hex.is_empty() != v.message.is_none() {
+        return Err(format!(
+            "{}: give both message_hex and message, or neither",
+            v.name
+        ));
+    }
+    Ok(())
 }
 
 fn interop() -> InteropFile {
@@ -255,15 +288,15 @@ fn every_interop_vector() {
             "{}: the frame is empty",
             v.name
         );
-        let Some(mp::federation_frame::Payload::Transfer(_)) = parsed.frame.payload else {
-            assert!(
-                v.message_hex.is_empty() && v.message.is_none() && v.reject.is_empty(),
-                "{}: only a transfer has a message or a verdict",
-                v.name
-            );
+        let transfer = matches!(
+            parsed.frame.payload,
+            Some(mp::federation_frame::Payload::Transfer(_))
+        );
+        check_schema(v, transfer).unwrap();
+        if !transfer {
             passed += 1;
             continue;
-        };
+        }
         transfers += 1;
         let envelope = parsed
             .envelope
@@ -275,15 +308,8 @@ fn every_interop_vector() {
         };
         assert_eq!(got, v.reject, "{}: verdict ({verdict:?})", v.name);
 
-        // message_hex and message come together or not at all; when given
-        // they describe the envelope's signed payload exactly, whatever the
-        // verdict.
-        assert_eq!(
-            v.message_hex.is_empty(),
-            v.message.is_none(),
-            "{}: give both message_hex and message, or neither",
-            v.name
-        );
+        // When given, message_hex and message describe the envelope's
+        // signed payload exactly, whatever the verdict.
         if let Some(message) = &v.message {
             let payload = match verdict {
                 Ok(ok) => ok.bytes,
@@ -306,6 +332,40 @@ fn every_interop_vector() {
     assert_eq!(passed, file.vectors.len());
     assert!(transfers > 0);
     eprintln!("interop vectors: {passed} passed ({transfers} transfers)");
+}
+
+/// The schema checker refuses what Hub's does: a null message counts as
+/// present and invalid.
+#[test]
+fn the_schema_check_refuses_a_null_message() {
+    let vector = |extra: &str| -> InteropVector {
+        let json = format!(r#"{{"name": "t", "producer": "go", "frame_hex": ""{extra}}}"#);
+        serde_json::from_str(&json).unwrap()
+    };
+    let null = vector(r#", "message_hex": "0a00", "message": null"#);
+    assert_eq!(
+        null.message,
+        Some(serde_json::Value::Null),
+        "null is present"
+    );
+    let err = check_schema(&null, true).unwrap_err();
+    assert!(err.contains("null"), "{err}");
+    // Null is refused with no message_hex too, and off a transfer.
+    let bare = vector(r#", "message": null"#);
+    assert!(check_schema(&bare, true).is_err());
+    assert!(check_schema(&bare, false).is_err());
+    // Omitted is absent; a message needs its hex and the other way round.
+    let omitted = vector("");
+    assert_eq!(omitted.message, None);
+    check_schema(&omitted, true).unwrap();
+    check_schema(&omitted, false).unwrap();
+    assert!(check_schema(&vector(r#", "message_hex": "0a00""#), true).is_err());
+    let both = vector(r#", "message_hex": "0a00", "message": {}"#);
+    check_schema(&both, true).unwrap();
+    assert!(check_schema(&both, false).is_err());
+    // The other keys stay typed: null is no string.
+    let json = r#"{"name": "t", "producer": "go", "frame_hex": "", "reject": null}"#;
+    assert!(serde_json::from_str::<InteropVector>(json).is_err());
 }
 
 /// The vector for a duplicated singular field: lenient decoding would take
