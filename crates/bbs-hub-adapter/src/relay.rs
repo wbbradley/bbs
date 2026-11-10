@@ -61,7 +61,7 @@ fn retryable(err: &anyhow::Error) -> bool {
     err.downcast_ref::<TrustRefused>().is_none_or(|r| {
         [
             verify::STORAGE_UNAVAILABLE,
-            "storage_full",
+            verify::STORAGE_FULL,
             verify::QUEUE_FULL,
             verify::HOME_OFFLINE,
         ]

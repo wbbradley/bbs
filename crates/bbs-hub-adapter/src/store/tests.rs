@@ -335,7 +335,22 @@ fn duplicates_and_conflicts_store_nothing_new() {
         panic!("{dup:?}");
     };
     assert_eq!(prior.state, "pending");
+    // The same origin with other bytes under a new handoff: a conflict.
+    // Under bbs-other, which now waits as a duplicate, it is a reused
+    // handoff ID, as for an original's.
     let conflict = store
+        .intake_outbound(
+            "bbs-third",
+            "h9",
+            &origin("m1"),
+            "hub",
+            b"changed",
+            1_000,
+            10,
+        )
+        .unwrap();
+    assert_eq!(conflict, Intake::Conflict);
+    let reused_dup = store
         .intake_outbound(
             "bbs-other",
             "h9",
@@ -346,7 +361,7 @@ fn duplicates_and_conflicts_store_nothing_new() {
             10,
         )
         .unwrap();
-    assert_eq!(conflict, Intake::Conflict);
+    assert_eq!(reused_dup, Intake::HandoffReused);
     // A reused BBS handoff ID for another message, and the same handoff
     // offered again.
     let reused = store
@@ -706,8 +721,15 @@ fn a_duplicate_waits_for_its_original_result() {
             .unwrap()
     };
     assert!(matches!(dup(&store, "bbs-dup"), Intake::Duplicate(p) if p.state == "sent"));
-    // Offered again by BBS before the result: still one waiter.
-    assert!(matches!(dup(&store, "bbs-dup"), Intake::Duplicate(_)));
+    // Offered again by BBS before the result: a repeat of the waiting
+    // duplicate, still one waiter; under that ID with other bytes, a reuse.
+    assert!(matches!(dup(&store, "bbs-dup"), Intake::Repeated(p) if p.state == "sent"));
+    assert_eq!(
+        store
+            .intake_outbound("bbs-dup", "h-x", &origin("m9"), "hub", b"other", 1_000, 22)
+            .unwrap(),
+        Intake::HandoffReused
+    );
     assert!(
         store.unreported(0, 1, 10).unwrap().is_empty(),
         "no answer yet"
@@ -818,5 +840,72 @@ fn a_result_is_resent_only_for_a_while_after_it_was_first_taken() {
             .unwrap()
             .is_empty(),
         "past its while, though not yet purged"
+    );
+}
+
+/// Theo's review: the relay sending an import's own handoff again on its
+/// stream is not a second transfer, and gets one result; and a duplicate
+/// of an import that ends unknown hears nothing.
+#[test]
+fn a_resent_import_gets_one_result_and_an_unknown_one_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(&dir);
+    let first = import(&mut store, 1);
+    let again = |store: &Store, relay_handoff: &str, connection: &str| {
+        store
+            .intake_inbound(
+                "in-again",
+                relay_handoff,
+                connection,
+                &origin("x1"),
+                b"m1",
+                b"e",
+                1_000,
+                25,
+            )
+            .unwrap()
+    };
+    assert!(matches!(
+        again(&store, "relay-1", "conn-1"),
+        Intake::Duplicate(_)
+    ));
+    assert!(matches!(
+        again(&store, "relay-dup", "conn-2"),
+        Intake::Duplicate(_)
+    ));
+    store
+        .inbound_result("in-1", "received", "", "", 26)
+        .unwrap()
+        .unwrap();
+    let mut queued = HashSet::new();
+    let mine = store.relay_unreported("conn-1", &mut queued, 10).unwrap();
+    assert_eq!(
+        mine.iter().map(|o| (o.id, o.duplicate)).collect::<Vec<_>>(),
+        vec![(first, false)],
+        "one result for the original's handoff"
+    );
+
+    // Import 2 is sent to BBS and lapses with no result; its duplicate on
+    // another stream is never answered.
+    let second = import(&mut store, 2);
+    store.mark_sent(Direction::Inbound, second, 27).unwrap();
+    store
+        .intake_inbound(
+            "in-dup2",
+            "relay-dup2",
+            "conn-3",
+            &origin("x2"),
+            b"m2",
+            b"e",
+            1_000,
+            28,
+        )
+        .unwrap();
+    assert_eq!(store.lapse(Direction::Inbound, 1_000).unwrap(), 1);
+    assert!(
+        store
+            .relay_unreported("conn-3", &mut queued, 10)
+            .unwrap()
+            .is_empty()
     );
 }

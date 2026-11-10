@@ -23,6 +23,7 @@ pub const MESSAGE_CONFLICT: &str = "message_conflict";
 pub const EXPIRED: &str = "expired";
 pub const UNSUPPORTED_CONTENT: &str = "unsupported_content";
 pub const STORAGE_UNAVAILABLE: &str = "storage_unavailable";
+pub const STORAGE_FULL: &str = "storage_full";
 pub const HOME_OFFLINE: &str = "home_offline";
 pub const QUEUE_FULL: &str = "queue_full";
 

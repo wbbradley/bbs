@@ -159,6 +159,8 @@ CREATE TABLE inbound_duplicates (
     UNIQUE (relay_connection, relay_handoff_id)
 );
 CREATE INDEX inbound_duplicates_of ON inbound_duplicates (inbound_id);
+CREATE INDEX inbound_duplicates_unreported ON inbound_duplicates (relay_connection, id)
+    WHERE reported = 0;
 CREATE TRIGGER outbound_settled BEFORE UPDATE OF state ON outbound
 WHEN OLD.state IN ('received', 'rejected')
     OR (OLD.state IN ('sent', 'unknown') AND NEW.state IN ('pending', 'attempted'))
@@ -171,7 +173,7 @@ BEGIN SELECT RAISE(ABORT, 'an import never changes once settled, and is re-offer
 
 /// The schema version. The adapter is unreleased: an older store is not
 /// migrated, the operator deletes it.
-const VERSION: i64 = 2;
+const VERSION: i64 = 3;
 
 /// `path` with `.suffix` appended, as SQLite names its WAL files.
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -645,9 +647,12 @@ impl Store {
         expires_at: i64,
         now: i64,
     ) -> Result<Intake> {
+        // BBS's handoff ID is known from an original or, until its
+        // original settles, from a duplicate waiting on it.
         if let Some((bytes, prior)) = self.prior(
             Direction::Outbound,
-            "bbs_handoff_id = ?1",
+            "bbs_handoff_id = ?1
+             OR id = (SELECT outbound_id FROM outbound_duplicates WHERE bbs_handoff_id = ?1)",
             &[bbs_handoff_id],
         )? {
             return Ok(if bytes == message {
@@ -704,9 +709,13 @@ impl Store {
             if let Intake::Duplicate(prior) = &intake
                 && !prior.settled()
             {
+                // The relay sending the original's own handoff again on its
+                // stream is not a second transfer: it gets one result.
                 self.conn.execute(
                     "INSERT OR IGNORE INTO inbound_duplicates (inbound_id, relay_handoff_id,
-                         relay_connection, created_at) VALUES (?1, ?2, ?3, ?4)",
+                         relay_connection, created_at)
+                     SELECT ?1, ?2, ?3, ?4 WHERE NOT EXISTS (SELECT 1 FROM inbound
+                         WHERE id = ?1 AND relay_handoff_id = ?2 AND relay_connection = ?3)",
                     params![prior.id, relay_handoff_id, relay_connection, now],
                 )?;
             }
