@@ -1547,7 +1547,7 @@ impl Bbs for Server {
             };
             // What the directory shows is cached as observed, as the
             // adapter's own observations are; a failure costs nothing more.
-            let observed = service::integration::observable(&namespace, &result);
+            let observed = service::integration::observable(&namespace, &result, (self.0.clock)());
             if !observed.entities.is_empty() {
                 let integration = q.integration.clone();
                 let cached = self

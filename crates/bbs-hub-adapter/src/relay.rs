@@ -219,25 +219,7 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
     }
     // Queries asked on this stream can have no answer now (Hub's
     // failQueries).
-    {
-        let mut remote = shared.remote.lock().unwrap_or_else(PoisonError::into_inner);
-        let ended: Vec<String> = remote
-            .iter()
-            .filter(|(_, q)| q.connection == connection)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in ended {
-            if let Some(q) = remote.remove(&id) {
-                let _ = q
-                    .done
-                    .send(F::DirectoryUnavailable(mp::DirectoryUnavailable {
-                        query_id: id,
-                        error_code: verify::RELAY_UNAVAILABLE.to_string(),
-                        detail: "the relay stream closed".to_string(),
-                    }));
-            }
-        }
-    }
+    fail_queries(shared, &connection);
     // Stopping: no new work, but what is queued gets a bounded while to go
     // (CONTRACT.md: shutdown drains in-flight work up to 10 seconds).
     if shared.is_stopping() {
@@ -248,6 +230,10 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
     }
     // Nothing more goes out on this stream: queued claims return to pending.
     tx.close();
+    // A query that took this stream before it was cleared, and registered
+    // after the sweep above, sent its frame before the close: fail it too.
+    // One that registers from here on finds the stream closed.
+    fail_queries(shared, &connection);
     drop(inbound);
     let mut tasks = std::mem::take(&mut *s.tasks.lock().unwrap_or_else(PoisonError::into_inner));
     tasks.shutdown().await;
@@ -262,6 +248,42 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
         tracing::error!("recording the relay session's end: {err:#}");
     }
     result
+}
+
+/// The query an answer on relay stream `connection` binds by `hash`, taken
+/// from those waiting; none for one asked on another stream (Hub's
+/// `onDirectoryAnswer`).
+fn answered(
+    remote: &mut HashMap<String, RemoteQuery>,
+    connection: &str,
+    hash: &[u8],
+) -> Option<RemoteQuery> {
+    let id = remote
+        .iter()
+        .find(|(_, q)| q.connection == connection && q.hash[..] == *hash)
+        .map(|(id, _)| id.clone())?;
+    remote.remove(&id)
+}
+
+/// Fail the remote directory queries waiting on relay stream `connection`.
+fn fail_queries(shared: &Shared, connection: &str) {
+    let mut remote = shared.remote.lock().unwrap_or_else(PoisonError::into_inner);
+    let ended: Vec<String> = remote
+        .iter()
+        .filter(|(_, q)| q.connection == connection)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ended {
+        if let Some(q) = remote.remove(&id) {
+            let _ = q
+                .done
+                .send(F::DirectoryUnavailable(mp::DirectoryUnavailable {
+                    query_id: id,
+                    error_code: verify::RELAY_UNAVAILABLE.to_string(),
+                    detail: "the relay stream closed".to_string(),
+                }));
+        }
+    }
 }
 
 impl Session {
@@ -904,20 +926,15 @@ impl Session {
             tracing::debug!("ignoring an undecodable directory answer");
             return;
         };
-        let waiter = {
-            let mut remote = self
+        let waiter = answered(
+            &mut self
                 .shared
                 .remote
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let id = remote
-                .iter()
-                .find(|(_, q)| {
-                    q.connection == self.connection && q.hash[..] == a.query_record_hash[..]
-                })
-                .map(|(id, _)| id.clone());
-            id.and_then(|id| remote.remove(&id))
-        };
+                .unwrap_or_else(PoisonError::into_inner),
+            &self.connection,
+            &a.query_record_hash,
+        );
         match waiter {
             Some(q) => {
                 let _ = q.done.send(F::DirectoryAnswer(fa));
@@ -1067,6 +1084,13 @@ impl Session {
 /// when BBS sets no deadline (Hub's `Directory`).
 const MAX_DIRECTORY_WAIT: i64 = 30_000_000;
 const DEFAULT_DIRECTORY_WAIT: i64 = 5_000_000;
+/// The shortest wait: BBS's deadline is from BBS's clock, so one already
+/// past here (by skew, or a slow hop) still gets a moment.
+const MIN_DIRECTORY_WAIT: i64 = 1_000_000;
+/// The longest page token passed either way, as BBS bounds its clients'.
+const MAX_PAGE_TOKEN: usize = 4096;
+/// The longest alias a query may carry.
+const MAX_ALIAS: usize = 128;
 
 /// Its place among the queries waiting on the relay, given up however the
 /// asker stops waiting.
@@ -1086,13 +1110,15 @@ impl Drop for Asked<'_> {
 }
 
 /// Answer BBS's directory query about another namespace: sign it as this
-/// installation, with a fresh query ID and a deadline of BBS's (at most 30
-/// seconds away; 5 by default), ask the relay, and return the destination
+/// installation, with a fresh query ID and BBS's deadline, kept between 1
+/// and 30 seconds from now on this clock (5 when BBS sets none), ask the
+/// relay, and return the destination
 /// home's answer once it is verified as bound to the query and signed by a
 /// host of that namespace. Every failure is a result with an error code
-/// (the relay's, or `relay_unavailable`, `directory_timeout`, a
-/// verification reason), never an empty directory. The result carries
-/// BBS's query ID.
+/// (the relay's, or `relay_unavailable`, `directory_timeout`, `queue_full`,
+/// and `invalid_signature` or `route_not_authorized` when the answer fails
+/// verification here, so a local trust gap cannot pass for the destination's
+/// own reason), never an empty directory. The result carries BBS's query ID.
 pub(crate) async fn remote_directory(
     shared: &Shared,
     q: mp::DirectoryQuery,
@@ -1112,6 +1138,14 @@ pub(crate) async fn remote_directory(
             &format!("this installation asserts only requesters in {ours}"),
         );
     }
+    // As Hub's checkAddress: an explicit run must be a valid ID.
+    let run = q.requester.as_ref().and_then(|r| r.run_id.as_deref());
+    if run.is_some_and(|r| !verify::valid_id(r)) {
+        return failed(
+            verify::INVALID_ARGUMENT,
+            "the requester's run ID is invalid",
+        );
+    }
     if !verify::valid_namespace(&q.namespace) || q.namespace == *ours {
         return failed(
             verify::INVALID_ARGUMENT,
@@ -1124,13 +1158,19 @@ pub(crate) async fn remote_directory(
             "alias and entity_id are mutually exclusive",
         );
     }
+    if !q.entity_id.is_empty() && !verify::valid_entity_id(&q.entity_id) {
+        return failed(verify::INVALID_ARGUMENT, "the entity ID is invalid");
+    }
+    if q.alias.len() > MAX_ALIAS || q.alias.chars().any(char::is_control) {
+        return failed(verify::INVALID_ARGUMENT, "the alias is invalid");
+    }
+    if q.page_token.len() > MAX_PAGE_TOKEN {
+        return failed(verify::INVALID_ARGUMENT, "the page token is too long");
+    }
     let now = now_micros();
     let deadline = match q.deadline_unix_micros {
         0 => now + DEFAULT_DIRECTORY_WAIT,
-        d if d <= now => {
-            return failed(verify::DIRECTORY_TIMEOUT, "the query's deadline has passed");
-        }
-        d => d.min(now + MAX_DIRECTORY_WAIT),
+        d => d.clamp(now + MIN_DIRECTORY_WAIT, now + MAX_DIRECTORY_WAIT),
     };
     let Some(relay) = shared
         .relay
@@ -1225,20 +1265,21 @@ pub(crate) async fn remote_directory(
     let mut result = match verified {
         Ok(result) => result,
         Err(r) => {
-            // A store failure takes Hub's fallback (asReason(err,
-            // RInvalidSignature)).
-            let code_ = if r.code == verify::STORAGE_UNAVAILABLE {
-                verify::INVALID_SIGNATURE
+            // This installation's own refusal of the answer, under a code of
+            // its own: a local trust gap (no binding here is
+            // namespace_unknown) must not read as the destination's answer.
+            let code_ = if r.code == verify::NOT_AUTHORIZED {
+                verify::NOT_AUTHORIZED
             } else {
-                r.code
+                verify::INVALID_SIGNATURE
             };
             tracing::warn!(
                 namespace,
-                reason = code_,
+                reason = r.code,
                 "refused a directory answer: {}",
                 r.detail
             );
-            return failed(code_, &r.detail);
+            return failed(code_, &format!("the answer failed verification: {r}"));
         }
     };
     // BBS takes at most a page of entries; a home that sends more is
@@ -1248,6 +1289,12 @@ pub(crate) async fn remote_directory(
         return failed(
             verify::INVALID_MESSAGE,
             &format!("the answer carries over {MAX_ENTRIES} entries"),
+        );
+    }
+    if result.next_page_token.len() > MAX_PAGE_TOKEN {
+        return failed(
+            verify::INVALID_MESSAGE,
+            &format!("the answer's page token is over {MAX_PAGE_TOKEN} bytes"),
         );
     }
     result.query_id = bbs_query;
@@ -1302,4 +1349,29 @@ pub(crate) fn seal(shared: &Shared, message: &[u8]) -> Vec<u8> {
         credential: Some(shared.s.credential.clone()),
     }
     .encode_to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An answer binds a query only on the stream it was asked on.
+    #[test]
+    fn answers_match_only_queries_asked_on_their_stream() {
+        let mut remote = HashMap::new();
+        let (done, _rx) = oneshot::channel();
+        remote.insert(
+            "q1".to_string(),
+            RemoteQuery {
+                hash: [7; 32],
+                connection: "a".into(),
+                done,
+            },
+        );
+        assert!(answered(&mut remote, "b", &[7; 32]).is_none());
+        assert!(answered(&mut remote, "a", &[8; 32]).is_none());
+        assert_eq!(remote.len(), 1, "a stray answer leaves the query waiting");
+        assert!(answered(&mut remote, "a", &[7; 32]).is_some());
+        assert!(remote.is_empty());
+    }
 }

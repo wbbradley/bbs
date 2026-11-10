@@ -47,8 +47,13 @@ pub(super) const MAX_STREAMS_PER_CONNECTION: u32 = 4;
 /// How often pending handoffs past their deadline are expired.
 const SWEEP: Duration = Duration::from_secs(60);
 
-/// The most remote directory queries waiting on one stream.
+/// The most remote directory queries waiting on one stream, and the most
+/// of them one caller may have. Each sends one frame, on the stream's
+/// outbound queue with handoffs: a handoff waits behind at most the first
+/// bound of query frames (the queue's senders are served in turn), and a
+/// query waits for room only until its deadline.
 const MAX_REMOTE_QUERIES: usize = 128;
+const MAX_REMOTE_QUERIES_PER_CALLER: usize = 8;
 /// How long a remote directory query waits for the adapter's result: the
 /// deadline the query carries, and a margin for the way back.
 const REMOTE_WAIT: Duration = Duration::from_secs(6);
@@ -57,7 +62,14 @@ const REMOTE_WAIT: Duration = Duration::from_secs(6);
 pub(super) type Sessions = Arc<Mutex<HashMap<String, Arc<Link>>>>;
 
 /// Remote directory queries waiting for their results, by query ID.
-type Waiting = HashMap<String, oneshot::Sender<mp::DirectoryResult>>;
+type Waiting = HashMap<String, Query>;
+
+/// A remote directory query waiting for its result.
+struct Query {
+    /// Who asked, as its requester entity ID.
+    caller: String,
+    done: oneshot::Sender<Result<mp::DirectoryResult, Status>>,
+}
 
 /// An open stream, as the server reaches it.
 pub(super) struct Link {
@@ -79,19 +91,16 @@ impl Link {
         self.queries().take();
     }
 
-    /// The adapter's result for a remote directory query; one nothing waits
-    /// for (late, or never asked) is dropped.
-    fn answered(&self, result: mp::DirectoryResult) {
-        let waiter = self
-            .queries()
-            .as_mut()
-            .and_then(|q| q.remove(&result.query_id));
+    /// The adapter's result for a remote directory query, or why it was
+    /// malformed; one nothing waits for (late, or never asked) is dropped.
+    fn answered(&self, query_id: &str, result: Result<mp::DirectoryResult, Status>) {
+        let waiter = self.queries().as_mut().and_then(|q| q.remove(query_id));
         match waiter {
             Some(w) => {
-                let _ = w.send(result);
+                let _ = w.done.send(result);
             }
             None => tracing::debug!(
-                query = result.query_id,
+                query = query_id,
                 "a late or unknown remote directory result"
             ),
         }
@@ -134,6 +143,12 @@ pub(super) async fn remote_directory(
                  adapter running?"
             ))
         })?;
+    let caller = query
+        .requester
+        .as_ref()
+        .and_then(|r| r.entity.as_ref())
+        .map(|e| e.entity_id.clone())
+        .unwrap_or_default();
     let (tx, rx) = oneshot::channel();
     let waiter = {
         let mut queries = link.queries();
@@ -148,7 +163,14 @@ pub(super) async fn remote_directory(
                  {integration}"
             )));
         }
-        waiting.insert(query.query_id.clone(), tx);
+        let mine = waiting.values().filter(|q| q.caller == caller).count();
+        if mine >= MAX_REMOTE_QUERIES_PER_CALLER {
+            return Err(Status::resource_exhausted(format!(
+                "queue_full: you have {mine} remote directory queries waiting; wait for \
+                 one to finish"
+            )));
+        }
+        waiting.insert(query.query_id.clone(), Query { caller, done: tx });
         Waiter {
             link: &link,
             id: query.query_id.clone(),
@@ -160,7 +182,7 @@ pub(super) async fn remote_directory(
         ))
     };
     let timed_out = || {
-        Status::unavailable(format!(
+        Status::deadline_exceeded(format!(
             "directory_timeout: integration {integration} did not answer in time"
         ))
     };
@@ -177,7 +199,7 @@ pub(super) async fn remote_directory(
         Err(_) => return Err(timed_out()),
     }
     let result = match tokio::time::timeout_at(deadline, rx).await {
-        Ok(Ok(result)) => result,
+        Ok(Ok(result)) => result?,
         Ok(Err(_)) => return Err(ended()),
         Err(_) => return Err(timed_out()),
     };
@@ -209,6 +231,19 @@ pub(super) fn remote_status(namespace: &str, result: &mp::DirectoryResult) -> St
         "namespace_unknown" | "entity_unknown" => Status::not_found(message),
         "invalid_argument" | "invalid_cursor" | "invalid_address" => {
             Status::invalid_argument(message)
+        }
+        // Refused by the destination, or by this installation's adapter
+        // verifying the answer.
+        "permission_denied" | "route_not_authorized" | "invalid_signature" => {
+            Status::permission_denied(message)
+        }
+        "expired" | "directory_timeout" => Status::deadline_exceeded(message),
+        "queue_full" => Status::resource_exhausted(message),
+        // A remote home cannot judge the local caller's credentials (Hub's
+        // herr.Remote): its claims about a token or scope, scope_denied
+        // included, are UNAVAILABLE, as is everything else.
+        "invalid_token" | "token_revoked" | "token_unknown" | "scope_denied" => {
+            Status::unavailable(message)
         }
         _ => Status::unavailable(message),
     }
@@ -708,9 +743,23 @@ impl Session {
                     })
                     .await?,
                 )),
+                // A malformed result fails only its own query, if it
+                // names one; the stream and its handoffs carry on.
                 Some(In::RemoteDirectoryResult(result)) => {
-                    integration::check_remote_directory(&result).map_err(status)?;
-                    self.link.answered(result);
+                    let query_id = result.query_id.clone();
+                    match integration::check_remote_directory(&result) {
+                        Ok(()) => self.link.answered(&query_id, Ok(result)),
+                        Err(why) => {
+                            tracing::warn!(integration = id, "{why}");
+                            self.link.answered(
+                                &query_id,
+                                Err(Status::unavailable(format!(
+                                    "invalid_message: integration {id}'s adapter sent a \
+                                     malformed answer: {why}"
+                                ))),
+                            );
+                        }
+                    }
                     None
                 }
                 Some(In::Ping(ping)) => Some(Out::Pong(pb::Pong { nonce: ping.nonce })),

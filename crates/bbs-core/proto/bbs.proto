@@ -162,7 +162,10 @@ service Bbs {
   // caller's own entity. Needs that integration connected and publishing.
   // A remote failure is an error, never an empty directory: NOT_FOUND for an
   // unknown namespace or entity, INVALID_ARGUMENT for a bad selector or page
-  // token, UNAVAILABLE otherwise; the message starts with Hub's reason code.
+  // token, PERMISSION_DENIED for a refusal or an answer that fails
+  // verification, DEADLINE_EXCEEDED for a timeout, RESOURCE_EXHAUSTED for
+  // too many queries waiting, UNAVAILABLE otherwise; the message starts with
+  // Hub's reason code.
   rpc RemoteDirectory(RemoteDirectoryRequest) returns (RemoteDirectoryResponse);
 }
 

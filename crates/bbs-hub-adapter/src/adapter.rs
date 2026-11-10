@@ -522,6 +522,24 @@ impl Adapter {
         })
     }
 
+    /// Ask the relay a directory query as BBS's stream would, bypassing
+    /// BBS's own checks: for tests of the adapter's.
+    #[doc(hidden)]
+    pub fn remote_directory_asker(
+        &self,
+    ) -> impl Fn(
+        mp::DirectoryQuery,
+    ) -> std::pin::Pin<Box<dyn Future<Output = mp::DirectoryResult> + Send>>
+    + Send
+    + Sync
+    + 'static {
+        let shared = self.shared.clone();
+        move |q| {
+            let shared = shared.clone();
+            Box::pin(async move { crate::relay::remote_directory(&shared, q).await })
+        }
+    }
+
     /// Open the adapter a configuration file describes.
     pub fn from_config(cfg: &Config) -> Result<Adapter> {
         let settings = Settings::load(cfg).context("loading the adapter's keys and credentials")?;

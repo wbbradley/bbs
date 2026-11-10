@@ -24,6 +24,7 @@ use bbs_core::hub_proto::integration::integration_client::IntegrationClient;
 use bbs_core::hub_proto::msgproto_v1 as mp;
 use pb::adapter_frame::Payload as Out;
 use pb::bbs_frame::Payload as In;
+use tokio::task::JoinSet;
 use tonic::transport::Endpoint;
 use tonic::{Code, Request, Status};
 
@@ -224,7 +225,11 @@ async fn read(
     mut inbound: tonic::Streaming<pb::BbsFrame>,
 ) -> Result<()> {
     let mut snapshot = true;
+    // BBS's remote directory queries, asked beside the reader; dropped,
+    // and so aborted, with it when the stream ends.
+    let mut queries = JoinSet::new();
     while let Some(f) = inbound.message().await? {
+        while queries.try_join_next().is_some() {}
         let reply = match f.payload {
             Some(In::Hello(_)) => bail!("BBS repeated its hello"),
             Some(In::Published(catalog)) => {
@@ -245,11 +250,11 @@ async fn read(
                 None
             }
             // Asked of the relay beside the reader, which never waits on it.
-            // The result goes back on this stream's control queue; it is
-            // dropped with the stream, as BBS's waiting query is.
+            // The result goes back on this stream's control queue; the task
+            // ends with the stream, as BBS's waiting query does.
             Some(In::RemoteDirectoryQuery(q)) => {
                 let (shared, tx) = (shared.clone(), tx.clone());
-                tokio::spawn(async move {
+                queries.spawn(async move {
                     let query = q.query_id.clone();
                     let result = crate::relay::remote_directory(&shared, q).await;
                     tracing::info!(

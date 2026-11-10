@@ -1061,7 +1061,8 @@ pub fn observe(
 
 /// How long the adapter has to answer a remote directory query.
 pub const REMOTE_DIRECTORY_DEADLINE: chrono::Duration = chrono::Duration::seconds(5);
-/// The longest page token a client may pass back.
+/// The longest page token a client may pass back, and so the longest a
+/// remote home's answer may carry.
 const MAX_REMOTE_PAGE_TOKEN_BYTES: usize = 4096;
 
 /// A remote directory query for the adapter, and the integration to ask.
@@ -1087,16 +1088,16 @@ pub fn remote_directory_query(
             "invalid namespace {namespace:?}: expected [a-z][a-z0-9-]*"
         )));
     }
-    if !req.alias.is_empty() && !req.entity_id.is_empty() {
+    let (alias, entity_id) = (req.alias.trim(), req.entity_id.trim());
+    if !alias.is_empty() && !entity_id.is_empty() {
         return Err(bad("alias and entity_id are mutually exclusive".into()));
     }
-    let alias = if req.alias.is_empty() {
+    let alias = if alias.is_empty() {
         String::new()
     } else {
-        normalize_alias(req.alias.trim())
-            .ok_or_else(|| bad(format!("invalid alias {:?}", req.alias)))?
+        normalize_alias(alias).ok_or_else(|| bad(format!("invalid alias {:?}", req.alias)))?
     };
-    if !req.entity_id.is_empty() && !entity::valid_entity_id(&req.entity_id) {
+    if !entity_id.is_empty() && !entity::valid_entity_id(entity_id) {
         return Err(bad(format!("invalid entity ID {:?}", req.entity_id)));
     }
     if req.page_token.len() > MAX_REMOTE_PAGE_TOKEN_BYTES {
@@ -1104,6 +1105,8 @@ pub fn remote_directory_query(
     }
     with_ctx(conn, caller, |ctx| {
         let me = ctx.actor()?;
+        // A focused agent reaches only its owner, here as for remote sends.
+        super::check_focus(ctx, &me, None)?;
         let local = db::namespace(ctx.conn)?;
         if namespace == local {
             return Err(bad(format!(
@@ -1131,7 +1134,7 @@ pub fn remote_directory_query(
                 page_size: req.page_size.min(MAX_ENTITIES as u32),
                 page_token: req.page_token.clone(),
                 deadline_unix_micros: deadline.timestamp_micros(),
-                entity_id: req.entity_id.clone(),
+                entity_id: entity_id.to_string(),
                 list_runs: false,
             },
         })
@@ -1181,8 +1184,12 @@ pub fn remote_directory_page(
 }
 
 /// The valid descriptors of a remote directory page in `namespace`, to
-/// cache as observations.
-pub fn observable(namespace: &str, result: &mp::DirectoryResult) -> pb::ObservedEntities {
+/// cache as observations made at `now`.
+pub fn observable(
+    namespace: &str,
+    result: &mp::DirectoryResult,
+    now: chrono::DateTime<chrono::Utc>,
+) -> pb::ObservedEntities {
     pb::ObservedEntities {
         entities: result
             .entities
@@ -1193,19 +1200,25 @@ pub fn observable(namespace: &str, result: &mp::DirectoryResult) -> pb::Observed
             })
             .cloned()
             .collect(),
-        observed_at_unix_micros: chrono::Utc::now().timestamp_micros(),
+        observed_at_unix_micros: now.timestamp_micros(),
     }
 }
 
-/// Check a directory result the adapter sent for a remote directory query.
-pub fn check_remote_directory(result: &mp::DirectoryResult) -> Result<()> {
+/// Check a directory result the adapter sent for a remote directory query:
+/// why it is malformed, if it is. Only that query fails for it.
+pub fn check_remote_directory(result: &mp::DirectoryResult) -> Result<(), String> {
     if !entity::valid_id(&result.query_id) {
-        return Err(invalid("remote_directory_result has an invalid query_id"));
+        return Err("remote_directory_result has an invalid query_id".into());
     }
     if result.entities.len() > MAX_ENTITIES || result.runs.len() > MAX_ENTITIES {
-        return Err(invalid(format!(
+        return Err(format!(
             "remote_directory_result carries over {MAX_ENTITIES} entries"
-        )));
+        ));
+    }
+    if result.next_page_token.len() > MAX_REMOTE_PAGE_TOKEN_BYTES {
+        return Err(format!(
+            "remote_directory_result's page token is over {MAX_REMOTE_PAGE_TOKEN_BYTES} bytes"
+        ));
     }
     Ok(())
 }
