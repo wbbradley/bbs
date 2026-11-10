@@ -232,6 +232,9 @@ pub fn name_spans(name: &str, owner: Option<&str>, kind: Kind) -> Vec<Span<'stat
     let role = match kind {
         Kind::Human => Role::Human,
         Kind::Agent => Role::Agent,
+        // Another installation's entity: neither one of ours, nor known as
+        // a human or an agent.
+        Kind::Remote => Role::Technical,
         Kind::Unspecified if owner.is_some() => Role::Agent,
         Kind::Unspecified => Role::Text,
     };

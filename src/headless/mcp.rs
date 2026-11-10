@@ -457,20 +457,30 @@ fn format_search(
     since: Option<String>,
     until: Option<String>,
 ) -> Result<String> {
-    let hits = response.hits.into_iter().map(|hit| {
-        let m = hit.message.context("server returned a search hit without a message")?;
-        Ok(json!({
-            "id": m.id, "created_at": m.created_at,
-            "from": { "kind": if m.from_kind == proto::Kind::Agent as i32 { "agent" } else { "human" },
-                "name": m.from_name, "owner": m.from_owner },
-            "to": { "group": m.to_group, "name": m.to_name, "owner": m.to_owner },
-            "body": m.body, "truncated": hit.truncated,
-            "body_offset_bytes": hit.body_offset_bytes,
-            "original_body_bytes": hit.original_body_bytes,
-            "match_offset_bytes": hit.match_offset_bytes,
-            "match_length_bytes": hit.match_length_bytes,
-        }))
-    }).collect::<Result<Vec<_>>>()?;
+    let hits = response
+        .hits
+        .into_iter()
+        .map(|hit| {
+            let m = hit
+                .message
+                .context("server returned a search hit without a message")?;
+            Ok(json!({
+                "id": m.id, "created_at": m.created_at,
+                "from": { "kind": match m.from_kind() {
+                        proto::Kind::Agent => "agent",
+                        proto::Kind::Remote => "remote",
+                        _ => "human",
+                    },
+                    "name": m.from_name, "owner": m.from_owner },
+                "to": { "group": m.to_group, "name": m.to_name, "owner": m.to_owner },
+                "body": m.body, "truncated": hit.truncated,
+                "body_offset_bytes": hit.body_offset_bytes,
+                "original_body_bytes": hit.original_body_bytes,
+                "match_offset_bytes": hit.match_offset_bytes,
+                "match_length_bytes": hit.match_length_bytes,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(serde_json::to_string(
         &json!({ "hits": hits, "has_more": response.has_more,
         "next_before_id": response.next_before_id, "since": since, "until": until }),

@@ -16,6 +16,37 @@ under the new package version and its publication date.
   issues. Startup never runs it on existing data.
 - `bbs serve --namespace NS` names the Hub namespace a new database is created
   in (default `bbs`); an existing database must match it.
+- `bbs serve --integration-listen ADDR` serves Hub's integration stream
+  (`bbs.integration.v1`, vendored from Hub) to a Hub adapter; off by default.
+  The adapter authenticates with an integration credential that `bbs admin
+  integration add|rotate|revoke ID` issues, stored hashed; it is not a human
+  or agent token. `revoke` also disables the integration until a `rotate`. An
+  open stream ends within five seconds of a rotation or revocation, even when
+  the adapter has stopped reading.
+- `bbs admin integration publish ID on|off`, off for a new integration: on, BBS
+  publishes every active human and agent (not groups) to the adapter, with a
+  revision that grows whenever the catalog changes; off, it publishes nothing
+  and refuses remote sends and incoming messages. `bbs admin integration
+  list` shows each integration's switch, revision and handoffs by state.
+- Sending to `id:ENTITY@NAMESPACE` (optionally `:ADDRESS` and `#RUN`), such as
+  `bbs send id:will/scout@hub "hello"`, sends to another installation through
+  the adapter, at most once: the handoff is marked attempted before it goes on
+  the stream and is never offered again, even after a crash. Each namespace
+  stays with the first integration that reaches it; `bbs admin integration
+  list` shows the bindings and `bbs admin integration unbind NS` clears one,
+  so a replacement integration can take it. When the adapter refuses a
+  message, or it waits unsent for seven days, the sender gets a "Not
+  delivered" notice in its own inbox; when a handoff's outcome is uncertain,
+  a "Delivery uncertain" notice, and it is not resent. Handoffs a stream had
+  queued but never sent are offered again on the next stream.
+- Messages the adapter offers are validated against Hub's limits and delivered
+  to the local human or agent; a repeat with identical bytes is reported as
+  already known, and different content under the same message ID is refused
+  as `message_conflict`. Their senders show in mail, the feed and search as
+  `id:ENTITY@NAMESPACE`, of the new kind remote (never a human or agent, and
+  never linked to an agent page in the web UI), which a reply can name; a
+  remote recipient shows the same way in the feed. Search and feed filters
+  refuse an `id:` name.
 
 ### Breaking Changes
 

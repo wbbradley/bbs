@@ -24,6 +24,7 @@ const ACTIVE_AT_DEBOUNCE: chrono::Duration = chrono::Duration::seconds(60);
 mod blockers;
 pub use blockers::{answer_blocker, cancel_blocker, get_blocker, list_blockers, put_blocker};
 mod drain;
+pub mod integration;
 pub use drain::{
     NOTICE as DRAIN_NOTICE, agent_drain, agent_drain_with_changes, check_agent_drains,
     report_drain, report_drain_with_changes,
@@ -178,7 +179,11 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
     proto::Message {
         id: m.id,
         created_at: m.created_at,
-        from_kind: proto_kind(m.from_kind).into(),
+        from_kind: if m.from_remote {
+            proto::Kind::Remote.into()
+        } else {
+            proto_kind(m.from_kind).into()
+        },
         from_name: m.from_name,
         from_owner: m.from_owner,
         reader_owner: m.reader_owner,
@@ -1826,6 +1831,15 @@ pub fn send(
         if let Some(control) = req.control {
             return send_control(ctx, &me, to, body, control);
         }
+        if let Some(reference) = to.strip_prefix("id:") {
+            let (id, to) = integration::send_remote(ctx, &me, reference, body)?;
+            return Ok(proto::SendResponse {
+                to,
+                recipients: None,
+                id: Some(id),
+                skipped: Vec::new(),
+            });
+        }
 
         if let Some(group) = to.strip_prefix('@') {
             let gid = require_group(ctx.conn, group)?;
@@ -2107,6 +2121,12 @@ fn message_principals(
     name: Option<&str>,
 ) -> Result<Option<Vec<(db::Kind, i64)>>> {
     name.map(|name| {
+        if name.starts_with("id:") {
+            bail!(
+                "{name} is another installation's entity; filtering by one is not \
+                 supported yet"
+            );
+        }
         let ids = db::principals_named(conn, name)?;
         if ids.is_empty() {
             bail!("no agent or human named {name:?}");

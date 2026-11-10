@@ -482,6 +482,7 @@ fn kind_name(kind: proto::Kind) -> &'static str {
     match kind {
         proto::Kind::Agent => "agent",
         proto::Kind::Human => "human",
+        proto::Kind::Remote => "remote",
         proto::Kind::Unspecified => "unspecified",
     }
 }
@@ -608,10 +609,10 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
         if i > 0 {
             out.push('\n');
         }
-        let human = if m.from_kind() == proto::Kind::Human {
-            " (human)"
-        } else {
-            ""
+        let human = match m.from_kind() {
+            proto::Kind::Human => " (human)",
+            proto::Kind::Remote => " (remote)",
+            _ => "",
         };
         let to = match (&m.to_group, &m.to_name) {
             (Some(g), _) => format!("@{g}"),

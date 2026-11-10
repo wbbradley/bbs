@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package bbs.integration.v1;
+
+import "msgproto/v1/messaging.proto";
+
+// REVIEW DRAFT, owned by BBS. The Rust adapter initiates one stream to BBS.
+// This is an internal home/adapter boundary, not a second federation protocol.
+service Integration {
+  rpc Connect(stream AdapterFrame) returns (stream BbsFrame);
+}
+
+message AdapterHello {
+  // Authenticated through a separately provisioned BBS integration credential
+  // in gRPC metadata. No bearer tokens in frames. Claim must match credential.
+  string integration_id = 1;
+  uint32 protocol_major = 2; // 1 in this draft; incompatible peers fail early.
+  string build = 3;
+}
+
+message BbsHello {
+  string integration_id = 1;
+  uint32 protocol_major = 2;
+  string namespace = 3;
+  string build = 4;
+}
+
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Pong {
+  uint64 nonce = 1;
+}
+
+message PublishedCatalog {
+  // BBS's current local publication set: all active native humans/agents when
+  // publication is on, empty when off (D090). No per-address selection in v1.
+  // Sent after Hello and when changed; no historical message replay.
+  // A full snapshot is adequate at
+  // the initial entity scale. The adapter does not infer withdrawal from loss
+  // of the stream; only a newer complete snapshot changes publication.
+  uint64 revision = 1;
+  repeated msgproto.v1.EntityDescriptor entities = 2;
+}
+
+message ObservedEntities {
+  // Cache descriptors learned from directory results or incoming traffic.
+  // BBS never accepts overwrites of its native identities or local tokens.
+  repeated msgproto.v1.EntityDescriptor entities = 1;
+  int64 observed_at_unix_micros = 2;
+}
+
+message MessageOffer {
+  // Identifies this logical handoff within the integration and direction.
+  // Not a stream-local sequence number. A reconnect does not replay offers.
+  string handoff_id = 1;
+  msgproto.v1.EncodedMessage message = 2;
+}
+
+enum HandoffDisposition {
+  HANDOFF_DISPOSITION_UNSPECIFIED = 0;
+  // Decoded and validated at this boundary, not necessarily persisted.
+  HANDOFF_DISPOSITION_RECEIVED = 1;
+  // Same origin message/bytes already known. No second native import.
+  HANDOFF_DISPOSITION_ALREADY_KNOWN = 2;
+  HANDOFF_DISPOSITION_REJECTED = 3;
+}
+
+message HandoffResult {
+  string handoff_id = 1;
+  HandoffDisposition disposition = 2;
+  string reason = 3;
+  string detail = 4;
+  // These results are informative receipt/rejection signals, NOT persistence
+  // ACKs. Sender completion is successful gRPC Send below; no result is needed
+  // before sender responsibility ends. Lost/uncertain results are not replayed.
+}
+
+message AdapterFrame {
+  oneof payload {
+    AdapterHello hello = 1;
+    MessageOffer incoming = 2;
+    HandoffResult outgoing_result = 3;
+    ObservedEntities observed = 4;
+    msgproto.v1.DirectoryQuery local_directory_query = 5;
+    msgproto.v1.DirectoryResult remote_directory_result = 6;
+    Ping ping = 7;
+    Pong pong = 8;
+  }
+}
+
+message BbsFrame {
+  oneof payload {
+    BbsHello hello = 1;
+    PublishedCatalog published = 2;
+    MessageOffer outgoing = 3;
+    HandoffResult incoming_result = 4;
+    msgproto.v1.DirectoryResult local_directory_result = 5;
+    msgproto.v1.DirectoryQuery remote_directory_query = 6;
+    Ping ping = 7;
+    Pong pong = 8;
+  }
+}

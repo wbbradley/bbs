@@ -11,6 +11,7 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, pa
 
 pub mod blockers;
 mod hub_model;
+pub mod integration;
 pub mod notes;
 
 pub use hub_model::{
@@ -123,6 +124,9 @@ pub struct MessageView {
     pub id: i64,
     pub created_at: String,
     pub from_kind: Kind,
+    /// The sender is another installation's entity; `from_kind` is then
+    /// meaningless and `from_name` is its `id:ENTITY@NAMESPACE` reference.
+    pub from_remote: bool,
     pub from_name: String,
     pub from_owner: Option<String>,
     pub reader_owner: Option<String>,
@@ -248,6 +252,17 @@ pub fn migrate_in(conn: &mut Connection, namespace: Option<&str>) -> Result<()> 
              and migrate it again with this release"
         );
     }
+    let missing = missing_integration_schema(conn)?;
+    if !missing.is_empty() {
+        bail!(
+            "this schema-v{SCHEMA_VERSION} database lacks the integration schema ({}): an \
+             earlier development build of the Hub model made it. If `bbs-server \
+             migrate-hub-model` made it, restore the schema-v{HUB_MODEL_SOURCE_VERSION} backup \
+             taken before that and migrate it again with this release; if it was created \
+             new, move it aside and let this release create it",
+            missing.join(", ")
+        );
+    }
     let stored = hub_model::namespace(conn)?;
     if let Some(namespace) = namespace
         && namespace != stored
@@ -255,6 +270,35 @@ pub fn migrate_in(conn: &mut Connection, namespace: Option<&str>) -> Result<()> 
         bail!("this database's namespace is {stored:?}, not {namespace:?}");
     }
     Ok(())
+}
+
+/// The tables and columns of the Hub model's integration schema that this
+/// schema-27 database lacks; early development builds of migration 27 had
+/// none of them.
+fn missing_integration_schema(conn: &Connection) -> Result<Vec<String>> {
+    const REQUIRED: &[(&str, &str)] = &[
+        ("bbs_installation", "catalog_epoch"),
+        ("bbs_integrations", "publication_revision"),
+        ("bbs_integrations", "publication_digest"),
+        ("integration_tokens", "token_hash"),
+        ("integration_namespaces", "integration_id"),
+        ("messages", "group_copy_namespace"),
+        ("messages", "group_copy_message_id"),
+        ("messages", "group_copy_sender_address_id"),
+        ("messages", "group_copy_sender_run_id"),
+    ];
+    let mut missing = Vec::new();
+    for (table, column) in REQUIRED {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            params![table, column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            missing.push(format!("{table}.{column}"));
+        }
+    }
+    Ok(missing)
 }
 
 /// Refuse a schema this binary cannot serve.
@@ -716,7 +760,7 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                 (SELECT MAX(created_at) FROM (
                    SELECT created_at FROM (
                      SELECT created_at FROM messages
-                     WHERE sender_address_id = {}
+                     WHERE sender_address_id = {} AND kind = 'application'
                      ORDER BY id DESC LIMIT 1)
                    UNION ALL
                    SELECT created_at FROM (
@@ -1029,16 +1073,40 @@ fn addresses_sql(condition: &str) -> String {
     )
 }
 
-/// Joins naming message `m`'s sender: its binding `sb`, and the agent `fa` or
-/// the human `fh` it is.
+/// Joins naming message `m`'s sender: its address `sa` and entity `se`, and
+/// for a native sender its binding `sb` and the agent `fa` or human `fh` it
+/// is. A foreign sender has no binding.
 const SENDER_JOINS: &str = "
     JOIN entity_addresses sa ON sa.id = m.sender_address_id
-    JOIN entity_local_bindings sb ON sb.entity_id = sa.entity_id
+    JOIN entities se ON se.id = sa.entity_id
+    LEFT JOIN entity_local_bindings sb ON sb.entity_id = sa.entity_id
     LEFT JOIN agents fa ON fa.id = sb.agent_id
     LEFT JOIN humans fh ON fh.id = sb.human_id";
 
-/// The sender's kind, with [`SENDER_JOINS`].
-const SENDER_KIND: &str = "CASE WHEN sb.agent_id IS NULL THEN 'human' ELSE 'agent' END";
+/// The sender's kind, with [`SENDER_JOINS`]: `remote` for another
+/// installation's entity, whatever an adapter says it is.
+const SENDER_KIND: &str = "CASE WHEN sb.agent_id IS NOT NULL THEN 'agent'
+    WHEN sb.human_id IS NOT NULL THEN 'human' ELSE 'remote' END";
+
+/// The sender's name, with [`SENDER_JOINS`]: a native name, or a foreign
+/// sender's exact address as `id:ENTITY@NAMESPACE` (see
+/// [`crate::entity::remote_display`]), which a reply can name.
+static SENDER_NAME: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "coalesce(fa.name, fh.name, {})",
+        remote_display_sql("se", "sa", "m.sender_run_id")
+    )
+});
+
+/// SQL for [`crate::entity::remote_display`] of entity `e`, address `a` and
+/// the run expression `run`.
+pub(crate) fn remote_display_sql(e: &str, a: &str, run: &str) -> String {
+    format!(
+        "'id:' || {e}.entity_id || '@' || {e}.namespace
+         || CASE WHEN {a}.address_id = '{NATIVE_ADDRESS}' THEN '' ELSE ':' || {a}.address_id END
+         || CASE WHEN {run} = '' THEN '' ELSE '#' || {run} END"
+    )
+}
 
 /// Move every retired entity off its plain ID, as the cutover does for records
 /// retired before it, so tests can reuse a retired native name.
@@ -1076,6 +1144,14 @@ pub fn native_address(conn: &Connection, kind: EntityKind, id: i64) -> Result<Op
         .optional()?)
 }
 
+/// The `entity_addresses` row of a native record's native address.
+pub fn native_address_row(conn: &Connection, kind: EntityKind, id: i64) -> Result<i64> {
+    conn.query_row(&format!("SELECT {}", address_sql(kind, "?1")), [id], |r| {
+        r.get::<_, Option<i64>>(0)
+    })?
+    .context("no native address")
+}
+
 // ---- messages --------------------------------------------------------------
 
 /// Where a message goes.
@@ -1089,7 +1165,8 @@ pub enum To {
 
 /// A new native message's ID in the installation's namespace: opaque and
 /// random, never the `bbs-legacy-` prefix the cutover gave older messages.
-fn new_message_id() -> String {
+/// Integration handoff IDs use the same form.
+pub(crate) fn new_message_id() -> String {
     let bytes: [u8; 16] = rand::random();
     data_encoding::BASE32_NOPAD
         .encode(&bytes)
@@ -1661,7 +1738,7 @@ pub fn record_human_conversation(
 /// The inbox of `me`, a principal of `kind` whose id is ?2 (?1 is the kind).
 fn inbox_select(kind: Kind) -> String {
     format!(
-        "SELECT m.id, m.created_at, {SENDER_KIND}, coalesce(fa.name, fh.name),
+        "SELECT m.id, m.created_at, {SENDER_KIND}, {},
                 g.name, m.body, owner.name, reader_owner.name, m.control, m.timer_id, m.auto_reply
          FROM deliveries d
          JOIN messages m ON m.id = d.message_id
@@ -1672,6 +1749,7 @@ fn inbox_select(kind: Kind) -> String {
          LEFT JOIN humans reader_owner ON reader_owner.id = reader.human_id
          LEFT JOIN bbs_groups g ON g.id = m.to_group_id
          WHERE d.recipient_address_id = {} AND d.recipient_run_id = ''",
+        *SENDER_NAME,
         address_sql(kind.into(), "?2")
     )
 }
@@ -1686,6 +1764,7 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         } else {
             Kind::Agent
         },
+        from_remote: from_kind == "remote",
         from_name: r.get(3)?,
         from_owner: r.get(6)?,
         reader_owner: r.get(7)?,
@@ -1784,7 +1863,7 @@ static AGENT_SUMMARIES: LazyLock<String> = LazyLock::new(|| {
                    (SELECT MAX(created_at) FROM (
                        SELECT created_at FROM (
                          SELECT created_at FROM messages
-                         WHERE sender_address_id = {}
+                         WHERE sender_address_id = {} AND kind = 'application'
                          ORDER BY id DESC LIMIT 1)
                        UNION ALL
                        SELECT created_at FROM (
@@ -2194,8 +2273,9 @@ fn feed_predicates(filter: &FeedFilter, expanded: Expanded) -> (String, Args) {
                 ));
             }
         }
+        // A delivery notice is BBS's, not a send by its addressee.
         clauses.push(format!(
-            "m.sender_address_id IN ({})",
+            "m.sender_address_id IN ({}) AND m.kind = 'application'",
             addresses_sql(&any.join(" OR "))
         ));
     }
@@ -2204,7 +2284,7 @@ fn feed_predicates(filter: &FeedFilter, expanded: Expanded) -> (String, Args) {
         .filter(|_| expanded != Expanded::FromHuman)
     {
         clauses.push(format!(
-            "m.sender_address_id IN ({})",
+            "m.sender_address_id IN ({}) AND m.kind = 'application'",
             addresses_sql(&format!(
                 "nb.human_id = ? OR nb.agent_id IN ({OWNED_AGENTS})"
             ))
@@ -2297,7 +2377,8 @@ fn term_sql(term: Term, limit: u32, filter: &FeedFilter, expanded: Expanded) -> 
     let (sql, mut args) = match term {
         Term::Sent(kind, id) => (
             format!(
-                "SELECT m.id FROM messages m WHERE m.sender_address_id = {}{predicates}
+                "SELECT m.id FROM messages m
+                 WHERE m.sender_address_id = {} AND m.kind = 'application'{predicates}
                  ORDER BY m.id {dir} LIMIT ?",
                 address_sql(kind.into(), "?")
             ),
@@ -2416,9 +2497,9 @@ pub fn feed_messages(
         return Ok(Vec::new());
     }
     let sql = format!(
-        "SELECT m.id, m.created_at, {SENDER_KIND}, COALESCE(fa.name, fh.name), g.name,
-                COALESCE(ta.name, th.name), d.archived_at, m.body, owner.name, to_owner.name,
-                m.auto_reply
+        "SELECT m.id, m.created_at, {SENDER_KIND}, {}, g.name,
+                COALESCE(ta.name, th.name, {}), d.archived_at, m.body, owner.name,
+                to_owner.name, m.auto_reply
          FROM messages m
          {SENDER_JOINS}
          LEFT JOIN agent_owners sender ON sender.agent_id = fa.id
@@ -2432,8 +2513,14 @@ pub fn feed_messages(
          LEFT JOIN humans th ON th.id = rb.human_id
          LEFT JOIN agent_owners recipient ON recipient.agent_id = ta.id
          LEFT JOIN humans to_owner ON to_owner.id = recipient.human_id
+         -- A remote recipient has no delivery: name its address instead.
+         LEFT JOIN entity_addresses xa ON m.to_group_id IS NULL AND d.message_id IS NULL
+           AND xa.id = m.recipient_address_id
+         LEFT JOIN entities xe ON xe.id = xa.entity_id
          WHERE m.id IN ({})
          ORDER BY m.id",
+        *SENDER_NAME,
+        remote_display_sql("xe", "xa", "m.recipient_run_id"),
         vec!["?"; ids.len()].join(", ")
     );
     let rows = conn
@@ -2448,6 +2535,7 @@ pub fn feed_messages(
                 } else {
                     Kind::Agent
                 },
+                from_remote: from_kind == "remote",
                 from_name: r.get(3)?,
                 from_owner: r.get(8)?,
                 reader_owner: None,

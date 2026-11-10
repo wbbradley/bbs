@@ -1,7 +1,9 @@
 // The JSON forms of proto/bbs.proto messages the web API carries: proto field
 // names, absent optionals as null, enums as their numbers.
 
-export const Kind = { Agent: 1, Human: 2 } as const;
+// Remote: another installation's entity, named `id:ENTITY@NAMESPACE`; never a
+// human or an agent of this board.
+export const Kind = { Agent: 1, Human: 2, Remote: 3 } as const;
 export const Control = {
   Cancel: 1,
   SetEffort: 2,

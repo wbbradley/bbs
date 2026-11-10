@@ -46,7 +46,11 @@ INSERT INTO hub_migration_assert SELECT NOT EXISTS (
 -- every native message. One row.
 CREATE TABLE bbs_installation (
   id INTEGER PRIMARY KEY CHECK(id = 1),
-  namespace TEXT NOT NULL CHECK(length(namespace) > 0)
+  namespace TEXT NOT NULL CHECK(length(namespace) > 0),
+  -- Bumped by any change to a native entity (see the triggers below), so the
+  -- integration stream rebuilds its publication catalog only when it may
+  -- have changed, whichever process made the change.
+  catalog_epoch INTEGER NOT NULL DEFAULT 0
 );
 INSERT INTO bbs_installation(id, namespace) SELECT 1, namespace FROM hub_migration_context;
 
@@ -87,7 +91,24 @@ CREATE TABLE bbs_integrations (
   id TEXT PRIMARY KEY NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
   -- D090: one publication switch, not a per-entity/address allowlist.
-  publish_entities INTEGER NOT NULL DEFAULT 0 CHECK(publish_entities IN (0, 1))
+  publish_entities INTEGER NOT NULL DEFAULT 0 CHECK(publish_entities IN (0, 1)),
+  -- The last publication snapshot sent: its revision, which only grows, and a
+  -- digest of its entities, so a changed catalog gets a new revision and a
+  -- repeat keeps the old one.
+  publication_revision INTEGER NOT NULL DEFAULT 0,
+  publication_digest TEXT
+);
+-- One credential per integration, stored hashed like human tokens. Revoking
+-- deletes the row; the integration and its history stay.
+CREATE TABLE integration_tokens (
+  integration_id TEXT PRIMARY KEY NOT NULL REFERENCES bbs_integrations(id),
+  token_hash TEXT NOT NULL UNIQUE
+);
+-- Each other installation's namespace is reached through one integration:
+-- the first that imports from it or sends to it. Others are refused.
+CREATE TABLE integration_namespaces (
+  namespace TEXT PRIMARY KEY NOT NULL,
+  integration_id TEXT NOT NULL REFERENCES bbs_integrations(id)
 );
 CREATE TABLE address_delivery_bindings (
   address_id INTEGER PRIMARY KEY REFERENCES entity_addresses(id),
@@ -154,6 +175,12 @@ CREATE TABLE messages_replacement (
   control TEXT,
   timer_id INTEGER,
   auto_reply INTEGER,
+  -- An imported group copy (D127): the message sent to the group and who sent
+  -- it, at the exact address replies go to. The copy's own sender is the group.
+  group_copy_namespace TEXT,
+  group_copy_message_id TEXT,
+  group_copy_sender_address_id INTEGER REFERENCES entity_addresses(id),
+  group_copy_sender_run_id TEXT,
   UNIQUE(origin_namespace, origin_message_id),
   CHECK((in_reply_to_namespace IS NULL) = (in_reply_to_message_id IS NULL))
 );
@@ -224,6 +251,13 @@ CREATE TABLE integration_outbox (
   UNIQUE(integration_id, handoff_id)
 );
 CREATE INDEX integration_outbox_pending ON integration_outbox(integration_id, id) WHERE state = 'pending';
+
+CREATE TRIGGER entities_catalog_insert AFTER INSERT ON entities
+WHEN NEW.namespace = (SELECT namespace FROM bbs_installation)
+BEGIN UPDATE bbs_installation SET catalog_epoch = catalog_epoch + 1; END;
+CREATE TRIGGER entities_catalog_update AFTER UPDATE ON entities
+WHEN NEW.namespace = (SELECT namespace FROM bbs_installation)
+BEGIN UPDATE bbs_installation SET catalog_epoch = catalog_epoch + 1; END;
 
 DROP VIEW hub_native_addresses;
 DROP TABLE hub_native_map;

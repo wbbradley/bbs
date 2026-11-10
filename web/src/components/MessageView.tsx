@@ -2,7 +2,7 @@ import { memo, type ReactNode } from "react";
 import { Markdown } from "../Markdown";
 import { NameLink, paths } from "../router";
 import { Kind, type Message } from "../types";
-import { clock, fullTime, same } from "../util";
+import { clock, fullTime, isRemoteName, same } from "../util";
 
 export type MessageMode =
   /** An agent conversation: mail with the viewer is unadorned. */
@@ -14,6 +14,8 @@ export type MessageMode =
 
 /** Agents link to their conversation; humans have no page. */
 function Name({ name, kind }: { name: string; kind: number }) {
+  // Another installation's entity has no page here.
+  if (kind === Kind.Remote) return <span className="remote">{name}</span>;
   if (kind !== Kind.Agent) return <span className="human">{name}</span>;
   return (
     <NameLink to={paths.agent(name)} className="agent">
@@ -31,7 +33,8 @@ function Recipient({ m }: { m: Message }) {
     );
   }
   if (!m.to_name) return null;
-  return <Name name={m.to_name} kind={m.to_owner ? Kind.Agent : Kind.Human} />;
+  const kind = isRemoteName(m.to_name) ? Kind.Remote : m.to_owner ? Kind.Agent : Kind.Human;
+  return <Name name={m.to_name} kind={kind} />;
 }
 
 export const MessageView = memo(function MessageView({

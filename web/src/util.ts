@@ -119,6 +119,11 @@ export function dayLabel(iso: string): string {
   return d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric", year: "numeric" });
 }
 
+/** Whether a name is another installation's entity, `id:ENTITY@NAMESPACE`. */
+export function isRemoteName(name: string | null | undefined): boolean {
+  return !!name && name.startsWith("id:");
+}
+
 export function senderName(m: Message): string {
   return m.from_kind === Kind.Agent ? qualified(m.from_name, m.from_owner) : m.from_name;
 }
