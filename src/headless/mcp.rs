@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::app::{
-    format_agents, format_groups, format_messages, parse_time, timer_line, timer_schedule,
+    format_agents, format_directory, format_groups, format_messages, parse_time, remote_directory,
+    timer_line, timer_schedule,
 };
 use crate::backend::Backend;
 use crate::config::Config;
@@ -294,6 +295,24 @@ impl Tools {
                 &b.list_agents(proto::ListAgentsRequest { all: false })
                     .await?,
             ),
+            "bbs_directory" => {
+                let text = |key: &str| args[key].as_str().unwrap_or_default().trim().to_string();
+                let req = proto::RemoteDirectoryRequest {
+                    namespace: arg("namespace")?,
+                    alias: text("alias"),
+                    entity_id: text("id"),
+                    ..Default::default()
+                };
+                let (entities, more) = remote_directory(b, req.clone()).await?;
+                let mut out = format_directory(&req, &entities);
+                if more {
+                    out.push_str(&format!(
+                        "(only the first {} pages are shown)\n",
+                        crate::app::MAX_DIRECTORY_PAGES
+                    ));
+                }
+                out
+            }
             "bbs_status" => {
                 b.set_status(proto::SetStatusRequest { text: arg("text")? })
                     .await?;
@@ -495,7 +514,7 @@ pub fn tool_list() -> Value {
             "name": "bbs_send",
             "description": "Send a BBS message to an agent or a human, or to @group to broadcast to a group where you have write access (marked [w] in bbs_group_list; only a human can grant it). Use blocker tools for structured group help requests.",
             "inputSchema": object(json!({
-                "to": string("Agent or human name, or @group"),
+                "to": string("Agent or human name, @group, or id:ENTITY@NAMESPACE for an entity in another namespace (see bbs_directory)"),
                 "body": string("Message text (at most 64 KiB)"),
             }), &["to", "body"]),
         },
@@ -503,6 +522,15 @@ pub fn tool_list() -> Value {
             "name": "bbs_agents",
             "description": "List the agents in your groups, with their status notes and last activity.",
             "inputSchema": object(json!({}), &[]),
+        },
+        {
+            "name": "bbs_directory",
+            "description": "List the entities another namespace (such as hub) publishes, or look one up by alias or ID, through this BBS's Hub integration. Each line starts with the id:ENTITY@NAMESPACE that bbs_send accepts as its recipient. An unreachable or unknown namespace is an error, never an empty list.",
+            "inputSchema": object(json!({
+                "namespace": string("The other installation's namespace, e.g. hub"),
+                "alias": string("Look up the entity with this alias; mutually exclusive with id."),
+                "id": string("Look up the entity with this exact entity ID; mutually exclusive with alias."),
+            }), &["namespace"]),
         },
         {
             "name": "bbs_status",
