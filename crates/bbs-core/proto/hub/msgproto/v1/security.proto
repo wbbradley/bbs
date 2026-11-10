@@ -1,0 +1,59 @@
+syntax = "proto3";
+package msgproto.v1;
+option go_package = "github.com/neuralwatt/hub/gen/msgproto/v1;msgprotov1";
+
+// REVIEW DEFAULTS: see CONTRACT.md for framing, validation, and trust sources.
+enum RecordKind {
+  RECORD_KIND_UNSPECIFIED = 0;
+  RECORD_KIND_INSTALLATION_CREDENTIAL = 1;
+  RECORD_KIND_INSTALLATION_REVOCATION = 2;
+  RECORD_KIND_MESSAGE = 3;
+  RECORD_KIND_ROUTE_CLAIM = 4;
+  RECORD_KIND_DIRECTORY_QUERY = 5;
+  RECORD_KIND_DIRECTORY_ANSWER = 6;
+}
+
+message SignedRecord {
+  RecordKind kind = 1;
+  uint32 format_major = 2;
+  bytes payload = 3; // Exact serialized message selected by kind.
+  bytes signer_public_key = 4; // Exactly 32 Ed25519 bytes.
+  bytes signature = 5; // Exactly 64 Ed25519 bytes.
+}
+
+enum InstallationPermission {
+  INSTALLATION_PERMISSION_UNSPECIFIED = 0;
+  // Assert senders and directory requesters within this namespace.
+  INSTALLATION_PERMISSION_ASSERT_SENDERS = 1;
+  // Register the namespace home route and answer its directory queries.
+  INSTALLATION_PERMISSION_HOST_NAMESPACE = 2;
+}
+
+message InstallationCredential {
+  string namespace = 1;
+  string installation_id = 2; // Stable across connections and operational keys.
+  bytes public_key = 3;
+  repeated InstallationPermission permissions = 4;
+  // No expiry or renewal requirement in v1 (D088).
+}
+
+message InstallationRevocation {
+  string namespace = 1;
+  bytes public_key = 2; // Permanently revoked within this namespace.
+  string reason = 3;
+  int64 issued_at_unix_micros = 4; // Diagnostic; not an expiry/freshness gate.
+}
+
+// Trusted operator directory data, received only from the configured relay
+// trust source. This is not an extra CA or a namespace-signed credential.
+message NamespaceBinding {
+  string namespace = 1;
+  bytes authority_public_key = 2;
+  uint64 revision = 3;
+  bool disabled = 4;
+}
+
+message SignedEnvelope {
+  SignedRecord message = 1; // Kind MESSAGE; payload is exact msgproto.v1.Message.
+  SignedRecord credential = 2; // Kind INSTALLATION_CREDENTIAL.
+}
