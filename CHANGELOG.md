@@ -58,7 +58,8 @@ under the new package version and its publication date.
   (signature, credential, trust and strict decoding) before BBS imports them,
   and BBS's answer goes back to the relay. Every handoff is at most once: work
   attempted when the adapter stops is never sent again. Hub's directory
-  queries for BBS's namespace get BBS's answer, signed. It passes all of
+  queries for BBS's namespace get BBS's answer, signed; a top-level ID
+  answers as its own alias, so `hub send will@bbs` reaches `will`. It passes all of
   Hub's signing and federation interop vectors. See "Running the Hub adapter"
   in the README.
 

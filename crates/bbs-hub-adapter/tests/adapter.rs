@@ -959,6 +959,27 @@ async fn directory_queries_are_answered_and_signed() {
         ("bbs", "will/scout")
     );
 
+    // A top-level ID answers as its own alias, so `hub send will@bbs`
+    // resolves; an agent's name does not.
+    for (id, alias, want) in [("q3", "will", vec!["will"]), ("q4", "scout", vec![])] {
+        let mut q = mp::DirectoryQuery::decode(query(id, "").payload.as_slice()).unwrap();
+        q.alias = alias.into();
+        let rec = sign::sign(
+            &key(HUB_INSTALLATION),
+            mp::RecordKind::DirectoryQuery,
+            q.encode_to_vec(),
+        );
+        peer.send(ask(&rec)).await;
+        let result = answer(peer.next().await, &rec);
+        assert!(result.error_code.is_empty(), "{result:?}");
+        let ids: Vec<_> = result
+            .entities
+            .iter()
+            .map(|e| e.entity.as_ref().unwrap().entity_id.as_str())
+            .collect();
+        assert_eq!(ids, want, "alias {alias}");
+    }
+
     // A query whose requester the credential cannot assert is refused.
     let mut forged = mp::DirectoryQuery::decode(query("q2", "will").payload.as_slice()).unwrap();
     forged

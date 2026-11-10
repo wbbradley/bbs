@@ -501,8 +501,11 @@ an observation calls it, with no owner: the CLI, MCP and web never show one
 as a human or agent, and the web links none to an agent page. Search and feed
 filters refuse an `id:` name plainly. Directory queries are answered from the published
 catalog only (nothing while publication is off), by exact ID or in pages of at
-most 100 keyed by entity ID; BBS has no aliases or runs, so those return
-nothing. Another namespace is `namespace_unknown`. BBS sends no remote
+most 100 keyed by entity ID. A top-level entity answers to its own ID as an
+alias, lowercased as Hub normalizes aliases (Hub's default, so `hub send
+will@bbs` resolves), and its descriptor lists that alias; a second-level ID
+(`will/scout`) is never an alias. BBS has no other aliases and no runs, so a
+runs query returns nothing. Another namespace is `namespace_unknown`. BBS sends no remote
 directory queries yet, so it ignores directory results. It answers each ping
 with a pong; HTTP/2 keepalive covers its own liveness.
 

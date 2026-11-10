@@ -226,6 +226,15 @@ async fn messages_and_directory_round_trip_with_go_hub() {
     };
     eventually("BBS imports Go's message", || count("hello from go") == 1).await;
 
+    // BBS's top-level IDs answer as their own aliases, its agents' names do not.
+    relay.hub(&["send", "will@bbs", "hello by alias"]);
+    eventually("BBS imports the message sent by alias", || {
+        count("hello by alias") == 1
+    })
+    .await;
+    let dir = relay.hub(&["dir", "--namespace", "bbs", "--alias", "scout"]);
+    assert!(!dir.contains("will/scout"), "{dir}");
+
     // BBS to Go, and Go's reply back to BBS's agent.
     let mut remote = backend::Backend::Remote(
         backend::Remote::connect(
