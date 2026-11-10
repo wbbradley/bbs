@@ -34,7 +34,8 @@ impl Message {
         }
     }
 
-    /// A group copy's sender as Hub shows it (D127): `ORIGINAL via GROUP`,
+    /// A group copy's sender as Hub shows it (D127): `ORIGINAL via GROUP`
+    /// (`from_name` is the group),
     /// with ` (reported)` when the original sender is in another namespace
     /// than the group, or `group GROUP (notice)` for a notice the group sent
     /// itself. None for other messages.
@@ -42,13 +43,13 @@ impl Message {
         if self.group_notice == Some(true) {
             return Some(format!("group {} (notice)", self.from_name));
         }
-        let via = self.via.as_deref()?;
+        let original = self.original_from.as_deref()?;
         let reported = if self.reported == Some(true) {
             " (reported)"
         } else {
             ""
         };
-        Some(format!("{} via {via}{reported}", self.from_name))
+        Some(format!("{original} via {}{reported}", self.from_name))
     }
 
     /// The direct recipient for board-wide displays, qualified like the sender.
@@ -67,15 +68,15 @@ mod tests {
     fn group_copies_name_original_sender_and_group() {
         let mut msg = Message {
             from_kind: Kind::Remote.into(),
-            from_name: "id:ann@hub".into(),
-            via: Some("id:release@hub".into()),
+            from_name: "id:release@hub".into(),
+            original_from: Some("id:ann@hub".into()),
             ..Default::default()
         };
         assert_eq!(
             msg.group_copy_sender().as_deref(),
             Some("id:ann@hub via id:release@hub")
         );
-        msg.from_name = "id:ann@lab".into();
+        msg.original_from = Some("id:ann@lab".into());
         msg.reported = Some(true);
         assert_eq!(
             msg.group_copy_sender().as_deref(),
@@ -90,7 +91,7 @@ mod tests {
             notice.group_copy_sender().as_deref(),
             Some("group id:release@hub (notice)")
         );
-        msg.via = None;
+        msg.original_from = None;
         assert_eq!(msg.group_copy_sender(), None);
     }
 

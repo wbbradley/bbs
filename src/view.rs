@@ -171,13 +171,12 @@ struct MessageJson<'a> {
     body: &'a str,
     /// When a direct message was read; null for broadcasts and unread mail.
     read_at: Option<&'a str>,
-    /// A group copy from another installation: the group it came through;
-    /// `from` is then the original sender. Null otherwise.
-    via: Option<&'a str>,
-    /// With `via`: the original sender is only the group's home's claim.
+    /// A group copy from another installation (`from` is the group): its
+    /// original sender. Null otherwise.
+    original_from: Option<&'a str>,
+    /// With `original_from`: it is only the group's home's claim.
     reported: bool,
-    /// A notice the group sent itself: `from` is the group, and there is no
-    /// sender to reply to.
+    /// A notice the group sent itself: there is no sender to reply to.
     notice: bool,
     /// The message this one answers: its id here, or `NAMESPACE:MESSAGE_ID`
     /// when this server does not have it. Null otherwise.
@@ -201,7 +200,7 @@ fn json(m: &Message) -> MessageJson<'_> {
         group: m.to_group.as_deref(),
         body: &m.body,
         read_at: m.read_at.as_deref(),
-        via: m.via.as_deref(),
+        original_from: m.original_from.as_deref(),
         reported: m.reported == Some(true),
         notice: m.group_notice == Some(true),
         in_reply_to: m.in_reply_to.as_deref(),

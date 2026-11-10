@@ -279,6 +279,7 @@ async fn messages_and_directory_round_trip_with_go_hub() {
             body: "hello from bbs".into(),
             control: None,
             reply_to: None,
+            not_to_owner: false,
         })
         .await
         .unwrap()
@@ -349,9 +350,13 @@ async fn messages_and_directory_round_trip_with_go_hub() {
         .unwrap()
         .messages;
     let copy = mail.iter().find(|m| m.body == "release notes").unwrap();
-    assert_eq!(copy.from_name, "id:will@hub");
+    assert_eq!(copy.from_name, "id:release@hub");
     assert_eq!(copy.from_kind(), proto::Kind::Remote);
-    assert_eq!(copy.via.as_deref(), Some("id:release@hub"));
+    assert_eq!(copy.original_from.as_deref(), Some("id:will@hub"));
+    assert_eq!(
+        copy.group_copy_sender().as_deref(),
+        Some("id:will@hub via id:release@hub")
+    );
     assert_eq!(copy.reported, None);
     assert_eq!(copy.group_notice, None);
     // Adding scout was announced to the group: a notice, with no sender to

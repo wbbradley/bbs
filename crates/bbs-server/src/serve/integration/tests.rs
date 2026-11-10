@@ -123,6 +123,7 @@ impl Rig {
                 body: body.into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         );
         self.state.changed();
@@ -644,6 +645,17 @@ async fn outbound_sends_are_claimed_once_and_record_results() {
             "delivery_error".into(),
             "bbs".into(),
             m2.id.as_ref().unwrap().message_id.clone()
+        )
+    );
+    // It answers scout's own message, which scout can see, by its ID here;
+    // being a notice, it cannot be answered.
+    assert_eq!(mail[0].in_reply_to, Some(second.to_string()));
+    let err = reply_as(&rig, &agent(&rig), mail[0].id, "why?").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "message {} is a notice to you; it can't be answered",
+            mail[0].id
         )
     );
 
@@ -2451,7 +2463,7 @@ async fn replies_go_to_the_exact_sender_or_a_copys_original_sender() {
     received(&adapter.offer("h1", m.encode_to_vec()).await);
     let read = rig.read();
     let direct = read[0].id;
-    assert_eq!(read[0].via, None);
+    assert_eq!(read[0].original_from, None);
     assert_eq!(read[0].in_reply_to, None);
     let sent = reply_as(&rig, &scout, direct, "hi bob").unwrap();
     assert_eq!(sent.to, "id:bob@hub#r9");
@@ -2513,9 +2525,11 @@ async fn replies_go_to_the_exact_sender_or_a_copys_original_sender() {
     let [copy, notice, reported] = &read[..] else {
         panic!("{read:?}")
     };
-    assert_eq!(copy.from_name, "id:ann@hub#r2");
+    // The copy stays from the group, which sent it; a client that does not
+    // know original_from shows the group.
+    assert_eq!(copy.from_name, "id:release@hub");
     assert_eq!(copy.from_kind(), proto::Kind::Remote);
-    assert_eq!(copy.via.as_deref(), Some("id:release@hub"));
+    assert_eq!(copy.original_from.as_deref(), Some("id:ann@hub#r2"));
     assert_eq!(copy.reported, None);
     assert_eq!(copy.group_notice, None);
     assert_eq!(
@@ -2523,13 +2537,14 @@ async fn replies_go_to_the_exact_sender_or_a_copys_original_sender() {
         Some("id:ann@hub#r2 via id:release@hub")
     );
     assert_eq!(notice.from_name, "id:release@hub");
-    assert_eq!(notice.via, None);
+    assert_eq!(notice.original_from, None);
     assert_eq!(notice.group_notice, Some(true));
     assert_eq!(
         notice.group_copy_sender().as_deref(),
         Some("group id:release@hub (notice)")
     );
-    assert_eq!(reported.from_name, "id:carol@lab");
+    assert_eq!(reported.from_name, "id:release@hub");
+    assert_eq!(reported.original_from.as_deref(), Some("id:carol@lab"));
     assert_eq!(reported.reported, Some(true));
     assert_eq!(
         reported.group_copy_sender().as_deref(),
@@ -2591,10 +2606,40 @@ async fn replies_go_to_the_exact_sender_or_a_copys_original_sender() {
     .unwrap()
     .id
     .unwrap();
-    for id in [elsewhere, 999_999] {
-        let err = reply_as(&rig, &scout, id, "peek").unwrap_err();
-        assert_eq!(err.to_string(), format!("no message {id} in your mail"));
-    }
+    let err = reply_as(&rig, &scout, elsewhere, "peek").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("message {elsewhere} was not delivered to you, so you can't reply to it")
+    );
+    let err = reply_as(&rig, &scout, 999_999, "peek").unwrap_err();
+    assert_eq!(err.to_string(), "no message 999999");
+    // A remote sender names what it answers; a message scout cannot see is
+    // shown only by its origin, not its ID here. The board-wide feed, which
+    // shows every message, names it by its ID.
+    let (namespace, origin): (String, String) = rig
+        .conn()
+        .query_row(
+            "SELECT origin_namespace, origin_message_id FROM messages WHERE id = ?1",
+            [elsewhere],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let mut m = message("m2", "bob", "will/scout", "about ann's mail");
+    m.in_reply_to = message_ref(&namespace, &origin);
+    received(&adapter.offer("h5", m.encode_to_vec()).await);
+    let read = rig.read();
+    assert_eq!(read[0].body, "about ann's mail");
+    assert_eq!(read[0].in_reply_to, Some(format!("{namespace}:{origin}")));
+    let feed = service::feed(
+        &mut rig.conn(),
+        &human(),
+        proto::FeedRequest {
+            backlog: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(feed.messages[0].in_reply_to, Some(elsewhere.to_string()));
     let mut b = client(&rig, scout.clone()).await;
     let err = b
         .send(proto::SendRequest {
@@ -2640,4 +2685,26 @@ async fn replies_go_to_the_exact_sender_or_a_copys_original_sender() {
     assert_eq!(answer.body, "local reply");
     assert_eq!(answer.from_name, "scout");
     assert_eq!(answer.in_reply_to, Some(local.to_string()));
+}
+
+#[tokio::test]
+async fn a_server_that_predates_replies_is_named_incompatible() {
+    let rig = Rig::new().await;
+    let mut b = client(&rig, agent(&rig)).await;
+    // A server that predates replies ignores reply_to, so it sees a send
+    // with no recipient; the client must still recognize its refusal.
+    let err = b
+        .send(proto::SendRequest {
+            body: "hi".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    let err = crate::backend::replies_unsupported(err);
+    assert!(
+        format!("{err:#}").starts_with(
+            "incompatible BBS server: it does not support replies; upgrade the server"
+        ),
+        "{err:#}"
+    );
 }

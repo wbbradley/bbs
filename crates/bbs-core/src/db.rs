@@ -144,12 +144,12 @@ pub struct MessageView {
     pub timer_id: Option<i64>,
     /// Sent via AutoReply.
     pub auto_reply: bool,
-    /// A group copy (D127): the group it came through. `from_name` is then
-    /// the original sender.
-    pub via: Option<String>,
-    /// A group copy the group itself sent: `from_name` is the group.
+    /// A group copy (D127): its original sender. `from_name` stays the group,
+    /// which sent the copy.
+    pub original_from: Option<String>,
+    /// A group copy the group itself sent: there is no original sender.
     pub group_notice: bool,
-    /// With `via`: the original sender is in another namespace than the group.
+    /// With `original_from`: it is in another namespace than the group.
     pub reported: bool,
     /// The message this one answers: its ID here, or its origin
     /// `NAMESPACE:MESSAGE_ID` when this installation does not have it.
@@ -1120,28 +1120,37 @@ const COPY_JOINS: &str = "
 /// Columns read by [`copy_view`], with [`SENDER_JOINS`] and [`COPY_JOINS`]: a
 /// copy's original sender, whether the group sent it itself (a notice),
 /// whether the original sender is in another namespace than the group, and
-/// what the message answers.
-static COPY_COLUMNS: LazyLock<String> = LazyLock::new(|| {
+/// what the message answers. A remote sender names what it answers, so the
+/// answered message's local ID is given only when the reader whose address
+/// is the SQL `reader` sent it or had it delivered; otherwise only its
+/// origin. Without `reader` (the board-wide feed, which shows every message)
+/// any local message counts.
+fn copy_columns(reader: Option<&str>) -> String {
+    let visible = match reader {
+        Some(a) => format!(
+            "AND (r.sender_address_id = {a} OR EXISTS (SELECT 1 FROM deliveries rd
+               WHERE rd.message_id = r.id AND rd.recipient_address_id = {a}))"
+        ),
+        None => String::new(),
+    };
     format!(
         "CASE WHEN oe.id IS NULL THEN NULL ELSE {} END, oe.id = se.id, oe.namespace != se.namespace,
          m.in_reply_to_namespace, m.in_reply_to_message_id,
          (SELECT r.id FROM messages r WHERE r.origin_namespace = m.in_reply_to_namespace
-            AND r.origin_message_id = m.in_reply_to_message_id)",
+            AND r.origin_message_id = m.in_reply_to_message_id {visible})",
         remote_display_sql("oe", "oa", "coalesce(m.group_copy_sender_run_id, '')")
     )
-});
+}
 
-/// Apply [`COPY_COLUMNS`], starting at column `at`, to `view`: a group copy
-/// names its original sender, and the group as `via`; a notice stays from
-/// the group.
+/// Apply [`copy_columns`], starting at column `at`, to `view`: a group copy
+/// stays from the group and names its original sender, unless the group sent
+/// it itself (a notice).
 fn copy_view(mut view: MessageView, r: &rusqlite::Row, at: usize) -> rusqlite::Result<MessageView> {
     if let Some(original) = r.get::<_, Option<String>>(at)? {
         if r.get::<_, Option<bool>>(at + 1)? == Some(true) {
             view.group_notice = true;
         } else {
-            view.via = Some(std::mem::replace(&mut view.from_name, original));
-            view.from_remote = true;
-            view.from_owner = None;
+            view.original_from = Some(original);
             view.reported = r.get::<_, Option<bool>>(at + 2)? == Some(true);
         }
     }
@@ -1326,9 +1335,9 @@ pub enum ReplyTarget {
     /// Another installation's exact address, run included, as
     /// [`crate::entity::remote_display`] names it.
     Remote(String),
-    /// A group: a copy's notice, which the group sent itself, has no sender
-    /// to reply to.
-    Group,
+    /// A group copy's notice, which the group sent itself: there is no
+    /// sender to reply to.
+    GroupNotice,
 }
 
 /// What [`reply_source`] finds about a message being answered.
@@ -1388,7 +1397,7 @@ pub fn reply_source(conn: &Connection, me: &Principal, id: i64) -> Result<Option
         return Ok(None);
     };
     let (target, answers) = match copy {
-        (_, _, _, _, Some(true)) => (ReplyTarget::Group, origin),
+        (_, _, _, _, Some(true)) => (ReplyTarget::GroupNotice, origin),
         (Some(namespace), Some(message_id), Some(by), run, _) => {
             (address_target(conn, by, &run)?, (namespace, message_id))
         }
@@ -1405,8 +1414,7 @@ pub fn reply_source(conn: &Connection, me: &Principal, id: i64) -> Result<Option
 /// Who `entity_addresses` row `address` with run `run` is, to reply to.
 fn address_target(conn: &Connection, address: i64, run: &str) -> Result<ReplyTarget> {
     conn.query_row(
-        "SELECT e.namespace, e.entity_id, a.address_id, fa.id, fa.name, fh.id, fh.name,
-                b.group_id IS NOT NULL
+        "SELECT e.namespace, e.entity_id, a.address_id, fa.id, fa.name, fh.id, fh.name
          FROM entity_addresses a JOIN entities e ON e.id = a.entity_id
          LEFT JOIN entity_local_bindings b ON b.entity_id = e.id
          LEFT JOIN agents fa ON fa.id = b.agent_id
@@ -1422,7 +1430,6 @@ fn address_target(conn: &Connection, address: i64, run: &str) -> Result<ReplyTar
             Ok(
                 match (principal(Kind::Agent, 3)?, principal(Kind::Human, 5)?) {
                     (Some(p), _) | (_, Some(p)) => ReplyTarget::Native(p),
-                    _ if r.get(7)? => ReplyTarget::Group,
                     _ => ReplyTarget::Remote(crate::entity::remote_display(
                         &r.get::<_, String>(0)?,
                         &r.get::<_, String>(1)?,
@@ -1944,7 +1951,7 @@ fn inbox_select(kind: Kind) -> String {
          LEFT JOIN bbs_groups g ON g.id = m.to_group_id
          WHERE d.recipient_address_id = {} AND d.recipient_run_id = ''",
         *SENDER_NAME,
-        *COPY_COLUMNS,
+        copy_columns(Some("d.recipient_address_id")),
         address_sql(kind.into(), "?2")
     )
 }
@@ -1971,7 +1978,7 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         control: r.get(8)?,
         timer_id: r.get(9)?,
         auto_reply: r.get::<_, Option<i64>>(10)?.is_some_and(|v| v != 0),
-        via: None,
+        original_from: None,
         group_notice: false,
         reported: false,
         in_reply_to: None,
@@ -2722,7 +2729,7 @@ pub fn feed_messages(
          ORDER BY m.id",
         *SENDER_NAME,
         remote_display_sql("xe", "xa", "m.recipient_run_id"),
-        *COPY_COLUMNS,
+        copy_columns(None),
         vec!["?"; ids.len()].join(", ")
     );
     let rows = conn
@@ -2749,7 +2756,7 @@ pub fn feed_messages(
                 control: None,
                 timer_id: None,
                 auto_reply: r.get::<_, Option<i64>>(10)?.is_some_and(|v| v != 0),
-                via: None,
+                original_from: None,
                 group_notice: false,
                 reported: false,
                 in_reply_to: None,

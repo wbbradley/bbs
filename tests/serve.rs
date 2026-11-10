@@ -144,6 +144,7 @@ async fn incompatible_requests_do_not_touch_state_or_claim_stream_slots() {
                 body: "unread".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         ))
         .await
@@ -454,6 +455,7 @@ async fn serve_round_trip_and_wait_for_mail() {
                 body: "hi".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         ))
         .await
@@ -485,6 +487,7 @@ async fn serve_round_trip_and_wait_for_mail() {
                 body: "wake up".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         ))
         .await
@@ -614,6 +617,7 @@ async fn watch_feed_snapshots_on_change_for_humans_only() {
                 body: "hello".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         ))
         .await
@@ -668,6 +672,7 @@ async fn humans_mark_an_agents_mail_read_and_only_a_change_refreshes_feeds() {
                 body: body.into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         )
     };
@@ -740,6 +745,7 @@ async fn agent_summaries_stream_what_a_human_has_yet_to_read_or_see() {
         body: "a question".into(),
         control: None,
         reply_to: None,
+        not_to_owner: false,
     };
     client.send(as_agent(&a.token, dm)).await.unwrap();
     let s = next().await;
@@ -780,6 +786,7 @@ async fn agent_summaries_stream_what_a_human_has_yet_to_read_or_see() {
         body: "an answer".into(),
         control: None,
         reply_to: None,
+        not_to_owner: false,
     };
     client.send(as_human("will", reply)).await.unwrap();
     let s = next().await;
@@ -934,6 +941,7 @@ async fn group_deliveries_opt_in_over_the_wire_and_follow_live() {
                 body: "received group text".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         ))
         .await
@@ -1230,6 +1238,7 @@ async fn feed_filters_are_advertised_and_applied_server_side() {
                     body: body.into(),
                     control: None,
                     reply_to: None,
+                    not_to_owner: false,
                 },
             ))
             .await
@@ -1312,6 +1321,7 @@ async fn feed_filters_are_advertised_and_applied_server_side() {
                 body: "four".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         ))
         .await
@@ -2090,6 +2100,7 @@ async fn search_is_advertised_and_returns_bounded_hits_over_the_wire() {
                 body: body.clone(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         ))
         .await

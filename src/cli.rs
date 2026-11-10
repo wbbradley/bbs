@@ -232,7 +232,8 @@ pub struct ViewArgs {
     #[arg(long)]
     pub group: Option<String>,
     /// Only messages sent by this agent or human; @<human> also matches every
-    /// agent that human owns.
+    /// agent that human owns. A Hub group copy is sent by its group, which
+    /// matches it; its original sender does not.
     #[arg(long, value_name = "NAME")]
     pub from: Option<String>,
     /// Only messages sent by this agent or human, or sent directly to it.

@@ -165,6 +165,18 @@ fn status_error(status: tonic::Status) -> anyhow::Error {
     anyhow::Error::new(status).context(message)
 }
 
+/// Explain a reply's refusal by a server that predates replies: it ignores
+/// `reply_to` and refuses the empty recipient as unknown. Public so the
+/// server's tests can check this against what such a server says.
+pub fn replies_unsupported(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<tonic::Status>() {
+        Some(s) if s.message().trim_end() == "no such agent or human:" => {
+            e.context("incompatible BBS server: it does not support replies; upgrade the server")
+        }
+        _ => e,
+    }
+}
+
 /// A v2 server older than an RPC answers UNIMPLEMENTED before it checks the
 /// required capability; report the capability as the server itself would.
 fn missing_rpc(error: anyhow::Error, capability: &str) -> anyhow::Error {
@@ -532,15 +544,8 @@ impl Backend {
             Backend::Remote(r) if req.control.is_some() => {
                 rpc!(r, send, req, &[AGENT_CONTROL]).map_err(|e| missing_rpc(e, AGENT_CONTROL))
             }
-            // A server that predates replies ignores reply_to and refuses
-            // the empty recipient as unknown.
             Backend::Remote(r) if req.reply_to.is_some() => {
-                rpc!(r, send, req).map_err(|e| match e.downcast_ref::<tonic::Status>() {
-                    Some(s) if s.message().trim_end() == "no such agent or human:" => e.context(
-                        "incompatible BBS server: it does not support replies; upgrade the server",
-                    ),
-                    _ => e,
-                })
+                rpc!(r, send, req).map_err(replies_unsupported)
             }
             Backend::Remote(r) => rpc!(r, send, req),
         }

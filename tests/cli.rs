@@ -950,7 +950,7 @@ fn replies_answer_the_sender_by_message_id(mode: Mode) {
     assert!(own.contains(&format!("you sent message {id}")), "{own}");
     assert!(
         bbs.err(&["reply", "999999", "x"])
-            .contains("no message 999999 in your mail")
+            .contains("no message 999999")
     );
 }
 
@@ -3133,7 +3133,7 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
             "id": acme["id"], "created_at": acme["created_at"], "from": a,
             "from_kind": "agent", "from_owner": "will", "to": null, "to_owner": null,
             "group": "acme", "body": "acme from A", "read_at": null,
-            "via": null, "reported": false, "notice": false, "in_reply_to": null,
+            "original_from": null, "reported": false, "notice": false, "in_reply_to": null,
         })
     );
     let dm = &all[bodies(&all)

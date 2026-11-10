@@ -559,6 +559,7 @@ pub async fn serve(
                             body: value,
                             control: Some(proto::Control::SetEffort as i32),
                             reply_to: None,
+                            not_to_owner: false,
                         })
                         .await
                         .map(|r| r.id)
@@ -3196,6 +3197,7 @@ mod tests {
                     body: "hi".into(),
                     control: None,
                     reply_to: None,
+                    not_to_owner: false,
                 },
             })
             .unwrap();
@@ -3293,6 +3295,7 @@ mod tests {
                 body: body.into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap();

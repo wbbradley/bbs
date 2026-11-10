@@ -281,6 +281,7 @@ impl Tools {
                         body: arg("body")?,
                         control: None,
                         reply_to: None,
+                        not_to_owner: false,
                     })
                     .await?;
                 let mut out = match r.recipients {
@@ -296,10 +297,12 @@ impl Tools {
                 out
             }
             "bbs_reply" => {
-                let id = args["message_id"]
-                    .as_i64()
-                    .context(r#"missing integer argument "message_id""#)?;
-                let r = b.send(crate::app::reply_request(id, arg("body")?)).await?;
+                let id = message_id(&args["message_id"])?;
+                let mut req = crate::app::reply_request(id, arg("body")?);
+                // Like bbs_send's check above, but the server knows who the
+                // reply goes to.
+                req.not_to_owner = guard;
+                let r = b.send(req).await?;
                 format!("Replied to {}.", r.to)
             }
             "bbs_agents" => format_agents(
@@ -487,6 +490,13 @@ fn search_request(args: &Value) -> Result<proto::SearchRequest> {
     })
 }
 
+/// A message id given as a number or a numeric string.
+fn message_id(v: &Value) -> Result<i64> {
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        .context(r#"missing integer argument "message_id""#)
+}
+
 fn format_search(
     response: proto::SearchResponse,
     since: Option<String>,
@@ -507,7 +517,7 @@ fn format_search(
                         _ => "human",
                     },
                     "name": m.from_name, "owner": m.from_owner },
-                "via": m.via, "reported": m.reported == Some(true),
+                "original_from": m.original_from, "reported": m.reported == Some(true),
                 "notice": m.group_notice == Some(true), "in_reply_to": m.in_reply_to,
                 "to": { "group": m.to_group, "name": m.to_name, "owner": m.to_owner },
                 "body": m.body, "truncated": hit.truncated,
@@ -572,7 +582,7 @@ pub fn tool_list() -> Value {
                 "case_sensitive": { "type": "boolean", "default": false },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
                 "before_id": { "type": "integer", "minimum": 1, "description": "Exclusive message-ID cursor from the previous response's next_before_id." },
-                "from": string("Only messages sent by this agent or human name; retired agents included."),
+                "from": string("Only messages sent by this agent or human name; retired agents included. A copy from another installation's group matches the group, not its original sender."),
                 "with": string("Only messages sent by or directly to this agent or human; not broadcasts delivered to it."),
                 "group": string("Only broadcasts to this group name, with or without @; archived groups included."),
                 "since": string("Inclusive start time: RFC3339 or a duration like 7d."),
@@ -946,6 +956,74 @@ mod search_tests {
         assert!(
             block(json!(mine.id)).await.is_ok(),
             "the chain's current version is open"
+        );
+    }
+
+    #[tokio::test]
+    async fn bbs_reply_refuses_the_owner_when_output_already_reaches_them() {
+        use crate::service::Caller;
+        let board = tempfile::tempdir().unwrap();
+        let mut db = crate::db::open(&board.path().join("bbs.db")).unwrap();
+        crate::db::migrate(&mut db).unwrap();
+        drop(db);
+        let config = Config::default();
+        let open = |caller: Caller| Backend::open(&config, board.path(), caller);
+        let human = |name: &str| Caller {
+            human: Some(name.into()),
+            ..Default::default()
+        };
+        let mut will = open(human("will")).await.unwrap();
+        for name in ["will", "ada"] {
+            will.ensure_human(proto::EnsureHumanRequest { name: name.into() })
+                .await
+                .unwrap();
+        }
+        let token = will
+            .register(proto::RegisterRequest {
+                name: Some("Agent".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .token;
+        let mut ada = open(human("ada")).await.unwrap();
+        let mut say = async |b: &mut Backend, body: &str| {
+            b.send(proto::SendRequest {
+                to: "Agent".into(),
+                body: body.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap()
+        };
+        let from_will = say(&mut will, "from will").await;
+        let from_ada = say(&mut ada, "from ada").await;
+        let tools = || Tools {
+            local: true,
+            ..Tools::new(board.path(), token.clone())
+        };
+        let reply = async |mut tools: Tools, id: Value| {
+            tools
+                .call("bbs_reply", &json!({"message_id": id, "body": "re"}))
+                .await
+                .map_err(|e| format!("{e:#}"))
+        };
+        let err = reply(tools().auto_owner_reply(), json!(from_will))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Nothing was sent."), "{err}");
+        // Another sender is answered; the id may be a numeric string.
+        assert_eq!(
+            reply(tools().auto_owner_reply(), json!(from_ada.to_string())).await,
+            Ok("Replied to ada.".to_string())
+        );
+        assert!(reply(tools(), json!("x")).await.is_err());
+        // Without automatic owner delivery, the owner is answered like anyone.
+        assert_eq!(
+            reply(tools(), json!(from_will)).await,
+            Ok("Replied to will.".to_string())
         );
     }
 

@@ -307,6 +307,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 body: read_body(body)?,
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             };
             let r = backend.send(req).await?;
             let mut out = match r.recipients {
@@ -620,13 +621,12 @@ struct MessageJson<'a> {
     body: &'a str,
     /// The timer that sent it; null for other messages.
     timer: Option<i64>,
-    /// A group copy from another installation: the group it came through;
-    /// `from` is then the original sender. Null otherwise.
-    via: Option<&'a str>,
-    /// With `via`: the original sender is only the group's home's claim.
+    /// A group copy from another installation (`from` is the group): its
+    /// original sender. Null otherwise.
+    original_from: Option<&'a str>,
+    /// With `original_from`: it is only the group's home's claim.
     reported: bool,
-    /// A notice the group sent itself: `from` is the group, and there is no
-    /// sender to reply to.
+    /// A notice the group sent itself: there is no sender to reply to.
     notice: bool,
     /// The message this one answers: its id here, or `NAMESPACE:MESSAGE_ID`
     /// when this server does not have it. Null otherwise.
@@ -769,6 +769,7 @@ pub(crate) fn reply_request(id: i64, body: String) -> proto::SendRequest {
         body,
         control: None,
         reply_to: Some(id),
+        not_to_owner: false,
     }
 }
 
@@ -792,7 +793,7 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
             group: m.to_group.as_deref(),
             body: &m.body,
             timer: m.timer_id,
-            via: m.via.as_deref(),
+            original_from: m.original_from.as_deref(),
             reported: m.reported == Some(true),
             notice: m.group_notice == Some(true),
             in_reply_to: m.in_reply_to.as_deref(),
@@ -995,15 +996,15 @@ mod tests {
             id: 7,
             created_at: at.clone(),
             from_kind: proto::Kind::Remote.into(),
-            from_name: "id:ann@hub".into(),
+            from_name: "id:release@hub".into(),
             to_name: Some("scout".into()),
             body: "ship it".into(),
-            via: Some("id:release@hub".into()),
+            original_from: Some("id:ann@hub".into()),
             ..Default::default()
         };
         let notice = proto::Message {
             id: 8,
-            from_name: "id:release@hub".into(),
+            original_from: None,
             group_notice: Some(true),
             ..copy.clone()
         };
@@ -1011,11 +1012,17 @@ mod tests {
             id: 9,
             from_kind: proto::Kind::Human.into(),
             from_name: "will".into(),
-            via: None,
+            original_from: None,
             in_reply_to: Some("3".into()),
             ..copy.clone()
         };
-        let text = format_messages(&[copy.clone(), notice, reply], false).unwrap();
+        // What a client that does not know original_from sees: the group.
+        let unaware = proto::Message {
+            id: 10,
+            original_from: None,
+            ..copy.clone()
+        };
+        let text = format_messages(&[copy.clone(), notice, reply, unaware], false).unwrap();
         let headers: Vec<_> = text.lines().filter(|l| l.starts_with('[')).collect();
         let time = display_time(&at);
         assert_eq!(
@@ -1024,12 +1031,13 @@ mod tests {
                 format!("[{time}] from id:ann@hub via id:release@hub to scout (id 7):"),
                 format!("[{time}] from group id:release@hub (notice) to scout (id 8):"),
                 format!("[{time}] from will (human) to scout (id 9) (reply to 3):"),
+                format!("[{time}] from id:release@hub (remote) to scout (id 10):"),
             ]
         );
         let json = format_messages(&[copy], true).unwrap();
         let v: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
-        assert_eq!(v["from"], "id:ann@hub");
-        assert_eq!(v["via"], "id:release@hub");
+        assert_eq!(v["from"], "id:release@hub");
+        assert_eq!(v["original_from"], "id:ann@hub");
         assert_eq!(v["reported"], false);
         assert_eq!(v["notice"], false);
         assert_eq!(v["in_reply_to"], serde_json::Value::Null);

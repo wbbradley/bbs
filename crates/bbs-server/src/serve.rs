@@ -2536,6 +2536,7 @@ mod tests {
                         body: format!("mail {n}"),
                         control: None,
                         reply_to: None,
+                        not_to_owner: false,
                     },
                 )
                 .unwrap();

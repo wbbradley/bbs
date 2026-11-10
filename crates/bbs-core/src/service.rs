@@ -204,8 +204,8 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
         },
         timer_id: m.timer_id,
         auto_reply: if m.auto_reply { Some(true) } else { None },
-        reported: (m.via.is_some() && m.reported).then_some(true),
-        via: m.via,
+        reported: (m.original_from.is_some() && m.reported).then_some(true),
+        original_from: m.original_from,
         group_notice: m.group_notice.then_some(true),
         in_reply_to: m.in_reply_to,
     }
@@ -1841,7 +1841,7 @@ pub fn send(
                 )
                 .into());
             }
-            return reply(ctx, &me, id, body);
+            return reply(ctx, &me, id, body, req.not_to_owner);
         }
         if let Some(control) = req.control {
             return send_control(ctx, &me, to, body, control);
@@ -1910,16 +1910,27 @@ pub fn send(
 /// exact sender, or a group copy's original sender, with `in_reply_to` set
 /// to the answered message's origin (D092, D127). The server resolves both,
 /// so a caller cannot name an arbitrary correlation.
-fn reply(ctx: &Ctx, me: &db::Principal, id: i64, body: &str) -> Result<proto::SendResponse> {
-    let source = db::reply_source(ctx.conn, me, id)?;
-    let source = match source {
+fn reply(
+    ctx: &Ctx,
+    me: &db::Principal,
+    id: i64,
+    body: &str,
+    not_to_owner: bool,
+) -> Result<proto::SendResponse> {
+    let source = match db::reply_source(ctx.conn, me, id)? {
+        // Only a notice is delivered to its own sender: a timer the caller
+        // set for itself, a delivery error, a restart-preparation report.
+        Some(s) if s.mine && s.delivered => {
+            bail!("message {id} is a notice to you; it can't be answered")
+        }
         Some(s) if s.mine => bail!("you sent message {id}; send to its recipient instead"),
         Some(s) if s.delivered => s,
-        _ => bail!("no message {id} in your mail"),
+        Some(_) => bail!("message {id} was not delivered to you, so you can't reply to it"),
+        None => bail!("no message {id}"),
     };
     let answers = Some((source.answers.0.as_str(), source.answers.1.as_str()));
     match source.target {
-        db::ReplyTarget::Group => bail!("a group notice has no sender to reply to"),
+        db::ReplyTarget::GroupNotice => bail!("a group notice has no sender to reply to"),
         db::ReplyTarget::Remote(reference) => {
             let reference = reference.strip_prefix("id:").unwrap_or(&reference);
             let (id, to) = integration::send_remote(ctx, me, reference, body, answers)?;
@@ -1931,6 +1942,18 @@ fn reply(ctx: &Ctx, me: &db::Principal, id: i64, body: &str) -> Result<proto::Se
             })
         }
         db::ReplyTarget::Native(target) => {
+            if not_to_owner
+                && me.kind == db::Kind::Agent
+                && target.kind == db::Kind::Human
+                && db::agent_owner_id(ctx.conn, me.id)? == Some(target.id)
+            {
+                bail!(
+                    "Nothing was sent. Message {id} is from your owner {owner}, and your ordinary \
+                     replies are delivered to {owner} automatically. Write your next ordinary \
+                     reply instead of replying to your owner with a tool.",
+                    owner = target.name
+                );
+            }
             if target.kind == db::Kind::Agent && !db::agent_is_live(ctx.conn, target.id)? {
                 bail!("{} is offline (retired)", target.name);
             }
@@ -3752,6 +3775,7 @@ mod tests {
                 body: "**ÉQUIPE** a.*%_[]\nnext line".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap()
@@ -3786,6 +3810,7 @@ mod tests {
                 body: "équipe private".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap()
@@ -3800,6 +3825,7 @@ mod tests {
                 body: "équipe reply".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap()
@@ -3821,6 +3847,7 @@ mod tests {
                 body: "équipe group".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap();
@@ -3839,6 +3866,7 @@ mod tests {
                 body: "équipe control".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap()
@@ -3950,6 +3978,7 @@ mod tests {
                 body: "needle group".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap();
@@ -4225,6 +4254,7 @@ mod tests {
                 body: "high".into(),
                 control: Some(proto::Control::SetEffort.into()),
                 reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap();
@@ -4337,6 +4367,7 @@ mod tests {
                     body: body.into(),
                     control: Some(proto::Control::SetEffort.into()),
                     reply_to: None,
+                    not_to_owner: false,
                 },
             )
         };
@@ -4498,6 +4529,7 @@ mod tests {
                     body: body.into(),
                     control: Some(c.into()),
                     reply_to: None,
+                    not_to_owner: false,
                 },
             )
         };
@@ -4648,6 +4680,7 @@ mod tests {
             body: "stop".into(),
             control: Some(proto::Control::Cancel.into()),
             reply_to: None,
+            not_to_owner: false,
         };
         send(&mut conn, &will, req).unwrap();
         let t = add(&mut conn, &will, "Lu", "in 1m").unwrap();
@@ -6533,6 +6566,7 @@ mod tests {
                     body: body.into(),
                     control: None,
                     reply_to: None,
+                    not_to_owner: false,
                 },
             )
             .unwrap();
@@ -6738,6 +6772,7 @@ mod tests {
                 body: format!("to {to}"),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             };
             send(conn, from, req)
         };
@@ -6949,6 +6984,7 @@ mod tests {
                 body: "chat".into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap_err();
@@ -6969,6 +7005,7 @@ mod tests {
                 body: body.into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             };
             send(&mut conn, agent, req).unwrap();
         }
@@ -7050,6 +7087,7 @@ mod tests {
             body: "a question".into(),
             control: None,
             reply_to: None,
+            not_to_owner: false,
         };
         send(&mut conn, &mateo, dm).unwrap();
         let shout = proto::SendRequest {
@@ -7057,6 +7095,7 @@ mod tests {
             body: "everyone".into(),
             control: None,
             reply_to: None,
+            not_to_owner: false,
         };
         send(&mut conn, &will, shout).unwrap();
         let record = |n: usize| {
@@ -7157,6 +7196,7 @@ mod tests {
                 body: body.into(),
                 control: None,
                 reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap();
@@ -7461,5 +7501,132 @@ mod tests {
         let too_large = error.downcast_ref::<SyncPageTooLarge>().expect("typed");
         assert_eq!(too_large.message_id, ids[0]);
         assert!(page(prost::Message::encoded_len(&first)).is_ok());
+    }
+
+    fn reply_to(
+        conn: &mut Connection,
+        from: &Caller,
+        id: i64,
+        not_to_owner: bool,
+    ) -> Result<proto::SendResponse> {
+        let req = proto::SendRequest {
+            body: format!("re {id}"),
+            reply_to: Some(id),
+            not_to_owner,
+            ..Default::default()
+        };
+        send(conn, from, req)
+    }
+
+    fn reply_err(conn: &mut Connection, from: &Caller, id: i64, not_to_owner: bool) -> String {
+        format!("{:#}", reply_to(conn, from, id, not_to_owner).unwrap_err())
+    }
+
+    #[test]
+    fn replies_follow_the_rules_of_a_direct_message_to_the_sender() {
+        let (mut conn, will, [mateo, zed, lu]) = board();
+        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
+        let ada = Caller {
+            human: Some("ada".into()),
+            ..Default::default()
+        };
+        let req = proto::SetGroupWriterRequest {
+            group: "crew".into(),
+            agent: "Mateo".into(),
+            grant: true,
+        };
+        set_group_writer(&mut conn, &will, req).unwrap();
+
+        // A native group broadcast's sender is who sent it: a reply goes to
+        // that sender directly, not to the group.
+        let broadcast = say(&mut conn, &mateo, "@crew", "all hands");
+        let r = reply_to(&mut conn, &zed, broadcast, false).unwrap();
+        assert_eq!(r.to, "Mateo");
+        let got = inbox(&mut conn, &mateo);
+        let answer = got.iter().find(|m| Some(m.id) == r.id).unwrap();
+        assert_eq!(answer.to_group, None);
+        assert_eq!(answer.to_name.as_deref(), Some("Mateo"));
+        assert_eq!(answer.in_reply_to, Some(broadcast.to_string()));
+
+        // A headless agent's ordinary output already reaches its owner, so
+        // with not_to_owner a reply to the owner, direct or to a group, is
+        // refused; to another human it is not.
+        let owners = [
+            say(&mut conn, &will, "Mateo", "from will"),
+            say(&mut conn, &will, "@crew", "will to crew"),
+        ];
+        for id in owners {
+            assert_eq!(
+                reply_err(&mut conn, &mateo, id, true),
+                format!(
+                    "Nothing was sent. Message {id} is from your owner will, and your ordinary \
+                     replies are delivered to will automatically. Write your next ordinary reply \
+                     instead of replying to your owner with a tool."
+                )
+            );
+            assert_eq!(reply_to(&mut conn, &mateo, id, false).unwrap().to, "will");
+        }
+        let from_ada = say(&mut conn, &ada, "Mateo", "from ada");
+        assert_eq!(
+            reply_to(&mut conn, &mateo, from_ada, true).unwrap().to,
+            "ada"
+        );
+
+        // An agent the replier no longer shares a group with.
+        let from_zed = say(&mut conn, &zed, "Mateo", "zed to mateo");
+        let leave = proto::GroupRequest {
+            group: "crew".into(),
+        };
+        group_leave(&mut conn, &zed, leave).unwrap();
+        assert_eq!(
+            reply_err(&mut conn, &mateo, from_zed, false),
+            "Zed is not in any of your groups"
+        );
+
+        // A retired sender.
+        let from_lu = say(&mut conn, &lu, "will", "lu to will");
+        let retire = proto::RetireRequest { agent: "Lu".into() };
+        retire_agent(&mut conn, &will, retire).unwrap();
+        assert_eq!(
+            reply_err(&mut conn, &will, from_lu, false),
+            "Lu is offline (retired)"
+        );
+
+        // A timer an agent set for itself is a notice to it.
+        let t = add(&mut conn, &mateo, "Mateo", "in 30m").unwrap();
+        fire_timers(&mut conn, time(&t.next_run)).unwrap();
+        let timer = inbox(&mut conn, &mateo)
+            .into_iter()
+            .find(|m| m.timer_id == Some(t.id))
+            .unwrap()
+            .id;
+        assert_eq!(
+            reply_err(&mut conn, &mateo, timer, false),
+            format!("message {timer} is a notice to you; it can't be answered")
+        );
+    }
+
+    #[test]
+    fn replies_respect_focus_mode_both_ways() {
+        let (mut conn, will, [mateo, zed, _]) = board();
+        let to_mateo = say(&mut conn, &zed, "Mateo", "zed to mateo");
+        let to_zed = say(&mut conn, &mateo, "Zed", "mateo to zed");
+        let req = proto::SetFocusRequest {
+            agent: "Mateo".into(),
+            focused: true,
+        };
+        set_focus(&mut conn, &will, req).unwrap();
+        // The focused agent may answer only its owner...
+        assert!(reply_err(&mut conn, &mateo, to_mateo, false).starts_with("you are in focus mode"),);
+        // ...and no one else may reach it.
+        assert!(reply_err(&mut conn, &zed, to_zed, false).starts_with("Mateo is unreachable"));
+        // The focus notice is from its owner: a reply goes to the owner, unless
+        // the agent's output already does.
+        let notice = inbox(&mut conn, &mateo).last().unwrap().id;
+        assert!(reply_err(&mut conn, &mateo, notice, true).starts_with("Nothing was sent."));
+        assert_eq!(
+            reply_to(&mut conn, &mateo, notice, false).unwrap().to,
+            "will"
+        );
     }
 }
