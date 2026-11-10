@@ -7,9 +7,10 @@
 //!
 //! One stream per integration: a new connection supersedes the older one,
 //! which ends. Outbound work is claimed (marked attempted and committed)
-//! before it is queued for the stream, and is never offered again (D072). A
-//! claim becomes `sent` only when the transport takes its frame; a stream
-//! that ends first leaves its queued claims `unknown`.
+//! before it is queued for the stream (D072). A claim becomes `sent` when the
+//! transport takes its frame; one still queued when its stream closes
+//! provably never left, and returns to pending. The queue's lock makes those
+//! two outcomes exclusive: see [`Outbound`].
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -44,8 +45,6 @@ const MAX_HANDSHAKES: usize = 16;
 pub(super) const MAX_STREAMS_PER_CONNECTION: u32 = 4;
 /// How often pending handoffs past their deadline are expired.
 const SWEEP: Duration = Duration::from_secs(60);
-/// Why queued claims that never reached the transport are unknown.
-const NOT_HANDED_OFF: &str = "the stream ended before the frame reached the transport";
 
 /// Open streams by integration ID; setting one's flag supersedes it.
 type Sessions = Arc<Mutex<HashMap<String, Arc<watch::Sender<bool>>>>>;
@@ -56,7 +55,21 @@ struct Item {
     claim: Option<i64>,
 }
 
-type Queue = Arc<Mutex<mpsc::Receiver<Item>>>;
+/// The frames waiting for the transport. Every move of a claim across the
+/// boundary happens under this lock: queuing one (only while open), taking
+/// one for the transport (only while open), and closing (which drains what
+/// is left). So a claim is either taken, and recorded sent, or drained, and
+/// returned to pending; never both, and nothing queued after the close.
+struct Outbound {
+    rx: mpsc::Receiver<Item>,
+    closed: bool,
+}
+
+type Queue = Arc<Mutex<Outbound>>;
+
+fn lock(queue: &Queue) -> std::sync::MutexGuard<'_, Outbound> {
+    queue.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[derive(Clone)]
 pub(super) struct Integration {
@@ -131,7 +144,8 @@ where
     })?
 }
 
-/// Record outbox rows in the background: the stream cannot wait for them.
+/// Record outbox rows in the background, as sent or back to pending: the
+/// stream cannot wait for them.
 fn record(state: &Arc<State>, claims: Vec<i64>, sent: bool) {
     if claims.is_empty() {
         return;
@@ -143,17 +157,17 @@ fn record(state: &Arc<State>, claims: Vec<i64>, sent: bool) {
     };
     let state = state.clone();
     runtime.spawn_blocking(move || {
-        let mut conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        let conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
         let result = if sent {
             claims
                 .iter()
                 .try_for_each(|&id| integration::handed_off(&conn, id))
         } else {
-            integration::mark_unknown(&mut conn, &claims, NOT_HANDED_OFF)
+            integration::requeue(&conn, &claims)
         };
         drop(conn);
         match result {
-            // An unknown handoff mails its sender a notice.
+            // Requeued work is pending again: wake the next stream.
             Ok(()) if !sent => state.changed(),
             Ok(()) => {}
             Err(err) => tracing::error!("recording handoffs: {err:#}"),
@@ -161,16 +175,46 @@ fn record(state: &Arc<State>, claims: Vec<i64>, sent: bool) {
     });
 }
 
-/// Close the queue and drop what it holds: none of it reaches the adapter,
-/// and its claims become unknown.
+/// Close the queue and drain it: none of what it holds reaches the
+/// transport, so its claims return to pending.
 fn abandon(queue: &Queue, state: &Arc<State>) {
-    let mut rx = queue.lock().unwrap_or_else(PoisonError::into_inner);
-    rx.close();
+    record(state, close(queue), false);
+}
+
+/// Close the queue, once; returns the claims it still held.
+fn close(queue: &Queue) -> Vec<i64> {
+    let mut out = lock(queue);
+    if out.closed {
+        return Vec::new();
+    }
+    out.closed = true;
+    out.rx.close();
     let mut claims = Vec::new();
-    while let Ok(item) = rx.try_recv() {
+    while let Ok(item) = out.rx.try_recv() {
         claims.extend(item.claim);
     }
-    record(state, claims, false);
+    claims
+}
+
+/// Queue `item` in the room `permit` reserved, unless the queue has closed,
+/// in which case it is handed back: it was never queued.
+fn enqueue(queue: &Queue, permit: mpsc::OwnedPermit<Item>, item: Item) -> Result<(), Item> {
+    let out = lock(queue);
+    if out.closed {
+        return Err(item);
+    }
+    permit.send(item);
+    Ok(())
+}
+
+/// Take the next frame for the transport; `Ready(None)` once the queue is
+/// closed or every sender has gone.
+fn take(queue: &Queue, cx: &mut std::task::Context<'_>) -> Poll<Option<Item>> {
+    let mut out = lock(queue);
+    if out.closed {
+        return Poll::Ready(None);
+    }
+    out.rx.poll_recv(cx)
 }
 
 fn frame(payload: Out) -> pb::BbsFrame {
@@ -213,15 +257,16 @@ impl Stream for FrameStream {
                 Poll::Pending => {}
             }
         }
-        let polled = this
-            .queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .poll_recv(cx);
-        match polled {
+        match take(&this.queue, cx) {
             Poll::Ready(Some(item)) => {
                 record(&this.state, item.claim.into_iter().collect(), true);
                 Poll::Ready(Some(Ok(item.frame)))
+            }
+            // Closed with a terminal status on its way: wait for it, so the
+            // stream never ends with OK in its place. The session sends it
+            // before closing, and the receiver above is registered.
+            Poll::Ready(None) if this.terminal.is_some() && lock(&this.queue).closed => {
+                Poll::Pending
             }
             Poll::Ready(None) => {
                 this.done = true;
@@ -349,7 +394,7 @@ impl IntegrationRpc for Integration {
             frame: frame(Out::Hello(bbs_hello)),
             claim: None,
         });
-        let queue: Queue = Arc::new(Mutex::new(rx));
+        let queue: Queue = Arc::new(Mutex::new(Outbound { rx, closed: false }));
         let (terminal, terminal_rx) = oneshot::channel();
         let this = self.clone();
         let session_queue = queue.clone();
@@ -359,6 +404,7 @@ impl IntegrationRpc for Integration {
                 state: state.clone(),
                 id: id.clone(),
                 tx,
+                queue: session_queue.clone(),
             };
             // Every way the stream ends is here, so each can cut short the
             // others, including a handoff waiting for room on the stream.
@@ -380,9 +426,10 @@ impl IntegrationRpc for Integration {
                         "integration stream ended: {}",
                         status.message()
                     );
-                    // Whatever is still queued never reaches the adapter.
-                    abandon(&session_queue, &state);
+                    // The status first, so the stream ends with it, then
+                    // whatever is still queued goes back to pending.
                     let _ = terminal.send(status);
+                    abandon(&session_queue, &state);
                 }
             }
             this.release(&id, &superseded);
@@ -423,6 +470,7 @@ struct Session {
     state: Arc<State>,
     id: String,
     tx: mpsc::Sender<Item>,
+    queue: Queue,
 }
 
 impl Session {
@@ -554,25 +602,32 @@ impl Session {
                 return Ok(false);
             };
             let id = self.id.clone();
-            let claimed = call(&self.state, move |conn| {
-                let Some((outbox, offer)) = integration::claim(conn, &id)? else {
-                    return Ok(false);
+            let queue = self.queue.clone();
+            let (queued, open, failed) = call(&self.state, move |conn| {
+                let claim = integration::claim(conn, &id)?;
+                let Some((outbox, offer)) = claim.handoff else {
+                    return Ok((false, true, claim.failed));
                 };
                 let handoff = offer.handoff_id.clone();
-                let tx = permit.send(Item {
+                let item = Item {
                     frame: frame(Out::Outgoing(offer)),
                     claim: Some(outbox),
-                });
-                if tx.is_closed() {
-                    // The queue closed: abandoned, or about to be.
-                    integration::mark_unknown(conn, &[outbox], NOT_HANDED_OFF)?;
+                };
+                if enqueue(&queue, permit, item).is_err() {
+                    // Closed since the room was reserved: never queued.
+                    integration::requeue(conn, &[outbox])?;
+                    return Ok((false, false, claim.failed));
                 }
                 tracing::info!(integration = id, handoff, "queued handoff");
-                Ok(true)
+                Ok((true, true, claim.failed))
             })
             .await?;
-            if !claimed {
-                return Ok(true);
+            // A rejection at the claim mailed its sender a notice.
+            if failed > 0 {
+                self.state.changed();
+            }
+            if !queued {
+                return Ok(open);
             }
         }
     }

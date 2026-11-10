@@ -603,14 +603,14 @@ pub fn outbox_state(
         .optional()?)
 }
 
-/// Pending handoffs whose message's deadline is at or before `now`.
-pub fn expired_pending(conn: &Connection, now: &str) -> Result<Vec<i64>> {
+/// Handoffs in `state` whose message's deadline is at or before `now`.
+pub fn expired(conn: &Connection, state: &str, now: &str) -> Result<Vec<i64>> {
     Ok(conn
         .prepare(
             "SELECT o.id FROM integration_outbox o JOIN messages m ON m.id = o.message_id
-             WHERE o.state = 'pending' AND m.expires_at <= ?1 ORDER BY o.id",
+             WHERE o.state = ?1 AND m.expires_at <= ?2 ORDER BY o.id",
         )?
-        .query_map([now], |r| r.get(0))?
+        .query_map([state, now], |r| r.get(0))?
         .collect::<Result<_, _>>()?)
 }
 

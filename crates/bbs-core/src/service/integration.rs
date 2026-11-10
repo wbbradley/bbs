@@ -91,15 +91,6 @@ pub fn authenticate(conn: &Connection, token: Option<&str>) -> Result<String> {
         .ok_or_else(|| AuthenticationError("invalid or revoked integration credential").into())
 }
 
-/// Check an open stream's credential again: it must still authenticate
-/// `integration`, which must still be enabled.
-pub fn recheck(conn: &Connection, integration: &str, token: &str) -> Result<()> {
-    if authenticate(conn, Some(token))? != integration {
-        return Err(AuthenticationError("invalid or revoked integration credential").into());
-    }
-    Ok(())
-}
-
 /// Check the adapter's first frame against its credential.
 pub fn check_hello(integration: &str, hello: &pb::AdapterHello) -> Result<()> {
     if hello.integration_id != integration {
@@ -245,14 +236,25 @@ pub fn catalog(conn: &mut Connection, integration: &str) -> Result<Catalog> {
 
 // ---- outbound handoff (D072) ---------------------------------------------------
 
+/// What [`claim`] did.
+#[derive(Debug, Default)]
+pub struct Claim {
+    /// The claimed outbox row and its offer, if any.
+    pub handoff: Option<(i64, pb::MessageOffer)>,
+    /// Rows rejected instead (expired, or without an encoding).
+    pub failed: usize,
+}
+
 /// Claim `integration`'s oldest pending handoff: mark it attempted, and
 /// commit, before the caller sends it. Work whose deadline passed is
 /// rejected as expired instead; work held while publication is off stays
-/// pending. Returns the outbox row and the offer to send.
-pub fn claim(conn: &mut Connection, integration: &str) -> Result<Option<(i64, pb::MessageOffer)>> {
+/// pending. Returns the outbox row and the offer to send, and how many rows
+/// it rejected on the way (each mailed its sender a notice).
+pub fn claim(conn: &mut Connection, integration: &str) -> Result<Claim> {
     with_ctx(conn, &NO_CALLER, |ctx| {
+        let mut claim = Claim::default();
         if store::publishes(ctx.conn, integration)? != Some(true) {
-            return Ok(None);
+            return Ok(claim);
         }
         while let Some(work) = store::next_pending(ctx.conn, integration)? {
             let expired = work
@@ -270,13 +272,15 @@ pub fn claim(conn: &mut Connection, integration: &str) -> Result<Option<(i64, pb
                 } else {
                     ("invalid_message", "the message has no frozen encoding")
                 };
-                fail(ctx, work.id, &["pending"], reason, detail)?;
+                if fail(ctx, work.id, &["pending"], reason, detail)? {
+                    claim.failed += 1;
+                }
                 continue;
             };
             if !store::set_outbox_state(ctx.conn, work.id, &["pending"], "attempted", None)? {
                 continue;
             }
-            return Ok(Some((
+            claim.handoff = Some((
                 work.id,
                 pb::MessageOffer {
                     handoff_id: work.handoff_id,
@@ -285,9 +289,10 @@ pub fn claim(conn: &mut Connection, integration: &str) -> Result<Option<(i64, pb
                         message_bytes: bytes,
                     }),
                 },
-            )));
+            ));
+            return Ok(claim);
         }
-        Ok(None)
+        Ok(claim)
     })
 }
 
@@ -298,25 +303,35 @@ pub fn handed_off(conn: &Connection, outbox: i64) -> Result<()> {
     Ok(())
 }
 
-/// Claimed handoffs that never reached the transport, because their stream
-/// ended first, become unknown, and their senders are told the delivery is
-/// uncertain. They are never offered again.
-pub fn mark_unknown(conn: &mut Connection, outbox: &[i64], detail: &str) -> Result<()> {
-    with_ctx(conn, &NO_CALLER, |ctx| {
-        for &id in outbox {
-            uncertain(ctx, id, detail)?;
-        }
-        Ok(())
-    })
+/// Claimed handoffs whose frames provably never left BBS (still queued in
+/// memory when their stream closed) return to pending, to be offered again
+/// with the same handoff ID; no notice.
+pub fn requeue(conn: &Connection, outbox: &[i64]) -> Result<()> {
+    for &id in outbox {
+        store::set_outbox_state(conn, id, &["attempted"], "pending", None)?;
+    }
+    Ok(())
 }
 
-/// Reject pending handoffs whose deadline has passed by `now`, telling their
-/// senders. The server runs this at startup and periodically. Returns how
-/// many expired.
+/// Settle handoffs whose deadline has passed by `now`, telling their
+/// senders: pending ones are rejected as expired, and sent ones the adapter
+/// never answered become unknown. The server runs this at startup and
+/// periodically. Returns how many it settled.
 pub fn expire(conn: &mut Connection, now: DateTime<Utc>) -> Result<usize> {
     with_ctx(conn, &NO_CALLER, |ctx| {
         let mut n = 0;
-        for id in store::expired_pending(ctx.conn, &fmt_time(now))? {
+        let now = fmt_time(now);
+        for id in store::expired(ctx.conn, "sent", &now)? {
+            if uncertain(
+                ctx,
+                id,
+                &["sent"],
+                "no result from the adapter by the deadline",
+            )? {
+                n += 1;
+            }
+        }
+        for id in store::expired(ctx.conn, "pending", &now)? {
             if fail(
                 ctx,
                 id,
@@ -374,11 +389,12 @@ fn fail(ctx: &Ctx, id: i64, from: &[&str], reason: &str, detail: &str) -> Result
     Ok(true)
 }
 
-/// Move attempted outbox row `id` to `unknown` with `detail`, and tell the
-/// sender the delivery is uncertain: it may or may not have reached the
-/// adapter, and BBS never sends it again. Returns whether the row moved.
-fn uncertain(ctx: &Ctx, id: i64, detail: &str) -> Result<bool> {
-    if !store::set_outbox_state(ctx.conn, id, &["attempted"], "unknown", Some(detail))? {
+/// Move outbox row `id` from one of `from` to `unknown` with `detail`, and
+/// tell the sender the delivery is uncertain: it may or may not have reached
+/// the recipient, and BBS never sends it again. Returns whether the row
+/// moved.
+fn uncertain(ctx: &Ctx, id: i64, from: &[&str], detail: &str) -> Result<bool> {
+    if !store::set_outbox_state(ctx.conn, id, from, "unknown", Some(detail))? {
         return Ok(false);
     }
     let failed = store::failed(ctx.conn, id)?;
@@ -407,6 +423,7 @@ pub fn interrupt_attempted(conn: &mut Connection) -> Result<usize> {
             if uncertain(
                 ctx,
                 id,
+                &["attempted"],
                 "interrupted: the server stopped during the handoff",
             )? {
                 n += 1;
@@ -769,17 +786,21 @@ fn import_in(
         )));
     }
     // A namespace is reached through one integration (see `send_remote`), so
-    // the duplicate check below is that integration's.
-    if let Some(bound) = store::namespace_integration(ctx.conn, &id.namespace)?
-        && bound != integration
-    {
-        return Ok(Err(refuse(
-            "route_not_authorized",
-            format!(
-                "namespace {} is reached through another integration",
-                id.namespace
-            ),
-        )));
+    // the duplicate check below is that integration's. A group copy's
+    // original speaks for its namespace too.
+    let original = m
+        .group_copy
+        .as_ref()
+        .map(|c| &c.original.as_ref().unwrap().namespace);
+    for namespace in std::iter::once(&id.namespace).chain(original) {
+        if let Some(bound) = store::namespace_integration(ctx.conn, namespace)?
+            && bound != integration
+        {
+            return Ok(Err(refuse(
+                "route_not_authorized",
+                format!("namespace {namespace} is reached through another integration"),
+            )));
+        }
     }
     // Hub's order: a duplicate is answered before any lifecycle or deadline
     // check, so an identical retry reports the original acceptance.
@@ -957,9 +978,10 @@ fn check_descriptor(d: &mp::EntityDescriptor) -> Result<()> {
 }
 
 /// Record what the adapter observed about foreign entities: kind, display
-/// name and lifecycle. Descriptors in this installation's own namespace, or
-/// in one another integration reaches, are ignored: observations never change
-/// native identities.
+/// name and lifecycle. Only descriptors in a namespace bound to
+/// `integration` count; the rest, this installation's own included, are
+/// ignored, so observations never change native identities or another
+/// integration's.
 pub fn observe(
     conn: &mut Connection,
     integration: &str,
@@ -977,9 +999,10 @@ pub fn observe(
         let local = db::namespace(ctx.conn)?;
         for d in &observed.entities {
             let e = d.entity.as_ref().unwrap();
+            // Only the integration a namespace is bound to speaks for it.
             if e.namespace == local
-                || store::namespace_integration(ctx.conn, &e.namespace)?
-                    .is_some_and(|bound| bound != integration)
+                || store::namespace_integration(ctx.conn, &e.namespace)?.as_deref()
+                    != Some(integration)
             {
                 continue;
             }

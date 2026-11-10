@@ -760,7 +760,7 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                 (SELECT MAX(created_at) FROM (
                    SELECT created_at FROM (
                      SELECT created_at FROM messages
-                     WHERE sender_address_id = {}
+                     WHERE sender_address_id = {} AND kind = 'application'
                      ORDER BY id DESC LIMIT 1)
                    UNION ALL
                    SELECT created_at FROM (
@@ -1863,7 +1863,7 @@ static AGENT_SUMMARIES: LazyLock<String> = LazyLock::new(|| {
                    (SELECT MAX(created_at) FROM (
                        SELECT created_at FROM (
                          SELECT created_at FROM messages
-                         WHERE sender_address_id = {}
+                         WHERE sender_address_id = {} AND kind = 'application'
                          ORDER BY id DESC LIMIT 1)
                        UNION ALL
                        SELECT created_at FROM (
@@ -2273,8 +2273,9 @@ fn feed_predicates(filter: &FeedFilter, expanded: Expanded) -> (String, Args) {
                 ));
             }
         }
+        // A delivery notice is BBS's, not a send by its addressee.
         clauses.push(format!(
-            "m.sender_address_id IN ({})",
+            "m.sender_address_id IN ({}) AND m.kind = 'application'",
             addresses_sql(&any.join(" OR "))
         ));
     }
@@ -2283,7 +2284,7 @@ fn feed_predicates(filter: &FeedFilter, expanded: Expanded) -> (String, Args) {
         .filter(|_| expanded != Expanded::FromHuman)
     {
         clauses.push(format!(
-            "m.sender_address_id IN ({})",
+            "m.sender_address_id IN ({}) AND m.kind = 'application'",
             addresses_sql(&format!(
                 "nb.human_id = ? OR nb.agent_id IN ({OWNED_AGENTS})"
             ))
@@ -2376,7 +2377,8 @@ fn term_sql(term: Term, limit: u32, filter: &FeedFilter, expanded: Expanded) -> 
     let (sql, mut args) = match term {
         Term::Sent(kind, id) => (
             format!(
-                "SELECT m.id FROM messages m WHERE m.sender_address_id = {}{predicates}
+                "SELECT m.id FROM messages m
+                 WHERE m.sender_address_id = {} AND m.kind = 'application'{predicates}
                  ORDER BY m.id {dir} LIMIT ?",
                 address_sql(kind.into(), "?")
             ),

@@ -682,7 +682,10 @@ async fn a_claim_interrupted_before_its_send_is_never_replayed() {
     let lost = rig.send("id:ada@hub", "lost").unwrap().id.unwrap();
     // The server claims the handoff (committed as attempted), then stops
     // before putting it on the stream.
-    let (outbox, _) = integration::claim(&mut rig.conn(), "hub").unwrap().unwrap();
+    let (outbox, _) = integration::claim(&mut rig.conn(), "hub")
+        .unwrap()
+        .handoff
+        .unwrap();
     assert_eq!(rig.outbox(lost).0, "attempted");
     // Attempted work is not offered, even before the restart.
     let (mut adapter, _) = rig.connect().await;
@@ -1186,9 +1189,9 @@ fn entity_ids_of(result: &mp::DirectoryResult) -> Vec<String> {
 }
 
 /// Read the adapter's side of the stream until it ends, a frame every
-/// `pause`; returns the outgoing offers received and the ending status.
-async fn drain(adapter: &mut Adapter, pause: Duration) -> (i64, Status) {
-    let mut offers = 0;
+/// `pause`; returns the outgoing offers' bodies and the ending status.
+async fn drain(adapter: &mut Adapter, pause: Duration) -> (Vec<Vec<u8>>, Status) {
+    let mut bodies = Vec::new();
     loop {
         tokio::time::sleep(pause).await;
         match timeout(Duration::from_secs(10), adapter.rx.message())
@@ -1196,48 +1199,71 @@ async fn drain(adapter: &mut Adapter, pause: Duration) -> (i64, Status) {
             .expect("a frame within ten seconds")
         {
             Ok(Some(pb::BbsFrame {
-                payload: Some(Out::Outgoing(_)),
-            })) => offers += 1,
+                payload: Some(Out::Outgoing(offer)),
+            })) => bodies.push(body_of(&offer)),
             Ok(Some(frame)) => panic!("unexpected frame: {frame:?}"),
             Ok(None) => panic!("the stream ended without a status"),
-            Err(status) => return (offers, status),
+            Err(status) => return (bodies, status),
         }
     }
 }
 
+fn body_of(offer: &pb::MessageOffer) -> Vec<u8> {
+    let bytes = &offer.message.as_ref().unwrap().message_bytes;
+    mp::Message::decode(bytes.as_slice()).unwrap().body
+}
+
+/// After a revoke cut a backlog short: the adapter got exactly what was
+/// counted sent, the rest is pending with no notice, and a new credential's
+/// stream offers the rest, so every message arrives exactly once.
+async fn finish_backlog(rig: &mut Rig, total: usize, mut got: Vec<Vec<u8>>) {
+    let states = rig.settled().await;
+    assert_eq!(
+        states.get("sent").copied().unwrap_or(0),
+        got.len() as i64,
+        "{states:?}"
+    );
+    assert_eq!(
+        states.get("pending").copied().unwrap_or(0),
+        (total - got.len()) as i64,
+        "{states:?}"
+    );
+    assert!(rig.read().is_empty());
+    let token = integration::admin_rotate(&mut rig.conn(), "hub").unwrap();
+    rig.token = token;
+    let (mut adapter, _) = rig.connect().await;
+    while got.len() < total {
+        let (offer, _) = adapter.outgoing().await;
+        got.push(body_of(&offer));
+    }
+    adapter.quiet().await;
+    let unique: HashSet<_> = got.iter().collect();
+    assert_eq!(unique.len(), total);
+}
+
 #[tokio::test]
 async fn a_revoke_mid_backlog_counts_as_sent_only_what_reached_the_adapter() {
-    let rig = Rig::new().await;
+    let mut rig = Rig::new().await;
     rig.publish(true);
     rig.backlog(400, 1024);
     let (mut adapter, _) = rig.connect().await;
+    let mut got = Vec::new();
     for _ in 0..50 {
-        adapter.outgoing().await;
+        got.push(body_of(&adapter.outgoing().await.0));
     }
     assert!(integration::admin_revoke(&mut rig.conn(), "hub").unwrap());
     // A slow reader: the stream ends at the recheck, well before the backlog
     // is through.
     let (rest, status) = drain(&mut adapter, Duration::from_millis(20)).await;
     assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
-    let received = 50 + rest;
-    assert!(received < 400, "{received}");
-    let states = rig.settled().await;
-    assert_eq!(states.get("sent").copied(), Some(received), "{states:?}");
-    assert_eq!(states.values().sum::<i64>(), 400, "{states:?}");
-    // Each unknown handoff, and only those, tells its sender delivery is
-    // uncertain; none is offered again.
-    let unknown = states.get("unknown").copied().unwrap_or(0);
-    let mail = rig.read();
-    assert_eq!(mail.len() as i64, unknown, "{states:?}");
-    assert!(mail.iter().all(|m| {
-        m.body
-            .starts_with("Delivery uncertain: your message to id:ada@hub")
-    }));
+    got.extend(rest);
+    assert!(got.len() < 400, "{}", got.len());
+    finish_backlog(&mut rig, 400, got).await;
 }
 
 #[tokio::test]
 async fn a_revoke_ends_a_stream_whose_adapter_stopped_reading() {
-    let rig = Rig::new().await;
+    let mut rig = Rig::new().await;
     rig.publish(true);
     rig.backlog(100, 4096);
     let endpoint = Channel::from_shared(format!("http://{}", rig.addr))
@@ -1250,39 +1276,99 @@ async fn a_revoke_ends_a_stream_whose_adapter_stopped_reading() {
         .unwrap();
     let (mut adapter, _) = Rig::greeted(adapter, "hub").await;
     // The adapter reads nothing more: the transport's windows and the
-    // stream's queue fill, and the session waits for room.
+    // stream's queue fill, and the session waits for room with claims
+    // queued.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(rig.states().get("pending").copied().unwrap_or(0) > 0);
+    assert!(rig.states().get("attempted").copied().unwrap_or(0) > 0);
     assert!(integration::admin_revoke(&mut rig.conn(), "hub").unwrap());
-    // The session ends anyway: what it had queued becomes unknown.
+    // The session ends anyway: what it had queued goes back to pending.
     let mut states = rig.states();
     for _ in 0..500 {
-        if states.contains_key("unknown") && !states.contains_key("attempted") {
+        if !states.contains_key("attempted") {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         states = rig.states();
     }
-    assert!(states.contains_key("unknown"), "{states:?}");
     assert!(!states.contains_key("attempted"), "{states:?}");
     // Once the adapter reads again, it gets exactly what was counted sent,
     // then the status.
-    let (received, status) = drain(&mut adapter, Duration::ZERO).await;
+    let (got, status) = drain(&mut adapter, Duration::ZERO).await;
     assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
-    let states = rig.settled().await;
-    assert_eq!(
-        states.get("sent").copied().unwrap_or(0),
-        received,
-        "{states:?}"
-    );
-    assert!(received < 100);
-    // The handoffs it had queued are uncertain, and their senders are told.
-    let mail = rig.read();
-    assert_eq!(mail.len() as i64, states["unknown"], "{states:?}");
-    assert!(
-        mail.iter()
-            .all(|m| m.body.starts_with("Delivery uncertain: "))
-    );
+    assert!(got.len() < 100);
+    finish_backlog(&mut rig, 100, got).await;
+}
+
+/// A claim queued as its queue closes is either taken for the transport or
+/// handed back by the close (to return to pending), never both and never
+/// lost, however the three race.
+#[test]
+fn a_claim_queued_as_the_stream_closes_is_sent_or_requeued_never_both() {
+    use std::task::{Context, Waker};
+    for round in 0..500 {
+        let (tx, rx) = mpsc::channel(4);
+        let queue: Queue = Arc::new(Mutex::new(Outbound { rx, closed: false }));
+        let total = 64;
+        let producer = {
+            let queue = queue.clone();
+            std::thread::spawn(move || {
+                let mut refused = Vec::new();
+                for claim in 0..total {
+                    let permit = loop {
+                        match tx.clone().try_reserve_owned() {
+                            Ok(permit) => break permit,
+                            Err(mpsc::error::TrySendError::Full(_)) => std::thread::yield_now(),
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                return refused_rest(refused, claim, total);
+                            }
+                        }
+                    };
+                    let item = Item {
+                        frame: frame(Out::Ping(pb::Ping { nonce: 0 })),
+                        claim: Some(claim),
+                    };
+                    if let Err(item) = enqueue(&queue, permit, item) {
+                        refused.extend(item.claim);
+                    }
+                }
+                refused
+            })
+        };
+        let consumer = {
+            let queue = queue.clone();
+            std::thread::spawn(move || {
+                let mut cx = Context::from_waker(Waker::noop());
+                let mut taken = Vec::new();
+                loop {
+                    match take(&queue, &mut cx) {
+                        Poll::Ready(Some(item)) => taken.extend(item.claim),
+                        Poll::Ready(None) => return taken,
+                        Poll::Pending => std::thread::yield_now(),
+                    }
+                }
+            })
+        };
+        for _ in 0..round % 50 {
+            std::thread::yield_now();
+        }
+        let drained = close(&queue);
+        let refused = producer.join().unwrap();
+        let taken = consumer.join().unwrap();
+        let mut all: Vec<i64> = taken
+            .iter()
+            .chain(&drained)
+            .chain(&refused)
+            .copied()
+            .collect();
+        all.sort();
+        assert_eq!(all, (0..total).collect::<Vec<_>>(), "round {round}");
+    }
+}
+
+/// Claims a producer never got room for are, like refused ones, not sent.
+fn refused_rest(mut refused: Vec<i64>, from: i64, total: i64) -> Vec<i64> {
+    refused.extend(from..total);
+    refused
 }
 
 #[tokio::test]
@@ -1317,34 +1403,68 @@ async fn revoking_disables_remote_sends_until_a_new_credential() {
 async fn sends_to_our_namespace_or_a_retired_entity_are_refused_before_any_write() {
     let rig = Rig::new().await;
     rig.publish(true);
+    let other = integration::admin_add(&mut rig.conn(), "other").unwrap();
     let (mut adapter, _) = rig.connect().await;
+    let (mut intruder, _) = rig.connect_as(&other, "other").await;
     let err = rig.send("id:will@bbs", "hi").unwrap_err();
     assert!(
         err.to_string().contains("this installation's namespace"),
         "{err:#}"
     );
+    // Before `hub` is bound to anyone, observations of it are ignored.
+    observe(&mut adapter, "ada", mp::Lifecycle::Retired).await;
+    assert_eq!(
+        rig.count("SELECT count(*) FROM entities WHERE entity_id = 'ada'"),
+        0
+    );
+    // An import binds it to integration `hub`; from then on only `hub`
+    // speaks for it.
+    received(
+        &adapter
+            .offer(
+                "h1",
+                message("m1", "bob", "will/scout", "hi").encode_to_vec(),
+            )
+            .await,
+    );
+    observe(&mut intruder, "bob", mp::Lifecycle::Retired).await;
+    assert_eq!(
+        rig.count("SELECT count(*) FROM entities WHERE entity_id = 'bob' AND lifecycle = 'active'"),
+        1
+    );
+    observe(&mut adapter, "ada", mp::Lifecycle::Retired).await;
+    let err = rig.send("id:ada@hub:slack", "hi").unwrap_err();
+    assert!(err.to_string().contains("is retired"), "{err:#}");
+    assert_eq!(rig.count("SELECT count(*) FROM integration_outbox"), 0);
+    assert_eq!(
+        rig.count(
+            "SELECT count(*) FROM entity_addresses a JOIN entities e ON e.id = a.entity_id
+             WHERE e.entity_id = 'ada'"
+        ),
+        0
+    );
+    adapter.quiet().await;
+}
+
+/// Send an observation of `hub`'s `entity` and wait until it is handled.
+async fn observe(adapter: &mut Adapter, entity: &str, lifecycle: mp::Lifecycle) {
     adapter
         .send(In::Observed(pb::ObservedEntities {
             entities: vec![mp::EntityDescriptor {
                 entity: Some(mp::EntityRef {
                     namespace: "hub".into(),
-                    entity_id: "ada".into(),
+                    entity_id: entity.into(),
                 }),
                 kind: "human".into(),
-                display_name: "Ada".into(),
-                lifecycle: mp::Lifecycle::Retired as i32,
+                display_name: entity.into(),
+                lifecycle: lifecycle as i32,
                 ..Default::default()
             }],
             observed_at_unix_micros: 1,
         }))
         .await;
     adapter.send(In::Ping(pb::Ping { nonce: 1 })).await;
-    adapter.next().await.unwrap();
-    let err = rig.send("id:ada@hub:slack", "hi").unwrap_err();
-    assert!(err.to_string().contains("is retired"), "{err:#}");
-    assert_eq!(rig.count("SELECT count(*) FROM messages"), 0);
-    assert_eq!(rig.count("SELECT count(*) FROM entity_addresses a JOIN entities e ON e.id = a.entity_id WHERE e.namespace = 'hub'"), 0);
-    adapter.quiet().await;
+    assert!(matches!(adapter.next().await.unwrap(), Out::Pong(_)));
 }
 
 #[tokio::test]
@@ -1402,8 +1522,13 @@ async fn work_queued_while_publication_is_off_waits_for_it() {
 async fn a_newer_stream_supersedes_an_older_one() {
     let rig = Rig::new().await;
     let (mut old, _) = rig.connect().await;
-    let (mut new, _) = rig.connect().await;
-    assert_eq!(old.next().await.unwrap_err().code(), tonic::Code::Aborted);
+    // Every time, the older stream ends with its status, never a bare OK.
+    for _ in 0..20 {
+        let (new, _) = rig.connect().await;
+        assert_eq!(old.next().await.unwrap_err().code(), tonic::Code::Aborted);
+        old = new;
+    }
+    let mut new = old;
     new.send(In::Ping(pb::Ping { nonce: 3 })).await;
     let Out::Pong(pong) = new.next().await.unwrap() else {
         panic!("expected pong");
@@ -1473,14 +1598,67 @@ async fn pending_work_expires_after_seven_days_and_tells_its_sender() {
     let claimed = rig.send("id:ada@hub", "claimed").unwrap().id.unwrap();
     expire_now(&rig, claimed);
     let fresh = rig.send("id:ada@hub", "fresh").unwrap().id.unwrap();
+    let woken = *rig.state.notify.borrow();
     let (mut adapter, _) = rig.connect().await;
     let (_, m) = adapter.outgoing().await;
     assert_eq!(m.body, b"fresh");
     adapter.quiet().await;
     assert_eq!(rig.outbox(claimed).0, "rejected");
     assert!(notice_body(&rig, claimed).is_some());
+    // That notice woke the sender's waiting reads.
+    assert!(*rig.state.notify.borrow() > woken);
     rig.settle(fresh, "sent").await;
     assert!(notice_body(&rig, fresh).is_none());
+
+    // Sent work the adapter never answers by its deadline is uncertain.
+    assert_eq!(
+        integration::expire(&mut rig.conn(), now + chrono::Duration::days(8)).unwrap(),
+        1
+    );
+    let (state, detail) = rig.outbox(fresh);
+    assert_eq!(state, "unknown");
+    assert_eq!(
+        detail.as_deref(),
+        Some("no result from the adapter by the deadline")
+    );
+    assert!(
+        notice_body(&rig, fresh)
+            .unwrap()
+            .starts_with("Delivery uncertain: ")
+    );
+
+    // Notices are BBS's, not the agent's own sends: they move neither its
+    // last send nor a search by sender.
+    let fresh_at: String = rig
+        .conn()
+        .query_row(
+            "SELECT created_at FROM messages WHERE id = ?1",
+            [fresh],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let scout = db::list_agents(&rig.conn(), false)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.name == "scout")
+        .unwrap();
+    assert_eq!(scout.last_sent_at.as_deref(), Some(fresh_at.as_str()));
+    let search = |from: Option<&str>| {
+        service::search(
+            &mut rig.conn(),
+            &human(),
+            proto::SearchRequest {
+                query: "delivered".into(),
+                from: from.map(Into::into),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .hits
+        .len()
+    };
+    assert!(search(None) > 0);
+    assert_eq!(search(Some("scout")), 0);
 }
 
 #[tokio::test]
@@ -1509,6 +1687,20 @@ async fn each_namespace_belongs_to_the_first_integration_to_use_it() {
     received(&acme.offer("a2", from_acme.encode_to_vec()).await);
     rejected(
         &hub.offer("h2", from_acme.encode_to_vec()).await,
+        "route_not_authorized",
+    );
+    // So may a group copy whose original is in a namespace `hub` does not
+    // own, even when the copy comes from `hub`'s own namespace.
+    let mut copy = message("c1", "team", "will/scout", "copied");
+    copy.group_copy = Some(mp::GroupCopy {
+        original: Some(mp::MessageRef {
+            namespace: "acme".into(),
+            message_id: "orig".into(),
+        }),
+        original_sender: address("acme", "eve"),
+    });
+    rejected(
+        &hub.offer("h3", copy.encode_to_vec()).await,
         "route_not_authorized",
     );
 
