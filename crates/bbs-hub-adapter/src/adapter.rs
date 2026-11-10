@@ -506,7 +506,11 @@ impl Adapter {
     /// Open the adapter a configuration file describes.
     pub fn from_config(cfg: &Config) -> Result<Adapter> {
         let settings = Settings::load(cfg).context("loading the adapter's keys and credentials")?;
-        Adapter::open(settings, &cfg.store, Options::default())
+        let opts = Options {
+            retention: cfg.retention(),
+            ..Options::default()
+        };
+        Adapter::open(settings, &cfg.store, opts)
     }
 
     /// Run until `shutdown` completes, or BBS turns out to be a peer this

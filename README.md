@@ -624,7 +624,7 @@ bbs admin integration unbind hub --state-dir /var/lib/bbs
 to BBS's integration listener with the integration credential, and to one Hub
 relay over Hub's federation stream, as the home of BBS's namespace. It keeps
 its own SQLite store, apart from BBS's database: Hub trust (namespace
-bindings, credentials and revocations, from the relay), the last catalog BBS
+bindings and revocations, from the relay), the last catalog BBS
 published, the relay session, the exact signed envelopes it sent and received,
 and the work it has not handed on yet. It is built with the workspace
 (`cargo build --release -p bbs-hub-adapter`); it is not in the release
@@ -683,19 +683,39 @@ key_file = "installation.key"
 credential_file = "installation.cred"
 ```
 
+The relay here is on a tailnet, so this configuration also needs
+`allow_plaintext_network = true` at the top level (see below). Optionally,
+`retention_days` (default 30; 0 keeps everything) sets how long a settled
+handoff stays in the adapter's store; BBS keeps the messages themselves.
+
 ```sh
 bbs-hub-adapter run --config /etc/bbs-hub-adapter/adapter.toml
 bbs-hub-adapter status --config /etc/bbs-hub-adapter/adapter.toml
 ```
 
-The adapter refuses to start when the key or the integration credential file
-can be read by anyone but its owner, when the credential is for another
-namespace, installation or key, or lacks either permission, and when the store
-was made for another installation; it stops if BBS turns out to be another
-namespace. The store is created owner-only and used by one adapter at a time.
-Keys and credentials are never logged. The streams are plain HTTP/2, like
-BBS's: keep both on loopback or the same encrypted private network (Hub
-assumes a tailnet). `RUST_LOG` sets the log level (default `info`).
+The adapter refuses to start when the key, the integration credential or the
+store (with its lock and WAL files) is not a regular file owned by the
+adapter's user and private to it (each is opened, never followed through a
+symlink, and checked through the open file), when the credential is for
+another namespace, installation or key, or lacks either permission, and when
+the store was made for another installation; it stops if BBS turns out to be
+another namespace. Directories it creates for the store or a new key are
+owner-only. The store is used by one adapter at a time. Keys and credentials
+are never logged.
+
+The streams are plain HTTP/2, like BBS's; the adapter has no TLS yet and
+refuses an `https://` endpoint. A plaintext endpoint must be on loopback
+unless the configuration sets `allow_plaintext_network = true`, which is only
+for a network that protects transport itself, such as a tailnet (Hub assumes
+one): otherwise the integration credential and federation traffic cross the
+network in the clear. The relay is also the adapter's trust source, by Hub's
+design (it pages the namespace bindings the adapter trusts), so the path to it
+must be one you trust. If BBS refuses the integration credential, the adapter
+reads its file again before retrying, so a rotated credential is picked up;
+if BBS ends the stream for a newer one with the same integration, another
+adapter is probably running for it, and this one waits the longest backoff
+(30 seconds) before trying again. `RUST_LOG` sets the log level (default
+`info`).
 
 Both sides reconnect on their own. Work for a side that is down waits in the
 store, and expires at its deadline. Every handoff is at most once (Hub's

@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod bbs;
 pub mod config;
+pub mod files;
 pub mod keys;
 pub mod link;
 pub mod relay;

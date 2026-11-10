@@ -4,6 +4,8 @@
 //! ```toml
 //! namespace = "bbs"            # this installation's Hub namespace
 //! store = "adapter.db"         # the adapter's own SQLite store
+//! # retention_days = 30        # how long settled handoffs are kept; 0 keeps them
+//! # allow_plaintext_network = false
 //!
 //! [bbs]
 //! endpoint = "http://127.0.0.1:7801"   # bbs serve --integration-listen
@@ -16,6 +18,14 @@
 //! key_file = "installation.key"        # bbs-hub-adapter keygen --out ...
 //! credential_file = "installation.cred"
 //! ```
+//!
+//! Transport: the adapter speaks plaintext HTTP/2 only (no TLS yet), so an
+//! `https://` endpoint is refused. A plaintext endpoint must be on loopback
+//! unless `allow_plaintext_network = true`, which is for a network that
+//! protects transport itself, such as a tailnet: otherwise the integration
+//! credential and federation traffic cross the network in the clear. The
+//! relay is also the trust source, by Hub's design: it pages the namespace
+//! bindings this adapter trusts, so the path to it must be protected.
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +39,12 @@ use crate::verify::{valid_id, valid_namespace};
 pub struct Config {
     pub namespace: String,
     pub store: PathBuf,
+    /// How long settled handoffs are kept, in days; 0 keeps them.
+    #[serde(default = "default_retention")]
+    pub retention_days: u64,
+    /// Allow plaintext endpoints on hosts other than loopback.
+    #[serde(default)]
+    pub allow_plaintext_network: bool,
     pub bbs: Bbs,
     pub hub: Hub,
 }
@@ -48,6 +64,19 @@ pub struct Hub {
     pub installation_id: String,
     pub key_file: PathBuf,
     pub credential_file: PathBuf,
+}
+
+fn default_retention() -> u64 {
+    30
+}
+
+/// Whether `host` (from a URL) is a loopback address or `localhost`.
+fn loopback(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 impl Config {
@@ -95,11 +124,35 @@ impl Config {
             ("bbs.endpoint", &self.bbs.endpoint),
             ("hub.relay", &self.hub.relay),
         ] {
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                bail!("{what} {url:?} must be an http:// or https:// URL");
+            let uri: tonic::codegen::http::Uri = url
+                .parse()
+                .with_context(|| format!("{what} {url:?} is not a URL"))?;
+            match uri.scheme_str() {
+                Some("http") => {}
+                Some("https") => bail!(
+                    "{what} {url:?}: TLS is not supported yet. Use an http:// endpoint on \
+                     loopback, or on a network that protects transport itself (such as a \
+                     tailnet) with allow_plaintext_network = true"
+                ),
+                _ => bail!("{what} {url:?} must be an http:// URL"),
+            }
+            let host = uri.host().unwrap_or_default();
+            if !loopback(host) && !self.allow_plaintext_network {
+                bail!(
+                    "{what} {url:?} is plaintext to {host}, not loopback: the integration \
+                     credential and federation traffic would cross the network unencrypted. \
+                     Keep it on loopback, or, on a network that protects transport itself \
+                     (such as a tailnet), set allow_plaintext_network = true"
+                );
             }
         }
         Ok(())
+    }
+
+    /// Settled handoffs' retention, as the adapter's options take it.
+    pub fn retention(&self) -> Option<std::time::Duration> {
+        (self.retention_days > 0)
+            .then(|| std::time::Duration::from_secs(self.retention_days * 24 * 3600))
     }
 }
 
@@ -136,7 +189,57 @@ credential_file = "installation.cred"
         );
         assert_eq!(cfg.hub.key_file, dir.path().join("installation.key"));
 
+        assert_eq!(
+            cfg.retention(),
+            Some(std::time::Duration::from_secs(30 * 24 * 3600))
+        );
+
         std::fs::write(&path, "namespace = \"bbs\"\nextra = 1\n").unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    fn with(bbs: &str, relay: &str, plaintext: bool) -> Config {
+        Config {
+            namespace: "bbs".into(),
+            store: "adapter.db".into(),
+            retention_days: 0,
+            allow_plaintext_network: plaintext,
+            bbs: Bbs {
+                endpoint: bbs.into(),
+                integration_id: "hub".into(),
+                credential_file: "t".into(),
+            },
+            hub: Hub {
+                relay: relay.into(),
+                installation_id: "bbs-1".into(),
+                key_file: "k".into(),
+                credential_file: "c".into(),
+            },
+        }
+    }
+
+    /// TLS is refused until it is supported; plaintext stays on loopback
+    /// unless the network is declared to protect it.
+    #[test]
+    fn endpoints_stay_plaintext_on_loopback_unless_allowed() {
+        let local = "http://127.0.0.1:7801";
+        for ok in ["http://127.0.0.1:1", "http://localhost:1", "http://[::1]:1"] {
+            with(ok, local, false).check().unwrap();
+            with(local, ok, false).check().unwrap();
+        }
+        let err = with(local, "https://relay.example:443", true)
+            .check()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TLS is not supported"), "{err}");
+        for remote in ["http://relay.example:7443", "http://100.64.0.1:7443"] {
+            let err = with(local, remote, false).check().unwrap_err().to_string();
+            assert!(err.contains("allow_plaintext_network"), "{err}");
+            let err = with(remote, local, false).check().unwrap_err().to_string();
+            assert!(err.contains("integration"), "{err}");
+            with(remote, remote, true).check().unwrap();
+        }
+        assert!(with("ftp://x", local, true).check().is_err());
+        assert_eq!(with(local, local, false).retention(), None);
     }
 }

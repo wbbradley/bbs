@@ -12,31 +12,40 @@ use anyhow::{Context as _, Result, bail};
 use bbs_core::hub_proto::msgproto_v1 as mp;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use crate::store::check_private;
+use crate::files;
 use crate::verify::{self, Credential};
 use crate::wire;
 
 /// Generate an installation key, write its hex seed to `out` (owner-only,
-/// never overwriting) and return its public key.
+/// never overwriting, in an owner-only directory if it creates one) and
+/// return its public key. A file it cannot finish writing is removed.
 pub fn generate(out: &Path) -> Result<VerifyingKey> {
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        files::create_private_dir(dir)?;
+    }
     let seed: [u8; 32] = rand::random();
     let key = SigningKey::from_bytes(&seed);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(out)
         .with_context(|| format!("creating {} (it must not exist)", out.display()))?;
-    f.write_all(format!("{}\n", data_encoding::HEXLOWER.encode(&seed)).as_bytes())?;
-    f.sync_all()?;
+    let written = f
+        .write_all(format!("{}\n", data_encoding::HEXLOWER.encode(&seed)).as_bytes())
+        .and_then(|()| f.sync_all());
+    if let Err(err) = written {
+        drop(f);
+        let _ = std::fs::remove_file(out);
+        return Err(err).with_context(|| format!("writing {}", out.display()));
+    }
     Ok(key.verifying_key())
 }
 
 /// Read an installation key's hex seed file, which must be owner-only.
 pub fn read_key(path: &Path) -> Result<SigningKey> {
-    check_private(path)?;
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = files::read_private(path)?;
     let seed = data_encoding::HEXLOWER_PERMISSIVE
         .decode(text.trim().as_bytes())
         .ok()
@@ -47,9 +56,7 @@ pub fn read_key(path: &Path) -> Result<SigningKey> {
 
 /// Read BBS's integration credential, which must be owner-only.
 pub fn read_token(path: &Path) -> Result<String> {
-    check_private(path)?;
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = files::read_private(path)?;
     let token = text.trim();
     if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
         bail!("{} does not hold an integration credential", path.display());

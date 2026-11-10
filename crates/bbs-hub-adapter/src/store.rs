@@ -18,8 +18,7 @@
 //! themselves. Results owed to BBS are kept until a transport takes them,
 //! then for a short while to be sent again on a new stream.
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -27,6 +26,8 @@ use anyhow::{Context as _, Result, bail};
 use bbs_core::hub_proto::msgproto_v1 as mp;
 use prost::Message as _;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
+
+use crate::files;
 
 const SCHEMA: &str = r#"
 CREATE TABLE identity (
@@ -144,6 +145,29 @@ BEGIN SELECT RAISE(ABORT, 'an import never changes once settled, and is re-offer
 
 const VERSION: i64 = 1;
 
+/// `path` with `.suffix` appended, as SQLite names its WAL files.
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".");
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// The store's WAL files, where they exist, must be as private as it is.
+fn check_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["wal", "shm"] {
+        let p = sidecar(path, suffix);
+        match std::fs::symlink_metadata(&p) {
+            Ok(_) => {
+                files::open_private(&p)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {}", p.display())),
+        }
+    }
+    Ok(())
+}
+
 /// Owe BBS an outbound row's result (`?2` is now); the caller adds the row
 /// filter.
 const OWE_REPORT: &str = "INSERT INTO reports (bbs_handoff_id, state, reason, detail, expires_at,
@@ -156,22 +180,6 @@ const OWE_REPORT: &str = "INSERT INTO reports (bbs_handoff_id, state, reason, de
 /// handoff's first result and ignores repeats). Never past the handoff's
 /// deadline.
 pub const REPORT_KEEP_MICROS: i64 = 3_600_000_000;
-
-/// Refuse a secret or private file that others may read or write.
-pub fn check_private(path: &Path) -> Result<()> {
-    let mode = std::fs::metadata(path)
-        .with_context(|| format!("reading {}", path.display()))?
-        .permissions()
-        .mode();
-    if mode & 0o077 != 0 {
-        bail!(
-            "{} is accessible to other users (mode {:o}); restrict it with chmod 600",
-            path.display(),
-            mode & 0o777
-        );
-    }
-    Ok(())
-}
 
 /// A namespace's trusted binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,30 +270,16 @@ pub struct Store {
 impl Store {
     /// Open (creating, owner-only) the store at `path` for the one adapter
     /// that may use it, and turn handoffs a previous run left attempted
-    /// into unknown.
+    /// into unknown. The database, its lock and its WAL files must be this
+    /// user's own and private (see [`crate::files`]); a parent directory it
+    /// creates is owner-only.
     pub fn open(path: &Path, now: i64) -> Result<Store> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            files::create_private_dir(dir)?;
         }
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-        {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
-        }
-        check_private(path)?;
-        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-        let lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&lock_path)
-            .with_context(|| format!("opening {}", lock_path.display()))?;
+        let main = files::open_or_create_private(path)?;
+        let lock_path = sidecar(path, "lock");
+        let lock = files::open_or_create_private(&lock_path)?;
         if lock.try_lock().is_err() {
             bail!(
                 "another adapter is using the store {} (locked by {})",
@@ -294,9 +288,13 @@ impl Store {
             );
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        if !files::same_file(&main, path)? {
+            bail!("{} changed while it was being opened", path.display());
+        }
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        check_sidecars(path)?;
         let mut store = Store {
             conn,
             _lock: Some(lock),
@@ -316,9 +314,13 @@ impl Store {
     /// Open an existing store read-only, for inspection beside a running
     /// adapter.
     pub fn open_read_only(path: &Path) -> Result<Store> {
-        check_private(path)?;
+        let main = files::open_private(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening {}", path.display()))?;
+        if !files::same_file(&main, path)? {
+            bail!("{} changed while it was being opened", path.display());
+        }
+        check_sidecars(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(Store { conn, _lock: None })
     }
