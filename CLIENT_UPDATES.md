@@ -47,6 +47,10 @@ only the server's error text.
 
 `ServerInfo` returns `require_human_token`, release version and revision, protocol
 epoch, capabilities, and the optional minimum and recommended client versions.
+A client refuses a `ServerInfo` listing more capabilities than it allows:
+clients before `remote-directory.v1` allow 32, which servers with it list, and
+later clients allow 64, so a server must not list a 33rd while those older
+clients are in use.
 Responses, errors, and opened streams carry compact server version, epoch, and
 policy hints. The client validates `ServerInfo` during `bbs init`, keeps typed gRPC
 status on errors, and reports `UNIMPLEMENTED` as a coordinated upgrade; successful

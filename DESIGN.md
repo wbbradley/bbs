@@ -505,9 +505,31 @@ most 100 keyed by entity ID. A top-level entity answers to its own ID as an
 alias, lowercased as Hub normalizes aliases (Hub's default, so `hub send
 will@bbs` resolves), and its descriptor lists that alias; a second-level ID
 (`will/scout`) is never an alias. BBS has no other aliases and no runs, so a
-runs query returns nothing. Another namespace is `namespace_unknown`. BBS sends no remote
-directory queries yet, so it ignores directory results. It answers each ping
-with a pong; HTTP/2 keepalive covers its own liveness.
+runs query returns nothing. Another namespace is `namespace_unknown`. It
+answers each ping with a pong; HTTP/2 keepalive covers its own liveness.
+
+**Remote directories.** `RemoteDirectory` (`remote-directory.v1`; `bbs
+directory`, the `bbs_directory` tool) lists or looks up another namespace's
+entities. The server checks the request (a valid namespace other than its own,
+which is `INVALID_ARGUMENT` with a pointer to `bbs agents`; at most one of an
+alias, normalized as Hub does, and an entity ID; pages of at most 100), routes
+it as remote sends are routed (the integration bound to the namespace, else
+the only usable one; publication on), and sends the adapter a
+`remote_directory_query` with a fresh query ID, the caller's own native entity
+as the requester (`will`, or `will/scout` for an agent), and a deadline five
+seconds out. It writes nothing to route it: a namespace is bound only by a
+send or an import. Each open stream is registered on the server state with its
+frame sender and the queries waiting on it, at most 128; the RPC waits up to six
+seconds for the matching `remote_directory_result`, without holding the
+database. A result with an error code is an error, never an empty directory:
+`namespace_unknown` and `entity_unknown` are `NOT_FOUND`, `invalid_argument`,
+`invalid_cursor` and `invalid_address` are `INVALID_ARGUMENT`, and anything
+else is `UNAVAILABLE`, the message led by the reason code. An adapter that is
+not connected (`relay_unavailable`), one whose stream ends while a query
+waits, and one that does not answer in time (`directory_timeout`) are
+`UNAVAILABLE` too; a late result is dropped. Descriptors outside the asked
+namespace, or malformed, are left out, and the rest are cached as
+observations (which count only for a namespace bound to that integration).
 
 ## Hub adapter
 
@@ -655,8 +677,24 @@ ID; BBS's answer is signed as a `DirectoryAnswer` bound to the query's record
 hash. With BBS away the signed answer carries `home_offline`, and with BBS's
 stream full `queue_full`; an answer BBS does not give before the query's
 deadline is not sent. A query is checked before any work starts for it; a
-store failure while checking answers `invalid_signature`, Hub's fallback. BBS asks no remote
-queries yet; one gets an `unimplemented` result.
+store failure while checking answers `invalid_signature`, Hub's fallback.
+
+BBS's remote directory queries go the other way, as Hub's `Directory` does:
+each runs beside BBS's reader, is signed as a `DirectoryQuery` by the
+installation key with a fresh query ID and BBS's deadline (five seconds when
+BBS sets none, at most 30), and goes to the relay with this installation's
+credential. The answer is matched by the query record hash it binds, and the
+relay's `DirectoryUnavailable` by query ID, each only on the stream the query
+went out on; at most 128 wait at once (`queue_full`). An answer is accepted only
+when Hub's `verifyAnswer` would accept it: a trusted HOST_NAMESPACE credential
+of the asked namespace, the record signed by its subject, and a payload binding
+the query's hash and namespace; otherwise the result is the verification
+reason (`invalid_signature` for an unbound answer or a store failure). The
+relay's refusal passes its code on (`home_offline` when it has none), a
+closed relay stream is `relay_unavailable`, as is having none, and the
+deadline passing is `directory_timeout`. The destination's own signed
+`error_code` passes through, and BBS gets every result under its own query
+ID.
 
 **Streams.** The relay stream sends its hello, pages trust from the relay
 (the configured trust source, by Hub's design), claims the route with a
