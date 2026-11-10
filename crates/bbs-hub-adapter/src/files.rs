@@ -5,6 +5,7 @@
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::Read as _;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
@@ -43,15 +44,28 @@ pub fn check_open(f: &File, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A checked file, opened without blocking (so a FIFO is refused rather
+/// than waited on), made blocking again for ordinary use.
+fn checked(f: File, path: &Path) -> Result<File> {
+    check_open(&f, path)?;
+    let fd = f.as_raw_fd();
+    // SAFETY: fcntl on a descriptor this File owns, with integer flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening {}", path.display()));
+    }
+    Ok(f)
+}
+
 /// Open an existing private file read-only, refusing a symlink, and check it.
 pub fn open_private(path: &Path) -> Result<File> {
     let f = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    check_open(&f, path)?;
-    Ok(f)
+    checked(f, path)
 }
 
 /// Open (creating it owner-only if missing) a private file for writing,
@@ -63,11 +77,10 @@ pub fn open_or_create_private(path: &Path) -> Result<File> {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    check_open(&f, path)?;
-    Ok(f)
+    checked(f, path)
 }
 
 /// Read a private file's contents as text.
@@ -132,6 +145,30 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         assert!(same_file(&f, &made).unwrap());
         assert!(!same_file(&f, &path).unwrap());
+    }
+
+    /// A FIFO is refused at once, not waited on for a writer.
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo");
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = open_private(&path).map(|_| ()).map_err(|e| e.to_string());
+            let created = open_or_create_private(&path)
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            let _ = tx.send((read, created));
+        });
+        let (read, created) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening a FIFO does not block");
+        for err in [read.unwrap_err(), created.unwrap_err()] {
+            assert!(err.contains("not a regular file"), "{err}");
+        }
     }
 
     #[test]

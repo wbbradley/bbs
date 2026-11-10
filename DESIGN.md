@@ -538,7 +538,8 @@ handoffs are kept, as Hub's contract keeps retained rows, unless
 the adapter no longer remembers. Routes are live state, as in Hub:
 re-registered on every connection. The database, its lock and WAL files, the
 key and BBS's integration credential are opened first (never through a
-symlink) and then checked through the open file: a regular file owned by the
+symlink, and without blocking, so a FIFO is refused rather than waited on)
+and then checked through the open file: a regular file owned by the
 adapter's user that no one else may read or write. Directories the adapter
 creates for them are owner-only.
 Keys are files, not rows: the installation key is a hex seed, as Hub's
