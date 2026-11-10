@@ -155,6 +155,37 @@ service Bbs {
   // other senders are refused, broadcasts and others' timers are not
   // delivered to it, and the agent can message only its owner.
   rpc SetFocus(SetFocusRequest) returns (SetFocusResponse);
+
+  // Hub federation (remote-directory.v1): list or look up the entities
+  // another namespace's home publishes, asked through the integration that
+  // reaches it (bound to the namespace, else the only usable one) as the
+  // caller's own entity. Needs that integration connected and publishing.
+  // A remote failure is an error, never an empty directory: NOT_FOUND for an
+  // unknown namespace or entity, INVALID_ARGUMENT for a bad selector or page
+  // token, UNAVAILABLE otherwise; the message starts with Hub's reason code.
+  rpc RemoteDirectory(RemoteDirectoryRequest) returns (RemoteDirectoryResponse);
+}
+
+message RemoteDirectoryRequest {
+  string namespace = 1;     // another installation's namespace, e.g. "hub"
+  // At most one selector; neither lists the published entities in pages.
+  string alias = 2;         // resolve this alias
+  string entity_id = 3;     // exact entity ID
+  bytes page_token = 4;     // next_page_token of the previous page
+  uint32 page_size = 5;     // 0: the remote home's default
+}
+message RemoteEntity {
+  string namespace = 1;
+  string entity_id = 2;     // `bbs send --to id:ENTITY@NAMESPACE` reaches it
+  string kind = 3;          // descriptive: human, agent, service, ...
+  string display_name = 4;
+  repeated string aliases = 5;
+  string description = 6;
+  string lifecycle = 7;     // "active", "retired", or "" when unspecified
+}
+message RemoteDirectoryResponse {
+  repeated RemoteEntity entities = 1;
+  bytes next_page_token = 2;  // empty on the last page
 }
 
 message SetFocusRequest {

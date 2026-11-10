@@ -44,7 +44,10 @@ pub const CAPABILITIES: &[&str] = &[
     "agent-focus.v1",
     "agent-goal.v1",
     "timers-edit.v1",
+    "remote-directory.v1",
 ];
+/// The most capabilities a ServerInfo may list.
+const MAX_CAPABILITIES: usize = 64;
 const MAX_METADATA_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;
 const REQUEST_KEYS: &[&str] = &[
@@ -300,7 +303,11 @@ pub fn validate_info(info: &proto::ServerInfoResponse) -> Result<()> {
     if release.revision.len() > 128 || release.revision.is_empty() {
         bail!("invalid BBS ServerInfo revision");
     }
-    if info.capabilities.len() > 32 || info.capabilities.iter().any(|c| !valid_capability(c)) {
+    // Clients before remote-directory.v1 accept at most 32, which this
+    // server now advertises; newer ones leave room for more.
+    if info.capabilities.len() > MAX_CAPABILITIES
+        || info.capabilities.iter().any(|c| !valid_capability(c))
+    {
         bail!("invalid BBS ServerInfo capabilities");
     }
     for version in info
