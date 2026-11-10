@@ -157,15 +157,7 @@ async fn session(shared: &Arc<Shared>, token: &str) -> Result<()> {
             "BBS connected"
         );
         *shared.bbs.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx.clone());
-        let reoffered = shared.store().reoffer_inbound(now_micros());
-        match reoffered {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                imports = n,
-                "offering again imports whose results were lost with an earlier stream"
-            ),
-            Err(err) => tracing::error!("re-offering imports: {err:#}"),
-        }
+        reoffer(shared);
         shared.bbs_kick.notify_one();
         tokio::select! {
             r = read(shared, &tx, inbound) => r,
@@ -182,6 +174,22 @@ async fn session(shared: &Arc<Shared>, token: &str) -> Result<()> {
     }
     tx.close();
     result
+}
+
+/// Offer again the imports whose results were lost with an earlier stream.
+/// What that stream's transport took is recorded first: an import taken
+/// just before it dropped is sent, so it is offered again too.
+fn reoffer(shared: &Shared) {
+    shared.apply_boundary();
+    let reoffered = shared.store().reoffer_inbound(now_micros());
+    match reoffered {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            imports = n,
+            "offering again imports whose results were lost with an earlier stream"
+        ),
+        Err(err) => tracing::error!("re-offering imports: {err:#}"),
+    }
 }
 
 fn check_hello(shared: &Shared, hello: &pb::BbsHello) -> Result<()> {
@@ -941,6 +949,55 @@ mod tests {
                 .relay_unreported("conn-1", &mut Default::default(), 10)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// An import the last stream's transport took just before it dropped
+    /// is offered again on the next stream, though its take was not yet
+    /// recorded when BBS reconnected.
+    #[tokio::test]
+    async fn an_import_taken_just_before_a_drop_is_offered_again() {
+        use tokio_stream::StreamExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let a = adapter(&dir);
+        let s = &a.shared;
+        let c = {
+            let mut store = s.store();
+            store
+                .intake_inbound(
+                    "in-1",
+                    "relay-1",
+                    "conn-1",
+                    &mp::MessageRef {
+                        namespace: "hub".into(),
+                        message_id: "m1".into(),
+                    },
+                    b"m",
+                    b"e",
+                    now_micros() + 60_000_000,
+                    now_micros(),
+                )
+                .unwrap();
+            store.claim_inbound(now_micros()).unwrap().unwrap()
+        };
+        let (tx, mut frames) = link::channel::<pb::AdapterFrame>(QUEUE, s.settle());
+        let item = Item {
+            frame: frame(Out::Pong(pb::Pong { nonce: 1 })),
+            claim: Some(Claim::Handoff(Direction::Inbound, c.id)),
+        };
+        assert!(tx.reserve().await.unwrap().send(item).is_ok());
+        // Taken, noted, not yet recorded; then the stream drops.
+        assert!(frames.next().await.is_some());
+        drop(frames);
+        reoffer(s);
+        assert_eq!(
+            s.store()
+                .state(Direction::Inbound, c.id)
+                .unwrap()
+                .unwrap()
+                .0,
+            "pending",
+            "offered again"
         );
     }
 
