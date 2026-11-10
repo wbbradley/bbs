@@ -283,6 +283,15 @@ kbd {
 .badge.focus.waiting {
   color: var(--warning);
 }
+.badge.goal {
+  background: transparent;
+  color: var(--success);
+  padding: 3px 0;
+  font-weight: 700;
+}
+.badge.goal.halted {
+  color: var(--warning);
+}
 .badge.quiet {
   background: transparent;
   color: var(--faint);

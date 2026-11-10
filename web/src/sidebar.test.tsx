@@ -8,7 +8,7 @@ import { Nav } from "./Nav";
 import { paths } from "./router";
 import { countCreators, sortAgents, useBoard, type LiveAgent } from "./store";
 import { Board } from "./test/setup";
-import type { Agent, AgentSummary, Blocker, ListBlockersResponse } from "./types";
+import { GoalStatus, type Agent, type AgentSummary, type Blocker, type GoalReport, type ListBlockersResponse } from "./types";
 
 const NOW = Date.parse("2026-10-27T12:00:00Z");
 const before = (secs: number) => new Date(NOW - secs * 1000).toISOString();
@@ -274,6 +274,52 @@ describe("the sidebar's agents", () => {
     expect(screen.getByText("none active")).toBeTruthy();
     fireEvent.click(screen.getByText("show 1 inactive"));
     expect(rows()).toEqual(["Stale"]);
+  });
+
+  it("mark agents in goal mode, halted ones apart, following the live summary", async () => {
+    listings(new Map([[0, page([])]]));
+    const goal = (status: number): GoalReport => ({
+      objective: "Ship the release",
+      status,
+      set_by: "ada",
+      set_at: before(600),
+      iteration: 3,
+      budget: 50,
+      reason: "",
+      evidence: "",
+      wake_at: null,
+      changed_by: "owner",
+    });
+    const working = { ...FRANK, goal: goal(GoalStatus.Active) };
+    api.auto.set("list_agents", () => ({ agents: [JEFE, working, ZED, MATEO], humans: [] }));
+    await show();
+    expect(rows()).toEqual(["Frank▸2h36m ago", "Jefenow", "Zed"]);
+    const mark = screen.getByLabelText("In goal mode, active");
+    expect(mark.title).toBe("Goal (active, turn 3 of 50): Ship the release");
+    expect(mark.className).toBe("badge goal");
+    // A summary without the field (an older server) keeps the listed goal.
+    act(() => api.stream("summary").push({ agents: [summary(working)] }));
+    expect(rows()).toEqual(["Frank▸2h36m ago", "Jefenow", "Zed"]);
+    // Halted until its owner resumes it: still in goal mode, marked apart.
+    act(() => api.stream("summary").push({ agents: [summary(working, { goal: goal(GoalStatus.Stalled) })] }));
+    expect(rows()).toEqual(["Frank▸2h36m ago", "Jefenow", "Zed"]);
+    expect(screen.getByLabelText("In goal mode, stalled").className).toBe("badge goal halted");
+    // Beside the focus mark when both apply.
+    act(() =>
+      api.stream("summary").push({
+        agents: [summary(ZED, { focused_at: before(0), goal: goal(GoalStatus.Waiting) })],
+      }),
+    );
+    expect(rows()).toEqual(["Frank▸2h36m ago", "Jefenow", "Zed◎▸"]);
+    // A finished goal, or none, ends goal mode.
+    act(() =>
+      api.stream("summary").push({
+        agents: [summary(working, { goal: goal(GoalStatus.Complete) }), summary(ZED, { focused_at: null, goal: null })],
+      }),
+    );
+    expect(rows()).toEqual(["Frank2h36m ago", "Jefenow", "Zed"]);
+    act(() => api.stream("summary").push({ agents: [summary(working, { goal: goal(GoalStatus.Expired) })] }));
+    expect(rows()).toEqual(["Frank2h36m ago", "Jefenow", "Zed"]);
   });
 
   it("keeps mixed-case names alphabetical when blockers, activity and listed order change", async () => {
