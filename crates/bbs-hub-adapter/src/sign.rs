@@ -104,6 +104,8 @@ pub fn verify(r: &mp::SignedRecord, want: mp::RecordKind) -> Result<(), VerifyEr
     // ed25519.Verify returns false for it.
     let key = VerifyingKey::from_bytes(key).map_err(|_| VerifyError::Signature)?;
     let message = input(label, r.format_major, &r.signer_public_key, &r.payload);
+    // dalek's verify, not verify_strict: it accepts and refuses what Go's
+    // ed25519.Verify does.
     key.verify(&message, &ed25519_dalek::Signature::from_bytes(signature))
         .map_err(|_| VerifyError::Signature)
 }
