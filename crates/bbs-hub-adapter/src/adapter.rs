@@ -245,6 +245,7 @@ impl Shared {
                 (true, Claim::Handoff(dir, id)) => store.mark_sent(dir, id, now),
                 (true, Claim::Report(id)) => store.mark_reported(id, now),
                 (true, Claim::RelayResult(id)) => store.mark_relay_reported(id),
+                (true, Claim::RelayDuplicate(id)) => store.mark_duplicate_reported(id),
                 (false, Claim::Handoff(dir, id)) => {
                     match dir {
                         Direction::Outbound => self.relay_kick.notify_one(),
@@ -252,7 +253,9 @@ impl Shared {
                     }
                     store.requeue(dir, id, now)
                 }
-                (false, Claim::Report(_) | Claim::RelayResult(_)) => Ok(()),
+                (false, Claim::Report(_) | Claim::RelayResult(_) | Claim::RelayDuplicate(_)) => {
+                    Ok(())
+                }
             };
             if let Err(err) = done {
                 tracing::error!(?claim, taken, "recording a stream's handoff: {err:#}");

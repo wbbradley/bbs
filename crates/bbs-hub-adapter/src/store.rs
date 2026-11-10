@@ -139,6 +139,26 @@ CREATE INDEX inbound_settled ON inbound (updated_at)
     WHERE state IN ('received', 'rejected', 'unknown');
 CREATE INDEX inbound_unreported ON inbound (relay_connection, id)
     WHERE reported = 0 AND state IN ('received', 'rejected');
+-- Duplicates of a handoff that has no result yet: the same message under
+-- another handoff ID. Each is owed the original's result once it has one,
+-- never an answer before (the original may yet be rejected).
+CREATE TABLE outbound_duplicates (
+    bbs_handoff_id TEXT PRIMARY KEY,
+    outbound_id INTEGER NOT NULL REFERENCES outbound (id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX outbound_duplicates_of ON outbound_duplicates (outbound_id);
+-- The same for imports, answered on the relay stream the duplicate came on.
+CREATE TABLE inbound_duplicates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inbound_id INTEGER NOT NULL REFERENCES inbound (id) ON DELETE CASCADE,
+    relay_handoff_id TEXT NOT NULL,
+    relay_connection TEXT NOT NULL,
+    reported INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    UNIQUE (relay_connection, relay_handoff_id)
+);
+CREATE INDEX inbound_duplicates_of ON inbound_duplicates (inbound_id);
 CREATE TRIGGER outbound_settled BEFORE UPDATE OF state ON outbound
 WHEN OLD.state IN ('received', 'rejected')
     OR (OLD.state IN ('sent', 'unknown') AND NEW.state IN ('pending', 'attempted'))
@@ -183,6 +203,12 @@ const OWE_REPORT: &str = "INSERT INTO reports (bbs_handoff_id, state, reason, de
      SELECT bbs_handoff_id, state, coalesce(reason, ''), coalesce(detail, ''), expires_at, ?2
      FROM outbound";
 
+/// A settled handoff's result as its duplicates get it: received is
+/// already known, a rejection is the original's. `o` is the original's row.
+const DUPLICATE_RESULT: &str = "o.state,
+     CASE o.state WHEN 'received' THEN 'already_known' ELSE coalesce(o.reason, '') END,
+     CASE o.state WHEN 'received' THEN '' ELSE coalesce(o.detail, '') END";
+
 /// How long a result BBS's stream took is kept, to send again on a new
 /// stream should BBS have ended the old one before acting on it (BBS keeps a
 /// handoff's first result and ignores repeats). Never past the handoff's
@@ -198,7 +224,8 @@ pub struct Binding {
     pub disabled: bool,
 }
 
-/// A handoff already stored, as a new offer finds it.
+/// A handoff already stored, as a new offer finds it. A duplicate of one
+/// that is not settled is recorded to get its result when it has one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prior {
     pub id: i64,
@@ -250,6 +277,9 @@ pub struct Outcome {
     pub state: String,
     pub reason: String,
     pub detail: String,
+    /// For an import's result to the relay: `id` is a duplicate transfer's
+    /// (in `inbound_duplicates`), answered with its original's result.
+    pub duplicate: bool,
 }
 
 /// Which direction a handoff goes.
@@ -273,6 +303,26 @@ impl Direction {
 pub struct Store {
     conn: Connection,
     _lock: Option<File>,
+}
+
+/// Owe BBS settled outbound row `id`'s result, and the same to each of its
+/// duplicates, which then wait no longer.
+fn owe_outbound(conn: &Connection, id: i64, now: i64) -> Result<()> {
+    conn.execute(&format!("{OWE_REPORT} WHERE id = ?1"), params![id, now])?;
+    conn.execute(
+        &format!(
+            "INSERT INTO reports (bbs_handoff_id, state, reason, detail, expires_at, created_at)
+             SELECT d.bbs_handoff_id, {DUPLICATE_RESULT}, o.expires_at, ?2
+             FROM outbound_duplicates d JOIN outbound o ON o.id = d.outbound_id
+             WHERE o.id = ?1"
+        ),
+        params![id, now],
+    )?;
+    conn.execute(
+        "DELETE FROM outbound_duplicates WHERE outbound_id = ?1",
+        [id],
+    )?;
+    Ok(())
 }
 
 impl Store {
@@ -580,8 +630,10 @@ impl Store {
 
     /// Store a message BBS handed off for Hub, pending. A handoff ID BBS
     /// used before is a repeat (same bytes) or a reuse (other bytes); a known
-    /// origin is a duplicate when its bytes match, else a conflict. In every
-    /// case but new, nothing new is stored.
+    /// origin is a duplicate when its bytes match, else a conflict. A
+    /// duplicate of a handoff not yet settled is recorded, to be owed its
+    /// result once it has one; otherwise, in every case but new, nothing
+    /// new is stored.
     #[allow(clippy::too_many_arguments)]
     pub fn intake_outbound(
         &self,
@@ -605,6 +657,15 @@ impl Store {
             });
         }
         if let Some(intake) = self.known(Direction::Outbound, origin, message)? {
+            if let Intake::Duplicate(prior) = &intake
+                && !prior.settled()
+            {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO outbound_duplicates (bbs_handoff_id, outbound_id,
+                         created_at) VALUES (?1, ?2, ?3)",
+                    params![bbs_handoff_id, prior.id, now],
+                )?;
+            }
             return Ok(intake);
         }
         self.conn.execute(
@@ -640,6 +701,15 @@ impl Store {
         now: i64,
     ) -> Result<Intake> {
         if let Some(intake) = self.known(Direction::Inbound, origin, message)? {
+            if let Intake::Duplicate(prior) = &intake
+                && !prior.settled()
+            {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO inbound_duplicates (inbound_id, relay_handoff_id,
+                         relay_connection, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![prior.id, relay_handoff_id, relay_connection, now],
+                )?;
+            }
             return Ok(intake);
         }
         self.conn.execute(
@@ -794,7 +864,7 @@ impl Store {
                 params![id, now],
             )?;
             if dir == Direction::Outbound {
-                tx.execute(&format!("{OWE_REPORT} WHERE id = ?1"), params![id, now])?;
+                owe_outbound(&tx, *id, now)?;
             }
         }
         tx.commit()?;
@@ -906,21 +976,22 @@ impl Store {
         now: i64,
     ) -> Result<bool> {
         let tx = self.conn.unchecked_transaction()?;
-        let changed = tx.execute(
-            "UPDATE outbound SET state = ?3, reason = NULLIF(?4, ''), detail = NULLIF(?5, ''),
-                 updated_at = ?6
-             WHERE handoff_id = ?1 AND connection_id = ?2
-                 AND state IN ('attempted', 'sent', 'unknown')",
-            params![handoff_id, connection, state, reason, detail, now],
-        )? > 0;
-        if changed {
-            tx.execute(
-                &format!("{OWE_REPORT} WHERE handoff_id = ?1"),
-                params![handoff_id, now],
-            )?;
+        let id: Option<i64> = tx
+            .query_row(
+                "UPDATE outbound SET state = ?3, reason = NULLIF(?4, ''), detail = NULLIF(?5, ''),
+                     updated_at = ?6
+                 WHERE handoff_id = ?1 AND connection_id = ?2
+                     AND state IN ('attempted', 'sent', 'unknown')
+                 RETURNING id",
+                params![handoff_id, connection, state, reason, detail, now],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = id {
+            owe_outbound(&tx, id, now)?;
         }
         tx.commit()?;
-        Ok(changed)
+        Ok(id.is_some())
     }
 
     /// Record BBS's import result for inbound handoff `handoff_id`, over
@@ -964,6 +1035,7 @@ impl Store {
                         state: r.get(3)?,
                         reason: r.get(4)?,
                         detail: r.get(5)?,
+                        duplicate: false,
                     })
                 },
             )
@@ -1012,6 +1084,7 @@ impl Store {
                 state: r.get(3)?,
                 reason: r.get(4)?,
                 detail: r.get(5)?,
+                duplicate: false,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1036,24 +1109,30 @@ impl Store {
     }
 
     /// BBS's import results not yet sent to relay stream `connection` (the
-    /// only stream Hub accepts them on), oldest first, up to `limit`, leaving
-    /// out the rows in `queued`: those already queued on that stream, which
-    /// are taken or go with it. There is no cursor: a result lands whenever
-    /// BBS answers, not in row order. Rows in `queued` reported since are
+    /// only stream Hub accepts them on), and the same results owed to
+    /// duplicates that came on it, up to `limit`, leaving out those in
+    /// `queued` (keyed `(duplicate, id)`): already queued on that stream, so
+    /// taken or gone with it. There is no cursor: a result lands whenever
+    /// BBS answers, not in row order. Entries in `queued` reported since are
     /// dropped from it.
     pub fn relay_unreported(
         &self,
         connection: &str,
-        queued: &mut HashSet<i64>,
+        queued: &mut HashSet<(bool, i64)>,
         limit: usize,
     ) -> Result<Vec<Outcome>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, relay_handoff_id, relay_connection, state, coalesce(reason, ''),
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT 0, id, relay_handoff_id, relay_connection, state, coalesce(reason, ''),
                  coalesce(detail, '')
              FROM inbound WHERE relay_connection = ?1 AND reported = 0
                  AND state IN ('received', 'rejected')
-             ORDER BY id",
-        )?;
+             UNION ALL
+             SELECT 1, d.id, d.relay_handoff_id, d.relay_connection, {DUPLICATE_RESULT}
+             FROM inbound_duplicates d JOIN inbound o ON o.id = d.inbound_id
+             WHERE d.relay_connection = ?1 AND d.reported = 0
+                 AND o.state IN ('received', 'rejected')
+             ORDER BY 1, 2"
+        ))?;
         let mut rows = stmt.query([connection])?;
         let mut owed = Vec::new();
         let mut still = HashSet::new();
@@ -1061,17 +1140,18 @@ impl Store {
         // seen, so what is left in `queued` is still unreported.
         while owed.len() < limit || still.len() < queued.len() {
             let Some(r) = rows.next()? else { break };
-            let id = r.get(0)?;
-            if queued.contains(&id) {
-                still.insert(id);
+            let key = (r.get(0)?, r.get(1)?);
+            if queued.contains(&key) {
+                still.insert(key);
             } else if owed.len() < limit {
                 owed.push(Outcome {
-                    id,
-                    handoff_id: r.get(1)?,
-                    connection: r.get(2)?,
-                    state: r.get(3)?,
-                    reason: r.get(4)?,
-                    detail: r.get(5)?,
+                    id: key.1,
+                    handoff_id: r.get(2)?,
+                    connection: r.get(3)?,
+                    state: r.get(4)?,
+                    reason: r.get(5)?,
+                    detail: r.get(6)?,
+                    duplicate: key.0,
                 });
             }
         }
@@ -1083,6 +1163,15 @@ impl Store {
     pub fn mark_relay_reported(&self, id: i64) -> Result<()> {
         self.conn
             .execute("UPDATE inbound SET reported = 1 WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// The relay's transport took the result for duplicate transfer `id`.
+    pub fn mark_duplicate_reported(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE inbound_duplicates SET reported = 1 WHERE id = ?1",
+            [id],
+        )?;
         Ok(())
     }
 

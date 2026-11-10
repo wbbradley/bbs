@@ -40,6 +40,9 @@ pub enum Claim {
     /// reported when taken; if not, that stream has gone and so has the
     /// result (Hub accepts it on no other).
     RelayResult(i64),
+    /// The same for a duplicate transfer, answered with its original's
+    /// result.
+    RelayDuplicate(i64),
 }
 
 /// What happens to a claim at the boundary. Called with the queue lock

@@ -416,6 +416,7 @@ fn on_outgoing(shared: &Shared, offer: &pb::MessageOffer) -> Option<pb::HandoffR
                 state: prior.state,
                 reason: prior.reason,
                 detail: prior.detail,
+                duplicate: false,
             })
         }),
         // A handoff ID BBS used before, for another message: no result can
@@ -428,18 +429,26 @@ fn on_outgoing(shared: &Shared, offer: &pb::MessageOffer) -> Option<pb::HandoffR
             None
         }
         // The same message under a new handoff ID: answered as the first
-        // was, rejected if it was, else already known.
+        // was, rejected if it was, else already known. One whose first has
+        // no result yet is owed that result once it has one.
         Ok(Intake::Duplicate(prior)) if prior.state == "rejected" => Some(pb::HandoffResult {
             handoff_id: id.clone(),
             disposition: pb::HandoffDisposition::Rejected as i32,
             reason: code(&prior.reason),
             detail: bounded(&prior.detail, 1024),
         }),
-        Ok(Intake::Duplicate(_)) => Some(pb::HandoffResult {
+        Ok(Intake::Duplicate(prior)) if prior.settled() => Some(pb::HandoffResult {
             handoff_id: id.clone(),
             disposition: pb::HandoffDisposition::AlreadyKnown as i32,
             ..Default::default()
         }),
+        Ok(Intake::Duplicate(_)) => {
+            tracing::info!(
+                handoff = id,
+                "a duplicate send waits for its first's result"
+            );
+            None
+        }
         Ok(Intake::Conflict) => Some(rejected(
             id,
             reason(
@@ -732,11 +741,8 @@ mod tests {
 
         // Taken: no result until the relay's.
         assert!(on_outgoing(s, &offer("h7", ok.clone())).is_none());
-        let again = on_outgoing(s, &offer("h8", ok)).unwrap();
-        assert_eq!(
-            again.disposition,
-            pb::HandoffDisposition::AlreadyKnown as i32
-        );
+        // A duplicate of it waits for that result too.
+        assert!(on_outgoing(s, &offer("h8", ok.clone())).is_none());
         let mut changed = message("m1");
         changed.body = b"changed".to_vec();
         assert_eq!(
@@ -746,6 +752,33 @@ mod tests {
         assert_eq!(
             s.store().counts(Direction::Outbound).unwrap(),
             vec![("pending".to_string(), 1)]
+        );
+
+        // The relay's result for h7 is owed to h7, and to h8 as already
+        // known; a later duplicate is answered at once.
+        {
+            let mut store = s.store();
+            let c = store
+                .claim_outbound("conn-1", now_micros(), |m| m.to_vec())
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .outbound_result(&c.handoff_id, "conn-1", "received", "", "", now_micros())
+                    .unwrap()
+            );
+            let owed = store.unreported(0, 10).unwrap();
+            assert_eq!(
+                owed.iter()
+                    .map(|o| (o.handoff_id.as_str(), o.reason.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![("h7", ""), ("h8", "already_known")]
+            );
+        }
+        let later = on_outgoing(s, &offer("h10", ok)).unwrap();
+        assert_eq!(
+            later.disposition,
+            pb::HandoffDisposition::AlreadyKnown as i32
         );
     }
 
@@ -1011,6 +1044,7 @@ mod tests {
             state: "rejected".into(),
             reason: "x".repeat(100),
             detail: "é".repeat(1000),
+            duplicate: false,
         };
         let r = crate::adapter::handoff_result(&o);
         assert_eq!(r.reason, "rejected");

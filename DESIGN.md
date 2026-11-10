@@ -604,9 +604,15 @@ lock order is store, then queue, then that note.
 *Outbound:* BBS offers its frozen `Message` bytes. The adapter decodes them
 strictly, applies `checkMessage`, and refuses (as BBS's result, with Hub's
 reason) a sender or message ID outside its namespace, a recipient inside it,
-or a passed deadline; the same origin with the same bytes is already known,
-with others a `message_conflict`; a duplicate of a rejected message gets the
-original's rejection. The same handoff offered again gets its stored result
+or a passed deadline; the same origin with other bytes is a
+`message_conflict`. A duplicate (the same origin and bytes under another
+handoff) gets the original's result: at once if it has one (its rejection,
+or already known for a receipt), otherwise when it does, and no answer
+before, so the two never hear different answers; a duplicate of an unknown
+original hears nothing unless the original learns its result. (Hub's relay
+answers a duplicate as already known at once because it settles its own
+receipt at once; this adapter, as a home, settles only on the relay's or
+BBS's result.) The same handoff offered again gets its stored result
 again, if it has one; a handoff ID BBS already used for another message gets
 no result under that ID (it would settle the first) and is logged. Otherwise
 the adapter stores the message pending and sends no result yet. Once the relay
@@ -623,9 +629,10 @@ handoff it never offered.
 
 *Inbound:* a transfer is verified as above, refused as `route_not_authorized`
 when it claims this namespace's origin or is addressed to another namespace,
-answered at once as already known or `message_conflict` when its origin is
-known (a duplicate of a rejected message gets the original's rejection), and
-otherwise stored pending and offered to BBS as an import, up to 16 queued.
+answered at once as `message_conflict` when its origin is known with other
+bytes, answered as its original is when the same message is known (as
+outbound duplicates are: at once if the original has a result, otherwise
+once it does, on the stream the duplicate came on), and otherwise stored pending and offered to BBS as an import, up to 16 queued.
 BBS's result (received, already known, or its refusal, such as
 `recipient_unknown`; an empty or malformed reason becomes `invalid_message`)
 is stored, and sent to the relay on the stream the transfer came on, as Hub

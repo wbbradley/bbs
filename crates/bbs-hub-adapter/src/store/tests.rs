@@ -473,15 +473,15 @@ fn import_results_are_found_whatever_order_they_land_in() {
         .unwrap();
     let owed = store.relay_unreported("conn-1", &mut queued, 10).unwrap();
     assert_eq!(ids(owed), vec![second]);
-    queued.insert(second);
+    queued.insert((false, second));
     store
         .inbound_result("in-1", "rejected", "recipient_unknown", "", 31)
         .unwrap()
         .unwrap();
     let owed = store.relay_unreported("conn-1", &mut queued, 10).unwrap();
     assert_eq!(ids(owed), vec![first], "the earlier row's later result");
-    queued.insert(first);
-    assert_eq!(queued, HashSet::from([first, second]));
+    queued.insert((false, first));
+    assert_eq!(queued, HashSet::from([(false, first), (false, second)]));
     // The transport took the second: it leaves `queued`; the first stays.
     store.mark_relay_reported(second).unwrap();
     assert!(
@@ -490,7 +490,7 @@ fn import_results_are_found_whatever_order_they_land_in() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(queued, HashSet::from([first]));
+    assert_eq!(queued, HashSet::from([(false, first)]));
     // A limit counts only rows not queued.
     let third = import(&mut store, 3);
     store
@@ -673,5 +673,105 @@ fn a_reoffered_import_lapses_to_unknown_not_rejected() {
     assert_eq!(
         owed.iter().map(|o| o.id).collect::<Vec<_>>(),
         vec![rejected[0]]
+    );
+}
+
+/// A duplicate of a handoff with no result yet is not answered: it gets
+/// the original's result once there is one, a rejection as a rejection and
+/// a receipt as already known. Both ways.
+#[test]
+fn a_duplicate_waits_for_its_original_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(&dir);
+    // Outbound: h1 is sent; bbs-dup is the same message.
+    outbound(&store, 1, 1_000);
+    let c = store.claim_outbound("conn-1", 20, seal).unwrap().unwrap();
+    store.mark_sent(Direction::Outbound, c.id, 21).unwrap();
+    let dup = |store: &Store, bbs_handoff: &str| {
+        store
+            .intake_outbound(
+                bbs_handoff,
+                "h-dup",
+                &origin("m1"),
+                "hub",
+                b"bytes 1",
+                1_000,
+                22,
+            )
+            .unwrap()
+    };
+    assert!(matches!(dup(&store, "bbs-dup"), Intake::Duplicate(p) if p.state == "sent"));
+    // Offered again by BBS before the result: still one waiter.
+    assert!(matches!(dup(&store, "bbs-dup"), Intake::Duplicate(_)));
+    assert!(store.unreported(0, 10).unwrap().is_empty(), "no answer yet");
+    assert!(
+        store
+            .outbound_result(
+                "h1",
+                "conn-1",
+                "rejected",
+                "recipient_unknown",
+                "nobody",
+                23
+            )
+            .unwrap()
+    );
+    let owed = store.unreported(0, 10).unwrap();
+    assert_eq!(
+        owed.iter()
+            .map(|o| (o.handoff_id.as_str(), o.state.as_str(), o.reason.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("bbs-h1", "rejected", "recipient_unknown"),
+            ("bbs-dup", "rejected", "recipient_unknown"),
+        ]
+    );
+    assert_eq!(owed[1].detail, "nobody");
+
+    // Inbound: in-1 is offered to BBS; a duplicate arrives on another stream.
+    let first = import(&mut store, 1);
+    let dup = store
+        .intake_inbound(
+            "in-dup",
+            "relay-dup",
+            "conn-2",
+            &origin("x1"),
+            b"m1",
+            b"e",
+            1_000,
+            25,
+        )
+        .unwrap();
+    assert!(matches!(dup, Intake::Duplicate(p) if p.state == "attempted"));
+    let mut queued = HashSet::new();
+    assert!(
+        store
+            .relay_unreported("conn-2", &mut queued, 10)
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .inbound_result("in-1", "received", "", "", 26)
+        .unwrap()
+        .unwrap();
+    // Each is owed on the stream it came on: the duplicate as already known.
+    let owed = store.relay_unreported("conn-2", &mut queued, 10).unwrap();
+    assert_eq!(owed.len(), 1);
+    assert_eq!(
+        (
+            owed[0].handoff_id.as_str(),
+            owed[0].reason.as_str(),
+            owed[0].duplicate
+        ),
+        ("relay-dup", "already_known", true)
+    );
+    let mine = store.relay_unreported("conn-1", &mut queued, 10).unwrap();
+    assert_eq!((mine[0].id, mine[0].duplicate), (first, false));
+    store.mark_duplicate_reported(owed[0].id).unwrap();
+    assert!(
+        store
+            .relay_unreported("conn-2", &mut queued, 10)
+            .unwrap()
+            .is_empty()
     );
 }

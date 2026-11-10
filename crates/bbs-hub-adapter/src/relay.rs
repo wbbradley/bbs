@@ -339,14 +339,19 @@ impl Session {
                 let Some(permit) = self.tx.reserve_control().await else {
                     return Ok(());
                 };
+                let claim = if o.duplicate {
+                    Claim::RelayDuplicate(o.id)
+                } else {
+                    Claim::RelayResult(o.id)
+                };
                 let item = Item {
                     frame: frame(F::TransferResult(transfer_result(&o))),
-                    claim: Some(Claim::RelayResult(o.id)),
+                    claim: Some(claim),
                 };
                 if permit.send(item).is_err() {
                     return Ok(());
                 }
-                queued.insert(o.id);
+                queued.insert((o.duplicate, o.id));
                 tracing::info!(
                     handoff = o.handoff_id,
                     state = o.state,
@@ -644,9 +649,10 @@ impl Session {
     }
 
     /// Admit one transfer for BBS: verify the envelope from its exact bytes,
-    /// then store it pending. Its result comes from BBS's import; a
-    /// duplicate or conflict is answered here, and BBS is not offered it
-    /// again.
+    /// then store it pending. Its result comes from BBS's import; a conflict,
+    /// or a duplicate of a settled import, is answered here, and BBS is not
+    /// offered it again. A duplicate of an import not yet settled gets that
+    /// import's result once it has one.
     fn on_transfer(&self, t: mp::Transfer, raw: Vec<u8>) {
         let shared = &self.shared;
         let reply = |disposition: mp::TransferDisposition, code_: &str, detail: &str| {
@@ -719,11 +725,20 @@ impl Session {
             }
             // The same message again: answered as the first was, rejected
             // if it was (expired, or refused by BBS), else already known.
+            // One whose first has no result yet waits for it, so the two
+            // are never answered differently.
             Ok(Intake::Duplicate(prior)) if prior.state == "rejected" => {
                 let code_ = crate::adapter::relay_code(&prior.reason);
                 reply(mp::TransferDisposition::Rejected, &code_, &prior.detail)
             }
-            Ok(Intake::Duplicate(_)) => reply(mp::TransferDisposition::AlreadyKnown, "", ""),
+            Ok(Intake::Duplicate(prior)) if prior.settled() => {
+                reply(mp::TransferDisposition::AlreadyKnown, "", "")
+            }
+            Ok(Intake::Duplicate(_)) => tracing::info!(
+                handoff = t.handoff_id,
+                origin = format!("{}:{}", id.namespace, id.message_id),
+                "a duplicate transfer waits for its first's result"
+            ),
             // Outbound only.
             Ok(Intake::Repeated(_) | Intake::HandoffReused) => {}
             Ok(Intake::Conflict) => reject(reason(
