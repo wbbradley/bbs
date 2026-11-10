@@ -46,8 +46,8 @@ pub const CAPABILITIES: &[&str] = &[
     "timers-edit.v1",
     "remote-directory.v1",
 ];
-/// The most capabilities a ServerInfo may list.
-const MAX_CAPABILITIES: usize = 64;
+/// The most bytes of capability names a ServerInfo may list, together.
+const MAX_CAPABILITY_BYTES: usize = 8192;
 const MAX_METADATA_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;
 const REQUEST_KEYS: &[&str] = &[
@@ -303,12 +303,14 @@ pub fn validate_info(info: &proto::ServerInfoResponse) -> Result<()> {
     if release.revision.len() > 128 || release.revision.is_empty() {
         bail!("invalid BBS ServerInfo revision");
     }
-    // Clients before remote-directory.v1 accept at most 32, which this
-    // server now advertises; newer ones leave room for more.
-    if info.capabilities.len() > MAX_CAPABILITIES
-        || info.capabilities.iter().any(|c| !valid_capability(c))
-    {
+    if info.capabilities.iter().any(|c| !valid_capability(c)) {
         bail!("invalid BBS ServerInfo capabilities");
+    }
+    if info.capabilities.iter().map(String::len).sum::<usize>() > MAX_CAPABILITY_BYTES {
+        bail!(
+            "incompatible BBS ServerInfo: its capabilities exceed {MAX_CAPABILITY_BYTES} bytes \
+             together; coordinate a client/server upgrade"
+        );
     }
     for version in info
         .minimum_client_version
@@ -442,5 +444,32 @@ mod tests {
         info.protocol_epoch = Some(EPOCH);
         info.release = None;
         assert!(validate_info(&info).is_err());
+    }
+
+    #[test]
+    fn info_bounds_capabilities_by_total_size_not_count() {
+        let mut info = Policy::default().info(false);
+        // Many short capabilities pass, up to the total size exactly.
+        let used: usize = info.capabilities.iter().map(String::len).sum();
+        let mut room = MAX_CAPABILITY_BYTES - used;
+        while room > 0 {
+            let len = room.min(16);
+            info.capabilities.push("x".repeat(len));
+            room -= len;
+        }
+        assert!(info.capabilities.len() > 64);
+        assert_eq!(
+            info.capabilities.iter().map(String::len).sum::<usize>(),
+            MAX_CAPABILITY_BYTES
+        );
+        validate_info(&info).unwrap();
+        // One byte over is an incompatible server, not a malformed one.
+        info.capabilities.push("x".into());
+        assert!(is_incompatible(&validate_info(&info).unwrap_err()));
+        // A malformed entry is still refused.
+        info.capabilities.truncate(1);
+        info.capabilities.push("x".repeat(129));
+        let err = validate_info(&info).unwrap_err();
+        assert!(!is_incompatible(&err), "{err}");
     }
 }
