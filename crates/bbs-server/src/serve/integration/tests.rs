@@ -1172,6 +1172,69 @@ async fn the_directory_answers_for_published_entities_in_pages() {
     assert_eq!(bad.error_code, "invalid_cursor");
 }
 
+/// A top-level ID answers as its own alias, as Hub's entities do by default,
+/// so `hub send will@bbs` resolves; a second-level ID never does.
+#[tokio::test]
+async fn a_top_level_id_is_its_own_alias() {
+    let rig = Rig::new().await;
+    service::ensure_human(
+        &mut rig.conn(),
+        proto::EnsureHumanRequest { name: "Ada".into() },
+    )
+    .unwrap();
+    let (mut adapter, _) = rig.connect().await;
+    let by_alias = |alias: &str| mp::DirectoryQuery {
+        query_id: "q".into(),
+        namespace: "bbs".into(),
+        alias: alias.into(),
+        ..Default::default()
+    };
+    // Nothing answers while publication is off.
+    let off = ask(&mut adapter, by_alias("will")).await;
+    assert!(off.entities.is_empty() && off.error_code.is_empty());
+
+    rig.publish(true);
+    let Out::Published(catalog) = adapter.next().await.unwrap() else {
+        panic!("expected a new catalog");
+    };
+    // The catalog lists the same aliases.
+    let aliases: Vec<_> = catalog.entities.iter().map(|e| e.aliases.clone()).collect();
+    assert_eq!(aliases, [vec!["ada"], vec!["will"], vec![]]);
+    let will = ask(&mut adapter, by_alias("will")).await;
+    assert_eq!(entity_ids_of(&will), ["will"]);
+    assert_eq!(will.entities[0].aliases, ["will"]);
+    assert!(will.entities[0].addresses[0].is_default);
+    // Aliases are normalized lowercase; the ID keeps its case.
+    assert_eq!(
+        entity_ids_of(&ask(&mut adapter, by_alias("WILL")).await),
+        ["will"]
+    );
+    let ada = ask(&mut adapter, by_alias("ada")).await;
+    assert_eq!(entity_ids_of(&ada), ["Ada"]);
+    assert_eq!(ada.entities[0].aliases, ["ada"]);
+    // An agent's last segment is no alias, and its descriptor lists none.
+    let scout = ask(&mut adapter, by_alias("scout")).await;
+    assert!(scout.entities.is_empty() && scout.error_code.is_empty());
+    let exact = ask(
+        &mut adapter,
+        mp::DirectoryQuery {
+            entity_id: "will/scout".into(),
+            ..by_alias("")
+        },
+    )
+    .await;
+    assert!(exact.entities[0].aliases.is_empty());
+    // A path is not an alias at all, nor is anything outside Hub's form.
+    for bad in ["will/scout", "_will", "w!ll", &"a".repeat(65)] {
+        let r = ask(&mut adapter, by_alias(bad)).await;
+        assert_eq!(r.error_code, "invalid_argument", "{bad}");
+        assert!(r.entities.is_empty());
+    }
+    // An unknown alias is an empty answer, not an error.
+    let none = ask(&mut adapter, by_alias("nobody")).await;
+    assert!(none.entities.is_empty() && none.error_code.is_empty());
+}
+
 async fn ask(adapter: &mut Adapter, q: mp::DirectoryQuery) -> mp::DirectoryResult {
     adapter.send(In::LocalDirectoryQuery(q)).await;
     match adapter.next().await.unwrap() {

@@ -143,6 +143,26 @@ fn address_ref(
     }
 }
 
+/// Hub's alias form: 1-64 characters of `[a-z0-9._-]`, starting with a
+/// letter or digit, after lowercasing. None when `alias` is not one.
+pub fn normalize_alias(alias: &str) -> Option<String> {
+    let a = alias.to_ascii_lowercase();
+    let ok = (1..=MAX_ALIAS_BYTES).contains(&a.len())
+        && a.as_bytes()[0].is_ascii_alphanumeric()
+        && a.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b));
+    ok.then_some(a)
+}
+
+/// A top-level entity answers to its own ID as an alias, normalized, as
+/// Hub's entities do by default; a second-level one (`will/scout`) has none.
+pub fn default_alias(entity_id: &str) -> Option<String> {
+    if entity_id.contains('/') {
+        return None;
+    }
+    normalize_alias(entity_id)
+}
+
 /// A published entity's descriptor: its one native address, which takes
 /// plain text sends. `allowed` reports send as allowed for a directory
 /// requester; the catalog is for no requester in particular.
@@ -155,7 +175,7 @@ fn descriptor(namespace: &str, p: store::Published, allowed: bool) -> mp::Entity
         }),
         kind: p.kind,
         display_name: p.display_name,
-        aliases: Vec::new(),
+        aliases: default_alias(&p.entity_id).into_iter().collect(),
         description: String::new(),
         lifecycle: mp::Lifecycle::Active as i32,
         addresses: vec![mp::AddressDescriptor {
@@ -1036,7 +1056,9 @@ pub fn check_remote_directory(result: &mp::DirectoryResult) -> Result<()> {
 
 /// Answer the adapter's directory query about this installation, for an
 /// external requester the adapter vouches for. Only published entities are
-/// visible: none while publication is off. BBS has no aliases or runs.
+/// visible: none while publication is off. A top-level entity answers to
+/// its own ID as an alias (see [`default_alias`]); BBS has no other aliases,
+/// and no runs.
 pub fn local_directory(
     conn: &mut Connection,
     integration: &str,
@@ -1072,16 +1094,27 @@ pub fn local_directory(
         if q.list_runs && q.entity_id.is_empty() {
             return Ok(fail("invalid_argument", "list_runs requires entity_id"));
         }
-        if q.alias.len() > MAX_ALIAS_BYTES {
-            return Ok(fail("invalid_argument", "alias is too long"));
-        }
+        let alias = if q.alias.is_empty() {
+            None
+        } else {
+            match normalize_alias(&q.alias) {
+                Some(a) => Some(a),
+                None => return Ok(fail("invalid_argument", "invalid alias")),
+            }
+        };
         if !q.entity_id.is_empty() && !entity::valid_entity_id(&q.entity_id) {
             return Ok(fail("invalid_argument", "invalid entity ID"));
         }
         if q.page_token.len() > MAX_PAGE_TOKEN_BYTES {
             return Ok(fail("invalid_cursor", "page token is too long"));
         }
-        if store::publishes(ctx.conn, integration)? != Some(true) || !q.alias.is_empty() {
+        if store::publishes(ctx.conn, integration)? != Some(true) {
+            return Ok(res);
+        }
+        if let Some(alias) = alias {
+            if let Some(p) = store::published_by_alias(ctx.conn, &alias)? {
+                res.entities.push(descriptor(&local, p, true));
+            }
             return Ok(res);
         }
         if !q.entity_id.is_empty() {

@@ -280,6 +280,33 @@ pub fn published_entity(conn: &Connection, entity_id: &str) -> Result<Option<Pub
         .optional()?)
 }
 
+/// The published top-level entity answering to `alias`, a normalized
+/// (lowercase) alias: its ID compared case-insensitively, as entity IDs are
+/// unique. A second-level ID (`will/scout`) is never an alias.
+pub fn published_by_alias(conn: &Connection, alias: &str) -> Result<Option<Published>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT e.entity_id, e.kind, e.display_name
+                 FROM entities e
+                 JOIN entity_local_bindings b ON b.entity_id = e.id
+                 JOIN entity_addresses a ON a.entity_id = e.id
+                   AND a.address_id = '{NATIVE_ADDRESS}' AND a.lifecycle = 'active'
+                 WHERE e.lifecycle = 'active' AND b.group_id IS NULL
+                   AND instr(e.entity_id, '/') = 0 AND lower(e.entity_id) = ?1"
+            ),
+            [alias],
+            |r| {
+                Ok(Published {
+                    entity_id: r.get(0)?,
+                    kind: r.get(1)?,
+                    display_name: r.get(2)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 // ---- native targets and foreign entities -----------------------------------
 
 /// A native entity's address, as an incoming message names it.
