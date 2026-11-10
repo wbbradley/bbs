@@ -48,6 +48,29 @@ fn the_store_is_owner_only_and_used_by_one_adapter() {
     open(&dir);
 }
 
+/// A store from an earlier schema is refused with what to do, not migrated.
+#[test]
+fn an_older_store_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adapter.db");
+    drop(open(&dir));
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 1)
+        .unwrap();
+    let err = Store::open(&path, 1).err().unwrap().to_string();
+    assert!(
+        err.contains("schema 1") && err.contains("delete the store"),
+        "{err}"
+    );
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", VERSION + 1)
+        .unwrap();
+    let err = Store::open(&path, 1).err().unwrap().to_string();
+    assert!(err.contains("this adapter knows"), "{err}");
+}
+
 #[test]
 fn a_store_belongs_to_one_installation() {
     let dir = tempfile::tempdir().unwrap();

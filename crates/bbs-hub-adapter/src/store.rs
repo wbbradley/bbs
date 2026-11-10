@@ -143,7 +143,9 @@ WHEN OLD.state IN ('received', 'rejected')
 BEGIN SELECT RAISE(ABORT, 'an import never changes once settled, and is re-offered only from pending'); END;
 "#;
 
-const VERSION: i64 = 1;
+/// The schema version. The adapter is unreleased: an older store is not
+/// migrated, the operator deletes it.
+const VERSION: i64 = 2;
 
 /// `path` with `.suffix` appended, as SQLite names its WAL files.
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -338,6 +340,11 @@ impl Store {
                 Ok(())
             }
             VERSION => Ok(()),
+            v if v < VERSION => bail!(
+                "the adapter store has schema {v}, from an earlier development build; this \
+                 adapter needs schema {VERSION} and does not migrate it. Stop the adapter, \
+                 delete the store (with its -wal, -shm and .lock files), then start it again"
+            ),
             v => bail!("the adapter store has schema {v}; this adapter knows {VERSION}"),
         }
     }

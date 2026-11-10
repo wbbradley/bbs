@@ -529,7 +529,9 @@ catalogs on a BBS stream only move forward; each stream's first is taken
 whatever its revision, so a BBS whose database was reset is followed), the
 `relay_session`, the handoffs, `outbound` (BBS to Hub) and `inbound` (Hub to
 BBS), each with its exact bytes and unique on the message's origin, and
-`reports`, the results owed to BBS. Row IDs are never reused
+`reports`, the results owed to BBS. A store of an older schema version is
+refused, not migrated, with an error telling the operator to delete it (the
+adapter is unreleased). Row IDs are never reused
 (AUTOINCREMENT): a stream's reporting cursor only moves forward. Settled
 handoffs are kept, as Hub's contract keeps retained rows, unless
 `retention_days` is set, which deletes them that many days after they settle: BBS keeps the messages, and its own duplicate check answers a repeat
