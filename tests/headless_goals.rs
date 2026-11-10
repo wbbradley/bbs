@@ -16,7 +16,7 @@ struct Rig {
 
 fn req<T>(message: T) -> Request<T> {
     let mut r = Request::new(message);
-    for (key, value) in [("bbs-protocol-epoch", "2"), ("bbs-human", "tester")] {
+    for (key, value) in [("bbs-protocol-epoch", "3"), ("bbs-human", "tester")] {
         r.metadata_mut().insert(key, value.parse().unwrap());
     }
     r
@@ -127,6 +127,8 @@ impl Rig {
                 to: "GoalTest".into(),
                 body: body.into(),
                 control: control.map(Into::into),
+                reply_to: None,
+                not_to_owner: false,
             }))
             .await
             .unwrap();

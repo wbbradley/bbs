@@ -5,6 +5,7 @@ vi.mock("./api", () => import("./test/fakeApi"));
 
 import * as api from "./test/fakeApi";
 import { Nav } from "./Nav";
+import { paths } from "./router";
 import { countCreators, sortAgents, useBoard, type LiveAgent } from "./store";
 import { Board } from "./test/setup";
 import type { Agent, AgentSummary, Blocker, ListBlockersResponse } from "./types";
@@ -217,6 +218,62 @@ describe("the sidebar's agents", () => {
       }),
     );
     expect(rows()).toEqual(["Frank2h36m ago", "Jefenow", "Zed◎"]);
+  });
+
+  it("hide your agents inactive for over 7 days until asked, unless focused or mid-turn", async () => {
+    listings(new Map([[0, page([])]]));
+    const DAY = 24 * 3600;
+    const old = before(8 * DAY);
+    const stale = agent(20, "Stale", "ada", { active_at: old, last_sent_at: old });
+    const recent = agent(21, "Recent", "ada", { active_at: before(6 * DAY) });
+    const focused = agent(22, "Focused", "ada", { active_at: old, focused_at: old });
+    const busy = agent(23, "Busy", "ada", { active_at: old, turn_event: "tool_call" });
+    const done = agent(24, "Done", "ada", { active_at: old, turn_event: "turn_end" });
+    // Others' agents are never hidden for inactivity.
+    const theirs = agent(25, "Theirs", "bob", { active_at: old });
+    api.auto.set("list_agents", () => ({ agents: [stale, recent, focused, busy, done, theirs], humans: [] }));
+    await show();
+    expect(rows()).toEqual(["Busy", "Focused◎", "Recent"]);
+
+    fireEvent.click(screen.getByText("show 2 inactive"));
+    expect(rows()).toEqual(["Busy", "Done", "Focused◎", "Recent", "Stale8d ago"]);
+    fireEvent.click(screen.getByText("hide inactive"));
+    expect(rows()).toEqual(["Busy", "Focused◎", "Recent"]);
+
+    // A message from an inactive agent shows it again at once.
+    act(() => api.stream("summary").push({ agents: [summary({ ...stale, last_sent_at: before(0) })] }));
+    expect(rows()).toEqual(["Busy", "Focused◎", "Recent", "Stalenow"]);
+    expect(screen.getByText("show 1 inactive")).toBeTruthy();
+    fireEvent.click(screen.getByText("show 1 inactive"));
+    expect(rows()).toEqual(["Busy", "Done", "Focused◎", "Recent", "Stalenow"]);
+    fireEvent.click(screen.getByText("show 1"));
+    expect(rows()).toContain("Theirs@bob");
+  });
+
+  it("keep an inactive agent with unread mail, open blockers or an open page", async () => {
+    const old = before(8 * 24 * 3600);
+    const mail = agent(20, "Mail", "ada", { active_at: old });
+    const asking = agent(21, "Asking", "ada", { active_at: old });
+    const viewed = agent(22, "Viewed", "ada", { active_at: old });
+    const quiet = agent(23, "Quiet", "ada", { active_at: old });
+    listings(new Map([[0, page([blocker(by(asking))])]]));
+    api.auto.set("list_agents", () => ({ agents: [mail, asking, viewed, quiet], humans: [] }));
+    history.pushState(null, "", paths.agent("Viewed"));
+    await show();
+    act(() => api.stream("summary").push({ agents: [summary(mail, { unread_messages: 1 })] }));
+    expect(rows().map((r) => r.replace(/[^A-Za-z].*$/, ""))).toEqual(["Asking", "Mail", "Viewed"]);
+    expect(screen.getByText("show 1 inactive")).toBeTruthy();
+    history.pushState(null, "", "/");
+  });
+
+  it("say so when every one of your agents is inactive", async () => {
+    listings(new Map([[0, page([])]]));
+    api.auto.set("list_agents", () => ({ agents: [agent(20, "Stale", "ada", { active_at: before(8 * 24 * 3600) })], humans: [] }));
+    await show();
+    expect(rows()).toEqual([]);
+    expect(screen.getByText("none active")).toBeTruthy();
+    fireEvent.click(screen.getByText("show 1 inactive"));
+    expect(rows()).toEqual(["Stale"]);
   });
 
   it("keeps mixed-case names alphabetical when blockers, activity and listed order change", async () => {

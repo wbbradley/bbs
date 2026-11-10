@@ -112,6 +112,11 @@ kbd {
 .human {
   color: var(--human);
 }
+/* Another installation's entity: neither a human nor an agent of this board. */
+.remote {
+  color: var(--technical);
+  font-style: italic;
+}
 .name-link:hover {
   text-decoration: underline;
 }

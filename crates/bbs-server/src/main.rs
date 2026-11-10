@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use bbs_core::{protocol, release, service};
-use bbs_server::serve;
+use bbs_server::{hub_migration, serve};
 
 /// Serve the BBS over gRPC, owning the database in the state directory.
 #[derive(Parser)]
@@ -32,6 +32,30 @@ enum Command {
         #[arg(long, conflicts_with = "json")]
         manifest: bool,
     },
+    /// Operator only: move a stopped server's schema-26 database to the Hub
+    /// model (schema 27), which this binary serves and refuses to start
+    /// without. Stop the server and back up the database first; it refuses
+    /// while any other connection uses the database.
+    MigrateHubModel {
+        /// The database to migrate (normally STATE_DIR/bbs.db).
+        #[arg(long, value_name = "PATH")]
+        db: PathBuf,
+        /// The installation's Hub namespace: 1-63 characters, [a-z][a-z0-9-]*.
+        #[arg(long)]
+        namespace: String,
+        /// A backup of this database at schema 26, such as `bbs backup`
+        /// writes, taken with the server stopped: its messages, deliveries,
+        /// blocker events and activity must match the database's. Required
+        /// unless --dry-run.
+        #[arg(long, value_name = "PATH")]
+        backup_taken: Option<PathBuf>,
+        /// Only report the entity-ID mapping and blocking issues; write
+        /// nothing. Meant for a backup copy: it opens --db read-only, which
+        /// can fail on a live WAL database without write access to its -shm
+        /// file.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -49,9 +73,18 @@ struct Serve {
     /// Secure; an http one serves sign-in and sessions in plain text.
     #[arg(long, value_name = "URL", requires = "web")]
     web_origin: Option<String>,
+    /// Also serve Hub's integration stream for an adapter on this address
+    /// (for example 127.0.0.1:7779). It authenticates with an integration
+    /// credential from `bbs admin integration add`. Off when not given.
+    #[arg(long, value_name = "ADDR")]
+    integration_listen: Option<std::net::SocketAddr>,
     /// Directory holding bbs.db (default: ~/.local/state/bbs).
     #[arg(long)]
     state_dir: Option<PathBuf>,
+    /// The installation's Hub namespace, [a-z][a-z0-9-]*: a new database is
+    /// created in it (default: bbs), and an existing one must match it.
+    #[arg(long)]
+    namespace: Option<String>,
     /// Require authenticated human accounts and strong, owned agent credentials.
     #[arg(long)]
     require_human_token: bool,
@@ -109,7 +142,9 @@ async fn run(args: Serve) -> Result<()> {
             addr,
             origin: args.web_origin,
         }),
+        args.integration_listen,
         &dir,
+        args.namespace.as_deref(),
         args.require_human_token,
         protocol::Policy::new(args.minimum_client_version, args.recommended_client_version)?,
         service::TimerLimits {
@@ -126,6 +161,13 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Some(Command::Version { json, manifest }) => release::print(json, manifest),
+        Some(Command::MigrateHubModel {
+            db,
+            namespace,
+            backup_taken,
+            dry_run,
+        }) => hub_migration::run(&db, &namespace, backup_taken.as_deref(), dry_run)
+            .map(|report| print!("{report}")),
         None => {
             init_logging();
             run(cli.serve).await

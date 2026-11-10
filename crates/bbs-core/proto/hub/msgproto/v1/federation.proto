@@ -1,0 +1,107 @@
+syntax = "proto3";
+package msgproto.v1;
+option go_package = "github.com/neuralwatt/hub/gen/msgproto/v1;msgprotov1";
+import "msgproto/v1/messaging.proto";
+import "msgproto/v1/security.proto";
+
+service Federation {
+  rpc Connect(stream FederationFrame) returns (stream FederationFrame);
+}
+
+message PeerHello {
+  uint32 protocol_major = 1;
+  string installation_id = 2;
+  string connection_id = 3; // Random per stream; not durable home identity.
+  string build = 4;
+  // Informational. Relay/trust-source role is configured, not self-granted.
+  bool serves_relay = 5;
+}
+message RouteClaim {
+  string namespace = 1;
+  string installation_id = 2;
+  string connection_id = 3; // Must match this peer's Hello.
+  string claim_id = 4;
+}
+message RegisterRoute {
+  SignedRecord claim = 1;
+  SignedRecord credential = 2;
+}
+message RouteResult {
+  string claim_id = 1;
+  string namespace = 2;
+  bool accepted = 3;
+  string error_code = 4;
+  string detail = 5;
+}
+message WithdrawRoute {
+  string namespace = 1; // Only routes owned by this current stream.
+}
+message Heartbeat { uint64 nonce = 1; }
+message Transfer {
+  string handoff_id = 1; // Stable local attempt ID, not message identity.
+  SignedEnvelope envelope = 2;
+}
+enum TransferDisposition {
+  TRANSFER_DISPOSITION_UNSPECIFIED = 0;
+  TRANSFER_DISPOSITION_RECEIVED = 1; // Validation/receipt; no persistence ACK.
+  TRANSFER_DISPOSITION_ALREADY_KNOWN = 2;
+  TRANSFER_DISPOSITION_REJECTED = 3;
+}
+message TransferResult {
+  string handoff_id = 1;
+  TransferDisposition disposition = 2;
+  string error_code = 3;
+  string detail = 4;
+}
+message FederatedDirectoryQuery {
+  SignedRecord query = 1; // Payload: DirectoryQuery.
+  SignedRecord credential = 2;
+}
+message DirectoryAnswer {
+  bytes query_record_hash = 1; // SHA-256 of framed signed query input.
+  string namespace = 2; // Authoritative destination namespace.
+  DirectoryResult result = 3;
+}
+message FederatedDirectoryAnswer {
+  SignedRecord answer = 1; // Payload: DirectoryAnswer.
+  SignedRecord credential = 2;
+}
+// Relay errors (e.g. home offline) cannot impersonate a home-signed answer.
+message DirectoryUnavailable {
+  string query_id = 1;
+  string error_code = 2;
+  string detail = 3;
+}
+message TrustQuery {
+  string query_id = 1;
+  string namespace = 2; // Empty: all enrolled namespaces.
+  bytes page_token = 3;
+}
+message TrustPage {
+  string query_id = 1;
+  repeated NamespaceBinding bindings = 2;
+  repeated SignedRecord credentials = 3;
+  repeated SignedRecord revocations = 4;
+  bytes next_page_token = 5;
+  string error_code = 6;
+}
+message TrustChanged {
+  string namespace = 1; // Hint to refresh; never invalidates cached trust.
+}
+message FederationFrame {
+  oneof payload {
+    PeerHello hello = 1;
+    RegisterRoute register_route = 2;
+    RouteResult route_result = 3;
+    WithdrawRoute withdraw_route = 4;
+    Heartbeat heartbeat = 5;
+    Transfer transfer = 6;
+    TransferResult transfer_result = 7;
+    FederatedDirectoryQuery directory_query = 8;
+    FederatedDirectoryAnswer directory_answer = 9;
+    DirectoryUnavailable directory_unavailable = 10;
+    TrustQuery trust_query = 11;
+    TrustPage trust_page = 12;
+    TrustChanged trust_changed = 13;
+  }
+}

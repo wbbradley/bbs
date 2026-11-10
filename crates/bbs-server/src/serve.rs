@@ -24,6 +24,7 @@ use crate::proto::{self, Kind};
 use crate::protocol::Policy;
 use crate::service::{self, Caller, TimerLimits, Watched};
 
+mod integration;
 mod web;
 
 /// Keepalive pings let a vanished client free its waiter slot within ~30s.
@@ -48,18 +49,21 @@ pub struct Web {
 pub async fn run(
     listen: SocketAddr,
     web: Option<Web>,
+    integration: Option<SocketAddr>,
     dir: &Path,
+    namespace: Option<&str>,
     require_human_token: bool,
     protocol: Policy,
     timer_limits: TimerLimits,
 ) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut conn = db::open(&dir.join("bbs.db"))?;
-    db::migrate(&mut conn)?;
+    db::migrate_in(&mut conn, namespace)?;
     serve(
         conn,
         listen,
         web,
+        integration,
         dir,
         require_human_token,
         protocol,
@@ -69,9 +73,10 @@ pub async fn run(
 }
 
 async fn serve(
-    conn: Connection,
+    mut conn: Connection,
     listen: SocketAddr,
     web: Option<Web>,
+    integration: Option<SocketAddr>,
     dir: &Path,
     require_human_token: bool,
     protocol: Policy,
@@ -94,6 +99,23 @@ async fn serve(
         }
         None => None,
     };
+    let integration = match integration {
+        Some(addr) => Some(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding {addr}"))?,
+        ),
+        None => None,
+    };
+    // Handoffs a stopped server left attempted are uncertain: they become
+    // unknown, and nothing offers them again.
+    let interrupted = service::integration::interrupt_attempted(&mut conn)?;
+    if interrupted > 0 {
+        tracing::warn!(
+            interrupted,
+            "integration handoffs interrupted by the last stop are now unknown"
+        );
+    }
     let state = Arc::new(State {
         conn: Mutex::new(conn),
         notify: watch::Sender::new(0),
@@ -105,8 +127,10 @@ async fn serve(
         auth_failures: Mutex::new(HashMap::new()),
         timer_limits,
         clock: Arc::new(Utc::now),
+        integrations: Default::default(),
     });
     tokio::spawn(run_timers(state.clone()));
+    tokio::spawn(integration::sweep(state.clone()));
     let (health, health_service) = tonic_health::server::health_reporter();
     health.set_serving::<BbsServer<Server>>().await;
     let server = tonic::transport::Server::builder()
@@ -134,6 +158,28 @@ async fn serve(
         }
         None => None,
     };
+    type Listener = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+    let mut integration: Option<Listener> = match integration {
+        Some(listener) => {
+            let integration_addr = listener.local_addr()?;
+            println!("bbs serve integration stream on {integration_addr}");
+            tracing::info!(%integration_addr, "serving the integration stream");
+            let server = tonic::transport::Server::builder()
+                .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+                .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
+                .max_concurrent_streams(Some(integration::MAX_STREAMS_PER_CONNECTION))
+                .add_service(integration::service(
+                    state.clone(),
+                    Some(&dir.join("bbs.db")),
+                )?)
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), {
+                    let state = state.clone();
+                    async move { state.stopping().await }
+                });
+            Some(Box::pin(async move { Ok(server.await?) }))
+        }
+        None => None,
+    };
     tracing::info!(%addr, state_dir = %dir.display(), "serving");
     tokio::select! {
         result = &mut server => result?,
@@ -147,6 +193,15 @@ async fn serve(
             result?;
             anyhow::bail!("the web UI stopped serving");
         }
+        result = async {
+            match integration.as_mut() {
+                Some(integration) => integration.await,
+                None => std::future::pending().await,
+            }
+        } => {
+            result?;
+            anyhow::bail!("the integration listener stopped serving");
+        }
         result = signal => {
             result?;
             health.set_not_serving::<BbsServer<Server>>().await;
@@ -159,9 +214,16 @@ async fn serve(
                         None => Ok(()),
                     }
                 };
-                let (grpc, web) = tokio::join!(&mut server, web);
+                let integration = async {
+                    match integration.as_mut() {
+                        Some(integration) => integration.await,
+                        None => Ok(()),
+                    }
+                };
+                let (grpc, web, integration) = tokio::join!(&mut server, web, integration);
                 grpc?;
-                web
+                web?;
+                integration
             };
             match tokio::time::timeout(SHUTDOWN_GRACE, drained).await {
                 Ok(result) => result?,
@@ -207,6 +269,8 @@ struct State {
     timer_limits: TimerLimits,
     /// The time timers fire by; tests set it.
     clock: Clock,
+    /// Open integration streams, so RPCs can ask their adapters.
+    integrations: integration::Sessions,
 }
 
 type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
@@ -413,6 +477,8 @@ impl State {
                     Status::unauthenticated(err.to_string())
                 } else if err.downcast_ref::<service::SyncPageTooLarge>().is_some() {
                     Status::resource_exhausted(err.to_string())
+                } else if let Some(e) = err.downcast_ref::<service::integration::InvalidRequest>() {
+                    Status::invalid_argument(e.to_string())
                 } else {
                     Status::failed_precondition(format!("{err:#}"))
                 }
@@ -1437,6 +1503,68 @@ impl Bbs for Server {
         })
         .await
     }
+
+    /// Checked and routed like a unary call, then asked of the integration's
+    /// adapter without holding the database, which may take seconds.
+    async fn remote_directory(
+        &self,
+        req: Request<proto::RemoteDirectoryRequest>,
+    ) -> Result<Response<proto::RemoteDirectoryResponse>, Status> {
+        const RPC: &str = "remote_directory";
+        self.0.protocol.validate(req.metadata())?;
+        let result = async {
+            let peer = req.remote_addr().map(|addr| addr.ip());
+            let caller = Arc::new(caller(&req, self.0.require_human_token));
+            self.0.enforce_auth_rate(peer, &caller).await?;
+            let req = req.into_inner();
+            let c = caller.clone();
+            let routed = self
+                .0
+                .call(move |conn| service::integration::remote_directory_query(conn, &c, &req))
+                .await;
+            let q = match routed {
+                Ok(q) => q,
+                Err(status) => {
+                    self.0.record_auth_failure(peer, &status);
+                    self.0.warn_failed(RPC, &caller, &status).await;
+                    return Err(status);
+                }
+            };
+            let namespace = q.query.namespace.clone();
+            let asked = integration::remote_directory(&self.0, &q.integration, q.query)
+                .await
+                .and_then(|r| match r.error_code.is_empty() {
+                    true => Ok(r),
+                    // Never an empty directory: the remote home's failure.
+                    false => Err(integration::remote_status(&namespace, &r)),
+                });
+            let result = match asked {
+                Ok(r) => r,
+                Err(status) => {
+                    self.0.warn_failed(RPC, &caller, &status).await;
+                    return Err(status);
+                }
+            };
+            // What the directory shows is cached as observed, as the
+            // adapter's own observations are; a failure costs nothing more.
+            let observed = service::integration::observable(&namespace, &result, (self.0.clock)());
+            if !observed.entities.is_empty() {
+                let integration = q.integration.clone();
+                let cached = self
+                    .0
+                    .call(move |conn| service::integration::observe(conn, &integration, &observed))
+                    .await;
+                if let Err(status) = cached {
+                    tracing::warn!("caching remote directory entries: {}", status.message());
+                }
+            }
+            Ok(Response::new(service::integration::remote_directory_page(
+                &namespace, &result,
+            )))
+        }
+        .await;
+        self.0.protocol.finish(result)
+    }
 }
 
 #[cfg(test)]
@@ -1484,6 +1612,7 @@ mod tests {
                 auth_failures: Mutex::new(HashMap::new()),
                 timer_limits: TimerLimits::default(),
                 clock: Arc::new(Utc::now),
+                integrations: Default::default(),
             });
             Self {
                 server: Server(state),
@@ -1618,7 +1747,10 @@ mod tests {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT count(*) FROM deliveries WHERE recipient_kind = 'human'",
+                "SELECT count(*) FROM deliveries d
+                     JOIN entity_addresses a ON a.id = d.recipient_address_id
+                     JOIN entity_local_bindings b ON b.entity_id = a.entity_id
+                     WHERE b.human_id IS NOT NULL",
                 [],
                 |r| r.get(0),
             )
@@ -1751,6 +1883,7 @@ mod tests {
                 auth_failures: Mutex::new(HashMap::new()),
                 timer_limits: TimerLimits::default(),
                 clock: Arc::new(Utc::now),
+                integrations: Default::default(),
             });
             let snapshot = || {
                 let conn = state.conn.lock().unwrap();
@@ -1957,6 +2090,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::from([(peer.ip(), (Instant::now(), 20))])),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(Utc::now),
+            integrations: Default::default(),
         });
         let server = Server(state.clone());
         let request = || {
@@ -2107,6 +2241,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::new()),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(Utc::now),
+            integrations: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -2281,6 +2416,7 @@ mod tests {
                 auth_failures: Mutex::new(HashMap::new()),
                 timer_limits: TimerLimits::default(),
                 clock: Arc::new(Utc::now),
+                integrations: Default::default(),
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap().to_string();
@@ -2399,6 +2535,8 @@ mod tests {
                         to: "will".into(),
                         body: format!("mail {n}"),
                         control: None,
+                        reply_to: None,
+                        not_to_owner: false,
                     },
                 )
                 .unwrap();
@@ -2418,6 +2556,7 @@ mod tests {
                 auth_failures: Mutex::new(HashMap::new()),
                 timer_limits: TimerLimits::default(),
                 clock: Arc::new(Utc::now),
+                integrations: Default::default(),
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap().to_string();
@@ -2500,6 +2639,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::new()),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(Utc::now),
+            integrations: Default::default(),
         });
         let status = state
             .call(|_| -> Result<()> { Err(service::SyncPageTooLarge { message_id: 7 }.into()) })
@@ -2529,6 +2669,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::new()),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(Utc::now),
+            integrations: Default::default(),
         });
         let (started, active) = tokio::sync::oneshot::channel();
         let (finish, release) = std::sync::mpsc::channel();
@@ -2597,6 +2738,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::new()),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(Utc::now),
+            integrations: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2612,7 +2754,7 @@ mod tests {
         let mut req = Request::new(message);
         req.metadata_mut().insert(key, value.parse().unwrap());
         req.metadata_mut()
-            .insert("bbs-protocol-epoch", "2".parse().unwrap());
+            .insert("bbs-protocol-epoch", "3".parse().unwrap());
         req
     }
 
@@ -2856,6 +2998,7 @@ mod tests {
             auth_failures: Mutex::new(HashMap::new()),
             timer_limits: TimerLimits::default(),
             clock: Arc::new(move || *clock.lock().unwrap()),
+            integrations: Default::default(),
         });
         let mut changes = state.notify.subscribe();
         // Wait for the scheduler to commit what `done` checks for. It bumps

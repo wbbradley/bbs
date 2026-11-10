@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::app::{
-    format_agents, format_groups, format_messages, parse_time, timer_line, timer_schedule,
+    format_agents, format_directory, format_groups, format_messages, parse_time, remote_directory,
+    timer_line, timer_schedule,
 };
 use crate::backend::Backend;
 use crate::config::Config;
@@ -26,6 +27,9 @@ const DEFAULT_PROTOCOL: &str = "2025-06-18";
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// ...from this far back, when it gives no start.
 const DEFAULT_HISTORY_SINCE: &str = "7d";
+/// Entities `bbs_directory` shows by default, and at most.
+const DEFAULT_DIRECTORY_LIMIT: usize = 50;
+const MAX_DIRECTORY_LIMIT: u64 = 200;
 
 pub async fn run(
     dir: &Path,
@@ -276,6 +280,8 @@ impl Tools {
                         to: arg("to")?,
                         body: arg("body")?,
                         control: None,
+                        reply_to: None,
+                        not_to_owner: false,
                     })
                     .await?;
                 let mut out = match r.recipients {
@@ -290,10 +296,42 @@ impl Tools {
                 }
                 out
             }
+            "bbs_reply" => {
+                let id = message_id(&args["message_id"])?;
+                let mut req = crate::app::reply_request(id, arg("body")?);
+                // Like bbs_send's check above, but the server knows who the
+                // reply goes to.
+                req.not_to_owner = guard;
+                let r = b.send(req).await?;
+                format!("Replied to {}.", r.to)
+            }
             "bbs_agents" => format_agents(
                 &b.list_agents(proto::ListAgentsRequest { all: false })
                     .await?,
             ),
+            "bbs_directory" => {
+                let text = |key: &str| args[key].as_str().unwrap_or_default().trim().to_string();
+                let req = proto::RemoteDirectoryRequest {
+                    namespace: arg("namespace")?,
+                    alias: text("alias"),
+                    entity_id: text("id"),
+                    ..Default::default()
+                };
+                let limit = match args["limit"].as_u64() {
+                    None => DEFAULT_DIRECTORY_LIMIT,
+                    Some(n @ 1..=MAX_DIRECTORY_LIMIT) => n as usize,
+                    Some(_) => bail!("limit must be 1 to {MAX_DIRECTORY_LIMIT}"),
+                };
+                let (entities, more) = remote_directory(b, req.clone(), limit).await?;
+                let mut out = format_directory(&req, &entities);
+                if more {
+                    out.push_str(&format!(
+                        "(more exist; only the first {limit} are shown: narrow the lookup with \
+                         alias or id)\n"
+                    ));
+                }
+                out
+            }
             "bbs_status" => {
                 b.set_status(proto::SetStatusRequest { text: arg("text")? })
                     .await?;
@@ -452,25 +490,44 @@ fn search_request(args: &Value) -> Result<proto::SearchRequest> {
     })
 }
 
+/// A message id given as a number or a numeric string.
+fn message_id(v: &Value) -> Result<i64> {
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        .context(r#"missing integer argument "message_id""#)
+}
+
 fn format_search(
     response: proto::SearchResponse,
     since: Option<String>,
     until: Option<String>,
 ) -> Result<String> {
-    let hits = response.hits.into_iter().map(|hit| {
-        let m = hit.message.context("server returned a search hit without a message")?;
-        Ok(json!({
-            "id": m.id, "created_at": m.created_at,
-            "from": { "kind": if m.from_kind == proto::Kind::Agent as i32 { "agent" } else { "human" },
-                "name": m.from_name, "owner": m.from_owner },
-            "to": { "group": m.to_group, "name": m.to_name, "owner": m.to_owner },
-            "body": m.body, "truncated": hit.truncated,
-            "body_offset_bytes": hit.body_offset_bytes,
-            "original_body_bytes": hit.original_body_bytes,
-            "match_offset_bytes": hit.match_offset_bytes,
-            "match_length_bytes": hit.match_length_bytes,
-        }))
-    }).collect::<Result<Vec<_>>>()?;
+    let hits = response
+        .hits
+        .into_iter()
+        .map(|hit| {
+            let m = hit
+                .message
+                .context("server returned a search hit without a message")?;
+            Ok(json!({
+                "id": m.id, "created_at": m.created_at,
+                "from": { "kind": match m.from_kind() {
+                        proto::Kind::Agent => "agent",
+                        proto::Kind::Remote => "remote",
+                        _ => "human",
+                    },
+                    "name": m.from_name, "owner": m.from_owner },
+                "original_from": m.original_from, "reported": m.reported == Some(true),
+                "notice": m.group_notice == Some(true), "in_reply_to": m.in_reply_to,
+                "to": { "group": m.to_group, "name": m.to_name, "owner": m.to_owner },
+                "body": m.body, "truncated": hit.truncated,
+                "body_offset_bytes": hit.body_offset_bytes,
+                "original_body_bytes": hit.original_body_bytes,
+                "match_offset_bytes": hit.match_offset_bytes,
+                "match_length_bytes": hit.match_length_bytes,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(serde_json::to_string(
         &json!({ "hits": hits, "has_more": response.has_more,
         "next_before_id": response.next_before_id, "since": since, "until": until }),
@@ -485,14 +542,32 @@ pub fn tool_list() -> Value {
             "name": "bbs_send",
             "description": "Send a BBS message to an agent or a human, or to @group to broadcast to a group where you have write access (marked [w] in bbs_group_list; only a human can grant it). Use blocker tools for structured group help requests.",
             "inputSchema": object(json!({
-                "to": string("Agent or human name, or @group"),
+                "to": string("Agent or human name, @group, or id:ENTITY@NAMESPACE for an entity in another namespace (see bbs_directory)"),
                 "body": string("Message text (at most 64 KiB)"),
             }), &["to", "body"]),
+        },
+        {
+            "name": "bbs_reply",
+            "description": "Reply to a message you received, by its id (shown as (id N) in mail headers and bbs_history). The reply goes to the message's exact sender, or for a copy from another installation's group (from X via GROUP) to its original sender X, not the group, and is marked as answering that message. A group notice has no sender to reply to.",
+            "inputSchema": object(json!({
+                "message_id": json!({ "type": "integer", "description": "The id of the message to reply to" }),
+                "body": string("Message text (at most 64 KiB)"),
+            }), &["message_id", "body"]),
         },
         {
             "name": "bbs_agents",
             "description": "List the agents in your groups, with their status notes and last activity.",
             "inputSchema": object(json!({}), &[]),
+        },
+        {
+            "name": "bbs_directory",
+            "description": "List the entities another namespace (such as hub) publishes, or look one up by alias or ID, through this BBS's Hub integration. Each line starts with the id:ENTITY@NAMESPACE that bbs_send accepts as its recipient. An unreachable or unknown namespace is an error, never an empty list.",
+            "inputSchema": object(json!({
+                "namespace": string("The other installation's namespace, e.g. hub"),
+                "alias": string("Look up the entity with this alias; mutually exclusive with id."),
+                "id": string("Look up the entity with this exact entity ID; mutually exclusive with alias."),
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Show at most this many entities; default 50." },
+            }), &["namespace"]),
         },
         {
             "name": "bbs_status",
@@ -507,7 +582,7 @@ pub fn tool_list() -> Value {
                 "case_sensitive": { "type": "boolean", "default": false },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
                 "before_id": { "type": "integer", "minimum": 1, "description": "Exclusive message-ID cursor from the previous response's next_before_id." },
-                "from": string("Only messages sent by this agent or human name; retired agents included."),
+                "from": string("Only messages sent by this agent or human name; retired agents included. A copy from another installation's group matches the group, not its original sender."),
                 "with": string("Only messages sent by or directly to this agent or human; not broadcasts delivered to it."),
                 "group": string("Only broadcasts to this group name, with or without @; archived groups included."),
                 "since": string("Inclusive start time: RFC3339 or a duration like 7d."),
@@ -642,6 +717,30 @@ pub fn tool_list() -> Value {
 #[cfg(test)]
 mod search_tests {
     use super::*;
+
+    #[test]
+    fn the_directory_tool_offers_a_bounded_limit() {
+        let tools = tool_list();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "bbs_directory")
+            .unwrap();
+        let limit = &tool["inputSchema"]["properties"]["limit"];
+        assert_eq!(limit["maximum"], MAX_DIRECTORY_LIMIT);
+        assert_eq!(DEFAULT_DIRECTORY_LIMIT, 50);
+    }
+
+    /// The MCP server acts only as the runner's existing agent: it offers no
+    /// way to register one.
+    #[test]
+    fn no_tool_registers_an_agent() {
+        for tool in tool_list().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            assert!(!name.contains("register"), "{name}");
+        }
+    }
 
     #[tokio::test]
     async fn goal_updates_are_left_for_the_runner() {
@@ -857,6 +956,74 @@ mod search_tests {
         assert!(
             block(json!(mine.id)).await.is_ok(),
             "the chain's current version is open"
+        );
+    }
+
+    #[tokio::test]
+    async fn bbs_reply_refuses_the_owner_when_output_already_reaches_them() {
+        use crate::service::Caller;
+        let board = tempfile::tempdir().unwrap();
+        let mut db = crate::db::open(&board.path().join("bbs.db")).unwrap();
+        crate::db::migrate(&mut db).unwrap();
+        drop(db);
+        let config = Config::default();
+        let open = |caller: Caller| Backend::open(&config, board.path(), caller);
+        let human = |name: &str| Caller {
+            human: Some(name.into()),
+            ..Default::default()
+        };
+        let mut will = open(human("will")).await.unwrap();
+        for name in ["will", "ada"] {
+            will.ensure_human(proto::EnsureHumanRequest { name: name.into() })
+                .await
+                .unwrap();
+        }
+        let token = will
+            .register(proto::RegisterRequest {
+                name: Some("Agent".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .token;
+        let mut ada = open(human("ada")).await.unwrap();
+        let mut say = async |b: &mut Backend, body: &str| {
+            b.send(proto::SendRequest {
+                to: "Agent".into(),
+                body: body.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap()
+        };
+        let from_will = say(&mut will, "from will").await;
+        let from_ada = say(&mut ada, "from ada").await;
+        let tools = || Tools {
+            local: true,
+            ..Tools::new(board.path(), token.clone())
+        };
+        let reply = async |mut tools: Tools, id: Value| {
+            tools
+                .call("bbs_reply", &json!({"message_id": id, "body": "re"}))
+                .await
+                .map_err(|e| format!("{e:#}"))
+        };
+        let err = reply(tools().auto_owner_reply(), json!(from_will))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Nothing was sent."), "{err}");
+        // Another sender is answered; the id may be a numeric string.
+        assert_eq!(
+            reply(tools().auto_owner_reply(), json!(from_ada.to_string())).await,
+            Ok("Replied to ada.".to_string())
+        );
+        assert!(reply(tools(), json!("x")).await.is_err());
+        // Without automatic owner delivery, the owner is answered like anyone.
+        assert_eq!(
+            reply(tools(), json!(from_will)).await,
+            Ok("Replied to will.".to_string())
         );
     }
 

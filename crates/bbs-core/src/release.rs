@@ -213,10 +213,11 @@ pub fn print(json: bool, manifest: bool) -> anyhow::Result<()> {
             (Provenance::Unknown, revision) => format!("{revision}, changes unknown"),
         };
         println!(
-            "{} {} ({source}, {})\nprotocol bbs.v{}: {}\nschema {}, config format {}",
+            "{} {} ({source}, {})\nprotocol {}, epoch {}: {}\nschema {}, config format {}",
             identity().name,
             report.version,
             report.target,
+            crate::protocol::PACKAGE,
             report.protocol.epoch,
             report.protocol.capabilities.join(", "),
             report.schema_version,

@@ -1,9 +1,12 @@
 //! Immutable blocker versions, terminal events and operation receipts.
 
+use std::sync::LazyLock;
+
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{Kind, Principal};
+use super::{Kind, Principal, address_sql, addresses_sql};
+use crate::entity::EntityKind;
 
 pub struct Outcome {
     pub kind: String,
@@ -39,15 +42,18 @@ pub struct Row {
     pub choices: Option<String>,
 }
 
-const SELECT: &str = "SELECT b.id, b.group_id, g.name, g.archived_at,
+/// The blocker query. A cancel notice is matched by its native addresses: the
+/// actor's as sender and the creator's as recipient.
+static SELECT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT b.id, b.group_id, g.name, g.archived_at,
     a.id, a.name, h.name, b.body, b.created_at, COALESCE(b.root_id, b.id),
     b.replaces, successor.id, e.kind, e.actor_kind, e.actor_id,
     CASE e.actor_kind WHEN 'human' THEN eh.name ELSE ea.name END,
     e.created_at, e.answer, COALESCE(e.message_id, (SELECT m.id FROM messages m
-        JOIN deliveries d ON d.message_id = m.id
-            AND d.recipient_kind = 'agent' AND d.recipient_id = b.creator_id
         WHERE e.kind = 'cancelled' AND m.created_at = e.created_at
-            AND m.from_kind = e.actor_kind AND m.from_id = e.actor_id
+            AND m.sender_address_id IN ({actor})
+            AND m.recipient_address_id = {creator}
             AND m.to_group_id IS NULL
             AND substr(m.body, 1, length('Blocker #' || b.id || ' in @'))
                 = 'Blocker #' || b.id || ' in @'
@@ -62,7 +68,14 @@ const SELECT: &str = "SELECT b.id, b.group_id, g.name, g.archived_at,
     LEFT JOIN humans eh ON e.actor_kind = 'human' AND eh.id = e.actor_id
     LEFT JOIN agents ea ON e.actor_kind = 'agent' AND ea.id = e.actor_id
     LEFT JOIN agent_owners actor_link ON e.actor_kind = 'agent' AND actor_link.agent_id = e.actor_id
-    LEFT JOIN humans actor_owner ON actor_owner.id = actor_link.human_id";
+    LEFT JOIN humans actor_owner ON actor_owner.id = actor_link.human_id",
+        actor = addresses_sql(
+            "(e.actor_kind = 'human' AND nb.human_id = e.actor_id)
+             OR (e.actor_kind = 'agent' AND nb.agent_id = e.actor_id)"
+        ),
+        creator = address_sql(EntityKind::Agent, "b.creator_id"),
+    )
+});
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     let outcome = if let Some(kind) = r.get::<_, Option<String>>(12)? {
@@ -109,13 +122,16 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
 
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Row>> {
     Ok(conn
-        .query_row(&format!("{SELECT} WHERE b.id = ?1"), [id], read_row)
+        .query_row(&format!("{} WHERE b.id = ?1", *SELECT), [id], read_row)
         .optional()?)
 }
 
 pub fn head(conn: &Connection, root: i64) -> Result<Row> {
     Ok(conn.query_row(
-        &format!("{SELECT} WHERE COALESCE(b.root_id, b.id) = ?1 AND successor.id IS NULL"),
+        &format!(
+            "{} WHERE COALESCE(b.root_id, b.id) = ?1 AND successor.id IS NULL",
+            *SELECT
+        ),
         [root],
         read_row,
     )?)
@@ -123,7 +139,8 @@ pub fn head(conn: &Connection, root: i64) -> Result<Row> {
 
 pub fn history(conn: &Connection, root: i64, before: i64, limit: usize) -> Result<Vec<Row>> {
     let mut query = conn.prepare(&format!(
-        "{SELECT} WHERE COALESCE(b.root_id, b.id) = ?1 AND b.id < ?2 ORDER BY b.id DESC LIMIT ?3"
+        "{} WHERE COALESCE(b.root_id, b.id) = ?1 AND b.id < ?2 ORDER BY b.id DESC LIMIT ?3",
+        *SELECT
     ))?;
     Ok(query
         .query_map(params![root, before, limit as i64], read_row)?
@@ -166,11 +183,12 @@ pub fn list(
     };
     let comparison = if order == "DESC" { "<" } else { ">" };
     let mut query = conn.prepare(&format!(
-        "{SELECT} WHERE {} AND successor.id IS NULL
+        "{select} WHERE {scope} AND successor.id IS NULL
          AND ({predicate})
          AND (?4 IS NULL OR COALESCE(b.root_id, b.id) {comparison} ?4)
          ORDER BY COALESCE(b.root_id, b.id) {order} LIMIT ?5",
-        scope()
+        select = *SELECT,
+        scope = scope()
     ))?;
     Ok(query
         .query_map(params![group, agent, human, cursor, limit as i64], read_row)?

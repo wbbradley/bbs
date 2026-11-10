@@ -155,6 +155,40 @@ service Bbs {
   // other senders are refused, broadcasts and others' timers are not
   // delivered to it, and the agent can message only its owner.
   rpc SetFocus(SetFocusRequest) returns (SetFocusResponse);
+
+  // Hub federation (remote-directory.v1): list or look up the entities
+  // another namespace's home publishes, asked through the integration that
+  // reaches it (bound to the namespace, else the only usable one) as the
+  // caller's own entity. Needs that integration connected and publishing.
+  // A remote failure is an error, never an empty directory: NOT_FOUND for an
+  // unknown namespace or entity, INVALID_ARGUMENT for a bad selector or page
+  // token, PERMISSION_DENIED for a refusal or an answer that fails
+  // verification, DEADLINE_EXCEEDED for a timeout, RESOURCE_EXHAUSTED for
+  // too many queries waiting, UNAVAILABLE otherwise; the message starts with
+  // Hub's reason code.
+  rpc RemoteDirectory(RemoteDirectoryRequest) returns (RemoteDirectoryResponse);
+}
+
+message RemoteDirectoryRequest {
+  string namespace = 1;     // another installation's namespace, e.g. "hub"
+  // At most one selector; neither lists the published entities in pages.
+  string alias = 2;         // resolve this alias
+  string entity_id = 3;     // exact entity ID
+  bytes page_token = 4;     // next_page_token of the previous page
+  uint32 page_size = 5;     // 0: the remote home's default
+}
+message RemoteEntity {
+  string namespace = 1;
+  string entity_id = 2;     // `bbs send --to id:ENTITY@NAMESPACE` reaches it
+  string kind = 3;          // descriptive: human, agent, service, ...
+  string display_name = 4;
+  repeated string aliases = 5;
+  string description = 6;
+  string lifecycle = 7;     // "active", "retired", or "" when unspecified
+}
+message RemoteDirectoryResponse {
+  repeated RemoteEntity entities = 1;
+  bytes next_page_token = 2;  // empty on the last page
 }
 
 message SetFocusRequest {
@@ -393,6 +427,9 @@ enum Kind {
   KIND_UNSPECIFIED = 0;
   KIND_AGENT = 1;
   KIND_HUMAN = 2;
+  // A sender in another installation, reached through a Hub integration
+  // (Message.from_kind only). Its from_name is `id:ENTITY@NAMESPACE`.
+  KIND_REMOTE = 3;
 }
 
 message Principal {
@@ -479,6 +516,16 @@ message SendRequest {
   string body = 2;
   // Humans only, direct to an agent they own. Requires agent-control.v1.
   optional Control control = 3;
+  // Reply to the message with this id, which must have been delivered to the
+  // caller. The server picks the recipient (the message's exact sender, or a
+  // group copy's original sender) and sets the reply's in_reply_to; `to` must
+  // then be empty, so a server that predates this field, which ignores it,
+  // refuses the send for want of a recipient instead of sending elsewhere.
+  // Needs no capability: that refusal is the old server's answer.
+  optional int64 reply_to = 4;
+  // With reply_to, from an agent whose ordinary output already reaches its
+  // owner (a headless agent): refuse a reply that would go to that owner.
+  bool not_to_owner = 5;
 }
 message SendResponse {
   string to = 1;                   // canonical recipient: "Juliana" or "@acme"
@@ -726,6 +773,22 @@ message Message {
   optional int64 timer_id = 13;      // inbox only: the timer that sent it
   // Set when the message was sent via AutoReply; absent on older servers.
   optional bool auto_reply = 14;
+  // A group copy from another installation (from_name is the group): its
+  // original sender, as `id:ENTITY@NAMESPACE`, as the group's home reports
+  // it. Clients show it as `ORIGINAL via GROUP`; one that does not know this
+  // field shows the group, which did send the copy. Absent on older servers
+  // and other messages.
+  optional string original_from = 15;
+  // A group copy that the group itself sent (a membership notice): there is
+  // no original sender to reply to.
+  optional bool group_notice = 16;
+  // With original_from: the original sender is in another namespace than the
+  // group, so it is only the group's home's claim, not a verified identity.
+  optional bool reported = 17;
+  // The message this one answers: its id here as a decimal number when this
+  // installation has it and the reader can see it, else its origin as
+  // `NAMESPACE:MESSAGE_ID`.
+  optional string in_reply_to = 18;
 }
 
 message WaitRequest { optional uint32 limit = 1; }

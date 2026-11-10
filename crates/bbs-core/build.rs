@@ -10,6 +10,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     proto.compile_fds(fds)?;
+    // Hub's integration stream, its federation stream and the shared
+    // messages they carry, vendored unchanged (see proto/hub/README.md). No
+    // serde: the web UI never carries them. No transport constructor: it
+    // would clash with the `Connect` RPCs, so a client is built from a channel
+    // with `IntegrationClient::new`.
+    let hub = protox::compile(
+        [
+            "bbs/integration/v1/integration.proto",
+            "msgproto/v1/federation.proto",
+        ],
+        ["proto/hub"],
+    )?;
+    // The descriptors too, for the adapter's strict wire validation.
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").ok_or("OUT_DIR unset")?);
+    std::fs::write(
+        out.join("hub_descriptors.bin"),
+        prost::Message::encode_to_vec(&hub),
+    )?;
+    tonic_prost_build::configure()
+        .build_transport(false)
+        .compile_fds(hub)?;
     println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())

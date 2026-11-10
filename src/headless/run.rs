@@ -1325,14 +1325,17 @@ fn preamble(agent: &str, owner: &str, instructions: Option<&str>, timers: bool) 
          and permission events are not sent as chat.\n\n\
          To contact other recipients, use the bbs_* tools: bbs_send messages an agent, another human, or a @group \
          (broadcasting needs write access, which only a human can grant; without it, \
-         message one of the group's writers), bbs_agents and bbs_group_list show who is around, bbs_status sets what you are \
-         working on, and bbs_history rereads past messages. bbs_search searches the whole board \
+         message one of the group's writers), bbs_reply answers a message you received by its id, \
+         bbs_agents and bbs_group_list show who is around, bbs_status sets what you are \
+         working on, and bbs_history rereads past messages. bbs_directory lists or looks up \
+         entities in another namespace such as hub, each with the id:ENTITY@NAMESPACE that \
+         bbs_send accepts. bbs_search searches the whole board \
          by literal message text, including other conversations. You can also join and leave \
          groups. bbs_blockers lists group help requests; bbs_blocker_put creates or replaces \
          one with immutable history, bbs_blocker_get reads its chain, and bbs_blocker_cancel \
          cancels it. Creation sends no ordinary mail; a human answer arrives as mail.\n\n\
          Direct messages from your owning human arrive as plain user input. Other mail \
-         includes BBS sender and recipient headers; humans there are marked (human). If a message needs \
+         includes BBS sender and recipient headers with each message's id; humans there are marked (human). If a message needs \
          no reply, end your turn without sending anything. {}\n\n",
         wake_sentence(timers)
     );
@@ -1370,8 +1373,18 @@ async fn report_drain(
     }
 }
 
+/// Whether a failed mail wait must end the run: a credential error, a protocol
+/// incompatibility (an upgraded server refuses this client for good), or an
+/// inbox another process still holds after `SLOT_RETRIES` tries.
+fn mail_wait_fatal(err: &anyhow::Error, slot_retries: u32) -> bool {
+    let text = format!("{err:#}");
+    text.contains("token")
+        || crate::protocol::is_incompatible(err)
+        || (text.contains("already running") && slot_retries >= SLOT_RETRIES)
+}
+
 /// Keep one mail wait open for the agent and forward each batch. Retries on
-/// connection errors; stops on a credential error.
+/// connection errors; stops on a credential error or an incompatible server.
 async fn wait_for_mail(
     config: Config,
     dir: PathBuf,
@@ -1388,6 +1401,10 @@ async fn wait_for_mail(
         if backend.is_none() {
             match Backend::open(&config, &dir, caller.clone()).await {
                 Ok(b) => backend = Some(b),
+                Err(err) if crate::protocol::is_incompatible(&err) => {
+                    let _ = tx.send(Err(err));
+                    return;
+                }
                 Err(err) => {
                     tracing::warn!("headless mail wait: {err:#}");
                     tokio::time::sleep(MAIL_RETRY).await;
@@ -1404,13 +1421,12 @@ async fn wait_for_mail(
                 }
             }
             Err(err) => {
-                let text = format!("{err:#}");
-                let busy = text.contains("already running");
-                if text.contains("token") || (busy && slot_retries >= SLOT_RETRIES) {
+                if mail_wait_fatal(&err, slot_retries) {
                     let _ = tx.send(Err(err));
                     return;
                 }
-                if busy {
+                let text = format!("{err:#}");
+                if text.contains("already running") {
                     slot_retries += 1;
                 }
                 tracing::warn!("headless mail wait: {text}");
@@ -1424,6 +1440,24 @@ async fn wait_for_mail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mail_waits_end_on_incompatible_servers_and_dead_tokens() {
+        // As the client reports a server's epoch rejection.
+        let status = tonic::Status::failed_precondition(
+            "incompatible BBS protocol: this server requires epoch 4 (bbs.v2); upgrade the client and server together",
+        );
+        let message = status.message().to_string();
+        let epoch = anyhow::Error::new(status).context(message);
+        assert!(mail_wait_fatal(&epoch, 0));
+        let token = anyhow::anyhow!("unknown or retired token");
+        assert!(mail_wait_fatal(&token, 0));
+        let busy = anyhow::anyhow!("another `bbs read --wait` is already running for Mateo");
+        assert!(!mail_wait_fatal(&busy, SLOT_RETRIES - 1));
+        assert!(mail_wait_fatal(&busy, SLOT_RETRIES));
+        let down = anyhow::Error::new(tonic::Status::unavailable("connection refused"));
+        assert!(!mail_wait_fatal(&down, 0));
+    }
 
     fn message(id: i64, kind: proto::Kind, name: &str, body: &str) -> proto::Message {
         proto::Message {
@@ -1596,7 +1630,7 @@ mod tests {
         assert_eq!(ids, vec![vec![1], vec![2], vec![3], vec![4, 5]]);
         assert_eq!(prompts[1], "second");
         assert_eq!(prompts[2], "third");
-        assert!(prompts[0].contains("from Peer to Ade:"));
+        assert!(prompts[0].contains("from Peer to Ade (id 1):"));
         assert!(prompts[3].starts_with("New BBS mail (2 messages):"));
         assert!(prompts[3].find("fourth").unwrap() < prompts[3].find("fifth").unwrap());
     }

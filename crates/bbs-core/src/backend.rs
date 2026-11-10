@@ -46,6 +46,8 @@ pub const FEED_SYNC: &str = "feed-sync.v1";
 pub const AGENT_FOCUS: &str = "agent-focus.v1";
 pub const AGENT_GOAL: &str = "agent-goal.v1";
 pub const TIMERS_EDIT: &str = "timers-edit.v1";
+/// Listing and looking up another namespace's entities through Hub.
+pub const REMOTE_DIRECTORY: &str = "remote-directory.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -135,14 +137,44 @@ impl Remote {
     }
 }
 
-/// The server sends the service's error text as the status message.
+/// The server sends the service's error text as the status message. A
+/// compatibility refusal also names the version to upgrade to, from the
+/// server's hints.
 fn status_error(status: tonic::Status) -> anyhow::Error {
-    let message = if status.code() == tonic::Code::Unimplemented {
+    let mut message = if status.code() == tonic::Code::Unimplemented {
         "BBS v2 service is unavailable; coordinate a client/server upgrade".to_string()
     } else {
         status.message().to_string()
     };
+    if status.code() == tonic::Code::FailedPrecondition && message.starts_with("incompatible BBS") {
+        let version = |key| {
+            status
+                .metadata()
+                .get(key)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| semver::Version::parse(v).ok())
+        };
+        if let Some(target) = version("bbs-recommended-client-version") {
+            message.push_str(&format!(
+                "; the server recommends bbs {target}: cargo install --locked bbs-cli --version '~{target}'"
+            ));
+        } else if let Some(server) = version("bbs-server-version") {
+            message.push_str(&format!("; the server runs bbs {server}"));
+        }
+    }
     anyhow::Error::new(status).context(message)
+}
+
+/// Explain a reply's refusal by a server that predates replies: it ignores
+/// `reply_to` and refuses the empty recipient as unknown. Public so the
+/// server's tests can check this against what such a server says.
+pub fn replies_unsupported(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<tonic::Status>() {
+        Some(s) if s.message().trim_end() == "no such agent or human:" => {
+            e.context("incompatible BBS server: it does not support replies; upgrade the server")
+        }
+        _ => e,
+    }
 }
 
 /// A v2 server older than an RPC answers UNIMPLEMENTED before it checks the
@@ -512,6 +544,9 @@ impl Backend {
             Backend::Remote(r) if req.control.is_some() => {
                 rpc!(r, send, req, &[AGENT_CONTROL]).map_err(|e| missing_rpc(e, AGENT_CONTROL))
             }
+            Backend::Remote(r) if req.reply_to.is_some() => {
+                rpc!(r, send, req).map_err(replies_unsupported)
+            }
             Backend::Remote(r) => rpc!(r, send, req),
         }
     }
@@ -787,6 +822,22 @@ impl Backend {
             }
             Backend::Remote(r) => rpc!(r, timer_update, req, &[TIMERS, TIMERS_EDIT])
                 .map_err(|e| missing_rpc(e, TIMERS_EDIT)),
+        }
+    }
+
+    /// List or look up another namespace's entities through the server's
+    /// Hub integration; only a server has one.
+    pub async fn remote_directory(
+        &mut self,
+        req: proto::RemoteDirectoryRequest,
+    ) -> Result<proto::RemoteDirectoryResponse> {
+        match self {
+            Backend::Local(_) => bail!(
+                "remote directories need a BBS server with a Hub integration; a local board \
+                 has none (configure one with `bbs init --server`)"
+            ),
+            Backend::Remote(r) => rpc!(r, remote_directory, req, &[REMOTE_DIRECTORY])
+                .map_err(|e| missing_rpc(e, REMOTE_DIRECTORY)),
         }
     }
 
@@ -1145,11 +1196,11 @@ mod tests {
             let mut original = tonic::Status::new(code, "test failure");
             original
                 .metadata_mut()
-                .insert("bbs-protocol-epoch", "2".parse().unwrap());
+                .insert("bbs-protocol-epoch", "3".parse().unwrap());
             let error = status_error(original);
             let status = error.downcast_ref::<tonic::Status>().unwrap();
             assert_eq!(status.code(), code);
-            assert_eq!(status.metadata().get("bbs-protocol-epoch").unwrap(), "2");
+            assert_eq!(status.metadata().get("bbs-protocol-epoch").unwrap(), "3");
             if code == tonic::Code::Unimplemented {
                 assert!(
                     error
@@ -1158,6 +1209,27 @@ mod tests {
                 );
             }
         }
+        // A compatibility refusal names the version to upgrade to.
+        let refusal = |hints: &[(&'static str, &str)]| {
+            let mut status = tonic::Status::failed_precondition(
+                "incompatible BBS protocol: this server requires epoch 3 (bbs.v2); upgrade the client and server together",
+            );
+            for (key, value) in hints {
+                status.metadata_mut().insert(*key, value.parse().unwrap());
+            }
+            status_error(status).to_string()
+        };
+        let text = refusal(&[
+            ("bbs-server-version", "0.25.0"),
+            ("bbs-recommended-client-version", "0.25.1"),
+        ]);
+        assert!(
+            text.ends_with("; the server recommends bbs 0.25.1: cargo install --locked bbs-cli --version '~0.25.1'"),
+            "{text}"
+        );
+        let text = refusal(&[("bbs-server-version", "0.25.0")]);
+        assert!(text.ends_with("; the server runs bbs 0.25.0"), "{text}");
+        assert!(refusal(&[("bbs-server-version", "not semver")]).ends_with("together"));
     }
 
     struct PendingBody;
@@ -1449,7 +1521,7 @@ mod tests {
         );
         for ((path, headers), (method, capabilities)) in observed.iter().zip(expected) {
             assert_eq!(path, &format!("/bbs.v2.Bbs/{method}"));
-            assert_eq!(headers["bbs-protocol-epoch"], "2");
+            assert_eq!(headers["bbs-protocol-epoch"], "3");
             assert_eq!(headers["bbs-client-version"], crate::release::VERSION);
             assert_eq!(
                 headers

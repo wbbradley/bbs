@@ -72,6 +72,8 @@ impl Board {
                 to: "worker".into(),
                 body: body.into(),
                 control: control.map(Into::into),
+                reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap()
@@ -102,13 +104,11 @@ impl Board {
         .unwrap()
     }
     fn reject_new_registration(&mut self) {
-        for name in [Some("newcomer"), None] {
-            let error = register(&mut self.conn, &self.owner, name).unwrap_err();
-            assert!(
-                error.to_string().contains("resume delivery in Settings"),
-                "{error:#}"
-            );
-        }
+        let error = register(&mut self.conn, &self.owner, Some("newcomer")).unwrap_err();
+        assert!(
+            error.to_string().contains("resume delivery in Settings"),
+            "{error:#}"
+        );
         let count: i64 = self
             .conn
             .query_row("SELECT count(*) FROM agents", [], |r| r.get(0))
@@ -191,6 +191,8 @@ fn cancellation_still_requires_the_owner_while_frozen() {
                 to: "worker".into(),
                 body: "cancel".into(),
                 control: Some(proto::Control::Cancel.into()),
+                reply_to: None,
+                not_to_owner: false,
             },
         );
         assert!(result.is_err());
@@ -256,5 +258,11 @@ fn empty_ready_barrier_refuses_new_agents_and_retired_names_stay_blocked() {
         assert!(error.to_string().contains("resume delivery in Settings"));
     }
     b.drain("resume");
-    register(&mut b.conn, &b.owner, Some("worker")).unwrap();
+    register(&mut b.conn, &b.owner, Some("newcomer")).unwrap();
+    // A retired agent's Hub ID is never reused.
+    let error = register(&mut b.conn, &b.owner, Some("worker")).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("belongs to a retired agent"),
+        "{error:#}"
+    );
 }

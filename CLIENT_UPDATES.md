@@ -22,7 +22,8 @@ config format; integration compatibility is not yet recorded) and refuses a
 version that is already tagged or released. There is no update command. The image
 publication workflow is separate from CLI installation.
 
-The wire service is `bbs.v2` with protocol epoch `2`. Every request except
+The wire service is `bbs.v2` with protocol epoch `3`. Epoch 3 marks the Hub
+entity/address model (schema 27); an epoch 2 client stops at its first request. Every request except
 `ServerInfo` and health carries `bbs-client-version`, `bbs-protocol-epoch`, and,
 when the operation depends on one, `bbs-required-capabilities` (for example
 `named-agents.v1` for a requested name, `group-archive.v1` for group deletion,
@@ -35,12 +36,20 @@ capabilities are `named-agents.v1`, `owner-attribution.v1`,
 `group-writers.v1`, and `group-add.v1`. `bbs serve --minimum-client-version` rejects absent, malformed,
 or older client versions; `--recommended-client-version` is advisory.
 
+Epoch 3 servers refuse a registration without an agent name. Clients before
+epoch 3 (0.24 and earlier) registered without one when no name was given, but
+they are already refused at their first request; an epoch 3 `bbs register`
+requires `--name`.
+
 Clients older than `group-writers.v1` still work against a newer server, but
 `bbs group list` does not mark writers and an agent's refused broadcast shows
 only the server's error text.
 
 `ServerInfo` returns `require_human_token`, release version and revision, protocol
 epoch, capabilities, and the optional minimum and recommended client versions.
+A client refuses a `ServerInfo` whose capability names exceed 8 KiB together
+(each is at most 128 bytes of `[A-Za-z0-9.-]`) as an incompatible server; there
+is no limit on how many it lists.
 Responses, errors, and opened streams carry compact server version, epoch, and
 policy hints. The client validates `ServerInfo` during `bbs init`, keeps typed gRPC
 status on errors, and reports `UNIMPLEMENTED` as a coordinated upgrade; successful
@@ -63,7 +72,7 @@ Use separate identifiers for separate decisions:
 | --- | --- |
 | Package version | SemVer from Cargo.toml; published tags `vMAJOR.MINOR.PATCH` |
 | Build revision | Full Git commit; `unknown` when provenance is unavailable; dirty development builds are marked |
-| Protocol epoch | Integer `2` with the new `bbs.v2` wire service; the existing `bbs.v1` service is legacy and requires coordinated bootstrap |
+| Protocol epoch | Integer `3` on the `bbs.v2` wire service (epoch 2 predates the Hub model); the existing `bbs.v1` service is legacy and requires coordinated bootstrap |
 | Capabilities | Stable strings for optional behavior, currently `named-agents.v1`, `owner-attribution.v1`, `human-token-sessions.v1`, `group-archive.v1`, `group-description.v1`, `feed-filter.v1`, `agent-control.v1`, `agent-token-rotate.v1`, `group-writers.v1`, and `group-add.v1` |
 | Minimum client version | Optional operator policy; rejection applies only when configured |
 | Recommended client version | Optional advisory hint, independent of the server package version |

@@ -7,4 +7,5 @@ use bbs_core::backend;
 use bbs_core::release;
 use bbs_core::{auth, db, proto, protocol, service};
 
+pub mod hub_migration;
 pub mod serve;

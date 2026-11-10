@@ -527,4 +527,25 @@ describe("feed cards", () => {
     expect(links("msg-1")).toEqual(["/agents/Jefe"]);
     expect(links("msg-2")).toEqual(["/groups/crew"]);
   });
+
+  it("show another installation's entities as remote, never as a human or a linked agent", () => {
+    go("/agents", true);
+    render(
+      <>
+        <MessageView
+          m={mail(1, "id:bob@hub", "Mateo", { from_kind: 3, to_owner: "ada" })}
+          me={ADA.name}
+          mode={{ kind: "feed" }}
+        />
+        <MessageView m={mail(2, "Mateo", "id:will/scout@hub")} me={ADA.name} mode={{ kind: "feed" }} />
+      </>,
+    );
+    const head = (id: string) => document.querySelector(`#${id} .msg-head`)!;
+    const from = [...head("msg-1").querySelectorAll(".remote")].map((e) => e.textContent);
+    expect(from).toEqual(["id:bob@hub"]);
+    expect(head("msg-1").querySelector(".human")).toBeNull();
+    expect([...head("msg-1").querySelectorAll("a")].map((a) => a.getAttribute("href"))).toEqual(["/agents/Mateo"]);
+    expect([...head("msg-2").querySelectorAll(".remote")].map((e) => e.textContent)).toEqual(["id:will/scout@hub"]);
+    expect([...head("msg-2").querySelectorAll("a")].map((a) => a.getAttribute("href"))).toEqual(["/agents/Mateo"]);
+  });
 });

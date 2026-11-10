@@ -262,7 +262,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
         },
         Command::Register { name, note } => {
             let req = proto::RegisterRequest {
-                name,
+                name: Some(name),
                 note,
                 pwd: std::env::current_dir()
                     .map(|p| p.display().to_string())
@@ -306,6 +306,8 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 to,
                 body: read_body(body)?,
                 control: None,
+                reply_to: None,
+                not_to_owner: false,
             };
             let r = backend.send(req).await?;
             let mut out = match r.recipients {
@@ -320,6 +322,12 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 );
             }
             out
+        }
+        Command::Reply { message_id, body } => {
+            let r = backend
+                .send(reply_request(message_id, read_body(body)?))
+                .await?;
+            format!("Replied to {}.\n", r.to)
         }
         Command::Read {
             limit,
@@ -348,7 +356,160 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 format_agents(&r)
             }
         }
+        Command::Directory {
+            namespace,
+            alias,
+            id,
+            limit,
+            json,
+        } => {
+            let req = proto::RemoteDirectoryRequest {
+                namespace: namespace.trim().to_string(),
+                alias: alias.unwrap_or_default().trim().to_string(),
+                entity_id: id.unwrap_or_default().trim().to_string(),
+                ..Default::default()
+            };
+            let limit = (limit as usize).min(MAX_DIRECTORY_LIMIT);
+            let (entities, more) = remote_directory(backend, req.clone(), limit).await?;
+            if more {
+                eprintln!("(more exist; only the first {limit} are shown)");
+            }
+            if json {
+                directory_json(&entities)?
+            } else {
+                format_directory(&req, &entities)
+            }
+        }
     })
+}
+
+/// The most entities one `bbs directory` listing shows, and its default.
+pub(crate) const MAX_DIRECTORY_LIMIT: usize = 2000;
+/// The largest page a remote home is asked for.
+const DIRECTORY_PAGE: usize = 100;
+
+/// The pages of a remote directory listing, up to `limit` entities; true
+/// when there are more.
+pub(crate) async fn remote_directory(
+    backend: &mut Backend,
+    mut req: proto::RemoteDirectoryRequest,
+    limit: usize,
+) -> Result<(Vec<proto::RemoteEntity>, bool)> {
+    let mut entities = Vec::new();
+    loop {
+        let want = limit
+            .saturating_sub(entities.len())
+            .clamp(1, DIRECTORY_PAGE);
+        req.page_size = want as u32;
+        let page = backend.remote_directory(req.clone()).await?;
+        entities.extend(page.entities);
+        if entities.len() >= limit || page.next_page_token.is_empty() {
+            let more = entities.len() > limit || !page.next_page_token.is_empty();
+            entities.truncate(limit);
+            return Ok((entities, more));
+        }
+        req.page_token = page.next_page_token;
+    }
+}
+
+/// Whether `c` is invisible formatting another home could use to disguise
+/// text: bidirectional overrides, embeddings, isolates and marks, and
+/// zero-width characters.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{061C}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Remote text as shown: without invisible formatting characters.
+fn visible(text: &str) -> String {
+    text.chars().filter(|c| !invisible(*c)).collect()
+}
+
+/// Remote text shown on one line: control characters become spaces, and
+/// invisible formatting is dropped.
+fn one_line(text: &str) -> String {
+    visible(text)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// One line per entity: `id:ENTITY@NAMESPACE  kind  display name  [aliases]`,
+/// the first column as `bbs send --to` takes it.
+pub(crate) fn format_directory(
+    req: &proto::RemoteDirectoryRequest,
+    entities: &[proto::RemoteEntity],
+) -> String {
+    if entities.is_empty() {
+        let ns = &req.namespace;
+        return match (req.alias.as_str(), req.entity_id.as_str()) {
+            ("", "") => format!("No entities are published in {ns}.\n"),
+            (alias, "") => format!("No entity in {ns} has the alias {alias}.\n"),
+            (_, id) => format!("No entity {id} in {ns}.\n"),
+        };
+    }
+    let rows: Vec<[String; 3]> = entities
+        .iter()
+        .map(|e| {
+            let mut kind = one_line(&e.kind);
+            if e.lifecycle == "retired" {
+                kind.push_str(" (retired)");
+            }
+            let mut name = one_line(&e.display_name);
+            if !e.aliases.is_empty() {
+                let aliases: Vec<_> = e.aliases.iter().map(|a| one_line(a)).collect();
+                let _ = write!(name, "  [{}]", aliases.join(", "));
+            }
+            [format!("id:{}@{}", e.entity_id, e.namespace), kind, name]
+        })
+        .collect();
+    let width = |i: usize| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
+    let (id_w, kind_w) = (width(0), width(1));
+    let mut out = String::new();
+    for [id, kind, name] in rows {
+        let line = format!("{id:<id_w$}  {kind:<kind_w$}  {name}");
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// Remote text in JSON is escaped where it is a control character, but
+/// invisible formatting is dropped, as in text.
+#[derive(Serialize)]
+struct DirectoryJson<'a> {
+    /// As `bbs send --to` takes it: `id:ENTITY@NAMESPACE`.
+    id: String,
+    namespace: &'a str,
+    entity_id: &'a str,
+    kind: String,
+    display_name: String,
+    aliases: Vec<String>,
+    description: String,
+    /// "active", "retired", or "" when the remote home does not say.
+    lifecycle: &'a str,
+}
+
+pub(crate) fn directory_json(entities: &[proto::RemoteEntity]) -> Result<String> {
+    json_lines(entities.iter().map(|e| DirectoryJson {
+        id: format!("id:{}@{}", e.entity_id, e.namespace),
+        namespace: &e.namespace,
+        entity_id: &e.entity_id,
+        kind: visible(&e.kind),
+        display_name: visible(&e.display_name),
+        aliases: e.aliases.iter().map(|a| visible(a)).collect(),
+        description: visible(&e.description),
+        lifecycle: &e.lifecycle,
+    }))
 }
 
 /// Validate remote enrollment before saving credentials or changing config.
@@ -460,6 +621,16 @@ struct MessageJson<'a> {
     body: &'a str,
     /// The timer that sent it; null for other messages.
     timer: Option<i64>,
+    /// A group copy from another installation (`from` is the group): its
+    /// original sender. Null otherwise.
+    original_from: Option<&'a str>,
+    /// With `original_from`: it is only the group's home's claim.
+    reported: bool,
+    /// A notice the group sent itself: there is no sender to reply to.
+    notice: bool,
+    /// The message this one answers: its id here, or `NAMESPACE:MESSAGE_ID`
+    /// when this server does not have it. Null otherwise.
+    in_reply_to: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -482,6 +653,7 @@ fn kind_name(kind: proto::Kind) -> &'static str {
     match kind {
         proto::Kind::Agent => "agent",
         proto::Kind::Human => "human",
+        proto::Kind::Remote => "remote",
         proto::Kind::Unspecified => "unspecified",
     }
 }
@@ -589,6 +761,26 @@ pub(crate) fn timer_line(t: &proto::Timer) -> String {
     )
 }
 
+/// A reply to message `id`: no recipient, which the server picks. A server
+/// that predates replies ignores `reply_to` and refuses the empty recipient.
+pub(crate) fn reply_request(id: i64, body: String) -> proto::SendRequest {
+    proto::SendRequest {
+        to: String::new(),
+        body,
+        control: None,
+        reply_to: Some(id),
+        not_to_owner: false,
+    }
+}
+
+/// ` (reply to REF)` for a message that answers another, else nothing.
+pub(crate) fn reply_marker(m: &proto::Message) -> String {
+    m.in_reply_to
+        .as_deref()
+        .map(|r| format!(" (reply to {r})"))
+        .unwrap_or_default()
+}
+
 pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<String> {
     if json {
         return json_lines(msgs.iter().map(|m| MessageJson {
@@ -601,6 +793,10 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
             group: m.to_group.as_deref(),
             body: &m.body,
             timer: m.timer_id,
+            original_from: m.original_from.as_deref(),
+            reported: m.reported == Some(true),
+            notice: m.group_notice == Some(true),
+            in_reply_to: m.in_reply_to.as_deref(),
         }));
     }
     let mut out = String::new();
@@ -608,11 +804,14 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
         if i > 0 {
             out.push('\n');
         }
-        let human = if m.from_kind() == proto::Kind::Human {
-            " (human)"
-        } else {
-            ""
-        };
+        let from = m.group_copy_sender().unwrap_or_else(|| {
+            let marker = match m.from_kind() {
+                proto::Kind::Human => " (human)",
+                proto::Kind::Remote => " (remote)",
+                _ => "",
+            };
+            format!("{}{marker}", m.sender_display_name())
+        });
         let to = match (&m.to_group, &m.to_name) {
             (Some(g), _) => format!("@{g}"),
             (None, to) => to.clone().unwrap_or_default(),
@@ -623,9 +822,10 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
             .unwrap_or_default();
         writeln!(
             out,
-            "[{}] from {}{human} to {to}{timer}:",
+            "[{}] from {from} to {to} (id {}){}{timer}:",
             display_time(&m.created_at),
-            m.sender_display_name()
+            m.id,
+            reply_marker(m),
         )?;
         out.push_str(m.body.trim_end_matches('\n'));
         out.push('\n');
@@ -733,12 +933,130 @@ mod tests {
     use super::*;
 
     #[test]
+    fn directory_lines_lead_with_the_sendable_id() {
+        let entity = |id: &str, kind: &str, name: &str, aliases: &[&str], lifecycle: &str| {
+            proto::RemoteEntity {
+                namespace: "hub".into(),
+                entity_id: id.into(),
+                kind: kind.into(),
+                display_name: name.into(),
+                aliases: aliases.iter().map(|a| a.to_string()).collect(),
+                description: String::new(),
+                lifecycle: lifecycle.into(),
+            }
+        };
+        let req = proto::RemoteDirectoryRequest {
+            namespace: "hub".into(),
+            ..Default::default()
+        };
+        let entities = [
+            entity(
+                "will",
+                "human",
+                "Will\x1b[2J\u{202E}\u{200B} B.\u{2066}\u{FEFF}",
+                &["wi\u{200D}ll"],
+                "active",
+            ),
+            entity("echo", "agent", "Echo", &[], "retired"),
+        ];
+        assert_eq!(
+            format_directory(&req, &entities),
+            "id:will@hub  human            Will [2J B.  [will]\n\
+             id:echo@hub  agent (retired)  Echo\n"
+        );
+        assert_eq!(
+            format_directory(&req, &[]),
+            "No entities are published in hub.\n"
+        );
+        let alias = proto::RemoteDirectoryRequest {
+            alias: "ada".into(),
+            ..req.clone()
+        };
+        assert_eq!(
+            format_directory(&alias, &[]),
+            "No entity in hub has the alias ada.\n"
+        );
+        let json = directory_json(&entities[..1]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+        assert_eq!(v["id"], "id:will@hub");
+        assert_eq!(v["aliases"][0], "will");
+        assert_eq!(v["display_name"], "Will\x1b[2J B.");
+        assert!(
+            Cli::try_parse_from(["bbs", "directory", "hub", "--alias", "a", "--id", "b"]).is_err()
+        );
+        for bad in ["0", "2001"] {
+            assert!(Cli::try_parse_from(["bbs", "directory", "hub", "--limit", bad]).is_err());
+        }
+    }
+
+    #[test]
+    fn read_output_shows_ids_replies_and_group_copies() {
+        let at = "2026-11-09T12:00:00.000000Z".to_string();
+        let copy = proto::Message {
+            id: 7,
+            created_at: at.clone(),
+            from_kind: proto::Kind::Remote.into(),
+            from_name: "id:release@hub".into(),
+            to_name: Some("scout".into()),
+            body: "ship it".into(),
+            original_from: Some("id:ann@hub".into()),
+            ..Default::default()
+        };
+        let notice = proto::Message {
+            id: 8,
+            original_from: None,
+            group_notice: Some(true),
+            ..copy.clone()
+        };
+        let reply = proto::Message {
+            id: 9,
+            from_kind: proto::Kind::Human.into(),
+            from_name: "will".into(),
+            original_from: None,
+            in_reply_to: Some("3".into()),
+            ..copy.clone()
+        };
+        // What a client that does not know original_from sees: the group.
+        let unaware = proto::Message {
+            id: 10,
+            original_from: None,
+            ..copy.clone()
+        };
+        let text = format_messages(&[copy.clone(), notice, reply, unaware], false).unwrap();
+        let headers: Vec<_> = text.lines().filter(|l| l.starts_with('[')).collect();
+        let time = display_time(&at);
+        assert_eq!(
+            headers,
+            [
+                format!("[{time}] from id:ann@hub via id:release@hub to scout (id 7):"),
+                format!("[{time}] from group id:release@hub (notice) to scout (id 8):"),
+                format!("[{time}] from will (human) to scout (id 9) (reply to 3):"),
+                format!("[{time}] from id:release@hub (remote) to scout (id 10):"),
+            ]
+        );
+        let json = format_messages(&[copy], true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+        assert_eq!(v["from"], "id:release@hub");
+        assert_eq!(v["original_from"], "id:ann@hub");
+        assert_eq!(v["reported"], false);
+        assert_eq!(v["notice"], false);
+        assert_eq!(v["in_reply_to"], serde_json::Value::Null);
+        let reply = Cli::parse_from(["bbs", "reply", "7", "-"]);
+        assert!(matches!(
+            reply.command,
+            Some(Command::Reply { message_id: 7, body: Some(ref b) }) if b == "-"
+        ));
+        let err = Cli::try_parse_from(["bbs", "reply", "DiCkgwvQ", "hi"]).unwrap_err();
+        assert!(err.to_string().contains("(id N)"), "{err}");
+    }
+
+    #[test]
     fn update_notice_is_for_humans_only() {
         let wants = |args: &[&str]| wants_update_notice(&Cli::parse_from(args));
         assert!(wants(&["bbs", "agents"]));
         assert!(wants(&["bbs", "group", "register", "g"]));
         assert!(!wants(&["bbs", "--token", "t", "agents"]));
-        assert!(!wants(&["bbs", "register"]));
+        assert!(!wants(&["bbs", "register", "--name", "a"]));
     }
 
     #[test]

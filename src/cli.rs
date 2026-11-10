@@ -64,16 +64,18 @@ pub enum Command {
     },
     /// Register a new agent and print its name and token.
     Register {
-        /// Requested agent name; fail if already reserved (case-insensitive).
+        /// The agent's name, short and descriptive; fails if already reserved
+        /// (case-insensitive) or ever used by one of your agents.
         #[arg(long)]
-        name: Option<String>,
+        name: String,
         /// Initial status note.
         #[arg(long)]
         note: Option<String>,
     },
     /// Update this agent's status note.
     Status { text: String },
-    /// Retire this agent, freeing its name and invalidating its token.
+    /// Retire this agent and invalidate its token. Its owner cannot reuse its
+    /// name: Hub IDs are never reused.
     Bye,
     /// Retire another agent and announce it to its groups (humans only).
     Retire { agent: String },
@@ -92,6 +94,16 @@ pub enum Command {
         /// Recipient name, or @group to broadcast.
         #[arg(long)]
         to: String,
+        /// Message body; read from stdin when omitted or "-".
+        body: Option<String>,
+    },
+    /// Reply to a message you received, by the id `bbs read` shows. It goes to
+    /// the message's exact sender, or for a copy from another installation's
+    /// group to its original sender, and is marked as answering it.
+    Reply {
+        /// The id of the message to reply to, the N in `(id N)`.
+        #[arg(value_parser = parse_reply_id)]
+        message_id: i64,
         /// Message body; read from stdin when omitted or "-".
         body: Option<String>,
     },
@@ -175,6 +187,25 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List the entities another namespace (such as Hub) publishes, or look
+    /// one up, through the server's Hub integration. Each line starts with
+    /// the `id:ENTITY@NAMESPACE` that `bbs send --to` accepts.
+    Directory {
+        /// The other installation's namespace, e.g. hub.
+        namespace: String,
+        /// Look up the entity with this alias.
+        #[arg(long, conflicts_with = "id")]
+        alias: Option<String>,
+        /// Look up the entity with this exact ID.
+        #[arg(long, value_name = "ENTITY")]
+        id: Option<String>,
+        /// Show at most this many entities (at most 2000).
+        #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u32).range(1..=2000))]
+        limit: u32,
+        /// Print one JSON object per entity (JSONL) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Where `bbs setup` installs; existing settings and custom handlers are kept.
@@ -202,7 +233,8 @@ pub struct ViewArgs {
     #[arg(long)]
     pub group: Option<String>,
     /// Only messages sent by this agent or human; @<human> also matches every
-    /// agent that human owns.
+    /// agent that human owns. A Hub group copy is sent by its group, which
+    /// matches it; its original sender does not.
     #[arg(long, value_name = "NAME")]
     pub from: Option<String>,
     /// Only messages sent by this agent or human, or sent directly to it.
@@ -243,6 +275,37 @@ pub enum AdminCommand {
         #[command(subcommand)]
         command: AdminHumanCommand,
     },
+    /// Manage Hub integrations: the adapter's credential and the publication
+    /// switch. Add and rotate print a new credential once to stdout.
+    Integration {
+        #[command(subcommand)]
+        command: AdminIntegrationCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminIntegrationCommand {
+    /// Create an integration, with publication off, and issue its credential.
+    Add { id: String },
+    /// Replace the integration's credential, enabling it; a stream on the old
+    /// one ends.
+    Rotate { id: String },
+    /// Revoke the integration's credential and disable it: a stream on it
+    /// ends, and remote sends through it are refused until a rotate.
+    Revoke { id: String },
+    /// Publish every active human and agent to the integration (on), or
+    /// none, refusing remote sends (off).
+    Publish {
+        id: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Clear another installation's namespace binding, so the next
+    /// integration to import from it or send to it takes it.
+    Unbind { namespace: String },
+    /// List integrations, their publication, their handoffs by state and the
+    /// namespaces bound to them.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -504,4 +567,11 @@ pub struct HeadlessRunArgs {
     /// Stop after this many turns fail in a row (default 3).
     #[arg(long)]
     pub max_turn_errors: Option<std::num::NonZeroU32>,
+}
+
+/// A message id as BBS shows it. Says so when given something else, such as
+/// an id another home showed for the same message.
+fn parse_reply_id(s: &str) -> Result<i64, String> {
+    s.parse()
+        .map_err(|_| "use the number shown as (id N) by bbs read or bbs view".into())
 }
