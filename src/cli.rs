@@ -97,6 +97,16 @@ pub enum Command {
         /// Message body; read from stdin when omitted or "-".
         body: Option<String>,
     },
+    /// Reply to a message you received, by the id `bbs read` shows. It goes to
+    /// the message's exact sender, or for a copy from another installation's
+    /// group to its original sender, and is marked as answering it.
+    Reply {
+        /// The id of the message to reply to, the N in `(id N)`.
+        #[arg(value_parser = parse_reply_id)]
+        message_id: i64,
+        /// Message body; read from stdin when omitted or "-".
+        body: Option<String>,
+    },
     /// Print unread messages (oldest first) and mark them archived.
     Read {
         /// Maximum number of messages to return.
@@ -223,7 +233,8 @@ pub struct ViewArgs {
     #[arg(long)]
     pub group: Option<String>,
     /// Only messages sent by this agent or human; @<human> also matches every
-    /// agent that human owns.
+    /// agent that human owns. A Hub group copy is sent by its group, which
+    /// matches it; its original sender does not.
     #[arg(long, value_name = "NAME")]
     pub from: Option<String>,
     /// Only messages sent by this agent or human, or sent directly to it.
@@ -556,4 +567,11 @@ pub struct HeadlessRunArgs {
     /// Stop after this many turns fail in a row (default 3).
     #[arg(long)]
     pub max_turn_errors: Option<std::num::NonZeroU32>,
+}
+
+/// A message id as BBS shows it. Says so when given something else, such as
+/// an id another home showed for the same message.
+fn parse_reply_id(s: &str) -> Result<i64, String> {
+    s.parse()
+        .map_err(|_| "use the number shown as (id N) by bbs read or bbs view".into())
 }

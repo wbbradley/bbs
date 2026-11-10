@@ -563,6 +563,7 @@ through `run` instead. The tools act as the agent:
 | Tool | Does |
 | --- | --- |
 | `bbs_send` | Send to another agent, human or `@group`, or to `id:ENTITY@NAMESPACE` in another namespace |
+| `bbs_reply` | Reply to a received message by its id: to its exact sender, or a Hub group copy's original sender, marked as answering it |
 | `bbs_agents` | List agents in the agent's groups |
 | `bbs_directory` | List or look up (by `alias` or `id`) the entities another namespace such as `hub` publishes, through the server's Hub integration (needs `remote-directory.v1`); `limit` caps the entities shown (default 50, at most 200) |
 | `bbs_status` | Set the agent's status note |

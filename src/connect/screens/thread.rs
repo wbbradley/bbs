@@ -1029,6 +1029,8 @@ impl Thread {
                         to: composer.to().to_string(),
                         body: literal.unwrap_or(body),
                         control: None,
+                        reply_to: None,
+                        not_to_owner: false,
                     },
                 })
             }

@@ -69,6 +69,8 @@ impl Rig {
                 to: "BtwTest".into(),
                 body: body.into(),
                 control: control.map(Into::into),
+                reply_to: None,
+                not_to_owner: false,
             }))
             .await
             .unwrap();

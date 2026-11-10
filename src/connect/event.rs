@@ -558,6 +558,8 @@ pub async fn serve(
                             to: agent.clone(),
                             body: value,
                             control: Some(proto::Control::SetEffort as i32),
+                            reply_to: None,
+                            not_to_owner: false,
                         })
                         .await
                         .map(|r| r.id)
@@ -3194,6 +3196,8 @@ mod tests {
                     to: "Mateo".into(),
                     body: "hi".into(),
                     control: None,
+                    reply_to: None,
+                    not_to_owner: false,
                 },
             })
             .unwrap();
@@ -3290,6 +3294,8 @@ mod tests {
                 to: "ada".into(),
                 body: body.into(),
                 control: None,
+                reply_to: None,
+                not_to_owner: false,
             },
         )
         .unwrap();

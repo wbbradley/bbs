@@ -550,12 +550,14 @@ fn route(ctx: &Ctx, namespace: &str, what: &str) -> Result<String> {
 
 /// Send a native message to a remote address: the message and its pending
 /// handoff are stored together, in the caller's transaction. Publication must
-/// be on for the integration that reaches the address.
+/// be on for the integration that reaches the address. A reply names the
+/// origin `(namespace, message ID)` it answers as `in_reply_to`.
 pub(super) fn send_remote(
     ctx: &Ctx,
     me: &db::Principal,
     reference: &str,
     body: &str,
+    in_reply_to: Option<(&str, &str)>,
 ) -> Result<(i64, String)> {
     let remote = entity::parse_remote(reference)?;
     let (namespace, entity_id, address_id) = (
@@ -597,7 +599,10 @@ pub(super) fn send_remote(
         expires_at_unix_micros: Some(expires.timestamp_micros()),
         content_type: CONTENT_TYPE.to_string(),
         body: body.as_bytes().to_vec(),
-        in_reply_to: None,
+        in_reply_to: in_reply_to.map(|(namespace, message_id)| mp::MessageRef {
+            namespace: namespace.to_string(),
+            message_id: message_id.to_string(),
+        }),
         kind: mp::MessageKind::Application as i32,
         delivery_error: None,
         group_copy: None,
@@ -618,7 +623,7 @@ pub(super) fn send_remote(
             created_at: &ctx.now_s,
             authored_at: &ctx.now_s,
             expires_at: Some(&fmt_time(expires)),
-            in_reply_to: None,
+            in_reply_to,
             group_copy: None,
             encoded: &encoded,
         },

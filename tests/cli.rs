@@ -139,6 +139,14 @@ impl Bbs {
         String::from_utf8(out.stdout).unwrap()
     }
 
+    /// `bbs read` or `bbs view` text without its message ids, which vary
+    /// from run to run.
+    fn read(&self, args: &[&str]) -> String {
+        static ID: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| regex::Regex::new(r" \(id \d+\)").unwrap());
+        ID.replace_all(&self.ok(args), "").into_owned()
+    }
+
     fn err(&self, args: &[&str]) -> String {
         let out = self.run(args);
         assert!(!out.status.success(), "bbs {args:?} unexpectedly succeeded");
@@ -447,20 +455,20 @@ fn cross_owner_messages_are_qualified_for_each_reader(mode: Mode) {
     }
     bbs.grant_write("acme", &sender);
     for token in [&ts, &same_token, &other_token] {
-        bbs.ok(&["--token", token, "read"]);
+        bbs.read(&["--token", token, "read"]);
     }
     bbs.ok(&["--token", &ts, "send", "--to", "@acme", "broadcast"]);
-    let same_mail = bbs.ok(&["--token", &same_token, "read"]);
-    let other_mail = bbs.ok(&["--token", &other_token, "read"]);
+    let same_mail = bbs.read(&["--token", &same_token, "read"]);
+    let other_mail = bbs.read(&["--token", &other_token, "read"]);
     assert!(same_mail.contains("from Jeffrey to @acme:"), "{same_mail}");
     assert!(
         other_mail.contains("from Jeffrey@will to @acme:"),
         "{other_mail}"
     );
-    assert!(bbs.ok(&["read"]).contains("from Jeffrey to @acme:"));
+    assert!(bbs.read(&["read"]).contains("from Jeffrey to @acme:"));
 
     bbs.ok(&["--token", &ts, "send", "--to", &other, "direct"]);
-    let direct = bbs.ok(&["--token", &other_token, "read", "--wait"]);
+    let direct = bbs.read(&["--token", &other_token, "read", "--wait"]);
     assert!(
         direct.contains(&format!("from Jeffrey@will to {other}:\ndirect")),
         "{direct}"
@@ -473,7 +481,7 @@ fn cross_owner_messages_are_qualified_for_each_reader(mode: Mode) {
         "jeffrey@WILL",
         "reply",
     ]);
-    let reply = bbs.ok(&["--token", &ts, "read"]);
+    let reply = bbs.read(&["--token", &ts, "read"]);
     assert!(
         reply.contains(&format!("from {other}@Ada to Jeffrey:")),
         "{reply}"
@@ -491,7 +499,7 @@ fn cross_owner_messages_are_qualified_for_each_reader(mode: Mode) {
     );
     bbs.ok(&["--token", &ts, "send", "--to", &same, "same owner"]);
     assert!(
-        bbs.ok(&["--token", &same_token, "read"])
+        bbs.read(&["--token", &same_token, "read"])
             .contains("from Jeffrey to ")
     );
 
@@ -511,10 +519,10 @@ fn cross_owner_messages_are_qualified_for_each_reader(mode: Mode) {
     bbs.ok(&["--token", &replacement, "group", "join", "acme"]);
     bbs.ok(&["--token", &replacement, "send", "--to", &other, "new owner"]);
     assert!(
-        bbs.ok(&["--token", &other_token, "read"])
+        bbs.read(&["--token", &other_token, "read"])
             .contains(&format!("from Jeffrey to {other}:\nnew owner"))
     );
-    let history = bbs.ok(&["--token", &other_token, "read", "--archived"]);
+    let history = bbs.read(&["--token", &other_token, "read", "--archived"]);
     assert!(
         history.contains(&format!("from Jeffrey@will to {other}:\ndirect")),
         "{history}"
@@ -596,7 +604,7 @@ fn online_backup_preserves_committed_state_and_restores() {
     assert!(!destination.with_file_name("snapshot.db-wal").exists());
     // The live server still works; changes after the snapshot stay out of it.
     assert!(
-        bbs.ok(&["--token", &token, "read"])
+        bbs.read(&["--token", &token, "read"])
             .contains("saved message")
     );
     bbs.ok(&["send", "--to", &name, "after backup"]);
@@ -820,14 +828,14 @@ fn remote_backend_round_trip() {
     let b = register_out.split('"').nth(1).unwrap();
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
     bbs.grant_write("acme", &a);
-    bbs.ok(&["--token", &ta, "read"]);
+    bbs.read(&["--token", &ta, "read"]);
     bbs.ok(&["--token", &ta, "send", "--to", "will", "hi"]);
     assert!(
-        bbs.ok(&["read"])
+        bbs.read(&["read"])
             .contains(&format!("from {a} to will:\nhi"))
     );
     bbs.ok(&["--token", &ta, "send", "--to", "@acme", "standup"]);
-    assert!(bbs.ok(&["read"]).contains("standup"));
+    assert!(bbs.read(&["read"]).contains("standup"));
     assert_eq!(bbs.ok(&["whoami"]), "will\n");
 
     // Hooks bind through the server but leave mail for the listener.
@@ -860,7 +868,7 @@ fn remote_backend_round_trip() {
             .is_none()
         );
     }
-    assert!(bbs.ok(&["--token", tb, "read"]).contains("from will"));
+    assert!(bbs.read(&["--token", tb, "read"]).contains("from will"));
 
     // `read --wait` blocks on the server until mail arrives.
     let mut waiter = bbs.spawn(&["--token", &ta, "read", "--wait"]);
@@ -899,15 +907,51 @@ fn direct_messages_within_group(mode: Mode) {
     bbs.ok(&["--token", &tb, "group", "join", "acme"]);
     bbs.ok(&["--token", &ta, "send", "--to", &b, "hello there"]);
 
-    let out = bbs.ok(&["--token", &tb, "read"]);
+    let out = bbs.read(&["--token", &tb, "read"]);
     assert!(
         out.contains(&format!("from {a} to {b}:\nhello there\n")),
         "{out}"
     );
     // Archived after reading: empty stdout, exit 0.
-    assert_eq!(bbs.ok(&["--token", &tb, "read"]), "");
-    let out = bbs.ok(&["--token", &tb, "read", "--archived", "--since", "1h"]);
+    assert_eq!(bbs.read(&["--token", &tb, "read"]), "");
+    let out = bbs.read(&["--token", &tb, "read", "--archived", "--since", "1h"]);
     assert!(out.contains("hello there"), "{out}");
+}
+
+fn replies_answer_the_sender_by_message_id(mode: Mode) {
+    let bbs = Bbs::with_mode("reply", mode);
+    let (a, ta) = bbs.register();
+    bbs.ok(&["send", "--to", &a, "status?"]);
+    let mail = bbs.ok(&["--token", &ta, "read"]);
+    let id: i64 = regex::Regex::new(r"\(id (\d+)\):")
+        .unwrap()
+        .captures(&mail)
+        .unwrap_or_else(|| panic!("no id in {mail}"))[1]
+        .parse()
+        .unwrap();
+    let id = id.to_string();
+    assert_eq!(
+        bbs.run_with_stdin(&["--token", &ta, "reply", &id], "all green\n")
+            .status
+            .code(),
+        Some(0)
+    );
+    let answer = bbs.ok(&["read"]);
+    assert!(
+        answer.contains(&format!(" (reply to {id}):\nall green")),
+        "{answer}"
+    );
+    assert!(
+        answer.contains(&format!("from {a} to will (id ")),
+        "{answer}"
+    );
+    // Your own message, or one you never received, is refused.
+    let own = bbs.err(&["reply", &id, "again"]);
+    assert!(own.contains(&format!("you sent message {id}")), "{own}");
+    assert!(
+        bbs.err(&["reply", "999999", "x"])
+            .contains("no message 999999")
+    );
 }
 
 fn humans_and_agents_message_each_other(mode: Mode) {
@@ -917,20 +961,20 @@ fn humans_and_agents_message_each_other(mode: Mode) {
     // Any human, with no shared group; agents see humans to address.
     bbs.ok(&["--token", &ta, "send", "--to", "alice", "need input"]);
     assert!(
-        bbs.ok(&["--as", "alice", "read"])
+        bbs.read(&["--as", "alice", "read"])
             .contains(&format!("from {a} to alice:\nneed input"))
     );
     assert!(bbs.ok(&["--token", &ta, "agents"]).contains("alice"));
     bbs.ok(&["send", "--to", "alice", "lunch?"]);
     assert!(
-        bbs.ok(&["--as", "alice", "read"])
+        bbs.read(&["--as", "alice", "read"])
             .contains("from will (human) to alice:\nlunch?")
     );
 
     assert!(bbs.err(&["send", "--to", &a, "-"]).contains("empty"));
     let out = bbs.run_with_stdin(&["send", "--to", &a], "multi\nline\n");
     assert!(out.status.success());
-    let out = bbs.ok(&["--token", &ta, "read"]);
+    let out = bbs.read(&["--token", &ta, "read"]);
     assert!(out.contains("from will (human)"), "{out}");
     assert!(out.contains("multi\nline\n"), "{out}");
 }
@@ -966,18 +1010,18 @@ fn broadcast_reaches_members_and_humans(mode: Mode) {
     assert!(out.contains("1 recipients"), "{out}"); // humans are not counted for agents
 
     assert!(
-        bbs.ok(&["--token", &tb, "read"])
+        bbs.read(&["--token", &tb, "read"])
             .contains(&format!("from {a} to @acme:\nstandup"))
     );
     // A has only B's join notice and the grant, not its own broadcast.
-    assert!(!bbs.ok(&["--token", &ta, "read"]).contains("standup"));
-    assert_eq!(bbs.ok(&["--token", &tc, "read"]), "");
-    assert!(bbs.ok(&["--as", "alice", "read"]).contains("standup"));
+    assert!(!bbs.read(&["--token", &ta, "read"]).contains("standup"));
+    assert_eq!(bbs.read(&["--token", &tc, "read"]), "");
+    assert!(bbs.read(&["--as", "alice", "read"]).contains("standup"));
 
     let out = bbs.ok(&["send", "--to", "@acme", "from a human"]);
     assert!(out.contains("3 recipients"), "{out}"); // both agents + alice
     assert!(
-        bbs.ok(&["--token", &ta, "read"])
+        bbs.read(&["--token", &ta, "read"])
             .contains("from will (human) to @acme")
     );
 }
@@ -1009,9 +1053,9 @@ fn bye_notifies_and_leaves_groups(mode: Mode) {
     bbs.ok(&["--token", &tb, "group", "join", "g"]);
     bbs.ok(&["--token", &tc, "group", "join", "h"]);
     for t in [&tb, &tc] {
-        bbs.ok(&["--token", t, "read"]);
+        bbs.read(&["--token", t, "read"]);
     }
-    bbs.ok(&["read"]);
+    bbs.read(&["read"]);
 
     bbs.ok(&["--token", &ta, "bye"]);
     let from_g = format!(
@@ -1020,17 +1064,17 @@ fn bye_notifies_and_leaves_groups(mode: Mode) {
     let from_h = format!(
         "from {a} to @h:\nAgent {a:?} retired. Agent {a:?} is no longer a member of group @h.\n"
     );
-    let mail_b = bbs.ok(&["--token", &tb, "read"]);
+    let mail_b = bbs.read(&["--token", &tb, "read"]);
     assert!(
         mail_b.contains(&from_g) && !mail_b.contains("@h"),
         "{mail_b}"
     );
-    let mail_c = bbs.ok(&["--token", &tc, "read"]);
+    let mail_c = bbs.read(&["--token", &tc, "read"]);
     assert!(
         mail_c.contains(&from_h) && !mail_c.contains("@g"),
         "{mail_c}"
     );
-    let human = bbs.ok(&["read"]);
+    let human = bbs.read(&["read"]);
     assert!(
         human.contains(&from_g) && human.contains(&from_h),
         "{human}"
@@ -1047,8 +1091,8 @@ fn humans_retire_agents(mode: Mode) {
     for t in [&ta, &tb] {
         bbs.ok(&["--token", t, "group", "join", "g"]);
     }
-    bbs.ok(&["--token", &ta, "read"]);
-    bbs.ok(&["--as", "ada", "read"]);
+    bbs.read(&["--token", &ta, "read"]);
+    bbs.read(&["--as", "ada", "read"]);
 
     assert!(
         bbs.err(&["--token", &tb, "retire", &a])
@@ -1058,8 +1102,8 @@ fn humans_retire_agents(mode: Mode) {
     let notice = format!(
         "from will (human) to @g:\nHuman \"will\" retired agent {a:?}. Agent {a:?} is no longer a member of group @g.\n"
     );
-    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&notice));
-    assert!(bbs.ok(&["--as", "ada", "read"]).contains(&notice));
+    assert!(bbs.read(&["--token", &tb, "read"]).contains(&notice));
+    assert!(bbs.read(&["--as", "ada", "read"]).contains(&notice));
     assert!(
         bbs.err(&["--token", &ta, "read"])
             .contains("unknown or retired token")
@@ -1112,7 +1156,7 @@ fn idle_agents_stay_live_and_restart_with_their_identity(mode: Mode) {
             .to_string();
         assert_ne!(new, old);
         assert_eq!(identity(), before);
-        assert!(bbs.ok(&["--token", &new, "read"]).contains("old news"));
+        assert!(bbs.read(&["--token", &new, "read"]).contains("old news"));
     }
 
     // After an explicit retirement a new run is refused: Hub IDs are never
@@ -1218,7 +1262,7 @@ fn deleting_groups_archives_history_and_removes_access(mode: Mode) {
     }
     bbs.grant_write("acme", &a);
     for token in [&ta, &tb] {
-        bbs.ok(&["--token", token, "read"]);
+        bbs.read(&["--token", token, "read"]);
     }
     bbs.ok(&["--token", &ta, "group", "join", "other"]);
     bbs.ok(&[
@@ -1285,21 +1329,21 @@ fn deleting_groups_archives_history_and_removes_access(mode: Mode) {
     assert!(archived);
     assert_eq!(members, 2);
     let notice = "Human \"will\" archived group @acme.";
-    let unread = bbs.ok(&["--token", &tb, "read"]);
+    let unread = bbs.read(&["--token", &tb, "read"]);
     assert!(unread.contains("to @acme:\nretained broadcast"), "{unread}");
     assert_eq!(unread.matches(notice).count(), 1, "{unread}");
-    let history = bbs.ok(&["--token", &tb, "read", "--archived"]);
+    let history = bbs.read(&["--token", &tb, "read", "--archived"]);
     assert!(history.contains("to @acme:\nretained broadcast"));
     assert!(history.contains(notice));
-    assert!(bbs.ok(&["--token", &ta, "read"]).contains(notice));
+    assert!(bbs.read(&["--token", &ta, "read"]).contains(notice));
 
     // Sharing another active group still grants access independently.
     bbs.ok(&["--token", &tb, "group", "join", "other"]);
     bbs.ok(&["--token", &ta, "send", "--to", &b, "allowed"]);
-    assert!(bbs.ok(&["--token", &tb, "read"]).contains("allowed"));
-    bbs.ok(&["read"]);
+    assert!(bbs.read(&["--token", &tb, "read"]).contains("allowed"));
+    bbs.read(&["read"]);
     bbs.ok(&["--token", &ta, "bye"]);
-    let retirement = bbs.ok(&["read"]);
+    let retirement = bbs.read(&["read"]);
     assert!(retirement.contains("@other"));
     assert!(!retirement.contains("@acme"), "{retirement}");
 
@@ -1320,7 +1364,7 @@ fn deleting_groups_archives_history_and_removes_access(mode: Mode) {
             .contains("no such group")
     );
     assert!(
-        bbs.ok(&["--token", &tb, "read", "--archived"])
+        bbs.read(&["--token", &tb, "read", "--archived"])
             .contains("retained broadcast")
     );
 }
@@ -1330,7 +1374,7 @@ fn group_archive_rolls_back_notice_on_failure(mode: Mode) {
     bbs.ok(&["group", "register", "acme"]);
     let (a, ta) = bbs.register();
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
-    bbs.ok(&["read"]);
+    bbs.read(&["read"]);
     let db = bbs.db();
     db.execute_batch(
         "CREATE TRIGGER reject_archive BEFORE UPDATE OF archived_at ON bbs_groups
@@ -1342,12 +1386,12 @@ fn group_archive_rolls_back_notice_on_failure(mode: Mode) {
             .contains("archive blocked")
     );
     assert_eq!(bbs.ok(&["group", "list"]), format!("@acme: {a}\n"));
-    assert_eq!(bbs.ok(&["--token", &ta, "read"]), "");
-    assert_eq!(bbs.ok(&["read"]), "");
+    assert_eq!(bbs.read(&["--token", &ta, "read"]), "");
+    assert_eq!(bbs.read(&["read"]), "");
     db.execute_batch("DROP TRIGGER reject_archive").unwrap();
     bbs.ok(&["group", "delete", "acme"]);
     assert!(
-        bbs.ok(&["--token", &ta, "read"])
+        bbs.read(&["--token", &ta, "read"])
             .contains("archived group @acme")
     );
     bbs.ok(&["group", "register", "empty"]);
@@ -1370,8 +1414,8 @@ fn groups_carry_human_written_descriptions(mode: Mode) {
     bbs.ok(&["group", "register", "plain"]);
     let (a, ta) = bbs.register();
     bbs.ok(&["--token", &ta, "group", "join", "infra"]);
-    bbs.ok(&["read"]);
-    bbs.ok(&["--token", &ta, "read"]);
+    bbs.read(&["read"]);
+    bbs.read(&["--token", &ta, "read"]);
 
     // Stored trimmed, shown indented under its group; groups without one are unchanged.
     let listing = format!("@infra: {a}\n  GPU fleet and deploys\n@plain: (no agents)\n");
@@ -1423,7 +1467,7 @@ fn groups_carry_human_written_descriptions(mode: Mode) {
             .ends_with("@plain: (no agents)\n")
     );
     // Describing is quiet metadata, not a lifecycle notice.
-    assert_eq!(bbs.ok(&["--token", &ta, "read"]), "");
+    assert_eq!(bbs.read(&["--token", &ta, "read"]), "");
 
     // Validation happens in the service and never half-applies.
     let max = "d".repeat(200);
@@ -1497,17 +1541,17 @@ fn joining_notifies_the_group(mode: Mode) {
     bbs.ok(&["--token", &tb, "group", "join", "g"]);
 
     let joined = format!("from {b} to @g:\nAgent {b:?} joined group @g.\n");
-    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&joined));
-    assert!(bbs.ok(&["read"]).contains(&joined));
-    assert_eq!(bbs.ok(&["--token", &tb, "read"]), "");
+    assert!(bbs.read(&["--token", &ta, "read"]).contains(&joined));
+    assert!(bbs.read(&["read"]).contains(&joined));
+    assert_eq!(bbs.read(&["--token", &tb, "read"]), "");
 
     // Re-joining is a no-op and announces nothing.
     assert!(
         bbs.ok(&["--token", &tb, "group", "join", "g"])
             .contains("Already in @g.")
     );
-    assert_eq!(bbs.ok(&["--token", &ta, "read"]), "");
-    assert_eq!(bbs.ok(&["read"]), "");
+    assert_eq!(bbs.read(&["--token", &ta, "read"]), "");
+    assert_eq!(bbs.read(&["read"]), "");
 }
 
 fn leaving_or_removal_notifies_the_group(mode: Mode) {
@@ -1524,21 +1568,21 @@ fn leaving_or_removal_notifies_the_group(mode: Mode) {
 
     bbs.ok(&["--token", &tc, "group", "leave", "acme"]);
     let left = format!("from {c} to @acme:\nAgent {c:?} left group @acme.\n");
-    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&left));
-    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&left));
-    assert!(bbs.ok(&["read"]).contains(&left));
-    assert_eq!(bbs.ok(&["--token", &tc, "read"]), "");
-    assert_eq!(bbs.ok(&["--token", &td, "read"]), "");
+    assert!(bbs.read(&["--token", &ta, "read"]).contains(&left));
+    assert!(bbs.read(&["--token", &tb, "read"]).contains(&left));
+    assert!(bbs.read(&["read"]).contains(&left));
+    assert_eq!(bbs.read(&["--token", &tc, "read"]), "");
+    assert_eq!(bbs.read(&["--token", &td, "read"]), "");
 
     bbs.ok(&["group", "remove", "acme", &a]);
     let removed = format!(
         "from will (human) to @acme:\nHuman \"will\" removed agent {a:?} from group @acme.\n"
     );
-    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&removed));
-    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&removed));
-    assert!(bbs.ok(&["--as", "ada", "read"]).contains(&removed));
-    assert!(!bbs.ok(&["read"]).contains("removed"));
-    assert_eq!(bbs.ok(&["--token", &tc, "read"]), "");
+    assert!(bbs.read(&["--token", &ta, "read"]).contains(&removed));
+    assert!(bbs.read(&["--token", &tb, "read"]).contains(&removed));
+    assert!(bbs.read(&["--as", "ada", "read"]).contains(&removed));
+    assert!(!bbs.read(&["read"]).contains("removed"));
+    assert_eq!(bbs.read(&["--token", &tc, "read"]), "");
     assert_eq!(bbs.ok(&["group", "list"]), format!("@acme: {b}\n"));
 }
 
@@ -1553,9 +1597,9 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
         bbs.ok(&["--token", t, "group", "join", "acme"]);
     }
     for t in [&ta, &tb] {
-        bbs.ok(&["--token", t, "read"]);
+        bbs.read(&["--token", t, "read"]);
     }
-    bbs.ok(&["--as", "ada", "read"]);
+    bbs.read(&["--as", "ada", "read"]);
 
     // Only humans grant, and only to current members.
     assert!(
@@ -1586,9 +1630,9 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
     let granted = format!(
         "from will (human) to @acme:\nHuman \"will\" granted write on @acme to agent {a:?}.\n"
     );
-    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&granted));
-    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&granted));
-    assert!(bbs.ok(&["--as", "ada", "read"]).contains(&granted));
+    assert!(bbs.read(&["--token", &ta, "read"]).contains(&granted));
+    assert!(bbs.read(&["--token", &tb, "read"]).contains(&granted));
+    assert!(bbs.read(&["--as", "ada", "read"]).contains(&granted));
     let list = bbs.ok(&["group", "list"]);
     assert!(
         list.contains(&format!("{a} [w]")) && !list.contains(&format!("{b} [w]")),
@@ -1603,18 +1647,18 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
     );
     // Without write an agent still reads the group and can DM members.
     bbs.ok(&["--token", &ta, "send", "--to", "@acme", "standup"]);
-    assert!(bbs.ok(&["--token", &tb, "read"]).contains("standup"));
+    assert!(bbs.read(&["--token", &tb, "read"]).contains("standup"));
     bbs.ok(&["--token", &tb, "send", "--to", &a, "dm"]);
-    assert!(bbs.ok(&["--token", &ta, "read"]).contains("dm"));
+    assert!(bbs.read(&["--token", &ta, "read"]).contains("dm"));
 
     // A grant outlives leaving and rejoining, and the rejoin says so.
     bbs.ok(&["--token", &ta, "group", "leave", "acme"]);
-    assert!(bbs.ok(&["--as", "ada", "read"]).contains(&format!(
+    assert!(bbs.read(&["--as", "ada", "read"]).contains(&format!(
         "Agent {a:?} left group @acme. @acme now has no agent writers.\n"
     )));
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
     assert!(
-        bbs.ok(&["--as", "ada", "read"])
+        bbs.read(&["--as", "ada", "read"])
             .contains(&format!("Agent {a:?} joined group @acme as a writer.\n"))
     );
     bbs.ok(&["--token", &ta, "send", "--to", "@acme", "back"]);
@@ -1622,12 +1666,12 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
     // Revoking needs no membership, and changes nothing else when the group
     // already had no writers among its members.
     bbs.ok(&["--token", &ta, "group", "leave", "acme"]);
-    bbs.ok(&["--token", &tb, "read"]);
+    bbs.read(&["--token", &tb, "read"]);
     assert_eq!(
         bbs.ok(&["group", "revoke", "acme", &a]),
         format!("Revoked write on @acme from {a}.\n")
     );
-    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&format!(
+    assert!(bbs.read(&["--token", &tb, "read"]).contains(&format!(
         "Human \"will\" revoked write on @acme from agent {a:?}.\n"
     )));
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
@@ -1639,9 +1683,9 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
     // Retiring drops the grant, and its name is never registered again: a
     // new agent lacks the grant.
     bbs.grant_write("acme", &a);
-    bbs.ok(&["--token", &tb, "read"]);
+    bbs.read(&["--token", &tb, "read"]);
     bbs.ok(&["--token", &ta, "bye"]);
-    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&format!(
+    assert!(bbs.read(&["--token", &tb, "read"]).contains(&format!(
         "Agent {a:?} is no longer a member of group @acme. @acme now has no agent writers.\n"
     )));
     let writers: i64 = bbs
@@ -1661,15 +1705,15 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
     );
 
     // Losing the last writer by revoke, removal, or retirement is announced.
-    bbs.ok(&["--token", &ta, "read"]);
+    bbs.read(&["--token", &ta, "read"]);
     bbs.grant_write("acme", &b);
     bbs.ok(&["group", "revoke", "acme", &b]);
-    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&format!(
+    assert!(bbs.read(&["--token", &ta, "read"]).contains(&format!(
         "revoked write on @acme from agent {b:?}. @acme now has no agent writers.\n"
     )));
     bbs.grant_write("acme", &b);
     bbs.ok(&["group", "remove", "acme", &b]);
-    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&format!(
+    assert!(bbs.read(&["--token", &ta, "read"]).contains(&format!(
         "removed agent {b:?} from group @acme. @acme now has no agent writers.\n"
     )));
     // Removal revokes write, so rejoining does not restore it.
@@ -1680,7 +1724,7 @@ fn humans_grant_and_revoke_group_writers(mode: Mode) {
     );
     bbs.grant_write("acme", &b);
     bbs.ok(&["retire", &b]);
-    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&format!(
+    assert!(bbs.read(&["--token", &ta, "read"]).contains(&format!(
         "Agent {b:?} is no longer a member of group @acme. @acme now has no agent writers.\n"
     )));
 }
@@ -1724,19 +1768,22 @@ fn humans_add_agents_to_groups(mode: Mode) {
             "from will (human) to @acme:\nHuman \"will\" added agent {agent:?} to group @acme{suffix}.\n"
         )
     };
-    let ada = bbs.ok(&["--as", "ada", "read"]);
+    let ada = bbs.read(&["--as", "ada", "read"]);
     assert!(
         ada.contains(&notice(&a, "")) && ada.contains(&notice(&b, "")),
         "{ada}"
     );
-    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&notice(&b, "")));
+    assert!(
+        bbs.read(&["--token", &ta, "read"])
+            .contains(&notice(&b, ""))
+    );
     assert_eq!(
         bbs.ok(&["group", "add", "acme", &a, &b, &a]),
         format!("Already in @acme: {a}, {b}.\n")
     );
     // Membership is real: the agents share a group now.
     bbs.ok(&["--token", &ta, "send", "--to", &b, "hi"]);
-    assert!(bbs.ok(&["--token", &tb, "read"]).contains("hi"));
+    assert!(bbs.read(&["--token", &tb, "read"]).contains("hi"));
 
     // Adding grants nothing, but a kept grant is announced.
     assert!(
@@ -1745,10 +1792,10 @@ fn humans_add_agents_to_groups(mode: Mode) {
     );
     bbs.grant_write("acme", &a);
     bbs.ok(&["--token", &ta, "group", "leave", "acme"]);
-    bbs.ok(&["--as", "ada", "read"]);
+    bbs.read(&["--as", "ada", "read"]);
     bbs.ok(&["group", "add", "acme", &a]);
     assert!(
-        bbs.ok(&["--as", "ada", "read"])
+        bbs.read(&["--as", "ada", "read"])
             .contains(&notice(&a, " as a writer"))
     );
     // Any human may add any agent, including another human's.
@@ -1911,7 +1958,7 @@ fn claude_code_hooks_bind_and_restore_identity(mode: Mode) {
     );
 
     // Mail is left for the listener.
-    let mail = bbs.ok(&["--token", &ta, "read"]);
+    let mail = bbs.read(&["--token", &ta, "read"]);
     assert!(
         mail.contains("before binding") && mail.contains("after binding"),
         "{mail}"
@@ -1970,7 +2017,7 @@ fn codex_hooks_bind_from_string_tool_response(mode: Mode) {
     );
     let stop = serde_json::json!({ "session_id": "c1", "hook_event_name": "Stop", "stop_hook_active": false });
     assert!(codex(stop).is_none());
-    assert!(bbs.ok(&["--token", token, "read"]).contains("hi codex"));
+    assert!(bbs.read(&["--token", token, "read"]).contains("hi codex"));
 }
 
 impl Bbs {
@@ -2007,7 +2054,7 @@ fn json_output_is_one_object_per_line(mode: Mode) {
     bbs.grant_write("acme", &a);
     bbs.ok(&["--token", &tb, "group", "join", "acme"]);
     for token in [&ta, &tb] {
-        bbs.ok(&["--token", token, "read"]);
+        bbs.read(&["--token", token, "read"]);
     }
     assert_eq!(bbs.ok(&["--token", &tb, "read", "--json"]), "");
 
@@ -2039,7 +2086,7 @@ fn json_output_is_one_object_per_line(mode: Mode) {
     assert_eq!(broadcast["body"], "all hands");
     assert_eq!(bbs.ok(&["--token", &tb, "read", "--json"]), "");
     // In text, the forged line is indistinguishable from a real header.
-    let text = bbs.ok(&["--token", &tb, "read", "--archived"]);
+    let text = bbs.read(&["--token", &tb, "read", "--archived"]);
     assert!(
         text.contains(&format!("\n[2026-01-01T00:00:00Z] from Mallory to {b}:\n")),
         "{text}"
@@ -2143,7 +2190,7 @@ fn read_wait_blocks_until_mail_arrives(mode: Mode) {
     // Already-unread mail returns immediately.
     bbs.ok(&["send", "--to", &a, "early"]);
     assert!(
-        bbs.ok(&["--token", &ta, "read", "--wait"])
+        bbs.read(&["--token", &ta, "read", "--wait"])
             .contains("early")
     );
 
@@ -2170,7 +2217,7 @@ fn read_wait_blocks_until_mail_arrives(mode: Mode) {
         stdout.contains("wake up") && !stdout.contains("not for a"),
         "{stdout}"
     );
-    assert_eq!(bbs.ok(&["--token", &ta, "read"]), "");
+    assert_eq!(bbs.read(&["--token", &ta, "read"]), "");
 }
 
 fn only_one_read_wait_per_inbox(mode: Mode) {
@@ -2201,12 +2248,12 @@ fn only_one_read_wait_per_inbox(mode: Mode) {
     // The lock is released on exit, even when the waiter is killed.
     bbs.ok(&["send", "--to", &a, "again"]);
     assert!(
-        bbs.ok(&["--token", &ta, "read", "--wait"])
+        bbs.read(&["--token", &ta, "read", "--wait"])
             .contains("again")
     );
     bbs.ok(&["send", "--to", &b, "after kill"]);
     assert!(
-        bbs.ok(&["--token", &tb, "read", "--wait"])
+        bbs.read(&["--token", &tb, "read", "--wait"])
             .contains("after kill")
     );
 }
@@ -2337,8 +2384,8 @@ fn blocker_tools_and_cli_keep_versions_retries_and_answer_delivery(mode: Mode) {
     let (agent, token) = bbs.register();
     bbs.ok(&["group", "register", "crew"]);
     bbs.ok(&["--token", &token, "group", "join", "crew"]);
-    bbs.ok(&["--token", &token, "read"]);
-    bbs.ok(&["read"]);
+    bbs.read(&["--token", &token, "read"]);
+    bbs.read(&["read"]);
     let catalog = bbs.run_with_env(
         &["headless", "mcp"],
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
@@ -2397,11 +2444,11 @@ fn blocker_tools_and_cli_keep_versions_retries_and_answer_delivery(mode: Mode) {
     let id = first["blocker"]["id"].as_i64().unwrap();
     assert_eq!(success("bbs_blocker_put", args)["replayed"], true);
     assert_eq!(
-        bbs.ok(&["read"]),
+        bbs.read(&["read"]),
         "",
         "creating a blocker sends no owner mail"
     );
-    assert_eq!(bbs.ok(&["--token", &token, "read"]), "");
+    assert_eq!(bbs.read(&["--token", &token, "read"]), "");
     let listing = success("bbs_blockers", json!({"agent":agent,"limit":1}));
     assert_eq!(listing["active_count"], 1);
     assert_eq!(listing["blockers"][0]["body"], "  Need approval\nOption A?");
@@ -2458,10 +2505,10 @@ fn blocker_tools_and_cli_keep_versions_retries_and_answer_delivery(mode: Mode) {
     .unwrap();
     assert_eq!(replay["replayed"], true);
     assert_eq!(replay["message_id"], answer["message_id"]);
-    let mail = bbs.ok(&["--token", &token, "read"]);
+    let mail = bbs.read(&["--token", &token, "read"]);
     assert!(mail.contains("Proceed with B"), "{mail}");
     assert_eq!(
-        bbs.ok(&["--token", &token, "read"]),
+        bbs.read(&["--token", &token, "read"]),
         "",
         "no duplicate answer delivery"
     );
@@ -2513,7 +2560,7 @@ fn blocker_tools_and_cli_keep_versions_retries_and_answer_delivery(mode: Mode) {
         )["replayed"],
         true
     );
-    assert_eq!(bbs.ok(&["read"]), "", "cancellation sends no owner mail");
+    assert_eq!(bbs.read(&["read"]), "", "cancellation sends no owner mail");
     let list: Value = serde_json::from_str(&bbs.ok(&[
         "blocker",
         "list",
@@ -2554,7 +2601,7 @@ fn blocker_choices_are_checked_in_the_tool_and_answered_by_selection(mode: Mode)
     let (_, token) = bbs.register();
     bbs.ok(&["group", "register", "crew"]);
     bbs.ok(&["--token", &token, "group", "join", "crew"]);
-    bbs.ok(&["--token", &token, "read"]);
+    bbs.read(&["--token", &token, "read"]);
     let call = |args: Value| -> Value {
         let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
             "params":{"name":"bbs_blocker_put","arguments":args}});
@@ -2667,7 +2714,7 @@ fn blocker_choices_are_checked_in_the_tool_and_answered_by_selection(mode: Mode)
         answer["blocker"]["outcome"]["selected"],
         json!(["merge", "wait"])
     );
-    let mail = bbs.ok(&["--token", &token, "read"]);
+    let mail = bbs.read(&["--token", &token, "read"]);
     assert!(
         mail.contains("Answer:\nSelected: Merge now [merge]\nSelected: Wait for CI [wait]"),
         "{mail}"
@@ -2716,7 +2763,7 @@ fn headless_search_reads_the_corpus_and_pages_without_archiving(mode: Mode) {
     let exact = search(serde_json::json!({"query":"équipe","case_sensitive":true}));
     assert_eq!(exact["hits"], serde_json::json!([]));
     assert!(
-        bbs.ok(&["--token", &tb, "read"]).contains("older Équipe"),
+        bbs.read(&["--token", &tb, "read"]).contains("older Équipe"),
         "still unread after another agent searched"
     );
     let list = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n";
@@ -2862,7 +2909,7 @@ fn timers_are_set_listed_fired_and_removed(mode: Mode) {
         )
         .unwrap();
     bbs.ok(&["--token", &tb, "status", "waiting for a timer"]);
-    let mail = bbs.ok(&["--token", &tb, "read", "--wait"]);
+    let mail = bbs.read(&["--token", &tb, "read", "--wait"]);
     assert!(
         mail.contains(&format!("from {a} to {b} (timer 1):\ncheck the build")),
         "{mail}"
@@ -2908,7 +2955,7 @@ fn timers_are_edited_and_cancelled_with_notices(mode: Mode) {
         out,
         format!("Timer 1 for {a}: every 2h, next at 2099-01-01T09:00:00Z.\n"),
     );
-    let mail = bbs.ok(&["--token", &ta, "read"]);
+    let mail = bbs.read(&["--token", &ta, "read"]);
     assert!(
         mail.contains(&format!(
             "from will (human) to {a} (timer 1):\nTimer #1 was edited by will: text changed; \
@@ -2925,7 +2972,7 @@ fn timers_are_edited_and_cancelled_with_notices(mode: Mode) {
     assert!(!out.contains("2099"), "{out}");
     let out = bbs.ok(&["timer", "edit", "1", "--repeat", ""]);
     assert!(out.contains("once at "), "{out}");
-    let mail = bbs.ok(&["--token", &ta, "read"]);
+    let mail = bbs.read(&["--token", &ta, "read"]);
     assert!(mail.contains("repeat once (was \"0 9 * * *\")"), "{mail}");
 
     for (args, why) in [
@@ -2958,7 +3005,7 @@ fn timers_are_edited_and_cancelled_with_notices(mode: Mode) {
     let out = bbs.ok(&["--token", &tb, "timer", "list", &a]);
     assert!(out.contains("from will: check the deploy"), "{out}");
     bbs.ok(&["--token", &tb, "timer", "edit", "1", "--text", "from b"]);
-    let mail = bbs.ok(&["--token", &ta, "read"]);
+    let mail = bbs.read(&["--token", &ta, "read"]);
     assert!(
         mail.contains(&format!(
             "from {b} to {a} (timer 1):\nTimer #1 was edited by {b}: text changed, now sent from {b}."
@@ -2972,11 +3019,11 @@ fn timers_are_edited_and_cancelled_with_notices(mode: Mode) {
     bbs.ok(&["--token", &ta, "timer", "edit", "1", "--text", "mine"]);
     bbs.ok(&["--token", &ta, "timer", "add", &a, "in 1h", "second"]);
     bbs.ok(&["--token", &ta, "timer", "rm", "2"]);
-    assert!(bbs.ok(&["--token", &ta, "read"]).is_empty());
+    assert!(bbs.read(&["--token", &ta, "read"]).is_empty());
 
     // A human's removal tells the agent which timer went.
     bbs.ok(&["timer", "rm", "1"]);
-    let mail = bbs.ok(&["--token", &ta, "read"]);
+    let mail = bbs.read(&["--token", &ta, "read"]);
     assert!(
         mail.contains(&format!(
             "from will (human) to {a} (timer 1):\nTimer #1 was cancelled by will (once, due "
@@ -3086,6 +3133,7 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
             "id": acme["id"], "created_at": acme["created_at"], "from": a,
             "from_kind": "agent", "from_owner": "will", "to": null, "to_owner": null,
             "group": "acme", "body": "acme from A", "read_at": null,
+            "original_from": null, "reported": false, "notice": false, "in_reply_to": null,
         })
     );
     let dm = &all[bodies(&all)
@@ -3188,7 +3236,7 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
     }
 
     // Plain text names owner, target, and read state.
-    let text = bbs.ok(&["view", "--no-follow", "--from", "@ada", "--limit", "4"]);
+    let text = bbs.read(&["view", "--no-follow", "--from", "@ada", "--limit", "4"]);
     assert!(
         text.contains("from ada (human) to will (unread):\nada to will"),
         "{text}"
@@ -3202,12 +3250,12 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
         text.contains(&format!("from ada (human) to {d}@ada (unread):\nada to D")),
         "{text}"
     );
-    let text = bbs.ok(&["view", "--no-follow", "--from", c.as_str()]);
+    let text = bbs.read(&["view", "--no-follow", "--from", c.as_str()]);
     assert!(
         text.contains(&format!("from {c}@ada to {a}@will (unread):\ndm C to A")),
         "{text}"
     );
-    bbs.ok(&["read"]);
+    bbs.read(&["read"]);
     let text = bbs.ok(&["view", "--no-follow", "--from", "ada", "--limit", "1"]);
     assert!(text.contains("to will (read 20"), "{text}");
 
@@ -3238,7 +3286,7 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
     )
     .unwrap();
     assert!(inbox.get("to_owner").is_none(), "{inbox}");
-    let text = bbs.ok(&["--token", &ta, "read", "--archived"]);
+    let text = bbs.read(&["--token", &ta, "read", "--archived"]);
     assert!(text.contains(&format!("from {c}@ada to {a}:")), "{text}");
 }
 
@@ -3426,7 +3474,7 @@ fn view_json_follow_emits_each_message_once(mode: Mode) {
     bbs.ok(&["send", "--to", &a, "live one"]);
     assert_eq!(next()["body"], "live one");
     // Reading changes read_at and re-sends the window; nothing is repeated.
-    bbs.ok(&["--token", &ta, "read"]);
+    bbs.read(&["--token", &ta, "read"]);
     // A non-matching sender produces a snapshot but no line.
     bbs.ok(&["--token", &ta, "send", "--to", "@acme", "x"]);
     bbs.ok(&["send", "--to", &a, "live two"]);
@@ -3624,7 +3672,7 @@ fn headless_replies_through_tools_and_cancels(mode: Mode) {
     bbs.ok(&["--token", &tp, "send", "--to", "Zed", "hello"]);
     let mut seen = String::new();
     let reply = eventually("the reply", || {
-        seen.push_str(&bbs.ok(&["--token", &tp, "read"]));
+        seen.push_str(&bbs.read(&["--token", &tp, "read"]));
         seen.contains("echo (").then(|| seen.clone())
     });
     assert!(
@@ -3761,7 +3809,7 @@ fn headless_process_mcp_env_routes_without_serializing_credentials(mode: Mode) {
         }
         bbs.ok(&["--token", &peer_token, "send", "--to", "Zed", "hello"]);
         eventually("reply through inherited MCP credentials", || {
-            bbs.ok(&["--token", &peer_token, "read"])
+            bbs.read(&["--token", &peer_token, "read"])
                 .contains("echo (yes)")
                 .then_some(())
         });
@@ -3965,7 +4013,7 @@ fn headless_codex_replies_steers_and_interrupts(mode: Mode) {
     let mut seen = String::new();
     let mut reply = |needle: &str| {
         eventually("the reply", || {
-            seen.push_str(&bbs.ok(&["--token", &tp, "read"]));
+            seen.push_str(&bbs.read(&["--token", &tp, "read"]));
             seen.contains(needle).then(|| seen.clone())
         })
     };
@@ -4695,7 +4743,7 @@ fn control_messages_are_for_owned_agents_only(mode: Mode) {
         .unwrap();
     assert_eq!(row.as_deref(), Some("cancel"));
     assert!(
-        bbs.ok(&["--token", &ta, "read"])
+        bbs.read(&["--token", &ta, "read"])
             .contains("Cancel your running turn")
     );
     assert!(
@@ -4736,7 +4784,7 @@ fn goal_controls_are_for_owned_agents_only(mode: Mode) {
     );
     assert_eq!(rows[0].1, "Ship the release");
     assert!(
-        bbs.ok(&["--token", &ta, "read"])
+        bbs.read(&["--token", &ta, "read"])
             .contains("Ship the release")
     );
     assert!(
@@ -4855,6 +4903,7 @@ both_modes!(
     init_is_idempotent,
     direct_messages_within_group,
     humans_and_agents_message_each_other,
+    replies_answer_the_sender_by_message_id,
     broadcast_reaches_members_and_humans,
     bye_retires_token_and_name,
     bye_notifies_and_leaves_groups,
@@ -5015,7 +5064,7 @@ fn owner_delivery(mode: Mode, kind: &str) {
     assert!(!first.concat().contains("OLD REPLAY"));
     assert!(shared_activity(&bbs, "Zed").is_empty());
     assert!(
-        bbs.ok(&["--as", "alice", "read"])
+        bbs.read(&["--as", "alice", "read"])
             .contains("other-recipient-still-works")
     );
     let prompts = std::fs::read_to_string(bbs.home.join("owner-prompts.jsonl")).unwrap();

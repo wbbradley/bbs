@@ -514,6 +514,16 @@ message SendRequest {
   string body = 2;
   // Humans only, direct to an agent they own. Requires agent-control.v1.
   optional Control control = 3;
+  // Reply to the message with this id, which must have been delivered to the
+  // caller. The server picks the recipient (the message's exact sender, or a
+  // group copy's original sender) and sets the reply's in_reply_to; `to` must
+  // then be empty, so a server that predates this field, which ignores it,
+  // refuses the send for want of a recipient instead of sending elsewhere.
+  // Needs no capability: that refusal is the old server's answer.
+  optional int64 reply_to = 4;
+  // With reply_to, from an agent whose ordinary output already reaches its
+  // owner (a headless agent): refuse a reply that would go to that owner.
+  bool not_to_owner = 5;
 }
 message SendResponse {
   string to = 1;                   // canonical recipient: "Juliana" or "@acme"
@@ -761,6 +771,22 @@ message Message {
   optional int64 timer_id = 13;      // inbox only: the timer that sent it
   // Set when the message was sent via AutoReply; absent on older servers.
   optional bool auto_reply = 14;
+  // A group copy from another installation (from_name is the group): its
+  // original sender, as `id:ENTITY@NAMESPACE`, as the group's home reports
+  // it. Clients show it as `ORIGINAL via GROUP`; one that does not know this
+  // field shows the group, which did send the copy. Absent on older servers
+  // and other messages.
+  optional string original_from = 15;
+  // A group copy that the group itself sent (a membership notice): there is
+  // no original sender to reply to.
+  optional bool group_notice = 16;
+  // With original_from: the original sender is in another namespace than the
+  // group, so it is only the group's home's claim, not a verified identity.
+  optional bool reported = 17;
+  // The message this one answers: its id here as a decimal number when this
+  // installation has it and the reader can see it, else its origin as
+  // `NAMESPACE:MESSAGE_ID`.
+  optional string in_reply_to = 18;
 }
 
 message WaitRequest { optional uint32 limit = 1; }

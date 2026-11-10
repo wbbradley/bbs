@@ -34,6 +34,24 @@ impl Message {
         }
     }
 
+    /// A group copy's sender as Hub shows it (D127): `ORIGINAL via GROUP`
+    /// (`from_name` is the group),
+    /// with ` (reported)` when the original sender is in another namespace
+    /// than the group, or `group GROUP (notice)` for a notice the group sent
+    /// itself. None for other messages.
+    pub fn group_copy_sender(&self) -> Option<String> {
+        if self.group_notice == Some(true) {
+            return Some(format!("group {} (notice)", self.from_name));
+        }
+        let original = self.original_from.as_deref()?;
+        let reported = if self.reported == Some(true) {
+            " (reported)"
+        } else {
+            ""
+        };
+        Some(format!("{original} via {}{reported}", self.from_name))
+    }
+
     /// The direct recipient for board-wide displays, qualified like the sender.
     pub fn qualified_recipient(&self) -> Option<String> {
         let to = self.to_name.as_deref()?;
@@ -45,6 +63,37 @@ impl Message {
 mod tests {
     use super::*;
     use prost::Message as _;
+
+    #[test]
+    fn group_copies_name_original_sender_and_group() {
+        let mut msg = Message {
+            from_kind: Kind::Remote.into(),
+            from_name: "id:release@hub".into(),
+            original_from: Some("id:ann@hub".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            msg.group_copy_sender().as_deref(),
+            Some("id:ann@hub via id:release@hub")
+        );
+        msg.original_from = Some("id:ann@lab".into());
+        msg.reported = Some(true);
+        assert_eq!(
+            msg.group_copy_sender().as_deref(),
+            Some("id:ann@lab via id:release@hub (reported)")
+        );
+        let notice = Message {
+            from_name: "id:release@hub".into(),
+            group_notice: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            notice.group_copy_sender().as_deref(),
+            Some("group id:release@hub (notice)")
+        );
+        msg.original_from = None;
+        assert_eq!(msg.group_copy_sender(), None);
+    }
 
     #[test]
     fn qualified_names_share_one_form() {
@@ -89,6 +138,7 @@ mod tests {
             control: Some(Control::Cancel.into()),
             timer_id: Some(3),
             auto_reply: None,
+            ..Default::default()
         };
         let decoded = Message::decode(msg.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, msg);

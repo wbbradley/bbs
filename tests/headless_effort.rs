@@ -123,6 +123,8 @@ impl Rig {
                 to: "EffortTest".into(),
                 body: body.into(),
                 control: control.map(Into::into),
+                reply_to: None,
+                not_to_owner: false,
             }))
             .await
             .unwrap()
@@ -340,7 +342,11 @@ async fn owner_inputs(kind: &str) {
         .collect();
     assert_eq!(inputs.len(), 4, "{wire:?}");
     assert!(inputs[1].starts_with("New BBS mail ("));
-    assert!(inputs[1].contains("from Peer to EffortTest:"));
+    assert!(
+        inputs[1].contains("from Peer to EffortTest (id "),
+        "{}",
+        inputs[1]
+    );
     assert_eq!(inputs[2], body);
     assert_eq!(inputs[3], "OWNER_SECOND");
     let log = std::fs::read_to_string(
@@ -363,7 +369,7 @@ async fn owner_inputs(kind: &str) {
             prompts[0]["mail_text"]
                 .as_str()
                 .unwrap()
-                .contains("from tester (human) to EffortTest:")
+                .contains("from tester (human) to EffortTest (id ")
         );
     }
     assert!(
