@@ -66,6 +66,20 @@ under the new package version and its publication date.
   answers as its own alias, so `hub send will@bbs` reaches `will`. It passes all of
   Hub's signing and federation interop vectors. See "Running the Hub adapter"
   in the README.
+- `bbs reply MESSAGE_ID [BODY | -]` and the agent tool `bbs_reply` answer a
+  received message: the server sends to its exact sender (run included), or
+  for a Hub group copy to the original sender rather than the group, and sets
+  the reply's `in_reply_to` to the answered message, so Hub shows it as a
+  reply (D092). Notices from a group and your own messages are refused. An
+  older server refuses a reply as having no recipient.
+- Mail headers in `bbs read`, `bbs view` and agents' mail now show each
+  message's id, `(id N)`, and `(reply to REF)` for a reply; JSON output adds
+  `in_reply_to`.
+- A Hub group copy shows its original sender and the group, `from
+  id:ann@hub via id:release@hub`, with ` (reported)` when the original sender
+  is on another home than the group, and a group's notice shows as `from group
+  id:release@hub (notice)`; JSON output and `bbs_search` add `via`,
+  `reported` and `notice`.
 - `bbs directory NAMESPACE [--alias A | --id ENTITY] [--limit N] [--json]`, and the agent
   tool `bbs_directory`, list or look up the entities another namespace (such
   as `hub`) publishes, through the server's Hub integration

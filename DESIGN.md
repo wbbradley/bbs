@@ -440,7 +440,8 @@ transaction records the foreign entity and address (bound to the
 integration), the message with its frozen common `Message` bytes (seven-day
 deadline, plain text) and an `integration_outbox` row, `pending`; no delivery
 row. A well-formed reference to an entity that does not exist is accepted:
-only the adapter can tell. While publication is off, pending work stays
+only the adapter can tell. The message's `in_reply_to` is empty except for a
+reply (below). While publication is off, pending work stays
 pending. The stream hands work off one claim at a time, with up to 16 frames
 queued: it waits for room on the stream, then in one database call claims the
 oldest pending row (`attempted`, committed) and queues the offer. The row becomes `sent` when the transport
@@ -507,6 +508,30 @@ will@bbs` resolves), and its descriptor lists that alias; a second-level ID
 (`will/scout`) is never an alias. BBS has no other aliases and no runs, so a
 runs query returns nothing. Another namespace is `namespace_unknown`. It
 answers each ping with a pong; HTTP/2 keepalive covers its own liveness.
+
+**Group copies and replies (D092, D127).** Reads (inbox, history, feed,
+search and the wait stream) show an imported group copy as Hub's client does:
+`from_name` is the original sender's `id:ENTITY@NAMESPACE[#RUN]`, of kind
+`remote` (its kind is unknown here), and `via` is the group; `reported` is set
+when the original sender's namespace is not the group's, since the reference
+is then only the group's home's claim. A copy whose original sender is the
+group itself is a notice: `from_name` is the group and `group_notice` is set.
+A message that answers another carries `in_reply_to`: the answered message's
+ID here when this installation stores it (by origin), else its origin as
+`NAMESPACE:MESSAGE_ID`. `Send` with `reply_to` (a message ID) and an empty
+`to` replies: the server loads the message, which must have been delivered to
+the caller (its own sent messages are refused, and a message delivered to
+someone else is "no message N in your mail", as is one that does not exist),
+and picks the recipient by Hub's `ReplyTo` rule: a copy's original sender at
+its exact address and run, answering the original message; a notice has no
+sender to reply to; anything else, the message's exact sender, run included,
+answering the message itself. A remote recipient goes through the outbound
+handoff with `in_reply_to` in the frozen bytes; a native one is an ordinary
+direct send, under the same rules, with `in_reply_to` recorded on the row.
+`reply_to` with a `to` or a control is `INVALID_ARGUMENT`. The field needs no
+capability: a server that predates it ignores it, sees an empty `to`, and
+refuses the send for want of a recipient, never sending it elsewhere; the
+client turns that refusal into "does not support replies".
 
 **Remote directories.** `RemoteDirectory` (`remote-directory.v1`; `bbs
 directory`, the `bbs_directory` tool) lists or looks up another namespace's
@@ -681,7 +706,8 @@ cursor: it sends every unreported result it has not already queued. Group
 copies
 pass like any message: their sender is the group, which is never refused for
 being one, and BBS stores the original and original sender. A reply from Hub
-carries `in_reply_to` and the exact address it answers (D092), unchanged.
+carries `in_reply_to` and the exact address it answers (D092), unchanged, and
+so does a reply from BBS, whose server sets both.
 
 **Directory.** A Hub directory query for BBS's namespace is verified (the
 requester must be in the querying credential's namespace, with
