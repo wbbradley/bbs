@@ -12,6 +12,11 @@ pub struct Outcome {
     pub actor_owner: Option<String>,
     pub created_at: String,
     pub answer: Option<String>,
+    /// The mail sent the creator: the answer, or a cancel notice. A notice is
+    /// not stored on the event; it is the one direct message the canceller
+    /// sent the creator in the cancel's transaction (same timestamp) about
+    /// this blocker, whose body starts `Blocker #<id> in @` (a test pins it).
+    /// The lookup goes away once a column records the notice's ID.
     pub message_id: Option<i64>,
     /// Canonical JSON array of selected option IDs; none for a free-text answer.
     pub selected: Option<String>,
@@ -38,7 +43,16 @@ const SELECT: &str = "SELECT b.id, b.group_id, g.name, g.archived_at,
     a.id, a.name, h.name, b.body, b.created_at, COALESCE(b.root_id, b.id),
     b.replaces, successor.id, e.kind, e.actor_kind, e.actor_id,
     CASE e.actor_kind WHEN 'human' THEN eh.name ELSE ea.name END,
-    e.created_at, e.answer, e.message_id, actor_owner.name, b.choices, e.selected
+    e.created_at, e.answer, COALESCE(e.message_id, (SELECT m.id FROM messages m
+        JOIN deliveries d ON d.message_id = m.id
+            AND d.recipient_kind = 'agent' AND d.recipient_id = b.creator_id
+        WHERE e.kind = 'cancelled' AND m.created_at = e.created_at
+            AND m.from_kind = e.actor_kind AND m.from_id = e.actor_id
+            AND m.to_group_id IS NULL
+            AND substr(m.body, 1, length('Blocker #' || b.id || ' in @'))
+                = 'Blocker #' || b.id || ' in @'
+        ORDER BY m.id LIMIT 1)),
+    actor_owner.name, b.choices, e.selected
     FROM blockers b JOIN bbs_groups g ON g.id = b.group_id
     JOIN agents a ON a.id = b.creator_id
     LEFT JOIN agent_owners owner ON owner.agent_id = a.id
