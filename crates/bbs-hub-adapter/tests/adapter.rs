@@ -1116,6 +1116,371 @@ async fn a_directory_query_without_bbs_says_the_home_is_offline() {
     adapter.stop().await.unwrap();
 }
 
+// ---- remote directories --------------------------------------------------------
+
+/// BBS's `RemoteDirectory` as human `will`, in the background, once BBS has
+/// the adapter's stream (until then BBS says the integration is not
+/// connected).
+fn remote_directory(
+    bbs: &Bbs,
+    req: proto::RemoteDirectoryRequest,
+) -> JoinHandle<anyhow::Result<proto::RemoteDirectoryResponse>> {
+    let addr = bbs.main.to_string();
+    tokio::spawn(async move {
+        let remote = backend::Remote::connect(
+            &addr,
+            service::Caller {
+                human: Some("will".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut b = backend::Backend::Remote(remote);
+        let start = tokio::time::Instant::now();
+        loop {
+            match b.remote_directory(req.clone()).await {
+                Err(e)
+                    if e.to_string().contains("integration hub is not connected")
+                        && start.elapsed() < WAIT =>
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await
+                }
+                r => return r,
+            }
+        }
+    })
+}
+
+fn hub_listing() -> proto::RemoteDirectoryRequest {
+    proto::RemoteDirectoryRequest {
+        namespace: "hub".into(),
+        ..Default::default()
+    }
+}
+
+/// The relay's side of a query: checked as BBS's installation signed it.
+async fn asked(peer: &mut Peer) -> (mp::SignedRecord, mp::DirectoryQuery) {
+    let F::DirectoryQuery(fq) = peer.next().await else {
+        panic!("expected a directory query");
+    };
+    let rec = fq.query.unwrap();
+    sign::verify(&rec, mp::RecordKind::DirectoryQuery).unwrap();
+    assert_eq!(
+        rec.signer_public_key,
+        key(BBS_INSTALLATION).verifying_key().to_bytes()
+    );
+    assert_eq!(
+        fq.credential.unwrap(),
+        credential(BBS_AUTHORITY, "bbs", "bbs-1", BBS_INSTALLATION)
+    );
+    let q = mp::DirectoryQuery::decode(rec.payload.as_slice()).unwrap();
+    assert!(verify::valid_id(&q.query_id));
+    (rec, q)
+}
+
+/// Hub's answer to `rec`, signed by `signer` with `cred`, bound to `hash`.
+fn hub_answer(
+    hash: Vec<u8>,
+    namespace: &str,
+    result: mp::DirectoryResult,
+    signer: u8,
+    cred: mp::SignedRecord,
+) -> F {
+    let answer = mp::DirectoryAnswer {
+        query_record_hash: hash,
+        namespace: namespace.into(),
+        result: Some(result),
+    };
+    F::DirectoryAnswer(mp::FederatedDirectoryAnswer {
+        answer: Some(sign::sign(
+            &key(signer),
+            mp::RecordKind::DirectoryAnswer,
+            answer.encode_to_vec(),
+        )),
+        credential: Some(cred),
+    })
+}
+
+fn hub_credential() -> mp::SignedRecord {
+    credential(HUB_AUTHORITY, "hub", "hub-1", HUB_INSTALLATION)
+}
+
+fn hub_entity(id: &str, kind: &str) -> mp::EntityDescriptor {
+    mp::EntityDescriptor {
+        entity: Some(mp::EntityRef {
+            namespace: "hub".into(),
+            entity_id: id.into(),
+        }),
+        kind: kind.into(),
+        display_name: id.into(),
+        aliases: vec![id.into()],
+        lifecycle: mp::Lifecycle::Active as i32,
+        ..Default::default()
+    }
+}
+
+fn status_of(err: &anyhow::Error) -> &Status {
+    err.downcast_ref::<Status>()
+        .unwrap_or_else(|| panic!("not a status: {err:#}"))
+}
+
+/// BBS's query reaches the relay signed by this installation as the
+/// caller, and Hub's verified answer comes back to BBS.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_directory_queries_are_signed_and_answered() {
+    let mut w = World::new().await;
+    let adapter = w.adapter();
+    let mut peer = w.relay.accept().await;
+    let listing = remote_directory(&w.bbs, hub_listing());
+    let (rec, q) = asked(&mut peer).await;
+    let who = q.requester.unwrap().entity.unwrap();
+    assert_eq!(
+        (who.namespace.as_str(), who.entity_id.as_str()),
+        ("bbs", "will")
+    );
+    assert_eq!(q.namespace, "hub");
+    let left = q.deadline_unix_micros - now_micros();
+    assert!((3_000_000..=5_000_000).contains(&left), "{left}");
+    peer.send(hub_answer(
+        sign::hash(&rec).unwrap().to_vec(),
+        "hub",
+        mp::DirectoryResult {
+            query_id: q.query_id.clone(),
+            entities: vec![hub_entity("will", "human"), hub_entity("echo", "agent")],
+            ..Default::default()
+        },
+        HUB_INSTALLATION,
+        hub_credential(),
+    ))
+    .await;
+    let page = listing.await.unwrap().unwrap();
+    let ids: Vec<_> = page
+        .entities
+        .iter()
+        .map(|e| format!("{}@{} {}", e.entity_id, e.namespace, e.kind))
+        .collect();
+    assert_eq!(ids, ["will@hub human", "echo@hub agent"]);
+
+    // A lookup by alias carries it.
+    let lookup = remote_directory(
+        &w.bbs,
+        proto::RemoteDirectoryRequest {
+            alias: "will".into(),
+            ..hub_listing()
+        },
+    );
+    let (rec, q) = asked(&mut peer).await;
+    assert_eq!((q.alias.as_str(), q.entity_id.as_str()), ("will", ""));
+    peer.send(hub_answer(
+        sign::hash(&rec).unwrap().to_vec(),
+        "hub",
+        mp::DirectoryResult {
+            query_id: q.query_id,
+            entities: vec![hub_entity("will", "human")],
+            ..Default::default()
+        },
+        HUB_INSTALLATION,
+        hub_credential(),
+    ))
+    .await;
+    assert_eq!(lookup.await.unwrap().unwrap().entities.len(), 1);
+    adapter.stop().await.unwrap();
+}
+
+/// The relay's refusals, and Hub's own signed errors, reach BBS's caller as
+/// errors with their reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_directory_refusals_reach_bbs_as_errors() {
+    let mut w = World::new().await;
+    let adapter = w.adapter();
+    let mut peer = w.relay.accept().await;
+    for (code, want, grpc) in [
+        (
+            "namespace_unknown",
+            "namespace_unknown",
+            tonic::Code::NotFound,
+        ),
+        ("", "home_offline", tonic::Code::Unavailable),
+    ] {
+        let listing = remote_directory(&w.bbs, hub_listing());
+        let (_, q) = asked(&mut peer).await;
+        peer.send(F::DirectoryUnavailable(mp::DirectoryUnavailable {
+            query_id: q.query_id,
+            error_code: code.into(),
+            detail: "no such home".into(),
+        }))
+        .await;
+        let err = listing.await.unwrap().unwrap_err();
+        assert_eq!(status_of(&err).code(), grpc, "{err:#}");
+        assert!(err.to_string().starts_with(&format!("{want}: ")), "{err:#}");
+    }
+    let listing = remote_directory(&w.bbs, hub_listing());
+    let (rec, q) = asked(&mut peer).await;
+    peer.send(hub_answer(
+        sign::hash(&rec).unwrap().to_vec(),
+        "hub",
+        mp::DirectoryResult {
+            query_id: q.query_id,
+            error_code: "invalid_cursor".into(),
+            detail: "bad page token".into(),
+            ..Default::default()
+        },
+        HUB_INSTALLATION,
+        hub_credential(),
+    ))
+    .await;
+    let err = listing.await.unwrap().unwrap_err();
+    assert_eq!(status_of(&err).code(), tonic::Code::InvalidArgument);
+    assert_eq!(err.to_string(), "invalid_cursor: bad page token");
+    adapter.stop().await.unwrap();
+}
+
+/// An answer that is not Hub's, or not for this query, is refused with the
+/// reason, never shown as a directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_or_unbound_directory_answers_are_refused() {
+    let mut w = World::new().await;
+    let adapter = w.adapter();
+    let mut peer = w.relay.accept().await;
+    let result = |id: &str| mp::DirectoryResult {
+        query_id: id.into(),
+        entities: vec![hub_entity("will", "human")],
+        ..Default::default()
+    };
+    type Forge<'a> = &'a dyn Fn(&mp::SignedRecord, &str) -> F;
+    let cases: [(&str, Forge); 4] = [
+        // Signed by a key that is not the credential's subject.
+        ("invalid_signature", &|rec, id| {
+            hub_answer(
+                sign::hash(rec).unwrap().to_vec(),
+                "hub",
+                result(id),
+                BBS_INSTALLATION,
+                hub_credential(),
+            )
+        }),
+        // Bound to another query.
+        ("invalid_signature", &|_, id| {
+            hub_answer(
+                vec![7; 32],
+                "hub",
+                result(id),
+                HUB_INSTALLATION,
+                hub_credential(),
+            )
+        }),
+        // For another namespace than asked.
+        ("invalid_signature", &|rec, id| {
+            hub_answer(
+                sign::hash(rec).unwrap().to_vec(),
+                "lab",
+                result(id),
+                HUB_INSTALLATION,
+                hub_credential(),
+            )
+        }),
+        // Signed by a host of another namespace.
+        ("route_not_authorized", &|rec, id| {
+            hub_answer(
+                sign::hash(rec).unwrap().to_vec(),
+                "hub",
+                result(id),
+                BBS_INSTALLATION,
+                credential(BBS_AUTHORITY, "bbs", "bbs-1", BBS_INSTALLATION),
+            )
+        }),
+    ];
+    for (i, (want, forge)) in cases.iter().enumerate() {
+        let listing = remote_directory(&w.bbs, hub_listing());
+        let (rec, q) = asked(&mut peer).await;
+        let forged = forge(&rec, &q.query_id);
+        // An unbound answer finds no query: the relay's refusal ends it.
+        let unbound = matches!(&forged, F::DirectoryAnswer(a)
+            if mp::DirectoryAnswer::decode(a.answer.as_ref().unwrap().payload.as_slice())
+                .unwrap()
+                .query_record_hash != sign::hash(&rec).unwrap());
+        peer.send(forged).await;
+        if unbound {
+            peer.send(F::DirectoryUnavailable(mp::DirectoryUnavailable {
+                query_id: q.query_id.clone(),
+                error_code: "home_offline".into(),
+                detail: "after the stray answer".into(),
+            }))
+            .await;
+        }
+        let err = listing.await.unwrap().unwrap_err();
+        let want = if unbound { "home_offline" } else { want };
+        assert_eq!(
+            status_of(&err).code(),
+            tonic::Code::Unavailable,
+            "case {i}: {err:#}"
+        );
+        assert!(
+            err.to_string().starts_with(&format!("{want}: ")),
+            "case {i}: {err:#}"
+        );
+    }
+    adapter.stop().await.unwrap();
+}
+
+/// No answer by the deadline is a timeout, and the late answer is ignored;
+/// with no relay, BBS hears so at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn unanswered_remote_directories_time_out_and_need_the_relay() {
+    let mut w = World::new().await;
+    let adapter = w.adapter();
+    let mut peer = w.relay.accept().await;
+    let listing = remote_directory(&w.bbs, hub_listing());
+    let (rec, q) = asked(&mut peer).await;
+    let err = listing.await.unwrap().unwrap_err();
+    assert_eq!(status_of(&err).code(), tonic::Code::Unavailable, "{err:#}");
+    assert!(
+        err.to_string().starts_with("directory_timeout: "),
+        "{err:#}"
+    );
+    peer.send(hub_answer(
+        sign::hash(&rec).unwrap().to_vec(),
+        "hub",
+        mp::DirectoryResult {
+            query_id: q.query_id,
+            ..Default::default()
+        },
+        HUB_INSTALLATION,
+        hub_credential(),
+    ))
+    .await;
+    assert!(peer.quiet().await.is_none());
+    // The relay's stream ends: a query waiting on it fails at once, and
+    // until another stream is up, BBS hears so at once.
+    let listing = remote_directory(&w.bbs, hub_listing());
+    asked(&mut peer).await;
+    drop(peer);
+    let err = timeout(Duration::from_secs(3), listing)
+        .await
+        .expect("before the deadline")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("relay_unavailable: ")
+            && err.to_string().ends_with("the relay stream closed"),
+        "{err:#}"
+    );
+    let start = tokio::time::Instant::now();
+    loop {
+        let err = remote_directory(&w.bbs, hub_listing())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(status_of(&err).code(), tonic::Code::Unavailable, "{err:#}");
+        if err.to_string().starts_with("relay_unavailable: ") {
+            break;
+        }
+        assert!(start.elapsed() < WAIT, "{err:#}");
+    }
+    adapter.stop().await.unwrap();
+}
+
 /// An adapter configured for another namespace than BBS's stops at once:
 /// it would sign BBS's messages for the wrong namespace.
 #[tokio::test(flavor = "multi_thread")]
