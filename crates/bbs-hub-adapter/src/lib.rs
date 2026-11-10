@@ -4,12 +4,18 @@
 //! credentials, trust, the relay session, exact signed envelopes and
 //! known-unsent work. Every handoff is at most once (D072).
 
+pub mod adapter;
+pub mod bbs;
 pub mod config;
 pub mod keys;
+pub mod link;
+pub mod relay;
 pub mod sign;
 pub mod store;
 pub mod verify;
 pub mod wire;
+
+pub use adapter::{Adapter, Options, Settings};
 
 /// Now, in Unix microseconds.
 pub fn now_micros() -> i64 {

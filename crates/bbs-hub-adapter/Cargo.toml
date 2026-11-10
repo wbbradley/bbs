@@ -9,6 +9,10 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
+[[bin]]
+name = "bbs-hub-adapter"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 bbs-core = { path = "../bbs-core", version = "=0.24.0" }
