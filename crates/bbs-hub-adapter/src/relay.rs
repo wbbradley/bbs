@@ -24,7 +24,7 @@ use tonic::transport::Endpoint;
 use tonic::{Request, Status, Streaming};
 
 use crate::adapter::{RelayLink, Shared, bounded, code};
-use crate::link::{self, Item};
+use crate::link::{self, Claim, Item};
 use crate::store::{Binding, Direction, Intake};
 use crate::verify::{self, reason};
 use crate::{new_id, now_micros, sign, wire};
@@ -415,7 +415,7 @@ impl Session {
             };
             let item = Item {
                 frame: wire::transfer_frame(&c.handoff_id, &c.bytes),
-                claim: Some((Direction::Outbound, c.id)),
+                claim: Some(Claim::Handoff(Direction::Outbound, c.id)),
             };
             if permit.send(item).is_err() {
                 shared
@@ -442,7 +442,9 @@ impl Session {
                 bail!("the relay was silent for {silent:?}");
             }
             nonce += 1;
-            self.send(F::Heartbeat(mp::Heartbeat { nonce }));
+            // Ahead of queued transfers, so a full queue never silences us.
+            self.tx
+                .try_send_priority(frame(F::Heartbeat(mp::Heartbeat { nonce })));
         }
     }
 
@@ -629,7 +631,7 @@ impl Session {
             reason = why,
             "the relay answered a transfer"
         );
-        self.shared.report_outbound();
+        self.shared.report_kick.notify_one();
     }
 
     fn unavailable(&self, query_id: &str, code_: &str, detail: &str) {

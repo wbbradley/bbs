@@ -3,7 +3,10 @@
 //!
 //! - keeps BBS's publication catalog (its revision only grows);
 //! - takes BBS's outbound handoffs, checks them, and stores them for the
-//!   relay; the relay's result goes back to BBS as the handoff's result;
+//!   relay; the relay's result goes back to BBS as the handoff's result.
+//!   Every result owed to BBS is stored until the transport takes it, and
+//!   sent again on the next stream if it did not; BBS keeps the first
+//!   result for a handoff and ignores any other;
 //! - offers verified messages from Hub to BBS as imports, one at a time,
 //!   claimed before they are queued; BBS's result goes back to the relay;
 //! - asks BBS to answer Hub's directory queries for this namespace.
@@ -21,7 +24,7 @@ use tonic::Request;
 use tonic::transport::Endpoint;
 
 use crate::adapter::{Shared, bounded, code};
-use crate::link::{self, Item};
+use crate::link::{self, Claim, Item};
 use crate::store::{Direction, Intake};
 use crate::verify::{self, Reason, reason};
 use crate::{new_id, now_micros, wire};
@@ -119,11 +122,11 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
             "BBS connected"
         );
         *shared.bbs.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx.clone());
-        shared.report_outbound();
         shared.bbs_kick.notify_one();
         tokio::select! {
             r = read(shared, &tx, inbound) => r,
             r = dispatch(shared, &tx) => r,
+            r = report(shared, &tx) => r,
         }
     }
     .await;
@@ -177,7 +180,7 @@ async fn read(
             Some(In::Outgoing(offer)) => {
                 let result = on_outgoing(shared, &offer);
                 shared.relay_kick.notify_one();
-                result.map(Out::OutgoingResult)
+                result.and_then(|r| owe(shared, r)).map(Out::OutgoingResult)
             }
             Some(In::IncomingResult(result)) => {
                 on_incoming_result(shared, &result);
@@ -366,6 +369,69 @@ fn on_outgoing(shared: &Shared, offer: &pb::MessageOffer) -> Option<pb::HandoffR
     }
 }
 
+/// Store a result the adapter settled itself, to report as the relay's
+/// are. One it cannot store, or one for an invalid handoff ID (which BBS
+/// would refuse on every stream), is returned to send now, once.
+fn owe(shared: &Shared, r: pb::HandoffResult) -> Option<pb::HandoffResult> {
+    if !verify::valid_id(&r.handoff_id) {
+        return Some(r);
+    }
+    let (state, why) = if r.disposition == pb::HandoffDisposition::AlreadyKnown as i32 {
+        ("received", "already_known")
+    } else {
+        ("rejected", r.reason.as_str())
+    };
+    match shared
+        .store()
+        .owe_report(&r.handoff_id, state, why, &r.detail, now_micros())
+    {
+        Ok(()) => {
+            shared.report_kick.notify_one();
+            None
+        }
+        Err(err) => {
+            tracing::error!("storing a result for BBS: {err:#}");
+            Some(r)
+        }
+    }
+}
+
+/// Report results owed to BBS in order. Each stays owed until the
+/// transport takes its frame; one still queued when the stream closes is
+/// reported again on the next.
+async fn report(shared: &Arc<Shared>, tx: &link::Sender<pb::AdapterFrame>) -> Result<()> {
+    let mut after = 0;
+    loop {
+        let owed = shared.store().unreported(after, 32)?;
+        if owed.is_empty() {
+            tokio::select! {
+                _ = shared.report_kick.notified() => {}
+                _ = tokio::time::sleep(shared.opts.poll) => {}
+            }
+            continue;
+        }
+        for o in owed {
+            let Some(permit) = tx.reserve().await else {
+                return Ok(());
+            };
+            let item = Item {
+                frame: frame(Out::OutgoingResult(crate::adapter::handoff_result(&o))),
+                claim: Some(Claim::Report(o.id)),
+            };
+            if permit.send(item).is_err() {
+                return Ok(());
+            }
+            after = o.id;
+            tracing::info!(
+                handoff = o.handoff_id,
+                state = o.state,
+                reason = o.reason,
+                "reported a remote send's result to BBS"
+            );
+        }
+    }
+}
+
 /// BBS's result for an import: record it and tell the relay.
 fn on_incoming_result(shared: &Shared, r: &pb::HandoffResult) {
     let (state, why) = match pb::HandoffDisposition::try_from(r.disposition) {
@@ -431,7 +497,7 @@ async fn dispatch(shared: &Arc<Shared>, tx: &link::Sender<pb::AdapterFrame>) -> 
                     message_bytes: c.bytes,
                 }),
             })),
-            claim: Some((Direction::Inbound, c.id)),
+            claim: Some(Claim::Handoff(Direction::Inbound, c.id)),
         };
         if permit.send(item).is_err() {
             shared
@@ -584,6 +650,49 @@ mod tests {
             s.store().counts(Direction::Outbound).unwrap(),
             vec![("pending".to_string(), 1)]
         );
+    }
+
+    /// A result still queued when its stream drops is owed, and the next
+    /// stream reports it; one the transport took is owed no longer.
+    #[tokio::test]
+    async fn a_result_queued_when_the_stream_drops_is_reported_on_the_next() {
+        use tokio_stream::StreamExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let a = adapter(&dir);
+        let s = &a.shared;
+        let mut late = message("m1");
+        late.expires_at_unix_micros = Some(now_micros() - 1);
+        let refused = on_outgoing(s, &offer("h1", late.encode_to_vec())).unwrap();
+        assert!(owe(s, refused).is_none(), "stored, not sent at once");
+        let owed = || s.store().unreported(0, 10).unwrap().len();
+        assert_eq!(owed(), 1);
+
+        // The first stream queues it, then drops before the transport takes it.
+        let (tx, frames) = link::channel::<pb::AdapterFrame>(QUEUE, s.settle());
+        let _ = tokio::time::timeout(Duration::from_millis(300), report(s, &tx)).await;
+        drop(frames);
+        assert!(tx.is_closed());
+        assert_eq!(owed(), 1, "still owed");
+
+        // The next stream reports it again; taken, it is owed no longer.
+        let (tx, mut frames) = link::channel::<pb::AdapterFrame>(QUEUE, s.settle());
+        let taken = tokio::select! {
+            r = report(s, &tx) => panic!("reporting stopped: {r:?}"),
+            f = frames.next() => f.unwrap(),
+        };
+        let Some(Out::OutgoingResult(r)) = taken.payload else {
+            panic!("a result, not {taken:?}");
+        };
+        assert_eq!(
+            (r.handoff_id.as_str(), r.disposition, r.reason.as_str()),
+            ("h1", pb::HandoffDisposition::Rejected as i32, "expired")
+        );
+        assert_eq!(owed(), 0);
+
+        // An invalid handoff ID, which BBS refuses on any stream, is not kept.
+        let bad = on_outgoing(s, &offer("bad id!", vec![])).unwrap();
+        assert!(owe(s, bad).is_some());
+        assert_eq!(owed(), 0);
     }
 
     #[test]

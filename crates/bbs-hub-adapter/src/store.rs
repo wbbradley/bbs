@@ -87,7 +87,6 @@ CREATE TABLE outbound (
     connection_id TEXT,
     reason TEXT,
     detail TEXT,
-    reported INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     attempted_at INTEGER,
     updated_at INTEGER NOT NULL,
@@ -95,8 +94,15 @@ CREATE TABLE outbound (
 );
 CREATE INDEX outbound_pending ON outbound (expires_at, id) WHERE state = 'pending';
 CREATE INDEX outbound_attempted ON outbound (id) WHERE state = 'attempted';
-CREATE INDEX outbound_unreported ON outbound (id)
-    WHERE reported = 0 AND state IN ('received', 'rejected');
+-- Results owed to BBS for its handoffs, until the transport takes them.
+CREATE TABLE reports (
+    id INTEGER PRIMARY KEY,
+    bbs_handoff_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('received', 'rejected')),
+    reason TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 CREATE TABLE inbound (
     id INTEGER PRIMARY KEY,
     handoff_id TEXT NOT NULL UNIQUE,
@@ -129,6 +135,11 @@ BEGIN SELECT RAISE(ABORT, 'a handoff never returns to pending once sent, nor cha
 "#;
 
 const VERSION: i64 = 1;
+
+/// Owe BBS an outbound row's result (`?2` is now); the caller adds the row
+/// filter.
+const OWE_REPORT: &str = "INSERT INTO reports (bbs_handoff_id, state, reason, detail, created_at)
+     SELECT bbs_handoff_id, state, coalesce(reason, ''), coalesce(detail, ''), ?2 FROM outbound";
 
 /// Refuse a secret or private file that others may read or write.
 pub fn check_private(path: &Path) -> Result<()> {
@@ -177,6 +188,7 @@ pub struct Claimed {
 /// A handoff's settled result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
+    /// The inbound row, or for a result owed to BBS, its report.
     pub id: i64,
     /// The handoff ID the other side knows it by: BBS's for outbound work,
     /// the relay's for inbound.
@@ -661,6 +673,9 @@ impl Store {
                 ),
                 params![id, now],
             )?;
+            if dir == Direction::Outbound {
+                tx.execute(&format!("{OWE_REPORT} WHERE id = ?1"), params![id, now])?;
+            }
         }
         tx.commit()?;
         Ok(ids)
@@ -770,13 +785,22 @@ impl Store {
         detail: &str,
         now: i64,
     ) -> Result<bool> {
-        Ok(self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE outbound SET state = ?3, reason = NULLIF(?4, ''), detail = NULLIF(?5, ''),
-                 reported = 0, updated_at = ?6
+                 updated_at = ?6
              WHERE handoff_id = ?1 AND connection_id = ?2
                  AND state IN ('attempted', 'sent', 'unknown')",
             params![handoff_id, connection, state, reason, detail, now],
-        )? > 0)
+        )? > 0;
+        if changed {
+            tx.execute(
+                &format!("{OWE_REPORT} WHERE handoff_id = ?1"),
+                params![handoff_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// Record BBS's import result for inbound handoff `handoff_id`, over
@@ -831,14 +855,33 @@ impl Store {
         self.inbound_outcome("id = ?1", &id.to_string())
     }
 
-    /// Outbound results not yet reported to BBS, oldest first.
-    pub fn unreported(&self, limit: usize) -> Result<Vec<Outcome>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, bbs_handoff_id, '', state, coalesce(reason, ''), coalesce(detail, '')
-             FROM outbound WHERE reported = 0 AND state IN ('received', 'rejected')
-             ORDER BY id LIMIT ?1",
+    /// Owe BBS a result for its handoff `bbs_handoff_id` that the adapter
+    /// settled itself (refused, or already known): kept until the transport
+    /// takes it, as a relay's result is.
+    pub fn owe_report(
+        &self,
+        bbs_handoff_id: &str,
+        state: &str,
+        reason: &str,
+        detail: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO reports (bbs_handoff_id, state, reason, detail, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![bbs_handoff_id, state, reason, detail, now],
         )?;
-        let rows = stmt.query_map([limit as i64], |r| {
+        Ok(())
+    }
+
+    /// Results owed to BBS after report `after`, oldest first; each
+    /// Outcome's ID is its report's.
+    pub fn unreported(&self, after: i64, limit: usize) -> Result<Vec<Outcome>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, bbs_handoff_id, '', state, reason, detail
+             FROM reports WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after, limit as i64], |r| {
             Ok(Outcome {
                 id: r.get(0)?,
                 handoff_id: r.get(1)?,
@@ -851,9 +894,10 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// The transport took report `id`: it is owed no longer.
     pub fn mark_reported(&self, id: i64) -> Result<()> {
         self.conn
-            .execute("UPDATE outbound SET reported = 1 WHERE id = ?1", [id])?;
+            .execute("DELETE FROM reports WHERE id = ?1", [id])?;
         Ok(())
     }
 

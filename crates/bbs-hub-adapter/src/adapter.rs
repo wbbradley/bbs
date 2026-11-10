@@ -17,7 +17,7 @@ use ed25519_dalek::SigningKey;
 use tokio::sync::{Notify, oneshot};
 
 use crate::config::Config;
-use crate::link::{self, Settle};
+use crate::link::{self, Claim, Settle};
 use crate::store::{Direction, Outcome, Store};
 use crate::{keys, now_micros, verify};
 
@@ -112,6 +112,8 @@ pub(crate) struct Shared {
     pub relay_kick: Notify,
     /// Wakes inbound dispatch to BBS.
     pub bbs_kick: Notify,
+    /// Wakes the reporting of results owed to BBS.
+    pub report_kick: Notify,
     /// Hub directory queries waiting for BBS's answer, by the query ID BBS
     /// was given.
     pub directory: Mutex<HashMap<String, oneshot::Sender<mp::DirectoryResult>>>,
@@ -127,24 +129,40 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Boundary(Weak<Shared>);
 
 impl Settle for Boundary {
-    fn taken(&self, dir: Direction, id: i64) {
-        if let Some(shared) = self.0.upgrade()
-            && let Err(err) = shared.store().mark_sent(dir, id, now_micros())
-        {
-            tracing::error!("recording a handoff as sent: {err:#}");
-        }
-    }
-
-    fn unsent(&self, dir: Direction, id: i64) {
+    fn taken(&self, claim: Claim) {
         let Some(shared) = self.0.upgrade() else {
             return;
         };
-        if let Err(err) = shared.store().requeue(dir, id, now_micros()) {
-            tracing::error!("returning an unsent handoff to pending: {err:#}");
+        match claim {
+            Claim::Handoff(dir, id) => {
+                if let Err(err) = shared.store().mark_sent(dir, id, now_micros()) {
+                    tracing::error!("recording a handoff as sent: {err:#}");
+                }
+            }
+            Claim::Report(id) => {
+                if let Err(err) = shared.store().mark_reported(id) {
+                    tracing::error!("recording a result as reported: {err:#}");
+                }
+            }
         }
-        match dir {
-            Direction::Outbound => shared.relay_kick.notify_one(),
-            Direction::Inbound => shared.bbs_kick.notify_one(),
+    }
+
+    fn unsent(&self, claim: Claim) {
+        let Some(shared) = self.0.upgrade() else {
+            return;
+        };
+        match claim {
+            Claim::Handoff(dir, id) => {
+                if let Err(err) = shared.store().requeue(dir, id, now_micros()) {
+                    tracing::error!("returning an unsent handoff to pending: {err:#}");
+                }
+                match dir {
+                    Direction::Outbound => shared.relay_kick.notify_one(),
+                    Direction::Inbound => shared.bbs_kick.notify_one(),
+                }
+            }
+            // Still owed: the next stream to BBS reports it.
+            Claim::Report(_) => {}
         }
     }
 }
@@ -187,48 +205,10 @@ impl Shared {
         lock(&self.relay).clone()
     }
 
-    /// Report outbound results BBS has not had yet, while it is connected.
-    pub fn report_outbound(&self) {
-        let Some(bbs) = self.bbs_link() else {
-            return;
-        };
-        loop {
-            let pending = match self.store().unreported(32) {
-                Ok(p) => p,
-                Err(err) => {
-                    tracing::error!("reading unreported results: {err:#}");
-                    return;
-                }
-            };
-            if pending.is_empty() {
-                return;
-            }
-            for o in pending {
-                let frame = pb::AdapterFrame {
-                    payload: Some(pb::adapter_frame::Payload::OutgoingResult(handoff_result(
-                        &o,
-                    ))),
-                };
-                if !bbs.try_send(frame) {
-                    return; // the stream is full or gone: the next connect reports it
-                }
-                if let Err(err) = self.store().mark_reported(o.id) {
-                    tracing::error!("recording a reported result: {err:#}");
-                    return;
-                }
-                tracing::info!(
-                    handoff = o.handoff_id,
-                    state = o.state,
-                    reason = o.reason,
-                    "reported a remote send's result to BBS"
-                );
-            }
-        }
-    }
-
     /// Tell the relay BBS's result for an inbound handoff, on the stream it
-    /// arrived on only (Hub accepts a result from no other). A result that
-    /// cannot go is informative and dropped.
+    /// arrived on only (Hub accepts a result from no other, CONTRACT.md:
+    /// TransferResult). So it is never kept to send again on a later stream:
+    /// a result that cannot go is informative and dropped.
     pub fn report_inbound(&self, o: &Outcome) {
         let Some(relay) = self.relay_link().filter(|r| r.connection == o.connection) else {
             tracing::info!(
@@ -267,7 +247,7 @@ impl Shared {
                     expired = ids.len(),
                     "remote sends expired before the relay took them"
                 );
-                self.report_outbound();
+                self.report_kick.notify_one();
             }
             Ok(_) => {}
             Err(err) => tracing::error!("expiring outbound work: {err:#}"),
@@ -445,6 +425,7 @@ impl Adapter {
                 relay: Mutex::new(None),
                 relay_kick: Notify::new(),
                 bbs_kick: Notify::new(),
+                report_kick: Notify::new(),
                 directory: Mutex::new(HashMap::new()),
             }),
         })

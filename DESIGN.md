@@ -570,8 +570,10 @@ with others a `message_conflict`. Otherwise it stores the message pending and
 sends no result yet. Once the relay stream has refreshed trust and its route
 claim is accepted, pending work goes one transfer at a time. The relay's
 result, accepted only on the stream the transfer was attempted on and only
-over attempted, sent or unknown, becomes BBS's result for the handoff; results
-BBS has not had yet are sent when it reconnects.
+over attempted, sent or unknown, becomes BBS's result for the handoff. Every
+result for BBS, the relay's or the adapter's own refusal, is stored until the
+transport takes its frame, and any still queued when the stream drops is sent
+again on the next; BBS keeps a handoff's first result and ignores the rest.
 
 *Inbound:* a transfer is verified as above, refused as `route_not_authorized`
 when it claims this namespace's origin or is addressed to another namespace,
@@ -579,7 +581,8 @@ answered at once as already known or `message_conflict` when its origin is
 known, and otherwise stored pending and offered to BBS as an import. BBS's
 result (received, already known, or its refusal, such as
 `recipient_unknown`) goes back to the relay on the stream the transfer came
-on; if that stream has gone, the informative result is dropped. Group copies
+on, as Hub accepts a result from no other stream; if that stream has gone,
+the informative result is dropped, never resent. Group copies
 pass like any message: their sender is the group, which is never refused for
 being one, and BBS stores the original and original sender. A reply from Hub
 carries `in_reply_to` and the exact address it answers (D092), unchanged.
@@ -594,7 +597,8 @@ queries yet; one gets an `unimplemented` result.
 
 **Streams.** The relay stream sends its hello, pages trust from the relay
 (the configured trust source), claims the route with a signed `RouteClaim`,
-heartbeats every 15 seconds and cuts a relay silent for 45. Both streams
+heartbeats every 15 seconds, ahead of any queued transfers, and cuts a relay
+silent for 45. Both streams
 reconnect with jittered exponential backoff from 250 ms to 30 seconds. An
 adapter whose BBS is another namespace, or speaks another integration
 protocol, stops rather than retry.

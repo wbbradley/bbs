@@ -1,11 +1,14 @@
-//! The frames waiting for one stream's transport, with the handoffs they
-//! carry. A claimed handoff counts as sent when the transport takes its
-//! frame from here (accepted into the HTTP/2 send path, not delivered or
-//! acknowledged: D072's stream-send boundary, as BBS and Hub use). Every move
-//! across that boundary happens under one lock: queuing (only while open),
-//! taking (only while open) and closing (which drains what is left). So a
-//! claim is either taken, and recorded sent, or drained, and returned to
-//! pending because it provably never left; never both.
+//! The frames waiting for one stream's transport, with the claims they
+//! carry: a handoff, or a stored result for BBS. A claim counts as done when
+//! the transport takes its frame from here (accepted into the HTTP/2 send
+//! path, not delivered or acknowledged: D072's stream-send boundary, as BBS
+//! and Hub use). Every move across that boundary happens under one lock:
+//! queuing (only while open), taking (only while open) and closing (which
+//! drains what is left). So a claim is either taken, and recorded, or
+//! drained, and returned because it provably never left; never both.
+//!
+//! Liveness frames (heartbeats) have a small queue of their own, taken
+//! before anything else, so a queue full of transfers never holds them back.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -16,21 +19,35 @@ use tokio_stream::Stream;
 
 use crate::store::Direction;
 
+/// What a frame carries across the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// A claimed handoff: sent when taken, back to pending if not.
+    Handoff(Direction, i64),
+    /// A stored result for BBS: reported when taken, reported again later
+    /// if not.
+    Report(i64),
+}
+
 /// What happens to a claim at the boundary.
 pub trait Settle: Send + Sync + 'static {
-    /// The transport took the claim's frame: sent.
-    fn taken(&self, dir: Direction, id: i64);
-    /// The claim never left: back to pending.
-    fn unsent(&self, dir: Direction, id: i64);
+    /// The transport took the claim's frame.
+    fn taken(&self, claim: Claim);
+    /// The claim never left.
+    fn unsent(&self, claim: Claim);
 }
 
-/// One frame and the handoff it carries, if any.
+/// One frame and what it carries, if anything.
 pub struct Item<T> {
     pub frame: T,
-    pub claim: Option<(Direction, i64)>,
+    pub claim: Option<Claim>,
 }
 
+/// Room for liveness frames: one or two are enough, as in Hub.
+const PRIORITY: usize = 4;
+
 struct Queue<T> {
+    priority: mpsc::Receiver<T>,
     rx: mpsc::Receiver<Item<T>>,
     closed: bool,
 }
@@ -45,7 +62,7 @@ impl<T> Shared<T> {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Close once, returning every claim still queued to pending.
+    /// Close once, returning every claim still queued.
     fn close(&self) {
         let mut q = self.lock();
         if q.closed {
@@ -53,9 +70,10 @@ impl<T> Shared<T> {
         }
         q.closed = true;
         q.rx.close();
+        q.priority.close();
         while let Ok(item) = q.rx.try_recv() {
-            if let Some((dir, id)) = item.claim {
-                self.settle.unsent(dir, id);
+            if let Some(claim) = item.claim {
+                self.settle.unsent(claim);
             }
         }
     }
@@ -64,6 +82,7 @@ impl<T> Shared<T> {
 /// The sending side of a link.
 pub struct Sender<T> {
     tx: mpsc::Sender<Item<T>>,
+    priority: mpsc::Sender<T>,
     shared: Arc<Shared<T>>,
 }
 
@@ -71,6 +90,7 @@ impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
         Sender {
             tx: self.tx.clone(),
+            priority: self.priority.clone(),
             shared: self.shared.clone(),
         }
     }
@@ -105,15 +125,22 @@ impl<T> Sender<T> {
         })
     }
 
-    /// Queue a frame that carries no handoff if there is room; false when
-    /// the link is full or closed.
+    /// Queue a frame that carries no claim if there is room; false when the
+    /// link is full or closed.
     pub fn try_send(&self, frame: T) -> bool {
         let q = self.shared.lock();
         !q.closed && self.tx.try_send(Item { frame, claim: None }).is_ok()
     }
 
+    /// Queue a liveness frame ahead of everything else; false when its own
+    /// small queue is full (one is already waiting) or the link is closed.
+    pub fn try_send_priority(&self, frame: T) -> bool {
+        let q = self.shared.lock();
+        !q.closed && self.priority.try_send(frame).is_ok()
+    }
+
     /// Close the link: nothing more is queued or taken, and claims still
-    /// queued return to pending.
+    /// queued are returned.
     pub fn close(&self) {
         self.shared.close();
     }
@@ -128,8 +155,8 @@ impl<T> Sender<T> {
     }
 }
 
-/// The transport's side: frames in order, each claim recorded as sent when
-/// taken. Dropping it closes the link.
+/// The transport's side: liveness frames first, then frames in order, each
+/// claim recorded when taken. Dropping it closes the link.
 pub struct Frames<T> {
     shared: Arc<Shared<T>>,
 }
@@ -143,10 +170,14 @@ impl<T> Stream for Frames<T> {
         if q.closed {
             return Poll::Ready(None);
         }
+        // Both queues register the waker; the priority one is asked first.
+        if let Poll::Ready(Some(frame)) = q.priority.poll_recv(cx) {
+            return Poll::Ready(Some(frame));
+        }
         match q.rx.poll_recv(cx) {
             Poll::Ready(Some(item)) => {
-                if let Some((dir, id)) = item.claim {
-                    shared.settle.taken(dir, id);
+                if let Some(claim) = item.claim {
+                    shared.settle.taken(claim);
                 }
                 Poll::Ready(Some(item.frame))
             }
@@ -164,13 +195,19 @@ impl<T> Drop for Frames<T> {
 /// A new link with room for `capacity` queued frames.
 pub fn channel<T>(capacity: usize, settle: Arc<dyn Settle>) -> (Sender<T>, Frames<T>) {
     let (tx, rx) = mpsc::channel(capacity);
+    let (priority_tx, priority) = mpsc::channel(PRIORITY);
     let shared = Arc::new(Shared {
-        queue: Mutex::new(Queue { rx, closed: false }),
+        queue: Mutex::new(Queue {
+            priority,
+            rx,
+            closed: false,
+        }),
         settle,
     });
     (
         Sender {
             tx,
+            priority: priority_tx,
             shared: shared.clone(),
         },
         Frames { shared },
@@ -183,32 +220,45 @@ mod tests {
     use tokio_stream::StreamExt as _;
 
     #[derive(Default)]
-    struct Record(Mutex<Vec<(&'static str, i64)>>);
+    struct Record(Mutex<Vec<(&'static str, Claim)>>);
 
     impl Settle for Record {
-        fn taken(&self, _: Direction, id: i64) {
-            self.0.lock().unwrap().push(("taken", id));
+        fn taken(&self, claim: Claim) {
+            self.0.lock().unwrap().push(("taken", claim));
         }
-        fn unsent(&self, _: Direction, id: i64) {
-            self.0.lock().unwrap().push(("unsent", id));
+        fn unsent(&self, claim: Claim) {
+            self.0.lock().unwrap().push(("unsent", claim));
         }
+    }
+
+    fn handoff(id: i64) -> Option<Claim> {
+        Some(Claim::Handoff(Direction::Outbound, id))
     }
 
     #[tokio::test]
     async fn a_claim_is_taken_or_returned_never_both() {
         let record = Arc::new(Record::default());
         let (tx, mut frames) = channel::<u32>(4, record.clone());
-        for id in 1..=3 {
+        for id in 1..=2 {
             tx.reserve()
                 .await
                 .unwrap()
                 .send(Item {
                     frame: id as u32,
-                    claim: Some((Direction::Outbound, id)),
+                    claim: handoff(id),
                 })
                 .ok()
                 .unwrap();
         }
+        tx.reserve()
+            .await
+            .unwrap()
+            .send(Item {
+                frame: 3,
+                claim: Some(Claim::Report(30)),
+            })
+            .ok()
+            .unwrap();
         assert!(tx.try_send(9));
         assert_eq!(frames.next().await, Some(1));
         tx.close();
@@ -225,9 +275,14 @@ mod tests {
                     .is_err()
         );
         assert!(!tx.try_send(5));
+        assert!(!tx.try_send_priority(6));
         assert_eq!(
             *record.0.lock().unwrap(),
-            vec![("taken", 1), ("unsent", 2), ("unsent", 3)]
+            vec![
+                ("taken", Claim::Handoff(Direction::Outbound, 1)),
+                ("unsent", Claim::Handoff(Direction::Outbound, 2)),
+                ("unsent", Claim::Report(30)),
+            ]
         );
     }
 
@@ -240,12 +295,32 @@ mod tests {
             .unwrap()
             .send(Item {
                 frame: 1,
-                claim: Some((Direction::Inbound, 7)),
+                claim: Some(Claim::Handoff(Direction::Inbound, 7)),
             })
             .ok()
             .unwrap();
         drop(frames);
         assert!(tx.is_closed());
-        assert_eq!(*record.0.lock().unwrap(), vec![("unsent", 7)]);
+        assert_eq!(
+            *record.0.lock().unwrap(),
+            vec![("unsent", Claim::Handoff(Direction::Inbound, 7))]
+        );
+    }
+
+    /// A full queue never holds back a heartbeat: it is taken next.
+    #[tokio::test]
+    async fn liveness_frames_go_ahead_of_a_full_queue() {
+        let record = Arc::new(Record::default());
+        let (tx, mut frames) = channel::<u32>(3, record.clone());
+        for n in 1..=3 {
+            assert!(tx.try_send(n));
+        }
+        assert!(!tx.try_send(4), "the queue is full");
+        assert!(tx.try_send_priority(100));
+        assert_eq!(frames.next().await, Some(100));
+        assert_eq!(frames.next().await, Some(1));
+        assert!(tx.try_send_priority(101));
+        assert_eq!(frames.next().await, Some(101));
+        assert_eq!(frames.next().await, Some(2));
     }
 }

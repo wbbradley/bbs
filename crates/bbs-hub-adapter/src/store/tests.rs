@@ -114,12 +114,39 @@ fn a_handoff_is_claimed_before_it_is_sent_and_settles_once() {
         store.state(Direction::Outbound, c.id).unwrap().unwrap(),
         ("rejected".into(), "recipient_unknown".into())
     );
-    let unreported = store.unreported(10).unwrap();
+    let unreported = store.unreported(0, 10).unwrap();
     assert_eq!(unreported.len(), 1);
     assert_eq!(unreported[0].handoff_id, "bbs-h1");
     assert_eq!(unreported[0].detail, "no such recipient");
-    store.mark_reported(c.id).unwrap();
-    assert!(store.unreported(10).unwrap().is_empty());
+    // Owed until the transport takes it, however often it was read.
+    assert_eq!(store.unreported(0, 10).unwrap(), unreported);
+    assert!(store.unreported(unreported[0].id, 10).unwrap().is_empty());
+    store.mark_reported(unreported[0].id).unwrap();
+    assert!(store.unreported(0, 10).unwrap().is_empty());
+}
+
+#[test]
+fn results_the_adapter_settles_itself_are_owed_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    store
+        .owe_report("bbs-h9", "rejected", "invalid_message", "bad", 1)
+        .unwrap();
+    store
+        .owe_report("bbs-h10", "received", "already_known", "", 2)
+        .unwrap();
+    let owed = store.unreported(0, 10).unwrap();
+    assert_eq!(
+        owed.iter()
+            .map(|o| (o.handoff_id.as_str(), o.state.as_str(), o.reason.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("bbs-h9", "rejected", "invalid_message"),
+            ("bbs-h10", "received", "already_known")
+        ]
+    );
+    store.mark_reported(owed[0].id).unwrap();
+    assert_eq!(store.unreported(0, 10).unwrap()[0].handoff_id, "bbs-h10");
 }
 
 #[test]
@@ -274,7 +301,7 @@ fn pending_work_past_its_deadline_is_rejected_as_expired() {
         store.state(Direction::Outbound, 1).unwrap().unwrap(),
         ("rejected".into(), "expired".into())
     );
-    assert_eq!(store.unreported(10).unwrap()[0].handoff_id, "bbs-h1");
+    assert_eq!(store.unreported(0, 10).unwrap()[0].handoff_id, "bbs-h1");
     // Claimed work is not expired: it is no longer pending.
     assert!(store.expire(Direction::Outbound, 5_000).unwrap().is_empty());
 
