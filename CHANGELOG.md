@@ -61,7 +61,7 @@ under the new package version and its publication date.
   Hub whose result was lost with a stream is offered to BBS again, which
   delivers it once. Plaintext endpoints must be on loopback unless
   `allow_plaintext_network = true`; there is no TLS yet. Settled handoffs are
-  kept 30 days (`retention_days`). Hub's directory
+  kept unless `retention_days` is set. Hub's directory
   queries for BBS's namespace get BBS's answer, signed; a top-level ID
   answers as its own alias, so `hub send will@bbs` reaches `will`. It passes all of
   Hub's signing and federation interop vectors. See "Running the Hub adapter"

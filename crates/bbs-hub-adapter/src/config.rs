@@ -4,7 +4,7 @@
 //! ```toml
 //! namespace = "bbs"            # this installation's Hub namespace
 //! store = "adapter.db"         # the adapter's own SQLite store
-//! # retention_days = 30        # how long settled handoffs are kept; 0 keeps them
+//! # retention_days = 0         # days to keep settled handoffs; 0 (default) keeps them
 //! # allow_plaintext_network = false
 //!
 //! [bbs]
@@ -39,8 +39,8 @@ use crate::verify::{valid_id, valid_namespace};
 pub struct Config {
     pub namespace: String,
     pub store: PathBuf,
-    /// How long settled handoffs are kept, in days; 0 keeps them.
-    #[serde(default = "default_retention")]
+    /// How long settled handoffs are kept, in days; 0, the default, keeps them.
+    #[serde(default)]
     pub retention_days: u64,
     /// Allow plaintext endpoints on hosts other than loopback.
     #[serde(default)]
@@ -64,10 +64,6 @@ pub struct Hub {
     pub installation_id: String,
     pub key_file: PathBuf,
     pub credential_file: PathBuf,
-}
-
-fn default_retention() -> u64 {
-    30
 }
 
 /// Whether `host` (from a URL) is a loopback address or `localhost`.
@@ -189,10 +185,7 @@ credential_file = "installation.cred"
         );
         assert_eq!(cfg.hub.key_file, dir.path().join("installation.key"));
 
-        assert_eq!(
-            cfg.retention(),
-            Some(std::time::Duration::from_secs(30 * 24 * 3600))
-        );
+        assert_eq!(cfg.retention(), None);
 
         std::fs::write(&path, "namespace = \"bbs\"\nextra = 1\n").unwrap();
         assert!(Config::load(&path).is_err());

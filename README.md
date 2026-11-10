@@ -685,7 +685,7 @@ credential_file = "installation.cred"
 
 The relay here is on a tailnet, so this configuration also needs
 `allow_plaintext_network = true` at the top level (see below). Optionally,
-`retention_days` (default 30; 0 keeps everything) sets how long a settled
+`retention_days` (default 0, which keeps everything) sets how many days a settled
 handoff stays in the adapter's store; BBS keeps the messages themselves.
 
 ```sh

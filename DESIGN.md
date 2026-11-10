@@ -531,8 +531,8 @@ whatever its revision, so a BBS whose database was reset is followed), the
 BBS), each with its exact bytes and unique on the message's origin, and
 `reports`, the results owed to BBS. Row IDs are never reused
 (AUTOINCREMENT): a stream's reporting cursor only moves forward. Settled
-handoffs are deleted 30 days after they settle (`retention_days`; 0 keeps
-them): BBS keeps the messages, and its own duplicate check answers a repeat
+handoffs are kept, as Hub's contract keeps retained rows, unless
+`retention_days` is set, which deletes them that many days after they settle: BBS keeps the messages, and its own duplicate check answers a repeat
 the adapter no longer remembers. Routes are live state, as in Hub:
 re-registered on every connection. The database, its lock and WAL files, the
 key and BBS's integration credential are opened first (never through a

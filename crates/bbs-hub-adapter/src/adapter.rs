@@ -61,7 +61,7 @@ impl Default for Options {
             backoff_max: Duration::from_secs(30),
             sweep: Duration::from_secs(30),
             poll: Duration::from_secs(1),
-            retention: Some(Duration::from_secs(30 * 24 * 3600)),
+            retention: None,
             drain: Duration::from_secs(10),
         }
     }
