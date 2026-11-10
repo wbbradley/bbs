@@ -198,6 +198,65 @@ fn check_sidecars(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write a consistent snapshot of the store at `path` to `destination`, a
+/// new file, while an adapter may be running on it. The copy goes through
+/// SQLite's online backup API from a read-only connection holding one read
+/// transaction, into a private (0600) temporary file beside `destination`
+/// that is synced and then published without overwriting anything. The
+/// store is neither locked, migrated nor recovered.
+pub fn backup(path: &Path, destination: &Path) -> Result<()> {
+    if destination.symlink_metadata().is_ok() {
+        bail!(
+            "backup destination already exists: {}",
+            destination.display()
+        );
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = destination.as_os_str().to_owned();
+        name.push(suffix);
+        if Path::new(&name).symlink_metadata().is_ok() {
+            bail!("backup destination has a SQLite sidecar; choose a new path");
+        }
+    }
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let resolved = parent
+        .canonicalize()
+        .with_context(|| format!("reading {}", parent.display()))?
+        .join(
+            destination
+                .file_name()
+                .context("backup destination needs a filename")?,
+        );
+    // SQLite and the adapter own these names even while they do not exist.
+    let source = path
+        .canonicalize()
+        .with_context(|| format!("opening backup source {}", path.display()))?;
+    for owned in ["-wal", "-shm", "-journal", ".lock"] {
+        let mut name = source.as_os_str().to_owned();
+        name.push(owned);
+        if resolved == Path::new(&name) {
+            bail!("backup destination is a store sidecar; choose a different path");
+        }
+    }
+    let store = Store::open_read_only(path)?;
+    // NamedTempFile creates the file owner-only: the store holds signed
+    // envelopes and message bytes.
+    let temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating backup in {}", parent.display()))?;
+    store.copy_to(temporary.path())?;
+    temporary.as_file().sync_all().context("syncing backup")?;
+    temporary.persist_noclobber(destination).with_context(|| {
+        format!(
+            "saving backup to {} without overwriting",
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Owe BBS an outbound row's result (`?2` is now); the caller adds the row
 /// filter.
 const OWE_REPORT: &str = "INSERT INTO reports (bbs_handoff_id, state, reason, detail, expires_at,
@@ -1202,6 +1261,29 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
+    }
+
+    /// Copy the store to `destination` in one backup step, from a read
+    /// transaction pinned first, so writers carry on and the copy is one
+    /// snapshot.
+    fn copy_to(&self, destination: &Path) -> Result<()> {
+        self.conn.execute_batch("BEGIN")?;
+        let _: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;
+        let mut target = Connection::open(destination)?;
+        {
+            let backup = rusqlite::backup::Backup::new(&self.conn, &mut target)?;
+            match backup.step(-1)? {
+                rusqlite::backup::StepResult::Done => {}
+                other => bail!("backup did not complete: {other:?}"),
+            }
+        }
+        self.conn.execute_batch("COMMIT")?;
+        // A standalone database, without WAL files to copy with it.
+        target.pragma_update(None, "journal_mode", "DELETE")?;
+        target.close().map_err(|(_, e)| e)?;
+        Ok(())
     }
 
     /// Handoffs by state, per direction.

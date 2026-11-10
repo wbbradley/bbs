@@ -619,6 +619,16 @@ Keys are files, not rows: the installation key is a hex seed, as Hub's
 only, never overwriting, and prints only the public key), and the credential
 is the encoded `SignedRecord` Hub's `hub admin credential` writes. The key and
 BBS's integration credential must be owner-only; neither is logged.
+`bbs-hub-adapter backup` snapshots the store as `bbs backup` does BBS's
+database: a read-only connection pins one read transaction and copies it
+through SQLite's online backup API into a private temporary file, published
+without overwriting, so a running adapter is unaffected; it neither takes the
+`.lock` nor migrates. Losing the store, or restoring an older one, can drop
+work in flight between the two sides (D072 never re-offers a handoff once it
+left, so `pending`/`attempted` outbound rows, inbound rows BBS has not
+received, owed `reports` and waiting duplicates are lost, and lapse to
+unknown on the other side) but never duplicates it: Hub and BBS both answer a
+repeated origin as already known. Keys and credentials are not in it.
 
 **Signing and decoding.** Records are signed exactly as Hub's `internal/sign`
 does: Ed25519 over `"msgproto/v1/" || label || 0 || U32BE(1) || key ||

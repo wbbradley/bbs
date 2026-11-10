@@ -909,3 +909,78 @@ fn a_resent_import_gets_one_result_and_an_unknown_one_none() {
             .is_empty()
     );
 }
+
+/// A backup beside a running adapter, with another writer mid-transaction:
+/// a private, standalone snapshot of what was committed, never overwritten.
+#[test]
+fn a_backup_is_a_consistent_snapshot_of_a_store_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adapter.db");
+    let store = open(&dir);
+    for n in 1..=3 {
+        assert_eq!(outbound(&store, n, 1_000), Intake::New);
+    }
+    // A writer holds the write lock with a row not yet committed.
+    let writer = Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer
+        .execute(
+            "INSERT INTO relay_session (id, connection_id, relay_installation, connected_at)
+             VALUES (1, 'conn-1', 'relay', 5)",
+            [],
+        )
+        .unwrap();
+
+    let out = dir.path().join("snapshot.db");
+    backup(&path, &out).unwrap();
+    writer.execute_batch("COMMIT").unwrap();
+    assert_eq!(outbound(&store, 4, 1_000), Intake::New);
+
+    let mode = std::fs::metadata(&out).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = out.as_os_str().to_owned();
+        name.push(suffix);
+        assert!(!std::path::Path::new(&name).exists(), "{suffix}");
+    }
+    let snap = Connection::open_with_flags(&out, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let check: String = snap
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+    let mode: String = snap
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    let ids: Vec<String> = snap
+        .prepare("SELECT bbs_handoff_id FROM outbound ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(ids, ["bbs-h1", "bbs-h2", "bbs-h3"]);
+    let sessions: i64 = snap
+        .query_row("SELECT count(*) FROM relay_session", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sessions, 0, "an uncommitted row is not in the snapshot");
+    drop(snap);
+
+    // Never overwritten, and never onto a name the store's files own.
+    let before = std::fs::read(&out).unwrap();
+    let err = backup(&path, &out).unwrap_err().to_string();
+    assert!(err.contains("already exists"), "{err}");
+    assert_eq!(std::fs::read(&out).unwrap(), before);
+    let err = backup(&path, &dir.path().join("adapter.db-journal"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("store sidecar"), "{err}");
+
+    // The snapshot opens as a store once the adapter is stopped.
+    drop(store);
+    let restored = Store::open(&out, 2).unwrap();
+    assert_eq!(
+        restored.counts(Direction::Outbound).unwrap(),
+        [("pending".to_string(), 3)]
+    );
+}

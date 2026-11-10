@@ -52,7 +52,9 @@ under the new package version and its publication date.
   for Hub trust, the relay session, exact signed envelopes and work not yet
   handed on. `bbs-hub-adapter keygen --out FILE` writes an owner-only
   installation key and prints its public key; `run --config FILE` runs it;
-  `status --config FILE` shows its trust, session and handoffs. Remote sends
+  `status --config FILE` shows its trust, session and handoffs; `backup
+  --config FILE --out PATH` writes a consistent, owner-only snapshot of its
+  store while it runs, never overwriting. Remote sends
   go to the relay signed over BBS's exact bytes, and the relay's receipt or
   rejection becomes the send's result in BBS; messages from Hub are verified
   (signature, credential, trust and strict decoding) before BBS imports them,
