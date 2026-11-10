@@ -316,10 +316,14 @@ impl Session {
             build = hello.build,
             "relay connected"
         );
+        // Heartbeats run as their own task: dispatch does synchronous store
+        // and signing work between awaits, and on a busy machine sharing
+        // this task with it would leave the ticker unpolled for long spans.
+        let mut beats = AbortOnDrop(tokio::spawn(self.clone().heartbeat()));
         tokio::select! {
             r = self.clone().read(inbound) => r,
             r = self.clone().setup_and_dispatch() => r,
-            r = self.clone().heartbeat() => r,
+            r = &mut beats.0 => r.context("the heartbeat task")?,
             r = self.clone().report_results() => r,
         }
     }
@@ -1373,5 +1377,14 @@ mod tests {
         assert_eq!(remote.len(), 1, "a stray answer leaves the query waiting");
         assert!(answered(&mut remote, "a", &[7; 32]).is_some());
         assert!(remote.is_empty());
+    }
+}
+
+/// Aborts its task when dropped, so a session's helper tasks end with it.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
