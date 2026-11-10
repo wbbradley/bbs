@@ -1046,6 +1046,8 @@ mod tests {
             reply.command,
             Some(Command::Reply { message_id: 7, body: Some(ref b) }) if b == "-"
         ));
+        let err = Cli::try_parse_from(["bbs", "reply", "DiCkgwvQ", "hi"]).unwrap_err();
+        assert!(err.to_string().contains("(id N)"), "{err}");
     }
 
     #[test]
