@@ -512,10 +512,10 @@ impl Session {
         }
     }
 
-    /// Hand off pending outbound work one transfer at a time: wait for room
-    /// on the stream, claim the oldest (committed as attempted, its envelope
-    /// signed at the first claim), then queue it. It becomes sent when the
-    /// transport takes it.
+    /// Hand off pending outbound work: wait for room (up to [`QUEUE`]
+    /// transfers queued), claim the oldest (committed as attempted, its
+    /// envelope signed at the first claim), then queue it. It becomes sent
+    /// when the transport takes it.
     async fn dispatch(&self) -> Result<()> {
         let shared = &self.shared;
         loop {

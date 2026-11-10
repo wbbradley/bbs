@@ -56,8 +56,12 @@ under the new package version and its publication date.
   go to the relay signed over BBS's exact bytes, and the relay's receipt or
   rejection becomes the send's result in BBS; messages from Hub are verified
   (signature, credential, trust and strict decoding) before BBS imports them,
-  and BBS's answer goes back to the relay. Every handoff is at most once: work
-  attempted when the adapter stops is never sent again. Hub's directory
+  and BBS's answer goes back to the relay. Every remote send is at most once:
+  one attempted when the adapter stops is never sent again; a message from
+  Hub whose result was lost with a stream is offered to BBS again, which
+  delivers it once. Plaintext endpoints must be on loopback unless
+  `allow_plaintext_network = true`; there is no TLS yet. Settled handoffs are
+  kept 30 days (`retention_days`). Hub's directory
   queries for BBS's namespace get BBS's answer, signed; a top-level ID
   answers as its own alias, so `hub send will@bbs` reaches `will`. It passes all of
   Hub's signing and federation interop vectors. See "Running the Hub adapter"

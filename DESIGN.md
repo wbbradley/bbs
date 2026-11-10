@@ -441,9 +441,9 @@ integration), the message with its frozen common `Message` bytes (seven-day
 deadline, plain text) and an `integration_outbox` row, `pending`; no delivery
 row. A well-formed reference to an entity that does not exist is accepted:
 only the adapter can tell. While publication is off, pending work stays
-pending. The stream hands work off one at a time: it waits for room on the
-stream, then in one database call claims the oldest pending row (`attempted`,
-committed) and queues the offer. The row becomes `sent` when the transport
+pending. The stream hands work off one claim at a time, with up to 16 frames
+queued: it waits for room on the stream, then in one database call claims the
+oldest pending row (`attempted`, committed) and queues the offer. The row becomes `sent` when the transport
 takes the frame from the stream: accepted into the HTTP/2 send buffer, not
 delivered, and not acknowledged by the adapter. When a stream ends, offers
 still queued in memory provably never left BBS and return to `pending`, to be
@@ -518,16 +518,27 @@ and, as the home of BBS's namespace, of one Hub relay's federation stream
 the other. BBS keeps history, inboxes and its own pending handoffs; the
 adapter keeps everything Hub-specific. It never reads BBS's database.
 
-**Store.** Its own SQLite file (WAL, created owner-only, refused if others can
-read it, held by one adapter through a `.lock` file) has `identity` (the
-namespace and installation it was made for; another is refused, a new key for
-the same installation replaces the old), Hub trust (`bindings` from the relay,
-whose revisions only move forward, an equal revision with other contents
-keeping the stored one; `credentials` verified and cached; `revocations`,
-permanent), the last `catalog` BBS published (a lower or equal revision is
-ignored), the `relay_session`, and the handoffs: `outbound` (BBS to Hub) and
-`inbound` (Hub to BBS), each with its exact bytes, unique on the message's
-origin. Routes are live state, as in Hub: re-registered on every connection.
+**Store.** Its own SQLite file (WAL, held by one adapter through a `.lock`
+file) has `identity` (the namespace and installation it was made for; another
+is refused, a new key for the same installation replaces the old), Hub trust
+(`bindings` from the relay, whose revisions only move forward, an equal
+revision with other contents keeping the stored one; a malformed binding or
+one whose authority key is not a point or has small order is skipped, not the
+page; `revocations`, permanent), the last `catalog` BBS published (later
+catalogs on a BBS stream only move forward; each stream's first is taken
+whatever its revision, so a BBS whose database was reset is followed), the
+`relay_session`, the handoffs, `outbound` (BBS to Hub) and `inbound` (Hub to
+BBS), each with its exact bytes and unique on the message's origin, and
+`reports`, the results owed to BBS. Row IDs are never reused
+(AUTOINCREMENT): a stream's reporting cursor only moves forward. Settled
+handoffs are deleted 30 days after they settle (`retention_days`; 0 keeps
+them): BBS keeps the messages, and its own duplicate check answers a repeat
+the adapter no longer remembers. Routes are live state, as in Hub:
+re-registered on every connection. The database, its lock and WAL files, the
+key and BBS's integration credential are opened first (never through a
+symlink) and then checked through the open file: a regular file owned by the
+adapter's user that no one else may read or write. Directories the adapter
+creates for them are owner-only.
 Keys are files, not rows: the installation key is a hex seed, as Hub's
 `hub admin keygen` writes it (`bbs-hub-adapter keygen` writes the same, owner
 only, never overwriting, and prints only the public key), and the credential
@@ -543,8 +554,9 @@ outright, since it lets anyone forge: as a record's signer it is
 `invalid_signature`, as a credential's subject `invalid_credential`. Untrusted bytes are bounded, then walked against the vendored
 descriptors before prost decodes them, as Hub's `internal/wire` does:
 malformed encoding, a wire-type mismatch, a repeated singular field,
-conflicting oneof members, invalid UTF-8, a reserved field number or nesting
-past 16 is refused, and unknown fields are kept. The federation stream carries
+conflicting oneof members, invalid UTF-8, a reserved field number or message
+nesting past 16 is refused, and unknown fields are kept (field numbers up to
+2^31-1, unknown groups nested up to protowire's 10,000, as Go accepts). The federation stream carries
 raw frames through its own codec, so every received frame is walked first (one
 that fails ends the stream, as in Hub) and a transfer's envelope stays the
 bytes it arrived in; outgoing transfers are written by hand around the stored
@@ -562,33 +574,60 @@ byte for byte from the same test seeds.
 the transport takes the frame, then `received` (detail `already_known` for a
 duplicate) or `rejected`. A claim still queued when its stream closes provably
 never left and returns to pending, under the same lock discipline BBS uses;
-anything attempted when the adapter stops becomes `unknown` at the next start
-and is never offered again. Pending work past its deadline becomes `rejected`
-(`expired`). Triggers stop a settled row from changing and sent or unknown
-work from returning to pending. An outbound envelope is signed at its first
-claim and kept (Hub's D114).
+anything attempted when the adapter stops becomes `unknown` at the next start.
+An outbound send that is sent or unknown is never offered again. An import
+that is sent or unknown is offered to BBS again when BBS reconnects, since
+its result was lost with the earlier stream; BBS answers a message it has as
+already known, so it is still delivered once. Pending work past its deadline
+becomes `rejected` (`expired`); sent work with no result by its deadline
+becomes `unknown`. Triggers stop a settled row from changing and an outbound
+send from returning to pending once sent. An outbound envelope is signed at
+its first claim and kept (Hub's D114).
+
+*Queues and locks:* each stream's frames wait in three queues, taken in
+order, as Hub's peer does: a few slots for heartbeats; 256 control slots for
+results, replies and trust and route requests; then the work (up to 64
+transfers to the relay, or 16 imports to BBS), claimed one at a time as room
+appears. Results the adapter owes wait for a control slot rather than being
+dropped; an immediate reply to the relay (a refusal, a duplicate's answer, a
+directory reply) that finds the control queue full is dropped, logged and
+counted, as Hub drops it. The queue lock is the boundary of D072: queuing,
+taking and closing happen under it. What the transport takes or returns is
+noted there and recorded in the store afterwards, by a separate task: the
+store is never taken inside a queue lock (debug builds check this), so the
+lock order is store, then queue, then that note.
 
 *Outbound:* BBS offers its frozen `Message` bytes. The adapter decodes them
 strictly, applies `checkMessage`, and refuses (as BBS's result, with Hub's
 reason) a sender or message ID outside its namespace, a recipient inside it,
 or a passed deadline; the same origin with the same bytes is already known,
-with others a `message_conflict`. Otherwise it stores the message pending and
-sends no result yet. Once the relay stream has refreshed trust and its route
-claim is accepted, pending work goes one transfer at a time. The relay's
-result, accepted only on the stream the transfer was attempted on and only
-over attempted, sent or unknown, becomes BBS's result for the handoff. Every
-result for BBS, the relay's or the adapter's own refusal, is stored until the
-transport takes its frame, and any still queued when the stream drops is sent
-again on the next; BBS keeps a handoff's first result and ignores the rest.
+with others a `message_conflict`; a duplicate of a rejected message gets the
+original's rejection. The same handoff offered again gets its stored result
+again, if it has one; a handoff ID BBS already used for another message gets
+no result under that ID (it would settle the first) and is logged. Otherwise
+the adapter stores the message pending and sends no result yet. Once the relay
+stream has refreshed trust and its route claim is accepted, pending work is
+claimed one transfer at a time, up to 64 queued. The relay's result, accepted
+only on the stream the transfer was attempted on and only over attempted, sent
+or unknown, becomes BBS's result for the handoff. Every result for BBS, the
+relay's or the adapter's own refusal, is stored until the transport takes its
+frame; one still queued when the stream drops is sent on the next, and one
+taken is kept an hour (never past its handoff's deadline) and sent again on a
+new stream, in case BBS ended the old one before acting on it. BBS keeps a
+handoff's first result and ignores the rest, and ignores a result for a
+handoff it never offered.
 
 *Inbound:* a transfer is verified as above, refused as `route_not_authorized`
 when it claims this namespace's origin or is addressed to another namespace,
 answered at once as already known or `message_conflict` when its origin is
-known, and otherwise stored pending and offered to BBS as an import. BBS's
-result (received, already known, or its refusal, such as
-`recipient_unknown`) goes back to the relay on the stream the transfer came
-on, as Hub accepts a result from no other stream; if that stream has gone,
-the informative result is dropped, never resent. Group copies
+known (a duplicate of a rejected message gets the original's rejection), and
+otherwise stored pending and offered to BBS as an import, up to 16 queued.
+BBS's result (received, already known, or its refusal, such as
+`recipient_unknown`; an empty or malformed reason becomes `invalid_message`)
+is stored, and sent to the relay on the stream the transfer came on, as Hub
+accepts a result from no other stream, whenever it arrives on that stream's
+life; if that stream has gone, the informative result is dropped, never
+resent. Group copies
 pass like any message: their sender is the group, which is never refused for
 being one, and BBS stores the original and original sender. A reply from Hub
 carries `in_reply_to` and the exact address it answers (D092), unchanged.
@@ -597,17 +636,29 @@ carries `in_reply_to` and the exact address it answers (D092), unchanged.
 requester must be in the querying credential's namespace, with
 ASSERT_SENDERS) and passed to BBS as a local directory query under a fresh
 ID; BBS's answer is signed as a `DirectoryAnswer` bound to the query's record
-hash. With BBS away the signed answer carries `home_offline`; an answer BBS
-does not give before the query's deadline is not sent. BBS asks no remote
+hash. With BBS away the signed answer carries `home_offline`, and with BBS's
+stream full `queue_full`; an answer BBS does not give before the query's
+deadline is not sent. A query is checked before any work starts for it; a
+store failure while checking answers `invalid_signature`, Hub's fallback. BBS asks no remote
 queries yet; one gets an `unimplemented` result.
 
 **Streams.** The relay stream sends its hello, pages trust from the relay
-(the configured trust source), claims the route with a signed `RouteClaim`,
-heartbeats every 15 seconds, ahead of any queued transfers, and cuts a relay
-silent for 45. Both streams
-reconnect with jittered exponential backoff from 250 ms to 30 seconds. An
-adapter whose BBS is another namespace, or speaks another integration
-protocol, stops rather than retry.
+(the configured trust source, by Hub's design), claims the route with a
+signed `RouteClaim`, and heartbeats every 15 seconds, ahead of anything
+queued. It cuts a relay silent for 45 seconds, and one that has stopped
+reading: frames waiting 45 seconds with none taken mean flow control is full,
+whatever heartbeats the relay sends (Hub's `watch` does the same). A
+`TrustChanged` refresh is retried until it applies or the stream ends. On
+shutdown the relay stream takes no new work, gives queued frames up to 10
+seconds to go (CONTRACT.md), and records its session ended. Both streams
+reconnect with jittered exponential backoff from 250 ms to 30 seconds. BBS
+refusing the integration credential makes the adapter read its file again;
+BBS superseding the stream (another adapter with the same integration) makes
+it wait the longest backoff. An adapter whose BBS is another namespace, or
+speaks another integration protocol, stops rather than retry. Transport is
+plaintext HTTP/2 only: an `https://` endpoint is refused, and a plaintext one
+must be on loopback unless `allow_plaintext_network` declares a network that
+protects transport itself, such as a tailnet.
 
 ## Web UI
 

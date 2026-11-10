@@ -342,8 +342,9 @@ impl Store {
         }
     }
 
-    /// Handoffs left attempted by a stop may or may not have left: unknown,
-    /// never sent again.
+    /// Handoffs left attempted by a stop may or may not have left: unknown.
+    /// An outbound send is never sent again; an import is offered again when
+    /// BBS reconnects ([`Store::reoffer_inbound`]).
     fn recover(&mut self, now: i64) -> Result<(usize, usize)> {
         let mut n = [0; 2];
         for (i, dir) in [Direction::Outbound, Direction::Inbound].iter().enumerate() {

@@ -721,14 +721,17 @@ Both sides reconnect on their own. Work for a side that is down waits in the
 store, and expires at its deadline. Every handoff is at most once (Hub's
 D072): the adapter marks work attempted, and commits, before it puts it on a
 stream; work still queued when a stream ends never left and is offered again,
-but anything attempted when the adapter stops becomes unknown at the next
-start and is never sent again. The relay's result for a remote send (received,
+but a remote send attempted when the adapter stops becomes unknown at the next
+start and is never sent again. A message from Hub whose result was lost with a
+stream to BBS is offered to BBS again when it reconnects; BBS recognises one
+it already has, so it is delivered once. The relay's result for a remote send (received,
 already known, or a rejection such as `recipient_unknown`) becomes BBS's
 result for its handoff, so a rejection reaches the sender as a "Not
 delivered" notice. A message from Hub is verified (Hub's signature, credential
 and trust rules, with strict decoding) before BBS is offered it, and BBS's
-answer goes back to the relay; a repeat the adapter has already handed on is
-answered as already known without offering it again. Hub's directory queries
+answer goes back to the relay on the stream the message came on; a repeat
+the adapter has already handed on is answered as the first was (already
+known, or its rejection) without offering it again. Hub's directory queries
 for BBS's namespace are answered by BBS and signed by the adapter; while BBS is
 away the signed answer says the home is offline. `status` shows the relay
 session, trusted namespaces, the catalog revision and the handoffs by state.
