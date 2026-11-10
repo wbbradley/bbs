@@ -596,11 +596,14 @@ at most once: BBS marks a handoff attempted before putting it on the stream
 and never offers it again, even after a crash, which can lose it. `bbs admin
 integration list` counts handoffs by state: pending, attempted, sent, then
 the adapter's received or rejected, or unknown when the outcome is uncertain.
-When the adapter rejects a message, or it is still pending after seven days,
-the sender gets a "Not delivered" notice in its own inbox. When the outcome is
-unknown (the stream or the server stopped mid-handoff), the sender gets a
-"Delivery uncertain" notice instead: the message may not have arrived, and
-BBS will not send it again.
+Sent means the server's HTTP/2 stack accepted the frame, not that the adapter
+got it. Handoffs still queued in the server when a stream ends never left it
+and are offered again on the next stream. When the adapter rejects a message,
+or it is still pending after seven days, the sender gets a "Not delivered"
+notice in its own inbox. When the outcome is unknown (the server stopped
+mid-handoff, or a sent message got no result within seven days), the sender
+gets a "Delivery uncertain" notice instead: the message may not have arrived,
+and BBS will not send it again.
 
 Each namespace belongs to the first integration that imports from it or
 sends to it; another integration's messages from that namespace are refused.

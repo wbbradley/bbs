@@ -37,7 +37,8 @@ under the new package version and its publication date.
   so a replacement integration can take it. When the adapter refuses a
   message, or it waits unsent for seven days, the sender gets a "Not
   delivered" notice in its own inbox; when a handoff's outcome is uncertain,
-  a "Delivery uncertain" notice, and it is not resent.
+  a "Delivery uncertain" notice, and it is not resent. Handoffs a stream had
+  queued but never sent are offered again on the next stream.
 - Messages the adapter offers are validated against Hub's limits and delivered
   to the local human or agent; a repeat with identical bytes is reported as
   already known, and different content under the same message ID is refused

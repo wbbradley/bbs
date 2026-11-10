@@ -382,13 +382,20 @@ as `bbs-integration-token`; a failure counts against the peer's
 authentication-failure budget. Credentials are checked on a separate
 read-only connection, so a flood of bad ones never holds the board's write
 connection; at most 16 streams may be between connecting and their hello, and
-one HTTP/2 connection carries at most 4 streams. The first frame must be a
+one HTTP/2 connection carries at most 4 streams. The 16 is one limit for all
+peers, not per peer: a flood of slow handshakes can delay a real adapter's
+connect, which it retries. The first frame must be a
 hello for the same integration with protocol major 1, within ten seconds; BBS
 answers with its hello, naming its namespace, and its catalog. A stream
 rechecks its credential every five seconds, and a newer stream for the
 integration supersedes it. Revocation, the recheck, shutdown and supersession
-end a stream even while it waits for the adapter to make room. Errors reach
-the adapter as their status and a fixed message; internal detail stays in the
+end a stream even while it waits for the adapter to make room, and the
+stream always ends with that status, never a bare OK. An adapter that has
+stopped reading keeps its HTTP/2 stream, and the slot it holds, until it reads
+the remaining frames and the status, or its connection closes: tonic gives a
+handler no way to reset a stream whose trailers are queued, so the four
+streams per connection bound what a stalled adapter can hold. Errors reach the
+adapter as their status and a fixed message; internal detail stays in the
 server log.
 
 **Bounds.** Frames are at most 4 MiB each way (gRPC enforces it before
@@ -436,29 +443,41 @@ only the adapter can tell. While publication is off, pending work stays
 pending. The stream hands work off one at a time: it waits for room on the
 stream, then in one database call claims the oldest pending row (`attempted`,
 committed) and queues the offer. The row becomes `sent` when the transport
-takes the frame from the stream; offers still queued when the stream ends
-become `unknown`. The adapter's result moves `attempted`, `sent` or `unknown`
-to `received` (detail `already_known` for ALREADY_KNOWN) or `rejected` with
-its reason; a later result never replaces the first, and a result for a
-handoff never offered is ignored. Startup turns every `attempted` row into
-`unknown`. Nothing returns to `pending`, so a crash between claim and send
-loses the message rather than risk sending it twice. Pending work past its
-deadline becomes `rejected` (`expired`): at the claim, and by a sweep at
+takes the frame from the stream: accepted into the HTTP/2 send buffer, not
+delivered, and not acknowledged by the adapter. When a stream ends, offers
+still queued in memory provably never left BBS and return to `pending`, to be
+offered again under the same handoff ID, with no notice. One lock over the
+queue makes this exact: queuing an offer (only while the queue is open),
+taking one for the transport (likewise) and closing the queue (which drains
+it) exclude each other, so an offer is either taken and `sent` or drained and
+`pending`, never both. The adapter's result moves `attempted`, `sent` or
+`unknown` to `received` (detail `already_known` for ALREADY_KNOWN) or
+`rejected` with its reason; a later result never replaces the first, and a
+result for a handoff never offered is ignored. Startup turns every
+`attempted` row into `unknown`: a crash between claim and send loses the
+message rather than risk sending it twice. Pending work past its deadline
+becomes `rejected` (`expired`), and `sent` work with no result by its
+deadline becomes `unknown`: at the claim (pending only), and by a sweep at
 startup and every minute. A rejection, the adapter's or an expiry, puts a
 `delivery_error` notice in the sender's own inbox, in reply to the failed
 message, naming its recipient and send time and a fixed phrase for the reason,
-never the adapter's detail. A move to `unknown`, a stream ending with offers
-queued or a restart finding `attempted` rows, is exactly where a message may
-have been lost, so it too sends a notice, worded apart from a failure: the
-delivery is uncertain, it may not have arrived, and BBS will not send it
-again. Nothing retries it. The states show in `bbs admin integration list`.
+never the adapter's detail. A move to `unknown` (a restart finding
+`attempted` rows, or `sent` work unanswered at its deadline) is where a
+message may have been lost, so it too sends a notice, worded apart from a
+failure: the delivery is uncertain, it may not have arrived, and BBS will not
+send it again. Nothing retries it. A notice is sent from the sender's own
+address to itself, with kind `delivery_error`; it is not counted as the
+sender's send: it moves neither the agent's last-sent time nor matches a
+search or feed filter by sender. The states show in `bbs admin integration
+list`.
 
 **Import.** An offer is validated as above, then a message with the same
 origin `(namespace, ID)` answers ALREADY_KNOWN when its stored bytes are
 identical and `message_conflict` otherwise, before any lifecycle or deadline
 check (Hub's order). A namespace bound to another integration is
 `route_not_authorized` before that check, so duplicates are matched only
-within the integration that owns the namespace. A new message must be
+within the integration that owns the namespace; the same holds for a group
+copy's original namespace. A new message must be
 unexpired, `text/plain; charset=utf-8`, UTF-8 and not blank. A group copy's
 original sender must be in its original's namespace, which must not be this
 installation's. The recipient must be in this installation's namespace, with
@@ -471,8 +490,9 @@ entity and address (kind `group` for a group copy, else `unknown` until an
 observation says), the message with its exact bytes, `in_reply_to`, the group
 copy's original and original sender, and one direct delivery, and the result
 is RECEIVED. Results use Hub's transfer reason names. Observations update only
-foreign entities' kind, display name and lifecycle, in namespaces not bound
-to another integration; they never touch native ones.
+foreign entities' kind, display name and lifecycle, and only in namespaces
+bound to the observing integration; others, unbound ones included, are
+ignored, and native entities are never touched.
 
 Reads show a foreign sender, or a remote recipient in the feed, as its
 `id:ENTITY@NAMESPACE` reference, of kind `remote` (`KIND_REMOTE`) whatever
