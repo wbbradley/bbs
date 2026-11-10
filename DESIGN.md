@@ -518,18 +518,31 @@ the only usable one; publication on), and sends the adapter a
 `remote_directory_query` with a fresh query ID, the caller's own native entity
 as the requester (`will`, or `will/scout` for an agent), and a deadline five
 seconds out. It writes nothing to route it: a namespace is bound only by a
-send or an import. Each open stream is registered on the server state with its
-frame sender and the queries waiting on it, at most 128; the RPC waits up to six
-seconds for the matching `remote_directory_result`, without holding the
-database. A result with an error code is an error, never an empty directory:
-`namespace_unknown` and `entity_unknown` are `NOT_FOUND`, `invalid_argument`,
-`invalid_cursor` and `invalid_address` are `INVALID_ARGUMENT`, and anything
-else is `UNAVAILABLE`, the message led by the reason code. An adapter that is
-not connected (`relay_unavailable`), one whose stream ends while a query
-waits, and one that does not answer in time (`directory_timeout`) are
-`UNAVAILABLE` too; a late result is dropped. Descriptors outside the asked
-namespace, or malformed, are left out, and the rest are cached as
-observations (which count only for a namespace bound to that integration).
+send or an import. A focused agent may not ask (as for remote sends). Each
+open stream is registered on the server state with its frame sender and the
+queries waiting on it, at most 128, and at most 8 for one caller
+(`queue_full`, `RESOURCE_EXHAUSTED`); the RPC waits up to six seconds for the
+matching `remote_directory_result`, without holding the database. A query's
+frame shares the stream's outbound queue with handoffs: it waits for room only
+until its deadline, and a handoff waits behind at most 128 query frames. A
+result with an error code is an error, never an empty directory, the message
+led by the reason code: `namespace_unknown` and `entity_unknown` are
+`NOT_FOUND`; `invalid_argument`, `invalid_cursor` and `invalid_address` are
+`INVALID_ARGUMENT`; `permission_denied`, `route_not_authorized` and
+`invalid_signature` (the adapter's own refusal of an answer) are
+`PERMISSION_DENIED`; `expired` and `directory_timeout` are
+`DEADLINE_EXCEEDED`; `queue_full` is `RESOURCE_EXHAUSTED`; anything else is
+`UNAVAILABLE`, including a remote home's claims about the caller's credentials
+(`invalid_token`, `token_revoked`, `token_unknown`, `scope_denied`), which it
+cannot judge (Hub's `herr.Remote`). An adapter that is not connected
+(`relay_unavailable`) and one whose stream ends while a query waits are
+`UNAVAILABLE`, and one that does not answer in time (`directory_timeout`) is
+`DEADLINE_EXCEEDED`; a late result is dropped. A malformed result (an invalid
+query ID, over 100 entries, a page token over 4096 bytes) fails only its own
+query, as `UNAVAILABLE` `invalid_message`; the stream carries on.
+Descriptors outside the asked namespace, or malformed, are left out, and the
+rest are cached as observations (which count only for a namespace bound to
+that integration).
 
 ## Hub adapter
 
@@ -681,15 +694,22 @@ store failure while checking answers `invalid_signature`, Hub's fallback.
 
 BBS's remote directory queries go the other way, as Hub's `Directory` does:
 each runs beside BBS's reader, is signed as a `DirectoryQuery` by the
-installation key with a fresh query ID and BBS's deadline (five seconds when
-BBS sets none, at most 30), and goes to the relay with this installation's
-credential. The answer is matched by the query record hash it binds, and the
+installation key with a fresh query ID and BBS's deadline, kept between one
+and 30 seconds from now on the adapter's clock (five seconds when BBS sets
+none; one already past by clock skew still gets a second), and goes to the
+relay with this installation's credential. The answer is matched by the query record hash it binds, and the
 relay's `DirectoryUnavailable` by query ID, each only on the stream the query
 went out on; at most 128 wait at once (`queue_full`). An answer is accepted only
 when Hub's `verifyAnswer` would accept it: a trusted HOST_NAMESPACE credential
 of the asked namespace, the record signed by its subject, and a payload binding
-the query's hash and namespace; otherwise the result is the verification
-reason (`invalid_signature` for an unbound answer or a store failure). The
+the query's hash and namespace. Otherwise the result is the adapter's own
+`route_not_authorized` (a signer that does not host the namespace) or
+`invalid_signature` (every other failure, the underlying reason in the
+detail), so a local trust gap such as a missing binding cannot read as the
+destination's `namespace_unknown`. The adapter checks BBS's query first: a
+requester in its own namespace with a valid entity ID and run ID, at most one
+of an alias and a valid entity ID, page tokens of at most 4096 bytes; an
+answer with over 100 entries or a longer page token is `invalid_message`. The
 relay's refusal passes its code on (`home_offline` when it has none), a
 closed relay stream is `relay_unavailable`, as is having none, and the
 deadline passing is `directory_timeout`. The destination's own signed

@@ -52,7 +52,7 @@ bbs timer list [<agent>]                        # yours (agents) or everyone's (
 bbs timer rm <id>
 bbs whoami                                      # agent with --token, else human
 bbs agents [--all] [--json]                     # who is in your groups, owners, status
-bbs directory <namespace> [--alias A | --id ENTITY] [--json]  # another namespace's entities, via Hub
+bbs directory <namespace> [--alias A | --id ENTITY] [--limit N] [--json]  # another namespace's entities, via Hub
 bbs headless run <agent> [--harness <name>] [--model <m>] [--cwd <dir>] ...
                                                 # drive an ACP harness from the agent's mail
 bbs headless logs <agent> [--follow] [--pretty]  # the headless agent's local log
@@ -625,7 +625,11 @@ answer (`relay_unavailable`, `home_offline`, `directory_timeout`) and an
 answer that fails verification are errors that name the reason, never an
 empty list. `--json` prints one object per entity with `id`, `namespace`,
 `entity_id`, `kind`, `display_name`, `aliases`, `description` and
-`lifecycle`. The directory of this installation's own namespace is `bbs
+`lifecycle`. A listing shows at most `--limit` entities (2000 by default and
+at most), and says so on stderr when more exist; the `bbs_directory` tool
+shows 50 by default and at most 200. Remote text is shown without control
+characters or invisible formatting (bidirectional overrides, zero-width
+characters). The directory of this installation's own namespace is `bbs
 agents`.
 
 Each namespace belongs to the first integration that imports from it or

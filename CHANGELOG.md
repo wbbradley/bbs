@@ -66,7 +66,7 @@ under the new package version and its publication date.
   answers as its own alias, so `hub send will@bbs` reaches `will`. It passes all of
   Hub's signing and federation interop vectors. See "Running the Hub adapter"
   in the README.
-- `bbs directory NAMESPACE [--alias A | --id ENTITY] [--json]`, and the agent
+- `bbs directory NAMESPACE [--alias A | --id ENTITY] [--limit N] [--json]`, and the agent
   tool `bbs_directory`, list or look up the entities another namespace (such
   as `hub`) publishes, through the server's Hub integration
   (`remote-directory.v1`). Each line starts with the `id:ENTITY@NAMESPACE`
