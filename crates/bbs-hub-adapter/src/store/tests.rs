@@ -629,3 +629,49 @@ fn catalogs_only_move_forward() {
     assert_eq!(store.catalog_revision().unwrap(), Some(1));
     assert!(store.put_catalog(&catalog(2), false, 2).unwrap());
 }
+
+/// An import offered again after its result was lost may already be in
+/// BBS: past its deadline it lapses to unknown, owing the relay nothing,
+/// never rejected as expired. One never offered is still rejected.
+#[test]
+fn a_reoffered_import_lapses_to_unknown_not_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(&dir);
+    let sent = import(&mut store, 1);
+    store.mark_sent(Direction::Inbound, sent, 21).unwrap();
+    store
+        .intake_inbound(
+            "in-2",
+            "relay-2",
+            "conn-1",
+            &origin("x2"),
+            b"m2",
+            b"e",
+            1_000,
+            10,
+        )
+        .unwrap();
+    // BBS reconnects: the sent import goes back to pending, offered again.
+    assert_eq!(store.reoffer_inbound(30).unwrap(), 1);
+    assert_eq!(
+        store.state(Direction::Inbound, sent).unwrap().unwrap().0,
+        "pending"
+    );
+    // Its deadline passes before BBS takes it again.
+    let rejected = store.expire(Direction::Inbound, 1_000).unwrap();
+    assert_eq!(rejected.len(), 1, "only the import never offered");
+    assert_ne!(rejected[0], sent);
+    assert_eq!(store.lapse(Direction::Inbound, 1_000).unwrap(), 1);
+    assert_eq!(
+        store.state(Direction::Inbound, sent).unwrap().unwrap(),
+        ("unknown".into(), "no_result_by_deadline".into())
+    );
+    // The relay hears only the definite rejection, not the uncertain one.
+    let owed = store
+        .relay_unreported("conn-1", &mut HashSet::new(), 10)
+        .unwrap();
+    assert_eq!(
+        owed.iter().map(|o| o.id).collect::<Vec<_>>(),
+        vec![rejected[0]]
+    );
+}

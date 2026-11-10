@@ -582,7 +582,9 @@ that is sent or unknown is offered to BBS again when BBS reconnects, since
 its result was lost with the earlier stream; BBS answers a message it has as
 already known, so it is still delivered once. Pending work past its deadline
 becomes `rejected` (`expired`); sent work with no result by its deadline
-becomes `unknown`. Triggers stop a settled row from changing and an outbound
+becomes `unknown`, as does a re-offered import still pending then: it may
+have reached BBS the first time, so the relay is told nothing rather than a
+rejection. Triggers stop a settled row from changing and an outbound
 send from returning to pending once sent. An outbound envelope is signed at
 its first claim and kept (Hub's D114).
 

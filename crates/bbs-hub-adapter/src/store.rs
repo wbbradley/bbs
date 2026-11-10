@@ -11,7 +11,9 @@
 //! Settled rows never change (triggers). An outbound handoff never returns
 //! to pending once sent; an import sent or unknown is offered to BBS again
 //! when BBS reconnects, which BBS answers as already known if it has it.
-//! Sent work with no result by its deadline becomes `unknown`.
+//! Sent work with no result by its deadline becomes `unknown`, as does a
+//! re-offered import still pending then: it may have reached BBS already,
+//! so it is never rejected as expired.
 //!
 //! Retention: settled rows (received, rejected, unknown) are deleted a fixed
 //! time after they settle ([`Store::purge_settled`]); BBS keeps the messages
@@ -122,6 +124,9 @@ CREATE TABLE inbound (
     detail TEXT,
     -- Whether BBS's result went to the relay stream it came on.
     reported INTEGER NOT NULL DEFAULT 0,
+    -- Offered again after an earlier offer's result was lost: BBS may have
+    -- it, so it never expires as rejected, only lapses to unknown.
+    reoffered INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     attempted_at INTEGER,
     updated_at INTEGER NOT NULL,
@@ -707,12 +712,18 @@ impl Store {
             .optional()?)
     }
 
-    /// Sent work with no result by its deadline: `unknown`. Returns how many.
+    /// Sent work with no result by its deadline: `unknown`, as is a
+    /// re-offered import still pending then (it may have reached BBS the
+    /// first time). Returns how many.
     pub fn lapse(&self, dir: Direction, now: i64) -> Result<usize> {
+        let reoffered = match dir {
+            Direction::Outbound => "",
+            Direction::Inbound => " OR (state = 'pending' AND reoffered = 1)",
+        };
         Ok(self.conn.execute(
             &format!(
                 "UPDATE {} SET state = 'unknown', reason = 'no_result_by_deadline',
-                 updated_at = ?1 WHERE state = 'sent' AND expires_at <= ?1",
+                 updated_at = ?1 WHERE (state = 'sent'{reoffered}) AND expires_at <= ?1",
                 dir.table()
             ),
             [now],
@@ -721,10 +732,11 @@ impl Store {
 
     /// Imports sent to an earlier BBS stream, or unknown, go back to pending
     /// to be offered again: the result was lost with that stream, and BBS
-    /// answers a message it has as already known. Returns how many.
+    /// answers a message it has as already known. Marked re-offered, they
+    /// never expire as rejected ([`Store::lapse`]). Returns how many.
     pub fn reoffer_inbound(&self, now: i64) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE inbound SET state = 'pending', updated_at = ?1
+            "UPDATE inbound SET state = 'pending', reoffered = 1, updated_at = ?1
              WHERE state IN ('sent', 'unknown') AND expires_at > ?1",
             [now],
         )?)
@@ -753,13 +765,19 @@ impl Store {
         Ok((n[0], n[1]))
     }
 
-    /// Reject pending work whose deadline has passed by `now`, as expired.
-    /// Returns the rows it rejected.
+    /// Reject pending work whose deadline has passed by `now`, as expired,
+    /// except a re-offered import, which lapses instead. Returns the rows it
+    /// rejected.
     pub fn expire(&mut self, dir: Direction, now: i64) -> Result<Vec<i64>> {
+        let fresh = match dir {
+            Direction::Outbound => "",
+            Direction::Inbound => " AND reoffered = 0",
+        };
         let tx = self.conn.transaction()?;
         let ids = {
             let mut stmt = tx.prepare(&format!(
-                "SELECT id FROM {} WHERE state = 'pending' AND expires_at <= ?1 ORDER BY id",
+                "SELECT id FROM {} WHERE state = 'pending' AND expires_at <= ?1{fresh}
+                 ORDER BY id",
                 dir.table()
             ))?;
             stmt.query_map([now], |r| r.get(0))?
