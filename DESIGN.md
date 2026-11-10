@@ -509,23 +509,35 @@ will@bbs` resolves), and its descriptor lists that alias; a second-level ID
 runs query returns nothing. Another namespace is `namespace_unknown`. It
 answers each ping with a pong; HTTP/2 keepalive covers its own liveness.
 
-**Group copies and replies (D092, D127).** Reads (inbox, history, feed,
-search and the wait stream) show an imported group copy as Hub's client does:
-`from_name` is the original sender's `id:ENTITY@NAMESPACE[#RUN]`, of kind
-`remote` (its kind is unknown here), and `via` is the group; `reported` is set
-when the original sender's namespace is not the group's, since the reference
-is then only the group's home's claim. A copy whose original sender is the
-group itself is a notice: `from_name` is the group and `group_notice` is set.
-A message that answers another carries `in_reply_to`: the answered message's
-ID here when this installation stores it (by origin), else its origin as
-`NAMESPACE:MESSAGE_ID`. `Send` with `reply_to` (a message ID) and an empty
-`to` replies: the server loads the message, which must have been delivered to
-the caller (its own sent messages are refused, and a message delivered to
-someone else is "no message N in your mail", as is one that does not exist),
-and picks the recipient by Hub's `ReplyTo` rule: a copy's original sender at
-its exact address and run, answering the original message; a notice has no
-sender to reply to; anything else, the message's exact sender, run included,
-answering the message itself. A remote recipient goes through the outbound
+**Group copies and replies (D092, D127).** An imported group copy stays from
+the group, which sent it: `from_name` is the group's `id:ENTITY@NAMESPACE`, of
+kind `remote`, as for any remote sender, so a client that knows nothing of
+copies shows the group, never an unverified name as if it had sent the
+message itself. Reads (inbox, history, feed, search and the wait stream) add
+`original_from`, the original sender's `id:ENTITY@NAMESPACE[#RUN]`, and the
+CLI and agents' mail show `ORIGINAL via GROUP` as Hub's client does;
+`reported` is set when the original sender's namespace is not the group's,
+since the reference is then only the group's home's claim. A copy whose
+original sender is the group itself is a notice: `group_notice` is set and
+there is no `original_from`. Filters (`--from`, `--with`) match the group,
+the stored sender, not the original sender. A message that answers another
+carries `in_reply_to`: the answered message's ID here when this installation
+stores it (by origin) and the reader sent it or had it delivered (the
+board-wide feed and search, which show every message, always qualify), else
+its origin as `NAMESPACE:MESSAGE_ID`, since a remote sender names what it
+answers. `Send` with `reply_to` (a message ID) and an empty `to` replies: the
+server loads the message, which must have been delivered to the caller. A
+message the caller sent is refused, and one both sent by and delivered to the
+caller (a timer it set itself, a delivery error, a restart-preparation
+report) is a notice that cannot be answered; one delivered only to others is
+"not delivered to you", and a missing one "no message N". The server picks
+the recipient by Hub's `ReplyTo` rule: a copy's original sender at its exact
+address and run, answering the original message; a notice has no sender to
+reply to; anything else (a native group broadcast included) the message's
+exact sender, run included, directly, answering the message itself. With
+`not_to_owner`, which the headless agent's `bbs_reply` sets because its
+ordinary output already reaches its owner, a reply that would go to the
+calling agent's owner is refused, like `bbs_send` to the owner. A remote recipient goes through the outbound
 handoff with `in_reply_to` in the frozen bytes; a native one is an ordinary
 direct send, under the same rules, with `in_reply_to` recorded on the row.
 `reply_to` with a `to` or a control is `INVALID_ARGUMENT`. The field needs no

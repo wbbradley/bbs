@@ -78,8 +78,9 @@ under the new package version and its publication date.
 - A Hub group copy shows its original sender and the group, `from
   id:ann@hub via id:release@hub`, with ` (reported)` when the original sender
   is on another home than the group, and a group's notice shows as `from group
-  id:release@hub (notice)`; JSON output and `bbs_search` add `via`,
-  `reported` and `notice`.
+  id:release@hub (notice)`. The copy is still from the group: JSON output and
+  `bbs_search` keep `from` as the group and add `original_from`, `reported`
+  and `notice`, and filters such as `bbs view --from` match the group.
 - `bbs directory NAMESPACE [--alias A | --id ENTITY] [--limit N] [--json]`, and the agent
   tool `bbs_directory`, list or look up the entities another namespace (such
   as `hub`) publishes, through the server's Hub integration
