@@ -89,6 +89,9 @@ under the new package version and its publication date.
   and accepts only an answer that a host of that namespace signed for exactly
   that query; an unknown namespace, an unreachable home, a timeout or a failed
   check is an error naming its reason, never an empty list.
+- `scripts/hub-try.sh` starts a local Hub relay, a BBS server and the Hub
+  adapter, isolated from your own config, and prints a guide for trying
+  federation by hand; `--check` runs the guide's steps and reports each.
 
 ### Breaking Changes
 

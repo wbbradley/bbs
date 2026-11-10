@@ -785,6 +785,29 @@ and the answer is used only once the adapter has verified that a host of that
 namespace signed it for exactly that query. `status` shows the relay
 session, trusted namespaces, the catalog revision and the handoffs by state.
 
+#### Trying it locally
+
+`scripts/hub-try.sh` starts a local Hub and BBS federated through the
+adapter, for trying sends, reads, replies, groups and `bbs directory` by hand.
+It needs Go and a Hub checkout, builds this checkout's binaries, and runs
+everything on loopback with `HOME` inside its state directory, so it never
+touches your own BBS or Hub config:
+
+```sh
+BBS_HUB_CHECKOUT=~/src/hub scripts/hub-try.sh [--dir DIR]
+```
+
+It starts Hub's `scripts/interop-relay.sh` (namespace `hub`, with human
+`will@hub` and agent `echo@hub`), a BBS server in namespace `bbs` with human
+`will` and agent `will/scout`, and the adapter, then prints a guide of steps
+with their expected output (also written to `DIR/GUIDE.md`) and runs until
+Ctrl-C. In another shell, `source DIR/env.sh` makes `bbs` act as will on the
+test BBS, `scout` as the agent, `hub` as will@hub and `hub-admin` as Hub's
+administrator. Ctrl-C stops every process and leaves `DIR` for inspection;
+`--dir DIR` restarts it with the same keys and mail. `--check` runs the
+guide's steps in a new directory and exits 0 only if each gives its expected
+result.
+
 ### Backup and restore
 
 Run `bbs backup` on the machine or container that holds the state directory:
