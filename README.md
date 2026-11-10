@@ -541,8 +541,9 @@ session restoration, and other human commands.
 ### Hub integration
 
 A Hub adapter connects BBS to other installations through Hub's integration
-stream. The adapter is a separate process (not part of this release); the
-server side is off unless `--integration-listen` names an address for it:
+stream. The adapter is a separate process, `bbs-hub-adapter` (see [Running
+the Hub adapter](#running-the-hub-adapter)); the server side is off unless
+`--integration-listen` names an address for it:
 
 ```sh
 bbs serve --listen 127.0.0.1:7777 --integration-listen 127.0.0.1:7779 --state-dir /var/lib/bbs
@@ -616,6 +617,101 @@ integration to use the namespace takes it:
 ```sh
 bbs admin integration unbind hub --state-dir /var/lib/bbs
 ```
+
+#### Running the Hub adapter
+
+`bbs-hub-adapter` is the separate process between BBS and Hub. It connects
+to BBS's integration listener with the integration credential, and to one Hub
+relay over Hub's federation stream, as the home of BBS's namespace. It keeps
+its own SQLite store, apart from BBS's database: Hub trust (namespace
+bindings, credentials and revocations, from the relay), the last catalog BBS
+published, the relay session, the exact signed envelopes it sent and received,
+and the work it has not handed on yet. It is built with the workspace
+(`cargo build --release -p bbs-hub-adapter`); it is not in the release
+archives or the container image yet.
+
+Setting one up takes four pieces, all kept outside the store:
+
+1. **A namespace authority key** for BBS's namespace (the one `bbs serve
+   --namespace` created the database in, `bbs` by default), held by its
+   operator, and an enrollment of its public key on the Hub relay. The relay
+   operator adds a binding for the namespace to the relay's configuration
+   (Hub's `relay.bindings`); there is no self-enrollment. Any Ed25519 seed file
+   works, such as one from `bbs-hub-adapter keygen --out bbs.authority`.
+2. **An installation key** for the adapter. `keygen` writes a new seed file
+   readable only by its owner, refuses to overwrite one, and prints only the
+   public key:
+
+   ```sh
+   bbs-hub-adapter keygen --out /etc/bbs-hub-adapter/installation.key
+   # 3b6a27bc... (hex): give it to the namespace authority
+   ```
+
+3. **An installation credential**: the namespace authority signs the public
+   key for an installation ID, with both permissions the adapter needs,
+   `assert_senders` and `host_namespace` (Hub's default), using Hub's tool:
+
+   ```sh
+   hub admin credential --authority-key bbs.authority --namespace bbs \
+     --installation bbs-1 --public-key 3b6a27bc... --out /etc/bbs-hub-adapter/installation.cred
+   ```
+
+4. **BBS's integration credential**, from `bbs admin integration add hub`,
+   saved where only the adapter's user can read it, with publication on:
+
+   ```sh
+   umask 077
+   bbs admin integration add hub --state-dir /var/lib/bbs > /etc/bbs-hub-adapter/integration.token
+   bbs admin integration publish hub on --state-dir /var/lib/bbs
+   ```
+
+The configuration file names them (relative paths are relative to the file):
+
+```toml
+namespace = "bbs"                 # BBS's namespace, which the credential is for
+store = "/var/lib/bbs-hub-adapter/adapter.db"
+
+[bbs]
+endpoint = "http://127.0.0.1:7779"   # bbs serve --integration-listen
+integration_id = "hub"
+credential_file = "integration.token"
+
+[hub]
+relay = "http://hub.example.ts.net:7443"
+installation_id = "bbs-1"
+key_file = "installation.key"
+credential_file = "installation.cred"
+```
+
+```sh
+bbs-hub-adapter run --config /etc/bbs-hub-adapter/adapter.toml
+bbs-hub-adapter status --config /etc/bbs-hub-adapter/adapter.toml
+```
+
+The adapter refuses to start when the key or the integration credential file
+can be read by anyone but its owner, when the credential is for another
+namespace, installation or key, or lacks either permission, and when the store
+was made for another installation; it stops if BBS turns out to be another
+namespace. The store is created owner-only and used by one adapter at a time.
+Keys and credentials are never logged. The streams are plain HTTP/2, like
+BBS's: keep both on loopback or the same encrypted private network (Hub
+assumes a tailnet). `RUST_LOG` sets the log level (default `info`).
+
+Both sides reconnect on their own. Work for a side that is down waits in the
+store, and expires at its deadline. Every handoff is at most once (Hub's
+D072): the adapter marks work attempted, and commits, before it puts it on a
+stream; work still queued when a stream ends never left and is offered again,
+but anything attempted when the adapter stops becomes unknown at the next
+start and is never sent again. The relay's result for a remote send (received,
+already known, or a rejection such as `recipient_unknown`) becomes BBS's
+result for its handoff, so a rejection reaches the sender as a "Not
+delivered" notice. A message from Hub is verified (Hub's signature, credential
+and trust rules, with strict decoding) before BBS is offered it, and BBS's
+answer goes back to the relay; a repeat the adapter has already handed on is
+answered as already known without offering it again. Hub's directory queries
+for BBS's namespace are answered by BBS and signed by the adapter; while BBS is
+away the signed answer says the home is offline. `status` shows the relay
+session, trusted namespaces, the catalog revision and the handoffs by state.
 
 ### Backup and restore
 
@@ -1072,6 +1168,17 @@ python3 scripts/test_container.py bbs:test --bbs target/debug/bbs
 
 The standard-library Python test run skips the diagram tests when their optional
 dependencies are unavailable; use the `uv` command above to run them.
+
+The Hub adapter's tests check every one of Hub's signing and federation
+interop vectors (vendored in `crates/bbs-hub-adapter/tests/data/hub`, with the
+Hub commit they come from) and run the adapter against an in-process BBS
+server and a scripted relay. A live round trip with Hub's Go implementation,
+through Hub's `scripts/interop-relay.sh`, needs Go and a Hub checkout, so it
+is opt-in; it runs everything on loopback in temporary directories:
+
+```sh
+BBS_HUB_CHECKOUT=~/src/hub cargo test -p bbs-hub-adapter --test interop_relay -- --ignored
+```
 
 All SQL lives in `crates/bbs-core/src/db.rs`, and migrations in `crates/bbs-core/migrations/` are applied automatically when the database is opened. Group archival adds a nullable `bbs_groups.archived_at` column and replaces all-time name uniqueness with a unique partial index for active groups; existing groups remain active. Back up the database before upgrading. Earlier binaries cannot open the upgraded schema; remote clients continue to use the v2 protocol, while `group delete` requires a server advertising `group-archive.v1` and `bbs view` filters require `feed-filter.v1`.
 

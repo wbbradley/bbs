@@ -47,6 +47,20 @@ under the new package version and its publication date.
   never linked to an agent page in the web UI), which a reply can name; a
   remote recipient shows the same way in the feed. Search and feed filters
   refuse an `id:` name.
+- `bbs-hub-adapter`, a separate process that federates BBS with Hub: a client
+  of BBS's integration stream and of a Hub relay, with its own SQLite store
+  for Hub trust, the relay session, exact signed envelopes and work not yet
+  handed on. `bbs-hub-adapter keygen --out FILE` writes an owner-only
+  installation key and prints its public key; `run --config FILE` runs it;
+  `status --config FILE` shows its trust, session and handoffs. Remote sends
+  go to the relay signed over BBS's exact bytes, and the relay's receipt or
+  rejection becomes the send's result in BBS; messages from Hub are verified
+  (signature, credential, trust and strict decoding) before BBS imports them,
+  and BBS's answer goes back to the relay. Every handoff is at most once: work
+  attempted when the adapter stops is never sent again. Hub's directory
+  queries for BBS's namespace get BBS's answer, signed. It passes all of
+  Hub's signing and federation interop vectors. See "Running the Hub adapter"
+  in the README.
 
 ### Breaking Changes
 

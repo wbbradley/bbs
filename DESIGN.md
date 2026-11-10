@@ -359,8 +359,9 @@ without write access to the `-shm` file. The rebuilt `messages` and
 ## Hub integration stream
 
 BBS serves Hub's integration stream (`bbs.integration.v1`, D085) for a
-separate adapter process that federates with Hub. The proto and the
-`msgproto.v1` messages it imports are vendored unchanged in
+separate adapter process that federates with Hub (see [Hub
+adapter](#hub-adapter)). The proto, the `msgproto.v1` messages it imports and
+the federation protos the adapter uses are vendored unchanged in
 [crates/bbs-core/proto/hub](crates/bbs-core/proto/hub) and generated beside
 `bbs.proto`. [crates/bbs-core/src/service/integration.rs](crates/bbs-core/src/service/integration.rs)
 holds the rules and [crates/bbs-server/src/serve/integration.rs](crates/bbs-server/src/serve/integration.rs)
@@ -504,6 +505,99 @@ most 100 keyed by entity ID; BBS has no aliases or runs, so those return
 nothing. Another namespace is `namespace_unknown`. BBS sends no remote
 directory queries yet, so it ignores directory results. It answers each ping
 with a pong; HTTP/2 keepalive covers its own liveness.
+
+## Hub adapter
+
+[crates/bbs-hub-adapter](crates/bbs-hub-adapter) is the separate process D085
+gives the federation side: a client of BBS's integration stream on one side
+and, as the home of BBS's namespace, of one Hub relay's federation stream
+(`msgproto.v1.Federation/Connect`, vendored beside the integration proto) on
+the other. BBS keeps history, inboxes and its own pending handoffs; the
+adapter keeps everything Hub-specific. It never reads BBS's database.
+
+**Store.** Its own SQLite file (WAL, created owner-only, refused if others can
+read it, held by one adapter through a `.lock` file) has `identity` (the
+namespace and installation it was made for; another is refused, a new key for
+the same installation replaces the old), Hub trust (`bindings` from the relay,
+whose revisions only move forward, an equal revision with other contents
+keeping the stored one; `credentials` verified and cached; `revocations`,
+permanent), the last `catalog` BBS published (a lower or equal revision is
+ignored), the `relay_session`, and the handoffs: `outbound` (BBS to Hub) and
+`inbound` (Hub to BBS), each with its exact bytes, unique on the message's
+origin. Routes are live state, as in Hub: re-registered on every connection.
+Keys are files, not rows: the installation key is a hex seed, as Hub's
+`hub admin keygen` writes it (`bbs-hub-adapter keygen` writes the same, owner
+only, never overwriting, and prints only the public key), and the credential
+is the encoded `SignedRecord` Hub's `hub admin credential` writes. The key and
+BBS's integration credential must be owner-only; neither is logged.
+
+**Signing and decoding.** Records are signed exactly as Hub's `internal/sign`
+does: Ed25519 over `"msgproto/v1/" || label || 0 || U32BE(1) || key ||
+U64BE(len) || payload`, the payload being the retained bytes, never a
+re-encoding. Untrusted bytes are bounded, then walked against the vendored
+descriptors before prost decodes them, as Hub's `internal/wire` does:
+malformed encoding, a wire-type mismatch, a repeated singular field,
+conflicting oneof members, invalid UTF-8, a reserved field number or nesting
+past 16 is refused, and unknown fields are kept. The federation stream carries
+raw frames through its own codec, so every received frame is walked first (one
+that fails ends the stream, as in Hub) and a transfer's envelope stays the
+bytes it arrived in; outgoing transfers are written by hand around the stored
+envelope. Verification follows Hub's order: envelope, credential against the
+namespace's binding and revocations, the record signature by the credential's
+subject, ASSERT_SENDERS, the message, `checkMessage`, then that the
+credential's namespace is the message's and the sender's. The crate's tests
+check every vector in Hub's `signing-vectors.json` and `interop-vectors.json`
+(vendored with their source commit), including the duplicated-field transfer
+that only the strict walk refuses, and rebuild Go's verified transfer frames
+byte for byte from the same test seeds.
+
+**Handoffs (D072).** Both directions use one state machine: `pending`, then
+`attempted` (claimed and committed before the frame is queued), `sent` when
+the transport takes the frame, then `received` (detail `already_known` for a
+duplicate) or `rejected`. A claim still queued when its stream closes provably
+never left and returns to pending, under the same lock discipline BBS uses;
+anything attempted when the adapter stops becomes `unknown` at the next start
+and is never offered again. Pending work past its deadline becomes `rejected`
+(`expired`). Triggers stop a settled row from changing and sent or unknown
+work from returning to pending. An outbound envelope is signed at its first
+claim and kept (Hub's D114).
+
+*Outbound:* BBS offers its frozen `Message` bytes. The adapter decodes them
+strictly, applies `checkMessage`, and refuses (as BBS's result, with Hub's
+reason) a sender or message ID outside its namespace, a recipient inside it,
+or a passed deadline; the same origin with the same bytes is already known,
+with others a `message_conflict`. Otherwise it stores the message pending and
+sends no result yet. Once the relay stream has refreshed trust and its route
+claim is accepted, pending work goes one transfer at a time. The relay's
+result, accepted only on the stream the transfer was attempted on and only
+over attempted, sent or unknown, becomes BBS's result for the handoff; results
+BBS has not had yet are sent when it reconnects.
+
+*Inbound:* a transfer is verified as above, refused as `route_not_authorized`
+when it claims this namespace's origin or is addressed to another namespace,
+answered at once as already known or `message_conflict` when its origin is
+known, and otherwise stored pending and offered to BBS as an import. BBS's
+result (received, already known, or its refusal, such as
+`recipient_unknown`) goes back to the relay on the stream the transfer came
+on; if that stream has gone, the informative result is dropped. Group copies
+pass like any message: their sender is the group, which is never refused for
+being one, and BBS stores the original and original sender. A reply from Hub
+carries `in_reply_to` and the exact address it answers (D092), unchanged.
+
+**Directory.** A Hub directory query for BBS's namespace is verified (the
+requester must be in the querying credential's namespace, with
+ASSERT_SENDERS) and passed to BBS as a local directory query under a fresh
+ID; BBS's answer is signed as a `DirectoryAnswer` bound to the query's record
+hash. With BBS away the signed answer carries `home_offline`; an answer BBS
+does not give before the query's deadline is not sent. BBS asks no remote
+queries yet; one gets an `unimplemented` result.
+
+**Streams.** The relay stream sends its hello, pages trust from the relay
+(the configured trust source), claims the route with a signed `RouteClaim`,
+heartbeats every 15 seconds and cuts a relay silent for 45. Both streams
+reconnect with jittered exponential backoff from 250 ms to 30 seconds. An
+adapter whose BBS is another namespace, or speaks another integration
+protocol, stops rather than retry.
 
 ## Web UI
 
