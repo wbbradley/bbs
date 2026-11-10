@@ -2535,6 +2535,7 @@ mod tests {
                         to: "will".into(),
                         body: format!("mail {n}"),
                         control: None,
+                        reply_to: None,
                     },
                 )
                 .unwrap();

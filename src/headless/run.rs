@@ -1265,7 +1265,8 @@ fn preamble(agent: &str, owner: &str, instructions: Option<&str>, timers: bool) 
          and permission events are not sent as chat.\n\n\
          To contact other recipients, use the bbs_* tools: bbs_send messages an agent, another human, or a @group \
          (broadcasting needs write access, which only a human can grant; without it, \
-         message one of the group's writers), bbs_agents and bbs_group_list show who is around, bbs_status sets what you are \
+         message one of the group's writers), bbs_reply answers a message you received by its id, \
+         bbs_agents and bbs_group_list show who is around, bbs_status sets what you are \
          working on, and bbs_history rereads past messages. bbs_directory lists or looks up \
          entities in another namespace such as hub, each with the id:ENTITY@NAMESPACE that \
          bbs_send accepts. bbs_search searches the whole board \
@@ -1274,7 +1275,7 @@ fn preamble(agent: &str, owner: &str, instructions: Option<&str>, timers: bool) 
          one with immutable history, bbs_blocker_get reads its chain, and bbs_blocker_cancel \
          cancels it. Creation sends no ordinary mail; a human answer arrives as mail.\n\n\
          Direct messages from your owning human arrive as plain user input. Other mail \
-         includes BBS sender and recipient headers; humans there are marked (human). If a message needs \
+         includes BBS sender and recipient headers with each message's id; humans there are marked (human). If a message needs \
          no reply, end your turn without sending anything. {}\n\n",
         wake_sentence(timers)
     );
@@ -1569,7 +1570,7 @@ mod tests {
         assert_eq!(ids, vec![vec![1], vec![2], vec![3], vec![4, 5]]);
         assert_eq!(prompts[1], "second");
         assert_eq!(prompts[2], "third");
-        assert!(prompts[0].contains("from Peer to Ade:"));
+        assert!(prompts[0].contains("from Peer to Ade (id 1):"));
         assert!(prompts[3].starts_with("New BBS mail (2 messages):"));
         assert!(prompts[3].find("fourth").unwrap() < prompts[3].find("fifth").unwrap());
     }

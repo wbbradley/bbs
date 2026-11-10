@@ -171,6 +171,17 @@ struct MessageJson<'a> {
     body: &'a str,
     /// When a direct message was read; null for broadcasts and unread mail.
     read_at: Option<&'a str>,
+    /// A group copy from another installation: the group it came through;
+    /// `from` is then the original sender. Null otherwise.
+    via: Option<&'a str>,
+    /// With `via`: the original sender is only the group's home's claim.
+    reported: bool,
+    /// A notice the group sent itself: `from` is the group, and there is no
+    /// sender to reply to.
+    notice: bool,
+    /// The message this one answers: its id here, or `NAMESPACE:MESSAGE_ID`
+    /// when this server does not have it. Null otherwise.
+    in_reply_to: Option<&'a str>,
 }
 
 fn json(m: &Message) -> MessageJson<'_> {
@@ -190,6 +201,10 @@ fn json(m: &Message) -> MessageJson<'_> {
         group: m.to_group.as_deref(),
         body: &m.body,
         read_at: m.read_at.as_deref(),
+        via: m.via.as_deref(),
+        reported: m.reported == Some(true),
+        notice: m.group_notice == Some(true),
+        in_reply_to: m.in_reply_to.as_deref(),
     }
 }
 
@@ -200,11 +215,13 @@ fn format_feed(rows: &[Message]) -> String {
         if i > 0 {
             out.push('\n');
         }
-        let from = match m.from_kind() {
-            Kind::Human => format!("{} (human)", m.from_name),
-            Kind::Remote => format!("{} (remote)", m.from_name),
-            _ => m.qualified_sender(),
-        };
+        let from = m
+            .group_copy_sender()
+            .unwrap_or_else(|| match m.from_kind() {
+                Kind::Human => format!("{} (human)", m.from_name),
+                Kind::Remote => format!("{} (remote)", m.from_name),
+                _ => m.qualified_sender(),
+            });
         let to = match (&m.to_group, m.qualified_recipient()) {
             (Some(group), _) => format!("@{group}"),
             (None, to) => {
@@ -216,8 +233,10 @@ fn format_feed(rows: &[Message]) -> String {
             }
         };
         out.push_str(&format!(
-            "[{}] from {from} to {to}:\n",
-            display_time(&m.created_at)
+            "[{}] from {from} to {to} (id {}){}:\n",
+            display_time(&m.created_at),
+            m.id,
+            crate::app::reply_marker(m)
         ));
         out.push_str(m.body.trim_end_matches('\n'));
         out.push('\n');
@@ -423,6 +442,7 @@ mod tests {
             body: body.into(),
             control: None,
             timer_id: None,
+            ..Default::default()
         }
     }
 

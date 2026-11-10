@@ -88,6 +88,7 @@ async fn control(
             to: agent,
             body,
             control: Some(control.into()),
+            reply_to: None,
         })
         .await?;
     Ok(r.to)

@@ -532,6 +532,16 @@ impl Backend {
             Backend::Remote(r) if req.control.is_some() => {
                 rpc!(r, send, req, &[AGENT_CONTROL]).map_err(|e| missing_rpc(e, AGENT_CONTROL))
             }
+            // A server that predates replies ignores reply_to and refuses
+            // the empty recipient as unknown.
+            Backend::Remote(r) if req.reply_to.is_some() => {
+                rpc!(r, send, req).map_err(|e| match e.downcast_ref::<tonic::Status>() {
+                    Some(s) if s.message().trim_end() == "no such agent or human:" => e.context(
+                        "incompatible BBS server: it does not support replies; upgrade the server",
+                    ),
+                    _ => e,
+                })
+            }
             Backend::Remote(r) => rpc!(r, send, req),
         }
     }

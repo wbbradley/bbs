@@ -97,6 +97,15 @@ pub enum Command {
         /// Message body; read from stdin when omitted or "-".
         body: Option<String>,
     },
+    /// Reply to a message you received, by the id `bbs read` shows. It goes to
+    /// the message's exact sender, or for a copy from another installation's
+    /// group to its original sender, and is marked as answering it.
+    Reply {
+        /// The id of the message to reply to.
+        message_id: i64,
+        /// Message body; read from stdin when omitted or "-".
+        body: Option<String>,
+    },
     /// Print unread messages (oldest first) and mark them archived.
     Read {
         /// Maximum number of messages to return.

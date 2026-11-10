@@ -171,6 +171,7 @@ impl Bbs {
                 to: to.into(),
                 body: body.into(),
                 control: None,
+                reply_to: None,
             })
             .await
             .unwrap()

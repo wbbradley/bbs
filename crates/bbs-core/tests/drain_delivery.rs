@@ -72,6 +72,7 @@ impl Board {
                 to: "worker".into(),
                 body: body.into(),
                 control: control.map(Into::into),
+                reply_to: None,
             },
         )
         .unwrap()
@@ -189,6 +190,7 @@ fn cancellation_still_requires_the_owner_while_frozen() {
                 to: "worker".into(),
                 body: "cancel".into(),
                 control: Some(proto::Control::Cancel.into()),
+                reply_to: None,
             },
         );
         assert!(result.is_err());

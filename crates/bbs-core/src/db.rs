@@ -144,6 +144,16 @@ pub struct MessageView {
     pub timer_id: Option<i64>,
     /// Sent via AutoReply.
     pub auto_reply: bool,
+    /// A group copy (D127): the group it came through. `from_name` is then
+    /// the original sender.
+    pub via: Option<String>,
+    /// A group copy the group itself sent: `from_name` is the group.
+    pub group_notice: bool,
+    /// With `via`: the original sender is in another namespace than the group.
+    pub reported: bool,
+    /// The message this one answers: its ID here, or its origin
+    /// `NAMESPACE:MESSAGE_ID` when this installation does not have it.
+    pub in_reply_to: Option<String>,
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -1098,6 +1108,54 @@ static SENDER_NAME: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// Joins naming a group copy's original sender (D127): its address `oa` and
+/// entity `oe`, with [`SENDER_JOINS`]. Only imports store copies, and import
+/// refuses a copy whose original is this installation's, so the original
+/// sender is always another installation's entity.
+const COPY_JOINS: &str = "
+    LEFT JOIN entity_addresses oa ON m.group_copy_message_id IS NOT NULL
+      AND oa.id = m.group_copy_sender_address_id
+    LEFT JOIN entities oe ON oe.id = oa.entity_id";
+
+/// Columns read by [`copy_view`], with [`SENDER_JOINS`] and [`COPY_JOINS`]: a
+/// copy's original sender, whether the group sent it itself (a notice),
+/// whether the original sender is in another namespace than the group, and
+/// what the message answers.
+static COPY_COLUMNS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "CASE WHEN oe.id IS NULL THEN NULL ELSE {} END, oe.id = se.id, oe.namespace != se.namespace,
+         m.in_reply_to_namespace, m.in_reply_to_message_id,
+         (SELECT r.id FROM messages r WHERE r.origin_namespace = m.in_reply_to_namespace
+            AND r.origin_message_id = m.in_reply_to_message_id)",
+        remote_display_sql("oe", "oa", "coalesce(m.group_copy_sender_run_id, '')")
+    )
+});
+
+/// Apply [`COPY_COLUMNS`], starting at column `at`, to `view`: a group copy
+/// names its original sender, and the group as `via`; a notice stays from
+/// the group.
+fn copy_view(mut view: MessageView, r: &rusqlite::Row, at: usize) -> rusqlite::Result<MessageView> {
+    if let Some(original) = r.get::<_, Option<String>>(at)? {
+        if r.get::<_, Option<bool>>(at + 1)? == Some(true) {
+            view.group_notice = true;
+        } else {
+            view.via = Some(std::mem::replace(&mut view.from_name, original));
+            view.from_remote = true;
+            view.from_owner = None;
+            view.reported = r.get::<_, Option<bool>>(at + 2)? == Some(true);
+        }
+    }
+    let namespace: Option<String> = r.get(at + 3)?;
+    let message_id: Option<String> = r.get(at + 4)?;
+    let local: Option<i64> = r.get(at + 5)?;
+    view.in_reply_to = match (local, namespace, message_id) {
+        (Some(id), _, _) => Some(id.to_string()),
+        (None, Some(ns), Some(id)) => Some(format!("{ns}:{id}")),
+        _ => None,
+    };
+    Ok(view)
+}
+
 /// SQL for [`crate::entity::remote_display`] of entity `e`, address `a` and
 /// the run expression `run`.
 pub(crate) fn remote_display_sql(e: &str, a: &str, run: &str) -> String {
@@ -1242,6 +1300,140 @@ pub fn insert_delivery(conn: &Connection, message_id: i64, kind: Kind, id: i64) 
 pub fn set_message_auto_reply(conn: &Connection, id: i64) -> Result<()> {
     conn.execute("UPDATE messages SET auto_reply = 1 WHERE id = ?1", [id])?;
     Ok(())
+}
+
+/// Record that native message `id` answers the message with origin
+/// `(namespace, message_id)`.
+pub fn set_message_in_reply_to(
+    conn: &Connection,
+    id: i64,
+    namespace: &str,
+    message_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET in_reply_to_namespace = ?2, in_reply_to_message_id = ?3
+         WHERE id = ?1",
+        params![id, namespace, message_id],
+    )?;
+    Ok(())
+}
+
+/// Who a reply goes to.
+#[derive(Debug)]
+pub enum ReplyTarget {
+    /// A native human or agent.
+    Native(Principal),
+    /// Another installation's exact address, run included, as
+    /// [`crate::entity::remote_display`] names it.
+    Remote(String),
+    /// A group: a copy's notice, which the group sent itself, has no sender
+    /// to reply to.
+    Group,
+}
+
+/// What [`reply_source`] finds about a message being answered.
+#[derive(Debug)]
+pub struct ReplySource {
+    /// The caller sent it.
+    pub mine: bool,
+    /// It was delivered to the caller.
+    pub delivered: bool,
+    pub target: ReplyTarget,
+    /// The answered message's origin, `(namespace, message ID)`: a group
+    /// copy's original, else the message's own.
+    pub answers: (String, String),
+}
+
+/// Who a reply by `me` to message `id` goes to, following Hub's rule
+/// (`hubclient.ReplyTo`): a group copy's original sender, answering the
+/// original message, unless the group itself sent it (a notice); otherwise
+/// the message's exact sender, answering the message. None when there is no
+/// such message.
+pub fn reply_source(conn: &Connection, me: &Principal, id: i64) -> Result<Option<ReplySource>> {
+    let me_address = address_sql(me.kind.into(), "?2");
+    let row = conn
+        .query_row(
+            &format!(
+                "SELECT m.sender_address_id = {me_address},
+                    EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id
+                      AND d.recipient_address_id = {me_address} AND d.recipient_run_id = ''),
+                    m.origin_namespace, m.origin_message_id, m.sender_address_id, m.sender_run_id,
+                    m.group_copy_namespace, m.group_copy_message_id, oa.id,
+                    coalesce(m.group_copy_sender_run_id, ''), oa.entity_id = sa.entity_id
+                 FROM messages m
+                 JOIN entity_addresses sa ON sa.id = m.sender_address_id
+                 LEFT JOIN entity_addresses oa ON m.group_copy_message_id IS NOT NULL
+                   AND oa.id = m.group_copy_sender_address_id
+                 WHERE m.id = ?1"
+            ),
+            params![id, me.id],
+            |r| {
+                Ok((
+                    r.get::<_, bool>(0)?,
+                    r.get::<_, bool>(1)?,
+                    (r.get::<_, String>(2)?, r.get::<_, String>(3)?),
+                    (r.get::<_, i64>(4)?, r.get::<_, String>(5)?),
+                    (
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<String>>(7)?,
+                        r.get::<_, Option<i64>>(8)?,
+                        r.get::<_, String>(9)?,
+                        r.get::<_, Option<bool>>(10)?,
+                    ),
+                ))
+            },
+        )
+        .optional()?;
+    let Some((mine, delivered, origin, (sender, sender_run), copy)) = row else {
+        return Ok(None);
+    };
+    let (target, answers) = match copy {
+        (_, _, _, _, Some(true)) => (ReplyTarget::Group, origin),
+        (Some(namespace), Some(message_id), Some(by), run, _) => {
+            (address_target(conn, by, &run)?, (namespace, message_id))
+        }
+        _ => (address_target(conn, sender, &sender_run)?, origin),
+    };
+    Ok(Some(ReplySource {
+        mine,
+        delivered,
+        target,
+        answers,
+    }))
+}
+
+/// Who `entity_addresses` row `address` with run `run` is, to reply to.
+fn address_target(conn: &Connection, address: i64, run: &str) -> Result<ReplyTarget> {
+    conn.query_row(
+        "SELECT e.namespace, e.entity_id, a.address_id, fa.id, fa.name, fh.id, fh.name,
+                b.group_id IS NOT NULL
+         FROM entity_addresses a JOIN entities e ON e.id = a.entity_id
+         LEFT JOIN entity_local_bindings b ON b.entity_id = e.id
+         LEFT JOIN agents fa ON fa.id = b.agent_id
+         LEFT JOIN humans fh ON fh.id = b.human_id
+         WHERE a.id = ?1",
+        [address],
+        |r| {
+            let principal = |kind, at| -> rusqlite::Result<Option<Principal>> {
+                Ok(r.get::<_, Option<i64>>(at)?
+                    .zip(r.get(at + 1)?)
+                    .map(|(id, name)| Principal { kind, id, name }))
+            };
+            Ok(
+                match (principal(Kind::Agent, 3)?, principal(Kind::Human, 5)?) {
+                    (Some(p), _) | (_, Some(p)) => ReplyTarget::Native(p),
+                    _ if r.get(7)? => ReplyTarget::Group,
+                    _ => ReplyTarget::Remote(crate::entity::remote_display(
+                        &r.get::<_, String>(0)?,
+                        &r.get::<_, String>(1)?,
+                        &r.get::<_, String>(2)?,
+                        run,
+                    )),
+                },
+            )
+        },
+    )
+    .map_err(Into::into)
 }
 
 /// An accepted auto-reply for this (registration, key), if any: its message
@@ -1739,10 +1931,12 @@ pub fn record_human_conversation(
 fn inbox_select(kind: Kind) -> String {
     format!(
         "SELECT m.id, m.created_at, {SENDER_KIND}, {},
-                g.name, m.body, owner.name, reader_owner.name, m.control, m.timer_id, m.auto_reply
+                g.name, m.body, owner.name, reader_owner.name, m.control, m.timer_id, m.auto_reply,
+                {}
          FROM deliveries d
          JOIN messages m ON m.id = d.message_id
          {SENDER_JOINS}
+         {COPY_JOINS}
          LEFT JOIN agent_owners sender ON sender.agent_id = fa.id
          LEFT JOIN humans owner ON owner.id = sender.human_id
          LEFT JOIN agent_owners reader ON ?1 = 'agent' AND reader.agent_id = ?2
@@ -1750,13 +1944,14 @@ fn inbox_select(kind: Kind) -> String {
          LEFT JOIN bbs_groups g ON g.id = m.to_group_id
          WHERE d.recipient_address_id = {} AND d.recipient_run_id = ''",
         *SENDER_NAME,
+        *COPY_COLUMNS,
         address_sql(kind.into(), "?2")
     )
 }
 
 fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
     let from_kind: String = r.get(2)?;
-    Ok(MessageView {
+    let view = MessageView {
         id: r.get(0)?,
         created_at: r.get(1)?,
         from_kind: if from_kind == "human" {
@@ -1776,7 +1971,12 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         control: r.get(8)?,
         timer_id: r.get(9)?,
         auto_reply: r.get::<_, Option<i64>>(10)?.is_some_and(|v| v != 0),
-    })
+        via: None,
+        group_notice: false,
+        reported: false,
+        in_reply_to: None,
+    };
+    copy_view(view, r, 11)
 }
 
 /// Mark read `me`'s unread mail from one sender; returns how many.
@@ -2499,9 +2699,10 @@ pub fn feed_messages(
     let sql = format!(
         "SELECT m.id, m.created_at, {SENDER_KIND}, {}, g.name,
                 COALESCE(ta.name, th.name, {}), d.archived_at, m.body, owner.name,
-                to_owner.name, m.auto_reply
+                to_owner.name, m.auto_reply, {}
          FROM messages m
          {SENDER_JOINS}
+         {COPY_JOINS}
          LEFT JOIN agent_owners sender ON sender.agent_id = fa.id
          LEFT JOIN humans owner ON owner.id = sender.human_id
          LEFT JOIN bbs_groups g ON g.id = m.to_group_id
@@ -2521,13 +2722,14 @@ pub fn feed_messages(
          ORDER BY m.id",
         *SENDER_NAME,
         remote_display_sql("xe", "xa", "m.recipient_run_id"),
+        *COPY_COLUMNS,
         vec!["?"; ids.len()].join(", ")
     );
     let rows = conn
         .prepare(&sql)?
         .query_map(rusqlite::params_from_iter(ids), |r| {
             let from_kind: String = r.get(2)?;
-            Ok(MessageView {
+            let view = MessageView {
                 id: r.get(0)?,
                 created_at: r.get(1)?,
                 from_kind: if from_kind == "human" {
@@ -2547,7 +2749,12 @@ pub fn feed_messages(
                 control: None,
                 timer_id: None,
                 auto_reply: r.get::<_, Option<i64>>(10)?.is_some_and(|v| v != 0),
-            })
+                via: None,
+                group_notice: false,
+                reported: false,
+                in_reply_to: None,
+            };
+            copy_view(view, r, 11)
         })?
         .collect::<Result<_, _>>()?;
     Ok(rows)

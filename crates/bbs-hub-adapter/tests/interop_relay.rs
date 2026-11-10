@@ -253,6 +253,7 @@ async fn messages_and_directory_round_trip_with_go_hub() {
             to: "id:will@hub".into(),
             body: "hello from bbs".into(),
             control: None,
+            reply_to: None,
         })
         .await
         .unwrap()

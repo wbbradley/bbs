@@ -122,6 +122,7 @@ impl Rig {
                 to: to.into(),
                 body: body.into(),
                 control: None,
+                reply_to: None,
             },
         );
         self.state.changed();
@@ -2380,4 +2381,263 @@ async fn a_focused_agent_may_not_query_remote_directories() {
         }))
         .await;
     asked.await.unwrap().unwrap();
+}
+
+// ---- replies -----------------------------------------------------------------
+
+/// Reply as `caller` to message `id`.
+fn reply_as(
+    rig: &Rig,
+    caller: &Caller,
+    id: i64,
+    body: &str,
+) -> anyhow::Result<proto::SendResponse> {
+    let out = service::send(
+        &mut rig.conn(),
+        caller,
+        proto::SendRequest {
+            body: body.into(),
+            reply_to: Some(id),
+            ..Default::default()
+        },
+    );
+    rig.state.changed();
+    out
+}
+
+/// A copy, from `hub`'s group `group`, of `original` by `by`, to `to`.
+fn group_copy(
+    id: &str,
+    group: &str,
+    to: &str,
+    original: (&str, &str),
+    by: Option<mp::AddressRef>,
+) -> mp::Message {
+    let mut m = message(id, group, to, &format!("copy {id}"));
+    m.group_copy = Some(mp::GroupCopy {
+        original: Some(mp::MessageRef {
+            namespace: original.0.into(),
+            message_id: original.1.into(),
+        }),
+        original_sender: by,
+    });
+    m
+}
+
+fn message_ref(namespace: &str, id: &str) -> Option<mp::MessageRef> {
+    Some(mp::MessageRef {
+        namespace: namespace.into(),
+        message_id: id.into(),
+    })
+}
+
+#[tokio::test]
+async fn replies_go_to_the_exact_sender_or_a_copys_original_sender() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    // A second human, whose mail scout cannot reply to.
+    service::ensure_human(
+        &mut rig.conn(),
+        proto::EnsureHumanRequest { name: "ann".into() },
+    )
+    .unwrap();
+    let (mut adapter, _) = rig.connect().await;
+    let scout = agent(&rig);
+
+    // A direct message from a run of hub's bob: the reply goes to that run
+    // and answers the message.
+    let mut m = message("m1", "bob", "will/scout", "hello from hub");
+    m.sender.as_mut().unwrap().run_id = Some("r9".into());
+    received(&adapter.offer("h1", m.encode_to_vec()).await);
+    let read = rig.read();
+    let direct = read[0].id;
+    assert_eq!(read[0].via, None);
+    assert_eq!(read[0].in_reply_to, None);
+    let sent = reply_as(&rig, &scout, direct, "hi bob").unwrap();
+    assert_eq!(sent.to, "id:bob@hub#r9");
+    let (_, out) = adapter.outgoing().await;
+    let mut bob = address("hub", "bob").unwrap();
+    bob.run_id = Some("r9".into());
+    assert_eq!(out.recipient, Some(bob));
+    assert_eq!(out.in_reply_to, message_ref("hub", "m1"));
+    assert_eq!(out.body, b"hi bob");
+    // Read back, the reply names the answered message by its ID here.
+    let feed = service::feed(
+        &mut rig.conn(),
+        &human(),
+        proto::FeedRequest {
+            backlog: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mine = feed
+        .messages
+        .iter()
+        .find(|f| Some(f.id) == sent.id)
+        .unwrap();
+    assert_eq!(mine.in_reply_to, Some(direct.to_string()));
+
+    // A group copy shows its original sender via the group; the reply goes
+    // to the original sender's exact address and answers the original.
+    let mut ann = address("hub", "ann").unwrap();
+    ann.run_id = Some("r2".into());
+    let copy = group_copy(
+        "c1",
+        "release",
+        "will/scout",
+        ("hub", "orig"),
+        Some(ann.clone()),
+    );
+    received(&adapter.offer("h2", copy.encode_to_vec()).await);
+    // A notice: the group sent it itself.
+    let notice = group_copy(
+        "n1",
+        "release",
+        "will/scout",
+        ("hub", "n1"),
+        address("hub", "release"),
+    );
+    received(&adapter.offer("h3", notice.encode_to_vec()).await);
+    // A copy whose original sender is on another home than the group: only
+    // the group home's claim.
+    let reported = group_copy(
+        "c2",
+        "release",
+        "will/scout",
+        ("lab", "o1"),
+        address("lab", "carol"),
+    );
+    received(&adapter.offer("h4", reported.encode_to_vec()).await);
+    let read = rig.read();
+    let [copy, notice, reported] = &read[..] else {
+        panic!("{read:?}")
+    };
+    assert_eq!(copy.from_name, "id:ann@hub#r2");
+    assert_eq!(copy.from_kind(), proto::Kind::Remote);
+    assert_eq!(copy.via.as_deref(), Some("id:release@hub"));
+    assert_eq!(copy.reported, None);
+    assert_eq!(copy.group_notice, None);
+    assert_eq!(
+        copy.group_copy_sender().as_deref(),
+        Some("id:ann@hub#r2 via id:release@hub")
+    );
+    assert_eq!(notice.from_name, "id:release@hub");
+    assert_eq!(notice.via, None);
+    assert_eq!(notice.group_notice, Some(true));
+    assert_eq!(
+        notice.group_copy_sender().as_deref(),
+        Some("group id:release@hub (notice)")
+    );
+    assert_eq!(reported.from_name, "id:carol@lab");
+    assert_eq!(reported.reported, Some(true));
+    assert_eq!(
+        reported.group_copy_sender().as_deref(),
+        Some("id:carol@lab via id:release@hub (reported)")
+    );
+    // Search and the feed show copies the same way.
+    let hits = service::search(
+        &mut rig.conn(),
+        &scout,
+        proto::SearchRequest {
+            query: "copy c".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .hits;
+    let found: Vec<_> = hits
+        .iter()
+        .map(|h| h.message.as_ref().unwrap().group_copy_sender().unwrap())
+        .collect();
+    assert_eq!(
+        found,
+        [
+            "id:carol@lab via id:release@hub (reported)",
+            "id:ann@hub#r2 via id:release@hub",
+        ]
+    );
+
+    let sent = reply_as(&rig, &scout, copy.id, "hi ann").unwrap();
+    assert_eq!(sent.to, "id:ann@hub#r2");
+    let (_, out) = adapter.outgoing().await;
+    assert_eq!(out.recipient, Some(ann));
+    assert_eq!(out.in_reply_to, message_ref("hub", "orig"));
+    let sent = reply_as(&rig, &scout, reported.id, "hi carol").unwrap();
+    assert_eq!(sent.to, "id:carol@lab");
+    let (_, out) = adapter.outgoing().await;
+    assert_eq!(out.recipient, address("lab", "carol"));
+    assert_eq!(out.in_reply_to, message_ref("lab", "o1"));
+    let err = reply_as(&rig, &scout, notice.id, "hi group").unwrap_err();
+    assert_eq!(err.to_string(), "a group notice has no sender to reply to");
+
+    // Refusals: your own message, one delivered to someone else, one that
+    // does not exist, and a reply that also names a recipient.
+    let own = sent.id.unwrap();
+    let err = reply_as(&rig, &scout, own, "again").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("you sent message {own}; send to its recipient instead")
+    );
+    let elsewhere = service::send(
+        &mut rig.conn(),
+        &human(),
+        proto::SendRequest {
+            to: "ann".into(),
+            body: "not for scout".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .id
+    .unwrap();
+    for id in [elsewhere, 999_999] {
+        let err = reply_as(&rig, &scout, id, "peek").unwrap_err();
+        assert_eq!(err.to_string(), format!("no message {id} in your mail"));
+    }
+    let mut b = client(&rig, scout.clone()).await;
+    let err = b
+        .send(proto::SendRequest {
+            to: "will".into(),
+            body: "both".into(),
+            reply_to: Some(direct),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    let status = err.downcast_ref::<Status>().unwrap();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{err:#}");
+    // Nothing else was queued.
+    adapter.quiet().await;
+
+    // A native reply goes to the native sender, through the client, and
+    // records what it answers.
+    let local = service::send(
+        &mut rig.conn(),
+        &human(),
+        proto::SendRequest {
+            to: "scout".into(),
+            body: "local hi".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .id
+    .unwrap();
+    let sent = b
+        .send(proto::SendRequest {
+            body: "local reply".into(),
+            reply_to: Some(local),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(sent.to, "will");
+    let read = service::read(&mut rig.conn(), &human(), proto::ReadRequest::default())
+        .unwrap()
+        .messages;
+    let answer = read.iter().find(|m| Some(m.id) == sent.id).unwrap();
+    assert_eq!(answer.body, "local reply");
+    assert_eq!(answer.from_name, "scout");
+    assert_eq!(answer.in_reply_to, Some(local.to_string()));
 }

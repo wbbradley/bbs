@@ -280,6 +280,7 @@ impl Tools {
                         to: arg("to")?,
                         body: arg("body")?,
                         control: None,
+                        reply_to: None,
                     })
                     .await?;
                 let mut out = match r.recipients {
@@ -293,6 +294,13 @@ impl Tools {
                     ));
                 }
                 out
+            }
+            "bbs_reply" => {
+                let id = args["message_id"]
+                    .as_i64()
+                    .context(r#"missing integer argument "message_id""#)?;
+                let r = b.send(crate::app::reply_request(id, arg("body")?)).await?;
+                format!("Replied to {}.", r.to)
             }
             "bbs_agents" => format_agents(
                 &b.list_agents(proto::ListAgentsRequest { all: false })
@@ -499,6 +507,8 @@ fn format_search(
                         _ => "human",
                     },
                     "name": m.from_name, "owner": m.from_owner },
+                "via": m.via, "reported": m.reported == Some(true),
+                "notice": m.group_notice == Some(true), "in_reply_to": m.in_reply_to,
                 "to": { "group": m.to_group, "name": m.to_name, "owner": m.to_owner },
                 "body": m.body, "truncated": hit.truncated,
                 "body_offset_bytes": hit.body_offset_bytes,
@@ -525,6 +535,14 @@ pub fn tool_list() -> Value {
                 "to": string("Agent or human name, @group, or id:ENTITY@NAMESPACE for an entity in another namespace (see bbs_directory)"),
                 "body": string("Message text (at most 64 KiB)"),
             }), &["to", "body"]),
+        },
+        {
+            "name": "bbs_reply",
+            "description": "Reply to a message you received, by its id (shown as (id N) in mail headers and bbs_history). The reply goes to the message's exact sender, or for a copy from another installation's group (from X via GROUP) to its original sender X, not the group, and is marked as answering that message. A group notice has no sender to reply to.",
+            "inputSchema": object(json!({
+                "message_id": json!({ "type": "integer", "description": "The id of the message to reply to" }),
+                "body": string("Message text (at most 64 KiB)"),
+            }), &["message_id", "body"]),
         },
         {
             "name": "bbs_agents",

@@ -143,6 +143,7 @@ async fn incompatible_requests_do_not_touch_state_or_claim_stream_slots() {
                 to: agent.name.clone(),
                 body: "unread".into(),
                 control: None,
+                reply_to: None,
             },
         ))
         .await
@@ -452,6 +453,7 @@ async fn serve_round_trip_and_wait_for_mail() {
                 to: "nobody".into(),
                 body: "hi".into(),
                 control: None,
+                reply_to: None,
             },
         ))
         .await
@@ -482,6 +484,7 @@ async fn serve_round_trip_and_wait_for_mail() {
                 to: b.name.clone(),
                 body: "wake up".into(),
                 control: None,
+                reply_to: None,
             },
         ))
         .await
@@ -610,6 +613,7 @@ async fn watch_feed_snapshots_on_change_for_humans_only() {
                 to: a.name.clone(),
                 body: "hello".into(),
                 control: None,
+                reply_to: None,
             },
         ))
         .await
@@ -663,6 +667,7 @@ async fn humans_mark_an_agents_mail_read_and_only_a_change_refreshes_feeds() {
                 to: "will".into(),
                 body: body.into(),
                 control: None,
+                reply_to: None,
             },
         )
     };
@@ -734,6 +739,7 @@ async fn agent_summaries_stream_what_a_human_has_yet_to_read_or_see() {
         to: "will".into(),
         body: "a question".into(),
         control: None,
+        reply_to: None,
     };
     client.send(as_agent(&a.token, dm)).await.unwrap();
     let s = next().await;
@@ -773,6 +779,7 @@ async fn agent_summaries_stream_what_a_human_has_yet_to_read_or_see() {
         to: a.name.clone(),
         body: "an answer".into(),
         control: None,
+        reply_to: None,
     };
     client.send(as_human("will", reply)).await.unwrap();
     let s = next().await;
@@ -926,6 +933,7 @@ async fn group_deliveries_opt_in_over_the_wire_and_follow_live() {
                 to: "@crew".into(),
                 body: "received group text".into(),
                 control: None,
+                reply_to: None,
             },
         ))
         .await
@@ -1221,6 +1229,7 @@ async fn feed_filters_are_advertised_and_applied_server_side() {
                     to: a.name.clone(),
                     body: body.into(),
                     control: None,
+                    reply_to: None,
                 },
             ))
             .await
@@ -1302,6 +1311,7 @@ async fn feed_filters_are_advertised_and_applied_server_side() {
                 to: a.name.clone(),
                 body: "four".into(),
                 control: None,
+                reply_to: None,
             },
         ))
         .await
@@ -2079,6 +2089,7 @@ async fn search_is_advertised_and_returns_bounded_hits_over_the_wire() {
                 to: "Recipient".into(),
                 body: body.clone(),
                 control: None,
+                reply_to: None,
             },
         ))
         .await

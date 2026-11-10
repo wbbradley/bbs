@@ -306,6 +306,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 to,
                 body: read_body(body)?,
                 control: None,
+                reply_to: None,
             };
             let r = backend.send(req).await?;
             let mut out = match r.recipients {
@@ -320,6 +321,12 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 );
             }
             out
+        }
+        Command::Reply { message_id, body } => {
+            let r = backend
+                .send(reply_request(message_id, read_body(body)?))
+                .await?;
+            format!("Replied to {}.\n", r.to)
         }
         Command::Read {
             limit,
@@ -613,6 +620,17 @@ struct MessageJson<'a> {
     body: &'a str,
     /// The timer that sent it; null for other messages.
     timer: Option<i64>,
+    /// A group copy from another installation: the group it came through;
+    /// `from` is then the original sender. Null otherwise.
+    via: Option<&'a str>,
+    /// With `via`: the original sender is only the group's home's claim.
+    reported: bool,
+    /// A notice the group sent itself: `from` is the group, and there is no
+    /// sender to reply to.
+    notice: bool,
+    /// The message this one answers: its id here, or `NAMESPACE:MESSAGE_ID`
+    /// when this server does not have it. Null otherwise.
+    in_reply_to: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -743,6 +761,25 @@ pub(crate) fn timer_line(t: &proto::Timer) -> String {
     )
 }
 
+/// A reply to message `id`: no recipient, which the server picks. A server
+/// that predates replies ignores `reply_to` and refuses the empty recipient.
+pub(crate) fn reply_request(id: i64, body: String) -> proto::SendRequest {
+    proto::SendRequest {
+        to: String::new(),
+        body,
+        control: None,
+        reply_to: Some(id),
+    }
+}
+
+/// ` (reply to REF)` for a message that answers another, else nothing.
+pub(crate) fn reply_marker(m: &proto::Message) -> String {
+    m.in_reply_to
+        .as_deref()
+        .map(|r| format!(" (reply to {r})"))
+        .unwrap_or_default()
+}
+
 pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<String> {
     if json {
         return json_lines(msgs.iter().map(|m| MessageJson {
@@ -755,6 +792,10 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
             group: m.to_group.as_deref(),
             body: &m.body,
             timer: m.timer_id,
+            via: m.via.as_deref(),
+            reported: m.reported == Some(true),
+            notice: m.group_notice == Some(true),
+            in_reply_to: m.in_reply_to.as_deref(),
         }));
     }
     let mut out = String::new();
@@ -762,11 +803,14 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
         if i > 0 {
             out.push('\n');
         }
-        let human = match m.from_kind() {
-            proto::Kind::Human => " (human)",
-            proto::Kind::Remote => " (remote)",
-            _ => "",
-        };
+        let from = m.group_copy_sender().unwrap_or_else(|| {
+            let marker = match m.from_kind() {
+                proto::Kind::Human => " (human)",
+                proto::Kind::Remote => " (remote)",
+                _ => "",
+            };
+            format!("{}{marker}", m.sender_display_name())
+        });
         let to = match (&m.to_group, &m.to_name) {
             (Some(g), _) => format!("@{g}"),
             (None, to) => to.clone().unwrap_or_default(),
@@ -777,9 +821,10 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
             .unwrap_or_default();
         writeln!(
             out,
-            "[{}] from {}{human} to {to}{timer}:",
+            "[{}] from {from} to {to} (id {}){}{timer}:",
             display_time(&m.created_at),
-            m.sender_display_name()
+            m.id,
+            reply_marker(m),
         )?;
         out.push_str(m.body.trim_end_matches('\n'));
         out.push('\n');
@@ -941,6 +986,58 @@ mod tests {
         for bad in ["0", "2001"] {
             assert!(Cli::try_parse_from(["bbs", "directory", "hub", "--limit", bad]).is_err());
         }
+    }
+
+    #[test]
+    fn read_output_shows_ids_replies_and_group_copies() {
+        let at = "2026-11-09T12:00:00.000000Z".to_string();
+        let copy = proto::Message {
+            id: 7,
+            created_at: at.clone(),
+            from_kind: proto::Kind::Remote.into(),
+            from_name: "id:ann@hub".into(),
+            to_name: Some("scout".into()),
+            body: "ship it".into(),
+            via: Some("id:release@hub".into()),
+            ..Default::default()
+        };
+        let notice = proto::Message {
+            id: 8,
+            from_name: "id:release@hub".into(),
+            group_notice: Some(true),
+            ..copy.clone()
+        };
+        let reply = proto::Message {
+            id: 9,
+            from_kind: proto::Kind::Human.into(),
+            from_name: "will".into(),
+            via: None,
+            in_reply_to: Some("3".into()),
+            ..copy.clone()
+        };
+        let text = format_messages(&[copy.clone(), notice, reply], false).unwrap();
+        let headers: Vec<_> = text.lines().filter(|l| l.starts_with('[')).collect();
+        let time = display_time(&at);
+        assert_eq!(
+            headers,
+            [
+                format!("[{time}] from id:ann@hub via id:release@hub to scout (id 7):"),
+                format!("[{time}] from group id:release@hub (notice) to scout (id 8):"),
+                format!("[{time}] from will (human) to scout (id 9) (reply to 3):"),
+            ]
+        );
+        let json = format_messages(&[copy], true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+        assert_eq!(v["from"], "id:ann@hub");
+        assert_eq!(v["via"], "id:release@hub");
+        assert_eq!(v["reported"], false);
+        assert_eq!(v["notice"], false);
+        assert_eq!(v["in_reply_to"], serde_json::Value::Null);
+        let reply = Cli::parse_from(["bbs", "reply", "7", "-"]);
+        assert!(matches!(
+            reply.command,
+            Some(Command::Reply { message_id: 7, body: Some(ref b) }) if b == "-"
+        ));
     }
 
     #[test]

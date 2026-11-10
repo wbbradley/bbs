@@ -204,6 +204,10 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
         },
         timer_id: m.timer_id,
         auto_reply: if m.auto_reply { Some(true) } else { None },
+        reported: (m.via.is_some() && m.reported).then_some(true),
+        via: m.via,
+        group_notice: m.group_notice.then_some(true),
+        in_reply_to: m.in_reply_to,
     }
 }
 
@@ -1828,11 +1832,22 @@ pub fn send(
         let me = ctx.actor()?;
         let (to, body) = (req.to.as_str(), req.body.as_str());
         validate_body(body)?;
+        if let Some(id) = req.reply_to {
+            if !to.is_empty() || req.control.is_some() {
+                return Err(integration::InvalidRequest(
+                    "a reply goes to the sender of the message it answers: leave `to` empty \
+                     and send no control"
+                        .into(),
+                )
+                .into());
+            }
+            return reply(ctx, &me, id, body);
+        }
         if let Some(control) = req.control {
             return send_control(ctx, &me, to, body, control);
         }
         if let Some(reference) = to.strip_prefix("id:") {
-            let (id, to) = integration::send_remote(ctx, &me, reference, body)?;
+            let (id, to) = integration::send_remote(ctx, &me, reference, body, None)?;
             return Ok(proto::SendResponse {
                 to,
                 recipients: None,
@@ -1887,44 +1902,92 @@ pub fn send(
                 None => bail!("no such agent or human: {to}"),
             },
         };
-        if target.kind == me.kind && target.id == me.id {
-            bail!("cannot send a message to yourself");
+        send_direct(ctx, &me, target, body, None)
+    })
+}
+
+/// Reply to message `id`, which must have been delivered to `me`: to its
+/// exact sender, or a group copy's original sender, with `in_reply_to` set
+/// to the answered message's origin (D092, D127). The server resolves both,
+/// so a caller cannot name an arbitrary correlation.
+fn reply(ctx: &Ctx, me: &db::Principal, id: i64, body: &str) -> Result<proto::SendResponse> {
+    let source = db::reply_source(ctx.conn, me, id)?;
+    let source = match source {
+        Some(s) if s.mine => bail!("you sent message {id}; send to its recipient instead"),
+        Some(s) if s.delivered => s,
+        _ => bail!("no message {id} in your mail"),
+    };
+    let answers = Some((source.answers.0.as_str(), source.answers.1.as_str()));
+    match source.target {
+        db::ReplyTarget::Group => bail!("a group notice has no sender to reply to"),
+        db::ReplyTarget::Remote(reference) => {
+            let reference = reference.strip_prefix("id:").unwrap_or(&reference);
+            let (id, to) = integration::send_remote(ctx, me, reference, body, answers)?;
+            Ok(proto::SendResponse {
+                to,
+                recipients: None,
+                id: Some(id),
+                skipped: Vec::new(),
+            })
         }
-        if me.kind == db::Kind::Agent
-            && target.kind == db::Kind::Agent
-            && !db::share_group(ctx.conn, me.id, target.id)?
-        {
-            bail!("{} is not in any of your groups", target.name);
-        }
-        check_focus(ctx, &me, Some(&target))?;
-        let msg = db::insert_message(
-            ctx.conn,
-            &me,
-            db::To::Direct(target.kind, target.id),
-            body,
-            &ctx.now_s,
-        )?;
-        match (me.kind, target.kind) {
-            (db::Kind::Human, db::Kind::Agent) => {
-                db::record_human_conversation(ctx.conn, target.id, me.id, &ctx.now_s)?;
+        db::ReplyTarget::Native(target) => {
+            if target.kind == db::Kind::Agent && !db::agent_is_live(ctx.conn, target.id)? {
+                bail!("{} is offline (retired)", target.name);
             }
-            (db::Kind::Agent, db::Kind::Human) => {
-                db::record_human_conversation(ctx.conn, me.id, target.id, &ctx.now_s)?;
-            }
-            _ => {}
+            send_direct(ctx, me, target, body, answers)
         }
-        tracing::info!(
-            from = me.name,
-            to = target.name,
-            bytes = body.len(),
-            "sent message"
-        );
-        Ok(proto::SendResponse {
-            to: target.name,
-            recipients: None,
-            id: Some(msg),
-            skipped: Vec::new(),
-        })
+    }
+}
+
+/// Send a direct message to a native human or agent, answering the message
+/// with origin `in_reply_to` when set.
+fn send_direct(
+    ctx: &Ctx,
+    me: &db::Principal,
+    target: db::Principal,
+    body: &str,
+    in_reply_to: Option<(&str, &str)>,
+) -> Result<proto::SendResponse> {
+    if target.kind == me.kind && target.id == me.id {
+        bail!("cannot send a message to yourself");
+    }
+    if me.kind == db::Kind::Agent
+        && target.kind == db::Kind::Agent
+        && !db::share_group(ctx.conn, me.id, target.id)?
+    {
+        bail!("{} is not in any of your groups", target.name);
+    }
+    check_focus(ctx, me, Some(&target))?;
+    let msg = db::insert_message(
+        ctx.conn,
+        me,
+        db::To::Direct(target.kind, target.id),
+        body,
+        &ctx.now_s,
+    )?;
+    if let Some((namespace, message_id)) = in_reply_to {
+        db::set_message_in_reply_to(ctx.conn, msg, namespace, message_id)?;
+    }
+    match (me.kind, target.kind) {
+        (db::Kind::Human, db::Kind::Agent) => {
+            db::record_human_conversation(ctx.conn, target.id, me.id, &ctx.now_s)?;
+        }
+        (db::Kind::Agent, db::Kind::Human) => {
+            db::record_human_conversation(ctx.conn, me.id, target.id, &ctx.now_s)?;
+        }
+        _ => {}
+    }
+    tracing::info!(
+        from = me.name,
+        to = target.name,
+        bytes = body.len(),
+        "sent message"
+    );
+    Ok(proto::SendResponse {
+        to: target.name,
+        recipients: None,
+        id: Some(msg),
+        skipped: Vec::new(),
     })
 }
 
@@ -3688,6 +3751,7 @@ mod tests {
                 to: "Lu".into(),
                 body: "**ÉQUIPE** a.*%_[]\nnext line".into(),
                 control: None,
+                reply_to: None,
             },
         )
         .unwrap()
@@ -3721,6 +3785,7 @@ mod tests {
                 to: "Eve".into(),
                 body: "équipe private".into(),
                 control: None,
+                reply_to: None,
             },
         )
         .unwrap()
@@ -3734,6 +3799,7 @@ mod tests {
                 to: "ada".into(),
                 body: "équipe reply".into(),
                 control: None,
+                reply_to: None,
             },
         )
         .unwrap()
@@ -3754,6 +3820,7 @@ mod tests {
                 to: "@crew".into(),
                 body: "équipe group".into(),
                 control: None,
+                reply_to: None,
             },
         )
         .unwrap();
@@ -3771,6 +3838,7 @@ mod tests {
                 to: "Lu".into(),
                 body: "équipe control".into(),
                 control: None,
+                reply_to: None,
             },
         )
         .unwrap()
@@ -3881,6 +3949,7 @@ mod tests {
                 to: "@crew".into(),
                 body: "needle group".into(),
                 control: None,
+                reply_to: None,
             },
         )
         .unwrap();
@@ -4155,6 +4224,7 @@ mod tests {
                 to: "Mateo".into(),
                 body: "high".into(),
                 control: Some(proto::Control::SetEffort.into()),
+                reply_to: None,
             },
         )
         .unwrap();
@@ -4266,6 +4336,7 @@ mod tests {
                     to: "Mateo".into(),
                     body: body.into(),
                     control: Some(proto::Control::SetEffort.into()),
+                    reply_to: None,
                 },
             )
         };
@@ -4426,6 +4497,7 @@ mod tests {
                     to: "Mateo".into(),
                     body: body.into(),
                     control: Some(c.into()),
+                    reply_to: None,
                 },
             )
         };
@@ -4575,6 +4647,7 @@ mod tests {
             to: "Lu".into(),
             body: "stop".into(),
             control: Some(proto::Control::Cancel.into()),
+            reply_to: None,
         };
         send(&mut conn, &will, req).unwrap();
         let t = add(&mut conn, &will, "Lu", "in 1m").unwrap();
@@ -6459,6 +6532,7 @@ mod tests {
                     to: to.into(),
                     body: body.into(),
                     control: None,
+                    reply_to: None,
                 },
             )
             .unwrap();
@@ -6663,6 +6737,7 @@ mod tests {
                 to: to.into(),
                 body: format!("to {to}"),
                 control: None,
+                reply_to: None,
             };
             send(conn, from, req)
         };
@@ -6873,6 +6948,7 @@ mod tests {
                 to: "Mateo".into(),
                 body: "chat".into(),
                 control: None,
+                reply_to: None,
             },
         )
         .unwrap_err();
@@ -6892,6 +6968,7 @@ mod tests {
                 to: "will".into(),
                 body: body.into(),
                 control: None,
+                reply_to: None,
             };
             send(&mut conn, agent, req).unwrap();
         }
@@ -6972,12 +7049,14 @@ mod tests {
             to: "will".into(),
             body: "a question".into(),
             control: None,
+            reply_to: None,
         };
         send(&mut conn, &mateo, dm).unwrap();
         let shout = proto::SendRequest {
             to: "@crew".into(),
             body: "everyone".into(),
             control: None,
+            reply_to: None,
         };
         send(&mut conn, &will, shout).unwrap();
         let record = |n: usize| {
@@ -7077,6 +7156,7 @@ mod tests {
                 to: to.into(),
                 body: body.into(),
                 control: None,
+                reply_to: None,
             },
         )
         .unwrap();
