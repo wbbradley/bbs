@@ -2280,7 +2280,8 @@ async fn the_integration_stream_follows_local_administration() {
     assert_eq!(
         admin(&["integration", "list"]),
         format!(
-            "hub: enabled, publication on (revision {}), credential issued; handoffs: none",
+            "hub: enabled, publication on (revision {}), credential issued; handoffs: none; \
+             namespaces: none",
             on.revision
         )
     );
@@ -2294,9 +2295,14 @@ async fn the_integration_stream_follows_local_administration() {
     assert_eq!(
         admin(&["integration", "list"]),
         format!(
-            "hub: disabled, publication on (revision {}), credential none; handoffs: none",
+            "hub: disabled, publication on (revision {}), credential none; handoffs: none; \
+             namespaces: none",
             on.revision
         )
+    );
+    assert_eq!(
+        admin(&["integration", "unbind", "acme"]),
+        "Namespace acme is not bound to an integration."
     );
 
     let _ = child.kill();

@@ -32,9 +32,12 @@ under the new package version and its publication date.
   `bbs send id:will/scout@hub "hello"`, sends to another installation through
   the adapter, at most once: the handoff is marked attempted before it goes on
   the stream and is never offered again, even after a crash. Each namespace
-  stays with the first integration that reaches it. When the adapter refuses
-  a message, or it waits unsent for seven days, the sender gets a "Not
-  delivered" notice in its own inbox.
+  stays with the first integration that reaches it; `bbs admin integration
+  list` shows the bindings and `bbs admin integration unbind NS` clears one,
+  so a replacement integration can take it. When the adapter refuses a
+  message, or it waits unsent for seven days, the sender gets a "Not
+  delivered" notice in its own inbox; when a handoff's outcome is uncertain,
+  a "Delivery uncertain" notice, and it is not resent.
 - Messages the adapter offers are validated against Hub's limits and delivered
   to the local human or agent; a repeat with identical bytes is reported as
   already known, and different content under the same message ID is refused

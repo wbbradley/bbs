@@ -143,16 +143,20 @@ fn record(state: &Arc<State>, claims: Vec<i64>, sent: bool) {
     };
     let state = state.clone();
     runtime.spawn_blocking(move || {
-        let conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
         let result = if sent {
             claims
                 .iter()
-                .try_for_each(|&id| integration::handed_off(&conn, id, true))
+                .try_for_each(|&id| integration::handed_off(&conn, id))
         } else {
-            integration::mark_unknown(&conn, &claims, NOT_HANDED_OFF)
+            integration::mark_unknown(&mut conn, &claims, NOT_HANDED_OFF)
         };
-        if let Err(err) = result {
-            tracing::error!("recording handoffs: {err:#}");
+        drop(conn);
+        match result {
+            // An unknown handoff mails its sender a notice.
+            Ok(()) if !sent => state.changed(),
+            Ok(()) => {}
+            Err(err) => tracing::error!("recording handoffs: {err:#}"),
         }
     });
 }

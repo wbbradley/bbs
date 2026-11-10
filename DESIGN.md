@@ -423,7 +423,11 @@ observation last showed retired, in focus mode, and unless the namespace's
 integration is enabled, holds a credential and publishes. A namespace belongs
 to the first integration that imports from it or sends to it
 (`integration_namespaces`); an unbound namespace uses the only enabled
-integration, and with several BBS refuses rather than choose. Then one
+integration, and with several BBS refuses rather than choose. `bbs admin
+integration list` shows each integration's namespaces, and `bbs admin
+integration unbind NS` clears one, so the next integration to use it takes
+it, moving its known addresses along; work already queued stays with its
+integration. Then one
 transaction records the foreign entity and address (bound to the
 integration), the message with its frozen common `Message` bytes (seven-day
 deadline, plain text) and an `integration_outbox` row, `pending`; no delivery
@@ -443,8 +447,11 @@ deadline becomes `rejected` (`expired`): at the claim, and by a sweep at
 startup and every minute. A rejection, the adapter's or an expiry, puts a
 `delivery_error` notice in the sender's own inbox, in reply to the failed
 message, naming its recipient and send time and a fixed phrase for the reason,
-never the adapter's detail. `unknown` is recorded only, never reported as a
-failure. The states show in `bbs admin integration list`.
+never the adapter's detail. A move to `unknown`, a stream ending with offers
+queued or a restart finding `attempted` rows, is exactly where a message may
+have been lost, so it too sends a notice, worded apart from a failure: the
+delivery is uncertain, it may not have arrived, and BBS will not send it
+again. Nothing retries it. The states show in `bbs admin integration list`.
 
 **Import.** An offer is validated as above, then a message with the same
 origin `(namespace, ID)` answers ALREADY_KNOWN when its stored bytes are

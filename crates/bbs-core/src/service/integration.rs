@@ -291,32 +291,23 @@ pub fn claim(conn: &mut Connection, integration: &str) -> Result<Option<(i64, pb
     })
 }
 
-/// After the send of a claimed handoff: `sent` when it was handed to the
-/// stream, else `unknown`. Neither replaces a result the adapter already
-/// reported, and neither is ever offered again.
-pub fn handed_off(conn: &Connection, outbox: i64, sent: bool) -> Result<()> {
-    if sent {
-        store::set_outbox_state(conn, outbox, &["attempted"], "sent", None)?;
-    } else {
-        store::set_outbox_state(
-            conn,
-            outbox,
-            &["attempted"],
-            "unknown",
-            Some("the stream closed during the handoff"),
-        )?;
-    }
+/// A claimed handoff the transport took: `sent`. It never replaces a result
+/// the adapter already reported, nor an `unknown`.
+pub fn handed_off(conn: &Connection, outbox: i64) -> Result<()> {
+    store::set_outbox_state(conn, outbox, &["attempted"], "sent", None)?;
     Ok(())
 }
 
 /// Claimed handoffs that never reached the transport, because their stream
-/// ended first, become unknown: never offered again, never reported as
-/// failed.
-pub fn mark_unknown(conn: &Connection, outbox: &[i64], detail: &str) -> Result<()> {
-    for &id in outbox {
-        store::set_outbox_state(conn, id, &["attempted"], "unknown", Some(detail))?;
-    }
-    Ok(())
+/// ended first, become unknown, and their senders are told the delivery is
+/// uncertain. They are never offered again.
+pub fn mark_unknown(conn: &mut Connection, outbox: &[i64], detail: &str) -> Result<()> {
+    with_ctx(conn, &NO_CALLER, |ctx| {
+        for &id in outbox {
+            uncertain(ctx, id, detail)?;
+        }
+        Ok(())
+    })
 }
 
 /// Reject pending handoffs whose deadline has passed by `now`, telling their
@@ -383,10 +374,46 @@ fn fail(ctx: &Ctx, id: i64, from: &[&str], reason: &str, detail: &str) -> Result
     Ok(true)
 }
 
-/// Handoffs a stopped server left attempted become unknown (see
-/// [`store::interrupt_attempted`]). The server runs this once at startup.
-pub fn interrupt_attempted(conn: &Connection) -> Result<usize> {
-    store::interrupt_attempted(conn)
+/// Move attempted outbox row `id` to `unknown` with `detail`, and tell the
+/// sender the delivery is uncertain: it may or may not have reached the
+/// adapter, and BBS never sends it again. Returns whether the row moved.
+fn uncertain(ctx: &Ctx, id: i64, detail: &str) -> Result<bool> {
+    if !store::set_outbox_state(ctx.conn, id, &["attempted"], "unknown", Some(detail))? {
+        return Ok(false);
+    }
+    let failed = store::failed(ctx.conn, id)?;
+    let body = format!(
+        "Delivery uncertain: your message to {} (sent {}) may not have arrived. BBS will \
+         not send it again.",
+        failed.recipient, failed.created_at
+    );
+    store::insert_notice(ctx.conn, &failed, &db::new_message_id(), &body, &ctx.now_s)?;
+    tracing::info!(
+        message = failed.message,
+        to = failed.recipient,
+        detail,
+        "remote send uncertain"
+    );
+    Ok(true)
+}
+
+/// Handoffs a stopped server left attempted may or may not have reached the
+/// adapter: they become unknown, with a notice to each sender. The server
+/// runs this once at startup. Returns how many.
+pub fn interrupt_attempted(conn: &mut Connection) -> Result<usize> {
+    with_ctx(conn, &NO_CALLER, |ctx| {
+        let mut n = 0;
+        for id in store::attempted(ctx.conn)? {
+            if uncertain(
+                ctx,
+                id,
+                "interrupted: the server stopped during the handoff",
+            )? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    })
 }
 
 fn check_text(what: &str, text: &str, max: usize) -> Result<()> {
@@ -1102,6 +1129,16 @@ pub fn admin_rotate(conn: &mut Connection, id: &str) -> Result<String> {
         let token = auth::new_token();
         store::set_token(ctx.conn, id, &auth::token_hash(&token))?;
         Ok(token)
+    })
+}
+
+/// Clear another installation's `namespace` binding, so the next integration
+/// to import from it or send to it takes it; for moving a namespace to an
+/// integration that replaces its old one. Work already queued stays with the
+/// integration it was queued for. Returns the integration it was bound to.
+pub fn admin_unbind(conn: &mut Connection, namespace: &str) -> Result<Option<String>> {
+    with_ctx(conn, &NO_CALLER, |ctx| {
+        store::unbind_namespace(ctx.conn, namespace)
     })
 }
 

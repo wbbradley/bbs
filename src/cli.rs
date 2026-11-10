@@ -270,7 +270,11 @@ pub enum AdminIntegrationCommand {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
-    /// List integrations, their publication and their handoffs by state.
+    /// Clear another installation's namespace binding, so the next
+    /// integration to import from it or send to it takes it.
+    Unbind { namespace: String },
+    /// List integrations, their publication, their handoffs by state and the
+    /// namespaces bound to them.
     List,
 }
 

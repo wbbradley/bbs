@@ -687,8 +687,12 @@ async fn a_claim_interrupted_before_its_send_is_never_replayed() {
     // Attempted work is not offered, even before the restart.
     let (mut adapter, _) = rig.connect().await;
     adapter.quiet().await;
-    // The restart marks it unknown; still nothing is offered.
-    assert_eq!(integration::interrupt_attempted(&rig.conn()).unwrap(), 1);
+    // The restart marks it unknown and tells the sender; still nothing is
+    // offered.
+    assert_eq!(
+        integration::interrupt_attempted(&mut rig.conn()).unwrap(),
+        1
+    );
     assert_eq!(
         rig.outbox(lost),
         (
@@ -699,15 +703,34 @@ async fn a_claim_interrupted_before_its_send_is_never_replayed() {
     let (mut adapter, _) = rig.connect().await;
     adapter.quiet().await;
     // A late send completion cannot revive it.
-    integration::handed_off(&rig.conn(), outbox, true).unwrap();
+    integration::handed_off(&rig.conn(), outbox).unwrap();
     assert_eq!(rig.outbox(lost).0, "unknown");
     // New work still flows.
     let next = rig.send("id:ada@hub", "next").unwrap().id.unwrap();
     let (_, m) = adapter.outgoing().await;
     assert_eq!(m.body, b"next");
     rig.settle(next, "sent").await;
-    // Unknown is not a failure: the sender got no notice.
-    assert!(rig.read().is_empty());
+    // The sender heard once that delivery is uncertain, in words unlike a
+    // failure's; nothing was resent.
+    let mail = rig.read();
+    assert_eq!(mail.len(), 1, "{mail:?}");
+    let created: String = rig
+        .conn()
+        .query_row(
+            "SELECT created_at FROM messages WHERE id = ?1",
+            [lost],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        mail[0].body,
+        format!(
+            "Delivery uncertain: your message to id:ada@hub (sent {created}) may not have \
+             arrived. BBS will not send it again."
+        )
+    );
+    assert_eq!(rig.outbox(lost).0, "unknown");
+    adapter.quiet().await;
 }
 
 #[tokio::test]
@@ -1201,8 +1224,15 @@ async fn a_revoke_mid_backlog_counts_as_sent_only_what_reached_the_adapter() {
     let states = rig.settled().await;
     assert_eq!(states.get("sent").copied(), Some(received), "{states:?}");
     assert_eq!(states.values().sum::<i64>(), 400, "{states:?}");
-    // Unknown is recorded, not reported: no notices.
-    assert!(rig.read().is_empty());
+    // Each unknown handoff, and only those, tells its sender delivery is
+    // uncertain; none is offered again.
+    let unknown = states.get("unknown").copied().unwrap_or(0);
+    let mail = rig.read();
+    assert_eq!(mail.len() as i64, unknown, "{states:?}");
+    assert!(mail.iter().all(|m| {
+        m.body
+            .starts_with("Delivery uncertain: your message to id:ada@hub")
+    }));
 }
 
 #[tokio::test]
@@ -1246,6 +1276,13 @@ async fn a_revoke_ends_a_stream_whose_adapter_stopped_reading() {
         "{states:?}"
     );
     assert!(received < 100);
+    // The handoffs it had queued are uncertain, and their senders are told.
+    let mail = rig.read();
+    assert_eq!(mail.len() as i64, states["unknown"], "{states:?}");
+    assert!(
+        mail.iter()
+            .all(|m| m.body.starts_with("Delivery uncertain: "))
+    );
 }
 
 #[tokio::test]
@@ -1484,7 +1521,54 @@ async fn each_namespace_belongs_to_the_first_integration_to_use_it() {
     assert_eq!(m.body, b"to acme");
     hub.quiet().await;
     acme.quiet().await;
-    assert_eq!(rig.count("SELECT count(*) FROM integration_namespaces"), 2);
+    let bound: Vec<_> = integration::admin_list(&mut rig.conn())
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.id, row.namespaces))
+        .collect();
+    assert_eq!(
+        bound,
+        [
+            ("hub".to_string(), vec!["hub".to_string()]),
+            ("other".to_string(), vec!["acme".to_string()])
+        ]
+    );
+
+    // Integration `other` replaces `hub`: unbinding moves `hub` to the next
+    // integration that uses it, addresses already known included.
+    assert_eq!(
+        integration::admin_unbind(&mut rig.conn(), "hub").unwrap(),
+        Some("hub".into())
+    );
+    assert_eq!(
+        integration::admin_unbind(&mut rig.conn(), "hub").unwrap(),
+        None
+    );
+    assert!(integration::admin_revoke(&mut rig.conn(), "hub").unwrap());
+    rig.send("id:ada@hub", "via other").unwrap();
+    let (_, m) = acme.outgoing().await;
+    assert_eq!(m.body, b"via other");
+    let mut again = message("m2", "bob", "will/scout", "now via other");
+    again.sender = address("hub", "bob");
+    received(&acme.offer("a3", again.encode_to_vec()).await);
+    assert_eq!(
+        rig.count(
+            "SELECT count(*) FROM address_delivery_bindings b
+             JOIN entity_addresses a ON a.id = b.address_id
+             JOIN entities e ON e.id = a.entity_id
+             WHERE e.namespace = 'hub' AND b.integration_id != 'other'"
+        ),
+        0
+    );
+    let namespaces: Vec<_> = integration::admin_list(&mut rig.conn())
+        .unwrap()
+        .into_iter()
+        .map(|row| row.namespaces)
+        .collect();
+    assert_eq!(
+        namespaces,
+        [vec![], vec!["acme".to_string(), "hub".to_string()]]
+    );
 }
 
 #[tokio::test]

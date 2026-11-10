@@ -64,6 +64,15 @@ fn integration(conn: &mut rusqlite::Connection, command: &AdminIntegrationComman
             let already = if changed { "" } else { " already" };
             println!("Integration {id}{already} {now}.");
         }
+        AdminIntegrationCommand::Unbind { namespace } => {
+            match admin::admin_unbind(conn, namespace)? {
+                Some(id) => println!(
+                    "Namespace {namespace} is no longer bound to integration {id}; the next \
+                 integration to import from it or send to it takes it."
+                ),
+                None => println!("Namespace {namespace} is not bound to an integration."),
+            }
+        }
         AdminIntegrationCommand::List => {
             let rows = admin::admin_list(conn)?;
             if rows.is_empty() {
@@ -77,7 +86,8 @@ fn integration(conn: &mut rusqlite::Connection, command: &AdminIntegrationComman
                     .collect::<Vec<_>>()
                     .join(", ");
                 println!(
-                    "{}: {}, publication {} (revision {}), credential {}; handoffs: {}",
+                    "{}: {}, publication {} (revision {}), credential {}; handoffs: {}; \
+                     namespaces: {}",
                     row.id,
                     if row.enabled { "enabled" } else { "disabled" },
                     if row.publish_entities { "on" } else { "off" },
@@ -87,6 +97,11 @@ fn integration(conn: &mut rusqlite::Connection, command: &AdminIntegrationComman
                         "none".to_string()
                     } else {
                         handoffs
+                    },
+                    if row.namespaces.is_empty() {
+                        "none".to_string()
+                    } else {
+                        row.namespaces.join(", ")
                     },
                 );
             }

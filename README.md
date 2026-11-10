@@ -579,7 +579,7 @@ retiring one updates the catalog:
 bbs admin integration publish hub on --state-dir /var/lib/bbs
 bbs admin integration publish hub off --state-dir /var/lib/bbs
 bbs admin integration list --state-dir /var/lib/bbs
-# hub: enabled, publication on (revision 3), credential issued; handoffs: 2 received
+# hub: enabled, publication on (revision 3), credential issued; handoffs: 2 received; namespaces: hub
 ```
 
 A running server notices a change within five seconds. Each changed catalog
@@ -597,13 +597,22 @@ and never offers it again, even after a crash, which can lose it. `bbs admin
 integration list` counts handoffs by state: pending, attempted, sent, then
 the adapter's received or rejected, or unknown when the outcome is uncertain.
 When the adapter rejects a message, or it is still pending after seven days,
-the sender gets a "Not delivered" notice in its own inbox; an unknown outcome
-sends none.
+the sender gets a "Not delivered" notice in its own inbox. When the outcome is
+unknown (the stream or the server stopped mid-handoff), the sender gets a
+"Delivery uncertain" notice instead: the message may not have arrived, and
+BBS will not send it again.
 
 Each namespace belongs to the first integration that imports from it or
 sends to it; another integration's messages from that namespace are refused.
 With one integration enabled, sends to a new namespace use it; with several,
-BBS refuses a send to a namespace none has reached yet.
+BBS refuses a send to a namespace none has reached yet. `bbs admin
+integration list` shows each integration's namespaces. When a new
+integration replaces an old one, clear the old binding so the next
+integration to use the namespace takes it:
+
+```sh
+bbs admin integration unbind hub --state-dir /var/lib/bbs
+```
 
 ### Backup and restore
 

@@ -73,7 +73,7 @@ pub async fn run(
 }
 
 async fn serve(
-    conn: Connection,
+    mut conn: Connection,
     listen: SocketAddr,
     web: Option<Web>,
     integration: Option<SocketAddr>,
@@ -109,7 +109,7 @@ async fn serve(
     };
     // Handoffs a stopped server left attempted are uncertain: they become
     // unknown, and nothing offers them again.
-    let interrupted = service::integration::interrupt_attempted(&conn)?;
+    let interrupted = service::integration::interrupt_attempted(&mut conn)?;
     if interrupted > 0 {
         tracing::warn!(
             interrupted,

@@ -17,6 +17,8 @@ pub struct IntegrationRow {
     pub publication_revision: i64,
     /// Outbox rows by state, in state order.
     pub outbox: Vec<(String, i64)>,
+    /// Other installations' namespaces bound to it, in order.
+    pub namespaces: Vec<String>,
 }
 
 pub fn exists(conn: &Connection, id: &str) -> Result<bool> {
@@ -101,6 +103,7 @@ pub fn list(conn: &Connection) -> Result<Vec<IntegrationRow>> {
                 has_credential: r.get(3)?,
                 publication_revision: r.get(4)?,
                 outbox: Vec::new(),
+                namespaces: Vec::new(),
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -108,9 +111,16 @@ pub fn list(conn: &Connection) -> Result<Vec<IntegrationRow>> {
         "SELECT state, count(*) FROM integration_outbox WHERE integration_id = ?1
          GROUP BY state ORDER BY state",
     )?;
+    let mut namespaces = conn.prepare(
+        "SELECT namespace FROM integration_namespaces WHERE integration_id = ?1
+         ORDER BY namespace",
+    )?;
     for row in &mut rows {
         row.outbox = counts
             .query_map([&row.id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        row.namespaces = namespaces
+            .query_map([&row.id], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
     }
     Ok(rows)
@@ -147,6 +157,17 @@ pub fn namespace_integration(conn: &Connection, namespace: &str) -> Result<Optio
     Ok(conn
         .query_row(
             "SELECT integration_id FROM integration_namespaces WHERE namespace = ?1",
+            [namespace],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Clear `namespace`'s binding; returns the integration it was bound to.
+pub fn unbind_namespace(conn: &Connection, namespace: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "DELETE FROM integration_namespaces WHERE namespace = ?1 RETURNING integration_id",
             [namespace],
             |r| r.get(0),
         )
@@ -335,8 +356,9 @@ pub fn foreign_entity(
     Ok(id)
 }
 
-/// A foreign entity's address `address_id`, recorded on first sight as
-/// reached through `integration`, its namespace's integration. Returns its
+/// A foreign entity's address `address_id`, reached through `integration`,
+/// its namespace's integration: recorded on first sight, and moved to
+/// `integration` when the namespace was rebound. Returns its
 /// `entity_addresses` row.
 pub fn foreign_address(
     conn: &Connection,
@@ -357,7 +379,9 @@ pub fn foreign_address(
     )?;
     conn.execute(
         "INSERT INTO address_delivery_bindings (address_id, handler, integration_id)
-         VALUES (?1, 'integration', ?2) ON CONFLICT(address_id) DO NOTHING",
+         VALUES (?1, 'integration', ?2)
+         ON CONFLICT(address_id) DO UPDATE SET integration_id = excluded.integration_id
+         WHERE handler = 'integration'",
         params![address, integration],
     )?;
     let bound: Option<String> = conn.query_row(
@@ -655,13 +679,10 @@ pub fn insert_notice(
     Ok(id)
 }
 
-/// Handoffs a stopped server left attempted become unknown: they may or may
-/// not have reached the adapter, and are never offered again.
-pub fn interrupt_attempted(conn: &Connection) -> Result<usize> {
-    Ok(conn.execute(
-        "UPDATE integration_outbox
-         SET state = 'unknown', detail = 'interrupted: the server stopped during the handoff'
-         WHERE state = 'attempted'",
-        [],
-    )?)
+/// Every attempted handoff, oldest first.
+pub fn attempted(conn: &Connection) -> Result<Vec<i64>> {
+    Ok(conn
+        .prepare("SELECT id FROM integration_outbox WHERE state = 'attempted' ORDER BY id")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?)
 }
