@@ -27,6 +27,9 @@ const DEFAULT_PROTOCOL: &str = "2025-06-18";
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// ...from this far back, when it gives no start.
 const DEFAULT_HISTORY_SINCE: &str = "7d";
+/// Entities `bbs_directory` shows by default, and at most.
+const DEFAULT_DIRECTORY_LIMIT: usize = 50;
+const MAX_DIRECTORY_LIMIT: u64 = 200;
 
 pub async fn run(
     dir: &Path,
@@ -303,12 +306,17 @@ impl Tools {
                     entity_id: text("id"),
                     ..Default::default()
                 };
-                let (entities, more) = remote_directory(b, req.clone()).await?;
+                let limit = match args["limit"].as_u64() {
+                    None => DEFAULT_DIRECTORY_LIMIT,
+                    Some(n @ 1..=MAX_DIRECTORY_LIMIT) => n as usize,
+                    Some(_) => bail!("limit must be 1 to {MAX_DIRECTORY_LIMIT}"),
+                };
+                let (entities, more) = remote_directory(b, req.clone(), limit).await?;
                 let mut out = format_directory(&req, &entities);
                 if more {
                     out.push_str(&format!(
-                        "(only the first {} pages are shown)\n",
-                        crate::app::MAX_DIRECTORY_PAGES
+                        "(more exist; only the first {limit} are shown: narrow the lookup with \
+                         alias or id)\n"
                     ));
                 }
                 out
@@ -530,6 +538,7 @@ pub fn tool_list() -> Value {
                 "namespace": string("The other installation's namespace, e.g. hub"),
                 "alias": string("Look up the entity with this alias; mutually exclusive with id."),
                 "id": string("Look up the entity with this exact entity ID; mutually exclusive with alias."),
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Show at most this many entities; default 50." },
             }), &["namespace"]),
         },
         {
@@ -680,6 +689,20 @@ pub fn tool_list() -> Value {
 #[cfg(test)]
 mod search_tests {
     use super::*;
+
+    #[test]
+    fn the_directory_tool_offers_a_bounded_limit() {
+        let tools = tool_list();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "bbs_directory")
+            .unwrap();
+        let limit = &tool["inputSchema"]["properties"]["limit"];
+        assert_eq!(limit["maximum"], MAX_DIRECTORY_LIMIT);
+        assert_eq!(DEFAULT_DIRECTORY_LIMIT, 50);
+    }
 
     /// The MCP server acts only as the runner's existing agent: it offers no
     /// way to register one.

@@ -189,6 +189,9 @@ pub enum Command {
         /// Look up the entity with this exact ID.
         #[arg(long, value_name = "ENTITY")]
         id: Option<String>,
+        /// Show at most this many entities (at most 2000).
+        #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u32).range(1..=2000))]
+        limit: u32,
         /// Print one JSON object per entity (JSONL) instead of text.
         #[arg(long)]
         json: bool,
