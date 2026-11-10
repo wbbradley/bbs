@@ -737,6 +737,7 @@ themselves.
 ```sh
 bbs-hub-adapter run --config /etc/bbs-hub-adapter/adapter.toml
 bbs-hub-adapter status --config /etc/bbs-hub-adapter/adapter.toml
+bbs-hub-adapter backup --config /etc/bbs-hub-adapter/adapter.toml --out ./adapter-snapshot.db
 ```
 
 The adapter refuses to start when the key, the integration credential or the
@@ -784,6 +785,40 @@ namespaces (`bbs directory`) are signed by the adapter and sent to the relay,
 and the answer is used only once the adapter has verified that a host of that
 namespace signed it for exactly that query. `status` shows the relay
 session, trusted namespaces, the catalog revision and the handoffs by state.
+
+`backup` copies the store named by the configuration to `--out` through
+SQLite's online backup API, from a read-only connection, so the adapter can
+keep running; as with `bbs backup`, the snapshot is a standalone database,
+private (0600), published only once complete, and an existing file or SQLite
+sidecar is never overwritten. It holds signed envelopes and message bytes. To
+restore, stop the adapter, set the store's files (with its `-wal`, `-shm` and
+`.lock`) aside, and copy the snapshot to the store's path, owned by and
+private to the adapter's user.
+
+What losing the store costs: the key, both credentials and the
+configuration are files, not rows (the store keeps only the public key and
+a copy of the installation credential, rewritten from the files at each
+start), and trust, the catalog and the relay session are fetched again on
+connect. What only the store has is work taken from one side and not yet
+handed to the other, since BBS and the relay each hand a message off once
+(D072) and never offer it again: remote sends still `pending` or `attempted`
+in `outbound`, messages from Hub not yet `received` by BBS in `inbound`,
+results owed to BBS (`reports`), and duplicates waiting for their original's
+result (`outbound_duplicates`, `inbound_duplicates`). Lost entirely, that
+work is dropped, in both directions: nothing is resent, and each side's
+handoff lapses to unknown at its deadline (seven days for BBS's, with a
+"Delivery uncertain" notice to the sender), even for a message that was
+delivered but whose result was lost. Restored from an older snapshot, the
+same is lost for work that arrived after the snapshot, and work the snapshot
+shows not yet handed on (a pending remote send; a message from Hub BBS had
+not answered) is handed on again; that never delivers twice, because Hub
+and BBS each recognise a message by its origin and answer a repeat as
+already known (Hub only while it still keeps the message, and work past its
+deadline is not sent). The snapshot otherwise keeps history (settled
+handoffs and their envelopes). So a backup protects history, not mail in
+flight: only a short interval matters, and the most useful time to take one
+is just before stopping the adapter for maintenance or a move, when
+`status` shows no work pending or sent.
 
 #### Trying it locally
 

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use bbs_hub_adapter::config::Config;
-use bbs_hub_adapter::store::{Direction, Store};
+use bbs_hub_adapter::store::{self, Direction, Store};
 use bbs_hub_adapter::{Adapter, keys};
 use clap::{Parser, Subcommand};
 
@@ -37,6 +37,16 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Back up the store, including while the adapter is running: a
+    /// consistent, owner-only snapshot that never overwrites an existing file.
+    Backup {
+        /// The adapter's configuration file.
+        #[arg(long)]
+        config: PathBuf,
+        /// New backup file to create; existing files are never overwritten.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -65,6 +75,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Status { config } => status(&Config::load(&config)?),
+        Command::Backup { config, out } => {
+            store::backup(&Config::load(&config)?.store, &out)?;
+            println!("Backup saved to {}", out.display());
+            Ok(())
+        }
     }
 }
 
