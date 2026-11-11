@@ -904,11 +904,8 @@ fn direct_messages_within_group(mode: Mode) {
     let (b, tb) = bbs.register();
     assert_ne!(a, b);
 
-    // Not sharing a group yet.
-    assert!(
-        bbs.err(&["--token", &ta, "send", "--to", &b, "hi"])
-            .contains("not in any of your groups")
-    );
+    // Direct mail needs no shared group.
+    bbs.ok(&["--token", &ta, "send", "--to", &b, "hi"]);
 
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
     bbs.ok(&["--token", &tb, "group", "join", "acme"]);
@@ -1300,10 +1297,8 @@ fn deleting_groups_archives_history_and_removes_access(mode: Mode) {
     assert_eq!(bbs.ok(&["--token", &tb, "group", "list"]), "");
     assert!(!bbs.ok(&["agents"]).contains("acme"));
     assert!(!bbs.ok(&["--token", &ta, "agents"]).contains(&b));
-    assert!(
-        bbs.err(&["--token", &ta, "send", "--to", &b, "denied"])
-            .contains("not in any of your groups")
-    );
+    // Without a shared group, direct mail still goes through.
+    bbs.ok(&["--token", &ta, "send", "--to", &b, "still direct"]);
     for command in ["join", "leave"] {
         assert!(
             bbs.err(&["--token", &ta, "group", command, "acme"])
@@ -2890,7 +2885,7 @@ fn timers_are_set_listed_fired_and_removed(mode: Mode) {
     for (args, why) in [
         (
             vec!["--token", &tc, "timer", "add", &b, "in 1h", "x"],
-            "is not in any of your groups",
+            "timers needs a shared group",
         ),
         (
             vec!["--token", &ta, "timer", "add", &b, "soonish", "x"],
@@ -2902,7 +2897,7 @@ fn timers_are_set_listed_fired_and_removed(mode: Mode) {
         ),
         (
             vec!["--token", &tc, "timer", "rm", "1"],
-            "is not in any of your groups",
+            "timers needs a shared group",
         ),
     ] {
         let err = bbs.err(&args);
@@ -3002,7 +2997,7 @@ fn timers_are_edited_and_cancelled_with_notices(mode: Mode) {
         (vec!["timer", "edit", "9", "--text", "x"], "no timer 9"),
         (
             vec!["--token", &tc, "timer", "edit", "1", "--text", "x"],
-            "is not in any of your groups",
+            "timers needs a shared group",
         ),
     ] {
         let err = bbs.err(&args);

@@ -2020,12 +2020,6 @@ fn send_direct(
     if target.kind == me.kind && target.id == me.id {
         bail!("cannot send a message to yourself");
     }
-    if me.kind == db::Kind::Agent
-        && target.kind == db::Kind::Agent
-        && !db::share_group(ctx.conn, me.id, target.id)?
-    {
-        bail!("{} is not in any of your groups", target.name);
-    }
     check_focus(ctx, me, Some(&target))?;
     let msg = db::insert_message(
         ctx.conn,
@@ -3079,8 +3073,8 @@ impl Default for TimerLimits {
 }
 
 /// Whether an agent needs a shared group with another agent to set, list or
-/// remove its timers, as `bbs send` does to message it. Waiting on the
-/// human's decision; humans, and agents managing their own, never do.
+/// remove its timers. Direct mail needs none; humans, and agents managing
+/// their own, never do.
 const TIMERS_NEED_SHARED_GROUP: bool = true;
 
 fn may_manage_timers(ctx: &Ctx, me: &db::Principal, target: &db::Principal) -> Result<()> {
@@ -3089,7 +3083,7 @@ fn may_manage_timers(ctx: &Ctx, me: &db::Principal, target: &db::Principal) -> R
         && me.id != target.id
         && !db::share_group(ctx.conn, me.id, target.id)?
     {
-        bail!("{} is not in any of your groups", target.name);
+        bail!("managing {}'s timers needs a shared group", target.name);
     }
     Ok(())
 }
@@ -3717,11 +3711,9 @@ mod tests {
         let refused = |conn: &mut Connection, from: &Caller, to: String| {
             send_to(conn, from, to).unwrap_err().to_string()
         };
-        // The direct-send rules still apply: Lu shares no group with Mateo.
-        assert_eq!(
-            refused(&mut conn, &mateo, format!("id:will/Lu@{ns}")),
-            "Lu is not in any of your groups"
-        );
+        // Like any direct send, it needs no shared group: Lu is in none.
+        let sent = send_to(&mut conn, &mateo, format!("id:will/Lu@{ns}")).unwrap();
+        assert_eq!(sent.to, format!("id:will/Lu@{ns}"));
         assert_eq!(
             refused(&mut conn, &will, format!("id:crew@{ns}")),
             format!("id:crew@{ns} is a group; send to it as @name")
@@ -3772,6 +3764,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(whoami(&mut conn, &mateo).unwrap().address, None);
+    }
+
+    /// Direct mail between agents needs no shared group; broadcasts still
+    /// need membership and a write grant.
+    #[test]
+    fn agents_message_agents_outside_their_groups() {
+        let (mut conn, _will, [mateo, _zed, lu]) = board();
+        let send_to = |conn: &mut Connection, from: &Caller, to: &str| {
+            send(
+                conn,
+                from,
+                proto::SendRequest {
+                    to: to.into(),
+                    body: "hi".into(),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(send_to(&mut conn, &lu, "Mateo").unwrap().to, "Mateo");
+        assert_eq!(send_to(&mut conn, &mateo, "Lu").unwrap().to, "Lu");
+        let err = send_to(&mut conn, &lu, "@crew").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a member of @crew"),
+            "{err:#}"
+        );
     }
 
     /// A schema-26 board cut over by the operator keeps its unread mail,
@@ -6720,7 +6737,7 @@ mod tests {
         let (mut conn, will, [mateo, _, lu]) = board();
         let no = add(&mut conn, &lu, "Zed", "in 1h").unwrap_err();
         assert!(
-            format!("{no:#}").contains("Zed is not in any of your groups"),
+            format!("{no:#}").contains("managing Zed's timers needs a shared group"),
             "{no:#}"
         );
         let t = add(&mut conn, &mateo, "Zed", "in 1h").unwrap();
@@ -7776,15 +7793,16 @@ mod tests {
             "ada"
         );
 
-        // An agent the replier no longer shares a group with.
+        // An agent the replier no longer shares a group with: direct mail
+        // needs no shared group.
         let from_zed = say(&mut conn, &zed, "Mateo", "zed to mateo");
         let leave = proto::GroupRequest {
             group: "crew".into(),
         };
         group_leave(&mut conn, &zed, leave).unwrap();
         assert_eq!(
-            reply_err(&mut conn, &mateo, from_zed, false),
-            "Zed is not in any of your groups"
+            reply_to(&mut conn, &mateo, from_zed, false).unwrap().to,
+            "Zed"
         );
 
         // A retired sender.
