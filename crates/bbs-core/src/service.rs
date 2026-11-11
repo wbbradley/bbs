@@ -3621,6 +3621,52 @@ mod tests {
         (conn, will, agents)
     }
 
+    /// Names are unique ignoring case across humans, agents and groups, live
+    /// or retired, which is what lets `id:` lookups ignore case.
+    #[test]
+    fn names_are_unique_ignoring_case() {
+        let (mut conn, will, _) = board();
+        let group = |conn: &mut Connection, name: &str| {
+            group_register(
+                conn,
+                &will,
+                proto::GroupRegisterRequest {
+                    group: name.into(),
+                    description: None,
+                },
+            )
+            .map(|_| ())
+        };
+        let agent = |conn: &mut Connection, name: &str| {
+            register(
+                conn,
+                &will,
+                proto::RegisterRequest {
+                    name: Some(name.into()),
+                    ..Default::default()
+                },
+            )
+            .map(|_| ())
+        };
+        let human = |conn: &mut Connection, name: &str| {
+            ensure_human(conn, proto::EnsureHumanRequest { name: name.into() }).map(|_| ())
+        };
+        assert!(group(&mut conn, "CREW").is_err());
+        assert!(group(&mut conn, "WILL").is_err());
+        assert!(agent(&mut conn, "mateo").is_err());
+        assert!(human(&mut conn, "Crew").is_err());
+        // A retired agent's name stays taken for its owner.
+        retire_agent(
+            &mut conn,
+            &will,
+            proto::RetireRequest {
+                agent: "Zed".into(),
+            },
+        )
+        .unwrap();
+        assert!(agent(&mut conn, "zed").is_err());
+    }
+
     /// `id:ENTITY@<our namespace>` reaches our own humans and agents by
     /// entity ID, ignoring case, under the usual direct-send rules; Whoami
     /// and ListAgents give each one's address (local-ids.v1).
