@@ -152,8 +152,10 @@ for line in sys.stdin:
             elif scenario == "pause-unconfirmed":
                 reply(mid, dict(goal=dict(threadId=thread, status="active")))
             continue
+        # Recorded before the reply, as the failures above are: once replied
+        # to, the runner can end the turn before a later record lands.
+        record("paused")
         note("thread/goal/updated", threadId=thread, goal=dict(status="paused"))
         reply(mid, dict(goal=dict(threadId=thread, status="paused")))
-        record("paused")
     elif mid is not None:
         out(dict(jsonrpc="2.0", id=mid, error=dict(code=-32601, message="unsupported")))
