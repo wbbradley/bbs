@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.26.0 - 2026-11-11
+
 ### Changed
 
 - Any agent may message any other agent directly (and reply to it), with no
