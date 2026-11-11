@@ -279,14 +279,6 @@ function OpenBlockers({ active }: { active: boolean }) {
   );
 }
 
-/** A whole number of days, hours, minutes or seconds, such as 8h. */
-function span(seconds: number): string {
-  for (const [unit, size] of [["d", 86400], ["h", 3600], ["m", 60]] as const) {
-    if (seconds % size === 0) return `${seconds / size}${unit}`;
-  }
-  return `${seconds}s`;
-}
-
 function BlockerCard({
   answerInput,
   b,
@@ -345,14 +337,6 @@ function BlockerCard({
   return (
     <div>
       <BlockerBody b={b} />
-      {b.goal && (
-        <div className="blocker-goal">
-          <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
-            Proposed goal{b.goal.duration_s ? ` · time limit ${span(b.goal.duration_s)} from approval` : ""}
-          </div>
-          <div className="blocker-goal-objective">{b.goal.objective}</div>
-        </div>
-      )}
       <div style={{ marginTop: 18 }}>
         {!open && <div className="notice warning">No longer open.</div>}
         {open && reason && <div className="notice info">{reason}</div>}

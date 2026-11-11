@@ -252,13 +252,6 @@ fn human_row(value: &Value) -> String {
         value["creator"]["name"].as_str().unwrap_or_default(),
         value["body"].as_str().unwrap_or_default()
     );
-    if let Some(objective) = value["goal"]["objective"].as_str() {
-        text.push_str(&format!("Proposed goal: {objective}\n"));
-        if let Some(seconds) = value["goal"]["duration_s"].as_u64() {
-            let span = humantime::format_duration(std::time::Duration::from_secs(seconds));
-            text.push_str(&format!("Time limit from approval: {span}\n"));
-        }
-    }
     if let Some(options) = value["choices"]["options"].as_array() {
         text.push_str(&format!(
             "Choices ({}):\n",

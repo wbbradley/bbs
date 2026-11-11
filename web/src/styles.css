@@ -1134,15 +1134,6 @@ mark {
   border-top: 1px solid var(--border);
   padding-top: 14px;
 }
-.blocker-goal {
-  margin-top: 14px;
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
-}
-.blocker-goal-objective {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
 .blocker-list {
   border-right: 1px solid var(--border);
   overflow-y: auto;

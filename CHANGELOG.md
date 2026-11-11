@@ -15,8 +15,9 @@ under the new package version and its publication date.
   proposal is a blocker with the objective, an optional time limit counted
   from approval, and fixed approve/decline choices. Only the agent's owner can
   answer it; approving sets the goal from the owner in the same transaction.
-  The web board and `bbs blocker get` show the proposed goal. No schema
-  change: the goal is stored with the blocker's choices.
+  The server appends the objective (at most 640 bytes) and time limit to the
+  blocker's text, so every client shows it. No schema change: the goal is
+  stored with the blocker's choices, within their 1 KiB limit.
 
 ## 0.26.0 - 2026-11-11
 

@@ -302,6 +302,10 @@ pub fn put_blocker(
 ) -> Result<proto::BlockerMutationResponse> {
     crate::blocker_limits::validate_body(&req.body)?;
     key(&req.request_key)?;
+    let body = match &req.goal {
+        Some(goal) => blocker_choices::goal_body(&req.body, goal),
+        None => req.body.clone(),
+    };
     if let Some(id) = req.replaces {
         positive(id, "predecessor ID")?;
     }
@@ -327,8 +331,8 @@ pub fn put_blocker(
         let groups = db::group_ids_named(ctx.conn, group_name(&req.group))?;
         if let Some(response) = replay(ctx, &actor, &req.request_key, |op| {
             matches!(op,
-            store::Operation::Put { group: old_group, body, replaces, choices: old_choices, .. }
-            if groups.contains(old_group) && *body == req.body && *replaces == req.replaces
+            store::Operation::Put { group: old_group, body: old_body, replaces, choices: old_choices, .. }
+            if groups.contains(old_group) && *old_body == body && *replaces == req.replaces
                 && *old_choices == choices)
         })? {
             return Ok(response);
@@ -355,7 +359,7 @@ pub fn put_blocker(
             group,
             actor.id,
             store::Version {
-                body: &req.body,
+                body: &body,
                 choices: choices.as_deref(),
             },
             prior.as_ref(),
@@ -2554,6 +2558,23 @@ mod tests {
             .unwrap();
         assert_eq!(proposal.goal.as_ref(), Some(&proposed));
         assert_eq!(proposal.choices, Some(blocker_choices::goal_choices()));
+        // Every client shows the objective, in the stored body.
+        assert!(
+            proposal.body.starts_with(
+                "I can own the release.\n\n**Proposed goal**, with a time limit of 8h"
+            )
+        );
+        assert!(
+            proposal.body.ends_with("\n\n> Ship 0.26"),
+            "{}",
+            proposal.body
+        );
+        // A retry with the same payload replays.
+        assert!(
+            propose(&mut b, proposed.clone(), None, "ship")
+                .unwrap()
+                .replayed
+        );
         // ada owns a crew member, so she can answer ordinary blockers here,
         // but only will owns Mateo and can set its goal.
         let read = |b: &mut Board, human: usize| {
