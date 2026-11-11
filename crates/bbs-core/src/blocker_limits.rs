@@ -3,7 +3,12 @@
 use anyhow::{Result, bail};
 
 pub const MAX_BODY_BYTES: usize = 2 * 1024;
+/// Covers the response options only; a goal proposal's goal is stored beside
+/// them and bounded by `blocker_choices::MAX_GOAL_OBJECTIVE`.
 pub const MAX_CHOICES_BYTES: usize = 1024;
+/// The database's bound on a stored body, which for a goal proposal includes
+/// the goal the server appends.
+pub const MAX_STORED_BODY_BYTES: usize = 8 * 1024;
 
 pub fn validate_body(body: &str) -> Result<()> {
     if body.trim().is_empty() || body.len() > MAX_BODY_BYTES {

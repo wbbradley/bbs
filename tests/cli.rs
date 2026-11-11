@@ -4549,7 +4549,7 @@ fn headless_goal_proposal_is_set_when_the_owner_approves_it() {
         shown.contains("**Proposed goal**, with a time limit of 2h from approval."),
         "{shown}"
     );
-    assert!(shown.contains("> Ship the fix"), "{shown}");
+    assert!(shown.contains("```\nShip the fix\n```"), "{shown}");
     assert!(shown.contains("--select approve"), "{shown}");
     assert_eq!(goal_status(&bbs), None);
     // Approval sets the goal from the owner; the agent then completes it.

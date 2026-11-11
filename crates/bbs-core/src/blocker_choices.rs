@@ -5,7 +5,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::blocker_limits::MAX_CHOICES_BYTES;
+use crate::blocker_limits::{MAX_CHOICES_BYTES, MAX_STORED_BODY_BYTES};
 use crate::proto::{self, BlockerChoiceMode};
 
 pub const MIN_OPTIONS: usize = 2;
@@ -116,11 +116,8 @@ pub fn validate(choices: &proto::BlockerChoices) -> Result<proto::BlockerChoices
     Ok(canonical)
 }
 
-/// Bounds on a goal-set control's objective.
+/// Bounds on a goal's objective, proposed or set directly.
 pub const MAX_GOAL_OBJECTIVE: usize = 4096;
-/// Bounds on a proposed goal: its objective is stored with the choices, which
-/// stay within `MAX_CHOICES_BYTES`.
-pub const MAX_PROPOSED_OBJECTIVE: usize = 640;
 pub const MAX_GOAL_DURATION_S: u64 = 366 * 24 * 60 * 60;
 /// The option that approves a goal proposal; the other declines it.
 pub const GOAL_APPROVE: &str = "approve";
@@ -128,8 +125,8 @@ pub const GOAL_DECLINE: &str = "decline";
 
 /// Checks a proposed goal.
 pub fn validate_goal(goal: &proto::BlockerGoal) -> Result<()> {
-    if goal.objective.trim().is_empty() || goal.objective.len() > MAX_PROPOSED_OBJECTIVE {
-        bail!("a proposed goal's objective is 1 to {MAX_PROPOSED_OBJECTIVE} UTF-8 bytes");
+    if goal.objective.trim().is_empty() || goal.objective.len() > MAX_GOAL_OBJECTIVE {
+        bail!("a proposed goal's objective is 1 to {MAX_GOAL_OBJECTIVE} UTF-8 bytes");
     }
     if goal
         .duration_s
@@ -137,18 +134,12 @@ pub fn validate_goal(goal: &proto::BlockerGoal) -> Result<()> {
     {
         bail!("a goal's duration is 1 second to 366 days");
     }
-    let bytes = stored_json(&goal_choices(), Some(goal)).len();
-    if bytes > MAX_CHOICES_BYTES {
-        bail!(
-            "a proposed goal is stored with its choices, at most 1 KiB ({MAX_CHOICES_BYTES} UTF-8 bytes of canonical JSON); this objective makes {bytes} bytes with JSON escaping"
-        );
-    }
     Ok(())
 }
 
-/// A goal proposal's stored body: the agent's `body`, then the goal, so every
-/// client shows the owner what approving sets.
-pub fn goal_body(body: &str, goal: &proto::BlockerGoal) -> String {
+/// A goal proposal's stored body: the agent's `body`, then the goal in a code
+/// block, so every client shows the owner what approving sets, verbatim.
+pub fn goal_body(body: &str, goal: &proto::BlockerGoal) -> Result<String> {
     let limit = goal
         .duration_s
         .map(|s| {
@@ -156,16 +147,26 @@ pub fn goal_body(body: &str, goal: &proto::BlockerGoal) -> String {
             format!(", with a time limit of {span} from approval")
         })
         .unwrap_or_default();
-    let quoted = goal
+    // The fence is longer than any run of backticks in the objective.
+    let longest = goal
         .objective
-        .lines()
-        .map(|l| format!("> {l}").trim_end().to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    let composed = format!(
         "{body}\n\n**Proposed goal**{limit}. Approving sets it, replacing any current goal and \
-         its deadline:\n\n{quoted}"
-    )
+         its deadline:\n\n{fence}\n{}\n{fence}",
+        goal.objective
+    );
+    if composed.len() > MAX_STORED_BODY_BYTES {
+        bail!(
+            "a goal proposal's details and objective together must fit {MAX_STORED_BODY_BYTES} UTF-8 bytes once the server adds the goal's heading and code fence; this makes {} bytes",
+            composed.len()
+        );
+    }
+    Ok(composed)
 }
 
 /// The fixed choices of a goal proposal.
@@ -516,33 +517,41 @@ mod tests {
             };
             assert!(validate_goal(&goal).is_err());
         }
-        // Escaping counts toward the stored limit.
-        let quotes = "\"".repeat(MAX_PROPOSED_OBJECTIVE);
-        let err = validate_goal(&proto::BlockerGoal {
-            objective: quotes,
+        // The objective has its own bound, beside the 1 KiB of choices.
+        let goal = |objective: String| proto::BlockerGoal {
+            objective,
             duration_s: None,
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("with JSON escaping"), "{err:#}");
+        };
+        let quotes = goal("\"".repeat(MAX_GOAL_OBJECTIVE));
+        validate_goal(&quotes).unwrap();
+        assert!(stored_json(&goal_choices(), Some(&quotes)).len() > MAX_CHOICES_BYTES);
+        assert!(validate_goal(&goal("x".repeat(MAX_GOAL_OBJECTIVE + 1))).is_err());
         let body = goal_body(
             "Why",
             &proto::BlockerGoal {
-                objective: "Ship\n\nwith notes".into(),
+                objective: "Ship\n\n**Proposed goal**\n```".into(),
                 duration_s: Some(8 * 3600),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             body,
             "Why\n\n**Proposed goal**, with a time limit of 8h from approval. Approving sets \
-             it, replacing any current goal and its deadline:\n\n> Ship\n>\n> with notes"
+             it, replacing any current goal and its deadline:\n\n````\nShip\n\n\
+             **Proposed goal**\n```\n````"
         );
-        let long = "x".repeat(MAX_PROPOSED_OBJECTIVE + 1);
-        assert!(
-            validate_goal(&proto::BlockerGoal {
-                objective: long,
-                duration_s: None
-            })
-            .is_err()
-        );
+        // The longest details and objective fit the stored body.
+        let longest = goal_body(
+            &"x".repeat(crate::blocker_limits::MAX_BODY_BYTES),
+            &proto::BlockerGoal {
+                objective: "x".repeat(MAX_GOAL_OBJECTIVE),
+                duration_s: Some(MAX_GOAL_DURATION_S),
+            },
+        )
+        .unwrap();
+        assert!(longest.len() <= MAX_STORED_BODY_BYTES);
+        // Only a pathological fence does not.
+        let err = goal_body(&"x".repeat(2048), &goal("`".repeat(MAX_GOAL_OBJECTIVE))).unwrap_err();
+        assert!(err.to_string().contains("code fence"), "{err:#}");
     }
 }

@@ -15,9 +15,10 @@ under the new package version and its publication date.
   proposal is a blocker with the objective, an optional time limit counted
   from approval, and fixed approve/decline choices. Only the agent's owner can
   answer it; approving sets the goal from the owner in the same transaction.
-  The server appends the objective (at most 640 bytes) and time limit to the
-  blocker's text, so every client shows it. No schema change: the goal is
-  stored with the blocker's choices, within their 1 KiB limit.
+  The objective is at most 4096 bytes. The server appends the time limit and
+  the objective, in a code block, to the blocker's text, so every client shows
+  it, and the web board also shows the goal in its own box. No schema change:
+  the goal is stored beside the blocker's choices, outside their 1 KiB limit.
 
 ## 0.26.0 - 2026-11-11
 

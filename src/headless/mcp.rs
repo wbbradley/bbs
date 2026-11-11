@@ -714,7 +714,7 @@ pub fn tool_list() -> Value {
             "description": "Propose a goal for yourself, or a change to your current one: the only way you can set or change your goal. Puts a blocker in a group you belong to, choices fixed to approve or decline, that only your owner can answer. The server adds the objective and time limit to the blocker's text. If they approve, the goal is set from them, replacing any current goal and its deadline, and your runner prompts you toward it; either way the answer arrives as mail. After an approval, check with bbs_goal_get: a runner with a Codex native goal running refuses the new goal, and then tell your owner. Requires blocker-goals.v1. Reuse request_key with the same payload after an uncertain result.",
             "inputSchema": object(json!({
                 "group": string("Group name, with or without @."),
-                "objective": string("The goal, 1..640 UTF-8 bytes (at most 1 KiB stored with the choices, after JSON escaping), set verbatim if approved: what to achieve and how to tell it is done. Put context in body."),
+                "objective": string("The goal, 1..4096 UTF-8 bytes, set verbatim if approved: what to achieve and how to tell it is done. Put context in body."),
                 "body": string("Why you propose it, for your owner: one nonblank Markdown description, at most 2 KiB (2048 UTF-8 bytes)."),
                 "for": string("Optional time limit counted from approval, such as 8h or 3days (at most 366 days): the goal's deadline."),
                 "replaces": { "type":"integer", "minimum":1, "description":"Optional current predecessor blocker version, such as an earlier proposal. Must be in the same group." },

@@ -1,3 +1,4 @@
+import { goalDetails, goalLimit } from "../blockerChoices";
 import { Markdown } from "../Markdown";
 import { NameLink, paths } from "../router";
 import { Kind, type Blocker } from "../types";
@@ -35,7 +36,18 @@ export function BlockerBody({ b }: { b: Blocker }) {
         <span title={fullTime(b.created_at)}>{new Date(b.created_at).toLocaleString()}</span>
         {b.replaces && <span> · replaces #{b.replaces}</span>}
       </div>
-      <Markdown text={b.body} />
+      <Markdown text={b.goal ? goalDetails(b.body, b.goal) : b.body} />
+      {b.goal && (
+        <div className="blocker-goal" aria-label="Proposed goal">
+          <div className="blocker-goal-label">
+            Proposed goal{b.goal.duration_s ? ` · time limit ${goalLimit(b.goal.duration_s)} from approval` : ""}
+          </div>
+          <div className="blocker-goal-objective">{b.goal.objective}</div>
+          <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+            Approving sets this goal, replacing any current goal and its deadline.
+          </div>
+        </div>
+      )}
     </>
   );
 }

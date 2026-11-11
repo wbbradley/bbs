@@ -302,8 +302,11 @@ pub fn put_blocker(
 ) -> Result<proto::BlockerMutationResponse> {
     crate::blocker_limits::validate_body(&req.body)?;
     key(&req.request_key)?;
+    if let Some(goal) = &req.goal {
+        blocker_choices::validate_goal(goal)?;
+    }
     let body = match &req.goal {
-        Some(goal) => blocker_choices::goal_body(&req.body, goal),
+        Some(goal) => blocker_choices::goal_body(&req.body, goal)?,
         None => req.body.clone(),
     };
     if let Some(id) = req.replaces {
@@ -313,13 +316,10 @@ pub fn put_blocker(
         Some(_) if req.choices.is_some() => {
             bail!("a goal proposal's choices are fixed; leave choices unset")
         }
-        Some(goal) => {
-            blocker_choices::validate_goal(goal)?;
-            Some(blocker_choices::stored_json(
-                &blocker_choices::goal_choices(),
-                Some(goal),
-            ))
-        }
+        Some(goal) => Some(blocker_choices::stored_json(
+            &blocker_choices::goal_choices(),
+            Some(goal),
+        )),
         None => req
             .choices
             .as_ref()
@@ -2565,7 +2565,7 @@ mod tests {
             )
         );
         assert!(
-            proposal.body.ends_with("\n\n> Ship 0.26"),
+            proposal.body.ends_with("\n\n```\nShip 0.26\n```"),
             "{}",
             proposal.body
         );
@@ -2642,5 +2642,15 @@ mod tests {
             (set[2].1.as_str(), set[2].2.as_str()),
             ("goal-set", "Tidy up")
         );
+        // A full-size objective, well past the choices limit once escaped,
+        // is stored and set whole.
+        let full = "\"".repeat(blocker_choices::MAX_GOAL_OBJECTIVE);
+        let big = propose(&mut b, goal(&full, None), None, "full")
+            .unwrap()
+            .blocker
+            .unwrap();
+        assert_eq!(big.goal.unwrap().objective, full);
+        select(&mut b, big.id, &["approve"], "", "approve-full").unwrap();
+        assert_eq!(controls(&b)[3].2, full);
     }
 }
