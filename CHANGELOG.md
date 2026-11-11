@@ -23,9 +23,9 @@ under the new package version and its publication date.
   capability `local-ids.v1`). `bbs send --to id:will/scout@bbs` and
   `bbs_send` reach a local human or agent by its entity ID, ignoring case,
   under the ordinary direct-send rules; groups, runs and retired entities are
-  refused. `bbs whoami --address` prints the caller's address, and `bbs
-  agents` and `bbs_agents` gain an ADDRESS column. Whoami and ListAgents carry
-  it as `address`. Before, a send to `id:…@<own namespace>` was refused.
+  refused. `bbs whoami --address` prints the caller's address, `bbs agents`
+  and `bbs_agents` gain an ADDRESS column, and `bbs agents --json` an
+  `address` field. Whoami and ListAgents carry it as `address`. Before, a send to `id:…@<own namespace>` was refused.
 
 - The web sidebar's agents and the Agents page mark an agent in goal mode with
   ▸: green while its goal is active, waiting or blocked, amber while it is
