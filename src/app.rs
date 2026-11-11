@@ -657,6 +657,9 @@ struct AgentJson<'a> {
     status: Option<&'a str>,
     /// When its owner put it in focus mode; null when not focused.
     focused_at: Option<&'a str>,
+    /// Its canonical address, `id:ENTITY@NAMESPACE`; null for humans and on
+    /// servers without local-ids.v1.
+    address: Option<&'a str>,
 }
 
 fn kind_name(kind: proto::Kind) -> &'static str {
@@ -855,6 +858,7 @@ fn agents_json(r: &proto::ListAgentsResponse) -> Result<String> {
         pwd: None,
         status: None,
         focused_at: None,
+        address: None,
     });
     let agents = r.agents.iter().map(|a| AgentJson {
         name: &a.name,
@@ -867,6 +871,7 @@ fn agents_json(r: &proto::ListAgentsResponse) -> Result<String> {
         pwd: Some(&a.pwd),
         status: a.status.as_deref(),
         focused_at: a.focused_at.as_deref(),
+        address: a.address.as_deref(),
     });
     json_lines(humans.chain(agents))
 }
@@ -876,22 +881,22 @@ pub(crate) fn format_agents(r: &proto::ListAgentsResponse) -> String {
         "NAME".into(),
         "KIND".into(),
         "OWNER".into(),
-        "ADDRESS".into(),
         "GROUPS".into(),
         "ACTIVE_AT".into(),
         "WHERE".into(),
         "STATUS".into(),
+        "ADDRESS".into(),
     ]];
     for h in &r.humans {
         table.push([
             h.name.clone(),
             "human".into(),
             "-".into(),
-            "-".into(),
             "*".into(),
             display_time(&h.active_at),
             String::new(),
             String::new(),
+            "-".into(),
         ]);
     }
     for a in &r.agents {
@@ -905,11 +910,11 @@ pub(crate) fn format_agents(r: &proto::ListAgentsResponse) -> String {
             a.name.clone(),
             kind.into(),
             a.owner.clone().unwrap_or_else(|| "-".into()),
-            a.address.clone().unwrap_or_else(|| "-".into()),
             if g.is_empty() { "-".into() } else { g },
             display_time(&a.active_at),
             format!("{}:{}", a.hostname, a.pwd),
             a.status.clone().unwrap_or_default(),
+            a.address.clone().unwrap_or_else(|| "-".into()),
         ]);
     }
     render_table(&table)

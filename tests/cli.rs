@@ -2141,6 +2141,8 @@ fn json_output_is_one_object_per_line(mode: Mode) {
     assert_eq!(jeffrey["kind"], "agent");
     assert_eq!(jeffrey["retired"], false);
     assert_eq!(jeffrey["owner"], "will");
+    assert_eq!(jeffrey["address"], format!("id:will/{a}@bbs"));
+    assert_eq!(human["address"], serde_json::Value::Null);
     assert_eq!(jeffrey["groups"], serde_json::json!(["acme"]));
     assert_eq!(jeffrey["status"], "on it");
     assert!(!jeffrey["hostname"].as_str().unwrap().is_empty());

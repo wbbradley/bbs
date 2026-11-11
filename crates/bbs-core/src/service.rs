@@ -441,16 +441,12 @@ pub fn whoami(conn: &mut Connection, caller: &Caller) -> Result<proto::Principal
             db::Kind::Agent => db::agent_owner_name(ctx.conn, me.id)?,
             db::Kind::Human => None,
         };
-        let entity_id = db::native_entity_id(ctx.conn, me.kind.into(), me.id)?;
-        let address = entity::remote_display(
-            &db::namespace(ctx.conn)?,
-            &entity_id,
-            entity::NATIVE_ADDRESS,
-            "",
-        );
+        let namespace = db::namespace(ctx.conn)?;
+        let address = db::native_entity_id(ctx.conn, me.kind.into(), me.id)?
+            .map(|id| entity::remote_display(&namespace, &id, entity::NATIVE_ADDRESS, ""));
         Ok(proto::Principal {
             owner,
-            address: Some(address),
+            address,
             ..principal(me)
         })
     })
@@ -3666,8 +3662,11 @@ mod tests {
             .unwrap()
             .messages;
         assert_eq!(mail.last().unwrap().body, "hi");
-        let sent = send_to(&mut conn, &zed, format!("id:will@{ns}")).unwrap();
+        let sent = send_to(&mut conn, &zed, format!("id:WiLL@{ns}")).unwrap();
         assert_eq!(sent.to, format!("id:will@{ns}"));
+        // The native address may be named; the response omits it, as usual.
+        let sent = send_to(&mut conn, &will, format!("id:will/Mateo@{ns}:native")).unwrap();
+        assert_eq!(sent.to, mateo_address);
 
         let refused = |conn: &mut Connection, from: &Caller, to: String| {
             send_to(conn, from, to).unwrap_err().to_string()
@@ -3691,6 +3690,10 @@ mod tests {
             refused(&mut conn, &will, format!("id:will/Nobody@{ns}")),
             format!("no such entity or address: id:will/Nobody@{ns}")
         );
+        assert_eq!(
+            refused(&mut conn, &will, format!("id:will/Mateo@{ns}:slack")),
+            format!("no such entity or address: id:will/Mateo@{ns}:slack")
+        );
         retire_agent(
             &mut conn,
             &will,
@@ -3703,6 +3706,26 @@ mod tests {
             refused(&mut conn, &will, format!("id:will/Zed@{ns}")),
             format!("id:will/Zed@{ns} is offline (retired)")
         );
+
+        // IDs differing only in case can't be created, but the table's own
+        // constraint is exact: such a pair is refused, never one picked.
+        conn.execute(
+            "UPDATE entities SET entity_id = 'will/MATEO' WHERE entity_id = 'will/Zed'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            refused(&mut conn, &will, format!("id:will/mateo@{ns}")),
+            "entity ID will/mateo matches several entities that differ only in case"
+        );
+        // A caller without an entity binding has no address, but Whoami works.
+        conn.execute(
+            "DELETE FROM entity_local_bindings
+             WHERE agent_id = (SELECT id FROM agents WHERE name = 'Mateo')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(whoami(&mut conn, &mateo).unwrap().address, None);
     }
 
     /// A schema-26 board cut over by the operator keeps its unread mail,
