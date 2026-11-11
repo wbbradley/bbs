@@ -6,6 +6,7 @@ import { sortAgents, useBoard } from "../store";
 import { ago, cap99, same, storage } from "../util";
 import { effortLabel } from "../components/Effort";
 import { FocusMark } from "../components/Focus";
+import { GoalMark } from "../components/Goal";
 
 export function AgentsPage({ openNav }: PageProps) {
   const board = useBoard();
@@ -83,6 +84,7 @@ export function AgentsPage({ openNav }: PageProps) {
                 <tr key={a.name} className="row" onClick={() => navigate(paths.agent(a.name))}>
                   <td className="name agent">
                     {a.name} <FocusMark owner={a.owner} since={a.focused_at ?? null} turnEvent={a.turn_event} />
+                    <GoalMark goal={a.goal} />
                   </td>
                   <td className="name human">{a.owner ?? "–"}</td>
                   <td className="num">

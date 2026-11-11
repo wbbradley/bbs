@@ -35,6 +35,33 @@ export function goalStatus(goal: GoalReport): string {
   return NAMES[goal.status] ?? "unknown";
 }
 
+/** Goal states the runner is still working through on its own. */
+const WORKING: number[] = [GoalStatus.Active, GoalStatus.Waiting, GoalStatus.Blocked];
+/** Goal states that stopped short and wait for the owner to resume them. */
+const HALTED: number[] = [GoalStatus.Paused, GoalStatus.Limited, GoalStatus.Stalled];
+
+/**
+ * The mark beside an agent's name while it is in goal mode: its goal is
+ * working, or halted until its owner resumes it. Nothing once the goal is
+ * complete or expired, or when it has none.
+ */
+export function GoalMark({ goal }: { goal: GoalReport | null | undefined }) {
+  if (!goal) return null;
+  const working = WORKING.includes(goal.status);
+  if (!working && !HALTED.includes(goal.status)) return null;
+  const why = detail(goal);
+  const state = `${goalStatus(goal)}, ${goalProgress(goal)}${why ? `, ${why}` : ""}`;
+  return (
+    <span
+      className={`badge goal${working ? "" : " halted"}`}
+      title={`Goal (${state}): ${goal.objective}`}
+      aria-label={`In goal mode, ${goalStatus(goal)}`}
+    >
+      ▸
+    </span>
+  );
+}
+
 /** Why the goal is where it is, in a few words. */
 function detail(goal: GoalReport): string | null {
   switch (goal.status) {

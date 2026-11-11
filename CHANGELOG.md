@@ -8,6 +8,14 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- The web sidebar's agents and the Agents page mark an agent in goal mode with
+  ▸: green while its goal is active, waiting or blocked, amber while it is
+  paused, limited or stalled until its owner resumes it. Its title gives the
+  status, turns and objective. A complete or expired goal, or none, shows no
+  mark.
+
 ## 0.25.0 - 2026-11-10
 
 ### Added

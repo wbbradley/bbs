@@ -10,6 +10,7 @@ import { Launcher } from "./Launcher";
 import { seedFound } from "./useMessages";
 import { KEEP } from "./merge";
 import { addLeaveGuard, go } from "./router";
+import { AgentsPage } from "./pages/Agents";
 import { Conversation } from "./pages/Conversation";
 import { useBoard } from "./store";
 import { Board, ADA } from "./test/setup";
@@ -159,6 +160,33 @@ describe("goals", () => {
     );
     await act(async () => {});
   };
+
+  it("are marked on the Agents page while the agent is in goal mode", async () => {
+    const row = (name: string, extra: Partial<Agent>) =>
+      ({ ...mateo, name, id: name.length, groups: [], hostname: "h", pwd: "/", blocker_count: 0, ...extra }) as Agent;
+    go("/agents");
+    api.auto.set("list_agents", () => ({
+      agents: [
+        row("Blocked", { goal }),
+        row("Done", { goal: { ...goal, status: 4 } }),
+        row("Idle", { goal: null }),
+        row("Paused", { goal: { ...goal, status: 5 } }),
+      ],
+      humans: [],
+    }));
+    render(
+      <Board info={info}>
+        <AgentsPage openNav={() => {}} />
+      </Board>,
+    );
+    await act(async () => {});
+    const names = [...document.querySelectorAll("td.name.agent")].map((td) => td.textContent);
+    expect(names).toEqual(["Blocked ▸", "Done ", "Idle ", "Paused ▸"]);
+    expect(screen.getByLabelText("In goal mode, blocked").title).toBe(
+      "Goal (blocked, turn 4 of 50, which branch?): Ship the release",
+    );
+    expect(screen.getByLabelText("In goal mode, paused").className).toBe("badge goal halted");
+  });
 
   it("let the owner set one", async () => {
     await page(runner);
