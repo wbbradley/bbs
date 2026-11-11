@@ -4533,6 +4533,31 @@ fn headless_goal_blocks_until_its_blocker_is_answered_and_pauses_on_cancel() {
 }
 
 #[test]
+fn headless_goal_proposal_is_set_when_the_owner_approves_it() {
+    let (bbs, _run) = goal_runner("goal-propose", "complete", 50);
+    let tz = headless_state(&bbs, "Zed")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    bbs.ok(&["group", "register", "crew"]);
+    bbs.ok(&["--token", &tz, "group", "join", "crew"]);
+    bbs.ok(&["send", "--to", "Zed", "PROPOSE-GOAL"]);
+    let proposal = bbs.home.join("fake-proposal.txt");
+    let id = eventually("the proposal", || std::fs::read_to_string(&proposal).ok());
+    let shown = bbs.ok(&["blocker", "get", &id]);
+    assert!(shown.contains("Proposed goal: Ship the fix"), "{shown}");
+    assert!(shown.contains("--select approve"), "{shown}");
+    assert_eq!(goal_status(&bbs), None);
+    // Approval sets the goal from the owner; the agent then completes it.
+    bbs.ok(&["blocker", "answer", &id, "--select", "approve"]);
+    wait_goal_status(&bbs, "complete");
+    let goal = &headless_state(&bbs, "Zed")["goal"];
+    assert_eq!(goal["objective"], "Ship the fix");
+    assert_eq!(goal["set_by"], "will");
+    assert!(goal["deadline"].is_string(), "{goal}");
+}
+
+#[test]
 fn headless_goal_resumes_when_someone_else_cancels_its_blocker() {
     let (bbs, _run, tp) = crew_goal_runner("goal-blocker-cancel", "block,complete");
     wait_goal_status(&bbs, "blocked");

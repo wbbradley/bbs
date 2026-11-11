@@ -8,6 +8,16 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- Goal proposals (`blocker-goals.v1`): a headless agent proposes a goal for
+  itself, or a change to its current one, with `bbs_goal_propose`. The
+  proposal is a blocker with the objective, an optional time limit counted
+  from approval, and fixed approve/decline choices. Only the agent's owner can
+  answer it; approving sets the goal from the owner in the same transaction.
+  The web board and `bbs blocker get` show the proposed goal. No schema
+  change: the goal is stored with the blocker's choices.
+
 ## 0.26.0 - 2026-11-11
 
 ### Changed

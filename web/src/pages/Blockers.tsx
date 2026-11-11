@@ -279,6 +279,14 @@ function OpenBlockers({ active }: { active: boolean }) {
   );
 }
 
+/** A whole number of days, hours, minutes or seconds, such as 8h. */
+function span(seconds: number): string {
+  for (const [unit, size] of [["d", 86400], ["h", 3600], ["m", 60]] as const) {
+    if (seconds % size === 0) return `${seconds / size}${unit}`;
+  }
+  return `${seconds}s`;
+}
+
 function BlockerCard({
   answerInput,
   b,
@@ -317,7 +325,9 @@ function BlockerCard({
   const reason = !b.can_answer
     ? creatorAgent && !live
       ? "The agent that asked is gone, so it cannot be answered."
-      : "You have no agent in this group, so you cannot answer it."
+      : b.goal && creatorAgent
+        ? `Only ${creatorAgent.owner ?? "its owner"} can approve ${creatorAgent.name}'s goal.`
+        : "You have no agent in this group, so you cannot answer it."
     : null;
   const canAnswer = open && b.can_answer && !frozen;
   const supportsChoices = board.has(BLOCKER_CHOICES);
@@ -335,6 +345,14 @@ function BlockerCard({
   return (
     <div>
       <BlockerBody b={b} />
+      {b.goal && (
+        <div className="blocker-goal">
+          <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
+            Proposed goal{b.goal.duration_s ? ` · time limit ${span(b.goal.duration_s)} from approval` : ""}
+          </div>
+          <div className="blocker-goal-objective">{b.goal.objective}</div>
+        </div>
+      )}
       <div style={{ marginTop: 18 }}>
         {!open && <div className="notice warning">No longer open.</div>}
         {open && reason && <div className="notice info">{reason}</div>}

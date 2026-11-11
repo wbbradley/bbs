@@ -23,6 +23,16 @@ struct Stored {
     min: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max: Option<u32>,
+    /// A goal proposal's goal, stored with its fixed choices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal: Option<StoredGoal>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredGoal {
+    objective: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_s: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -106,8 +116,53 @@ pub fn validate(choices: &proto::BlockerChoices) -> Result<proto::BlockerChoices
     Ok(canonical)
 }
 
+/// Bounds on a goal proposal, matching a goal-set control's objective.
+pub const MAX_GOAL_OBJECTIVE: usize = 4096;
+pub const MAX_GOAL_DURATION_S: u64 = 366 * 24 * 60 * 60;
+/// The option that approves a goal proposal; the other declines it.
+pub const GOAL_APPROVE: &str = "approve";
+pub const GOAL_DECLINE: &str = "decline";
+
+/// Checks a proposed goal.
+pub fn validate_goal(goal: &proto::BlockerGoal) -> Result<()> {
+    if goal.objective.trim().is_empty() || goal.objective.len() > MAX_GOAL_OBJECTIVE {
+        bail!("a goal's objective is 1 to {MAX_GOAL_OBJECTIVE} UTF-8 bytes");
+    }
+    if goal
+        .duration_s
+        .is_some_and(|d| d == 0 || d > MAX_GOAL_DURATION_S)
+    {
+        bail!("a goal's duration is 1 second to 366 days");
+    }
+    Ok(())
+}
+
+/// The fixed choices of a goal proposal.
+pub fn goal_choices() -> proto::BlockerChoices {
+    let option = |id: &str, label: &str| proto::BlockerOption {
+        id: id.into(),
+        label: label.into(),
+        detail: None,
+    };
+    proto::BlockerChoices {
+        mode: BlockerChoiceMode::BlockerSelectOne.into(),
+        options: vec![
+            option(GOAL_APPROVE, "Approve and set this goal"),
+            option(GOAL_DECLINE, "Decline"),
+        ],
+        min: None,
+        max: None,
+    }
+}
+
 /// The canonical JSON stored for validated choices.
 pub fn to_json(choices: &proto::BlockerChoices) -> String {
+    stored_json(choices, None)
+}
+
+/// The canonical JSON stored for validated choices and, for a goal proposal,
+/// its validated goal.
+pub fn stored_json(choices: &proto::BlockerChoices, goal: Option<&proto::BlockerGoal>) -> String {
     let mode = match choices.mode() {
         BlockerChoiceMode::BlockerSelectMany => "select_many",
         _ => "select_one",
@@ -125,6 +180,10 @@ pub fn to_json(choices: &proto::BlockerChoices) -> String {
             .collect(),
         min: choices.min,
         max: choices.max,
+        goal: goal.map(|g| StoredGoal {
+            objective: g.objective.clone(),
+            duration_s: g.duration_s,
+        }),
     })
     .expect("choices serialize")
 }
@@ -150,6 +209,15 @@ pub fn from_json(json: &str) -> Result<proto::BlockerChoices> {
         min: stored.min,
         max: stored.max,
     })
+}
+
+/// The goal a stored blocker proposes; none for other blockers.
+pub fn goal_from_json(json: &str) -> Result<Option<proto::BlockerGoal>> {
+    let stored: Stored = serde_json::from_str(json)?;
+    Ok(stored.goal.map(|g| proto::BlockerGoal {
+        objective: g.objective,
+        duration_s: g.duration_s,
+    }))
 }
 
 /// A checked answer: the selection in declared option order, and the text
@@ -389,5 +457,38 @@ mod tests {
             let error = answer(choices, &selected, "").unwrap_err().to_string();
             assert!(error.contains(needle), "{error:?} lacks {needle:?}");
         }
+    }
+
+    #[test]
+    fn a_goal_is_stored_with_its_fixed_choices() {
+        let goal = proto::BlockerGoal {
+            objective: "Ship".into(),
+            duration_s: Some(60),
+        };
+        validate_goal(&goal).unwrap();
+        let json = stored_json(&goal_choices(), Some(&goal));
+        assert_eq!(goal_from_json(&json).unwrap(), Some(goal));
+        assert_eq!(from_json(&json).unwrap(), goal_choices());
+        // Ordinary choices store no goal.
+        assert_eq!(goal_from_json(&to_json(&goal_choices())).unwrap(), None);
+        for (objective, duration_s) in [
+            ("", None),
+            ("Ship", Some(0)),
+            ("Ship", Some(MAX_GOAL_DURATION_S + 1)),
+        ] {
+            let goal = proto::BlockerGoal {
+                objective: objective.into(),
+                duration_s,
+            };
+            assert!(validate_goal(&goal).is_err());
+        }
+        let long = "x".repeat(MAX_GOAL_OBJECTIVE + 1);
+        assert!(
+            validate_goal(&proto::BlockerGoal {
+                objective: long,
+                duration_s: None
+            })
+            .is_err()
+        );
     }
 }

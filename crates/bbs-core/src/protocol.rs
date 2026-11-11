@@ -46,6 +46,7 @@ pub const CAPABILITIES: &[&str] = &[
     "timers-edit.v1",
     "remote-directory.v1",
     "local-ids.v1",
+    "blocker-goals.v1",
 ];
 /// The most bytes of capability names a ServerInfo may list, together.
 const MAX_CAPABILITY_BYTES: usize = 8192;

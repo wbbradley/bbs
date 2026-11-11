@@ -65,6 +65,24 @@ fn require_open(row: &store::Row) -> Result<()> {
     Ok(())
 }
 
+/// The goal a blocker version proposes; none for other blockers.
+fn proposed_goal(row: &store::Row) -> Result<Option<proto::BlockerGoal>> {
+    Ok(row
+        .choices
+        .as_deref()
+        .map(blocker_choices::goal_from_json)
+        .transpose()?
+        .flatten())
+}
+
+/// Only an agent's owner can set its goal, so only they answer its proposal.
+fn answers_goal(ctx: &Ctx<'_>, actor: &Principal, row: &store::Row) -> Result<bool> {
+    Ok(
+        actor.kind == Kind::Human
+            && db::agent_owner_id(ctx.conn, row.creator.id)? == Some(actor.id),
+    )
+}
+
 fn selected(json: Option<&str>) -> Result<Vec<String>> {
     Ok(json
         .map(serde_json::from_str)
@@ -75,8 +93,11 @@ fn selected(json: Option<&str>) -> Result<Vec<String>> {
 fn as_proto(ctx: &Ctx<'_>, actor: &Principal, row: store::Row) -> Result<proto::Blocker> {
     let open = row.outcome.is_none() && row.replaced_by.is_none() && !row.archived;
     let can_cancel = open && manages(ctx, actor, row.group_id)?;
-    let can_answer =
-        can_cancel && actor.kind == Kind::Human && db::agent_is_live(ctx.conn, row.creator.id)?;
+    let goal = proposed_goal(&row)?;
+    let can_answer = can_cancel
+        && actor.kind == Kind::Human
+        && db::agent_is_live(ctx.conn, row.creator.id)?
+        && (goal.is_none() || answers_goal(ctx, actor, &row)?);
     let status = match row.outcome.as_ref().map(|e| e.kind.as_str()) {
         Some("answered") => proto::BlockerStatus::BlockerAnswered,
         Some("cancelled") => proto::BlockerStatus::BlockerCancelled,
@@ -121,6 +142,7 @@ fn as_proto(ctx: &Ctx<'_>, actor: &Principal, row: store::Row) -> Result<proto::
         can_answer,
         can_cancel,
         choices,
+        goal,
     })
 }
 
@@ -283,11 +305,23 @@ pub fn put_blocker(
     if let Some(id) = req.replaces {
         positive(id, "predecessor ID")?;
     }
-    let choices = req
-        .choices
-        .as_ref()
-        .map(|c| blocker_choices::validate(c).map(|c| blocker_choices::to_json(&c)))
-        .transpose()?;
+    let choices = match &req.goal {
+        Some(_) if req.choices.is_some() => {
+            bail!("a goal proposal's choices are fixed; leave choices unset")
+        }
+        Some(goal) => {
+            blocker_choices::validate_goal(goal)?;
+            Some(blocker_choices::stored_json(
+                &blocker_choices::goal_choices(),
+                Some(goal),
+            ))
+        }
+        None => req
+            .choices
+            .as_ref()
+            .map(|c| blocker_choices::validate(c).map(|c| blocker_choices::to_json(&c)))
+            .transpose()?,
+    };
     with_ctx(conn, caller, |ctx| {
         let actor = ctx.agent()?;
         let groups = db::group_ids_named(ctx.conn, group_name(&req.group))?;
@@ -301,6 +335,9 @@ pub fn put_blocker(
         }
         let group = require_group(ctx.conn, group_name(&req.group))?;
         authorize(ctx, &actor, group)?;
+        if req.goal.is_some() && db::agent_owner_id(ctx.conn, actor.id)?.is_none() {
+            bail!("you have no owner to approve a goal");
+        }
         let prior = req.replaces.map(|id| require_row(ctx, id)).transpose()?;
         if let Some(prior) = &prior {
             if prior.group_id != group {
@@ -378,8 +415,28 @@ pub fn answer_blocker(
         if !db::agent_is_live(ctx.conn, row.creator.id)? {
             bail!("creating agent is retired; cancel or replace this blocker instead");
         }
+        let goal = proposed_goal(&row)?;
+        if goal.is_some() && !answers_goal(ctx, &actor, &row)? {
+            bail!(
+                "only {}'s owner can answer its goal proposal",
+                row.creator.name
+            );
+        }
         let answer = answer?;
         text(&answer.text, "answer")?;
+        // Approval sets the goal as the owner's own goal-set would, before the
+        // answer mail, so the runner has the goal when the agent reads it.
+        if let Some(goal) = goal
+            && answer.selected == [blocker_choices::GOAL_APPROVE]
+        {
+            let to = row.creator.id;
+            super::insert_control(ctx, &actor, to, &goal.objective, "goal-set")?;
+            if let Some(seconds) = goal.duration_s {
+                let deadline = (ctx.now + chrono::Duration::seconds(seconds as i64))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                super::insert_control(ctx, &actor, to, &deadline, "goal-deadline")?;
+            }
+        }
         let body = format!(
             "Blocker #{} in @{}:\n{}\n\nAnswer:\n{}",
             row.id, row.group, row.body, answer.text
@@ -560,6 +617,7 @@ mod tests {
                 &mut self.conn,
                 &self.agents[agent],
                 proto::PutBlockerRequest {
+                    goal: None,
                     choices: None,
                     group: "crew".into(),
                     body: body.into(),
@@ -658,6 +716,7 @@ mod tests {
             &mut b.conn,
             &b.agents[2],
             proto::PutBlockerRequest {
+                goal: None,
                 group: "elsewhere".into(),
                 body: "not your queue".into(),
                 request_key: "hidden".into(),
@@ -790,6 +849,7 @@ mod tests {
         let before = b.messages();
         for replaces in [None, Some(original.id)] {
             let req = proto::PutBlockerRequest {
+                goal: None,
                 group: "crew".into(),
                 body: format!("{body}x"),
                 replaces,
@@ -807,6 +867,7 @@ mod tests {
                 detail: Some("x".repeat(500)),
             });
             let req = proto::PutBlockerRequest {
+                goal: None,
                 group: "crew".into(),
                 body: "short".into(),
                 replaces,
@@ -927,6 +988,7 @@ mod tests {
                 &mut b.conn,
                 who,
                 proto::PutBlockerRequest {
+                    goal: None,
                     choices: None,
                     group: group.into(),
                     body: key.into(),
@@ -1210,6 +1272,7 @@ mod tests {
             &mut b.conn,
             &b.agents[2],
             proto::PutBlockerRequest {
+                goal: None,
                 choices: None,
                 group: "other".into(),
                 body: "other issue".into(),
@@ -1301,6 +1364,7 @@ mod tests {
             &mut b.conn,
             &mateo,
             proto::PutBlockerRequest {
+                goal: None,
                 choices: None,
                 group: "new-group".into(),
                 body: "new agent".into(),
@@ -1503,6 +1567,7 @@ mod tests {
                 &mut b.conn,
                 &b.agents[2],
                 proto::PutBlockerRequest {
+                    goal: None,
                     choices: None,
                     group: "crew".into(),
                     body: "not a member".into(),
@@ -1517,6 +1582,7 @@ mod tests {
                 &mut b.conn,
                 &b.humans[0],
                 proto::PutBlockerRequest {
+                    goal: None,
                     choices: None,
                     group: "crew".into(),
                     body: "human create".into(),
@@ -1569,6 +1635,7 @@ mod tests {
     fn blocker_receipts_refuse_payload_or_operation_reuse_and_replay_without_new_mail() {
         let mut b = Board::memory();
         let request = proto::PutBlockerRequest {
+            goal: None,
             choices: None,
             group: "crew".into(),
             body: "Original".into(),
@@ -1937,6 +2004,7 @@ mod tests {
                     &mut b.conn,
                     &b.agents[0],
                     proto::PutBlockerRequest {
+                        goal: None,
                         choices: None,
                         group: "crew".into(),
                         body,
@@ -1982,6 +2050,7 @@ mod tests {
                 &mut b.conn,
                 &b.agents[0],
                 proto::PutBlockerRequest {
+                    goal: None,
                     choices: None,
                     group: "crew".into(),
                     body: "fork a chain".into(),
@@ -2035,6 +2104,7 @@ mod tests {
             &mut b.conn,
             &b.agents[0],
             proto::PutBlockerRequest {
+                goal: None,
                 choices: None,
                 group: "crew".into(),
                 body: "Archive after commit".into(),
@@ -2050,6 +2120,7 @@ mod tests {
                 &mut b.conn,
                 &b.agents[0],
                 proto::PutBlockerRequest {
+                    goal: None,
                     choices: None,
                     group: "crew".into(),
                     body: "New write after archive".into(),
@@ -2132,6 +2203,7 @@ mod tests {
             &mut b.conn,
             &b.agents[0],
             proto::PutBlockerRequest {
+                goal: None,
                 choices: None,
                 group: "@crew".into(),
                 body: "Original group".into(),
@@ -2192,6 +2264,7 @@ mod tests {
                 &mut b.conn,
                 &b.agents[0],
                 proto::PutBlockerRequest {
+                    goal: None,
                     choices: None,
                     group: "crew".into(),
                     body: "Move history".into(),
@@ -2270,6 +2343,7 @@ mod tests {
             &mut b.conn,
             &b.agents[0],
             proto::PutBlockerRequest {
+                goal: None,
                 group: "crew".into(),
                 body: "Which plan?".into(),
                 replaces,
@@ -2413,6 +2487,139 @@ mod tests {
         assert_eq!(
             outcome.answer.as_deref(),
             Some("Approved; continue with option B.")
+        );
+    }
+
+    fn propose(
+        b: &mut Board,
+        goal: proto::BlockerGoal,
+        choices: Option<proto::BlockerChoices>,
+        key: &str,
+    ) -> Result<proto::BlockerMutationResponse> {
+        put_blocker(
+            &mut b.conn,
+            &b.agents[0],
+            proto::PutBlockerRequest {
+                group: "crew".into(),
+                body: "I can own the release.".into(),
+                replaces: None,
+                request_key: key.into(),
+                choices,
+                goal: Some(goal),
+            },
+        )
+    }
+
+    /// Every control message: its ID, control and body, oldest first.
+    fn controls(b: &Board) -> Vec<(i64, String, String)> {
+        let mut stmt = b
+            .conn
+            .prepare("SELECT id, control, body FROM messages WHERE control IS NOT NULL ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn only_the_owner_answers_a_goal_proposal_and_approval_sets_the_goal() {
+        let mut b = Board::memory();
+        let goal = |objective: &str, duration_s| proto::BlockerGoal {
+            objective: objective.into(),
+            duration_s,
+        };
+        let pick = choices(proto::BlockerChoiceMode::BlockerSelectOne, &["a", "b"]);
+        let err = propose(&mut b, goal("Ship", None), Some(pick), "own").unwrap_err();
+        assert!(err.to_string().contains("choices are fixed"), "{err:#}");
+        assert!(propose(&mut b, goal(" ", None), None, "blank").is_err());
+        assert!(propose(&mut b, goal("Ship", Some(0)), None, "zero").is_err());
+        let err = put_blocker(
+            &mut b.conn,
+            &b.humans[0],
+            proto::PutBlockerRequest {
+                group: "crew".into(),
+                body: "Mine".into(),
+                request_key: "human".into(),
+                goal: Some(goal("Ship", None)),
+                ..Default::default()
+            },
+        );
+        assert!(err.is_err());
+
+        let proposed = goal("Ship 0.26", Some(8 * 3600));
+        let proposal = propose(&mut b, proposed.clone(), None, "ship")
+            .unwrap()
+            .blocker
+            .unwrap();
+        assert_eq!(proposal.goal.as_ref(), Some(&proposed));
+        assert_eq!(proposal.choices, Some(blocker_choices::goal_choices()));
+        // ada owns a crew member, so she can answer ordinary blockers here,
+        // but only will owns Mateo and can set its goal.
+        let read = |b: &mut Board, human: usize| {
+            get_blocker(
+                &mut b.conn,
+                &b.humans[human],
+                proto::GetBlockerRequest {
+                    id: proposal.id,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .blocker
+            .unwrap()
+        };
+        let as_ada = read(&mut b, 1);
+        assert!(as_ada.can_cancel && !as_ada.can_answer);
+        assert!(read(&mut b, 0).can_answer);
+        let err = b.answer(1, proposal.id, "ada").unwrap_err();
+        assert!(err.to_string().contains("only Mateo's owner"), "{err:#}");
+        assert!(controls(&b).is_empty());
+
+        // Approval sets the goal and its deadline from the owner, before the
+        // answer mail, in the same transaction.
+        let answered = select(&mut b, proposal.id, &["approve"], "", "approve").unwrap();
+        let set = controls(&b);
+        assert_eq!(set.len(), 2);
+        assert_eq!(
+            (set[0].1.as_str(), set[0].2.as_str()),
+            ("goal-set", "Ship 0.26")
+        );
+        assert_eq!(set[1].1, "goal-deadline");
+        let deadline = chrono::DateTime::parse_from_rfc3339(&set[1].2).unwrap();
+        let ahead = deadline.with_timezone(&chrono::Utc) - chrono::Utc::now();
+        assert!((ahead - chrono::Duration::hours(8)).num_seconds().abs() < 60);
+        let mail_id = answered.message_id.unwrap();
+        assert!(set.iter().all(|c| c.0 < mail_id));
+        assert!(mail(&b, mail_id).contains("Selected: Approve and set this goal [approve]"));
+        // A retry replays without setting it again.
+        let again = select(&mut b, proposal.id, &["approve"], "", "approve").unwrap();
+        assert!(again.replayed);
+        assert_eq!(controls(&b).len(), 2);
+
+        // Declining, or answering with only a note, sets nothing.
+        let undated = propose(&mut b, goal("Tidy up", None), None, "tidy")
+            .unwrap()
+            .blocker
+            .unwrap();
+        select(&mut b, undated.id, &["decline"], "Not now.", "decline").unwrap();
+        let noted = propose(&mut b, goal("Tidy up", None), None, "tidy-2")
+            .unwrap()
+            .blocker
+            .unwrap();
+        b.answer(0, noted.id, "note").unwrap();
+        assert_eq!(controls(&b).len(), 2);
+        // Without a duration, approval sets no deadline.
+        let last = propose(&mut b, goal("Tidy up", None), None, "tidy-3")
+            .unwrap()
+            .blocker
+            .unwrap();
+        select(&mut b, last.id, &["approve"], "Go ahead.", "approve-3").unwrap();
+        let set = controls(&b);
+        assert_eq!(set.len(), 3);
+        assert_eq!(
+            (set[2].1.as_str(), set[2].2.as_str()),
+            ("goal-set", "Tidy up")
         );
     }
 }

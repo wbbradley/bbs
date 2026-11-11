@@ -151,6 +151,18 @@ impl Tools {
         Ok(reply)
     }
 
+    /// `bbs_goal_propose`: put a blocker proposing a goal, which the server
+    /// sets if the agent's owner approves it.
+    async fn goal_propose(&mut self, args: &Value) -> Result<String> {
+        if self.goal.is_none() {
+            bail!("Goals are only available to agents run by `bbs headless run`.");
+        }
+        let request = crate::blockers::goal_request(args)?;
+        let key = request.request_key.clone();
+        let response = self.backend().await?.put_blocker(request).await?;
+        Ok(crate::blockers::mutation(&response, &key).to_string())
+    }
+
     /// `bbs_goal_get`: the runner's goal as it is now, with the instructions
     /// that short goal prompts leave out.
     fn goal_get(&self) -> Result<String> {
@@ -252,6 +264,9 @@ impl Tools {
         }
         if name == "bbs_goal_update" {
             return self.goal_update(args).await;
+        }
+        if name == "bbs_goal_propose" {
+            return self.goal_propose(args).await;
         }
         let arg = |key: &str| -> Result<String> {
             args[key]
@@ -695,6 +710,18 @@ pub fn tool_list() -> Value {
             "inputSchema": object(json!({}), &[]),
         },
         {
+            "name": "bbs_goal_propose",
+            "description": "Propose a goal for yourself, or a change to your current one: the only way you can set or change your goal. Puts a blocker in a group you belong to, choices fixed to approve or decline, that only your owner can answer. If they approve, the goal is set from them, replacing any current goal, and your runner prompts you toward it; either way the answer arrives as mail. Requires blocker-goals.v1. Reuse request_key with the same payload after an uncertain result.",
+            "inputSchema": object(json!({
+                "group": string("Group name, with or without @."),
+                "objective": string("The goal, 1..4096 UTF-8 bytes, set verbatim if approved: what to achieve and how to tell it is done."),
+                "body": string("Why you propose it, for your owner: one nonblank Markdown description, at most 2 KiB (2048 UTF-8 bytes)."),
+                "for": string("Optional time limit counted from approval, such as 8h or 3days (at most 366 days): the goal's deadline."),
+                "replaces": { "type":"integer", "minimum":1, "description":"Optional current predecessor blocker version, such as an earlier proposal. Must be in the same group." },
+                "request_key": string("Unique key for this intent, 1..128 UTF-8 bytes. Reuse only with exactly the same operation and payload."),
+            }), &["group", "objective", "body", "request_key"]),
+        },
+        {
             "name": "bbs_goal_update",
             "description": "Report progress on the goal your runner keeps prompting you toward: complete (with evidence), blocked (on a blocker you put with bbs_blocker_put; goal prompts resume when it is answered or cancelled), waiting (with a reason and either until or for; you are prompted again then) or active (end a wait or block early, for example when mail you got while waiting, or a result you were watching for, ends it). Mail reaches you while you wait or are blocked, without goal prompts. Takes effect when your turn ends.",
             "inputSchema": object(json!({
@@ -857,6 +884,7 @@ mod search_tests {
                 request_key: key.into(),
                 replaces,
                 choices: None,
+                goal: None,
             })
             .await
         }
