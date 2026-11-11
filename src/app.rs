@@ -345,7 +345,17 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
             };
             format_messages(&backend.read(req).await?.messages, json)?
         }
-        Command::Whoami => format!("{}\n", backend.whoami().await?.name),
+        Command::Whoami { address } => {
+            let me = backend.whoami().await?;
+            if address {
+                let address = me
+                    .address
+                    .context("this server does not report addresses (local-ids.v1)")?;
+                format!("{address}\n")
+            } else {
+                format!("{}\n", me.name)
+            }
+        }
         Command::Agents { all, json } => {
             let r = backend
                 .list_agents(proto::ListAgentsRequest { all })
@@ -862,10 +872,11 @@ fn agents_json(r: &proto::ListAgentsResponse) -> Result<String> {
 }
 
 pub(crate) fn format_agents(r: &proto::ListAgentsResponse) -> String {
-    let mut table: Vec<[String; 7]> = vec![[
+    let mut table: Vec<[String; 8]> = vec![[
         "NAME".into(),
         "KIND".into(),
         "OWNER".into(),
+        "ADDRESS".into(),
         "GROUPS".into(),
         "ACTIVE_AT".into(),
         "WHERE".into(),
@@ -875,6 +886,7 @@ pub(crate) fn format_agents(r: &proto::ListAgentsResponse) -> String {
         table.push([
             h.name.clone(),
             "human".into(),
+            "-".into(),
             "-".into(),
             "*".into(),
             display_time(&h.active_at),
@@ -893,6 +905,7 @@ pub(crate) fn format_agents(r: &proto::ListAgentsResponse) -> String {
             a.name.clone(),
             kind.into(),
             a.owner.clone().unwrap_or_else(|| "-".into()),
+            a.address.clone().unwrap_or_else(|| "-".into()),
             if g.is_empty() { "-".into() } else { g },
             display_time(&a.active_at),
             format!("{}:{}", a.hostname, a.pwd),
@@ -902,7 +915,7 @@ pub(crate) fn format_agents(r: &proto::ListAgentsResponse) -> String {
     render_table(&table)
 }
 
-fn render_table(rows: &[[String; 7]]) -> String {
+fn render_table(rows: &[[String; 8]]) -> String {
     let mut widths: HashMap<usize, usize> = HashMap::new();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {

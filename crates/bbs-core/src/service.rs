@@ -12,6 +12,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::auth::{self, AuthenticationError};
 use crate::db;
+use crate::entity;
 use crate::proto;
 use crate::timer::Schedule;
 
@@ -167,6 +168,7 @@ fn principal(p: db::Principal) -> proto::Principal {
         id: p.id,
         name: p.name,
         owner: None,
+        address: None,
     }
 }
 
@@ -439,8 +441,16 @@ pub fn whoami(conn: &mut Connection, caller: &Caller) -> Result<proto::Principal
             db::Kind::Agent => db::agent_owner_name(ctx.conn, me.id)?,
             db::Kind::Human => None,
         };
+        let entity_id = db::native_entity_id(ctx.conn, me.kind.into(), me.id)?;
+        let address = entity::remote_display(
+            &db::namespace(ctx.conn)?,
+            &entity_id,
+            entity::NATIVE_ADDRESS,
+            "",
+        );
         Ok(proto::Principal {
             owner,
+            address: Some(address),
             ..principal(me)
         })
     })
@@ -1847,6 +1857,10 @@ pub fn send(
             return send_control(ctx, &me, to, body, control);
         }
         if let Some(reference) = to.strip_prefix("id:") {
+            let address = entity::parse_remote(reference)?;
+            if address.address.entity.namespace == db::namespace(ctx.conn)? {
+                return send_local_id(ctx, &me, reference, &address, body);
+            }
             let (id, to) = integration::send_remote(ctx, &me, reference, body, None)?;
             return Ok(proto::SendResponse {
                 to,
@@ -1903,6 +1917,42 @@ pub fn send(
             },
         };
         send_direct(ctx, &me, target, body, None)
+    })
+}
+
+/// Send to `id:{reference}`, parsed as `address`, which names an entity of
+/// this installation: a human or agent, found by its entity ID ignoring case
+/// (local-ids.v1). The response names it by its exact canonical address.
+fn send_local_id(
+    ctx: &Ctx,
+    me: &db::Principal,
+    reference: &str,
+    address: &entity::RemoteAddress,
+    body: &str,
+) -> Result<proto::SendResponse> {
+    if address.run.is_some() {
+        bail!("id:{reference} names a run, but this installation's addresses have none");
+    }
+    let target = &address.address;
+    let Some(found) = db::local_entity(ctx.conn, &target.entity.entity_id, &target.address_id)?
+    else {
+        bail!("no such entity or address: id:{reference}");
+    };
+    let Some(principal) = found.principal else {
+        bail!("id:{reference} is a group; send to it as @name");
+    };
+    if !found.active {
+        bail!("id:{reference} is offline (retired)");
+    }
+    let to = entity::remote_display(
+        &target.entity.namespace,
+        &found.entity_id,
+        &target.address_id,
+        "",
+    );
+    Ok(proto::SendResponse {
+        to,
+        ..send_direct(ctx, me, principal, body, None)?
     })
 }
 
@@ -2137,6 +2187,8 @@ pub fn list_agents(
         let mut groups = db::agent_groups(ctx.conn)?;
         let counts = db::blockers::agent_counts(ctx.conn)?;
         let mut rows = db::list_agents(ctx.conn, req.all && me.kind == db::Kind::Human)?;
+        let namespace = db::namespace(ctx.conn)?;
+        let mut entity_ids = db::native_entity_ids(ctx.conn, entity::EntityKind::Agent)?;
         if me.kind == db::Kind::Agent {
             let mine: HashSet<&String> = groups.get(&me.id).into_iter().flatten().collect();
             rows.retain(|a| {
@@ -2162,6 +2214,9 @@ pub fn list_agents(
                 id: Some(a.id),
                 blocker_count: Some(counts.get(&a.id).copied().unwrap_or(0)),
                 groups: groups.remove(&a.id).unwrap_or_default(),
+                address: entity_ids
+                    .remove(&a.id)
+                    .map(|id| entity::remote_display(&namespace, &id, entity::NATIVE_ADDRESS, "")),
                 name: a.name,
                 status: a.status,
                 pwd: a.pwd,
@@ -3568,6 +3623,86 @@ mod tests {
             group_join(&mut conn, agent, req).unwrap();
         }
         (conn, will, agents)
+    }
+
+    /// `id:ENTITY@<our namespace>` reaches our own humans and agents by
+    /// entity ID, ignoring case, under the usual direct-send rules; Whoami
+    /// and ListAgents give each one's address (local-ids.v1).
+    #[test]
+    fn local_ids_address_our_own_humans_and_agents() {
+        let (mut conn, will, [mateo, zed, _lu]) = board();
+        let ns = db::namespace(&conn).unwrap();
+        let send_to = |conn: &mut Connection, from: &Caller, to: String| {
+            send(
+                conn,
+                from,
+                proto::SendRequest {
+                    to,
+                    body: "hi".into(),
+                    ..Default::default()
+                },
+            )
+        };
+        let mateo_address = format!("id:will/Mateo@{ns}");
+        assert_eq!(
+            whoami(&mut conn, &mateo).unwrap().address.as_deref(),
+            Some(mateo_address.as_str())
+        );
+        assert_eq!(
+            whoami(&mut conn, &will).unwrap().address,
+            Some(format!("id:will@{ns}"))
+        );
+        let agents = list_agents(&mut conn, &will, proto::ListAgentsRequest::default())
+            .unwrap()
+            .agents;
+        let listed = agents.iter().find(|a| a.name == "Mateo").unwrap();
+        assert_eq!(listed.address.as_deref(), Some(mateo_address.as_str()));
+
+        // The response names the canonical address, whatever the case sent.
+        let sent = send_to(&mut conn, &will, format!("id:WILL/mateo@{ns}")).unwrap();
+        assert_eq!(sent.to, mateo_address);
+        assert!(sent.id.is_some());
+        let mail = read(&mut conn, &mateo, proto::ReadRequest::default())
+            .unwrap()
+            .messages;
+        assert_eq!(mail.last().unwrap().body, "hi");
+        let sent = send_to(&mut conn, &zed, format!("id:will@{ns}")).unwrap();
+        assert_eq!(sent.to, format!("id:will@{ns}"));
+
+        let refused = |conn: &mut Connection, from: &Caller, to: String| {
+            send_to(conn, from, to).unwrap_err().to_string()
+        };
+        // The direct-send rules still apply: Lu shares no group with Mateo.
+        assert_eq!(
+            refused(&mut conn, &mateo, format!("id:will/Lu@{ns}")),
+            "Lu is not in any of your groups"
+        );
+        assert_eq!(
+            refused(&mut conn, &will, format!("id:crew@{ns}")),
+            format!("id:crew@{ns} is a group; send to it as @name")
+        );
+        assert_eq!(
+            refused(&mut conn, &will, format!("id:will/Mateo@{ns}#r1")),
+            format!(
+                "id:will/Mateo@{ns}#r1 names a run, but this installation's addresses have none"
+            )
+        );
+        assert_eq!(
+            refused(&mut conn, &will, format!("id:will/Nobody@{ns}")),
+            format!("no such entity or address: id:will/Nobody@{ns}")
+        );
+        retire_agent(
+            &mut conn,
+            &will,
+            proto::RetireRequest {
+                agent: "Zed".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            refused(&mut conn, &will, format!("id:will/Zed@{ns}")),
+            format!("id:will/Zed@{ns} is offline (retired)")
+        );
     }
 
     /// A schema-26 board cut over by the operator keeps its unread mail,

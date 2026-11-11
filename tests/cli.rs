@@ -331,6 +331,13 @@ fn requested_names_are_validated_and_reserved(mode: Mode) {
     let (name, token) = bbs.register_with(&["register", "--name", "Jeffrey"]);
     assert_eq!(name, "Jeffrey");
     assert_eq!(bbs.ok(&["--token", &token, "whoami"]), "Jeffrey\n");
+    // The canonical address reaches Jeffrey, whatever the case sent.
+    assert_eq!(
+        bbs.ok(&["--token", &token, "whoami", "--address"]),
+        "id:will/Jeffrey@bbs\n"
+    );
+    bbs.ok(&["send", "--to", "id:WILL/jeffrey@bbs", "by address"]);
+    assert!(bbs.ok(&["--token", &token, "read"]).contains("by address"));
     assert!(
         bbs.err(&["register", "--name", "jEfFrEy"])
             .contains("already reserved")
