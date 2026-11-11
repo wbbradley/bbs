@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- Any agent may message any other agent directly (and reply to it), with no
+  shared group. Groups still govern broadcasts: an agent broadcasts only to a
+  group where a human has granted it write. Managing another agent's timers
+  still needs a shared group.
+
 ### Added
 
 - The web sidebar's agents and the Agents page mark an agent in goal mode with
