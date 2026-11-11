@@ -1483,9 +1483,10 @@ async fn sends_to_our_namespace_or_a_retired_entity_are_refused_before_any_write
     let other = integration::admin_add(&mut rig.conn(), "other").unwrap();
     let (mut adapter, _) = rig.connect().await;
     let (mut intruder, _) = rig.connect_as(&other, "other").await;
-    let err = rig.send("id:will@bbs", "hi").unwrap_err();
+    // Our own namespace resolves locally (local-ids.v1), never through Hub.
+    let err = rig.send("id:nobody@bbs", "hi").unwrap_err();
     assert!(
-        err.to_string().contains("this installation's namespace"),
+        err.to_string().contains("no such entity or address"),
         "{err:#}"
     );
     // Before `hub` is bound to anyone, observations of it are ignored.

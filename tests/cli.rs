@@ -331,6 +331,13 @@ fn requested_names_are_validated_and_reserved(mode: Mode) {
     let (name, token) = bbs.register_with(&["register", "--name", "Jeffrey"]);
     assert_eq!(name, "Jeffrey");
     assert_eq!(bbs.ok(&["--token", &token, "whoami"]), "Jeffrey\n");
+    // The canonical address reaches Jeffrey, whatever the case sent.
+    assert_eq!(
+        bbs.ok(&["--token", &token, "whoami", "--address"]),
+        "id:will/Jeffrey@bbs\n"
+    );
+    bbs.ok(&["send", "--to", "id:WILL/jeffrey@bbs", "by address"]);
+    assert!(bbs.ok(&["--token", &token, "read"]).contains("by address"));
     assert!(
         bbs.err(&["register", "--name", "jEfFrEy"])
             .contains("already reserved")
@@ -2134,6 +2141,8 @@ fn json_output_is_one_object_per_line(mode: Mode) {
     assert_eq!(jeffrey["kind"], "agent");
     assert_eq!(jeffrey["retired"], false);
     assert_eq!(jeffrey["owner"], "will");
+    assert_eq!(jeffrey["address"], format!("id:will/{a}@bbs"));
+    assert_eq!(human["address"], serde_json::Value::Null);
     assert_eq!(jeffrey["groups"], serde_json::json!(["acme"]));
     assert_eq!(jeffrey["status"], "on it");
     assert!(!jeffrey["hostname"].as_str().unwrap().is_empty());

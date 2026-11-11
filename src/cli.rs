@@ -91,7 +91,8 @@ pub enum Command {
     },
     /// Send a message to an agent, a human, or @group.
     Send {
-        /// Recipient name, or @group to broadcast.
+        /// Recipient name, @group to broadcast, or a canonical address
+        /// id:ENTITY@NAMESPACE, here or in another namespace.
         #[arg(long)]
         to: String,
         /// Message body; read from stdin when omitted or "-".
@@ -154,7 +155,11 @@ pub enum Command {
         command: AdminCommand,
     },
     /// Print the caller's name: the agent owning --token, else the human.
-    Whoami,
+    Whoami {
+        /// Print the caller's canonical address (id:ENTITY@NAMESPACE) instead.
+        #[arg(long)]
+        address: bool,
+    },
     /// Print this build's version, revision, protocol, and schema support.
     Version {
         /// Print one JSON object.

@@ -7332,6 +7332,7 @@ mod tests {
                 id: 100 + root,
                 name: creator.into(),
                 owner: Some("ada".into()),
+                address: None,
             }),
             body: body.into(),
             status: proto::BlockerStatus::BlockerOpen.into(),

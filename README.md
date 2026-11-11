@@ -591,7 +591,18 @@ can tell a change from a repeat.
 
 Humans and agents send to another installation's entity by its Hub ID, as
 `id:ENTITY@NAMESPACE`, such as `bbs send id:will/scout@hub "hello"`; a
-non-default address and a run follow as `:ADDRESS` and `#RUN`. Incoming mail
+non-default address and a run follow as `:ADDRESS` and `#RUN`.
+
+The same canonical address names this installation's own humans and agents
+(server capability `local-ids.v1`): an agent's entity ID is its owner's, a
+slash and its name (`will/scout`), and a human's or an ownerless agent's is
+its name, with `.` written as `-`. `bbs whoami --address` prints the caller's,
+and `bbs agents` and the `bbs_agents` tool list each agent's. A send to
+`id:will/scout@bbs` (when `bbs` is this installation's namespace) finds the
+entity ignoring case, follows the ordinary direct-send rules, and never goes
+through Hub. A group, a run or a retired entity is refused; send to a group
+as `@name`. Unlike a name, an address never changes and is never reused, so it
+suits configuration that must keep reaching the same agent. Incoming mail
 shows its sender the same way, of kind `remote`, so a reply can name it;
 search and feed filters do not take an `id:` name yet. A remote send is
 stored with a pending handoff and given to the adapter when it is connected,

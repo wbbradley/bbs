@@ -439,6 +439,9 @@ message Principal {
   // Agents only: the owning human, resolved by the server; absent when
   // unknown, for humans, or on servers without auto-reply.v1.
   optional string owner = 4;
+  // The caller's canonical address, `id:ENTITY@NAMESPACE`, which Send accepts
+  // here and other installations reach it by (local-ids.v1).
+  optional string address = 5;
 }
 
 message EnsureHumanRequest { string name = 1; }
@@ -834,6 +837,8 @@ message Agent {
   // steer, tool, thought, text, turn_end, turn_error, cancel or stop); absent
   // when there is none or the server is older.
   optional string turn_event = 18;
+  // The agent's canonical address, `id:ENTITY@NAMESPACE` (local-ids.v1).
+  optional string address = 19;
 }
 
 // The window is the most recent `backlog` (1 to 1000) messages that match every

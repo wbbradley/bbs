@@ -1219,6 +1219,95 @@ pub fn native_address_row(conn: &Connection, kind: EntityKind, id: i64) -> Resul
     .context("no native address")
 }
 
+/// The entity IDs of every native record of `kind`, by native ID.
+pub fn native_entity_ids(conn: &Connection, kind: EntityKind) -> Result<HashMap<i64, String>> {
+    let column = hub_model::binding_column(kind);
+    let mut stmt = conn.prepare(&format!(
+        "SELECT nb.{column}, e.entity_id FROM entity_local_bindings nb
+         JOIN entities e ON e.id = nb.entity_id WHERE nb.{column} IS NOT NULL"
+    ))?;
+    let ids = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(ids)
+}
+
+/// A native record's entity ID; None when it has no entity binding.
+pub fn native_entity_id(conn: &Connection, kind: EntityKind, id: i64) -> Result<Option<String>> {
+    let column = hub_model::binding_column(kind);
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT e.entity_id FROM entity_local_bindings nb
+                 JOIN entities e ON e.id = nb.entity_id WHERE nb.{column} = ?1"
+            ),
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// A native entity of this installation, found by its ID.
+#[derive(Debug)]
+pub struct LocalEntity {
+    /// Its exact entity ID.
+    pub entity_id: String,
+    /// The human or agent it is; None for a group.
+    pub principal: Option<Principal>,
+    /// The entity and the named address are both active.
+    pub active: bool,
+}
+
+/// The native entity `entity_id` of this installation, with its address
+/// `address_id`. New entity IDs are unique ignoring case, so case is
+/// ignored; the table's own constraint is exact, so IDs differing only in
+/// case are refused as ambiguous rather than one picked.
+pub fn local_entity(
+    conn: &Connection,
+    entity_id: &str,
+    address_id: &str,
+) -> Result<Option<LocalEntity>> {
+    let mut found = conn
+        .prepare(
+            "SELECT e.entity_id, e.lifecycle = 'active' AND a.lifecycle = 'active',
+                    nb.human_id, h.name, nb.agent_id, ag.name
+             FROM entities e
+             JOIN entity_local_bindings nb ON nb.entity_id = e.id
+             JOIN entity_addresses a ON a.entity_id = e.id AND a.address_id = ?3
+             LEFT JOIN humans h ON h.id = nb.human_id
+             LEFT JOIN agents ag ON ag.id = nb.agent_id
+             WHERE e.namespace = ?1 AND lower(e.entity_id) = lower(?2)
+             LIMIT 2",
+        )?
+        .query_map(params![namespace(conn)?, entity_id, address_id], |r| {
+            let human: Option<i64> = r.get(2)?;
+            let agent: Option<i64> = r.get(4)?;
+            let principal = match (human, agent) {
+                (Some(id), _) => Some(Principal {
+                    kind: Kind::Human,
+                    id,
+                    name: r.get(3)?,
+                }),
+                (None, Some(id)) => Some(Principal {
+                    kind: Kind::Agent,
+                    id,
+                    name: r.get(5)?,
+                }),
+                (None, None) => None,
+            };
+            Ok(LocalEntity {
+                entity_id: r.get(0)?,
+                principal,
+                active: r.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if found.len() > 1 {
+        bail!("entity ID {entity_id} matches several entities that differ only in case");
+    }
+    Ok(found.pop())
+}
+
 // ---- messages --------------------------------------------------------------
 
 /// Where a message goes.

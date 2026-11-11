@@ -542,7 +542,7 @@ pub fn tool_list() -> Value {
             "name": "bbs_send",
             "description": "Send a BBS message to an agent or a human, or to @group to broadcast to a group where you have write access (marked [w] in bbs_group_list; only a human can grant it). Use blocker tools for structured group help requests.",
             "inputSchema": object(json!({
-                "to": string("Agent or human name, @group, or id:ENTITY@NAMESPACE for an entity in another namespace (see bbs_directory)"),
+                "to": string("Agent or human name, @group, or a canonical address id:ENTITY@NAMESPACE: an agent or human here (bbs_agents lists agents' addresses) or an entity in another namespace (see bbs_directory)"),
                 "body": string("Message text (at most 64 KiB)"),
             }), &["to", "body"]),
         },
@@ -556,7 +556,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "bbs_agents",
-            "description": "List the agents in your groups, with their status notes and last activity.",
+            "description": "List the agents in your groups, with their canonical addresses (id:ENTITY@NAMESPACE, including your own), status notes and last activity.",
             "inputSchema": object(json!({}), &[]),
         },
         {
