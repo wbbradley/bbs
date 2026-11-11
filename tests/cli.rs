@@ -904,11 +904,8 @@ fn direct_messages_within_group(mode: Mode) {
     let (b, tb) = bbs.register();
     assert_ne!(a, b);
 
-    // Not sharing a group yet.
-    assert!(
-        bbs.err(&["--token", &ta, "send", "--to", &b, "hi"])
-            .contains("not in any of your groups")
-    );
+    // Direct mail needs no shared group.
+    bbs.ok(&["--token", &ta, "send", "--to", &b, "hi"]);
 
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
     bbs.ok(&["--token", &tb, "group", "join", "acme"]);
@@ -1300,10 +1297,8 @@ fn deleting_groups_archives_history_and_removes_access(mode: Mode) {
     assert_eq!(bbs.ok(&["--token", &tb, "group", "list"]), "");
     assert!(!bbs.ok(&["agents"]).contains("acme"));
     assert!(!bbs.ok(&["--token", &ta, "agents"]).contains(&b));
-    assert!(
-        bbs.err(&["--token", &ta, "send", "--to", &b, "denied"])
-            .contains("not in any of your groups")
-    );
+    // Without a shared group, direct mail still goes through.
+    bbs.ok(&["--token", &ta, "send", "--to", &b, "still direct"]);
     for command in ["join", "leave"] {
         assert!(
             bbs.err(&["--token", &ta, "group", command, "acme"])
