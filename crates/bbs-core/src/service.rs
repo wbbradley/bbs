@@ -3083,7 +3083,7 @@ fn may_manage_timers(ctx: &Ctx, me: &db::Principal, target: &db::Principal) -> R
         && me.id != target.id
         && !db::share_group(ctx.conn, me.id, target.id)?
     {
-        bail!("{} is not in any of your groups", target.name);
+        bail!("managing {}'s timers needs a shared group", target.name);
     }
     Ok(())
 }
@@ -6737,7 +6737,7 @@ mod tests {
         let (mut conn, will, [mateo, _, lu]) = board();
         let no = add(&mut conn, &lu, "Zed", "in 1h").unwrap_err();
         assert!(
-            format!("{no:#}").contains("Zed is not in any of your groups"),
+            format!("{no:#}").contains("managing Zed's timers needs a shared group"),
             "{no:#}"
         );
         let t = add(&mut conn, &mateo, "Zed", "in 1h").unwrap();

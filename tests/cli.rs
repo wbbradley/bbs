@@ -2885,7 +2885,7 @@ fn timers_are_set_listed_fired_and_removed(mode: Mode) {
     for (args, why) in [
         (
             vec!["--token", &tc, "timer", "add", &b, "in 1h", "x"],
-            "is not in any of your groups",
+            "timers needs a shared group",
         ),
         (
             vec!["--token", &ta, "timer", "add", &b, "soonish", "x"],
@@ -2897,7 +2897,7 @@ fn timers_are_set_listed_fired_and_removed(mode: Mode) {
         ),
         (
             vec!["--token", &tc, "timer", "rm", "1"],
-            "is not in any of your groups",
+            "timers needs a shared group",
         ),
     ] {
         let err = bbs.err(&args);
@@ -2997,7 +2997,7 @@ fn timers_are_edited_and_cancelled_with_notices(mode: Mode) {
         (vec!["timer", "edit", "9", "--text", "x"], "no timer 9"),
         (
             vec!["--token", &tc, "timer", "edit", "1", "--text", "x"],
-            "is not in any of your groups",
+            "timers needs a shared group",
         ),
     ] {
         let err = bbs.err(&args);
