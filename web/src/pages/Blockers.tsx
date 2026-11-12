@@ -6,6 +6,7 @@ import { isCovered } from "../cover";
 import type { PageProps } from "../App";
 import { BlockerBody, BlockerCreator as Creator, BlockerCreatorLink, BlockerGroupLink } from "../components/BlockerBody";
 import { ClosedBlockers } from "../components/ClosedBlockers";
+import { blocksGoal } from "../components/Goal";
 import { PageHeader } from "../components/PageHeader";
 import { BlockerOptions } from "../components/BlockerOptions";
 import { Link, paths } from "../router";
@@ -312,7 +313,10 @@ function BlockerCard({
   const choices = frozen && kept?.kind === "answer" ? kept.row.choices : b.choices;
   const shownSelection = frozen && kept?.kind === "answer" ? (kept.selected ?? []) : selection;
   const creatorAgent = b.creator?.kind === Kind.Agent ? b.creator : null;
-  const live = creatorAgent && board.agents.some((a) => a.id === creatorAgent.id && same(a.name, creatorAgent.name));
+  const agent = creatorAgent && board.agents.find((a) => a.id === creatorAgent.id && same(a.name, creatorAgent.name));
+  const live = !!agent;
+  // Whether the asking agent's goal waits on this blocker, as its runner last reported.
+  const blocking = agent && board.has("agent-goal.v1") ? blocksGoal(agent.goal, b.root_id) : null;
   const open = !held && b.status === BlockerStatus.Open;
   const reason = !b.can_answer
     ? creatorAgent && !live
@@ -340,6 +344,15 @@ function BlockerCard({
       <div style={{ marginTop: 18 }}>
         {!open && <div className="notice warning">No longer open.</div>}
         {open && reason && <div className="notice info">{reason}</div>}
+        {open && agent && blocking === true && (
+          <div className="notice warning">
+            Blocking <BlockerCreatorLink b={b} />'s goal: answering it lets the goal continue.
+            <div className="blocker-blocked-goal" title={agent.goal!.objective}>{agent.goal!.objective}</div>
+          </div>
+        )}
+        {open && agent && blocking === false && (
+          <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>Not blocking a goal.</div>
+        )}
         {choices && (
           <>
             <BlockerOptions

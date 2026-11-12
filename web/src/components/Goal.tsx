@@ -62,6 +62,11 @@ export function GoalMark({ goal }: { goal: GoalReport | null | undefined }) {
   );
 }
 
+/** Whether the goal waits on the blocker chain that starts at `rootId`. */
+export function blocksGoal(goal: GoalReport | null | undefined, rootId: number): boolean {
+  return goal?.status === GoalStatus.Blocked && goal.blocker_id === rootId;
+}
+
 /** Why the goal is where it is, in a few words. */
 function detail(goal: GoalReport): string | null {
   switch (goal.status) {

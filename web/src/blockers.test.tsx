@@ -9,7 +9,7 @@ import { Dialog } from "./components/Dialog";
 import { BlockersPage, REPLACED_GUARD_MS, loadKept, nearest } from "./pages/Blockers";
 import { useBoard } from "./store";
 import { Board, INFO } from "./test/setup";
-import { BlockerChoiceMode, BlockerStatus, type Blocker, type ServerInfo } from "./types";
+import { BlockerChoiceMode, BlockerStatus, GoalStatus, Kind, type Agent, type Blocker, type ServerInfo } from "./types";
 import { BLOCKER_CHOICES } from "./blockerChoices";
 import { loadDraft, saveDraft, setDraftOwner } from "./util";
 
@@ -518,5 +518,54 @@ describe("structured blocker answers", () => {
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
     expect(api.pending("answer_blocker")).toHaveLength(0);
     expect(api.pending("server_info")).toHaveLength(0);
+  });
+});
+
+describe("blockers and goals", () => {
+  const goalInfo: ServerInfo = { ...INFO, capabilities: [...INFO.capabilities, "agent-goal.v1"] };
+  const zed = (goal: Agent["goal"]) =>
+    ({ name: "Zed", owner: "ada", id: 101, groups: ["crew"], status: null, effort: null, goal, goal_reported_at: "2026-11-05T08:00:00Z" }) as unknown as Agent;
+  const blocked = (blocker_id: number) => ({
+    objective: "Ship the release\nthen tag it",
+    status: GoalStatus.Blocked,
+    set_by: "ada",
+    set_at: "2026-11-05T09:00:00Z",
+    iteration: 4,
+    budget: 50,
+    reason: "which branch?",
+    evidence: "",
+    wake_at: null,
+    changed_by: "agent",
+    blocker_id,
+  });
+  const show = async (agent: Agent, info: ServerInfo = goalInfo) => {
+    api.auto.set("list_agents", () => ({ agents: [agent], humans: [] }));
+    // A later version of the chain that starts at #1, from the agent.
+    const asked = row(1, 5);
+    await page([{ ...asked, creator: { ...asked.creator!, kind: Kind.Agent } }], info);
+  };
+
+  it("says when the asking agent's goal waits on the blocker's chain", async () => {
+    await show(zed(blocked(1)));
+    const notice = document.querySelector(".notice.warning")!;
+    expect(notice.textContent).toContain("Blocking Zed's goal: answering it lets the goal continue.");
+    expect(notice.querySelector(".blocker-blocked-goal")?.textContent).toBe("Ship the release\nthen tag it");
+    expect(screen.queryByText("Not blocking a goal.")).toBeNull();
+  });
+
+  it.each([
+    ["another blocker", blocked(9)],
+    ["a goal that is not blocked", { ...blocked(1), status: GoalStatus.Active }],
+    ["no goal", null],
+  ])("says it blocks no goal for %s", async (_, goal) => {
+    await show(zed(goal));
+    expect(screen.getByText("Not blocking a goal.")).toBeTruthy();
+    expect(document.querySelector(".notice.warning")).toBeNull();
+  });
+
+  it("says nothing about goals to a server without them", async () => {
+    await show(zed(blocked(1)), INFO);
+    expect(document.querySelector(".notice.warning")).toBeNull();
+    expect(screen.queryByText("Not blocking a goal.")).toBeNull();
   });
 });
