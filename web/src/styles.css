@@ -463,6 +463,15 @@ select.input {
   outline: none;
 }
 
+.blocker-blocked-goal {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .blocker-goal {
   margin-top: 14px;
   border: 1px solid var(--border);

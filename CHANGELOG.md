@@ -8,6 +8,14 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- The web board's blocker details say whether the blocker holds up its
+  agent's goal: while the agent's runner reports its goal blocked on this
+  blocker, a notice names the agent and shows the objective; otherwise the
+  details say it blocks no goal. Servers without `agent-goal.v1`, and goals
+  blocked without naming a blocker, show neither.
+
 ## 0.27.0 - 2026-11-12
 
 ### Added
