@@ -463,6 +463,23 @@ select.input {
   outline: none;
 }
 
+.blocker-goal {
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--info);
+  background: var(--info-surface);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.blocker-goal-label {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.blocker-goal-objective {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .blocker-options {
   border: 0;
   padding: 0;

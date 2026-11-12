@@ -204,6 +204,13 @@ export interface BlockerChoices {
   max: number | null;
 }
 
+/** A goal the agent proposes for itself; approving it sets the goal. */
+export interface BlockerGoal {
+  objective: string;
+  /** Time limit counted from approval. */
+  duration_s?: number | null;
+}
+
 export interface Blocker {
   id: number;
   group_id: number;
@@ -219,6 +226,7 @@ export interface Blocker {
   can_answer: boolean;
   can_cancel: boolean;
   choices?: BlockerChoices | null;
+  goal?: BlockerGoal | null;
 }
 
 export interface ListBlockersResponse {

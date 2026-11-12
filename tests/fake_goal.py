@@ -20,7 +20,9 @@ A prompt without a goal block that carries mail saying RESUME-NOW ends the
 goal's wait with bbs_goal_update(status="active"). One whose mail says
 READ-INBOX reports an in-progress tool call, waits until the test writes to
 the fake-go FIFO, then reads its inbox with `bbs read`, as an agent might from
-its shell, into fake-read.txt.
+its shell, into fake-read.txt. One whose mail says PROPOSE-GOAL proposes a
+goal with bbs_goal_propose in @crew and writes the blocker's ID to
+fake-proposal.txt.
 
 Every bbs_goal_update result is appended to fake-goal-results.jsonl.
 """
@@ -103,6 +105,8 @@ def main():
                 action = "activate"
             elif "READ-INBOX" in text:
                 action = "readinbox"
+            elif "PROPOSE-GOAL" in text:
+                action = "propose"
             else:
                 action = "idle"
 
@@ -142,6 +146,12 @@ def main():
                 blocker = json.loads(put["content"][0]["text"])["blocker"]["id"]
                 tool("bbs_goal_update", {"status": "blocked", "blocker": blocker,
                                          "reason": "which branch?"})
+            elif action == "propose":
+                put = tool("bbs_goal_propose", {"group": "crew", "objective": "Ship the fix",
+                                                "body": "The fix is ready to ship.", "for": "2h",
+                                                "request_key": "propose"})
+                blocker = json.loads(put["content"][0]["text"])["blocker"]["id"]
+                Path("fake-proposal.txt").write_text(str(blocker))
             elif action == "readinbox":
                 update(session, {"sessionUpdate": "tool_call", "toolCallId": "r",
                                  "title": "read-inbox", "status": "in_progress"})

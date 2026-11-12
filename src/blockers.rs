@@ -35,6 +35,9 @@ pub fn row(blocker: &proto::Blocker) -> Value {
             "options": c.options.iter().map(|o| json!({ "id": o.id, "label": o.label, "detail": o.detail })).collect::<Vec<_>>(),
             "min": c.min, "max": c.max,
         })),
+        "goal": blocker.goal.as_ref().map(|g| json!({
+            "objective": g.objective, "duration_s": g.duration_s,
+        })),
         "outcome": blocker.outcome.as_ref().map(|o| json!({
             "actor": o.actor.as_ref().map(identity), "created_at": o.created_at,
             "answer": o.answer, "message_id": o.message_id, "selected": o.selected,
@@ -176,6 +179,47 @@ pub fn put_request(args: &Value) -> Result<proto::PutBlockerRequest> {
         replaces: args.replaces,
         request_key: args.request_key,
         choices,
+        goal: None,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoalArgs {
+    group: String,
+    objective: String,
+    body: String,
+    #[serde(rename = "for")]
+    for_: Option<String>,
+    replaces: Option<i64>,
+    request_key: String,
+}
+
+/// A goal proposal, validated here before the RPC with the server's rules.
+pub fn goal_request(args: &Value) -> Result<proto::PutBlockerRequest> {
+    let args: GoalArgs =
+        serde_json::from_value(args.clone()).context("invalid goal proposal arguments")?;
+    bbs_core::blocker_limits::validate_body(&args.body)?;
+    let duration_s = args
+        .for_
+        .map(|span| {
+            humantime::parse_duration(span.trim())
+                .with_context(|| format!("{span:?} is not a duration such as 8h"))
+                .map(|d| d.as_secs())
+        })
+        .transpose()?;
+    let goal = proto::BlockerGoal {
+        objective: args.objective,
+        duration_s,
+    };
+    bbs_core::blocker_choices::validate_goal(&goal)?;
+    Ok(proto::PutBlockerRequest {
+        group: args.group,
+        body: args.body,
+        replaces: args.replaces,
+        request_key: args.request_key,
+        choices: None,
+        goal: Some(goal),
     })
 }
 
@@ -269,7 +313,7 @@ pub async fn run(
             body,
         } => {
             let key = request_key(key);
-            let response = backend.put_blocker(proto::PutBlockerRequest { group, body: crate::app::read_body(body)?, replaces, request_key: key.clone(), choices: None }).await
+            let response = backend.put_blocker(proto::PutBlockerRequest { group, body: crate::app::read_body(body)?, replaces, request_key: key.clone(), choices: None, goal: None }).await
                 .with_context(|| format!("blocker request key {key}; reuse --request-key with the same payload if retrying"))?;
             mutation(&response, &key)
         }

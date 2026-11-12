@@ -40,6 +40,8 @@ pub const BLOCKERS_MINE: &str = "blockers-mine.v1";
 pub const BLOCKERS_CLOSED: &str = "blockers-closed.v1";
 /// Structured blocker options and answers selecting them.
 pub const BLOCKER_CHOICES: &str = "blocker-choices.v1";
+/// Goal proposals: blockers whose approval sets the agent's goal.
+pub const BLOCKER_GOALS: &str = "blocker-goals.v1";
 pub const AGENT_NOTES: &str = "agent-notes.v1";
 /// Replicating the caller's whole personal history with `FeedRequest.sync`.
 pub const FEED_SYNC: &str = "feed-sync.v1";
@@ -484,7 +486,9 @@ impl Backend {
         match self {
             Backend::Local(l) => service::put_blocker(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => {
-                let capability = if req.choices.is_some() {
+                let capability = if req.goal.is_some() {
+                    BLOCKER_GOALS
+                } else if req.choices.is_some() {
                     BLOCKER_CHOICES
                 } else {
                     BLOCKERS

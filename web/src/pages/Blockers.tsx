@@ -317,7 +317,9 @@ function BlockerCard({
   const reason = !b.can_answer
     ? creatorAgent && !live
       ? "The agent that asked is gone, so it cannot be answered."
-      : "You have no agent in this group, so you cannot answer it."
+      : b.goal && creatorAgent
+        ? `Only ${creatorAgent.owner ?? "its owner"} can approve ${creatorAgent.name}'s goal.`
+        : "You have no agent in this group, so you cannot answer it."
     : null;
   const canAnswer = open && b.can_answer && !frozen;
   const supportsChoices = board.has(BLOCKER_CHOICES);

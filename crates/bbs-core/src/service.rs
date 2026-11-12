@@ -944,14 +944,7 @@ fn send_control(
     if db::agent_owner_id(ctx.conn, target.id)? != Some(me.id) {
         bail!("{} is not your agent", target.name);
     }
-    let msg = db::insert_message(
-        ctx.conn,
-        me,
-        db::To::Direct(db::Kind::Agent, target.id),
-        body,
-        &ctx.now_s,
-    )?;
-    db::set_message_control(ctx.conn, msg, control)?;
+    let msg = insert_control(ctx, me, target.id, body, control)?;
     tracing::info!(
         from = me.name,
         to = target.name,
@@ -964,6 +957,25 @@ fn send_control(
         id: Some(msg),
         skipped: Vec::new(),
     })
+}
+
+/// Store a control message from `me` to agent `to`, unchecked.
+fn insert_control(
+    ctx: &Ctx,
+    me: &db::Principal,
+    to: i64,
+    body: &str,
+    control: &str,
+) -> Result<i64> {
+    let msg = db::insert_message(
+        ctx.conn,
+        me,
+        db::To::Direct(db::Kind::Agent, to),
+        body,
+        &ctx.now_s,
+    )?;
+    db::set_message_control(ctx.conn, msg, control)?;
+    Ok(msg)
 }
 
 // ---- side channels (agent-interactions.v1) -------------------------------------
@@ -2722,7 +2734,7 @@ fn effort_json(report: &proto::EffortReport) -> String {
 // ---- agent goals (agent-goal.v1) ---------------------------------------------
 
 /// Bounds on one goal report and on a goal-set control's objective.
-const MAX_GOAL_OBJECTIVE: usize = 4096;
+use crate::blocker_choices::MAX_GOAL_OBJECTIVE;
 const MAX_GOAL_TEXT: usize = 4096;
 const MAX_GOAL_NAME: usize = 128;
 const GOAL_CHANGERS: [&str; 3] = ["agent", "owner", "runner"];
