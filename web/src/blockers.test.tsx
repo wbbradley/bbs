@@ -563,6 +563,12 @@ describe("blockers and goals", () => {
     expect(document.querySelector(".notice.warning")).toBeNull();
   });
 
+  it("says nothing when a blocked goal does not name its blocker", async () => {
+    await show(zed({ ...blocked(1), blocker_id: null }));
+    expect(document.querySelector(".notice.warning")).toBeNull();
+    expect(screen.queryByText("Not blocking a goal.")).toBeNull();
+  });
+
   it("says nothing about goals to a server without them", async () => {
     await show(zed(blocked(1)), INFO);
     expect(document.querySelector(".notice.warning")).toBeNull();

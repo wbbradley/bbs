@@ -62,9 +62,13 @@ export function GoalMark({ goal }: { goal: GoalReport | null | undefined }) {
   );
 }
 
-/** Whether the goal waits on the blocker chain that starts at `rootId`. */
-export function blocksGoal(goal: GoalReport | null | undefined, rootId: number): boolean {
-  return goal?.status === GoalStatus.Blocked && goal.blocker_id === rootId;
+/**
+ * Whether the goal waits on the blocker chain that starts at `rootId`; null
+ * when a blocked goal does not say which blocker it waits on.
+ */
+export function blocksGoal(goal: GoalReport | null | undefined, rootId: number): boolean | null {
+  if (goal?.status !== GoalStatus.Blocked) return false;
+  return goal.blocker_id ? goal.blocker_id === rootId : null;
 }
 
 /** Why the goal is where it is, in a few words. */
