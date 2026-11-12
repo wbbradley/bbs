@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.27.0 - 2026-11-12
+
 ### Added
 
 - Goal proposals (`blocker-goals.v1`): a headless agent proposes a goal for
