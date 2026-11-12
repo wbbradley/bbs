@@ -4309,6 +4309,27 @@ fn goal_runner(test: &str, script: &str, budget: u32) -> (Bbs, RunGuard) {
     (bbs, run)
 }
 
+/// Send a control from the owner, will, straight through the local service,
+/// bypassing the CLI's own checks of its body.
+fn owner_control(bbs: &Bbs, agent: &str, body: &str, control: bbs_core::proto::Control) {
+    let mut conn = bbs_core::db::open(&bbs.home.join(".local/state/bbs/bbs.db")).unwrap();
+    let caller = bbs_core::service::Caller {
+        human: Some("will".into()),
+        ..Default::default()
+    };
+    bbs_core::service::send(
+        &mut conn,
+        &caller,
+        bbs_core::proto::SendRequest {
+            to: agent.into(),
+            body: body.into(),
+            control: Some(control.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
 fn goal_logged(bbs: &Bbs, event: &str, count: usize) {
     let log = bbs.home.join(".local/state/bbs/headless/zed/log.jsonl");
     eventually(event, || {
@@ -4722,10 +4743,15 @@ fn headless_goal_expires_at_its_deadline_and_a_later_one_resumes_it() {
         "1h",
     ]);
     wait_goal_status(&bbs, "waiting");
-    // A deadline that has passed ends the goal before the hour-long wait
-    // does. Moving it only once the goal waits keeps a slow start from
-    // expiring it first.
-    bbs.ok(&["headless", "goal", "Zed", "deadline", "1s"]);
+    // The owner moves the deadline into the past, which the CLI refuses but
+    // the runner may still receive; it ends the goal on that control, before
+    // the hour-long wait does, with no clock in the test.
+    owner_control(
+        &bbs,
+        "Zed",
+        "2026-01-01T00:00:00Z",
+        bbs_core::proto::Control::GoalDeadline,
+    );
     wait_goal_status(&bbs, "expired");
     let state = headless_state(&bbs, "Zed");
     assert_eq!(state["goal"]["budget"], 0, "no turn budget unless set");
