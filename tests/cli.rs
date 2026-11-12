@@ -4719,10 +4719,13 @@ fn headless_goal_expires_at_its_deadline_and_a_later_one_resumes_it() {
         "set",
         "Ship the release",
         "--for",
-        "2s",
+        "1h",
     ]);
     wait_goal_status(&bbs, "waiting");
-    // The deadline comes before the hour-long wait ends.
+    // A deadline that has passed ends the goal before the hour-long wait
+    // does. Moving it only once the goal waits keeps a slow start from
+    // expiring it first.
+    bbs.ok(&["headless", "goal", "Zed", "deadline", "1s"]);
     wait_goal_status(&bbs, "expired");
     let state = headless_state(&bbs, "Zed");
     assert_eq!(state["goal"]["budget"], 0, "no turn budget unless set");
