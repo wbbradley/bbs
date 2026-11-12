@@ -1109,9 +1109,9 @@ static SENDER_NAME: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// Joins naming a group copy's original sender (D127): its address `oa` and
-/// entity `oe`, with [`SENDER_JOINS`]. Only imports store copies, and import
-/// refuses a copy whose original is this installation's, so the original
-/// sender is always another installation's entity.
+/// entity `oe`, with [`SENDER_JOINS`]. Only imports store copies. The
+/// original sender is another installation's entity, or one of ours when
+/// import matched the copy to the message that entity sent the group.
 const COPY_JOINS: &str = "
     LEFT JOIN entity_addresses oa ON m.group_copy_message_id IS NOT NULL
       AND oa.id = m.group_copy_sender_address_id
@@ -1119,7 +1119,8 @@ const COPY_JOINS: &str = "
 
 /// Columns read by [`copy_view`], with [`SENDER_JOINS`] and [`COPY_JOINS`]: a
 /// copy's original sender, whether the group sent it itself (a notice),
-/// whether the original sender is in another namespace than the group, and
+/// whether the original sender is in another namespace than the group and not
+/// ours (import checked ours against what we sent, so it is no mere claim), and
 /// what the message answers. A remote sender names what it answers, so the
 /// answered message's local ID is given only when the reader whose address
 /// is the SQL `reader` sent it or had it delivered; otherwise only its
@@ -1134,7 +1135,9 @@ fn copy_columns(reader: Option<&str>) -> String {
         None => String::new(),
     };
     format!(
-        "CASE WHEN oe.id IS NULL THEN NULL ELSE {} END, oe.id = se.id, oe.namespace != se.namespace,
+        "CASE WHEN oe.id IS NULL THEN NULL ELSE {} END, oe.id = se.id,
+         oe.namespace != se.namespace
+           AND NOT EXISTS (SELECT 1 FROM entity_local_bindings ob WHERE ob.entity_id = oe.id),
          m.in_reply_to_namespace, m.in_reply_to_message_id,
          (SELECT r.id FROM messages r WHERE r.origin_namespace = m.in_reply_to_namespace
             AND r.origin_message_id = m.in_reply_to_message_id {visible})",

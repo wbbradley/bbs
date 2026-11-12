@@ -351,6 +351,53 @@ pub fn native_target(
         .optional()?)
 }
 
+/// What a group copy claims about one of this installation's own messages:
+/// its ID, its native sender (entity and address) and what it says, and the
+/// remote group it went to.
+pub struct ClaimedOriginal<'a> {
+    pub message_id: &'a str,
+    pub sender_entity: &'a str,
+    pub sender_address: &'a str,
+    pub group_namespace: &'a str,
+    pub group_entity: &'a str,
+    pub content_type: &'a str,
+    pub body: &'a str,
+}
+
+/// The native sender's `entity_addresses` row of this installation's message
+/// `c.message_id` when it is exactly what `c` claims: sent here, without a
+/// run, by that native entity at that address, to an address of that remote
+/// group, with that content. None otherwise, a message never stored here
+/// included.
+pub fn native_original(conn: &Connection, c: &ClaimedOriginal) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT m.sender_address_id FROM messages m
+             JOIN entity_addresses sa ON sa.id = m.sender_address_id
+             JOIN entities se ON se.id = sa.entity_id
+             JOIN entity_local_bindings sb ON sb.entity_id = se.id
+             JOIN entity_addresses ra ON ra.id = m.recipient_address_id
+             JOIN entities re ON re.id = ra.entity_id
+             WHERE m.origin_namespace = ?1 AND m.origin_message_id = ?2
+               AND se.namespace = ?1 AND se.entity_id = ?3 AND sa.address_id = ?4
+               AND m.sender_run_id = '' AND m.group_copy_message_id IS NULL
+               AND re.namespace = ?5 AND re.entity_id = ?6
+               AND m.content_type = ?7 AND m.body = ?8",
+            params![
+                super::namespace(conn)?,
+                c.message_id,
+                c.sender_entity,
+                c.sender_address,
+                c.group_namespace,
+                c.group_entity,
+                c.content_type,
+                c.body
+            ],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// The entity `entity_id` in another installation's `namespace`, recorded on
 /// first sight with `kind` (`unknown` when nothing says) and its ID as display
 /// name; a known `kind` replaces `unknown`. Returns its `entities` row.

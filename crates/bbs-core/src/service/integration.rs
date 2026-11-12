@@ -820,21 +820,20 @@ fn import_in(
             format!("messages from {local} originate only at its home"),
         )));
     }
-    if m.group_copy
+    // A group copy whose original is one of ours comes back when a native
+    // entity posts to a remote group with other native members; it is
+    // checked against what we sent below, once the body is known.
+    let native_copy = m
+        .group_copy
         .as_ref()
-        .is_some_and(|c| c.original.as_ref().unwrap().namespace == local)
-    {
-        return Ok(Err(refuse(
-            "invalid_message",
-            format!("a group copy cannot name one of {local}'s entities as its original sender"),
-        )));
-    }
+        .filter(|c| c.original.as_ref().unwrap().namespace == local);
     // A namespace is reached through one integration (see `send_remote`), so
     // the duplicate check below is that integration's. A group copy's
-    // original speaks for its namespace too.
+    // original speaks for its namespace too, unless it is ours.
     let original = m
         .group_copy
         .as_ref()
+        .filter(|_| native_copy.is_none())
         .map(|c| &c.original.as_ref().unwrap().namespace);
     for namespace in std::iter::once(&id.namespace).chain(original) {
         if let Some(bound) = store::namespace_integration(ctx.conn, namespace)?
@@ -878,6 +877,38 @@ fn import_in(
     if body.trim().is_empty() {
         return Ok(Err(refuse("invalid_message", "the body is empty")));
     }
+    // This installation is authoritative for its own messages: a copy of one
+    // is accepted only when it repeats exactly what its native sender sent to
+    // this very group, so another home cannot put words in a native entity's
+    // mouth. Its original sender is then that native address.
+    let native_by = match native_copy {
+        None => None,
+        Some(copy) => {
+            let by = copy.original_sender.as_ref().unwrap();
+            let group = m.sender.as_ref().unwrap().entity.as_ref().unwrap();
+            let claimed = store::ClaimedOriginal {
+                message_id: &copy.original.as_ref().unwrap().message_id,
+                sender_entity: &by.entity.as_ref().unwrap().entity_id,
+                sender_address: &by.address_id,
+                group_namespace: &group.namespace,
+                group_entity: &group.entity_id,
+                content_type: &m.content_type,
+                body,
+            };
+            match store::native_original(ctx.conn, &claimed)? {
+                Some(address) if by.run_id.is_none() => Some(address),
+                _ => {
+                    return Ok(Err(refuse(
+                        "invalid_message",
+                        format!(
+                            "a group copy names a message of {local}'s that its original \
+                             sender did not send to this group"
+                        ),
+                    )));
+                }
+            }
+        }
+    };
 
     // Whether the recipient is unpublished, absent, a group or retired is
     // never told apart: each is `recipient_unknown`, with one detail.
@@ -924,25 +955,26 @@ fn import_in(
             let original = copy.original.as_ref().unwrap();
             let by = copy.original_sender.as_ref().unwrap();
             let by_entity = by.entity.as_ref().unwrap();
-            // Another installation's entity (checked above), possibly unknown
-            // here until now.
-            let e = store::foreign_entity(
-                ctx.conn,
-                &by_entity.namespace,
-                &by_entity.entity_id,
-                "unknown",
-                &ctx.now_s,
-            )?;
-            let address = Some(store::foreign_address(
-                ctx.conn,
-                e,
-                &by.address_id,
-                integration,
-            )?);
+            let address = match native_by {
+                // Our own sender, as checked above.
+                Some(address) => address,
+                // Another installation's entity, possibly unknown here until
+                // now.
+                None => {
+                    let e = store::foreign_entity(
+                        ctx.conn,
+                        &by_entity.namespace,
+                        &by_entity.entity_id,
+                        "unknown",
+                        &ctx.now_s,
+                    )?;
+                    store::foreign_address(ctx.conn, e, &by.address_id, integration)?
+                }
+            };
             Some((
                 original.namespace.as_str(),
                 original.message_id.as_str(),
-                address,
+                Some(address),
                 by.run_id.as_deref(),
             ))
         }

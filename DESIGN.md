@@ -479,10 +479,15 @@ identical and `message_conflict` otherwise, before any lifecycle or deadline
 check (Hub's order). A namespace bound to another integration is
 `route_not_authorized` before that check, so duplicates are matched only
 within the integration that owns the namespace; the same holds for a group
-copy's original namespace. A new message must be
+copy's original namespace, unless it is this installation's. A new message must be
 unexpired, `text/plain; charset=utf-8`, UTF-8 and not blank. A group copy's
-original sender must be in its original's namespace, which must not be this
-installation's. The recipient must be in this installation's namespace, with
+original sender must be in its original's namespace. When that is this
+installation's (a native entity posted to a remote group with other native
+members), this installation is authoritative: the copy must repeat a message
+stored here, sent without a run by exactly that native address to an address
+of the copy's sending group, with the same content type and body, or it is
+`invalid_message`; so no other home can put words in a native entity's mouth.
+The recipient must be in this installation's namespace, with
 no run, publication on, and an active native human or agent address; any
 other target (unknown, retired, a group, another namespace) gets the same
 `recipient_unknown`, "no such recipient", so the answer reveals nothing, and
@@ -517,7 +522,8 @@ message itself. Reads (inbox, history, feed, search and the wait stream) add
 `original_from`, the original sender's `id:ENTITY@NAMESPACE[#RUN]`, and the
 CLI and agents' mail show `ORIGINAL via GROUP` as Hub's client does;
 `reported` is set when the original sender's namespace is not the group's,
-since the reference is then only the group's home's claim. A copy whose
+since the reference is then only the group's home's claim, unless the original
+sender is native, which import checked against what it sent. A copy whose
 original sender is the group itself is a notice: `group_notice` is set and
 there is no `original_from`. Filters (`--from`, `--with`) match the group,
 the stored sender, not the original sender. A message that answers another

@@ -802,6 +802,8 @@ message Message {
   optional bool group_notice = 16;
   // With original_from: the original sender is in another namespace than the
   // group, so it is only the group's home's claim, not a verified identity.
+  // Never set for one of this installation's own entities, whose copies
+  // import checks against what it sent.
   optional bool reported = 17;
   // The message this one answers: its id here as a decimal number when this
   // installation has it and the reader can see it, else its origin as

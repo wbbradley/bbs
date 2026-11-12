@@ -901,8 +901,7 @@ async fn imports_reach_the_inbox_with_the_foreign_sender_shown() {
         &adapter.offer("h3", bad.encode_to_vec()).await,
         "invalid_message",
     );
-    // An original sender outside the original's namespace, or one of ours,
-    // is malformed.
+    // An original sender outside the original's namespace is malformed.
     let mut elsewhere = copy.clone();
     elsewhere.id.as_mut().unwrap().message_id = "c3".into();
     elsewhere.group_copy.as_mut().unwrap().original_sender = address("acme", "carol");
@@ -910,6 +909,8 @@ async fn imports_reach_the_inbox_with_the_foreign_sender_shown() {
         &adapter.offer("h4", elsewhere.encode_to_vec()).await,
         "invalid_message",
     );
+    // So is a copy of a message of ours that was never sent (see
+    // `a_copy_of_our_own_message_is_accepted_only_as_sent`).
     let mut native = copy.clone();
     native.id.as_mut().unwrap().message_id = "c4".into();
     native.group_copy = Some(mp::GroupCopy {
@@ -922,6 +923,107 @@ async fn imports_reach_the_inbox_with_the_foreign_sender_shown() {
     rejected(
         &adapter.offer("h5", native.encode_to_vec()).await,
         "invalid_message",
+    );
+}
+
+#[tokio::test]
+async fn a_copy_of_our_own_message_is_accepted_only_as_sent() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    // Agent scout posts to remote group `team`, of which human will is also
+    // a member.
+    let sent = rig.send("id:team@hub", "to the team").unwrap().id.unwrap();
+    let original: String = rig
+        .conn()
+        .query_row(
+            "SELECT origin_message_id FROM messages WHERE id = ?1",
+            [sent],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let (mut adapter, _) = rig.connect().await;
+    adapter.outgoing().await;
+    // The group's home fans a copy back out to will.
+    let copy_of = |id: &str, by: &str, group: &str, body: &str| {
+        let mut copy = message(id, group, "will", body);
+        copy.group_copy = Some(mp::GroupCopy {
+            original: Some(mp::MessageRef {
+                namespace: "bbs".into(),
+                message_id: original.clone(),
+            }),
+            original_sender: address("bbs", by),
+        });
+        copy
+    };
+
+    // Anything but what scout sent the group is a forgery: other words,
+    // another sender (ours or not), another group, a run, a message never
+    // sent.
+    let mut forged = vec![
+        copy_of("f1", "will/scout", "team", "words scout never wrote"),
+        copy_of("f2", "will", "team", "to the team"),
+        copy_of("f3", "will/scout", "other", "to the team"),
+    ];
+    let mut run = copy_of("f4", "will/scout", "team", "to the team");
+    let by = run.group_copy.as_mut().unwrap().original_sender.as_mut();
+    by.unwrap().run_id = Some("r1".into());
+    forged.push(run);
+    let mut unsent = copy_of("f5", "will/scout", "team", "to the team");
+    unsent
+        .group_copy
+        .as_mut()
+        .unwrap()
+        .original
+        .as_mut()
+        .unwrap()
+        .message_id = "nope".into();
+    forged.push(unsent);
+    for (i, f) in forged.iter().enumerate() {
+        let result = adapter.offer(&format!("hf{i}"), f.encode_to_vec()).await;
+        rejected(&result, "invalid_message");
+    }
+    assert_eq!(
+        rig.count("SELECT count(*) FROM deliveries WHERE direct = 1"),
+        0
+    );
+
+    // The genuine copy reaches will from the group, naming scout, and
+    // answering it goes to scout directly, threaded on the original.
+    let genuine = copy_of("c1", "will/scout", "team", "to the team");
+    received(&adapter.offer("h1", genuine.encode_to_vec()).await);
+    let read = service::read(&mut rig.conn(), &human(), proto::ReadRequest::default())
+        .unwrap()
+        .messages;
+    assert_eq!(read.len(), 1);
+    let got = &read[0];
+    assert_eq!(got.from_name, "id:team@hub");
+    assert_eq!(got.from_kind(), proto::Kind::Remote);
+    assert_eq!(got.original_from.as_deref(), Some("id:will/scout@bbs"));
+    // We checked scout's words ourselves: not merely the group's claim.
+    assert_eq!(got.reported, None);
+    assert_eq!(
+        got.group_copy_sender().as_deref(),
+        Some("id:will/scout@bbs via id:team@hub")
+    );
+    let reply = service::send(
+        &mut rig.conn(),
+        &human(),
+        proto::SendRequest {
+            to: String::new(),
+            body: "got it".into(),
+            control: None,
+            reply_to: Some(got.id),
+            not_to_owner: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(reply.to, "scout");
+    let inbox = rig.read();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].body, "got it");
+    assert_eq!(
+        inbox[0].in_reply_to.as_deref(),
+        Some(sent.to_string().as_str())
     );
 }
 
