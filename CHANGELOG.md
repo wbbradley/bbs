@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.27.1 - 2026-11-12
+
 ### Added
 
 - The web board's blocker details say whether the blocker holds up its
