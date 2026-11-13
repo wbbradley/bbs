@@ -2828,7 +2828,7 @@ async fn the_poller_reads_followed_rooms_through_the_stream() {
         .await;
     for _ in 0..100 {
         let f = b.room("follows", &serde_json::json!({})).await.unwrap();
-        if f["follows"][0]["state"] == "following" {
+        if f["follows"][0]["state"] == "active" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

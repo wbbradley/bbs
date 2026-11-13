@@ -255,11 +255,39 @@ pub async fn run(
     json_output: bool,
 ) -> Result<String> {
     let (verb, args) = request(command, host);
-    let value = backend.room(verb, &args).await?;
+    let value = match backend.room(verb, &args).await {
+        Ok(v) => v,
+        // With --json, the failure is also one JSON object on stdout.
+        Err(err) if json_output => {
+            println!("{}", error_json(&err));
+            return Err(err);
+        }
+        Err(err) => return Err(err),
+    };
     if json_output {
         return Ok(format!("{}\n", serde_json::to_string(&value)?));
     }
     Ok(text(verb, &value))
+}
+
+/// `{"error": {"code", "detail"}}` for a failed command: the reason code
+/// its message starts with (the host's, the relay's or this server's), else
+/// `error`.
+pub fn error_json(err: &anyhow::Error) -> Value {
+    let message = err.to_string();
+    let (code, detail) = match message.split_once(": ") {
+        Some((code, detail))
+            if !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') =>
+        {
+            (code.to_string(), detail.to_string())
+        }
+        _ => ("error".to_string(), message.clone()),
+    };
+    json!({"error": {"code": code, "detail": detail}})
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -533,6 +561,17 @@ mod tests {
             )
         );
         assert!(crate::cli::Cli::try_parse_from(["bbs", "room", "grant", "war"]).is_err());
+    }
+
+    #[test]
+    fn errors_name_their_code() {
+        let e = anyhow::anyhow!("not_found: no room rooms/x");
+        assert_eq!(
+            error_json(&e),
+            json!({"error": {"code": "not_found", "detail": "no room rooms/x"}})
+        );
+        let e = anyhow::anyhow!("rooms are off: no integration");
+        assert_eq!(error_json(&e)["error"]["code"], "error");
     }
 
     #[test]

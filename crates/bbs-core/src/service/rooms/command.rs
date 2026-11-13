@@ -565,14 +565,7 @@ impl<H: RoomHome> Cmd<'_, H> {
                          AND follower_address_id = ?2",
                         params![id, me.address, mode],
                     )?;
-                    Ok((
-                        if start.is_some() {
-                            "following"
-                        } else {
-                            "pending"
-                        },
-                        true,
-                    ))
+                    Ok((if start.is_some() { "active" } else { "pending" }, true))
                 }
                 None => {
                     ctx.conn.execute(
@@ -654,7 +647,7 @@ impl<H: RoomHome> Cmd<'_, H> {
                         "room": room.display(),
                         "mode": r.get::<_, String>(2)?,
                         "from": r.get::<_, String>(3)?,
-                        "state": if started { "following" } else { "pending" },
+                        "state": if started { "active" } else { "pending" },
                         "backfilling": r.get::<_, bool>(5)?,
                         "archived": r.get::<_, bool>(6)?,
                         "since": r.get::<_, String>(7)?,
@@ -1001,12 +994,19 @@ impl<H: RoomHome> Cmd<'_, H> {
                 level = next;
             }
         }
+        // `records`: the post and its replies in one list, as history reads.
+        let records: Vec<Value> = post
+            .iter()
+            .cloned()
+            .chain(replies.iter().cloned())
+            .collect();
         Ok(json!({
             "room": room.display(),
             "ref": ref_display(&r),
             "status": status,
             "post": post,
             "replies": replies,
+            "records": records,
         }))
     }
 }

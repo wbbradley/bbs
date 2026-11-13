@@ -821,8 +821,14 @@ followed room through one shared fetch cursor on `rooms`, as the stable
 entity `bbs-room-fetcher`: AFTER the cursor every 15 s with a `wake`
 follower, else 60 s; 5 min after an hour with no posts; hourly when archived;
 backing off on reads with no answer; ±20% jitter; at once after a local post,
-a tag or a new follow. `BBS_ROOM_TIMER_SCALE` scales every room timer (tests
-and scenario harnesses) and `BBS_ROOM_HOST` sets the default host (`hub`). A
+a tag or a new follow. On the server, `BBS_ROOM_TIMER_SCALE` scales every
+room timer and `ROOMS_TIMERS_JSON` sets any of them in seconds (`poll_wake`,
+`poll_quiet`, `idle_after`, `poll_idle`, `poll_archived`, `backoff_max`,
+`wake_coalesce`, `readback` (a list), `readback_every`, `unconfirmed_after`,
+`unconfirmed_every`, `unconfirmed_for`, `mention_retry` (a list), and
+`jitter` as a fraction), for tests and scenario harnesses; `BBS_ROOM_HOST`
+sets the default host (`hub`). With `--json`, a failed `bbs room` command
+also prints `{"error": {"code", "detail"}}`. A
 new follow starts at the head the first read after it sees; one `--from
 oldest` or a cursor also gets a one-off backfill up to the shared cursor's
 position when it joined (at most 500 posts). Each AFTER page is one

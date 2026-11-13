@@ -735,7 +735,7 @@ async fn a_follow_starts_at_the_head_and_imports_each_page_once() {
     assert_eq!(v["state"], "pending");
     rig.poll().await;
     let follows = rig.run(&rig.ranger, "follows", json!({})).await.unwrap();
-    assert_eq!(follows["follows"][0]["state"], "following");
+    assert_eq!(follows["follows"][0]["state"], "active");
     let start: (Vec<u8>, i64) = rig
         .home
         .conn
@@ -1267,4 +1267,15 @@ async fn search_show_and_threads_read_the_room() {
         replies,
         [("on it".to_string(), 1), ("thanks".to_string(), 2)]
     );
+}
+
+#[test]
+fn timers_take_overrides_in_seconds() {
+    let t: Timers =
+        serde_json::from_value(json!({"poll_wake": 0.2, "readback": [0, 0.5]})).unwrap();
+    assert_eq!(t.poll_wake, 0.2);
+    assert_eq!(t.poll_quiet, 60.0);
+    assert_eq!(t.readback_after(1), 0.5);
+    assert_eq!(t.readback_after(5), 900.0);
+    assert!(serde_json::from_value::<Timers>(json!({"poll_wak": 1})).is_err());
 }

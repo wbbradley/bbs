@@ -196,7 +196,7 @@ pub async fn poll_once<H: RoomHome>(home: &H, cfg: &RoomConfig) -> Result<Option
 
 /// When the next pass has work.
 fn next_due(ctx: &Ctx, cfg: &RoomConfig) -> Result<Option<DateTime<Utc>>> {
-    let day_ago = fmt_time(ctx.now - cfg.d(super::UNCONFIRMED_FOR));
+    let day_ago = fmt_time(ctx.now - cfg.d(cfg.timers.unconfirmed_for));
     let times: Vec<Option<String>> = vec![
         ctx.conn.query_row(
             "SELECT min(coalesce(r.next_fetch_at, ?1)) FROM rooms r WHERE r.ended IS NULL

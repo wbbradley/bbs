@@ -9,10 +9,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 
 use super::super::integration::{self, route};
 use super::super::{Ctx, fmt_time};
-use super::{
-    BACKOFF_MAX, IDLE_AFTER, MAX_BACKFILL, MAX_PER_ROOM, POLL_ARCHIVED, POLL_IDLE, POLL_QUIET,
-    POLL_WAKE, RoomConfig, RoomName,
-};
+use super::{MAX_BACKFILL, MAX_PER_ROOM, RoomConfig, RoomName};
 use crate::db::{self, integration as dbi};
 use crate::entity::NATIVE_ADDRESS;
 use crate::hub_proto::msgproto_v1 as mp;
@@ -272,14 +269,15 @@ pub(super) fn schedule_fetch(ctx: &Ctx, cfg: &RoomConfig, room: i64) -> Result<(
             [room],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
-    let base = if wake { POLL_WAKE } else { POLL_QUIET };
-    let idle_since = fmt_time(ctx.now - cfg.d(IDLE_AFTER));
+    let t = &cfg.timers;
+    let base = if wake { t.poll_wake } else { t.poll_quiet };
+    let idle_since = fmt_time(ctx.now - cfg.d(t.idle_after));
     let secs = if failures > 0 {
-        (base * 2f64.powi(failures.min(10) as i32)).min(BACKOFF_MAX)
+        (base * 2f64.powi(failures.min(10) as i32)).min(t.backoff_max)
     } else if archived {
-        POLL_ARCHIVED
+        t.poll_archived
     } else if last_post.is_some_and(|t| t < idle_since) {
-        POLL_IDLE
+        t.poll_idle
     } else {
         base
     };
@@ -851,7 +849,7 @@ pub(super) fn flush_due(ctx: &Ctx, cfg: &RoomConfig) -> Result<usize> {
     for (follower, room) in tagged {
         delivered += flush(ctx, follower, Some(room))?;
     }
-    let since = fmt_time(ctx.now - cfg.d(super::WAKE_COALESCE));
+    let since = fmt_time(ctx.now - cfg.d(cfg.timers.wake_coalesce));
     let woken: Vec<(i64, i64, i64)> = ctx
         .conn
         .prepare(
@@ -888,7 +886,7 @@ pub(super) fn next_wake(ctx: &Ctx, cfg: &RoomConfig) -> Result<Option<String>> {
         let t = chrono::DateTime::parse_from_rfc3339(&t)
             .map(|t| t.to_utc())
             .unwrap_or(ctx.now);
-        fmt_time(t + cfg.d(super::WAKE_COALESCE))
+        fmt_time(t + cfg.d(cfg.timers.wake_coalesce))
     }))
 }
 
@@ -1128,7 +1126,7 @@ pub(super) fn settle_mention(ctx: &Ctx, cfg: &RoomConfig, m: &Mention, found: Fo
         }
         Found::Unanswered => {
             let checks = m.checks + 1;
-            match super::MENTION_RETRY.get(checks as usize) {
+            match cfg.timers.mention_retry.get(checks as usize) {
                 Some(secs) => {
                     ctx.conn.execute(
                         "UPDATE room_mentions SET checks = ?2, next_check_at = ?3
@@ -1259,7 +1257,7 @@ pub(super) fn due_readbacks(
     ctx: &Ctx,
     cfg: &RoomConfig,
 ) -> Result<Vec<(i64, i64, mp::MessageRef)>> {
-    let day_ago = fmt_time(ctx.now - cfg.d(super::UNCONFIRMED_FOR));
+    let day_ago = fmt_time(ctx.now - cfg.d(cfg.timers.unconfirmed_for));
     Ok(ctx
         .conn
         .prepare(
@@ -1301,9 +1299,9 @@ pub(super) fn settle_readback(
     let checks = checks + 1;
     let unconfirmed = readback.as_deref() == Some("unconfirmed");
     let next = if unconfirmed {
-        cfg.d(super::UNCONFIRMED_EVERY)
+        cfg.d(cfg.timers.unconfirmed_every)
     } else {
-        cfg.d(super::READBACK[(checks as usize).min(super::READBACK.len() - 1)])
+        cfg.d(cfg.timers.readback_after(checks as usize))
     };
     let next_s = fmt_time(ctx.now + next);
     match found {
@@ -1342,7 +1340,7 @@ pub(super) fn settle_readback(
                 params![message, checks, next_s, ctx.now_s, absent],
             )?;
             let limit = cfg
-                .d(super::ABSENT_LIMIT)
+                .d(cfg.timers.unconfirmed_after)
                 .num_microseconds()
                 .unwrap_or(i64::MAX);
             if !unconfirmed && absent >= limit {
@@ -1352,7 +1350,7 @@ pub(super) fn settle_readback(
                     params![
                         message,
                         ctx.now_s,
-                        fmt_time(ctx.now + cfg.d(super::UNCONFIRMED_EVERY))
+                        fmt_time(ctx.now + cfg.d(cfg.timers.unconfirmed_every))
                     ],
                 )?;
             }

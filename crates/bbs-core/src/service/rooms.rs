@@ -72,6 +72,7 @@ pub struct RoomConfig {
     pub default_host: String,
     /// Jitter on poll intervals, as a fraction either way (D7: 20%).
     pub jitter: f64,
+    pub timers: Timers,
 }
 
 impl Default for RoomConfig {
@@ -80,15 +81,86 @@ impl Default for RoomConfig {
             scale: 1.0,
             default_host: DEFAULT_HOST.to_string(),
             jitter: 0.2,
+            timers: Timers::default(),
         }
+    }
+}
+
+/// The room timers, in seconds (before `scale`). `ROOMS_TIMERS_JSON` may
+/// set any of them, with the same keys, plus `jitter`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Timers {
+    pub poll_wake: f64,
+    pub poll_quiet: f64,
+    pub idle_after: f64,
+    pub poll_idle: f64,
+    pub poll_archived: f64,
+    pub backoff_max: f64,
+    pub wake_coalesce: f64,
+    /// Read-back delays after the handoff result, then every `readback_every`.
+    pub readback: Vec<f64>,
+    pub readback_every: f64,
+    /// Host-answered absence that makes a post unconfirmed.
+    pub unconfirmed_after: f64,
+    pub unconfirmed_every: f64,
+    pub unconfirmed_for: f64,
+    /// Tag read-back delays; after the last, the tag is delivered unverified.
+    pub mention_retry: Vec<f64>,
+}
+
+impl Default for Timers {
+    fn default() -> Timers {
+        Timers {
+            poll_wake: POLL_WAKE,
+            poll_quiet: POLL_QUIET,
+            idle_after: IDLE_AFTER,
+            poll_idle: POLL_IDLE,
+            poll_archived: POLL_ARCHIVED,
+            backoff_max: BACKOFF_MAX,
+            wake_coalesce: WAKE_COALESCE,
+            readback: READBACK.to_vec(),
+            readback_every: READBACK[READBACK.len() - 1],
+            unconfirmed_after: ABSENT_LIMIT,
+            unconfirmed_every: UNCONFIRMED_EVERY,
+            unconfirmed_for: UNCONFIRMED_FOR,
+            mention_retry: MENTION_RETRY.to_vec(),
+        }
+    }
+}
+
+impl Timers {
+    /// The delay before read-back number `checks` (0 is the first).
+    pub fn readback_after(&self, checks: usize) -> f64 {
+        self.readback
+            .get(checks)
+            .copied()
+            .unwrap_or(self.readback_every)
     }
 }
 
 impl RoomConfig {
     /// From the environment: `BBS_ROOM_TIMER_SCALE` (a positive factor on
-    /// every room timer, e.g. 0.01) and `BBS_ROOM_HOST` (the default host).
+    /// every room timer, e.g. 0.01), `ROOMS_TIMERS_JSON` (a JSON object of
+    /// [`Timers`] in seconds, and `jitter` as a fraction) and `BBS_ROOM_HOST`
+    /// (the default host).
     pub fn from_env() -> Result<RoomConfig> {
         let mut cfg = RoomConfig::default();
+        if let Ok(json) = std::env::var("ROOMS_TIMERS_JSON")
+            && !json.trim().is_empty()
+        {
+            let mut v: serde_json::Value = serde_json::from_str(&json)
+                .map_err(|e| anyhow::anyhow!("ROOMS_TIMERS_JSON: {e}"))?;
+            if let Some(j) = v.as_object_mut().and_then(|o| o.remove("jitter")) {
+                let j = j
+                    .as_f64()
+                    .filter(|j| (0.0..1.0).contains(j))
+                    .ok_or_else(|| anyhow::anyhow!("ROOMS_TIMERS_JSON: jitter is a fraction"))?;
+                cfg.jitter = j;
+            }
+            cfg.timers =
+                serde_json::from_value(v).map_err(|e| anyhow::anyhow!("ROOMS_TIMERS_JSON: {e}"))?;
+        }
         if let Ok(scale) = std::env::var("BBS_ROOM_TIMER_SCALE") {
             let scale: f64 = scale
                 .parse()
