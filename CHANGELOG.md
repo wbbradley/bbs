@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.28.0 - 2026-11-13
+
 ### Removed
 
 - `/btw` side questions (`side-questions.v1`) and side conversations
