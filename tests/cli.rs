@@ -263,13 +263,13 @@ fn version_reports_identity_without_side_effects() {
             );
             assert_eq!(report["protocol"]["epoch"], 3);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
-            assert_eq!(report["schema_version"], 27);
+            assert_eq!(report["schema_version"], 28);
             assert_eq!(report["config_format"], 4);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {
             assert!(stdout.starts_with(&format!("bbs {} (", env!("CARGO_PKG_VERSION"))));
             assert!(stdout.contains("\nprotocol bbs.v2, epoch 3: "), "{stdout}");
-            assert!(stdout.contains("\nschema 27, "), "{stdout}");
+            assert!(stdout.contains("\nschema 28, "), "{stdout}");
         }
     }
     assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);

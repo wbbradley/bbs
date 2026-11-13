@@ -8,6 +8,15 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Added
+
+- Rooms (`rooms.v1`): `bbs room` and the `bbs_room_*` MCP tools list,
+  create, manage, post to, read, search and follow shared rooms on another
+  home such as Hub, through the server's Hub integration. Followed rooms'
+  posts arrive as `AUTHOR via room ROOM (reported)`; posts are read back
+  until confirmed, and tags are sent once their post is. Opening a database
+  migrates it to schema 28; earlier releases refuse a schema-28 database.
+
 ## 0.27.1 - 2026-11-12
 
 ### Added
