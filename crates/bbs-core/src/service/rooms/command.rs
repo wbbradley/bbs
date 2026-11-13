@@ -19,6 +19,14 @@ use super::{MAX_TAGS, RoomConfig, RoomHome, RoomName, address_display, b64, ref_
 use crate::db;
 use crate::hub_proto::msgproto_v1 as mp;
 
+/// A follow's state, from `room_follows f`: pending until its first read,
+/// backfill while it backfills, else active.
+const FOLLOW_STATE: &str = "CASE WHEN f.start_position IS NULL THEN 'pending'
+    WHEN f.backfill_until IS NOT NULL THEN 'backfill' ELSE 'active' END";
+
+/// How long a rerun may reuse an unresolved operation (seconds, scaled).
+const OP_REUSE: f64 = 600.0;
+
 /// Every verb [`command`] takes.
 pub const VERBS: &[&str] = &[
     "list",
@@ -287,9 +295,8 @@ impl<H: RoomHome> Cmd<'_, H> {
             bail!("invalid_message: {host} answered List without a list");
         };
         Ok(json!({
-            "host": host,
             "rooms": list.rooms.iter().map(|i| info_json(&host, i)).collect::<Vec<_>>(),
-            "next_page_token": opt_b64(&list.next_page_token),
+            "next_page": opt_b64(&list.next_page_token),
         }))
     }
 
@@ -312,21 +319,34 @@ impl<H: RoomHome> Cmd<'_, H> {
             name: name.clone(),
         };
         let (me, integration) = self.route(&host).await?;
-        let post = subjects(
-            self.args.post.as_deref().unwrap_or(&["any".to_string()]),
-            &me,
-        )?;
-        // BBS agents are persistent: no extra managers by default (D5).
-        let managers = subjects(self.args.manage.as_deref().unwrap_or(&[]), &me)?;
-        let mut create = mp::RoomCreate {
-            operation_id: String::new(),
-            name: name.clone(),
-            description: self.args.desc.clone().unwrap_or_default(),
-            post,
-            managers,
+        let command = self.command_key("create", &room);
+        let (create, replay) = match self.pending_op(&me, &host, &command).await? {
+            Some((_, bytes)) => (mp::RoomCreate::decode(bytes.as_slice())?, true),
+            None => {
+                let post = subjects(
+                    self.args.post.as_deref().unwrap_or(&["any".to_string()]),
+                    &me,
+                )?;
+                // BBS agents are persistent: no extra managers by default (D5).
+                let managers = subjects(self.args.manage.as_deref().unwrap_or(&[]), &me)?;
+                let create = mp::RoomCreate {
+                    operation_id: db::new_message_id(),
+                    name: name.clone(),
+                    description: self.args.desc.clone().unwrap_or_default(),
+                    post,
+                    managers,
+                };
+                self.save_op(
+                    &me,
+                    &room,
+                    &command,
+                    &create.operation_id,
+                    create.encode_to_vec(),
+                )
+                .await?;
+                (create, false)
+            }
         };
-        let fingerprint = fingerprint(&host, "", &create.encode_to_vec());
-        create.operation_id = self.operation(&me, &host, &fingerprint).await?;
         let op_id = create.operation_id.clone();
         let answer = self
             .ask(
@@ -345,6 +365,9 @@ impl<H: RoomHome> Cmd<'_, H> {
                 };
                 let mut v = info_json(&host, &info);
                 v["created"] = json!(true);
+                if replay {
+                    v["replayed"] = json!(true);
+                }
                 Ok(v)
             }
             // Exists, and the caller manages it: as good as created (D2).
@@ -368,31 +391,85 @@ impl<H: RoomHome> Cmd<'_, H> {
         }
     }
 
-    /// The operation ID for a change: the pending one for the same command,
-    /// else a new one, saved before the request goes (D2).
-    async fn operation(&self, me: &Me, host: &str, fingerprint: &str) -> Result<String> {
-        let (address, host, fingerprint) = (me.address, host.to_string(), fingerprint.to_string());
+    /// A digest of this command: its verb, room and arguments. A rerun of the
+    /// same command has the same key.
+    fn command_key(&self, verb: &str, room: &RoomName) -> String {
+        let a = &self.args;
+        let text = format!(
+            "{verb}\0{}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}",
+            room.display(),
+            a.name,
+            a.desc,
+            a.text,
+            a.post,
+            a.manage
+        );
+        fingerprint(&room.host, &room.path(), text.as_bytes())
+    }
+
+    /// The caller's pending operation for `command`, if it is unresolved and
+    /// younger than [`OP_REUSE`]: its ID and the exact operation sent. An
+    /// older one is abandoned, and the command starts fresh.
+    async fn pending_op(
+        &self,
+        me: &Me,
+        host: &str,
+        command: &str,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        let (address, host, command) = (me.address, host.to_string(), command.to_string());
+        let young = self.cfg.d(OP_REUSE);
         tx(self.home, self.caller, move |ctx| {
-            let pending: Option<String> = ctx
+            let since = fmt_time(ctx.now - young);
+            ctx.conn.execute(
+                "UPDATE room_operations SET state = 'abandoned' WHERE requester_address_id = ?1
+                 AND host = ?2 AND command = ?3 AND state = 'pending' AND created_at <= ?4",
+                params![address, host, command, since],
+            )?;
+            Ok(ctx
                 .conn
                 .query_row(
-                    "SELECT operation_id FROM room_operations WHERE requester_address_id = ?1
-                     AND host = ?2 AND fingerprint = ?3 AND state = 'pending'",
-                    params![address, host, fingerprint],
-                    |r| r.get(0),
+                    "SELECT operation_id, request FROM room_operations
+                     WHERE requester_address_id = ?1 AND host = ?2 AND command = ?3
+                       AND state = 'pending' ORDER BY id DESC LIMIT 1",
+                    params![address, host, command],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .optional()?;
-            if let Some(id) = pending {
-                return Ok(id);
-            }
-            let id = db::new_message_id();
+                .optional()?)
+        })
+        .await
+    }
+
+    /// Save an operation, exactly as it will be sent, before it goes (D2).
+    async fn save_op(
+        &self,
+        me: &Me,
+        room: &RoomName,
+        command: &str,
+        operation_id: &str,
+        request: Vec<u8>,
+    ) -> Result<()> {
+        let (address, room, command, op) = (
+            me.address,
+            room.clone(),
+            command.to_string(),
+            operation_id.to_string(),
+        );
+        tx(self.home, self.caller, move |ctx| {
             ctx.conn.execute(
-                "INSERT INTO room_operations (requester_address_id, host, fingerprint,
-                     operation_id, state, created_at)
-                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
-                params![address, host, fingerprint, id, ctx.now_s],
+                "INSERT INTO room_operations (requester_address_id, host, command, room,
+                     operation_id, request, state, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+                params![
+                    address,
+                    room.host,
+                    command,
+                    room.path(),
+                    op,
+                    request,
+                    ctx.now_s
+                ],
             )?;
-            Ok(id)
+            Ok(())
         })
         .await
     }
@@ -414,22 +491,47 @@ impl<H: RoomHome> Cmd<'_, H> {
         .await
     }
 
-    /// describe, policy, grant, revoke, archive, unarchive: Info, then an
-    /// Update at its revision (retried once on a revision race).
+    /// describe, policy, grant, revoke, archive, unarchive. A rerun of a
+    /// command whose operation is still unresolved (and young) resends that
+    /// exact operation, never one rebuilt from fresh Info, and reports
+    /// `replayed`. Otherwise: Info, then an Update at its revision, saved
+    /// before it goes (retried once on a revision race).
     async fn update(&self, verb: &str) -> Result<Value> {
         let room = self.room()?;
         let (me, integration) = self.route(&room.host).await?;
+        let command = self.command_key(verb, &room);
+        if let Some((op_id, bytes)) = self.pending_op(&me, &room.host, &command).await? {
+            let update = mp::RoomUpdate::decode(bytes.as_slice())?;
+            let answer = self
+                .ask(
+                    &me,
+                    &integration,
+                    &room.host,
+                    &room.path(),
+                    mp::room_request::Op::Update(update),
+                )
+                .await;
+            self.answered_op(&answer, &op_id).await?;
+            match answer {
+                // The room moved on since: start fresh below.
+                Answer::Refused(code, _, _) if code == "revision_mismatch" => {}
+                other => {
+                    let mut v = self.updated(&room, answered(other, &room.host)?).await?;
+                    v["replayed"] = json!(true);
+                    return Ok(v);
+                }
+            }
+        }
         for attempt in 0..2 {
             let info = self.info_of(&me, &integration, &room).await?;
             let Some(mut update) = self.change(verb, &info, &me)? else {
-                let mut v = info_json(&room.host, &info);
-                v["changed"] = json!(false);
-                return Ok(v);
+                return Ok(info_json(&room.host, &info));
             };
             update.expected_revision = info.revision;
-            let fingerprint = fingerprint(&room.host, &room.path(), &update.encode_to_vec());
-            update.operation_id = self.operation(&me, &room.host, &fingerprint).await?;
+            update.operation_id = db::new_message_id();
             let op_id = update.operation_id.clone();
+            self.save_op(&me, &room, &command, &op_id, update.encode_to_vec())
+                .await?;
             let answer = self
                 .ask(
                     &me,
@@ -444,29 +546,29 @@ impl<H: RoomHome> Cmd<'_, H> {
                 Answer::Refused(code, _, _) if code == "revision_mismatch" && attempt == 0 => {
                     continue;
                 }
-                other => {
-                    let a = answered(other, &room.host)?;
-                    let Some(mp::room_answer::Result::Info(info)) = a.result else {
-                        bail!(
-                            "invalid_message: {} answered Update without a room",
-                            room.host
-                        );
-                    };
-                    let (name, archived) = (room.clone(), info.archived);
-                    tx(self.home, self.caller, move |ctx| {
-                        store::set_archived(ctx, &name, archived)
-                    })
-                    .await?;
-                    let mut v = info_json(&room.host, &info);
-                    v["changed"] = json!(true);
-                    return Ok(v);
-                }
+                other => return self.updated(&room, answered(other, &room.host)?).await,
             }
         }
         bail!(
             "revision_mismatch: {} kept changing; try again",
             room.display()
         )
+    }
+
+    /// The room an Update answered with, noting whether it is archived.
+    async fn updated(&self, room: &RoomName, a: mp::RoomAnswer) -> Result<Value> {
+        let Some(mp::room_answer::Result::Info(info)) = a.result else {
+            bail!(
+                "invalid_message: {} answered Update without a room",
+                room.host
+            );
+        };
+        let (name, archived) = (room.clone(), info.archived);
+        tx(self.home, self.caller, move |ctx| {
+            store::set_archived(ctx, &name, archived)
+        })
+        .await?;
+        Ok(info_json(&room.host, &info))
     }
 
     /// The Update a verb makes of `info`, or None when it changes nothing.
@@ -549,23 +651,25 @@ impl<H: RoomHome> Cmd<'_, H> {
                 "UPDATE rooms SET ended = NULL WHERE id = ?1 AND ended IS NOT NULL",
                 [id],
             )?;
-            let existing: Option<Option<i64>> = ctx
+            let existing: Option<String> = ctx
                 .conn
                 .query_row(
-                    "SELECT start_position FROM room_follows WHERE room_id = ?1
-                     AND follower_address_id = ?2",
+                    &format!(
+                        "SELECT {FOLLOW_STATE} FROM room_follows f WHERE room_id = ?1
+                         AND follower_address_id = ?2"
+                    ),
                     params![id, me.address],
                     |r| r.get(0),
                 )
                 .optional()?;
             match existing {
-                Some(start) => {
+                Some(state) => {
                     ctx.conn.execute(
                         "UPDATE room_follows SET mode = ?3 WHERE room_id = ?1
                          AND follower_address_id = ?2",
                         params![id, me.address, mode],
                     )?;
-                    Ok((if start.is_some() { "active" } else { "pending" }, true))
+                    Ok((state, true))
                 }
                 None => {
                     ctx.conn.execute(
@@ -575,7 +679,7 @@ impl<H: RoomHome> Cmd<'_, H> {
                         params![id, me.address, mode, kind, cursor, ctx.now_s],
                     )?;
                     store::fetch_now(ctx, id)?;
-                    Ok(("pending", false))
+                    Ok(("pending".to_string(), false))
                 }
             }
         })
@@ -585,8 +689,7 @@ impl<H: RoomHome> Cmd<'_, H> {
             "room": room.display(),
             "mode": mode,
             "state": state,
-            "already_following": existed,
-            "from": if existed { Value::Null } else { json!(kind) },
+            "created": !existed,
         }))
     }
 
@@ -617,7 +720,7 @@ impl<H: RoomHome> Cmd<'_, H> {
             )? > 0)
         })
         .await?;
-        Ok(json!({"room": room.display(), "unfollowed": removed}))
+        Ok(json!({"room": room.display(), "removed": removed}))
     }
 
     async fn follows(&self) -> Result<Value> {
@@ -625,34 +728,20 @@ impl<H: RoomHome> Cmd<'_, H> {
             let me = me(ctx)?;
             let rows = ctx
                 .conn
-                .prepare(
-                    "SELECT r.host, r.name, f.mode, f.start_kind, f.start_position IS NOT NULL,
-                        f.backfill_until IS NOT NULL, r.archived, f.created_at,
-                        (SELECT count(*) FROM room_deliveries d WHERE d.room_id = r.id
-                           AND d.follower_address_id = f.follower_address_id
-                           AND d.state = 'pending'),
-                        (SELECT count(*) FROM room_deliveries d WHERE d.room_id = r.id
-                           AND d.follower_address_id = f.follower_address_id
-                           AND d.state = 'delivered')
+                .prepare(&format!(
+                    "SELECT r.host, r.name, f.mode, {FOLLOW_STATE}
                      FROM room_follows f JOIN rooms r ON r.id = f.room_id
-                     WHERE f.follower_address_id = ?1 ORDER BY r.host, r.name",
-                )?
+                     WHERE f.follower_address_id = ?1 ORDER BY r.host, r.name"
+                ))?
                 .query_map([me.address], |r| {
                     let room = RoomName {
                         host: r.get(0)?,
                         name: r.get(1)?,
                     };
-                    let started: bool = r.get(4)?;
                     Ok(json!({
                         "room": room.display(),
                         "mode": r.get::<_, String>(2)?,
-                        "from": r.get::<_, String>(3)?,
-                        "state": if started { "active" } else { "pending" },
-                        "backfilling": r.get::<_, bool>(5)?,
-                        "archived": r.get::<_, bool>(6)?,
-                        "since": r.get::<_, String>(7)?,
-                        "undelivered": r.get::<_, i64>(8)?,
-                        "delivered": r.get::<_, i64>(9)?,
+                        "state": r.get::<_, String>(3)?,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -736,9 +825,7 @@ impl<H: RoomHome> Cmd<'_, H> {
                 .await?
                 .context("no such room post")?;
             if o.settled() || o.state == "unconfirmed" || tokio::time::Instant::now() >= until {
-                let mut v = outcome_json(&o);
-                v["waited"] = json!(true);
-                return Ok(v);
+                return Ok(outcome_json(&o));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -950,21 +1037,31 @@ impl<H: RoomHome> Cmd<'_, H> {
             .ask_ok(&me, &integration, &room.host, &room.path(), refs_op(&r))
             .await?;
         let answer = Answer::Ok(a);
-        let (status, post) = match found(&answer, &r) {
-            Found::Present(rec) => ("present", Some(record_json(&room, rec))),
-            Found::Missing(why) if why == "absent" => ("absent", None),
+        let (post, head) = match found(&answer, &r) {
+            Found::Present(rec) => {
+                let head = match &answer {
+                    Answer::Ok(a) => match &a.result {
+                        Some(mp::room_answer::Result::Page(p)) => p.head_position,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                (rec.clone(), head)
+            }
+            Found::Missing(why) if why == "absent" => bail!(
+                "not_found: {} has no post {}",
+                room.display(),
+                ref_display(&r)
+            ),
             Found::Missing(why) => {
-                let mut v = json!({"room": room.display(), "ref": ref_display(&r),
-                    "status": "refused", "reason": why});
-                v["replies"] = json!([]);
-                return Ok(v);
+                bail!("{why}: {} refused post {}", room.display(), ref_display(&r))
             }
             Found::Unanswered => bail!("no answer from {} about {}", room.host, ref_display(&r)),
         };
-        let mut replies = Vec::new();
-        if self.args.thread && post.is_some() {
+        let mut records = vec![post];
+        if self.args.thread {
             let mut level = vec![r.clone()];
-            for depth in 1..=4 {
+            for _ in 1..=4 {
                 let mut next = Vec::new();
                 for parent in &level {
                     let op = mp::room_request::Op::Read(mp::RoomRead {
@@ -979,34 +1076,25 @@ impl<H: RoomHome> Cmd<'_, H> {
                     let Some(mp::room_answer::Result::Page(page)) = a.result else {
                         continue;
                     };
-                    for rec in &page.records {
-                        let mut v = record_json(&room, rec);
-                        v["depth"] = json!(depth);
-                        replies.push(v);
-                        if let Some(id) = store::decode_record(rec).and_then(|f| f.message.id) {
+                    for rec in page.records {
+                        if let Some(id) = store::decode_record(&rec).and_then(|f| f.message.id) {
                             next.push(id);
                         }
+                        records.push(rec);
                     }
                 }
-                if next.is_empty() || replies.len() >= 200 {
+                if next.is_empty() || records.len() > 200 {
                     break;
                 }
                 level = next;
             }
         }
-        // `records`: the post and its replies in one list, as history reads.
-        let records: Vec<Value> = post
-            .iter()
-            .cloned()
-            .chain(replies.iter().cloned())
-            .collect();
+        records.sort_by_key(|r| r.position);
         Ok(json!({
-            "room": room.display(),
-            "ref": ref_display(&r),
-            "status": status,
-            "post": post,
-            "replies": replies,
-            "records": records,
+            "posts": records.iter().map(|r| record_json(&room, r)).collect::<Vec<_>>(),
+            "next_cursor": null,
+            "head": head,
+            "scan_truncated": false,
         }))
     }
 }
@@ -1263,10 +1351,6 @@ fn opt_b64(b: &[u8]) -> Value {
     }
 }
 
-fn micros(t: i64) -> Value {
-    DateTime::from_timestamp_micros(t).map_or(Value::Null, |t| json!(fmt_time(t)))
-}
-
 fn subject_json(s: &mp::RoomSubject) -> String {
     use mp::room_subject::Subject as S;
     match &s.subject {
@@ -1277,32 +1361,35 @@ fn subject_json(s: &mp::RoomSubject) -> String {
     }
 }
 
+/// Room info as every home's CLI prints it (the build contract's machine
+/// output).
 fn info_json(host: &str, i: &mp::RoomInfo) -> Value {
     let name = i.name.strip_prefix("rooms/").unwrap_or(&i.name);
     json!({
         "room": format!("rooms/{name}@{host}"),
-        "name": name,
-        "host": host,
         "description": i.description,
         "post": i.post.iter().map(subject_json).collect::<Vec<_>>(),
         "managers": i.managers.iter().map(subject_json).collect::<Vec<_>>(),
         "archived": i.archived,
         "revision": i.revision,
-        "head_position": i.head_position,
-        "head_cursor": opt_b64(&i.head_cursor),
+        "head": i.head_position,
         "creator": i.creator.as_ref().map(|e| format!("{}@{}", e.entity_id, e.namespace)),
-        "created_at": micros(i.created_at_unix_micros),
-        "recent_authors": i.recent_authors.iter().map(address_display).collect::<Vec<_>>(),
-        "address": i.address.as_ref().map(address_display),
+        "recent_authors": i.recent_authors.iter().map(author_display).collect::<Vec<_>>(),
     })
 }
 
+/// An author as `PATH@NAMESPACE`.
+fn author_display(a: &mp::AddressRef) -> String {
+    let e = a.entity.clone().unwrap_or_default();
+    format!("{}@{}", e.entity_id, e.namespace)
+}
+
+/// A post record.
 fn record_json(room: &RoomName, rec: &mp::RoomRecord) -> Value {
     let Some(f) = store::decode_record(rec) else {
-        return json!({"position": rec.position, "unreadable": true});
+        return json!({"room": room.display(), "position": rec.position, "kind": "unreadable"});
     };
     let m = &f.message;
-    let author = m.sender.as_ref().map(address_display);
     let notice = m
         .sender
         .as_ref()
@@ -1310,18 +1397,18 @@ fn record_json(room: &RoomName, rec: &mp::RoomRecord) -> Value {
         .is_some_and(|e| e.namespace == room.host && e.entity_id == room.path());
     json!({
         "ref": m.id.as_ref().map(ref_display),
+        "room": room.display(),
+        "author": m.sender.as_ref().map(author_display),
+        "in_reply_to": m.in_reply_to.as_ref().map(ref_display),
+        "body": String::from_utf8_lossy(&m.body),
+        "kind": if notice { "notice" } else { "post" },
+        "accepted_at": f.accepted_at,
         "position": rec.position,
         "cursor": b64(&rec.cursor),
-        "accepted_at": f.accepted_at,
-        "author": author,
-        "author_reported": true,
-        "notice": notice,
-        "in_reply_to": m.in_reply_to.as_ref().map(ref_display),
-        "content_type": m.content_type,
-        "body": String::from_utf8_lossy(&m.body),
     })
 }
 
+/// A page of posts, ascending.
 fn page_json(room: &RoomName, a: mp::RoomAnswer) -> Result<Value> {
     let Some(mp::room_answer::Result::Page(page)) = a.result else {
         bail!(
@@ -1330,23 +1417,23 @@ fn page_json(room: &RoomName, a: mp::RoomAnswer) -> Result<Value> {
         );
     };
     Ok(json!({
-        "room": room.display(),
-        "records": page.records.iter().map(|r| record_json(room, r)).collect::<Vec<_>>(),
+        "posts": page.records.iter().map(|r| record_json(room, r)).collect::<Vec<_>>(),
         "next_cursor": opt_b64(&page.next_cursor),
-        "head_position": page.head_position,
-        "head_cursor": opt_b64(&page.head_cursor),
+        "head": page.head_position,
         "scan_truncated": page.scan_truncated,
     }))
 }
 
 fn outcome_json(o: &store::Outcome) -> Value {
     json!({
-        "message": o.message,
         "ref": ref_display(&o.origin),
         "room": o.room.display(),
         "state": o.state,
         "reason": o.reason,
-        "position": o.position,
-        "tags": o.tags.iter().map(|(t, s)| json!({"target": t, "state": s})).collect::<Vec<_>>(),
+        "tags": o.tags.iter().map(|(t, s, why)| json!({
+            "to": t.strip_prefix("id:").unwrap_or(t),
+            "state": s,
+            "reason": why,
+        })).collect::<Vec<_>>(),
     })
 }

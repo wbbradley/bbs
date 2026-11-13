@@ -37,6 +37,10 @@ struct Host {
     ops: HashMap<(String, String), mp::RoomAnswer>,
     /// Answer nothing: every request is RoomUnavailable.
     down: bool,
+    /// Apply each change (create, update) but lose its answer.
+    lose_answers: bool,
+    /// Refuse the next reads with these codes, one each.
+    fail_reads: Vec<String>,
     requests: Vec<mp::RoomRequest>,
 }
 
@@ -140,6 +144,24 @@ impl Host {
     }
 
     fn answer(&mut self, req: mp::RoomRequest) -> pb::RoomResult {
+        let id = req.request_id.clone();
+        let change = matches!(
+            req.op,
+            Some(mp::room_request::Op::Create(_) | mp::room_request::Op::Update(_))
+        );
+        let result = self.answer_inner(req);
+        if self.lose_answers && change {
+            return pb::RoomResult {
+                request_id: id,
+                unavailable_code: "room_timeout".into(),
+                detail: "the answer was lost".into(),
+                answer: None,
+            };
+        }
+        result
+    }
+
+    fn answer_inner(&mut self, req: mp::RoomRequest) -> pb::RoomResult {
         self.requests.push(req.clone());
         if self.down {
             return pb::RoomResult {
@@ -212,6 +234,15 @@ impl Host {
                 None => fail(&mut a, "not_found"),
             },
             mp::room_request::Op::Update(u) => {
+                let key = (
+                    format!("{}/{}", who.namespace, who.entity_id),
+                    u.operation_id.clone(),
+                );
+                if let Some(prior) = self.ops.get(&key) {
+                    let mut again = prior.clone();
+                    again.request_id = req.request_id.clone();
+                    return ok(again);
+                }
                 let Some(r) = self.rooms.get_mut(&req.room) else {
                     fail(&mut a, "not_found");
                     return ok(a);
@@ -234,8 +265,14 @@ impl Host {
                 }
                 r.info.revision += 1;
                 a.result = Some(mp::room_answer::Result::Info(Box::new(r.info.clone())));
+                self.ops.insert(key, a.clone());
             }
             mp::room_request::Op::Read(rd) => {
+                if !self.fail_reads.is_empty() {
+                    let code = self.fail_reads.remove(0);
+                    fail(&mut a, &code);
+                    return ok(a);
+                }
                 let Some(r) = self.rooms.get(&req.room) else {
                     fail(&mut a, "not_found");
                     return ok(a);
@@ -594,7 +631,7 @@ async fn requests_carry_the_caller_and_answers_come_back() {
         .run(&rig.ranger, "list", json!({"filter": "inc"}))
         .await
         .unwrap();
-    assert_eq!(listed["rooms"][0]["name"], "incident");
+    assert_eq!(listed["rooms"][0]["room"], "rooms/incident@hub");
     // A host error comes back as its code.
     let err = rig
         .run(&rig.scout, "info", json!({"room": "rooms/nope@hub"}))
@@ -696,11 +733,12 @@ async fn managers_update_with_the_current_revision() {
         .await
         .unwrap();
     assert_eq!(v["archived"], true);
+    let revision = v["revision"].clone();
     let v = rig
         .run(&rig.scout, "archive", json!({"room": "ops"}))
         .await
         .unwrap();
-    assert_eq!(v["changed"], false);
+    assert_eq!(v["revision"], revision, "a no-op sends no update");
     let v = rig
         .run(
             &rig.scout,
@@ -876,11 +914,7 @@ async fn two_agents_in_one_room_see_each_others_posts() {
     assert!(seen_by_scout.iter().any(|m| m.body == "ack"));
     // The post confirmed by read-back (it reads at once after a post).
     let st = rig
-        .run(
-            &rig.scout,
-            "status",
-            json!({"message": posted["message"].to_string()}),
-        )
+        .run(&rig.scout, "status", json!({"message": posted["ref"]}))
         .await
         .unwrap();
     assert_eq!(st["state"], "confirmed");
@@ -889,7 +923,7 @@ async fn two_agents_in_one_room_see_each_others_posts() {
         .run(&rig.ranger, "history", json!({"room": "war"}))
         .await
         .unwrap();
-    assert_eq!(h["records"][0]["author"], "will/scout@bbs");
+    assert_eq!(h["posts"][0]["author"], "will/scout@bbs");
 }
 
 #[tokio::test]
@@ -917,7 +951,7 @@ async fn backfill_delivers_from_the_oldest_up_to_the_switch() {
     assert!(bodies.contains(&"old 0".to_string()));
     assert!(bodies.contains(&"new".to_string()));
     let follows = rig.run(&rig.ranger, "follows", json!({})).await.unwrap();
-    assert_eq!(follows["follows"][0]["backfilling"], false);
+    assert_eq!(follows["follows"][0]["state"], "active");
 }
 
 #[tokio::test]
@@ -1052,11 +1086,7 @@ async fn post_outcomes_confirm_reject_and_hold_tags() {
     rig.hand_off(Some("sender_not_permitted"));
     rig.poll().await;
     let st = rig
-        .run(
-            &rig.scout,
-            "status",
-            json!({"message": p["message"].to_string()}),
-        )
+        .run(&rig.scout, "status", json!({"message": p["ref"]}))
         .await
         .unwrap();
     assert_eq!(st["state"], "rejected");
@@ -1232,7 +1262,7 @@ async fn search_show_and_threads_read_the_room() {
         .run(&rig.scout, "search", json!({"room": "s", "text": "gpu-07"}))
         .await
         .unwrap();
-    assert_eq!(found["records"].as_array().unwrap().len(), 1);
+    assert_eq!(found["posts"].as_array().unwrap().len(), 1);
     let found = rig
         .run(
             &rig.scout,
@@ -1241,7 +1271,7 @@ async fn search_show_and_threads_read_the_room() {
         )
         .await
         .unwrap();
-    assert_eq!(found["records"].as_array().unwrap().len(), 2);
+    assert_eq!(found["posts"].as_array().unwrap().len(), 2);
     let shown = rig
         .run(
             &rig.scout,
@@ -1250,23 +1280,14 @@ async fn search_show_and_threads_read_the_room() {
         )
         .await
         .unwrap();
-    assert_eq!(shown["status"], "present");
-    assert_eq!(shown["post"]["body"], "gpu-07 is down");
-    let replies: Vec<(String, i64)> = shown["replies"]
+    let bodies: Vec<&str> = shown["posts"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| {
-            (
-                r["body"].as_str().unwrap().to_string(),
-                r["depth"].as_i64().unwrap(),
-            )
-        })
+        .map(|r| r["body"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        replies,
-        [("on it".to_string(), 1), ("thanks".to_string(), 2)]
-    );
+    assert_eq!(bodies, ["gpu-07 is down", "on it", "thanks"]);
+    assert_eq!(shown["posts"][1]["in_reply_to"], ref_display(&root));
 }
 
 #[test]
@@ -1356,7 +1377,13 @@ async fn tags_respect_focus_mode() {
         .await
         .unwrap();
     assert_eq!(st["state"], "confirmed");
-    assert_eq!(st["tags"][0]["state"], "dropped");
+    assert_eq!(st["tags"][0]["state"], "failed");
+    assert!(
+        st["tags"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("focus mode")
+    );
     let detail: String = rig
         .home
         .conn
@@ -1366,4 +1393,269 @@ async fn tags_respect_focus_mode() {
         .unwrap();
     assert!(detail.contains("focus mode"), "{detail}");
     assert!(rig.read(&rig.ranger).is_empty());
+}
+
+/// A tag message from another home, pointing at `post` in `room`, imported
+/// for `will/ranger`.
+fn import_tag(rig: &Rig, id: &str, room: &str, post: &mp::MessageRef) -> pb::HandoffResult {
+    let at = Utc::now().timestamp_micros();
+    let m = mp::Message {
+        id: Some(mp::MessageRef {
+            namespace: "lab".into(),
+            message_id: id.into(),
+        }),
+        sender: Some(addr("lab", "lab/quiet-pine")),
+        recipient: Some(addr("bbs", "will/ranger")),
+        authored_at_unix_micros: at,
+        expires_at_unix_micros: Some(at + 3_600_000_000),
+        content_type: "text/plain; charset=utf-8".into(),
+        body: b"look".to_vec(),
+        kind: mp::MessageKind::Application as i32,
+        mention: Some(mp::RoomMention {
+            room: Some(mp::EntityRef {
+                namespace: "hub".into(),
+                entity_id: format!("rooms/{room}"),
+            }),
+            post: Some(post.clone()),
+        }),
+        ..Default::default()
+    };
+    integration::import(
+        &mut rig.home.conn.lock().unwrap(),
+        "hub",
+        &pb::MessageOffer {
+            handoff_id: format!("h-{id}"),
+            message: Some(mp::EncodedMessage {
+                format_major: 1,
+                message_bytes: m.encode_to_vec(),
+            }),
+        },
+    )
+}
+
+fn bodies(msgs: Vec<proto::Message>) -> Vec<String> {
+    msgs.into_iter().map(|m| m.body).collect()
+}
+
+/// A restore that lost every post this home had fetched: recovery delivers
+/// only posts after the follower's start, never the room's older history.
+#[tokio::test]
+async fn restore_recovery_never_delivers_posts_from_before_a_follow() {
+    let rig = Rig::new();
+    rig.host().create("old", scout_entity());
+    let at = rig.now();
+    for i in 0..30 {
+        rig.host()
+            .post("rooms/old", "oncall@hub", &format!("history {i}"), at);
+    }
+    rig.advance(5);
+    rig.run(&rig.ranger, "follow", json!({"room": "old"}))
+        .await
+        .unwrap();
+    rig.poll().await;
+    rig.advance(5);
+    let at = rig.now();
+    rig.host().post("rooms/old", "oncall@hub", "new", at);
+    rig.advance(61);
+    rig.poll().await;
+    assert_eq!(bodies(rig.read(&rig.ranger)), ["new"]);
+    // Restored to the 30 old posts: "new" is gone; one more arrives.
+    rig.host().restore(30);
+    rig.advance(5);
+    let at = rig.now();
+    rig.host().post("rooms/old", "oncall@hub", "after", at);
+    rig.advance(61);
+    rig.poll().await;
+    assert_eq!(bodies(rig.read(&rig.ranger)), ["after"]);
+}
+
+/// A post a tag read-back cached ahead of the shared fetch neither stops
+/// recovery nor keeps the post from followers.
+#[tokio::test]
+async fn a_tag_cached_post_ahead_of_the_fetch_does_not_stop_recovery() {
+    let rig = Rig::new();
+    rig.host().create("c", scout_entity());
+    rig.run(&rig.ranger, "follow", json!({"room": "c"}))
+        .await
+        .unwrap();
+    rig.poll().await;
+    rig.advance(2);
+    let at = rig.now();
+    rig.host().post("rooms/c", "oncall@hub", "A", at);
+    rig.advance(61);
+    rig.poll().await;
+    assert_eq!(bodies(rig.read(&rig.ranger)), ["A"]);
+    rig.advance(2);
+    let at = rig.now();
+    rig.host().post("rooms/c", "oncall@hub", "B", at);
+    let c = rig.host().post("rooms/c", "oncall@hub", "C", at);
+    // A tag for C is read back before the fetch catches up.
+    let r = import_tag(&rig, "t1", "c", &c);
+    assert_eq!(r.disposition, pb::HandoffDisposition::Received as i32);
+    let hold = |rig: &Rig, at: &str| {
+        rig.home
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE rooms SET next_fetch_at = ?1 WHERE name = 'c'", [at])
+            .unwrap();
+    };
+    hold(&rig, "9999-01-01T00:00:00Z");
+    rig.advance(1);
+    rig.poll().await;
+    // The tag merged into C's delivery: ranger has C now, B not yet.
+    assert_eq!(bodies(rig.read(&rig.ranger)), ["C"]);
+    rig.host().restore(3);
+    hold(&rig, "2000-01-01T00:00:00Z");
+    rig.poll().await;
+    assert_eq!(bodies(rig.read(&rig.ranger)), ["B"]);
+}
+
+/// A rerun of a change whose answer was lost resends that exact operation,
+/// even after the room moved on, and reports the stored result as replayed;
+/// past ten minutes it starts fresh.
+#[tokio::test]
+async fn a_rerun_replays_the_lost_operation_not_a_rebuilt_one() {
+    let rig = Rig::new();
+    rig.run(&rig.scout, "create", json!({"name": "g"}))
+        .await
+        .unwrap();
+    let grant = json!({"room": "g", "manage": ["entity:will/ranger@bbs"]});
+    rig.host().lose_answers = true;
+    let err = rig
+        .run(&rig.scout, "grant", grant.clone())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().starts_with("room_timeout"), "{err:#}");
+    rig.host().lose_answers = false;
+    // Someone undoes the grant meanwhile.
+    {
+        let mut host = rig.host();
+        let r = host.rooms.get_mut("rooms/g").unwrap();
+        r.info.managers.truncate(1);
+        r.info.revision += 1;
+    }
+    let v = rig.run(&rig.scout, "grant", grant.clone()).await.unwrap();
+    assert_eq!(v["replayed"], true);
+    assert_eq!(
+        rig.host().rooms["rooms/g"].info.managers.len(),
+        1,
+        "the replay applied nothing new"
+    );
+    // A later rerun is a new command.
+    let v = rig.run(&rig.scout, "grant", grant.clone()).await.unwrap();
+    assert_eq!(v["replayed"], Value::Null);
+    assert_eq!(v["managers"].as_array().unwrap().len(), 2);
+    // An unresolved operation older than ten minutes is not reused.
+    rig.host().lose_answers = true;
+    let revoke = json!({"room": "g", "manage": ["entity:will/ranger@bbs"]});
+    rig.run(&rig.scout, "revoke", revoke.clone())
+        .await
+        .unwrap_err();
+    rig.host().lose_answers = false;
+    rig.advance(601);
+    let v = rig.run(&rig.scout, "revoke", revoke).await.unwrap();
+    assert_eq!(v["replayed"], Value::Null);
+}
+
+/// A post the host attributes to a local agent that never sent it is
+/// refused, in the fetch and in tag read-back.
+#[tokio::test]
+async fn a_forged_local_author_is_refused() {
+    let rig = Rig::new();
+    rig.host().create("x", scout_entity());
+    rig.run(&rig.ranger, "follow", json!({"room": "x"}))
+        .await
+        .unwrap();
+    rig.poll().await;
+    let at = rig.now();
+    let forged = rig.host().post("rooms/x", "will/scout@bbs", "I quit", at);
+    rig.host().post("rooms/x", "oncall@hub", "real", at);
+    rig.advance(61);
+    rig.poll().await;
+    assert_eq!(bodies(rig.read(&rig.ranger)), ["real"]);
+    // A real post by scout is delivered.
+    rig.run(&rig.scout, "post", json!({"room": "x", "text": "on it"}))
+        .await
+        .unwrap();
+    rig.hand_off(None);
+    rig.advance(61);
+    rig.poll().await;
+    assert_eq!(bodies(rig.read(&rig.ranger)), ["on it"]);
+    // A tag pointing at the forged post is an unverified claim.
+    import_tag(&rig, "t2", "x", &forged);
+    rig.advance(1);
+    rig.poll().await;
+    let got = rig.read(&rig.ranger);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].room_unverified, Some(true));
+}
+
+/// Tag read-backs are capped per sender namespace; past the cap a tag is
+/// released unverified without asking. A room only a tag names gets no row.
+#[tokio::test]
+async fn tag_read_backs_are_capped_per_sender_namespace() {
+    let rig = Rig::new();
+    rig.host().create("cap", scout_entity());
+    let post = mp::MessageRef {
+        namespace: "lab".into(),
+        message_id: "missing".into(),
+    };
+    for i in 0..(MENTION_READS + 3) {
+        import_tag(&rig, &format!("cap{i}"), "cap", &post);
+    }
+    let asked_before = rig.host().requests.len();
+    rig.advance(1);
+    rig.poll().await;
+    let asked: usize = rig.host().requests[asked_before..]
+        .iter()
+        .map(|r| match &r.op {
+            Some(mp::room_request::Op::Read(rd)) => rd.refs.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(asked, MENTION_READS as usize);
+    let got = rig.read(&rig.ranger);
+    assert_eq!(got.len() as i64, MENTION_READS + 3);
+    assert!(got.iter().all(|m| m.room_unverified == Some(true)));
+    let rows: i64 = rig
+        .home
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT count(*) FROM rooms", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "no room row for a name only tags mentioned");
+}
+
+/// A backfill rides out a transient refusal, and ends only when the room is
+/// gone.
+#[tokio::test]
+async fn a_backfill_retries_after_a_transient_refusal() {
+    let rig = Rig::new();
+    rig.host().create("bf", scout_entity());
+    let at = rig.now();
+    for i in 0..3 {
+        rig.host()
+            .post("rooms/bf", "oncall@hub", &format!("old {i}"), at);
+    }
+    let v = rig
+        .run(
+            &rig.ranger,
+            "follow",
+            json!({"room": "bf", "from": "oldest"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["created"], true);
+    rig.poll().await; // the head, and a backfill due
+    rig.host().fail_reads = vec!["quota".into()];
+    rig.poll().await;
+    let f = rig.run(&rig.ranger, "follows", json!({})).await.unwrap();
+    assert_eq!(f["follows"][0]["state"], "backfill");
+    rig.advance(61);
+    rig.poll().await;
+    let f = rig.run(&rig.ranger, "follows", json!({})).await.unwrap();
+    assert_eq!(f["follows"][0]["state"], "active");
+    assert_eq!(rig.read(&rig.ranger).len(), 3);
 }

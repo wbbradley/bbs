@@ -51,6 +51,12 @@ CREATE TABLE room_follows (
   backfill_cursor BLOB,
   backfill_until INTEGER,
   backfill_count INTEGER NOT NULL DEFAULT 0,
+  -- When a backfill page that got no usable answer is tried again.
+  backfill_next_at TEXT,
+  -- The host's acceptance time of the post the follow started after (its
+  -- head when it became active; '' from the oldest): restore recovery gives
+  -- it only posts accepted after this.
+  start_accepted_at TEXT,
   last_wake_at TEXT,
   created_at TEXT NOT NULL,
   UNIQUE(room_id, follower_address_id)
@@ -79,6 +85,9 @@ CREATE TABLE room_posts (
   content_type TEXT NOT NULL,
   body TEXT NOT NULL,
   notice INTEGER NOT NULL CHECK(notice IN (0, 1)),
+  -- Imported by the shared fetch (contiguous progress), not only cached by
+  -- a tag read-back or a backfill: only these stop restore recovery.
+  fetched INTEGER NOT NULL DEFAULT 0 CHECK(fetched IN (0, 1)),
   UNIQUE(room_id, ref_namespace, ref_message_id)
 );
 CREATE INDEX room_posts_position ON room_posts(room_id, epoch, position);
@@ -113,16 +122,20 @@ CREATE TABLE room_operations (
   id INTEGER PRIMARY KEY,
   requester_address_id INTEGER NOT NULL REFERENCES entity_addresses(id),
   host TEXT NOT NULL,
-  -- A digest of the command's contents: a rerun of the same command reuses
-  -- the pending operation.
-  fingerprint TEXT NOT NULL,
+  -- A digest of the command (verb, room and arguments): a rerun of the same
+  -- command reuses the pending operation while it is young.
+  command TEXT NOT NULL,
+  room TEXT NOT NULL,
   operation_id TEXT NOT NULL UNIQUE,
-  state TEXT NOT NULL CHECK(state IN ('pending', 'answered')),
+  -- The exact operation sent (RoomCreate or RoomUpdate, with its
+  -- expected_revision), resent unchanged by a rerun.
+  request BLOB NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('pending', 'answered', 'abandoned')),
   created_at TEXT NOT NULL,
   answered_at TEXT
 );
-CREATE UNIQUE INDEX room_operations_pending
-  ON room_operations(requester_address_id, host, fingerprint) WHERE state = 'pending';
+CREATE INDEX room_operations_pending
+  ON room_operations(requester_address_id, host, command) WHERE state = 'pending';
 
 -- What became of each room post this installation sent (D9), independent of
 -- follows. The handoff's own state is the outbox's; this adds the read-back.
@@ -151,7 +164,8 @@ CREATE TABLE room_tags (
   id INTEGER PRIMARY KEY,
   post_message_id INTEGER NOT NULL REFERENCES messages(id),
   target TEXT NOT NULL,
-  state TEXT NOT NULL CHECK(state IN ('held', 'sent', 'dropped')),
+  -- dropped: the post ended unconfirmed; failed: sending the tag failed.
+  state TEXT NOT NULL CHECK(state IN ('held', 'sent', 'dropped', 'failed')),
   tag_message_id INTEGER REFERENCES messages(id),
   detail TEXT,
   UNIQUE(post_message_id, target)
@@ -163,7 +177,13 @@ CREATE TABLE room_tags (
 CREATE TABLE room_mentions (
   message_id INTEGER PRIMARY KEY REFERENCES messages(id),
   recipient_address_id INTEGER NOT NULL REFERENCES entity_addresses(id),
-  room_id INTEGER NOT NULL REFERENCES rooms(id),
+  -- The room as the tag names it; no rooms row is made for it until its host
+  -- shows the post.
+  room_host TEXT NOT NULL,
+  room_name TEXT NOT NULL,
+  sender_namespace TEXT NOT NULL,
+  -- When it was last read back: read-backs are capped per sender namespace.
+  asked_at TEXT,
   post_namespace TEXT NOT NULL,
   post_message_id TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('pending', 'merged', 'unverified')),
@@ -176,13 +196,15 @@ CREATE TABLE room_mentions (
 );
 CREATE INDEX room_mentions_pending ON room_mentions(next_check_at) WHERE state = 'pending';
 CREATE INDEX room_mentions_held ON room_mentions(recipient_address_id) WHERE held = 1;
+CREATE INDEX room_mentions_asked ON room_mentions(sender_namespace, asked_at);
 
 -- The tag budget (D10): when a tag last woke each recipient for each room. A
 -- tag wakes a recipient at most once per room per wake_coalesce (a minute);
 -- others are delivered quietly, at its next read.
 CREATE TABLE room_tag_wakes (
   recipient_address_id INTEGER NOT NULL REFERENCES entity_addresses(id),
-  room_id INTEGER NOT NULL REFERENCES rooms(id),
+  room_host TEXT NOT NULL,
+  room_name TEXT NOT NULL,
   woke_at TEXT NOT NULL,
-  PRIMARY KEY(recipient_address_id, room_id)
+  PRIMARY KEY(recipient_address_id, room_host, room_name)
 );

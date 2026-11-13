@@ -152,7 +152,12 @@ pub(super) fn decode_record(rec: &mp::RoomRecord) -> Option<Fetched> {
 /// Store a fetched post once per room; returns its row and whether it was
 /// new. A post seen again (after a restore) keeps its row and moves to its
 /// new position and epoch.
-pub(super) fn upsert_post(ctx: &Ctx, room: &Room, f: &Fetched) -> Result<(i64, bool)> {
+pub(super) fn upsert_post(
+    ctx: &Ctx,
+    room: &Room,
+    f: &Fetched,
+    fetched: bool,
+) -> Result<(i64, bool)> {
     let m = &f.message;
     let id = m.id.as_ref().unwrap();
     let existing: Option<i64> = ctx
@@ -166,8 +171,9 @@ pub(super) fn upsert_post(ctx: &Ctx, room: &Room, f: &Fetched) -> Result<(i64, b
         .optional()?;
     if let Some(post) = existing {
         ctx.conn.execute(
-            "UPDATE room_posts SET position = ?2, epoch = ?3, cursor = ?4 WHERE id = ?1",
-            params![post, f.position, room.epoch, f.cursor],
+            "UPDATE room_posts SET position = ?2, epoch = ?3, cursor = ?4,
+                 fetched = max(fetched, ?5) WHERE id = ?1",
+            params![post, f.position, room.epoch, f.cursor, fetched],
         )?;
         return Ok((post, false));
     }
@@ -187,8 +193,8 @@ pub(super) fn upsert_post(ctx: &Ctx, room: &Room, f: &Fetched) -> Result<(i64, b
         "INSERT INTO room_posts (room_id, ref_namespace, ref_message_id, position, epoch, cursor,
              accepted_at, authored_at, author_namespace, author_entity_id, author_address_id,
              author_run_id, in_reply_to_namespace, in_reply_to_message_id, content_type, body,
-             notice)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             notice, fetched)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             room.id,
             id.namespace,
@@ -207,9 +213,65 @@ pub(super) fn upsert_post(ctx: &Ctx, room: &Room, f: &Fetched) -> Result<(i64, b
             m.content_type,
             body,
             notice,
+            fetched,
         ],
     )?;
     Ok((ctx.conn.last_insert_rowid(), true))
+}
+
+/// Whether the host attributes post `f` to one of this installation's own
+/// entities although this installation never sent that message to this
+/// room: such a report is refused, so a host cannot put words in a local
+/// agent's mouth.
+pub(super) fn forged(ctx: &Ctx, room: &RoomName, f: &Fetched) -> Result<bool> {
+    let m = &f.message;
+    let author = m.sender.as_ref().and_then(|s| s.entity.as_ref());
+    let local = db::namespace(ctx.conn)?;
+    let Some(author) = author.filter(|a| a.namespace == local) else {
+        return Ok(false);
+    };
+    let id = m.id.as_ref().unwrap();
+    if id.namespace != local {
+        return Ok(true);
+    }
+    let sent: bool = ctx.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM messages m
+             JOIN entity_addresses sa ON sa.id = m.sender_address_id
+             JOIN entities se ON se.id = sa.entity_id
+             JOIN entity_addresses ra ON ra.id = m.recipient_address_id
+             JOIN entities re ON re.id = ra.entity_id
+             WHERE m.origin_namespace = ?1 AND m.origin_message_id = ?2
+               AND se.namespace = ?1 AND se.entity_id = ?3
+               AND re.namespace = ?4 AND re.entity_id = ?5)",
+        params![
+            local,
+            id.message_id,
+            author.entity_id,
+            room.host,
+            room.path()
+        ],
+        |r| r.get(0),
+    )?;
+    Ok(!sent)
+}
+
+/// Store a fetched post unless its author is forged ([`forged`]); None for
+/// one refused.
+pub(super) fn admit(
+    ctx: &Ctx,
+    room: &Room,
+    f: &Fetched,
+    fetched: bool,
+) -> Result<Option<(i64, bool)>> {
+    if forged(ctx, &room.name, f)? {
+        tracing::warn!(
+            room = room.name.display(),
+            post = f.message.id.as_ref().map(super::ref_display),
+            "refused a post the host attributes to a local agent that did not send it"
+        );
+        return Ok(None);
+    }
+    upsert_post(ctx, room, f, fetched).map(Some)
 }
 
 /// Queue post `post` for `follower`, once per follower; returns whether it
@@ -239,12 +301,15 @@ pub(super) struct Follow {
     pub wake: bool,
     pub start_position: Option<i64>,
     pub epoch: Option<i64>,
+    /// The host's acceptance time of the post it started after.
+    pub start_accepted: String,
 }
 
 pub(super) fn follows(conn: &Connection, room: i64) -> Result<Vec<Follow>> {
     Ok(conn
         .prepare(
-            "SELECT follower_address_id, mode = 'wake', start_position, epoch
+            "SELECT follower_address_id, mode = 'wake', start_position, epoch,
+                    coalesce(start_accepted_at, '')
              FROM room_follows WHERE room_id = ?1 ORDER BY id",
         )?
         .query_map([room], |r| {
@@ -253,6 +318,7 @@ pub(super) fn follows(conn: &Connection, room: i64) -> Result<Vec<Follow>> {
                 wake: r.get(1)?,
                 start_position: r.get(2)?,
                 epoch: r.get(3)?,
+                start_accepted: r.get(4)?,
             })
         })?
         .collect::<Result<_, _>>()?)
@@ -326,27 +392,37 @@ pub(super) fn start_fetch(
     page: &mp::RoomPage,
 ) -> Result<()> {
     let head = i64::try_from(page.head_position).unwrap_or(i64::MAX);
+    // The head record's acceptance time starts follows from the head ('' for
+    // an empty room: every post is after it).
+    let accepted = page
+        .records
+        .iter()
+        .filter_map(decode_record)
+        .map(|f| f.accepted_at)
+        .max()
+        .unwrap_or_default();
     ctx.conn.execute(
         "UPDATE rooms SET fetch_cursor = ?2, fetch_position = ?3, failures = 0,
-             last_post_at = coalesce(last_post_at, ?4)
+             last_post_at = coalesce(nullif(?5, ''), last_post_at, ?4)
          WHERE id = ?1",
-        params![room.id, page.head_cursor, head, ctx.now_s],
+        params![room.id, page.head_cursor, head, ctx.now_s, accepted],
     )?;
     let room = super::store::room(ctx.conn, room.id)?;
-    join_pending(ctx, &room, head)?;
+    join_pending(ctx, &room, head, &accepted)?;
     schedule_fetch(ctx, cfg, room.id)
 }
 
 /// Start the room's pending follows at fetch position `at`: a follow from
 /// the head starts there; one from earlier also gets a backfill up to it.
-fn join_pending(ctx: &Ctx, room: &Room, at: i64) -> Result<()> {
+fn join_pending(ctx: &Ctx, room: &Room, at: i64, accepted: &str) -> Result<()> {
     ctx.conn.execute(
         "UPDATE room_follows SET start_position = ?2, epoch = ?3,
              backfill_cursor = CASE WHEN start_kind = 'head' THEN NULL
                  ELSE coalesce(start_cursor, x'') END,
-             backfill_until = CASE WHEN start_kind = 'head' THEN NULL ELSE ?2 END
+             backfill_until = CASE WHEN start_kind = 'head' THEN NULL ELSE ?2 END,
+             start_accepted_at = CASE WHEN start_kind = 'head' THEN ?4 ELSE '' END
          WHERE room_id = ?1 AND start_position IS NULL",
-        params![room.id, at, room.epoch],
+        params![room.id, at, room.epoch, accepted],
     )?;
     Ok(())
 }
@@ -366,7 +442,8 @@ pub(super) fn apply_page(
     // page, so its posts reach them through the shared fetch.
     ctx.conn.execute(
         "UPDATE room_follows SET start_position = ?2, epoch = ?3,
-             backfill_cursor = coalesce(start_cursor, x''), backfill_until = ?2
+             backfill_cursor = coalesce(start_cursor, x''), backfill_until = ?2,
+             start_accepted_at = ''
          WHERE room_id = ?1 AND start_position IS NULL AND start_kind != 'head'",
         params![room.id, before, room.epoch],
     )?;
@@ -390,7 +467,9 @@ pub(super) fn apply_page(
         }
         position = Some(f.position);
         last_post = Some(f.accepted_at.clone());
-        let (post, _) = upsert_post(ctx, room, &f)?;
+        let Some((post, _)) = admit(ctx, room, &f, true)? else {
+            continue;
+        };
         for follow in &started {
             if f.position > follow.start_position.unwrap()
                 && queue_delivery(ctx, room.id, follow.follower, post, "follow", follow.wake)?
@@ -413,7 +492,8 @@ pub(super) fn apply_page(
     // Follows from the head start at the head this read saw.
     let head = i64::try_from(page.head_position).unwrap_or(i64::MAX);
     ctx.conn.execute(
-        "UPDATE room_follows SET start_position = ?2, epoch = ?3
+        "UPDATE room_follows SET start_position = ?2, epoch = ?3,
+             start_accepted_at = (SELECT coalesce(last_post_at, '') FROM rooms WHERE id = ?1)
          WHERE room_id = ?1 AND start_position IS NULL AND start_kind = 'head'",
         params![room.id, head.max(position.unwrap_or(0)), room.epoch],
     )?;
@@ -463,9 +543,11 @@ pub(super) fn end_follows(ctx: &Ctx, room: &Room, code: &str, detail: &str) -> R
 /// Restore recovery (D7, D8), in one transaction: the host's log was
 /// restored or replaced, so the room's epoch moves on. `records` were read
 /// backward from the head noted when recovery began (`head`, `head_cursor`),
-/// down to a post already fetched or the bound (`bounded`). Posts not seen
-/// before go to every started follow; every follow then starts at the noted
-/// head in the new epoch, as the fetch does. Backfills in progress end.
+/// down to a post the shared fetch had delivered, a post older than every
+/// follow's start, or the bound (`bounded`). Each is offered to every started
+/// follow whose start it is after, cached or not (per-follower uniqueness
+/// deduplicates); every follow then starts at the noted head in the new
+/// epoch, as the fetch does. Backfills in progress end.
 pub(super) fn recover(
     ctx: &Ctx,
     cfg: &RoomConfig,
@@ -490,16 +572,19 @@ pub(super) fn recover(
     let mut fetched: Vec<Fetched> = records.iter().filter_map(decode_record).collect();
     fetched.sort_by_key(|f| f.position);
     for f in &fetched {
-        let (post, new) = upsert_post(ctx, &room, f)?;
-        if !new {
+        let Some((post, _)) = admit(ctx, &room, f, true)? else {
             continue;
-        }
+        };
         for follow in &started {
-            if queue_delivery(ctx, room.id, follow.follower, post, "recovery", follow.wake)? {
+            if f.accepted_at > follow.start_accepted
+                && queue_delivery(ctx, room.id, follow.follower, post, "recovery", follow.wake)?
+            {
                 queued += 1;
             }
         }
     }
+    // Every follow now starts at the noted head: its acceptance time.
+    let head_accepted = fetched.iter().map(|f| f.accepted_at.clone()).max();
     let backfilling: Vec<i64> = ctx
         .conn
         .prepare(
@@ -523,9 +608,9 @@ pub(super) fn recover(
     }
     ctx.conn.execute(
         "UPDATE room_follows SET start_position = ?2, epoch = ?3, backfill_cursor = NULL,
-             backfill_until = NULL
+             backfill_until = NULL, start_accepted_at = coalesce(?4, start_accepted_at)
          WHERE room_id = ?1 AND start_position IS NOT NULL",
-        params![room.id, head, epoch],
+        params![room.id, head, epoch, head_accepted],
     )?;
     if bounded {
         for f in &started {
@@ -555,11 +640,13 @@ pub(super) fn recover(
     Ok(queued)
 }
 
-/// Whether a post with this reference is already stored for the room.
-pub(super) fn known_post(conn: &Connection, room: i64, r: &mp::MessageRef) -> Result<bool> {
+/// Whether the shared fetch delivered the post with this reference: its
+/// contiguous progress, which alone stops restore recovery (a post only a
+/// tag read-back or a backfill cached does not).
+pub(super) fn fetched_post(conn: &Connection, room: i64, r: &mp::MessageRef) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM room_posts WHERE room_id = ?1 AND ref_namespace = ?2
-             AND ref_message_id = ?3)",
+             AND ref_message_id = ?3 AND fetched = 1)",
         params![room, r.namespace, r.message_id],
         |r| r.get(0),
     )?)
@@ -575,15 +662,17 @@ pub(super) struct Backfill {
     pub count: i64,
 }
 
-pub(super) fn backfills(conn: &Connection) -> Result<Vec<Backfill>> {
-    Ok(conn
+pub(super) fn backfills(ctx: &Ctx) -> Result<Vec<Backfill>> {
+    Ok(ctx
+        .conn
         .prepare(
             "SELECT f.id, f.room_id, f.follower_address_id, f.backfill_cursor, f.backfill_until,
                     f.backfill_count
              FROM room_follows f JOIN rooms r ON r.id = f.room_id
-             WHERE f.backfill_until IS NOT NULL AND f.epoch = r.epoch AND r.ended IS NULL",
+             WHERE f.backfill_until IS NOT NULL AND f.epoch = r.epoch AND r.ended IS NULL
+               AND (f.backfill_next_at IS NULL OR f.backfill_next_at <= ?1)",
         )?
-        .query_map([], |r| {
+        .query_map([&ctx.now_s], |r| {
             Ok(Backfill {
                 follow: r.get(0)?,
                 room: r.get(1)?,
@@ -616,11 +705,13 @@ pub(super) fn apply_backfill(ctx: &Ctx, b: &Backfill, page: &mp::RoomPage) -> Re
             stopped = true;
             break;
         }
-        let (post, _) = upsert_post(ctx, &room, &f)?;
+        count += 1;
+        let Some((post, _)) = admit(ctx, &room, &f, false)? else {
+            continue;
+        };
         if queue_delivery(ctx, room.id, b.follower, post, "backfill", false)? {
             queued += 1;
         }
-        count += 1;
     }
     if count >= MAX_BACKFILL && !done {
         stopped = true;
@@ -651,11 +742,25 @@ pub(super) fn apply_backfill(ctx: &Ctx, b: &Backfill, page: &mp::RoomPage) -> Re
         )?;
     } else {
         ctx.conn.execute(
-            "UPDATE room_follows SET backfill_cursor = ?2, backfill_count = ?3 WHERE id = ?1",
+            "UPDATE room_follows SET backfill_cursor = ?2, backfill_count = ?3,
+                 backfill_next_at = NULL WHERE id = ?1",
             params![b.follow, page.next_cursor, count],
         )?;
     }
     Ok(queued)
+}
+
+/// A backfill page that got no usable answer (no answer, or a transient
+/// refusal such as quota): tried again after a quiet poll interval.
+pub(super) fn backfill_later(ctx: &Ctx, cfg: &RoomConfig, b: &Backfill) -> Result<()> {
+    ctx.conn.execute(
+        "UPDATE room_follows SET backfill_next_at = ?2 WHERE id = ?1",
+        params![
+            b.follow,
+            fmt_time(ctx.now + cfg.jittered(cfg.timers.poll_quiet))
+        ],
+    )?;
+    Ok(())
 }
 
 /// End a backfill the host can no longer serve, telling its follower.
@@ -847,7 +952,8 @@ pub(super) fn flush_due(ctx: &Ctx, cfg: &RoomConfig) -> Result<usize> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     for (follower, room) in tagged {
-        if tag_may_wake(ctx, cfg, follower, room)? {
+        let name = super::store::room(ctx.conn, room)?.name;
+        if tag_may_wake(ctx, cfg, follower, &name)? {
             delivered += flush(ctx, follower, Some(room))?;
         } else {
             // Over the tag budget: delivered quietly, at the next read.
@@ -965,8 +1071,8 @@ pub fn annotate(conn: &Connection, messages: &mut [proto::Message]) -> Result<()
         tagger_sql()
     ))?;
     let mut unverified = conn.prepare(
-        "SELECT 'rooms/' || r.name || '@' || r.host FROM room_mentions x
-         JOIN rooms r ON r.id = x.room_id WHERE x.message_id = ?1 AND x.state = 'unverified'",
+        "SELECT 'rooms/' || x.room_name || '@' || x.room_host FROM room_mentions x
+         WHERE x.message_id = ?1 AND x.state = 'unverified'",
     )?;
     for m in messages.iter_mut() {
         if let Some(room) = room_of
@@ -1020,69 +1126,98 @@ pub fn hold_mention(
     if post.namespace.is_empty() || post.message_id.is_empty() {
         bail!("a mention names an invalid post");
     }
+    // No rooms row: a name only a tag mentioned gets one when its host shows
+    // the post.
     conn.execute(
-        "INSERT INTO rooms (host, name, created_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(host, name) DO NOTHING",
-        params![room.namespace, name, now],
-    )?;
-    let room_id: i64 = conn.query_row(
-        "SELECT id FROM rooms WHERE host = ?1 AND name = ?2",
-        params![room.namespace, name],
-        |r| r.get(0),
-    )?;
-    conn.execute(
-        "INSERT INTO room_mentions (message_id, recipient_address_id, room_id, post_namespace,
-             post_message_id, state, next_check_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)",
+        "INSERT INTO room_mentions (message_id, recipient_address_id, room_host, room_name,
+             sender_namespace, post_namespace, post_message_id, state, next_check_at, created_at)
+         SELECT ?1, ?2, ?3, ?4, origin_namespace, ?5, ?6, 'pending', ?7, ?7
+         FROM messages WHERE id = ?1",
         params![
             message,
             recipient,
-            room_id,
+            room.namespace,
+            name,
             post.namespace,
             post.message_id,
             now
         ],
     )?;
-    // A tag reads its room at once (D7).
+    // A tag reads a followed room at once (D7).
     conn.execute(
-        "UPDATE rooms SET next_fetch_at = ?2, kicks = kicks + 1
-         WHERE id = ?1 AND next_fetch_at IS NOT NULL",
-        params![room_id, now],
+        "UPDATE rooms SET next_fetch_at = ?3, kicks = kicks + 1
+         WHERE host = ?1 AND name = ?2 AND next_fetch_at IS NOT NULL",
+        params![room.namespace, name, now],
     )?;
     Ok(())
 }
 
 /// A held tag due a read-back.
+#[derive(Debug, Clone)]
 pub(super) struct Mention {
     pub message: i64,
     pub recipient: i64,
-    pub room: i64,
+    pub room: RoomName,
     pub post: mp::MessageRef,
     pub checks: i64,
 }
 
-pub(super) fn due_mentions(ctx: &Ctx) -> Result<Vec<Mention>> {
-    Ok(ctx
+/// Held tags due a read-back. Read-backs are capped per sender namespace
+/// ([`MENTION_READS`] a minute, D10): past that, a tag is released at once as
+/// an unverified claim, without asking its host. Returns the ones to ask
+/// about, each marked asked.
+pub(super) fn due_mentions(ctx: &Ctx, cfg: &RoomConfig) -> Result<Vec<Mention>> {
+    let due: Vec<(Mention, String)> = ctx
         .conn
         .prepare(
-            "SELECT message_id, recipient_address_id, room_id, post_namespace, post_message_id,
-                    checks
+            "SELECT message_id, recipient_address_id, room_host, room_name, post_namespace,
+                    post_message_id, checks, sender_namespace
              FROM room_mentions WHERE state = 'pending' AND next_check_at <= ?1
-             ORDER BY room_id, message_id",
+             ORDER BY room_host, room_name, message_id",
         )?
         .query_map([&ctx.now_s], |r| {
-            Ok(Mention {
-                message: r.get(0)?,
-                recipient: r.get(1)?,
-                room: r.get(2)?,
-                post: mp::MessageRef {
-                    namespace: r.get(3)?,
-                    message_id: r.get(4)?,
+            Ok((
+                Mention {
+                    message: r.get(0)?,
+                    recipient: r.get(1)?,
+                    room: RoomName {
+                        host: r.get(2)?,
+                        name: r.get(3)?,
+                    },
+                    post: mp::MessageRef {
+                        namespace: r.get(4)?,
+                        message_id: r.get(5)?,
+                    },
+                    checks: r.get(6)?,
                 },
-                checks: r.get(5)?,
-            })
+                r.get(7)?,
+            ))
         })?
-        .collect::<Result<_, _>>()?)
+        .collect::<Result<_, _>>()?;
+    let since = fmt_time(ctx.now - cfg.d(60.0));
+    let mut ask = Vec::new();
+    for (m, sender) in due {
+        let asked: i64 = ctx.conn.query_row(
+            "SELECT count(*) FROM room_mentions WHERE sender_namespace = ?1 AND asked_at > ?2",
+            params![sender, since],
+            |r| r.get(0),
+        )?;
+        if asked >= super::MENTION_READS {
+            tracing::info!(
+                message = m.message,
+                sender,
+                "over the tag read-back cap; releasing the tag unverified"
+            );
+            unverified(ctx, cfg, &m)?;
+            continue;
+        }
+        ctx.conn.execute(
+            "UPDATE room_mentions SET asked_at = ?2 WHERE message_id = ?1",
+            params![m.message, ctx.now_s],
+        )?;
+        ask.push(m);
+    }
+    Ok(ask)
 }
 
 /// What a read-back found for one reference.
@@ -1101,9 +1236,13 @@ pub(super) enum Found<'a> {
 pub(super) fn settle_mention(ctx: &Ctx, cfg: &RoomConfig, m: &Mention, found: Found) -> Result<()> {
     match found {
         Found::Present(rec) => {
-            let room = room(ctx.conn, m.room)?;
             let f = decode_record(rec).context("an unreadable room record")?;
-            let (post, _) = upsert_post(ctx, &room, &f)?;
+            // The host showed the post: the room is real now.
+            let id = room_id(ctx, &m.room)?;
+            let room = room(ctx.conn, id)?;
+            let Some((post, _)) = admit(ctx, &room, &f, false)? else {
+                return unverified(ctx, cfg, m);
+            };
             let state: Option<String> = ctx
                 .conn
                 .query_row(
@@ -1175,7 +1314,7 @@ fn unverified(ctx: &Ctx, cfg: &RoomConfig, m: &Mention) -> Result<()> {
 /// Deliver a settled tag's own message: at once if the tag budget lets it
 /// wake its recipient, else held for the recipient's next read.
 fn deliver_tag(ctx: &Ctx, cfg: &RoomConfig, m: &Mention) -> Result<()> {
-    if tag_may_wake(ctx, cfg, m.recipient, m.room)? {
+    if tag_may_wake(ctx, cfg, m.recipient, &m.room)? {
         dbi::insert_delivery(ctx.conn, m.message, m.recipient)?;
     } else {
         ctx.conn.execute(
@@ -1188,13 +1327,14 @@ fn deliver_tag(ctx: &Ctx, cfg: &RoomConfig, m: &Mention) -> Result<()> {
 
 /// The tag budget (D10): whether a tag may wake `recipient` for `room` now,
 /// at most once per room per `wake_coalesce`; spends it when it may.
-fn tag_may_wake(ctx: &Ctx, cfg: &RoomConfig, recipient: i64, room: i64) -> Result<bool> {
+fn tag_may_wake(ctx: &Ctx, cfg: &RoomConfig, recipient: i64, room: &RoomName) -> Result<bool> {
     let since = fmt_time(ctx.now - cfg.d(cfg.timers.wake_coalesce));
     let n = ctx.conn.execute(
-        "INSERT INTO room_tag_wakes (recipient_address_id, room_id, woke_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(recipient_address_id, room_id) DO UPDATE SET woke_at = excluded.woke_at
-         WHERE room_tag_wakes.woke_at <= ?4",
-        params![recipient, room, ctx.now_s, since],
+        "INSERT INTO room_tag_wakes (recipient_address_id, room_host, room_name, woke_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(recipient_address_id, room_host, room_name)
+         DO UPDATE SET woke_at = excluded.woke_at WHERE room_tag_wakes.woke_at <= ?5",
+        params![recipient, room.host, room.name, ctx.now_s, since],
     )?;
     Ok(n == 1)
 }
@@ -1220,13 +1360,12 @@ pub(super) fn record_post(ctx: &Ctx, message: i64, room: i64, tags: &[String]) -
 /// A room post's outcome (D9) and its tags.
 #[derive(Debug, Clone)]
 pub(super) struct Outcome {
-    pub message: i64,
     pub origin: mp::MessageRef,
     pub room: RoomName,
     pub state: &'static str,
     pub reason: Option<String>,
-    pub position: Option<i64>,
-    pub tags: Vec<(String, String)>,
+    /// Each tag: its target, state and why (a failed send, a dropped post).
+    pub tags: Vec<(String, String, Option<String>)>,
 }
 
 impl Outcome {
@@ -1265,7 +1404,7 @@ pub(super) fn outcome(conn: &Connection, message: i64) -> Result<Option<Outcome>
             },
         )
         .optional()?;
-    let Some((origin, room, readback, reason, position, handoff, detail)) = row else {
+    let Some((origin, room, readback, reason, _position, handoff, detail)) = row else {
         return Ok(None);
     };
     let handoff_reason = || {
@@ -1286,16 +1425,16 @@ pub(super) fn outcome(conn: &Connection, message: i64) -> Result<Option<Outcome>
         (_, Some(_)) => ("sent", None),
     };
     let tags = conn
-        .prepare("SELECT target, state FROM room_tags WHERE post_message_id = ?1 ORDER BY id")?
-        .query_map([message], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .prepare(
+            "SELECT target, state, detail FROM room_tags WHERE post_message_id = ?1 ORDER BY id",
+        )?
+        .query_map([message], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<_, _>>()?;
     Ok(Some(Outcome {
-        message,
         origin,
         room,
         state,
         reason,
-        position,
         tags,
     }))
 }
@@ -1428,8 +1567,8 @@ pub(super) fn settle_tags(ctx: &Ctx, message: i64) -> Result<()> {
     let held: Vec<String> = o
         .tags
         .iter()
-        .filter(|(_, s)| s == "held")
-        .map(|(t, _)| t.clone())
+        .filter(|(_, s, _)| s == "held")
+        .map(|(t, _, _)| t.clone())
         .collect();
     let told: bool = ctx.conn.query_row(
         "SELECT settled_at IS NOT NULL FROM room_post_outcomes WHERE message_id = ?1",
@@ -1609,7 +1748,7 @@ pub(super) fn send_tags(ctx: &Ctx, message: i64) -> Result<()> {
                 params![id, tag],
             )?,
             Err(err) => ctx.conn.execute(
-                "UPDATE room_tags SET state = 'dropped', detail = ?2 WHERE id = ?1",
+                "UPDATE room_tags SET state = 'failed', detail = ?2 WHERE id = ?1",
                 params![id, format!("{err:#}")],
             )?,
         };

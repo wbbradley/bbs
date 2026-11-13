@@ -229,6 +229,7 @@ dependencies = [
  "chrono",
  "croner",
  "data-encoding",
+ "futures-util",
  "http-body",
  "humantime",
  "prost",

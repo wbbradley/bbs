@@ -5423,16 +5423,23 @@ fn room_commands_run_on_the_server() {
     assert_eq!(v["mode"], "wake");
     assert_eq!(v["state"], "pending");
     let out = bbs.ok(&["--token", &token, "room", "follows"]);
-    assert_eq!(out, "rooms/war@hub (wake, pending)  0 undelivered\n");
+    assert_eq!(out, "rooms/war@hub (wake, pending)\n");
+    assert_eq!(v["created"], true);
     let err = bbs.err(&["--token", &token, "room", "info", "rooms/war@lab"]);
     assert!(
         err.contains("rooms are off: no integration is enabled"),
         "{err}"
     );
+    // With --json a failure is one flat object on stdout, and exit code 1.
+    let out = bbs.run(&["--token", &token, "room", "info", "rooms/war@lab", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"], "error");
+    assert!(v["detail"].as_str().unwrap().contains("no integration"));
     let err = bbs.err(&[
         "--token", &token, "room", "post", "war", "x", "--tag", "nope",
     ]);
     assert!(err.contains("invalid tag"), "{err}");
     let out = bbs.ok(&["--token", &token, "room", "unfollow", "war", "--json"]);
-    assert!(out.contains("\"unfollowed\":true"), "{out}");
+    assert!(out.contains("\"removed\":true"), "{out}");
 }

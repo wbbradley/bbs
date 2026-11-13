@@ -4,6 +4,9 @@
 //! made as [`FETCHER`], one stable entity for the whole installation.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use futures_util::stream::{self, StreamExt as _};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -11,7 +14,7 @@ use rusqlite::{Connection, params};
 
 use super::super::{Ctx, NO_CALLER, fmt_time, with_ctx_at};
 use super::store::{self, Found};
-use super::{FETCHER, MAX_RECOVERY, MAX_REFS, RoomConfig, RoomHome, RoomName};
+use super::{CONCURRENCY, FETCHER, MAX_RECOVERY, MAX_REFS, RoomConfig, RoomHome, RoomName};
 use crate::db;
 use crate::hub_proto::integration as pb;
 use crate::hub_proto::msgproto_v1 as mp;
@@ -149,8 +152,17 @@ pub(super) fn found<'a>(answer: &'a Answer, r: &mp::MessageRef) -> Found<'a> {
     }
 }
 
-/// One pass of room work. Returns when the next is due, if anything waits.
+/// One pass of room work. Post and tag read-backs go first, then routine
+/// catch-up fetches and backfills; within each, independent room requests
+/// run [`CONCURRENCY`] at a time, so one slow host delays no other room.
+/// Every import is still one transaction. Returns when the next pass is due.
 pub async fn poll_once<H: RoomHome>(home: &H, cfg: &RoomConfig) -> Result<Option<DateTime<Utc>>> {
+    if let Err(err) = readbacks(home, cfg).await {
+        tracing::warn!("reading back room posts: {err:#}");
+    }
+    if let Err(err) = mentions(home, cfg).await {
+        tracing::warn!("reading back room tags: {err:#}");
+    }
     let due: Vec<i64> = tx(home, |ctx| {
         Ok(ctx
             .conn
@@ -164,23 +176,21 @@ pub async fn poll_once<H: RoomHome>(home: &H, cfg: &RoomConfig) -> Result<Option
             .collect::<Result<_, _>>()?)
     })
     .await?;
-    for room in due {
-        if let Err(err) = fetch(home, cfg, room).await {
-            tracing::warn!(room, "reading a followed room: {err:#}");
-        }
-    }
-    let backfills = tx(home, |ctx| store::backfills(ctx.conn)).await?;
-    for b in backfills {
-        if let Err(err) = backfill(home, b).await {
-            tracing::warn!("a room backfill: {err:#}");
-        }
-    }
-    if let Err(err) = readbacks(home, cfg).await {
-        tracing::warn!("reading back room posts: {err:#}");
-    }
-    if let Err(err) = mentions(home, cfg).await {
-        tracing::warn!("reading back room tags: {err:#}");
-    }
+    stream::iter(due)
+        .for_each_concurrent(CONCURRENCY, |room| async move {
+            if let Err(err) = fetch(home, cfg, room).await {
+                tracing::warn!(room, "reading a followed room: {err:#}");
+            }
+        })
+        .await;
+    let backfills = tx(home, store::backfills).await?;
+    stream::iter(backfills)
+        .for_each_concurrent(CONCURRENCY, |b| async move {
+            if let Err(err) = backfill(home, cfg, b).await {
+                tracing::warn!("a room backfill: {err:#}");
+            }
+        })
+        .await;
     let cfg2 = cfg.clone();
     let delivered = tx(home, move |ctx| {
         store::settle_failed_handoffs(ctx)?;
@@ -218,11 +228,11 @@ fn next_due(ctx: &Ctx, cfg: &RoomConfig) -> Result<Option<DateTime<Utc>>> {
             |r| r.get(0),
         )?,
         store::next_wake(ctx, cfg)?,
-        // A backfill in progress continues at once.
+        // A backfill in progress continues at once, or after its backoff.
         ctx.conn.query_row(
-            "SELECT CASE WHEN EXISTS (SELECT 1 FROM room_follows f JOIN rooms r ON r.id = f.room_id
-                 WHERE f.backfill_until IS NOT NULL AND f.epoch = r.epoch AND r.ended IS NULL)
-             THEN ?1 END",
+            "SELECT min(coalesce(f.backfill_next_at, ?1)) FROM room_follows f
+             JOIN rooms r ON r.id = f.room_id
+             WHERE f.backfill_until IS NOT NULL AND f.epoch = r.epoch AND r.ended IS NULL",
             [&ctx.now_s],
             |r| r.get(0),
         )?,
@@ -244,6 +254,20 @@ async fn load<H: RoomHome>(
         let r = store::room(ctx.conn, room)?;
         let integration = store::integration_for(ctx, &r.name.host).map_err(|e| format!("{e:#}"));
         Ok((r, integration, fetcher(ctx.conn)?))
+    })
+    .await
+}
+
+/// The integration that reaches `room`'s host (or why there is none) and
+/// the fetcher's entity, for a room that may have no row.
+async fn route<H: RoomHome>(
+    home: &H,
+    room: &RoomName,
+) -> Result<(Result<String, String>, mp::EntityRef)> {
+    let host = room.host.clone();
+    tx(home, move |ctx| {
+        let integration = store::integration_for(ctx, &host).map_err(|e| format!("{e:#}"));
+        Ok((integration, fetcher(ctx.conn)?))
     })
     .await
 }
@@ -369,10 +393,22 @@ async fn refused<H: RoomHome>(
     unanswered(home, cfg, room.id, &format!("{code}: {detail}")).await
 }
 
-/// Restore recovery (D7): note the head, read backward from it to a post
-/// already fetched or [`MAX_RECOVERY`] posts, then apply it all at once.
+/// Restore recovery (D7, the build contract's rules): note the head, then
+/// read backward from it, stopping at a post the shared fetch delivered, at
+/// the first post older than every started follow's start, or at
+/// [`MAX_RECOVERY`] posts; then apply it all in one transaction.
 async fn recover<H: RoomHome>(home: &H, cfg: &RoomConfig, id: i64) -> Result<()> {
     let (room, integration, me) = load(home, id).await?;
+    // The oldest start among started follows; none started: nothing to give.
+    let oldest: Option<String> = tx(home, move |ctx| {
+        Ok(ctx.conn.query_row(
+            "SELECT min(coalesce(start_accepted_at, '')) FROM room_follows
+             WHERE room_id = ?1 AND start_position IS NOT NULL",
+            [id],
+            |r| r.get(0),
+        )?)
+    })
+    .await?;
     let mut records: Vec<mp::RoomRecord> = Vec::new();
     let mut head = None;
     let mut cursor = Vec::new();
@@ -410,26 +446,36 @@ async fn recover<H: RoomHome>(home: &H, cfg: &RoomConfig, id: i64) -> Result<()>
                 page.head_cursor.clone(),
             ));
         }
-        let refs: Vec<mp::MessageRef> = page
-            .records
-            .iter()
-            .filter_map(|r| store::decode_record(r).and_then(|f| f.message.id))
-            .collect();
-        let known = tx(home, move |ctx| {
-            for r in &refs {
-                if store::known_post(ctx.conn, id, r)? {
-                    return Ok(true);
+        let Some(oldest) = oldest.clone() else {
+            break;
+        };
+        // Newest first: keep records until a stop.
+        let newest_first: Vec<mp::RoomRecord> = page.records.iter().rev().cloned().collect();
+        let (kept, stop) = tx(home, move |ctx| {
+            let mut kept = Vec::new();
+            for rec in newest_first {
+                let Some(f) = store::decode_record(&rec) else {
+                    continue;
+                };
+                let r = f.message.id.clone().unwrap();
+                if f.accepted_at <= oldest || store::fetched_post(ctx.conn, id, &r)? {
+                    return Ok((kept, true));
                 }
+                kept.push(rec);
             }
-            Ok(false)
+            Ok((kept, false))
         })
         .await?;
-        let empty = page.records.is_empty();
-        records.extend(page.records);
-        if known || empty || page.next_cursor.is_empty() || page.next_cursor == cursor {
+        records.extend(kept);
+        if stop
+            || page.records.is_empty()
+            || page.next_cursor.is_empty()
+            || page.next_cursor == cursor
+        {
             break;
         }
         if records.len() >= MAX_RECOVERY {
+            records.truncate(MAX_RECOVERY);
             bounded = true;
             break;
         }
@@ -438,20 +484,19 @@ async fn recover<H: RoomHome>(home: &H, cfg: &RoomConfig, id: i64) -> Result<()>
     }
     let (head, head_cursor) = head.unwrap_or_default();
     let cfg = cfg.clone();
-    let queued = tx(home, move |ctx| {
+    tx(home, move |ctx| {
         let room = store::room(ctx.conn, id)?;
         store::recover(ctx, &cfg, &room, head, &head_cursor, &records, bounded)
     })
     .await?;
-    if queued > 0 {
-        home.changed();
-    }
     home.changed();
     Ok(())
 }
 
-/// One page of a follow's backfill (D7).
-async fn backfill<H: RoomHome>(home: &H, b: store::Backfill) -> Result<()> {
+/// One page of a follow's backfill (D7). It ends only when the host says
+/// the room is gone or closed to us (or its log was restored); no answer,
+/// or a transient refusal such as quota, tries again later.
+async fn backfill<H: RoomHome>(home: &H, cfg: &RoomConfig, b: store::Backfill) -> Result<()> {
     let (room, integration, me) = load(home, b.room).await?;
     let answer = ask(
         home,
@@ -464,22 +509,30 @@ async fn backfill<H: RoomHome>(home: &H, b: store::Backfill) -> Result<()> {
     match answer {
         Answer::Ok(a) => {
             let Some(mp::room_answer::Result::Page(page)) = a.result else {
-                return Ok(());
+                let cfg = cfg.clone();
+                return tx(home, move |ctx| store::backfill_later(ctx, &cfg, &b)).await;
             };
             tx(home, move |ctx| store::apply_backfill(ctx, &b, &page)).await?;
         }
-        Answer::Refused(code, detail, _) => {
+        Answer::Refused(code, detail, _)
+            if matches!(
+                code.as_str(),
+                "not_found" | "not_a_room" | "forbidden" | "cursor_invalid"
+            ) =>
+        {
             let why = format!("the host answered {code}: {detail}");
             tx(home, move |ctx| store::end_backfill(ctx, &b, &why)).await?;
             home.changed();
         }
-        // Tried again on the next pass.
-        Answer::Unavailable(..) => {}
+        Answer::Refused(..) | Answer::Unavailable(..) => {
+            let cfg = cfg.clone();
+            tx(home, move |ctx| store::backfill_later(ctx, &cfg, &b)).await?;
+        }
     }
     Ok(())
 }
 
-/// Read back pending posts, batched per room (D9).
+/// Read back pending posts, batched per room (D9), rooms concurrently.
 async fn readbacks<H: RoomHome>(home: &H, cfg: &RoomConfig) -> Result<()> {
     let cfg2 = cfg.clone();
     let due = tx(home, move |ctx| store::due_readbacks(ctx, &cfg2)).await?;
@@ -487,73 +540,82 @@ async fn readbacks<H: RoomHome>(home: &H, cfg: &RoomConfig) -> Result<()> {
     for (message, room, r) in due {
         by_room.entry(room).or_default().push((message, r));
     }
-    for (room, posts) in by_room {
-        for chunk in posts.chunks(MAX_REFS) {
-            let (r, integration, me) = load(home, room).await?;
-            let refs: Vec<mp::MessageRef> = chunk.iter().map(|(_, r)| r.clone()).collect();
-            let op = mp::room_request::Op::Read(mp::RoomRead {
-                mode: mp::RoomReadMode::Refs as i32,
-                refs,
-                ..Default::default()
-            });
-            let answer = ask(home, &integration, me, &r.name, op).await;
-            let chunk = chunk.to_vec();
-            let cfg = cfg.clone();
-            let answer = std::sync::Arc::new(answer);
-            tx(home, move |ctx| {
-                for (message, r) in &chunk {
-                    store::settle_readback(ctx, &cfg, *message, found(&answer, r))?;
-                }
-                Ok(())
-            })
-            .await?;
-        }
-    }
+    let jobs: Vec<(i64, Vec<(i64, mp::MessageRef)>)> = by_room
+        .into_iter()
+        .flat_map(|(room, posts)| {
+            posts
+                .chunks(MAX_REFS)
+                .map(|c| (room, c.to_vec()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    stream::iter(jobs)
+        .for_each_concurrent(CONCURRENCY, |(room, chunk)| async move {
+            let done = async {
+                let (r, integration, me) = load(home, room).await?;
+                let refs: Vec<mp::MessageRef> = chunk.iter().map(|(_, r)| r.clone()).collect();
+                let answer = Arc::new(ask(home, &integration, me, &r.name, refs_op(refs)).await);
+                let cfg = cfg.clone();
+                tx(home, move |ctx| {
+                    for (message, r) in &chunk {
+                        store::settle_readback(ctx, &cfg, *message, found(&answer, r))?;
+                    }
+                    Ok(())
+                })
+                .await
+            };
+            if let Err(err) = done.await {
+                tracing::warn!(room, "reading back room posts: {err:#}");
+            }
+        })
+        .await;
     Ok(())
 }
 
-/// Read back the posts received tags point at (D10).
+fn refs_op(refs: Vec<mp::MessageRef>) -> mp::room_request::Op {
+    mp::room_request::Op::Read(mp::RoomRead {
+        mode: mp::RoomReadMode::Refs as i32,
+        refs,
+        ..Default::default()
+    })
+}
+
+/// Read back the posts received tags point at (D10), rooms concurrently.
 async fn mentions<H: RoomHome>(home: &H, cfg: &RoomConfig) -> Result<()> {
-    let due = tx(home, store::due_mentions).await?;
-    let mut by_room: BTreeMap<i64, Vec<store::Mention>> = BTreeMap::new();
+    let cfg2 = cfg.clone();
+    let due = tx(home, move |ctx| store::due_mentions(ctx, &cfg2)).await?;
+    let mut by_room: BTreeMap<(String, String), Vec<store::Mention>> = BTreeMap::new();
     for m in due {
-        by_room.entry(m.room).or_default().push(m);
+        by_room
+            .entry((m.room.host.clone(), m.room.name.clone()))
+            .or_default()
+            .push(m);
     }
-    let mut any = false;
-    for (room, ms) in by_room {
-        for chunk in ms.chunks(MAX_REFS) {
-            let (r, integration, me) = load(home, room).await?;
-            let refs: Vec<mp::MessageRef> = chunk.iter().map(|m| m.post.clone()).collect();
-            let op = mp::room_request::Op::Read(mp::RoomRead {
-                mode: mp::RoomReadMode::Refs as i32,
-                refs,
-                ..Default::default()
-            });
-            let answer = std::sync::Arc::new(ask(home, &integration, me, &r.name, op).await);
-            let chunk: Vec<(i64, i64, i64, mp::MessageRef, i64)> = chunk
-                .iter()
-                .map(|m| (m.message, m.recipient, m.room, m.post.clone(), m.checks))
-                .collect();
-            let cfg = cfg.clone();
-            tx(home, move |ctx| {
-                for (message, recipient, room, post, checks) in chunk {
-                    let m = store::Mention {
-                        message,
-                        recipient,
-                        room,
-                        post,
-                        checks,
-                    };
-                    store::settle_mention(ctx, &cfg, &m, found(&answer, &m.post))?;
-                }
-                Ok(())
-            })
-            .await?;
-            any = true;
-        }
-    }
-    if any {
-        home.changed();
-    }
+    let jobs: Vec<Vec<store::Mention>> = by_room
+        .into_values()
+        .flat_map(|ms| ms.chunks(MAX_REFS).map(<[_]>::to_vec).collect::<Vec<_>>())
+        .collect();
+    stream::iter(jobs)
+        .for_each_concurrent(CONCURRENCY, |chunk| async move {
+            let done = async {
+                let room = chunk[0].room.clone();
+                let (integration, me) = route(home, &room).await?;
+                let refs: Vec<mp::MessageRef> = chunk.iter().map(|m| m.post.clone()).collect();
+                let answer = Arc::new(ask(home, &integration, me, &room, refs_op(refs)).await);
+                let cfg = cfg.clone();
+                tx(home, move |ctx| {
+                    for m in &chunk {
+                        store::settle_mention(ctx, &cfg, m, found(&answer, &m.post))?;
+                    }
+                    Ok(())
+                })
+                .await
+            };
+            if let Err(err) = done.await {
+                tracing::warn!("reading back room tags: {err:#}");
+            }
+        })
+        .await;
+    home.changed();
     Ok(())
 }

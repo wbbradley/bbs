@@ -41,6 +41,11 @@ pub const MAX_PER_ROOM: usize = 50;
 pub const MAX_BACKFILL: i64 = 500;
 /// The most posts restore recovery reads back (D7).
 pub const MAX_RECOVERY: usize = 1000;
+/// The most tag read-backs a minute for one sender namespace (D10); past it,
+/// tags are released as unverified without asking.
+pub const MENTION_READS: i64 = 30;
+/// The most room requests the poller has outstanding at once.
+pub const CONCURRENCY: usize = 8;
 /// The most references one read-back asks for (D2).
 pub const MAX_REFS: usize = 32;
 

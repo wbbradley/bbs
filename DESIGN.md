@@ -811,9 +811,13 @@ credential of the host, the answer's namespace, the signed request's hash and
 ID) and returns `remote_room_result`: the verified answer, or why there is
 none (`unavailable_code`, which means "no information"). The adapter keeps no
 room state. A room request for BBS's own namespace gets a signed
-`unsupported_op`. Changes (create, update) carry an operation ID saved in
-`room_operations` before the request goes and reused by a rerun until a signed
-answer arrives; updates send the revision from an Info just before.
+`unsupported_op`. A change (create, update) is saved in `room_operations`
+exactly as it will be sent (operation ID, full request with its
+`expected_revision`, keyed by the command's verb, room and arguments) before
+it goes. A rerun of the same command resends those exact bytes, never an
+update rebuilt from fresh Info, while the operation is unresolved and less
+than 10 minutes old, and reports `"replayed": true`; otherwise it reads Info
+and builds a new operation at that revision.
 
 **Follows** are local (`room_follows`): the room, the follower's address, a
 mode (`quiet` or `wake`) and where it starts. One poller task reads each
@@ -827,18 +831,32 @@ room timer and `ROOMS_TIMERS_JSON` sets any of them in seconds (`poll_wake`,
 `wake_coalesce`, `readback` (a list), `readback_every`, `unconfirmed_after`,
 `unconfirmed_every`, `unconfirmed_for`, `mention_retry` (a list), and
 `jitter` as a fraction), for tests and scenario harnesses; `BBS_ROOM_HOST`
-sets the default host (`hub`). With `--json`, a failed `bbs room` command
-also prints `{"error": {"code", "detail"}}`. A
-new follow starts at the head the first read after it sees; one `--from
+sets the default host (`hub`). Reads, read-backs, backfills and fetches for
+different rooms run up to 8 at a time, post and tag read-backs before
+routine catch-up fetches, so one slow host delays no other room; each import
+is still one transaction. A new follow starts at the head the first read after it sees; one `--from
 oldest` or a cursor also gets a one-off backfill up to the shared cursor's
-position when it joined (at most 500 posts). Each AFTER page is one
-transaction: the posts (`room_posts`, once per room), a delivery per
-follower started before each post (`room_deliveries`, unique per follower and
-post), and the new cursor. `not_found`, `not_a_room` and `forbidden` end the
+position when it joined (at most 500 posts); a backfill page that gets no
+answer or a transient refusal (`quota`, `storage_unavailable`) is tried
+again after a quiet interval, and the backfill ends only on `not_found`,
+`not_a_room`, `forbidden` (or `cursor_invalid`, which restore recovery
+handles). Each AFTER page is one transaction: the posts (`room_posts`, once
+per room, marked `fetched` as the shared fetch's contiguous progress), a
+delivery per follower started before each post (`room_deliveries`, unique
+per follower and post), and the new cursor. A post the host attributes to
+one of this installation's own entities is refused unless this installation
+sent that message to that room (fetch, backfill, recovery and tag
+read-back alike), so a host cannot put words in a local agent's mouth. `not_found`, `not_a_room` and `forbidden` end the
 room's follows with a notice to each follower. `cursor_invalid` (the host's
-log was restored) starts restore recovery: note the head, read backward to a
-post already fetched or 1,000 posts, deliver what was new, and move every
-follower into a new local epoch at the noted head, in one transaction.
+log was restored) starts restore recovery. Each follow records the host's
+acceptance time of the post it started after (its head when it became
+active; none from the oldest). Recovery notes the head and reads backward,
+stopping at a post the shared fetch delivered (`fetched`; a post only a tag
+read-back or a backfill cached does not count), at the first post accepted no
+later than every follow's start, or at 1,000 posts. It offers each recovered
+post to every follow it is after, cached or not (per-follower uniqueness
+deduplicates), and moves every follow into a new local epoch at the noted
+head, in one transaction.
 
 **Delivery** is its own path, not Hub import (the author may be local, and
 the post's expiry may have passed): a pending delivery becomes a message from
@@ -865,11 +883,25 @@ with `mention`, or a local tag) is held in `room_mentions` until the poller
 reads its post back: found, it merges into the post's delivery to the
 recipient (one item, delivered at once, marked tagged by its sender); not
 found, or no answer after the last retry, the tag message is delivered as an
-unverified claim. Tags follow BBS's ordinary direct-message rules, focus mode
+unverified claim. Tag read-backs are capped at 30 a minute per sender
+namespace; past that a tag is released as unverified without asking. No
+`rooms` row is made for a room only a tag names until its host shows the
+post. Tags follow BBS's ordinary direct-message rules, focus mode
 included (a tag to a local agent in focus mode is dropped, and its poster
 sees why in `room status`). A tag wakes its recipient at most once per room
 per minute (`wake_coalesce`, in `room_tag_wakes`); tags past that budget are
 delivered quietly, at the recipient's next read, as quiet follows are.
+
+**Machine output.** `bbs room VERB --json` prints the shapes the rooms build
+contract fixes for every home: room info (`room`, `description`, `post`,
+`managers`, `archived`, `revision`, `head`, `creator`, `recent_authors`, plus
+`created` or `replayed`), pages (`posts` of records with `ref`, `room`,
+`author`, `in_reply_to`, `body`, `kind`, `accepted_at`, `position`, `cursor`;
+`next_cursor`, `head`, `scan_truncated`), post outcomes (`ref`, `room`,
+`state`, `reason`, `tags` with `to`, `state`, `reason`), follows (`room`,
+`mode`, `state`: `pending`, `active` or `backfill`, `created`). A failure
+prints `{"error": CODE, "detail": TEXT}`; the exit code is 1 for a refusal or
+error, 2 when `--wait` ran out, 4 when no answer came.
 
 ## Web UI
 

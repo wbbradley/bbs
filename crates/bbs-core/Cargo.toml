@@ -29,6 +29,7 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.10"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tokio-stream = { version = "0.1.19", features = ["net", "time"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 tonic = { version = "0.14.6", default-features = false, features = ["channel", "codegen"] }
 tonic-prost = "0.14.6"
 tracing = "0.1.44"

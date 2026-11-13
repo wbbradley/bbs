@@ -248,6 +248,11 @@ pub fn request(command: RoomCommand, host: Option<String>) -> (&'static str, Val
     (verb, args)
 }
 
+/// Exit codes (the build contract's machine output): 1 refused or error,
+/// 2 `--wait` ran out, 4 no answer (host or relay unavailable).
+pub const EXIT_WAIT: i32 = 2;
+pub const EXIT_NO_ANSWER: i32 = 4;
+
 pub async fn run(
     backend: &mut Backend,
     command: RoomCommand,
@@ -257,23 +262,49 @@ pub async fn run(
     let (verb, args) = request(command, host);
     let value = match backend.room(verb, &args).await {
         Ok(v) => v,
-        // With --json, the failure is also one JSON object on stdout.
-        Err(err) if json_output => {
-            println!("{}", error_json(&err));
+        Err(err) => {
+            let (v, no_answer) = error_json(&err);
+            if json_output {
+                // The failure is also one JSON object on stdout.
+                println!("{v}");
+            }
+            if no_answer {
+                eprintln!("bbs: {err:#}");
+                std::process::exit(EXIT_NO_ANSWER);
+            }
             return Err(err);
         }
-        Err(err) => return Err(err),
     };
-    if json_output {
-        return Ok(format!("{}\n", serde_json::to_string(&value)?));
+    let out = if json_output {
+        format!("{}\n", serde_json::to_string(&value)?)
+    } else {
+        text(verb, &value)
+    };
+    // `--wait` ran out before the post settled.
+    if args["wait"] == true
+        && matches!(value["state"].as_str(), Some("queued" | "sent" | "unknown"))
+    {
+        print!("{out}");
+        std::process::exit(EXIT_WAIT);
     }
-    Ok(text(verb, &value))
+    Ok(out)
 }
 
-/// `{"error": {"code", "detail"}}` for a failed command: the reason code
-/// its message starts with (the host's, the relay's or this server's), else
-/// `error`.
-pub fn error_json(err: &anyhow::Error) -> Value {
+/// The codes that mean no answer came: the host or the relay was not
+/// reachable (as opposed to a refusal).
+const NO_ANSWER: &[&str] = &[
+    "relay_unavailable",
+    "home_offline",
+    "room_timeout",
+    "queue_full",
+    "namespace_unknown",
+    "storage_unavailable",
+];
+
+/// `{"error": "<code>", "detail": "<text>"}` for a failed command, with the
+/// reason code its message starts with (the host's, the relay's or this
+/// server's), else `error`; and whether it means no answer.
+pub fn error_json(err: &anyhow::Error) -> (Value, bool) {
     let message = err.to_string();
     let (code, detail) = match message.split_once(": ") {
         Some((code, detail))
@@ -287,7 +318,8 @@ pub fn error_json(err: &anyhow::Error) -> Value {
         }
         _ => ("error".to_string(), message.clone()),
     };
-    json!({"error": {"code": code, "detail": detail}})
+    let no_answer = NO_ANSWER.contains(&code.as_str()) || detail.starts_with("no answer from");
+    (json!({"error": code, "detail": detail}), no_answer)
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -301,7 +333,7 @@ pub fn text(verb: &str, v: &Value) -> String {
         "list" => {
             let rooms = v["rooms"].as_array().cloned().unwrap_or_default();
             if rooms.is_empty() {
-                let _ = writeln!(out, "No rooms on {}.", s(v, "host"));
+                out.push_str("No rooms.\n");
             }
             for r in rooms {
                 let archived = if r["archived"] == true {
@@ -314,33 +346,30 @@ pub fn text(verb: &str, v: &Value) -> String {
         }
         "info" | "create" | "describe" | "policy" | "grant" | "revoke" | "archive"
         | "unarchive" => {
-            match (verb, &v["created"], &v["changed"]) {
-                ("create", Value::Bool(true), _) => {
+            match (verb, &v["created"]) {
+                ("create", Value::Bool(true)) => {
                     let _ = writeln!(out, "Created {}.", s(v, "room"));
                 }
-                ("create", _, _) => {
+                ("create", _) => {
                     let _ = writeln!(out, "{} already exists; you manage it.", s(v, "room"));
                 }
-                (_, _, Value::Bool(false)) => {
-                    let _ = writeln!(out, "No change to {}.", s(v, "room"));
-                }
-                (_, _, Value::Bool(true)) => {
-                    let _ = writeln!(out, "Updated {}.", s(v, "room"));
-                }
                 _ => {}
+            }
+            if v["replayed"] == true {
+                out.push_str("(the host returned the stored result of an earlier attempt)\n");
             }
             info_text(&mut out, v);
         }
         "follow" => {
-            let state = if s(v, "state") == "pending" {
-                " (pending: it starts at the next read of the room)"
-            } else {
-                ""
+            let state = match s(v, "state") {
+                "pending" => " (pending: it starts at the next read of the room)",
+                "backfill" => " (backfilling earlier posts)",
+                _ => "",
             };
             let _ = writeln!(out, "Following {} ({}){state}.", s(v, "room"), s(v, "mode"));
         }
         "unfollow" => {
-            let _ = if v["unfollowed"] == true {
+            let _ = if v["removed"] == true {
                 writeln!(out, "Unfollowed {}.", s(v, "room"))
             } else {
                 writeln!(out, "You did not follow {}.", s(v, "room"))
@@ -354,29 +383,17 @@ pub fn text(verb: &str, v: &Value) -> String {
             for f in follows {
                 let _ = writeln!(
                     out,
-                    "{} ({}, {}){}{}  {} undelivered",
+                    "{} ({}, {})",
                     s(&f, "room"),
                     s(&f, "mode"),
-                    s(&f, "state"),
-                    if f["backfilling"] == true {
-                        ", backfilling"
-                    } else {
-                        ""
-                    },
-                    if f["archived"] == true {
-                        ", archived"
-                    } else {
-                        ""
-                    },
-                    f["undelivered"]
+                    s(&f, "state")
                 );
             }
         }
         "post" | "reply" | "status" if v["private"] != true => {
             let _ = write!(
                 out,
-                "Post {} ({}) to {}: {}",
-                v["message"],
+                "Post {} to {}: {}",
                 s(v, "ref"),
                 s(v, "room"),
                 s(v, "state")
@@ -386,7 +403,11 @@ pub fn text(verb: &str, v: &Value) -> String {
             }
             out.push_str(".\n");
             for t in v["tags"].as_array().cloned().unwrap_or_default() {
-                let _ = writeln!(out, "  tag {}: {}", s(&t, "target"), s(&t, "state"));
+                let _ = write!(out, "  tag {}: {}", s(&t, "to"), s(&t, "state"));
+                if let Some(r) = t["reason"].as_str() {
+                    let _ = write!(out, " ({r})");
+                }
+                out.push('\n');
             }
         }
         "reply" => {
@@ -399,12 +420,12 @@ pub fn text(verb: &str, v: &Value) -> String {
                 v["message"]
             );
         }
-        "history" | "search" => {
-            let records = v["records"].as_array().cloned().unwrap_or_default();
-            if records.is_empty() {
-                let _ = writeln!(out, "No posts in {}.", s(v, "room"));
+        "history" | "search" | "show" => {
+            let posts = v["posts"].as_array().cloned().unwrap_or_default();
+            if posts.is_empty() {
+                out.push_str("No posts.\n");
             }
-            for r in &records {
+            for r in &posts {
                 record_text(&mut out, r, "");
             }
             if v["scan_truncated"] == true {
@@ -413,31 +434,9 @@ pub fn text(verb: &str, v: &Value) -> String {
                 );
             }
             if let Some(c) = v["next_cursor"].as_str()
-                && !records.is_empty()
+                && !posts.is_empty()
             {
                 let _ = writeln!(out, "(older: --before {c})");
-            }
-        }
-        "show" => {
-            match &v["post"] {
-                Value::Null => {
-                    let _ = writeln!(
-                        out,
-                        "{} in {}: {}{}",
-                        s(v, "ref"),
-                        s(v, "room"),
-                        s(v, "status"),
-                        v["reason"]
-                            .as_str()
-                            .map(|r| format!(" ({r})"))
-                            .unwrap_or_default()
-                    );
-                }
-                post => record_text(&mut out, post, ""),
-            }
-            for r in v["replies"].as_array().cloned().unwrap_or_default() {
-                let depth = r["depth"].as_u64().unwrap_or(1) as usize;
-                record_text(&mut out, &r, &"  ".repeat(depth));
             }
         }
         _ => {
@@ -484,7 +483,7 @@ fn info_text(out: &mut String, v: &Value) {
 }
 
 fn record_text(out: &mut String, r: &Value, indent: &str) {
-    let who = if r["notice"] == true {
+    let who = if r["kind"] == "notice" {
         "(room notice)".to_string()
     } else {
         format!("{} (reported)", s(r, "author"))
@@ -568,19 +567,24 @@ mod tests {
         let e = anyhow::anyhow!("not_found: no room rooms/x");
         assert_eq!(
             error_json(&e),
-            json!({"error": {"code": "not_found", "detail": "no room rooms/x"}})
+            (
+                json!({"error": "not_found", "detail": "no room rooms/x"}),
+                false
+            )
         );
         let e = anyhow::anyhow!("rooms are off: no integration");
-        assert_eq!(error_json(&e)["error"]["code"], "error");
+        assert_eq!(error_json(&e).0["error"], "error");
+        let e = anyhow::anyhow!("home_offline: no answer from hub");
+        assert!(error_json(&e).1);
     }
 
     #[test]
     fn text_names_authors_as_reported() {
         let out = text(
             "history",
-            &json!({"room": "rooms/war@hub", "records": [
+            &json!({"posts": [
                 {"accepted_at": "t", "author": "oncall@hub", "ref": "hub:1", "body": "mine",
-                 "notice": false}
+                 "kind": "post"}
             ], "next_cursor": "abc"}),
         );
         assert_eq!(
