@@ -94,6 +94,8 @@ CREATE TABLE room_deliveries (
   source TEXT NOT NULL CHECK(source IN ('follow', 'backfill', 'recovery', 'tag')),
   -- Set when a tag points at this post: the tag message, merged into this one.
   tag_message_id INTEGER REFERENCES messages(id),
+  -- The merged tag may wake the follower (within its tag budget).
+  tag_wake INTEGER NOT NULL DEFAULT 0 CHECK(tag_wake IN (0, 1)),
   wake INTEGER NOT NULL DEFAULT 0 CHECK(wake IN (0, 1)),
   state TEXT NOT NULL CHECK(state IN ('pending', 'delivered', 'skipped')),
   -- The inbox message once delivered.
@@ -165,8 +167,22 @@ CREATE TABLE room_mentions (
   post_namespace TEXT NOT NULL,
   post_message_id TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('pending', 'merged', 'unverified')),
+  -- Settled, but its message waits for the recipient's next read: the tag
+  -- was over the recipient's tag budget, so it does not wake it.
+  held INTEGER NOT NULL DEFAULT 0 CHECK(held IN (0, 1)),
   checks INTEGER NOT NULL DEFAULT 0,
   next_check_at TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX room_mentions_pending ON room_mentions(next_check_at) WHERE state = 'pending';
+CREATE INDEX room_mentions_held ON room_mentions(recipient_address_id) WHERE held = 1;
+
+-- The tag budget (D10): when a tag last woke each recipient for each room. A
+-- tag wakes a recipient at most once per room per wake_coalesce (a minute);
+-- others are delivered quietly, at its next read.
+CREATE TABLE room_tag_wakes (
+  recipient_address_id INTEGER NOT NULL REFERENCES entity_addresses(id),
+  room_id INTEGER NOT NULL REFERENCES rooms(id),
+  woke_at TEXT NOT NULL,
+  PRIMARY KEY(recipient_address_id, room_id)
+);

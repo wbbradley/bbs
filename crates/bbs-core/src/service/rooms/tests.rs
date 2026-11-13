@@ -1279,3 +1279,91 @@ fn timers_take_overrides_in_seconds() {
     assert_eq!(t.readback_after(5), 900.0);
     assert!(serde_json::from_value::<Timers>(json!({"poll_wak": 1})).is_err());
 }
+
+/// Post `text` to `room` as `who`, tagging `tags`, and confirm it.
+async fn tagged_post(rig: &Rig, who: &Caller, room: &str, text: &str, tags: &[&str]) {
+    rig.run(
+        who,
+        "post",
+        json!({"room": room, "text": text, "tags": tags}),
+    )
+    .await
+    .unwrap();
+    rig.hand_off(None);
+    rig.poll().await;
+}
+
+#[tokio::test]
+async fn a_tag_wakes_its_recipient_at_most_once_per_room_per_minute() {
+    let rig = Rig::new();
+    rig.run(&rig.scout, "create", json!({"name": "t1"}))
+        .await
+        .unwrap();
+    rig.run(&rig.scout, "create", json!({"name": "t2"}))
+        .await
+        .unwrap();
+    tagged_post(&rig, &rig.scout, "t1", "first", &["will/ranger@bbs"]).await;
+    let woken = rig.read_waiting(&rig.ranger);
+    assert_eq!(woken.len(), 1, "the first tag wakes");
+    assert_eq!(woken[0].room_tagged_by.as_deref(), Some("will/scout@bbs"));
+    // A second tag in the same room within the minute is delivered quietly.
+    tagged_post(&rig, &rig.scout, "t1", "second", &["will/ranger@bbs"]).await;
+    assert!(rig.read_waiting(&rig.ranger).is_empty(), "no second wake");
+    // Another room has its own budget.
+    tagged_post(&rig, &rig.scout, "t2", "elsewhere", &["will/ranger@bbs"]).await;
+    let woken = rig.read_waiting(&rig.ranger);
+    let mut bodies: Vec<&str> = woken.iter().map(|m| m.body.as_str()).collect();
+    bodies.sort();
+    // The quiet one comes along with the wake, as quiet mail does.
+    assert_eq!(bodies, ["elsewhere", "second"]);
+    // After the minute, a tag wakes again.
+    rig.advance(61);
+    tagged_post(&rig, &rig.scout, "t1", "third", &["will/ranger@bbs"]).await;
+    assert_eq!(rig.read_waiting(&rig.ranger).len(), 1);
+}
+
+#[tokio::test]
+async fn tags_respect_focus_mode() {
+    let rig = Rig::new();
+    rig.run(&rig.scout, "create", json!({"name": "f"}))
+        .await
+        .unwrap();
+    super::super::set_focus(
+        &mut rig.home.conn.lock().unwrap(),
+        &Caller {
+            human: Some("will".into()),
+            ..Default::default()
+        },
+        proto::SetFocusRequest {
+            agent: "ranger".into(),
+            focused: true,
+        },
+    )
+    .unwrap();
+    rig.read(&rig.ranger); // the focus notice
+    let p = rig
+        .run(
+            &rig.scout,
+            "post",
+            json!({"room": "f", "text": "x", "tags": ["will/ranger@bbs"]}),
+        )
+        .await
+        .unwrap();
+    rig.hand_off(None);
+    rig.poll().await;
+    let st = rig
+        .run(&rig.scout, "status", json!({"message": p["ref"]}))
+        .await
+        .unwrap();
+    assert_eq!(st["state"], "confirmed");
+    assert_eq!(st["tags"][0]["state"], "dropped");
+    let detail: String = rig
+        .home
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT detail FROM room_tags", [], |r| r.get(0))
+        .unwrap();
+    assert!(detail.contains("focus mode"), "{detail}");
+    assert!(rig.read(&rig.ranger).is_empty());
+}

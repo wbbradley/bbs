@@ -842,12 +842,21 @@ pub(super) fn flush_due(ctx: &Ctx, cfg: &RoomConfig) -> Result<usize> {
         .conn
         .prepare(
             "SELECT DISTINCT follower_address_id, room_id FROM room_deliveries
-             WHERE state = 'pending' AND tag_message_id IS NOT NULL",
+             WHERE state = 'pending' AND tag_wake = 1",
         )?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     for (follower, room) in tagged {
-        delivered += flush(ctx, follower, Some(room))?;
+        if tag_may_wake(ctx, cfg, follower, room)? {
+            delivered += flush(ctx, follower, Some(room))?;
+        } else {
+            // Over the tag budget: delivered quietly, at the next read.
+            ctx.conn.execute(
+                "UPDATE room_deliveries SET tag_wake = 0 WHERE follower_address_id = ?1
+                 AND room_id = ?2 AND state = 'pending'",
+                params![follower, room],
+            )?;
+        }
     }
     let since = fmt_time(ctx.now - cfg.d(cfg.timers.wake_coalesce));
     let woken: Vec<(i64, i64, i64)> = ctx
@@ -903,7 +912,8 @@ pub fn flush_for_reader(conn: &Connection, me: &db::Principal, waiting: bool) ->
     let address = db::native_address_row(conn, me.kind.into(), me.id)?;
     let pending: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM room_deliveries
-             WHERE follower_address_id = ?1 AND state = 'pending')",
+             WHERE follower_address_id = ?1 AND state = 'pending')
+          OR EXISTS (SELECT 1 FROM room_mentions WHERE recipient_address_id = ?1 AND held = 1)",
         [address],
         |r| r.get(0),
     )?;
@@ -921,7 +931,20 @@ pub fn flush_for_reader(conn: &Connection, me: &db::Principal, waiting: bool) ->
             return Ok(0);
         }
     }
-    flush(&ctx, address, None)
+    let held: Vec<i64> = conn
+        .prepare(
+            "SELECT message_id FROM room_mentions WHERE recipient_address_id = ?1 AND held = 1",
+        )?
+        .query_map([address], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for message in &held {
+        dbi::insert_delivery(conn, *message, address)?;
+        conn.execute(
+            "UPDATE room_mentions SET held = 0 WHERE message_id = ?1",
+            [message],
+        )?;
+    }
+    Ok(held.len() + flush(&ctx, address, None)?)
 }
 
 /// Mark inbox messages that came from rooms: their room, that the author is
@@ -1092,20 +1115,20 @@ pub(super) fn settle_mention(ctx: &Ctx, cfg: &RoomConfig, m: &Mention, found: Fo
                 .optional()?;
             match state.as_deref() {
                 // Already shown: the tag itself is the news, verified.
-                Some("delivered") | Some("skipped") => {
-                    dbi::insert_delivery(ctx.conn, m.message, m.recipient)?;
-                }
+                Some("delivered") | Some("skipped") => deliver_tag(ctx, cfg, m)?,
+                // Merged into the post's delivery, which the tag may wake
+                // (flush_due spends the budget).
                 Some(_) => {
                     ctx.conn.execute(
-                        "UPDATE room_deliveries SET tag_message_id = ?3, wake = 1
+                        "UPDATE room_deliveries SET tag_message_id = ?3, tag_wake = 1
                          WHERE follower_address_id = ?1 AND post_id = ?2",
                         params![m.recipient, post, m.message],
                     )?;
                 }
                 None => {
-                    queue_delivery(ctx, room.id, m.recipient, post, "tag", true)?;
+                    queue_delivery(ctx, room.id, m.recipient, post, "tag", false)?;
                     ctx.conn.execute(
-                        "UPDATE room_deliveries SET tag_message_id = ?3
+                        "UPDATE room_deliveries SET tag_message_id = ?3, tag_wake = 1
                          WHERE follower_address_id = ?1 AND post_id = ?2",
                         params![m.recipient, post, m.message],
                     )?;
@@ -1122,7 +1145,7 @@ pub(super) fn settle_mention(ctx: &Ctx, cfg: &RoomConfig, m: &Mention, found: Fo
                 why,
                 "a tag's post could not be read back"
             );
-            unverified(ctx, m)?;
+            unverified(ctx, cfg, m)?;
         }
         Found::Unanswered => {
             let checks = m.checks + 1;
@@ -1134,20 +1157,46 @@ pub(super) fn settle_mention(ctx: &Ctx, cfg: &RoomConfig, m: &Mention, found: Fo
                         params![m.message, checks, fmt_time(ctx.now + cfg.d(*secs))],
                     )?;
                 }
-                None => unverified(ctx, m)?,
+                None => unverified(ctx, cfg, m)?,
             }
         }
     }
     Ok(())
 }
 
-fn unverified(ctx: &Ctx, m: &Mention) -> Result<()> {
-    dbi::insert_delivery(ctx.conn, m.message, m.recipient)?;
+fn unverified(ctx: &Ctx, cfg: &RoomConfig, m: &Mention) -> Result<()> {
     ctx.conn.execute(
         "UPDATE room_mentions SET state = 'unverified' WHERE message_id = ?1",
         [m.message],
     )?;
+    deliver_tag(ctx, cfg, m)
+}
+
+/// Deliver a settled tag's own message: at once if the tag budget lets it
+/// wake its recipient, else held for the recipient's next read.
+fn deliver_tag(ctx: &Ctx, cfg: &RoomConfig, m: &Mention) -> Result<()> {
+    if tag_may_wake(ctx, cfg, m.recipient, m.room)? {
+        dbi::insert_delivery(ctx.conn, m.message, m.recipient)?;
+    } else {
+        ctx.conn.execute(
+            "UPDATE room_mentions SET held = 1 WHERE message_id = ?1",
+            [m.message],
+        )?;
+    }
     Ok(())
+}
+
+/// The tag budget (D10): whether a tag may wake `recipient` for `room` now,
+/// at most once per room per `wake_coalesce`; spends it when it may.
+fn tag_may_wake(ctx: &Ctx, cfg: &RoomConfig, recipient: i64, room: i64) -> Result<bool> {
+    let since = fmt_time(ctx.now - cfg.d(cfg.timers.wake_coalesce));
+    let n = ctx.conn.execute(
+        "INSERT INTO room_tag_wakes (recipient_address_id, room_id, woke_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(recipient_address_id, room_id) DO UPDATE SET woke_at = excluded.woke_at
+         WHERE room_tag_wakes.woke_at <= ?4",
+        params![recipient, room, ctx.now_s, since],
+    )?;
+    Ok(n == 1)
 }
 
 // ---- post outcomes (D9) and tags (D10) -----------------------------------
@@ -1529,6 +1578,8 @@ pub(super) fn send_tags(ctx: &Ctx, message: i64) -> Result<()> {
                 )?
                 .and_then(|f| f.principal.filter(|_| f.active))
                 .with_context(|| format!("no live local agent or human {target}"))?;
+                // A tag is a direct message: focus mode applies as to any.
+                super::super::check_focus(ctx, &me, Some(&found))?;
                 let to = db::native_address_row(ctx.conn, found.kind.into(), found.id)?;
                 let from = db::native_address_row(ctx.conn, me.kind.into(), me.id)?;
                 ctx.conn.execute(

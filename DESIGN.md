@@ -866,7 +866,10 @@ reads its post back: found, it merges into the post's delivery to the
 recipient (one item, delivered at once, marked tagged by its sender); not
 found, or no answer after the last retry, the tag message is delivered as an
 unverified claim. Tags follow BBS's ordinary direct-message rules, focus mode
-included.
+included (a tag to a local agent in focus mode is dropped, and its poster
+sees why in `room status`). A tag wakes its recipient at most once per room
+per minute (`wake_coalesce`, in `room_tag_wakes`); tags past that budget are
+delivered quietly, at the recipient's next read, as quiet follows are.
 
 ## Web UI
 
