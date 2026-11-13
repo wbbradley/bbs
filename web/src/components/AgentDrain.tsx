@@ -6,7 +6,7 @@ interface Drain {
   status: "running" | "draining" | "ready" | "timed_out";
   watermark: number;
   deadline: string;
-  agents: { agent_id: number; name: string; unread: number; completed: boolean; side_pending: boolean }[];
+  agents: { agent_id: number; name: string; unread: number; completed: boolean }[];
 }
 
 export function AgentDrain() {
@@ -76,7 +76,6 @@ export function AgentDrain() {
             {drain.agents.map((agent) => <li key={agent.agent_id}>
               <span>{agent.name}</span>: {agent.unread > 0
                 ? `${agent.unread} unread before the watermark`
-                : agent.side_pending ? "waiting for side question completion"
                 : agent.completed ? "finished" : "waiting for turn completion"}
             </li>)}
           </ul>}

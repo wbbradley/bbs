@@ -31,8 +31,6 @@ pub const CAPABILITIES: &[&str] = &[
     "agent-effort.v1",
     "auto-reply.v1",
     "agent-interactions.v1",
-    "side-questions.v1",
-    "side-conversations.v1",
     "message-search.v1",
     "blockers.v1",
     "blockers-mine.v1",

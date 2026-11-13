@@ -8,6 +8,25 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Removed
+
+- `/btw` side questions (`side-questions.v1`) and side conversations
+  (`side-conversations.v1`) are gone from the server, `bbs connect`, the web
+  board and `bbs headless run`, along with the `AskSide`, `CancelSide`,
+  `ClaimSide` and `ReportSide` RPCs. The server no longer advertises either
+  capability, and restart preparation waits only on mail and turns. No schema
+  change: the `side_requests` table and the side capability columns stay in
+  the database, unused, and any side answers stored there are no longer shown.
+  Older clients and runners keep working against an updated server: an older
+  `bbs connect` refuses `/btw` locally, saying the agent's runner does not
+  answer side questions, and never sends it as mail; an older runner finds
+  `side-questions.v1` missing, never starts its side-question loop, and runs
+  its turns as before. The web board ships with the server, so a reloaded page
+  has no aside button. An updated client or runner against an older server
+  never offers or answers `/btw`; there the older server still holds restart
+  preparation for unacknowledged side questions from an earlier runner, until
+  its 20-minute timeout.
+
 ## 0.27.1 - 2026-11-12
 
 ### Added

@@ -22,7 +22,7 @@ use super::harness::{
 use super::mcp::{Tools, tool_list};
 use super::rpc::{Incoming, Process, Rpc};
 use super::settings::HarnessConfig;
-use super::{codex_btw, context, input};
+use super::{context, input};
 use crate::proto::effort_outcome::Result as Outcome;
 use crate::proto::{EffortRequest, EffortState};
 
@@ -167,14 +167,9 @@ pub struct Codex {
     thread_id: String,
     pub resumed: bool,
     /// The thread holds the BBS tools as plain functions; otherwise they come
-    /// from the MCP server config sent with the thread and its forks.
+    /// from the MCP server config sent with the thread.
     pub dynamic_tools: bool,
-    /// What a side fork must be told, or it takes Codex's own defaults: the
-    /// session's model and provider, and an adopted thread's MCP server.
-    fork: Value,
     turn: Arc<TurnState>,
-    side: Arc<codex_btw::SideChannel>,
-    side_tools: Arc<tokio::sync::Mutex<Tools>>,
 }
 
 impl Codex {
@@ -193,23 +188,12 @@ impl Codex {
         let turn = Arc::new(TurnState::default());
         turn.inputs.enable(input_enabled);
         let effort = Arc::new(Mutex::new(CodexEffort::default()));
-        let side = Arc::new(codex_btw::SideChannel::default());
-        let side_tools = Arc::new(tokio::sync::Mutex::new(tools.independent()));
         let handler = {
             let turn = turn.clone();
-            let side = side.clone();
-            let side_tools = side_tools.clone();
             let tools = Arc::new(tokio::sync::Mutex::new(tools));
             let effort = effort.clone();
             let events = events.clone();
-            move |rpc: &Rpc, msg: Incoming| {
-                if matches!(msg, Incoming::Exited) {
-                    side.exited();
-                }
-                if let Some(msg) = side.handle(rpc, msg, &side_tools) {
-                    handle(rpc, msg, &turn, &tools, &effort, &events)
-                }
-            }
+            move |rpc: &Rpc, msg: Incoming| handle(rpc, msg, &turn, &tools, &effort, &events)
         };
         let (rpc, mut process) = Rpc::spawn(&config.command, &config.env, cwd, stderr, handler)?;
         let mut codex = Codex {
@@ -219,10 +203,7 @@ impl Codex {
             thread_id: String::new(),
             resumed: false,
             dynamic_tools: false,
-            fork: json!({}),
             turn,
-            side,
-            side_tools,
         };
         match timeout(SETUP_TIMEOUT, codex.open_thread(config, cwd, mcp, resume)).await {
             Ok(Ok(())) => Ok((codex, process, rx)),
@@ -264,11 +245,9 @@ impl Codex {
         });
         if let Some(model) = &config.model {
             params["model"] = model.clone().into();
-            self.fork["model"] = model.clone().into();
         }
         if let Some(provider) = &config.provider {
             params["modelProvider"] = provider.clone().into();
-            self.fork["modelProvider"] = provider.clone().into();
         }
         if let Some(Resume {
             id,
@@ -279,9 +258,8 @@ impl Codex {
             self.effort.lock().unwrap().parent = Some(id.to_string());
             let mut resume_params = params.clone();
             resume_params["threadId"] = id.into();
-            let mcp = (!dynamic_tools).then(|| mcp_config(mcp));
-            if let Some(mcp) = &mcp {
-                resume_params["config"] = mcp.clone();
+            if !dynamic_tools {
+                resume_params["config"] = mcp_config(mcp);
             }
             match self.rpc.request("thread/resume", resume_params).await {
                 Ok(result) => {
@@ -305,9 +283,6 @@ impl Codex {
                             );
                         }
                     }
-                    if let Some(mcp) = mcp {
-                        self.fork["config"] = mcp;
-                    }
                     return Ok(());
                 }
                 Err(err) if strict => {
@@ -327,47 +302,6 @@ impl Codex {
         self.effort.lock().unwrap().parent = Some(self.thread_id.clone());
         self.discover_effort(&result).await;
         Ok(())
-    }
-
-    pub async fn side_turn(
-        &self,
-        question: &str,
-        mode: codex_btw::Mode,
-        cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> codex_btw::Outcome {
-        self.side
-            .run(
-                &self.rpc,
-                &self.thread_id,
-                &self.fork,
-                codex_btw::Prompt {
-                    text: question,
-                    mode,
-                },
-                cancel,
-                &self.side_tools,
-            )
-            .await
-    }
-    pub fn side_retained(&self) -> bool {
-        self.side.retained()
-    }
-    pub async fn finish_side(&self) -> bool {
-        self.side
-            .cleanup(&self.rpc, Instant::now() + Duration::from_secs(5))
-            .await
-    }
-
-    #[cfg(test)]
-    pub fn side_tools_for_test(&self) -> Arc<tokio::sync::Mutex<Tools>> {
-        self.side_tools.clone()
-    }
-
-    pub fn side_progress(&self) -> Option<String> {
-        self.side.progress()
-    }
-    pub fn side_text(&self) -> String {
-        self.side.text()
     }
 
     pub fn thread_id(&self) -> &str {
@@ -701,7 +635,7 @@ fn handle(
             {
                 rpc.respond_later(
                     id,
-                    Err("tool call is not in the opened parent or active side thread".into()),
+                    Err("tool call is not in the opened parent thread".into()),
                 );
                 return;
             }
@@ -778,7 +712,7 @@ fn handle(
             {
                 rpc.respond_later(
                     id,
-                    Err("callback is not in the opened parent or active side thread".into()),
+                    Err("callback is not in the opened parent thread".into()),
                 );
             } else {
                 rpc.respond_later(id, answer(&method, &params, events));

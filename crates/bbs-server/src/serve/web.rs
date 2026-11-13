@@ -685,8 +685,6 @@ async fn rpc(
         "mark_seen" => mark_seen,
         "side_report" => side_report,
         "answer_owner_input" => answer_owner_input,
-        "ask_side" => ask_side,
-        "cancel_side" => cancel_side,
         "list_blockers" => list_blockers,
         "answer_blocker" => answer_blocker,
         "cancel_blocker" => cancel_blocker,

@@ -995,8 +995,8 @@ async fn group_deliveries_opt_in_over_the_wire_and_follow_live() {
 }
 
 #[tokio::test]
-async fn side_questions_are_advertised_and_answered_over_the_wire() {
-    let server = Server::start("side-questions");
+async fn owner_input_is_advertised_and_answered_over_the_wire() {
+    let server = Server::start("owner-input");
     let mut client = server.client().await;
     let info = client
         .server_info(proto::Empty {})
@@ -1071,145 +1071,6 @@ async fn side_questions_are_advertised_and_answered_over_the_wire() {
     let input = report.pending_input.unwrap();
     assert_eq!(input.status(), proto::InputStatus::Answered);
     assert_eq!(input.answers[0].value, "yes");
-}
-
-#[tokio::test]
-async fn side_questions_are_asked_claimed_and_answered_over_the_wire() {
-    let server = Server::start("side-questions-wire");
-    let mut client = server.client().await;
-    let info = client
-        .server_info(proto::Empty {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(info.capabilities.iter().any(|c| c == "side-questions.v1"));
-    let agent = register(&mut client).await;
-    client
-        .begin_side_session(as_agent(
-            &agent.token,
-            proto::BeginSideSessionRequest {
-                generation: "proc-1".into(),
-            },
-        ))
-        .await
-        .unwrap();
-    client
-        .report_context(as_agent(
-            &agent.token,
-            proto::ReportContextRequest {
-                side_followups: None,
-                generation: "proc-1".into(),
-                usage: None,
-                side_supported: Some(true),
-                side_reason: None,
-                preserve_usage: false,
-            },
-        ))
-        .await
-        .unwrap();
-    let asked = client
-        .ask_side(as_human(
-            "will",
-            proto::AskSideRequest {
-                follows: None,
-                agent: agent.name.clone(),
-                question: "is the deploy green?".into(),
-            },
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    let claim = client
-        .claim_side(as_agent(
-            &agent.token,
-            proto::ClaimSideRequest {
-                generation: "proc-1".into(),
-            },
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    let side = claim.request.unwrap();
-    assert_eq!(side.id, asked.id);
-    client
-        .report_side(as_agent(
-            &agent.token,
-            proto::ReportSideRequest {
-                generation: "proc-1".into(),
-                id: side.id,
-                status: proto::SideStatus::SideCompleted.into(),
-                answer: Some("green across the board".into()),
-            },
-        ))
-        .await
-        .unwrap();
-    let report = client
-        .side_report(as_human(
-            "will",
-            proto::SideReportRequest {
-                agent: agent.name.clone(),
-                generation: None,
-            },
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    let side = report.side.unwrap();
-    assert_eq!(side.status(), proto::SideStatus::SideCompleted);
-    assert_eq!(side.answer.as_deref(), Some("green across the board"));
-    assert_eq!((side.conversation, side.ended), (Some(asked.id), false));
-
-    // side-conversations.v1: a follow-up, required as a client sends it,
-    // joins the conversation once the runner says it continues them.
-    assert!(
-        info.capabilities
-            .iter()
-            .any(|c| c == "side-conversations.v1")
-    );
-    client
-        .report_context(as_agent(
-            &agent.token,
-            proto::ReportContextRequest {
-                side_followups: Some(true),
-                generation: "proc-1".into(),
-                usage: None,
-                side_supported: None,
-                side_reason: None,
-                preserve_usage: true,
-            },
-        ))
-        .await
-        .unwrap();
-    let mut req = as_human(
-        "will",
-        proto::AskSideRequest {
-            follows: Some(asked.id),
-            agent: agent.name.clone(),
-            question: "and staging?".into(),
-        },
-    );
-    req.metadata_mut().insert(
-        "bbs-required-capabilities",
-        "side-conversations.v1".parse().unwrap(),
-    );
-    let follow = client.ask_side(req).await.unwrap().into_inner();
-    let report = client
-        .side_report(as_human(
-            "will",
-            proto::SideReportRequest {
-                agent: agent.name.clone(),
-                generation: None,
-            },
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(report.side_followups, Some(true));
-    let side = report.side.unwrap();
-    assert_eq!(
-        (side.id, side.conversation, side.follows),
-        (follow.id, Some(asked.id), Some(asked.id))
-    );
 }
 
 #[tokio::test]

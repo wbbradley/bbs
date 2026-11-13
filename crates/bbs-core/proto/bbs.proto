@@ -54,7 +54,7 @@ service Bbs {
   // Unread mail oldest first, archived as returned; or archived history.
   // Per-human restart barrier. Empty action queries; start/resume mutate it.
   rpc AgentDrain(AgentDrainRequest) returns (AgentDrainResponse);
-  // Reports completed parent-mail and independently quiescent side-request IDs.
+  // Reports completed mail IDs.
   rpc ReportDrain(ReportDrainRequest) returns (Empty);
   rpc Read(ReadRequest) returns (ReadResponse);
   // Authenticated agents and humans may search the entire ordinary-message
@@ -109,7 +109,7 @@ service Bbs {
   // A runner begins one interaction session per process; a fresh generation
   // resets the agent's side state. Agent token, self only.
   rpc BeginSideSession(BeginSideSessionRequest) returns (BeginSideSessionResponse);
-  // A driver reports context usage and side capability; generation-gated.
+  // A driver reports context usage; generation-gated.
   rpc ReportContext(ReportContextRequest) returns (Empty);
   // A driver asks its owning human up to three structured questions.
   rpc RequestOwnerInput(RequestOwnerInputRequest) returns (RequestOwnerInputResponse);
@@ -119,16 +119,6 @@ service Bbs {
   rpc CloseOwnerInput(CloseOwnerInputRequest) returns (Empty);
   // One agent's side state: the owner, or the driver with its generation.
   rpc SideReport(SideReportRequest) returns (SideReportResponse);
-
-  // Isolated side questions (side-questions.v1): the owning human asks the
-  // agent a question its runner answers in an isolated turn, outside mail,
-  // history and the parent's model input.
-  rpc AskSide(AskSideRequest) returns (AskSideResponse);
-  rpc CancelSide(CancelSideRequest) returns (Empty);
-  // A runner claims the agent's one open side request, once.
-  rpc ClaimSide(ClaimSideRequest) returns (ClaimSideResponse);
-  // The claiming runner reports progressive text (OPEN) or a terminal result.
-  rpc ReportSide(ReportSideRequest) returns (Empty);
 
   // Immutable group blockers; all require blockers.v1. Reads are board-wide
   // for authenticated callers. Writes enforce current group relationships.
@@ -356,70 +346,6 @@ message BlockerMutationResponse {
   // notice when someone other than the creator cancels. A replayed cancel
   // carries none.
   optional int64 message_id = 3;
-}
-
-enum SideStatus {
-  SIDE_STATUS_UNSPECIFIED = 0;
-  SIDE_OPEN = 1;
-  SIDE_COMPLETED = 2;
-  SIDE_FAILED = 3;
-  SIDE_CANCELLED = 4;
-  SIDE_INTERRUPTED = 5;
-  // side-conversations.v1: a follow-up whose side conversation no longer
-  // exists (the runner restarted, timed it out idle, or it was ended); the
-  // runner reports it without a model call. The owner's next /btw is fresh.
-  SIDE_ENDED = 6;
-}
-message SideRequest {
-  int64 id = 1;
-  string question = 2;
-  SideStatus status = 3;
-  // Progressive text while open, the final answer at terminal; never trimmed.
-  optional string answer = 4;
-  string updated_at = 5;
-  // side-conversations.v1: the side question this one follows up, in the
-  // same side conversation; absent for a conversation's first question.
-  optional int64 follows = 6;
-  // side-conversations.v1: this question's conversation cannot be
-  // continued: the owner ended it, it went idle, the runner generation that
-  // answered it is gone, or it was INTERRUPTED or ENDED. Derived by the
-  // server.
-  bool ended = 7;
-  // side-conversations.v1: the id of this conversation's first question; a
-  // question that starts a conversation has its own id.
-  optional int64 conversation = 8;
-}
-message AskSideRequest {
-  string agent = 1;
-  string question = 2;  // <= 4 KiB
-  // side-conversations.v1: continue the side conversation whose latest
-  // question this is. Refused unless it is the agent's latest side question,
-  // terminal (COMPLETED, FAILED or CANCELLED), answered by the current
-  // runner generation, not ended, and that generation answers follow-ups.
-  optional int64 follows = 3;
-}
-message AskSideResponse { int64 id = 1; }  // never reused
-message CancelSideRequest {
-  int64 id = 1;
-  // side-conversations.v1: false cancels the OPEN question `id` only (its
-  // conversation continues); true also ends the conversation whose latest
-  // question is `id`, open or terminal. Idempotent.
-  bool end = 2;
-}
-message ClaimSideRequest { string generation = 1; }
-message ClaimSideResponse {
-  // The claimed request, or none when nothing is open. Idempotent per
-  // generation: a lost reply's retry returns the same claim.
-  optional SideRequest request = 1;
-}
-message ReportSideRequest {
-  string generation = 1;
-  int64 id = 2;
-  // OPEN, COMPLETED, FAILED, or ENDED: for an OPEN follow-up whose
-  // conversation is gone, or the latest terminal question this generation
-  // answered when its child is lost (marks the conversation ended).
-  SideStatus status = 3;
-  optional string answer = 4;  // <= 64 KiB
 }
 
 message Empty {}
@@ -664,19 +590,11 @@ message ReportContextRequest {
   string generation = 1;
   // Present: replace the stored usage. Absent: clear it.
   optional ContextUsage usage = 2;
-  // Whether this generation answers isolated side questions, and why not.
-  // Omitted fields preserve the stored value; a fresh generation clears it.
-  // Current-generation report, never a liveness guarantee. Reason <= 4 KiB.
-  optional bool side_supported = 3;
-  optional string side_reason = 4;
-  // True: keep the stored usage and its report time untouched (a
-  // capability-only update). False: usage is replaced or cleared as usual.
-  // Rejected when usage is also present.
+  reserved 3, 4, 6;
+  reserved "side_supported", "side_reason", "side_followups";
+  // True: keep the stored usage and its report time untouched. False: usage
+  // is replaced or cleared as usual. Rejected when usage is also present.
   bool preserve_usage = 5;
-  // side-conversations.v1: whether this generation continues side
-  // conversations (answers AskSide.follows). Omitted preserves the stored
-  // value; a fresh generation clears it.
-  optional bool side_followups = 6;
 }
 
 message InputOption {
@@ -756,14 +674,8 @@ message SideReportResponse {
   // Server receipt of the latest driver report (begin or context report);
   // input activity and polls never move it.
   string reported_at = 7;
-  // The open or latest terminal side question, until the next ask.
-  optional SideRequest side = 8;
-  // Whether the current generation answers side questions, and why not.
-  optional bool side_supported = 9;
-  optional string side_reason = 10;
-  // side-conversations.v1: whether the current generation continues side
-  // conversations.
-  optional bool side_followups = 11;
+  reserved 8, 9, 10, 11;
+  reserved "side", "side_supported", "side_reason", "side_followups";
 }
 
 message ReadRequest {
@@ -1059,7 +971,8 @@ message AgentDrainTarget {
   string name = 2;
   uint32 unread = 3;
   bool completed = 4;
-  bool side_pending = 5;
+  reserved 5;
+  reserved "side_pending";
 }
 message AgentDrainResponse {
   bool frozen = 1;
@@ -1070,7 +983,6 @@ message AgentDrainResponse {
 }
 message ReportDrainRequest {
   int64 completed_through = 1;
-  // Highest side-request id observed quiescent by the runner, including
-  // cancelled/ended requests whose provider work has actually stopped.
-  int64 side_completed_through = 2;
+  reserved 2;
+  reserved "side_completed_through";
 }
