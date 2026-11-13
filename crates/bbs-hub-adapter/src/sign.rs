@@ -27,6 +27,8 @@ pub fn label(kind: i32) -> Option<&'static str> {
         K::RouteClaim => "route-claim",
         K::DirectoryQuery => "directory-query",
         K::DirectoryAnswer => "directory-answer",
+        K::RoomRequest => "room-request",
+        K::RoomAnswer => "room-answer",
         K::Unspecified => return None,
     })
 }

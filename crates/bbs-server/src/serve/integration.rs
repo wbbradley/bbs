@@ -762,6 +762,10 @@ impl Session {
                     }
                     None
                 }
+                Some(In::RemoteRoomResult(result)) => {
+                    tracing::debug!(request = result.request_id, "an unasked room result");
+                    None
+                }
                 Some(In::Ping(ping)) => Some(Out::Pong(pb::Pong { nonce: ping.nonce })),
                 Some(In::Pong(_)) => None,
             };

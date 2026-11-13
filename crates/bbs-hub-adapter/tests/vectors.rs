@@ -78,6 +78,8 @@ fn decodes_as_kind(kind: mp::RecordKind, payload: &[u8]) -> bool {
         K::RouteClaim => wire::decode::<mp::RouteClaim>(payload, max).is_ok(),
         K::DirectoryQuery => wire::decode::<mp::DirectoryQuery>(payload, max).is_ok(),
         K::DirectoryAnswer => wire::decode::<mp::DirectoryAnswer>(payload, max).is_ok(),
+        K::RoomRequest => wire::decode::<mp::RoomRequest>(payload, max).is_ok(),
+        K::RoomAnswer => wire::decode::<mp::RoomAnswer>(payload, max).is_ok(),
         K::Unspecified => false,
     }
 }

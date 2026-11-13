@@ -606,6 +606,7 @@ pub(super) fn send_remote(
         kind: mp::MessageKind::Application as i32,
         delivery_error: None,
         group_copy: None,
+        mention: None,
     };
     // Frozen once: the adapter signs exactly these bytes.
     let encoded = message.encode_to_vec();

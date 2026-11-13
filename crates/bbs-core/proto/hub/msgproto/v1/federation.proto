@@ -72,6 +72,21 @@ message DirectoryUnavailable {
   string error_code = 2;
   string detail = 3;
 }
+// Rooms (ROOMS.md): the same pattern as the directory frames.
+message FederatedRoomRequest {
+  SignedRecord request = 1; // Payload: RoomRequest.
+  SignedRecord credential = 2;
+}
+message FederatedRoomAnswer {
+  SignedRecord answer = 1; // Payload: RoomAnswer.
+  SignedRecord credential = 2;
+}
+// Relay-generated; cannot impersonate a host-signed answer.
+message RoomUnavailable {
+  string request_id = 1;
+  string error_code = 2;
+  string detail = 3;
+}
 message TrustQuery {
   string query_id = 1;
   string namespace = 2; // Empty: all enrolled namespaces.
@@ -103,5 +118,8 @@ message FederationFrame {
     TrustQuery trust_query = 11;
     TrustPage trust_page = 12;
     TrustChanged trust_changed = 13;
+    FederatedRoomRequest room_request = 14;
+    FederatedRoomAnswer room_answer = 15;
+    RoomUnavailable room_unavailable = 16;
   }
 }

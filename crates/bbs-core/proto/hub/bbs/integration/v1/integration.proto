@@ -77,6 +77,29 @@ message HandoffResult {
   // before sender responsibility ends. Lost/uncertain results are not replayed.
 }
 
+// Rooms (ROOMS.md, D2): BBS asks a room request of a host in another
+// namespace, as one of its own entities. The adapter signs it as a
+// ROOM_REQUEST with a fresh request ID, forwards it through the relay with
+// its own pending budget (separate from directory queries), and verifies the
+// host's FederatedRoomAnswer: a HOST_NAMESPACE credential of the request's
+// namespace, the answer's namespace, and the signed request's record hash.
+// The adapter keeps no room state; every durable record is BBS's.
+message RoomResult {
+  // The request_id BBS gave the request.
+  string request_id = 1;
+  // Empty when the host answered: `answer` is set and verified. Otherwise
+  // why there is no answer, which is "no information" about the room: the
+  // relay's RoomUnavailable code, or the adapter's own (relay_unavailable,
+  // room_timeout, queue_full, invalid_argument, and invalid_signature or
+  // route_not_authorized for an answer that failed verification).
+  string unavailable_code = 2;
+  string detail = 3;
+  // The host's answer exactly as it signed it, decoded. Its error_code is
+  // the host's (not_found, forbidden, cursor_invalid, ...). Its request_id is
+  // the one the adapter sent, not BBS's.
+  msgproto.v1.RoomAnswer answer = 4;
+}
+
 message AdapterFrame {
   oneof payload {
     AdapterHello hello = 1;
@@ -87,6 +110,7 @@ message AdapterFrame {
     msgproto.v1.DirectoryResult remote_directory_result = 6;
     Ping ping = 7;
     Pong pong = 8;
+    RoomResult remote_room_result = 9;
   }
 }
 
@@ -100,5 +124,8 @@ message BbsFrame {
     msgproto.v1.DirectoryQuery remote_directory_query = 6;
     Ping ping = 7;
     Pong pong = 8;
+    // The requester must be one of BBS's own entities; request_id is BBS's,
+    // and the adapter's result echoes it.
+    msgproto.v1.RoomRequest remote_room_request = 9;
   }
 }

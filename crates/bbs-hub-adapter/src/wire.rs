@@ -17,6 +17,10 @@ pub const MAX_MESSAGE: usize = 96 << 10;
 pub const MAX_ENVELOPE: usize = 128 << 10;
 pub const MAX_CREDENTIAL: usize = 4 << 10;
 pub const MAX_DIRECTORY: usize = 1 << 20;
+/// The largest room answer payload (ROOMS.md D2: the room-answer wire limit).
+pub const MAX_ROOM_ANSWER: usize = 1 << 20;
+/// The largest room request payload.
+pub const MAX_ROOM_REQUEST: usize = 64 << 10;
 pub const MAX_FRAME: usize = 4 << 20;
 const MAX_DEPTH: usize = 16;
 
@@ -65,6 +69,8 @@ schema! {
     mp::RouteClaim => "msgproto.v1.RouteClaim",
     mp::DirectoryQuery => "msgproto.v1.DirectoryQuery",
     mp::DirectoryAnswer => "msgproto.v1.DirectoryAnswer",
+    mp::RoomRequest => "msgproto.v1.RoomRequest",
+    mp::RoomAnswer => "msgproto.v1.RoomAnswer",
 }
 
 /// The descriptor of message `name`.

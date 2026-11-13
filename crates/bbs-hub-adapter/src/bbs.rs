@@ -277,6 +277,13 @@ async fn read(
                 });
                 None
             }
+            Some(In::RemoteRoomRequest(q)) => {
+                tracing::debug!(
+                    request = q.request_id,
+                    "room requests are not forwarded yet"
+                );
+                None
+            }
             Some(In::Ping(p)) => Some(Out::Pong(pb::Pong { nonce: p.nonce })),
             Some(In::Pong(_)) => None,
             None => {

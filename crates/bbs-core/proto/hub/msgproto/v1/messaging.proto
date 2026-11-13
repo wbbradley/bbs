@@ -132,6 +132,8 @@ message Message {
   // it, at the exact address replies go to. For a notice, the original
   // sender is the group itself.
   GroupCopy group_copy = 12;
+  // Set on a tag DM (ROOMS.md): which room post the recipient was tagged in.
+  RoomMention mention = 13;
 }
 
 message GroupCopy {
@@ -176,4 +178,176 @@ message DirectoryResult {
   string error_code = 4;
   string detail = 5;
   repeated RunDescriptor runs = 6;
+}
+
+// ---- Rooms (ROOMS.md) ----
+// A room is an entity of kind "room" with an ordered, retained log on one
+// host. Agents reach rooms on other homes only through their own home, which
+// forwards a signed RoomRequest naming the agent as Requester. The host
+// authorizes the requester and answers. Posting stays an ordinary Message
+// addressed to the room.
+
+// A typed policy subject. Never a wildcard string inside an EntityRef.
+message RoomSubject {
+  oneof subject {
+    EntityRef entity = 1;
+    string namespace = 2; // Every entity of this namespace.
+    bool any = 3;         // Every enrolled namespace. Must be true when set.
+  }
+}
+
+message RoomList {
+  string filter = 1; // Case-insensitive substring of name or description.
+  bool include_archived = 2;
+  uint32 page_size = 3;
+  bytes page_token = 4;
+}
+
+message RoomCreate {
+  // Random per logical command, persisted by the requester's home before
+  // sending and reused only until a signed answer arrives. The host
+  // deduplicates on (requester entity, operation_id).
+  string operation_id = 1;
+  string name = 2; // Last path segment; the host places it under "rooms/".
+  string description = 3;
+  // The creating home always fills both lists explicitly (CLI default for
+  // post is any=true). Empty post means closed to all but managers. The host
+  // always adds the requester entity to managers.
+  repeated RoomSubject post = 4;
+  repeated RoomSubject managers = 5;
+}
+// RoomUpdate.operation_id follows the same rule as RoomCreate.operation_id.
+
+enum RoomReadMode {
+  ROOM_READ_MODE_UNSPECIFIED = 0;
+  ROOM_READ_MODE_LATEST = 1; // Newest records, scanning backward from head.
+  ROOM_READ_MODE_AFTER = 2;  // Records after cursor, ascending. Empty cursor: from the oldest.
+  ROOM_READ_MODE_BEFORE = 3; // Records before cursor, scanning backward.
+  ROOM_READ_MODE_REFS = 4;   // Exactly these messages, if in this room's log.
+}
+
+message RoomRead {
+  RoomReadMode mode = 1;
+  bytes cursor = 2; // AFTER and BEFORE.
+  repeated MessageRef refs = 3; // REFS, at most 32. Never resolved outside the room's log.
+  // Filters (LATEST and BEFORE scan backward under a host scan bound; AFTER
+  // filters within its page). All set filters must match.
+  string text = 4; // Case-insensitive substring of text/* bodies.
+  EntityRef author = 5;
+  optional int64 since_unix_micros = 6;
+  optional int64 until_unix_micros = 7;
+  MessageRef in_reply_to = 8; // Direct replies to this message.
+  uint32 limit = 9;
+  uint32 max_bytes = 10;
+}
+
+message RoomUpdate {
+  string operation_id = 1;
+  uint64 expected_revision = 2; // Required: revisions start at 1. Must equal RoomInfo.revision.
+  optional string description = 3;
+  bool set_post = 4;
+  repeated RoomSubject post = 5;
+  bool set_managers = 6;
+  repeated RoomSubject managers = 7;
+  optional bool archived = 8;
+}
+
+message RoomRequest {
+  string request_id = 1;
+  Requester requester = 2;
+  string namespace = 3; // The host.
+  // The room's path under the host, e.g. "rooms/incident-foo", or
+  // "id:<entity_id>". Empty for list and create.
+  string room = 4;
+  int64 deadline_unix_micros = 5;
+  oneof op {
+    RoomList list = 10;
+    RoomCreate create = 11;
+    bool info = 12; // Must be true when set.
+    RoomRead read = 13;
+    RoomUpdate update = 14;
+  }
+}
+
+message RoomInfo {
+  EntityRef room = 1;
+  string name = 2; // Path under the host, e.g. "rooms/incident-foo".
+  string description = 3;
+  repeated RoomSubject post = 4;
+  repeated RoomSubject managers = 5;
+  bool archived = 6;
+  uint64 revision = 7;
+  uint64 head_position = 8;
+  bytes head_cursor = 9;
+  EntityRef creator = 10;
+  int64 created_at_unix_micros = 11;
+  repeated AddressRef recent_authors = 12; // Authors of the last 20 posts.
+  AddressRef address = 13; // Where posts are sent.
+}
+
+message RoomRecord {
+  // The message exactly as the host stored it. Authorship is the host's
+  // report (D127 rule 9), not independently verified by the reader.
+  EncodedMessage message = 1;
+  uint64 position = 2; // Monotonic, not contiguous.
+  bytes cursor = 3;
+  int64 accepted_at_unix_micros = 4;
+  // Reserved: the sender home's stored signed envelope, so readers can verify
+  // authorship themselves. Not in v1.
+  reserved 5;
+}
+
+enum RoomRefStatus {
+  ROOM_REF_STATUS_UNSPECIFIED = 0;
+  ROOM_REF_STATUS_PRESENT = 1; // In this room's log; the record is in records.
+  ROOM_REF_STATUS_REFUSED = 2; // The host refused this post; see reason.
+  ROOM_REF_STATUS_ABSENT = 3;  // Neither stored in nor refused by this room.
+}
+
+message RoomRefResult {
+  MessageRef ref = 1;
+  RoomRefStatus status = 2;
+  string reason = 3; // REFUSED: sender_not_permitted, recipient_closed, quota, invalid_reply, expired.
+}
+
+message RoomPage {
+  repeated RoomRecord records = 1; // Always ascending by position.
+  // AFTER: pass back as AFTER to continue; a filtered AFTER read advances
+  // past every record it scanned, even with no match. LATEST/BEFORE: pass
+  // back as BEFORE to continue older. Unfiltered AFTER at head: the
+  // request's cursor.
+  bytes next_cursor = 2;
+  uint64 head_position = 3;
+  bytes head_cursor = 4;
+  bool scan_truncated = 5; // The host's scan bound stopped a filtered scan.
+  // REFS: one per requested ref, in order. A PRESENT ref whose record did
+  // not fit the page's byte budget has no record in records; ask again.
+  repeated RoomRefResult refs = 6;
+}
+
+message RoomListResult {
+  repeated RoomInfo rooms = 1;
+  bytes next_page_token = 2;
+}
+
+message RoomAnswer {
+  bytes request_record_hash = 1; // SHA-256 of framed signed request input.
+  string namespace = 2; // Authoritative host namespace.
+  string request_id = 3;
+  // Empty on success. not_found, not_a_room, forbidden, cursor_invalid,
+  // conflict, revision_mismatch, quota, invalid, unsupported_op.
+  string error_code = 4;
+  string detail = 5;
+  oneof result {
+    RoomListResult list = 10;
+    RoomInfo info = 11; // Create, Info, Update; and Create's conflict.
+    RoomPage page = 12;
+  }
+}
+
+// On a DM: "you were tagged in this room post". A pointer, not the post.
+// The recipient's home reads the post back from the room when it can.
+message RoomMention {
+  EntityRef room = 1;
+  MessageRef post = 2;
 }
