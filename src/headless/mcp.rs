@@ -450,9 +450,55 @@ impl Tools {
                 let t = b.timer_remove(proto::TimerRemoveRequest { id }).await?;
                 format!("Removed timer {} for {}.", t.id, t.agent)
             }
+            room if room.starts_with("bbs_room_") => {
+                let (verb, args) = room_call(room, args)?;
+                serde_json::to_string(&b.room(verb, &args).await?)?
+            }
             other => bail!("unknown tool {other}"),
         })
     }
+}
+
+/// A `bbs_room_*` tool's verb and arguments: the tool's own arguments, as
+/// `bbs room VERB --json` takes them; `bbs_room_manage` names its verb in
+/// `action`.
+fn room_call(tool: &str, args: &Value) -> Result<(&'static str, Value)> {
+    let mut args = match args {
+        Value::Object(o) => o.clone(),
+        Value::Null => serde_json::Map::new(),
+        _ => bail!("{tool} takes an object of arguments"),
+    };
+    let verb =
+        match tool {
+            "bbs_room_manage" => {
+                let action = args
+                    .remove("action")
+                    .and_then(|a| a.as_str().map(str::to_string))
+                    .context("missing string argument \"action\"")?;
+                crate::service::rooms::VERBS
+                .iter()
+                .copied()
+                .filter(|v| {
+                    ["describe", "policy", "grant", "revoke", "archive", "unarchive"].contains(v)
+                })
+                .find(|v| *v == action)
+                .with_context(|| {
+                    format!(
+                        "unknown action {action:?}: describe, policy, grant, revoke, archive or \
+                         unarchive"
+                    )
+                })?
+            }
+            other => {
+                let verb = other.trim_start_matches("bbs_room_");
+                crate::service::rooms::VERBS
+                    .iter()
+                    .copied()
+                    .find(|v| *v == verb)
+                    .with_context(|| format!("unknown tool {other}"))?
+            }
+        };
+    Ok((verb, Value::Object(args)))
 }
 
 fn search_request(args: &Value) -> Result<proto::SearchRequest> {
@@ -552,7 +598,7 @@ fn format_search(
 pub fn tool_list() -> Value {
     let object = |props: Value, required: &[&str]| json!({ "type": "object", "properties": props, "required": required });
     let string = |description: &str| json!({ "type": "string", "description": description });
-    json!([
+    let mut tools = json!([
         {
             "name": "bbs_send",
             "description": "Send a BBS message to an agent or a human, or to @group to broadcast to a group where you have write access (marked [w] in bbs_group_list; only a human can grant it). Use blocker tools for structured group help requests.",
@@ -738,7 +784,130 @@ pub fn tool_list() -> Value {
             "description": "Remove a timer by its id, as shown by bbs_timer_list.",
             "inputSchema": object(json!({ "id": { "type": "integer", "description": "Timer id" } }), &["id"]),
         },
-    ])
+    ]);
+    tools.as_array_mut().unwrap().extend(room_tools());
+    tools
+}
+
+/// The `bbs_room_*` tools: one per `bbs room` verb, `bbs_room_manage` for a
+/// manager's changes.
+fn room_tools() -> Vec<Value> {
+    let object = |props: Value, required: &[&str]| json!({ "type": "object", "properties": props, "required": required });
+    let string = |description: &str| json!({ "type": "string", "description": description });
+    vec![
+        json!({
+            "name": "bbs_room_list",
+            "description": "List rooms on a room host (default hub): shared, ordered chats any agent on any home can read, post to and follow. Every room action goes through this BBS. Returns JSON.",
+            "inputSchema": object(json!({
+                "filter": string("Only rooms whose name or description contains this."),
+                "archived": { "type": "boolean", "description": "Include archived rooms." },
+                "host": string("The room host's namespace; default hub."),
+            }), &[]),
+        }),
+        json!({
+            "name": "bbs_room_info",
+            "description": "A room's description, who may post, managers, recent posters and head. ROOM is NAME, rooms/NAME or rooms/NAME@HOST. Returns JSON.",
+            "inputSchema": object(json!({ "room": string("The room."), "host": string("Host if the room names none.") }), &["room"]),
+        }),
+        json!({
+            "name": "bbs_room_create",
+            "description": "Create a room you manage, e.g. a breakout like incident-foo-2026-11-12. If it exists and you manage it, that counts as success. Returns JSON.",
+            "inputSchema": object(json!({
+                "name": string("[a-z0-9][a-z0-9-]*"),
+                "desc": string("What the room is for."),
+                "post": { "type": "array", "items": { "type": "string" }, "description": "Who may post: any (default), none, self, ns:NAMESPACE, entity:PATH@NAMESPACE." },
+                "manage": { "type": "array", "items": { "type": "string" }, "description": "Extra managers, same forms." },
+                "host": string("Host; default hub."),
+            }), &["name"]),
+        }),
+        json!({
+            "name": "bbs_room_manage",
+            "description": "Change a room you manage. action: describe (text), policy (post: who may post), grant or revoke (one of post or manage: a one-item list), archive, unarchive. Returns the room as JSON.",
+            "inputSchema": object(json!({
+                "room": string("The room."),
+                "action": { "type": "string", "enum": ["describe", "policy", "grant", "revoke", "archive", "unarchive"] },
+                "text": string("describe: the new description."),
+                "post": { "type": "array", "items": { "type": "string" } },
+                "manage": { "type": "array", "items": { "type": "string" } },
+            }), &["room", "action"]),
+        }),
+        json!({
+            "name": "bbs_room_follow",
+            "description": "Follow a room: its new posts come to your mail, at your next read (quiet, the default) or waking you (wake: true, at most once a minute per room). Starts at the room's head unless from is oldest or a cursor.",
+            "inputSchema": object(json!({
+                "room": string("The room."),
+                "wake": { "type": "boolean" },
+                "from": string("oldest, or a cursor from bbs_room_history."),
+            }), &["room"]),
+        }),
+        json!({
+            "name": "bbs_room_unfollow",
+            "description": "Stop following a room.",
+            "inputSchema": object(json!({ "room": string("The room.") }), &["room"]),
+        }),
+        json!({
+            "name": "bbs_room_follows",
+            "description": "The rooms you follow, with mode and undelivered counts.",
+            "inputSchema": object(json!({}), &[]),
+        }),
+        json!({
+            "name": "bbs_room_post",
+            "description": "Post to a room. Returns the post's outcome as JSON: queued until it leaves, then sent, and confirmed once read back from the room (or rejected, expired, unconfirmed). Tags (full addresses, at most 8) are sent only once the post is confirmed.",
+            "inputSchema": object(json!({
+                "room": string("The room."),
+                "text": string("The post."),
+                "reply": string("Answer this post: NAMESPACE:ID or a message id."),
+                "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "Agents to tag, as PATH@NAMESPACE." },
+                "wait": { "type": "boolean", "description": "Wait for the outcome (up to wait_secs, default 60)." },
+                "wait_secs": { "type": "integer", "minimum": 1, "maximum": 600 },
+            }), &["room", "text"]),
+        }),
+        json!({
+            "name": "bbs_room_reply",
+            "description": "Reply to post message in a room, or privately (private: true) to its author by direct message, best effort.",
+            "inputSchema": object(json!({
+                "room": string("The room."),
+                "message": string("The post: NAMESPACE:ID or a message id from your mail."),
+                "text": string("The reply."),
+                "private": { "type": "boolean" },
+            }), &["room", "message", "text"]),
+        }),
+        json!({
+            "name": "bbs_room_status",
+            "description": "What became of your room post: queued, sent, unknown, confirmed, rejected (with reason), expired or unconfirmed. Checks the room at once.",
+            "inputSchema": object(json!({ "message": string("Your post: its message id or NAMESPACE:ID.") }), &["message"]),
+        }),
+        json!({
+            "name": "bbs_room_history",
+            "description": "A room's recent posts without following it, oldest first; authors are the host's report. Returns JSON with next_cursor for older posts (pass as before).",
+            "inputSchema": object(json!({
+                "room": string("The room."),
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                "before": string("A cursor: posts older than it."),
+            }), &["room"]),
+        }),
+        json!({
+            "name": "bbs_room_search",
+            "description": "Search a room by text, author (PATH@NAMESPACE) or time (since/until: a duration like 1h or RFC3339). Returns JSON.",
+            "inputSchema": object(json!({
+                "room": string("The room."),
+                "text": string("Case-insensitive substring."),
+                "author": string("PATH@NAMESPACE."),
+                "since": string("Duration back from now, or RFC3339."),
+                "until": string("RFC3339."),
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+            }), &["room"]),
+        }),
+        json!({
+            "name": "bbs_room_show",
+            "description": "One room post by reference, and with thread: true its replies level by level. Returns JSON.",
+            "inputSchema": object(json!({
+                "room": string("The room."),
+                "message": string("NAMESPACE:ID or a message id from your mail."),
+                "thread": { "type": "boolean" },
+            }), &["room", "message"]),
+        }),
+    ]
 }
 
 #[cfg(test)]
@@ -757,6 +926,34 @@ mod search_tests {
         let limit = &tool["inputSchema"]["properties"]["limit"];
         assert_eq!(limit["maximum"], MAX_DIRECTORY_LIMIT);
         assert_eq!(DEFAULT_DIRECTORY_LIMIT, 50);
+    }
+
+    /// Every room tool maps to a `bbs room` verb, with its arguments as the
+    /// verb takes them.
+    #[test]
+    fn room_tools_cover_every_room_verb() {
+        let tools = tool_list();
+        let mut verbs = std::collections::BTreeSet::new();
+        for tool in tools.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            if !name.starts_with("bbs_room_") {
+                continue;
+            }
+            if name == "bbs_room_manage" {
+                let actions = tool["inputSchema"]["properties"]["action"]["enum"].clone();
+                for a in actions.as_array().unwrap() {
+                    let (verb, args) = room_call(name, &json!({"room": "r", "action": a})).unwrap();
+                    assert_eq!(args, json!({"room": "r"}));
+                    verbs.insert(verb);
+                }
+            } else {
+                verbs.insert(room_call(name, &json!({})).unwrap().0);
+            }
+        }
+        let all: std::collections::BTreeSet<&str> =
+            crate::service::rooms::VERBS.iter().copied().collect();
+        assert_eq!(verbs, all);
+        assert!(room_call("bbs_room_manage", &json!({"action": "follow"})).is_err());
     }
 
     /// The MCP server acts only as the runner's existing agent: it offers no

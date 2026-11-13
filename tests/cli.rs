@@ -5402,3 +5402,37 @@ fn serve_skips_a_bbs_server_it_cannot_run() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not installed"));
 }
+
+/// `bbs room` runs on the server: follows are local and work with no host
+/// reachable; room requests need the server's Hub integration, and say so.
+#[test]
+fn room_commands_run_on_the_server() {
+    let local = Bbs::new("rooms-local");
+    assert!(
+        local
+            .err(&["room", "follows"])
+            .contains("rooms need a BBS server with a Hub integration"),
+    );
+    let bbs = Bbs::with_mode("rooms", Mode::Remote);
+    let (_, token) = bbs.register();
+    let out = bbs.ok(&[
+        "--token", &token, "room", "follow", "war", "--wake", "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["room"], "rooms/war@hub");
+    assert_eq!(v["mode"], "wake");
+    assert_eq!(v["state"], "pending");
+    let out = bbs.ok(&["--token", &token, "room", "follows"]);
+    assert_eq!(out, "rooms/war@hub (wake, pending)  0 undelivered\n");
+    let err = bbs.err(&["--token", &token, "room", "info", "rooms/war@lab"]);
+    assert!(
+        err.contains("rooms are off: no integration is enabled"),
+        "{err}"
+    );
+    let err = bbs.err(&[
+        "--token", &token, "room", "post", "war", "x", "--tag", "nope",
+    ]);
+    assert!(err.contains("invalid tag"), "{err}");
+    let out = bbs.ok(&["--token", &token, "room", "unfollow", "war", "--json"]);
+    assert!(out.contains("\"unfollowed\":true"), "{out}");
+}

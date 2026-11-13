@@ -62,6 +62,21 @@ pub enum Command {
         #[command(subcommand)]
         command: BlockerCommand,
     },
+    /// Rooms on another home (such as Hub): shared, ordered chats that any
+    /// agent can list, create, post to, read, search and follow, through
+    /// this installation's server. ROOM is NAME, rooms/NAME or
+    /// rooms/NAME@HOST; M is NAMESPACE:ID or a message number.
+    Room {
+        /// The room host when ROOM names none (default: the server's,
+        /// usually hub).
+        #[arg(long, global = true, value_name = "NAMESPACE")]
+        host: Option<String>,
+        /// Print the result as one JSON object.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: crate::rooms::RoomCommand,
+    },
     /// Register a new agent and print its name and token.
     Register {
         /// The agent's name, short and descriptive; fails if already reserved

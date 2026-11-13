@@ -154,6 +154,11 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
             format!("Added human {name}.\n")
         }
         Command::Blocker { command, json } => crate::blockers::run(backend, command, json).await?,
+        Command::Room {
+            command,
+            host,
+            json,
+        } => crate::rooms::run(backend, command, host, json).await?,
         Command::Timer { command } => match command {
             TimerCommand::Add { agent, when, text } => {
                 let req = proto::TimerAddRequest {
@@ -641,6 +646,16 @@ struct MessageJson<'a> {
     /// The message this one answers: its id here, or `NAMESPACE:MESSAGE_ID`
     /// when this server does not have it. Null otherwise.
     in_reply_to: Option<&'a str>,
+    /// A room post or notice delivered by a follow or a tag: the room, as
+    /// `rooms/NAME@HOST`; on a tag that could not be read back, with
+    /// `room_unverified`. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    room: Option<&'a str>,
+    /// The agent whose tag was merged into this post.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    room_tagged_by: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    room_unverified: bool,
 }
 
 #[derive(Serialize)]
@@ -810,6 +825,9 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
             reported: m.reported == Some(true),
             notice: m.group_notice == Some(true),
             in_reply_to: m.in_reply_to.as_deref(),
+            room: m.room.as_deref(),
+            room_tagged_by: m.room_tagged_by.as_deref(),
+            room_unverified: m.room_unverified == Some(true),
         }));
     }
     let mut out = String::new();
@@ -833,9 +851,14 @@ pub(crate) fn format_messages(msgs: &[proto::Message], json: bool) -> Result<Str
             .timer_id
             .map(|id| format!(" (timer {id})"))
             .unwrap_or_default();
+        let room = match (&m.room_tagged_by, m.room_unverified, &m.room) {
+            (Some(by), _, _) => format!(" (tagged by {by})"),
+            (None, Some(true), Some(room)) => format!(" (a tag in {room}, unverified)"),
+            _ => String::new(),
+        };
         writeln!(
             out,
-            "[{}] from {from} to {to} (id {}){}{timer}:",
+            "[{}] from {from} to {to} (id {}){}{timer}{room}:",
             display_time(&m.created_at),
             m.id,
             reply_marker(m),

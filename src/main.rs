@@ -8,6 +8,7 @@ mod config;
 mod connect;
 mod headless;
 mod hook;
+mod rooms;
 mod serve;
 mod setup;
 mod ui;
