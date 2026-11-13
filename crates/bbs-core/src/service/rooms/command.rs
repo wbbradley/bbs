@@ -905,12 +905,18 @@ impl<H: RoomHome> Cmd<'_, H> {
         })
         .await?;
         self.home.changed();
+        let sent = sent.context("the direct message was not stored")?;
+        let (dm, state, reason) = self
+            .home
+            .db(move |conn| store::dm_state(conn, sent))
+            .await?;
+        // The direct message's delivery as this installation saw it.
         Ok(json!({
-            "private": true,
+            "ref": ref_display(&dm),
             "to": to,
             "in_reply_to": ref_display(&r),
-            "message": sent,
-            "note": "sent as a direct message; this reports only what this installation saw",
+            "state": state,
+            "reason": reason,
         }))
     }
 

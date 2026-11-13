@@ -836,6 +836,22 @@ async fn a_follow_starts_at_the_head_and_imports_each_page_once() {
         .unwrap();
     assert_eq!(v["to"], "oncall@hub");
     assert_eq!(v["in_reply_to"], ref_display(&p1));
+    assert_eq!(v["state"], "queued");
+    assert_eq!(v["reason"], Value::Null);
+    let r = v["ref"].as_str().unwrap();
+    assert!(r.starts_with("bbs:"), "{r}");
+    let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["ref", "to", "in_reply_to", "state", "reason"]);
+    rig.hand_off(None);
+    let v = rig
+        .run(
+            &rig.ranger,
+            "reply",
+            json!({"room": "feed", "message": ref_display(&p1), "text": "dm2", "private": true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "queued", "a new message, not yet handed off");
     assert!(rig.read(&rig.ranger).is_empty());
 }
 

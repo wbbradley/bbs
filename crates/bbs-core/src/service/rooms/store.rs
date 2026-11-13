@@ -1441,6 +1441,40 @@ pub(super) fn outcome(conn: &Connection, message: i64) -> Result<Option<Outcome>
     }))
 }
 
+/// A direct message's reference and its delivery as this installation saw
+/// it: its outbox handoff's state for a remote recipient (`queued`, `sent`,
+/// `unknown`, `rejected` with a reason, `expired`), `sent` for a local one.
+pub(super) fn dm_state(
+    conn: &Connection,
+    message: i64,
+) -> Result<(mp::MessageRef, &'static str, Option<String>)> {
+    let (ns, id, handoff, detail): (String, String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT m.origin_namespace, m.origin_message_id, x.state, x.detail
+             FROM messages m LEFT JOIN integration_outbox x ON x.message_id = m.id
+             WHERE m.id = ?1",
+            [message],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+    let reason = detail.map(|d| d.split(':').next().unwrap_or(&d).trim().to_string());
+    let (state, reason) = match handoff.as_deref() {
+        None => ("sent", None),
+        Some("pending" | "attempted") => ("queued", None),
+        Some("unknown") => ("unknown", None),
+        Some("rejected") if reason.as_deref() == Some("expired") => ("expired", None),
+        Some("rejected") => ("rejected", reason),
+        Some(_) => ("sent", None),
+    };
+    Ok((
+        mp::MessageRef {
+            namespace: ns,
+            message_id: id,
+        },
+        state,
+        reason,
+    ))
+}
+
 /// Room posts due a read-back: those past their first hop (sent, received
 /// or unknown), not yet decided, or unconfirmed for less than a day.
 pub(super) fn due_readbacks(

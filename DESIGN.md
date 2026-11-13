@@ -899,7 +899,9 @@ contract fixes for every home: room info (`room`, `description`, `post`,
 `author`, `in_reply_to`, `body`, `kind`, `accepted_at`, `position`, `cursor`;
 `next_cursor`, `head`, `scan_truncated`), post outcomes (`ref`, `room`,
 `state`, `reason`, `tags` with `to`, `state`, `reason`), follows (`room`,
-`mode`, `state`: `pending`, `active` or `backfill`, `created`). A failure
+`mode`, `state`: `pending`, `active` or `backfill`, `created`). A private
+reply prints its direct message's delivery as BBS saw it (`ref`, `to`,
+`in_reply_to`, `state`, `reason`) and fails only when refused locally. A failure
 prints `{"error": CODE, "detail": TEXT}`; the exit code is 1 for a refusal or
 error (including a post that settled as `rejected`, whose output is still
 its outcome), 2 when `--wait` ran out, 4 when no answer came.

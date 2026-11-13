@@ -292,7 +292,9 @@ pub async fn run(
 /// rejected (the output stays the outcome, not an error object), 2 when
 /// `--wait` ran out before the post settled.
 pub fn exit_code(verb: &str, args: &Value, value: &Value) -> Option<i32> {
-    if !matches!(verb, "post" | "reply" | "status") {
+    // A private reply's state is its direct message's, and only a local
+    // refusal (an error) fails it.
+    if !matches!(verb, "post" | "reply" | "status") || !value["to"].is_null() {
         return None;
     }
     match value["state"].as_str() {
@@ -402,7 +404,7 @@ pub fn text(verb: &str, v: &Value) -> String {
                 );
             }
         }
-        "post" | "reply" | "status" if v["private"] != true => {
+        "post" | "reply" | "status" if v["to"].is_null() => {
             let _ = write!(
                 out,
                 "Post {} to {}: {}",
@@ -423,14 +425,18 @@ pub fn text(verb: &str, v: &Value) -> String {
             }
         }
         "reply" => {
-            let _ = writeln!(
+            let _ = write!(
                 out,
-                "Sent to {} privately, answering {} (message {}). Only what this \
-                 installation saw is known.",
+                "Private reply {} to {}, answering {}: {}",
+                s(v, "ref"),
                 s(v, "to"),
                 s(v, "in_reply_to"),
-                v["message"]
+                s(v, "state")
             );
+            if let Some(r) = v["reason"].as_str() {
+                let _ = write!(out, " ({r})");
+            }
+            out.push_str(". Only what this installation saw is known.\n");
         }
         "history" | "search" | "show" => {
             let posts = v["posts"].as_array().cloned().unwrap_or_default();
