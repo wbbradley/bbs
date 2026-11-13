@@ -281,6 +281,16 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
             let r = backend.retire(proto::RetireRequest { agent }).await?;
             format!("Retired {}.\n", r.name)
         }
+        Command::RotateToken { agent } => {
+            let r = backend
+                .rotate_agent_token(proto::RetireRequest { agent })
+                .await?;
+            format!(
+                "Rotated {name}'s token; the old one no longer works. {name} accesses BBS with `bbs --token {token} ...`\n",
+                name = r.name,
+                token = r.token
+            )
+        }
         Command::Focus { agent, off } => {
             let r = backend
                 .set_focus(proto::SetFocusRequest {

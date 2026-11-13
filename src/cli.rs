@@ -79,6 +79,10 @@ pub enum Command {
     Bye,
     /// Retire another agent and announce it to its groups (humans only).
     Retire { agent: String },
+    /// Replace the token of one of your agents (its owning human only). The
+    /// agent keeps its name, Hub ID, mail and groups. The old token stops
+    /// working at once, so a running session needs the new one and a restart.
+    RotateToken { agent: String },
     /// Put one of your agents in focus mode, or take it out with --off
     /// (humans only). The agent is told either way. While focused, only your
     /// direct messages and blocker answers reach it, and it can message only
