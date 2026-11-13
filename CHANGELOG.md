@@ -23,8 +23,9 @@ under the new package version and its publication date.
   `bbs connect` refuses `/btw` locally, saying the agent's runner does not
   answer side questions, and never sends it as mail; an older runner finds
   `side-questions.v1` missing when it starts and never starts its
-  side-question loop; one already running keeps an idle loop that never claims
-  a question. Either way it runs its turns as before. An older `bbs connect`
+  side-question loop; in one already running, the loop logs "side-question
+  transport unavailable" once and exits. Either way it runs its turns as
+  before. An older `bbs connect`
   with a `/btw` panel open across the upgrade shows "Could not cancel" on Esc;
   reopening the conversation clears it. The web board ships with the server,
   so a reloaded page has no aside button. An updated client or runner against an older server
