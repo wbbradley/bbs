@@ -1165,8 +1165,8 @@ pub(super) struct Mention {
 /// Held tags due a read-back. Read-backs are capped per sender namespace
 /// ([`MENTION_READS`] a minute, D10): past that, a tag is released at once as
 /// an unverified claim, without asking its host. Returns the ones to ask
-/// about, each marked asked.
-pub(super) fn due_mentions(ctx: &Ctx, cfg: &RoomConfig) -> Result<Vec<Mention>> {
+/// about, each marked asked, and how many it released.
+pub(super) fn due_mentions(ctx: &Ctx, cfg: &RoomConfig) -> Result<(Vec<Mention>, usize)> {
     let due: Vec<(Mention, String)> = ctx
         .conn
         .prepare(
@@ -1196,6 +1196,7 @@ pub(super) fn due_mentions(ctx: &Ctx, cfg: &RoomConfig) -> Result<Vec<Mention>> 
         .collect::<Result<_, _>>()?;
     let since = fmt_time(ctx.now - cfg.d(60.0));
     let mut ask = Vec::new();
+    let mut released = 0;
     for (m, sender) in due {
         let asked: i64 = ctx.conn.query_row(
             "SELECT count(*) FROM room_mentions WHERE sender_namespace = ?1 AND asked_at > ?2",
@@ -1209,6 +1210,7 @@ pub(super) fn due_mentions(ctx: &Ctx, cfg: &RoomConfig) -> Result<Vec<Mention>> 
                 "over the tag read-back cap; releasing the tag unverified"
             );
             unverified(ctx, cfg, &m)?;
+            released += 1;
             continue;
         }
         ctx.conn.execute(
@@ -1217,7 +1219,7 @@ pub(super) fn due_mentions(ctx: &Ctx, cfg: &RoomConfig) -> Result<Vec<Mention>> 
         )?;
         ask.push(m);
     }
-    Ok(ask)
+    Ok((ask, released))
 }
 
 /// What a read-back found for one reference.

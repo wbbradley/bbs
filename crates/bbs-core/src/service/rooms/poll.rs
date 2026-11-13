@@ -583,7 +583,10 @@ fn refs_op(refs: Vec<mp::MessageRef>) -> mp::room_request::Op {
 /// Read back the posts received tags point at (D10), rooms concurrently.
 async fn mentions<H: RoomHome>(home: &H, cfg: &RoomConfig) -> Result<()> {
     let cfg2 = cfg.clone();
-    let due = tx(home, move |ctx| store::due_mentions(ctx, &cfg2)).await?;
+    let (due, released) = tx(home, move |ctx| store::due_mentions(ctx, &cfg2)).await?;
+    if released > 0 {
+        home.changed();
+    }
     let mut by_room: BTreeMap<(String, String), Vec<store::Mention>> = BTreeMap::new();
     for m in due {
         by_room
@@ -595,6 +598,9 @@ async fn mentions<H: RoomHome>(home: &H, cfg: &RoomConfig) -> Result<()> {
         .into_values()
         .flat_map(|ms| ms.chunks(MAX_REFS).map(<[_]>::to_vec).collect::<Vec<_>>())
         .collect();
+    if jobs.is_empty() {
+        return Ok(());
+    }
     stream::iter(jobs)
         .for_each_concurrent(CONCURRENCY, |chunk| async move {
             let done = async {
