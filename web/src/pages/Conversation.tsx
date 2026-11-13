@@ -11,7 +11,6 @@ import { FocusMark, FocusToggle } from "../components/Focus";
 import { MessageView } from "../components/MessageView";
 import { NoteDrawer, type NoteHandle } from "../components/NoteDrawer";
 import { PageHeader } from "../components/PageHeader";
-import { SidePanel } from "../components/SidePanel";
 import { Timeline } from "../components/Timeline";
 import { go, navigate, paths, useSearch } from "../router";
 import { isCovered, useCovered } from "../cover";
@@ -19,17 +18,8 @@ import { empty, mergeWindow, type Held } from "../merge";
 import { SeekNote } from "../components/SeekNote";
 import { useMessages } from "../useMessages";
 import { useBoard, usePrefs } from "../store";
-import {
-  Control,
-  ContextSource,
-  InputStatus,
-  Kind,
-  SideStatus,
-  type Activity,
-  type SideReport,
-  type SideRequest,
-} from "../types";
-import { ago, same, sideDraft } from "../util";
+import { Control, ContextSource, InputStatus, Kind, type Activity, type SideReport } from "../types";
+import { ago, same } from "../util";
 
 const FEED_BACKLOG = 300;
 const ACTIVITY_BACKLOG = 200;
@@ -53,8 +43,6 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const [following, setFollowing] = useState(true);
   const [noteOpen, setNoteOpen] = useState(false);
   const [answering, setAnswering] = useState(false);
-  const [sideOpen, setSideOpen] = useState(false);
-  const [sideHistory, setSideHistory] = useState<SideRequest[]>([]);
   const [side, setSide] = useState<SideReport | null>(null);
   const [sideError, setSideError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -103,7 +91,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   );
   const records = activityHeld.rows;
 
-  // The owner's side state: questions waiting on them, context and asides.
+  // The owner's side state: questions waiting on them, and context.
   const sideSupported = owned && board.has("agent-interactions.v1");
   useEffect(() => {
     if (!sideSupported) return;
@@ -132,17 +120,6 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
       window.clearTimeout(timer);
     };
   }, [agent, sideSupported]);
-
-  // Remember earlier exchanges of this side conversation for the visit.
-  useEffect(() => {
-    const s = side?.side;
-    if (!s || s.status === SideStatus.Open) return;
-    setSideHistory((h) => {
-      const conversation = s.conversation ?? s.id;
-      const kept = h.filter((x) => (x.conversation ?? x.id) === conversation && x.id !== s.id);
-      return [...kept, s];
-    });
-  }, [side?.side]);
 
   const entries = useMemo(() => buildActivity(records), [records]);
 
@@ -239,17 +216,6 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
   const send = useCallback(
     async (text: string) => {
       setNotice(null);
-      const draft = sideDraft(text);
-      if (owned && draft.kind === "ask") {
-        const question = draft.question;
-        setSideOpen(true);
-        if (!question) return true;
-        const report = side?.side;
-        const follows =
-          report && report.status !== SideStatus.Open && !report.ended && side?.side_followups ? report.id : null;
-        await rpc("ask_side", { agent, question, follows });
-        return true;
-      }
       if (owned && text.trim() === "/answer") {
         if (pendingInput) setAnswering(true);
         else setNotice(`${agent} has no questions waiting.`);
@@ -259,10 +225,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
         setNotice(contextLabel(side) ?? "Context not reported.");
         return true;
       }
-      // Only `//btw` loses a slash, to send a literal `/btw`; all else is
-      // sent as typed.
-      const body = draft.kind === "literal" ? draft.body : text;
-      await rpc("send", { to: agent, body });
+      await rpc("send", { to: agent, body: text });
       return true;
     },
     [agent, owned, side, pendingInput],
@@ -343,11 +306,6 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
                 Note{board.notes.get(noteId)?.body ? " •" : ""}
               </button>
             )}
-            {owned && board.has("side-questions.v1") && (
-              <button className="btn small" onClick={() => setSideOpen(true)} title="/btw: ask on the side">
-                Aside
-              </button>
-            )}
             {owned && info && !info.goal && info.goal_reported_at && board.has("agent-goal.v1") && (
               <button className="btn small" onClick={() => setGoalOpen("new")} title="Give the agent a goal to work toward across turns">
                 Goal
@@ -392,7 +350,7 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
             hint={
               notice ??
               (owned
-                ? "/btw asks on the side · /answer · /context"
+                ? "/answer · /context"
                 : info?.focused_at
                   ? `${agent} is in focus mode with ${info.owner ?? "its owner"} and is not accepting messages`
                   : info
@@ -424,9 +382,6 @@ export function Conversation({ agent, openNav }: { agent: string } & PageProps) 
                       Answer
                     </button>
                   </div>
-                )}
-                {sideOpen && (
-                  <SidePanel agent={agent} report={side} history={sideHistory} onClose={() => setSideOpen(false)} />
                 )}
               </>
             }

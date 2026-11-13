@@ -149,61 +149,6 @@ impl Harness {
         }
     }
 
-    pub fn side_supported(&self) -> bool {
-        matches!(self, Self::Codex(_))
-    }
-    pub async fn finish_side(&self) -> bool {
-        match self {
-            Self::Codex(c) => c.finish_side().await,
-            Self::Acp(_) => true,
-        }
-    }
-
-    pub fn side_progress(&self) -> Option<String> {
-        match self {
-            Self::Codex(c) => c.side_progress(),
-            Self::Acp(_) => None,
-        }
-    }
-    pub fn side_text(&self) -> String {
-        match self {
-            Self::Codex(c) => c.side_text(),
-            Self::Acp(_) => String::new(),
-        }
-    }
-    pub fn side_retained(&self) -> bool {
-        match self {
-            Self::Codex(c) => c.side_retained(),
-            Self::Acp(_) => false,
-        }
-    }
-    #[cfg(test)]
-    pub async fn side_question(
-        &self,
-        question: &str,
-        cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> super::codex_btw::Outcome {
-        self.side_turn(question, super::codex_btw::Mode::OneShot, cancel)
-            .await
-    }
-    pub async fn side_turn(
-        &self,
-        question: &str,
-        mode: super::codex_btw::Mode,
-        cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> super::codex_btw::Outcome {
-        match self {
-            Self::Codex(c) => c.side_turn(question, mode, cancel).await,
-            Self::Acp(_) => super::codex_btw::Outcome {
-                status: super::codex_btw::Status::Unsupported,
-                answer: String::new(),
-                detail: "ACP side-fork isolation has not been verified".into(),
-                disable: true,
-                retained: false,
-            },
-        }
-    }
-
     pub fn input_pending(&self, key: &str) -> bool {
         match self {
             Self::Acp(a) => a.inputs.pending(key),

@@ -220,11 +220,7 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             return Err(err);
         }
     };
-    let mut interactions = if let Some(s) = side_session {
-        Some(s.start(agent_harness.clone(), share_warn.clone()).await)
-    } else {
-        None
-    };
+    let interactions = side_session.map(|s| s.start(agent_harness.clone(), share_warn.clone()));
     state.harness = Some(harness.clone());
     state.session_id = Some(agent_harness.session_id().to_string());
     state.dynamic_tools = agent_harness.dynamic_tools();
@@ -335,7 +331,6 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
 
     let (drain_reports, drain_rx) =
         tokio::sync::watch::channel(proto::ReportDrainRequest::default());
-    let mut side_drain = interactions.as_ref().and_then(|side| side.drain_progress());
     let drain_reporting = if server_has(&config, dir, "agent-drain.v1").await {
         Some(tokio::spawn(report_drain(identity_backend, drain_rx)))
     } else {
@@ -373,13 +368,9 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
             && outbox.is_empty()
             && mail_rx.is_empty()
         {
-            let side_completed_through = side_drain.as_ref().map_or(0, |r| *r.borrow());
             drain_reports.send_if_modified(|report| {
-                if received_through > report.completed_through
-                    || side_completed_through > report.side_completed_through
-                {
+                if received_through > report.completed_through {
                     report.completed_through = received_through;
-                    report.side_completed_through = side_completed_through;
                     true
                 } else {
                     false
@@ -680,9 +671,6 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
                     None => break Err(anyhow::anyhow!("owner reply sender stopped; outbox retained")),
                 }
             }
-            changed = async { side_drain.as_mut().unwrap().changed().await }, if side_drain.is_some() => {
-                if changed.is_err() { side_drain = None; }
-            }
             _ = tokio::time::sleep_until(ready_at), if throttled => {}
             _ = tokio::time::sleep_until(wake.unwrap_or(ready_at)), if wake.is_some() && turn.is_none() => {
                 if let Some(g) = state.goal.as_mut() && (g.expire() || g.wake()) {
@@ -713,10 +701,6 @@ pub async fn run(dir: &Path, as_human: Option<&str>, args: HeadlessRunArgs) -> R
     }
     if turn.is_some() {
         let _ = agent_harness.cancel().await;
-    }
-    // Retained side children must finish while the provider can still reply.
-    if let Some(interactions) = interactions.as_mut() {
-        interactions.finish_btw().await;
     }
     // Stop the producer before draining, so late cancellation text is retained.
     if !process.stop().await {
@@ -1359,10 +1343,7 @@ async fn report_drain(
             _ = retry.tick() => {},
         }
         let report = *reports.borrow_and_update();
-        if report.completed_through == 0
-            || (report.completed_through <= sent.completed_through
-                && report.side_completed_through <= sent.side_completed_through)
-        {
+        if report.completed_through <= sent.completed_through {
             continue;
         }
         match tokio::time::timeout(Duration::from_secs(10), backend.report_drain(report)).await {

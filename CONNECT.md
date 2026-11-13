@@ -132,45 +132,6 @@ request, with no percentage when the limit is unknown and "not reported" rather
 than 0%; Esc closes it. Both commands are local, never sent, and only for the
 agent's owner.
 
-### Side questions
-
-In an owned agent conversation, `/btw QUESTION` opens a side answer panel.
-Questions are at most 4 KiB and answers at most 64 KiB; one question may run
-at a time. `//btw QUESTION` sends the literal text `/btw QUESTION` as mail.
-An empty question, missing support or a refusal keeps the draft and explains
-the problem. A confirmed start clears the submitted draft only if it has not
-changed; an uncertain start keeps it and is never automatically retried.
-
-While the panel is up, typing goes to the side conversation or nowhere: Enter
-never sends the draft to the agent as mail. `/answer`, `/context` and a fresh
-`/btw QUESTION` still work. The panel holds the composer with its own draft;
-the parent draft is kept aside and returns when the panel closes. Within the
-open agent conversation, a side draft left then comes back with the next
-`/btw` panel. Leaving the agent conversation drops its unfinished side draft;
-it never becomes a parent draft.
-
-With an updated server and runner (`side-conversations.v1`), the side
-question starts a side conversation in btw mode: the panel takes the
-timeline's place, and Enter asks a follow-up in the same side copy, which
-remembers the earlier side questions. The parent timeline keeps loading out of
-view; the panel's header counts new messages from the agent, which are not
-marked read, nor its activity seen, until the timeline shows again. Questions
-the agent is waiting on still show, and `/answer` still opens them. Esc while
-an answer runs cancels that answer and stays; otherwise it ends the side
-conversation and returns to the timeline. The side conversation also ends
-after 30 minutes idle or when the runner restarts; the panel then says so and
-keeps typing fenced until Esc, and the next `/btw` starts fresh. Earlier
-exchanges show for this session only; after reopening, the panel shows the
-latest one and notes that the agent still has the rest.
-
-Without that support, a finished panel stays above the composer, where the
-parent timeline remains visible, typing is fenced until Esc closes it, and
-closing the conversation keeps the request running; reopening shows its
-latest result. A runner restart interrupts pending work.
-Side questions require `side-questions.v1` and a supporting runner; the initial
-implementation supports Codex app-server. Tools and shared systems remain
-available to the child, as described in [HEADLESS.md](HEADLESS.md#side-questions).
-
 ### Blockers
 
 `bbs connect` keeps one queue of your blockers (`blockers-mine.v1`): every open
@@ -182,9 +143,9 @@ up. While any are open, the right end of the status bar shows
 conversation's mail and activity marks, however long the rest of the bar.
 
 The queue is a page of its own, like Agents and Groups: `[B]lockers` on the
-main menu, or F2 from any screen, including dialogs, forms, the search prompt
-and the `/btw` panel. F2 never opens a second page: with the page already open
-beneath, it goes back to it. F2 from an open note stores a changed note first,
+main menu, or F2 from any screen, including dialogs, forms and the search
+prompt. F2 never opens a second page: with the page already open beneath, it
+goes back to it. F2 from an open note stores a changed note first,
 as any destination does, and stays in the note if it cannot be stored. The
 page is split in two parts that never move for each other: the top third
 holds the list, the bottom two thirds the selected blocker and its answer,
@@ -396,8 +357,8 @@ saved with the color scheme in `~/.local/state/bbs/connect.json`, so later
 sessions start in it; without a saved choice, conversations are verbose. If the
 choice cannot be saved, the bottom bar says why and the view still changes for
 this session. An open `/answer` form keeps
-every key, so `Ctrl-T` does nothing there. The question card, `/context` and
-the `/btw` panel are unaffected, and toggling never cancels anything. Marking
+every key, so `Ctrl-T` does nothing there. The question card and `/context`
+are unaffected, and toggling never cancels anything. Marking
 read and seen, progress, and notices work the same in both views.
 
 Each thing is shown once. An activity `text` record naming the owner mail it
@@ -627,8 +588,7 @@ and Home/End work everywhere too.
   drafts and cursor positions are restored when their discussions are reopened,
   including in a later `connect` session. Arrow keys move within the draft in
   Insert mode; `Up` on the draft's first display row (of a wrapped first line,
-  its first row) switches to navigation and scrolls the timeline up a line. In
-  btw mode, `Up` stays in the side draft.
+  its first row) switches to navigation and scrolls the timeline up a line.
 - A group thread opens with the composer active. `Esc` returns to
   navigation, and `i` (or `Tab`) focuses the composer again.
 - In every composer, `Ctrl-u` deletes back to the start of the logical line;

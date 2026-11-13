@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { KEEP, empty, mergeContext, mergeWindow, release } from "./merge";
-import { sideDraft } from "./util";
 
 const ids = (...n: number[]) => n.map((id) => ({ id }));
 
@@ -78,17 +77,5 @@ describe("searching again and again", () => {
     }
     // Back at the newest, nothing is kept beyond the cap.
     expect(release(held).rows.length).toBe(KEEP);
-  });
-});
-
-describe("/btw in a draft", () => {
-  it("unescapes only //btw, as connect does", () => {
-    expect(sideDraft("// TODO: check")).toEqual({ kind: "mail" });
-    expect(sideDraft("//host/path")).toEqual({ kind: "mail" });
-    expect(sideDraft("///btw")).toEqual({ kind: "mail" });
-    expect(sideDraft("//btw is a command")).toEqual({ kind: "literal", body: "/btw is a command" });
-    expect(sideDraft("  /btw  why? ")).toEqual({ kind: "ask", question: "why?" });
-    expect(sideDraft("/btwx no")).toEqual({ kind: "mail" });
-    expect(sideDraft("/btw")).toEqual({ kind: "ask", question: "" });
   });
 });

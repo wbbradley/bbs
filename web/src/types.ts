@@ -28,14 +28,6 @@ export const BlockerStatus = { Open: 1, Answered: 2, Cancelled: 3, Superseded: 4
 export const BlockerChoiceMode = { SelectOne: 1, SelectMany: 2 } as const;
 export const InputStatus = { Pending: 1, Answered: 2, Declined: 3, Cancelled: 4, Stale: 5 } as const;
 export const AnswerAction = { Submit: 1, Decline: 2, Cancel: 3 } as const;
-export const SideStatus = {
-  Open: 1,
-  Completed: 2,
-  Failed: 3,
-  Cancelled: 4,
-  Interrupted: 5,
-  Ended: 6,
-} as const;
 export const ContextSource = { Current: 1, LastRequest: 2 } as const;
 export const EffortResult = { Applied: 1, Failed: 2, Unknown: 3 } as const;
 
@@ -271,27 +263,12 @@ export interface OwnerInput {
   is_blocking: boolean;
 }
 
-export interface SideRequest {
-  id: number;
-  question: string;
-  status: number;
-  answer: string | null;
-  updated_at: string;
-  follows: number | null;
-  ended: boolean;
-  conversation: number | null;
-}
-
 export interface SideReport {
   agent: string;
   pending_input: OwnerInput | null;
   usage: { used_tokens: number | null; limit_tokens: number | null; source: number } | null;
   revision: number;
   reported_at: string;
-  side: SideRequest | null;
-  side_supported: boolean | null;
-  side_reason: string | null;
-  side_followups: boolean | null;
 }
 
 export interface SearchHit {

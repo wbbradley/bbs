@@ -88,22 +88,15 @@ pub fn report_drain_with_changes(
     caller: &Caller,
     req: proto::ReportDrainRequest,
 ) -> Result<(proto::Empty, bool)> {
-    if req.completed_through < 0 || req.side_completed_through < 0 {
-        bail!("completed message and side request ids must not be negative");
+    if req.completed_through < 0 {
+        bail!("completed message id must not be negative");
     }
     with_ctx(conn, caller, |ctx| {
         let me = ctx.agent()?;
-        // A side question's cancelled/ended status records owner intent, not
-        // provider quiescence. Only this runner-confirmed cursor clears it.
         let updated = ctx.conn.execute(
-            "WITH observed AS (
-                SELECT coalesce(max(id), 0) AS through_id FROM side_requests WHERE agent_id = ?1
-             )
-             UPDATE agent_drain_targets SET completed = 1,
-                side_completed_through = max(side_completed_through, min(?3, (SELECT through_id FROM observed)))
-             WHERE agent_id = ?1 AND final_message_id <= ?2
-                AND (completed = 0 OR side_completed_through < min(?3, (SELECT through_id FROM observed)))",
-            params![me.id, req.completed_through, req.side_completed_through],
+            "UPDATE agent_drain_targets SET completed = 1
+             WHERE agent_id = ?1 AND final_message_id <= ?2 AND completed = 0",
+            params![me.id, req.completed_through],
         )?;
         let reconciled = reconcile(ctx)?;
         Ok((proto::Empty {}, updated > 0 || reconciled > 0))
@@ -131,10 +124,6 @@ fn snapshot(ctx: &Ctx<'_>, human: i64) -> Result<proto::AgentDrainResponse> {
             ..Default::default()
         });
     };
-    // Completed history from a prior runner generation is not work for the
-    // current side driver (ACP may not have one). Current-generation work and
-    // older failed/cancelled/interrupted work still require explicit quiescence;
-    // neither an ended flag nor an absent driver proves it has stopped.
     let agents = ctx
         .conn
         .prepare(&targets_sql())?
@@ -144,7 +133,6 @@ fn snapshot(ctx: &Ctx<'_>, human: i64) -> Result<proto::AgentDrainResponse> {
                 name: r.get(1)?,
                 completed: r.get(2)?,
                 unread: r.get(3)?,
-                side_pending: r.get(4)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -178,10 +166,7 @@ fn reconcile(ctx: &Ctx<'_>) -> Result<usize> {
     let mut changed = 0;
     for (id, name) in rows {
         let state = snapshot(ctx, id)?;
-        let ready = state
-            .agents
-            .iter()
-            .all(|a| a.completed && a.unread == 0 && !a.side_pending);
+        let ready = state.agents.iter().all(|a| a.completed && a.unread == 0);
         if !ready && state.deadline > ctx.now_s {
             continue;
         }
@@ -189,14 +174,14 @@ fn reconcile(ctx: &Ctx<'_>) -> Result<usize> {
         let pending: Vec<_> = state
             .agents
             .iter()
-            .filter(|a| !a.completed || a.unread > 0 || a.side_pending)
+            .filter(|a| !a.completed || a.unread > 0)
             .map(|a| a.name.as_str())
             .collect();
         let body = if ready {
-            "BBS restart preparation complete: all agents read their mail through the watermark and reported their turns and reply queues finished; side questions have also finished. It is safe to restart your headless agents. After restarting, resume delivery in Settings.".to_string()
+            "BBS restart preparation complete: all agents read their mail through the watermark and reported their turns and reply queues finished. It is safe to restart your headless agents. After restarting, resume delivery in Settings.".to_string()
         } else {
             format!(
-                "BBS restart preparation timed out after 20 minutes. Restart is as safe as we can confirm, but these agents have unread mail, active side questions, or have not confirmed completed turns: {}. Check them before restarting if possible. Delivery remains paused until you resume it in Settings.",
+                "BBS restart preparation timed out after 20 minutes. Restart is as safe as we can confirm, but these agents have unread mail or have not confirmed completed turns: {}. Check them before restarting if possible. Delivery remains paused until you resume it in Settings.",
                 pending.join(", ")
             )
         };
@@ -217,16 +202,11 @@ fn reconcile(ctx: &Ctx<'_>) -> Result<usize> {
     Ok(changed)
 }
 
-/// Each target agent of human ?1's drain: its id, name, completion, unread
-/// mail up to the watermark ?2, and whether side work is pending.
+/// Each target agent of human ?1's drain: its id, name, completion, and
+/// unread mail up to the watermark ?2.
 fn targets_sql() -> String {
     format!("SELECT t.agent_id, a.name, t.completed,
-        (SELECT count(*) FROM deliveries d WHERE d.recipient_address_id = {} AND d.recipient_run_id = '' AND d.message_id <= ?2 AND d.archived_at IS NULL),
-        EXISTS(SELECT 1 FROM side_requests s WHERE s.agent_id = t.agent_id
-          AND (s.status = 'open' OR (s.id > t.side_completed_through
-            AND NOT (s.status = 'completed' AND EXISTS (
-              SELECT 1 FROM side_state state WHERE state.agent_id = s.agent_id
-                AND s.generation IS NOT NULL AND state.generation != s.generation)))))
+        (SELECT count(*) FROM deliveries d WHERE d.recipient_address_id = {} AND d.recipient_run_id = '' AND d.message_id <= ?2 AND d.archived_at IS NULL)
         FROM agent_drain_targets t JOIN agents a ON a.id = t.agent_id WHERE t.human_id = ?1 ORDER BY lower(a.name)",
         db::address_sql(EntityKind::Agent, "t.agent_id"))
 }
@@ -335,7 +315,6 @@ mod tests {
                 &self.agent,
                 proto::ReportDrainRequest {
                     completed_through: id,
-                    ..Default::default()
                 },
             )
             .unwrap();
@@ -408,7 +387,6 @@ mod tests {
                 &b.owner,
                 proto::ReportDrainRequest {
                     completed_through: barrier.watermark,
-                    ..Default::default()
                 }
             )
             .is_err()
@@ -518,49 +496,6 @@ mod tests {
         assert_eq!(b.drain("").status, "draining");
         assert_eq!(b.read()[0].id, drain.watermark);
         b.complete(drain.watermark);
-        assert_eq!(b.drain("").status, "ready");
-    }
-
-    #[test]
-    fn side_questions_delay_readiness_and_new_side_turns_are_frozen() {
-        let mut b = Board::new();
-        b.conn.execute("INSERT INTO side_requests(agent_id, question, asked_at, status, updated_at) VALUES (?1, 'active side turn', 'now', 'open', 'now')", [b.id]).unwrap();
-        let first = b.drain("start");
-        b.read();
-        b.complete(first.watermark);
-        let status = b.drain("");
-        assert_eq!(status.status, "draining");
-        assert!(status.agents[0].completed);
-        assert!(status.agents[0].side_pending);
-        let error = service::ask_side(
-            &mut b.conn,
-            &b.owner,
-            proto::AskSideRequest {
-                agent: "worker".into(),
-                question: "new side turn".into(),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("paused for restart"));
-        b.conn
-            .execute("UPDATE side_requests SET status = 'cancelled'", [])
-            .unwrap();
-        // Owner cancellation cannot stand in for a stopped provider turn.
-        assert_eq!(b.drain("").status, "draining");
-        let side_id = b
-            .conn
-            .query_row("SELECT max(id) FROM side_requests", [], |r| r.get(0))
-            .unwrap();
-        report_drain(
-            &mut b.conn,
-            &b.agent,
-            proto::ReportDrainRequest {
-                completed_through: first.watermark,
-                side_completed_through: side_id,
-            },
-        )
-        .unwrap();
         assert_eq!(b.drain("").status, "ready");
     }
 

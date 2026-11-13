@@ -7,7 +7,7 @@ import { AgentDrain } from "./AgentDrain";
 beforeEach(() => { api.reset(); vi.useFakeTimers(); });
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 const running = { frozen: false, status: "running", watermark: 0, deadline: "", agents: [] };
-const draining = { frozen: true, status: "draining", watermark: 42, deadline: "2026-10-27T21:00:00Z", agents: [{ agent_id: 1, name: "Mateo", unread: 0, completed: false, side_pending: false }] };
+const draining = { frozen: true, status: "draining", watermark: 42, deadline: "2026-10-27T21:00:00Z", agents: [{ agent_id: 1, name: "Mateo", unread: 0, completed: false }] };
 
 it("starts a drain, distinguishes read from finished, and requires manual resume after ready", async () => {
   render(<AgentDrain />);
@@ -47,10 +47,4 @@ it("does not let a stale status response overwrite a successful start", async ()
   await act(async () => api.take("agent_drain").resolve(draining));
   await act(async () => stale.resolve(running));
   expect(screen.getByText("Resume delivery")).toBeTruthy();
-});
-
-it("shows side questions still running after the mail turn completes", async () => {
-  render(<AgentDrain />);
-  await act(async () => api.take("agent_drain").resolve({ ...draining, agents: [{ ...draining.agents[0], completed: true, side_pending: true }] }));
-  expect(screen.getByText(/waiting for side question completion/)).toBeTruthy();
 });

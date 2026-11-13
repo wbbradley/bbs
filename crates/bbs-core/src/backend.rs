@@ -32,8 +32,6 @@ pub const AGENT_SUMMARY: &str = "agent-summary.v1";
 pub const AGENT_EFFORT: &str = "agent-effort.v1";
 pub const AUTO_REPLY: &str = "auto-reply.v1";
 pub const AGENT_INTERACTIONS: &str = "agent-interactions.v1";
-pub const SIDE_QUESTIONS: &str = "side-questions.v1";
-pub const SIDE_CONVERSATIONS: &str = "side-conversations.v1";
 pub const MESSAGE_SEARCH: &str = "message-search.v1";
 pub const BLOCKERS: &str = "blockers.v1";
 pub const BLOCKERS_MINE: &str = "blockers-mine.v1";
@@ -582,7 +580,7 @@ impl Backend {
         }
     }
 
-    /// Report context usage and side capability. A server needs
+    /// Report context usage. A server needs
     /// `agent-interactions.v1`.
     pub async fn report_context(
         &mut self,
@@ -644,67 +642,6 @@ impl Backend {
             Backend::Local(l) => service::side_report(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => rpc!(r, side_report, req, &[AGENT_INTERACTIONS])
                 .map_err(|e| missing_rpc(e, AGENT_INTERACTIONS)),
-        }
-    }
-
-    /// Ask the owning agent an isolated side question. A server needs
-    /// `side-questions.v1`, and `side-conversations.v1` for a follow-up, so
-    /// an older server refuses one rather than asking it fresh.
-    pub async fn ask_side(&mut self, req: proto::AskSideRequest) -> Result<proto::AskSideResponse> {
-        let cap = if req.follows.is_some() {
-            SIDE_CONVERSATIONS
-        } else {
-            SIDE_QUESTIONS
-        };
-        match self {
-            Backend::Local(l) => service::ask_side(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, ask_side, req, &[cap]).map_err(|e| missing_rpc(e, cap)),
-        }
-    }
-
-    /// Cancel a side question by exact id. A server needs `side-questions.v1`,
-    /// and `side-conversations.v1` to end a conversation.
-    pub async fn cancel_side(&mut self, req: proto::CancelSideRequest) -> Result<proto::Empty> {
-        let cap = if req.end {
-            SIDE_CONVERSATIONS
-        } else {
-            SIDE_QUESTIONS
-        };
-        match self {
-            Backend::Local(l) => service::cancel_side(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => {
-                rpc!(r, cancel_side, req, &[cap]).map_err(|e| missing_rpc(e, cap))
-            }
-        }
-    }
-
-    /// Claim the calling agent's open side question. A server needs
-    /// `side-questions.v1`.
-    pub async fn claim_side(
-        &mut self,
-        req: proto::ClaimSideRequest,
-    ) -> Result<proto::ClaimSideResponse> {
-        match self {
-            Backend::Local(l) => service::claim_side(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, claim_side, req, &[SIDE_QUESTIONS])
-                .map_err(|e| missing_rpc(e, SIDE_QUESTIONS)),
-        }
-    }
-
-    /// Report progressive text or a terminal result for a claimed side
-    /// question. A server needs `side-questions.v1`, and
-    /// `side-conversations.v1` for ENDED.
-    pub async fn report_side(&mut self, req: proto::ReportSideRequest) -> Result<proto::Empty> {
-        let cap = if req.status() == proto::SideStatus::SideEnded {
-            SIDE_CONVERSATIONS
-        } else {
-            SIDE_QUESTIONS
-        };
-        match self {
-            Backend::Local(l) => service::report_side(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => {
-                rpc!(r, report_side, req, &[cap]).map_err(|e| missing_rpc(e, cap))
-            }
         }
     }
 
@@ -1373,33 +1310,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        // A follow-up, an end or ENDED that an older server ignored would
-        // become a fresh question or a plain cancel, so each requires
-        // side-conversations.v1; one-shot side calls keep side-questions.v1.
-        for follows in [None, Some(7)] {
-            let ask = proto::AskSideRequest {
-                agent: "Mateo".into(),
-                question: "q".into(),
-                follows,
-            };
-            assert!(backend.ask_side(ask).await.is_err());
-        }
-        for end in [false, true] {
-            let cancel = proto::CancelSideRequest { id: 7, end };
-            assert!(backend.cancel_side(cancel).await.is_err());
-        }
-        for status in [
-            proto::SideStatus::SideCompleted,
-            proto::SideStatus::SideEnded,
-        ] {
-            let report = proto::ReportSideRequest {
-                generation: "run-1".into(),
-                id: 7,
-                status: status.into(),
-                answer: None,
-            };
-            assert!(backend.report_side(report).await.is_err());
-        }
         assert!(
             backend
                 .list_blockers(proto::ListBlockersRequest::default())
@@ -1499,12 +1409,6 @@ mod tests {
             ("GroupRegister", Some("group-description.v1")),
             ("GroupRegister", None),
             ("GroupDescribe", Some("group-description.v1")),
-            ("AskSide", Some("side-questions.v1")),
-            ("AskSide", Some("side-conversations.v1")),
-            ("CancelSide", Some("side-questions.v1")),
-            ("CancelSide", Some("side-conversations.v1")),
-            ("ReportSide", Some("side-questions.v1")),
-            ("ReportSide", Some("side-conversations.v1")),
             ("ListBlockers", Some("blockers.v1")),
             ("ListBlockers", Some("blockers-mine.v1")),
             ("ListBlockers", Some("blockers-closed.v1")),

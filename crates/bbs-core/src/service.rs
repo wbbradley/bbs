@@ -1117,7 +1117,7 @@ pub fn begin_side_session(
     })
 }
 
-/// Latest context usage and capability; replaces or clears usage explicitly.
+/// Latest context usage; replaces or clears usage explicitly.
 pub fn report_context(
     conn: &mut Connection,
     caller: &Caller,
@@ -1146,13 +1146,6 @@ pub fn report_context(
                 })?)
             }
         };
-        if req
-            .side_reason
-            .as_deref()
-            .is_some_and(|r| r.len() > 4 * 1024)
-        {
-            bail!("side reason exceeds 4 KiB");
-        }
         if req.preserve_usage && req.usage.is_some() {
             bail!("preserve_usage does not take new usage");
         }
@@ -1160,11 +1153,6 @@ pub fn report_context(
             ctx.conn,
             me.id,
             usage_json.as_deref(),
-            db::SideCapability {
-                supported: req.side_supported,
-                reason: req.side_reason.as_deref(),
-                followups: req.side_followups,
-            },
             &ctx.now_s,
             req.preserve_usage,
         )?;
@@ -1450,268 +1438,6 @@ pub fn close_owner_input(
     })
 }
 
-// ---- isolated side questions (side-questions.v1) ----------------------------
-
-fn side_status_proto(status: &str) -> proto::SideStatus {
-    match status {
-        "completed" => proto::SideStatus::SideCompleted,
-        "failed" => proto::SideStatus::SideFailed,
-        "cancelled" => proto::SideStatus::SideCancelled,
-        "interrupted" => proto::SideStatus::SideInterrupted,
-        "ended" => proto::SideStatus::SideEnded,
-        _ => proto::SideStatus::SideOpen,
-    }
-}
-
-/// A terminal side conversation idle this long cannot be continued; the
-/// runner keeps its child a minute longer.
-const SIDE_IDLE_LIMIT: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
-
-/// Statuses a follow-up may continue from.
-fn side_continuable_status(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled")
-}
-
-/// Whether `row`'s conversation cannot be continued, derived at read time:
-/// stored ended, INTERRUPTED or ENDED, claimed by a generation other than
-/// the current one, or terminal and either never claimed or idle past the
-/// limit. A new open row that no runner has claimed yet is not ended.
-fn side_ended(row: &db::SideRequestRow, state: Option<&db::SideState>, now: DateTime<Utc>) -> bool {
-    if row.ended || matches!(row.status.as_str(), "interrupted" | "ended") {
-        return true;
-    }
-    let current = state.map(|s| s.generation.as_str());
-    match &row.generation {
-        Some(g) if Some(g.as_str()) != current => return true,
-        Some(_) => {}
-        None => return row.status != "open",
-    }
-    row.status != "open"
-        && DateTime::parse_from_rfc3339(&row.updated_at)
-            .ok()
-            .is_none_or(|t| now - t.with_timezone(&Utc) >= SIDE_IDLE_LIMIT)
-}
-
-fn side_request_proto(
-    row: db::SideRequestRow,
-    state: Option<&db::SideState>,
-    now: DateTime<Utc>,
-) -> Result<proto::SideRequest> {
-    Ok(proto::SideRequest {
-        ended: side_ended(&row, state, now),
-        conversation: Some(row.conversation),
-        follows: row.follows,
-        id: row.id,
-        question: row.question,
-        status: side_status_proto(&row.status).into(),
-        answer: row.answer,
-        updated_at: row.updated_at,
-    })
-}
-
-/// The owner asks the agent an isolated side question; one open at a time.
-/// A follow-up continues the conversation whose latest question it names,
-/// checked and inserted in this one write transaction.
-pub fn ask_side(
-    conn: &mut Connection,
-    caller: &Caller,
-    req: proto::AskSideRequest,
-) -> Result<proto::AskSideResponse> {
-    with_ctx(conn, caller, |ctx| {
-        let me = ctx.human()?;
-        let Some(agent) = db::live_agent_by_name(ctx.conn, &req.agent)? else {
-            bail!("no live agent named {:?}", req.agent);
-        };
-        if db::agent_owner_id(ctx.conn, agent.id)? != Some(me.id) {
-            bail!("{:?} is not your agent", req.agent);
-        }
-        let frozen: bool = ctx.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_drains WHERE human_id = ?1)",
-            [me.id],
-            |r| r.get(0),
-        )?;
-        if frozen {
-            bail!(
-                "agent delivery is paused for restart; resume delivery in Settings before asking a side question"
-            );
-        }
-        if req.question.is_empty() || req.question.len() > 4 * 1024 {
-            bail!("question must be 1 byte to 4 KiB");
-        }
-        let state = match db::side_state(ctx.conn, agent.id)? {
-            Some(state) if state.supported == Some(true) => state,
-            _ => bail!("{}'s runner does not answer side questions", agent.name),
-        };
-        if db::open_side_request(ctx.conn, agent.id)?.is_some() {
-            bail!("a side question is already open");
-        }
-        let followed = match req.follows {
-            None => None,
-            Some(follows) => {
-                if state.followups != Some(true) {
-                    bail!("follow-ups need an updated runner");
-                }
-                let latest = db::latest_side_request(ctx.conn, agent.id)?;
-                match latest {
-                    Some(row)
-                        if row.id == follows
-                            && side_continuable_status(&row.status)
-                            && !side_ended(&row, Some(&state), ctx.now) =>
-                    {
-                        Some(row)
-                    }
-                    _ => bail!("side conversation ended"),
-                }
-            }
-        };
-        let id = db::insert_side_request(
-            ctx.conn,
-            agent.id,
-            &req.question,
-            followed.as_ref(),
-            &ctx.now_s,
-        )?;
-        Ok(proto::AskSideResponse { id })
-    })
-}
-
-/// The owner cancels a side question by exact id; idempotent once cancelled.
-/// With `end`, the owner ends the conversation whose latest question is
-/// `id`, cancelling it too if open; idempotent.
-pub fn cancel_side(
-    conn: &mut Connection,
-    caller: &Caller,
-    req: proto::CancelSideRequest,
-) -> Result<proto::Empty> {
-    with_ctx(conn, caller, |ctx| {
-        let me = ctx.human()?;
-        let Some(row) = db::side_request(ctx.conn, req.id)? else {
-            bail!("no such side question");
-        };
-        if db::agent_owner_id(ctx.conn, row.agent_id)? != Some(me.id) {
-            bail!("not your agent's question");
-        }
-        if req.end {
-            if db::latest_side_request(ctx.conn, row.agent_id)?.map(|r| r.id) != Some(row.id) {
-                bail!("not the agent's latest side question");
-            }
-            if row.status == "open" {
-                db::cancel_side_request(ctx.conn, row.id, &ctx.now_s)?;
-            }
-            if !row.ended {
-                db::end_side_request(ctx.conn, row.id, &ctx.now_s)?;
-            }
-            return Ok(proto::Empty {});
-        }
-        // Idempotent after a lost reply: already cancelled is a no-op.
-        if row.status == "cancelled" {
-            return Ok(proto::Empty {});
-        }
-        if row.status != "open" {
-            bail!("side question is not open");
-        }
-        db::cancel_side_request(ctx.conn, req.id, &ctx.now_s)?;
-        Ok(proto::Empty {})
-    })
-}
-
-/// The runner claims the agent's one open side question. Idempotent per
-/// generation: a lost reply's retry returns the same claim.
-pub fn claim_side(
-    conn: &mut Connection,
-    caller: &Caller,
-    req: proto::ClaimSideRequest,
-) -> Result<proto::ClaimSideResponse> {
-    with_ctx(conn, caller, |ctx| {
-        let me = ctx.agent()?;
-        validate_generation(ctx, &me, &req.generation)?;
-        let Some(row) = db::open_side_request(ctx.conn, me.id)? else {
-            return Ok(proto::ClaimSideResponse { request: None });
-        };
-        let claimed = match &row.generation {
-            None => db::claim_side_request(ctx.conn, me.id, &req.generation, &ctx.now_s)?,
-            Some(g) if *g == req.generation => true,
-            Some(_) => bail!("side question already claimed"),
-        };
-        let request = if claimed {
-            let row = db::open_side_request(ctx.conn, me.id)?.expect("just claimed");
-            let state = db::side_state(ctx.conn, me.id)?;
-            Some(side_request_proto(row, state.as_ref(), ctx.now)?)
-        } else {
-            // A concurrent claim won the race; treat it as interrupted.
-            None
-        };
-        Ok(proto::ClaimSideResponse { request })
-    })
-}
-
-/// The claiming runner reports progressive text or a terminal result.
-pub fn report_side(
-    conn: &mut Connection,
-    caller: &Caller,
-    req: proto::ReportSideRequest,
-) -> Result<proto::Empty> {
-    with_ctx(conn, caller, |ctx| {
-        let me = ctx.agent()?;
-        validate_generation(ctx, &me, &req.generation)?;
-        if req.answer.as_deref().is_some_and(|a| a.len() > 64 * 1024) {
-            bail!("answer exceeds 64 KiB");
-        }
-        let status = match req.status() {
-            proto::SideStatus::SideOpen => "open",
-            proto::SideStatus::SideCompleted => "completed",
-            proto::SideStatus::SideFailed => "failed",
-            proto::SideStatus::SideEnded => return report_side_ended(ctx, &me, &req),
-            _ => bail!("a side report must be OPEN, COMPLETED, FAILED or ENDED"),
-        };
-        let Some(row) = db::side_request(ctx.conn, req.id)? else {
-            bail!("no such side question");
-        };
-        if row.agent_id != me.id || row.generation.as_deref() != Some(req.generation.as_str()) {
-            bail!("not your claimed side question");
-        }
-        if row.status != "open" {
-            bail!("side question is closed");
-        }
-        db::report_side_request(ctx.conn, req.id, req.answer.as_deref(), status, &ctx.now_s)?;
-        Ok(proto::Empty {})
-    })
-}
-
-/// ENDED from the runner, never after a model call: an open follow-up whose
-/// conversation it no longer holds ends with that status; the latest
-/// terminal question it answered keeps its status and is flagged ended when
-/// its child is lost. A repeat, or a question a newer one has replaced
-/// (pruned or not), is a no-op so the runner never retries in a loop.
-fn report_side_ended(
-    ctx: &Ctx,
-    me: &db::Principal,
-    req: &proto::ReportSideRequest,
-) -> Result<proto::Empty> {
-    let latest = db::latest_side_request(ctx.conn, me.id)?;
-    let Some(row) = db::side_request(ctx.conn, req.id)? else {
-        if latest.is_some_and(|l| l.id > req.id) {
-            return Ok(proto::Empty {});
-        }
-        bail!("no such side question");
-    };
-    if row.agent_id != me.id || row.generation.as_deref() != Some(req.generation.as_str()) {
-        bail!("not your claimed side question");
-    }
-    if row.status == "open" {
-        if row.follows.is_none() {
-            bail!("only a follow-up can be reported ENDED while open");
-        }
-        db::report_side_request(ctx.conn, row.id, req.answer.as_deref(), "ended", &ctx.now_s)?;
-        return Ok(proto::Empty {});
-    }
-    let replaced = latest.is_some_and(|l| l.id != row.id);
-    if !replaced && !row.ended && row.status != "ended" {
-        db::end_side_request(ctx.conn, row.id, &ctx.now_s)?;
-    }
-    Ok(proto::Empty {})
-}
-
 /// One agent's side state: the owner, or the driver with its generation.
 pub fn side_report(
     conn: &mut Connection,
@@ -1740,32 +1466,21 @@ pub fn side_report(
         let pending = db::latest_owner_input(ctx.conn, agent.id)?
             .map(owner_input_proto)
             .transpose()?;
-        let side = db::latest_side_request(ctx.conn, agent.id)?
-            .map(|row| side_request_proto(row, state.as_ref(), ctx.now))
-            .transpose()?;
         let Some(state) = state else {
             return Ok(proto::SideReportResponse {
-                side_followups: None,
                 agent: agent.name,
                 pending_input: pending,
                 usage: None,
                 revision: 0,
                 reported_at: String::new(),
-                side,
-                side_supported: None,
-                side_reason: None,
             });
         };
         Ok(proto::SideReportResponse {
-            side_followups: state.followups,
             agent: agent.name,
             pending_input: pending,
             usage: usage_proto(state.usage)?,
             revision: state.revision,
             reported_at: state.reported_at,
-            side,
-            side_supported: state.supported,
-            side_reason: state.reason,
         })
     })
 }
@@ -5311,11 +5026,8 @@ mod tests {
                     &mut conn,
                     &mateo,
                     proto::ReportContextRequest {
-                        side_followups: None,
                         generation: "run-1".into(),
                         usage: Some(usage),
-                        side_supported: None,
-                        side_reason: None,
                         preserve_usage: false,
                     },
                 )
@@ -5326,15 +5038,12 @@ mod tests {
             &mut conn,
             &mateo,
             proto::ReportContextRequest {
-                side_followups: None,
                 generation: "run-1".into(),
                 usage: Some(proto::ContextUsage {
                     used_tokens: Some(120),
                     limit_tokens: Some(100),
                     source: proto::context_usage::Source::CurrentContext.into(),
                 }),
-                side_supported: None,
-                side_reason: None,
                 preserve_usage: false,
             },
         )
@@ -5359,6 +5068,48 @@ mod tests {
                 proto::context_usage::Source::CurrentContext
             )
         );
+        // preserve_usage (older runners' capability updates) keeps usage and
+        // its report time, and takes no new usage.
+        let preserve = |conn: &mut Connection, usage| {
+            report_context(
+                conn,
+                &mateo,
+                proto::ReportContextRequest {
+                    generation: "run-1".into(),
+                    usage,
+                    preserve_usage: true,
+                },
+            )
+        };
+        assert!(
+            preserve(
+                &mut conn,
+                Some(proto::ContextUsage {
+                    used_tokens: Some(1),
+                    limit_tokens: Some(100),
+                    source: proto::context_usage::Source::CurrentContext.into(),
+                })
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("preserve_usage does not take new usage")
+        );
+        let reported_at = "2000-01-01T00:00:00Z";
+        conn.execute(
+            "UPDATE side_state SET reported_at = ?1 WHERE generation = 'run-1'",
+            [reported_at],
+        )
+        .unwrap();
+        preserve(&mut conn, None).unwrap();
+        let stored: (String, String) = conn
+            .query_row(
+                "SELECT usage, reported_at FROM side_state WHERE generation = 'run-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(stored.0.contains("120"), "{stored:?}");
+        assert_eq!(stored.1, reported_at);
 
         // Bounds.
         assert!(ask(&mut conn, "run-1", 1, vec![]).is_err());
@@ -5692,15 +5443,12 @@ mod tests {
             &mut conn,
             &mateo,
             proto::ReportContextRequest {
-                side_followups: None,
                 generation: "run-4".into(),
                 usage: Some(proto::ContextUsage {
                     used_tokens: Some(9),
                     limit_tokens: None,
                     source: proto::context_usage::Source::LastModelRequest.into(),
                 }),
-                side_supported: None,
-                side_reason: None,
                 preserve_usage: false,
             },
         )
@@ -5763,717 +5511,6 @@ mod tests {
 
         // Nothing side-channel ever becomes mail, a delivery, or a conversation.
         assert_eq!(mail_counts(&mut conn), before);
-    }
-
-    #[test]
-    fn side_conversations_follow_end_and_derive_ended() {
-        let (mut conn, will, [mateo, zed, _lu]) = board();
-        let begin = |conn: &mut Connection, g: &str| {
-            begin_side_session(
-                conn,
-                &mateo,
-                proto::BeginSideSessionRequest {
-                    generation: g.into(),
-                },
-            )
-            .unwrap();
-        };
-        // Every side row and each agent's revision, to show a call wrote nothing.
-        let snapshot = |conn: &mut Connection| -> Vec<String> {
-            let mut out: Vec<String> = conn
-                .prepare(
-                    "SELECT id, agent_id, generation, status, answer, ended, updated_at
-                     FROM side_requests ORDER BY id",
-                )
-                .unwrap()
-                .query_map([], |r| {
-                    Ok(format!(
-                        "{}|{}|{:?}|{}|{:?}|{}|{}",
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                        r.get::<_, i64>(5)?,
-                        r.get::<_, String>(6)?,
-                    ))
-                })
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
-            let revisions: Vec<String> = conn
-                .prepare("SELECT agent_id, revision FROM side_state ORDER BY agent_id")
-                .unwrap()
-                .query_map([], |r| {
-                    Ok(format!("{}:{}", r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                })
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
-            out.extend(revisions);
-            out
-        };
-        let support = |conn: &mut Connection, g: &str, followups: Option<bool>| {
-            report_context(
-                conn,
-                &mateo,
-                proto::ReportContextRequest {
-                    side_followups: followups,
-                    generation: g.into(),
-                    usage: None,
-                    side_supported: Some(true),
-                    side_reason: None,
-                    preserve_usage: false,
-                },
-            )
-            .unwrap();
-        };
-        let ask = |conn: &mut Connection, q: &str, follows: Option<i64>| {
-            ask_side(
-                conn,
-                &will,
-                proto::AskSideRequest {
-                    follows,
-                    agent: "Mateo".into(),
-                    question: q.into(),
-                },
-            )
-            .map(|r| r.id)
-            .map_err(|e| e.to_string())
-        };
-        let claim = |conn: &mut Connection, g: &str| {
-            claim_side(
-                conn,
-                &mateo,
-                proto::ClaimSideRequest {
-                    generation: g.into(),
-                },
-            )
-            .unwrap()
-            .request
-            .unwrap()
-        };
-        let report = |conn: &mut Connection, g: &str, id: i64, status: proto::SideStatus| {
-            report_side(
-                conn,
-                &mateo,
-                proto::ReportSideRequest {
-                    generation: g.into(),
-                    id,
-                    status: status.into(),
-                    answer: Some("answer".into()),
-                },
-            )
-            .map_err(|e| e.to_string())
-        };
-        let cancel = |conn: &mut Connection, id: i64, end: bool| {
-            cancel_side(conn, &will, proto::CancelSideRequest { id, end })
-                .map_err(|e| e.to_string())
-        };
-        let view = |conn: &mut Connection| {
-            side_report(
-                conn,
-                &will,
-                proto::SideReportRequest {
-                    agent: "Mateo".into(),
-                    generation: None,
-                },
-            )
-            .unwrap()
-        };
-        let latest = |conn: &mut Connection| view(conn).side.unwrap();
-        // Ask, claim and complete a fresh question on `g`.
-        let answered = |conn: &mut Connection, g: &str, q: &str, follows: Option<i64>| {
-            let id = ask(conn, q, follows).unwrap();
-            assert_eq!(claim(conn, g).id, id);
-            report(conn, g, id, proto::SideStatus::SideCompleted).unwrap();
-            id
-        };
-        let mail = |conn: &mut Connection| -> i64 {
-            conn.query_row(
-                "SELECT (SELECT count(*) FROM messages) + (SELECT count(*) FROM deliveries)
-                   + (SELECT count(*) FROM agent_human_conversations)",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        let before = mail(&mut conn);
-        let ended = "side conversation ended";
-
-        // A first question is its own conversation; open and unclaimed, it
-        // is not ended. Follow-ups need the runner to say it continues them.
-        begin(&mut conn, "run-1");
-        support(&mut conn, "run-1", None);
-        let first = ask(&mut conn, "q1", None).unwrap();
-        let row = latest(&mut conn);
-        assert_eq!(
-            (row.conversation, row.follows, row.ended),
-            (Some(first), None, false)
-        );
-        assert_eq!(claim(&mut conn, "run-1").conversation, Some(first));
-        report(&mut conn, "run-1", first, proto::SideStatus::SideCompleted).unwrap();
-        let err = ask(&mut conn, "q2", Some(first)).unwrap_err();
-        assert!(err.contains("need an updated runner"), "{err}");
-        support(&mut conn, "run-1", Some(true));
-        assert_eq!(view(&mut conn).side_followups, Some(true));
-        // Omitted preserves it.
-        support(&mut conn, "run-1", None);
-        assert_eq!(view(&mut conn).side_followups, Some(true));
-
-        // Only the latest question continues; a stale or unknown id is refused.
-        assert!(
-            ask(&mut conn, "q2", Some(first + 100))
-                .unwrap_err()
-                .contains(ended)
-        );
-        let second = ask(&mut conn, "q2", Some(first)).unwrap();
-        let row = latest(&mut conn);
-        assert_eq!(
-            (row.conversation, row.follows, row.ended),
-            (Some(first), Some(first), false)
-        );
-        // A second follow-up of the same id is refused while the first is
-        // open, and once it is answered the old id is no longer the latest.
-        assert!(
-            ask(&mut conn, "q2b", Some(first))
-                .unwrap_err()
-                .contains("already open")
-        );
-        assert_eq!(claim(&mut conn, "run-1").follows, Some(first));
-        report(&mut conn, "run-1", second, proto::SideStatus::SideCompleted).unwrap();
-        assert!(
-            ask(&mut conn, "q2b", Some(first))
-                .unwrap_err()
-                .contains(ended)
-        );
-
-        // ENDED for an open follow-up the runner cannot continue: terminal.
-        let third = ask(&mut conn, "q3", Some(second)).unwrap();
-        claim(&mut conn, "run-1");
-        report(&mut conn, "run-1", third, proto::SideStatus::SideEnded).unwrap();
-        let row = latest(&mut conn);
-        assert_eq!(
-            (row.status(), row.ended),
-            (proto::SideStatus::SideEnded, true)
-        );
-        assert!(
-            ask(&mut conn, "q4", Some(third))
-                .unwrap_err()
-                .contains(ended)
-        );
-        // An open first question cannot be reported ENDED.
-        let fresh = ask(&mut conn, "fresh", None).unwrap();
-        assert_eq!(latest(&mut conn).conversation, Some(fresh));
-        claim(&mut conn, "run-1");
-        let err = report(&mut conn, "run-1", fresh, proto::SideStatus::SideEnded).unwrap_err();
-        assert!(err.contains("only a follow-up"), "{err}");
-        report(&mut conn, "run-1", fresh, proto::SideStatus::SideCompleted).unwrap();
-
-        // A lost child on the latest terminal question, with or without
-        // follows, flags it ended and keeps its status; a repeat is a no-op.
-        report(&mut conn, "run-1", fresh, proto::SideStatus::SideEnded).unwrap();
-        let flagged = snapshot(&mut conn);
-        report(&mut conn, "run-1", fresh, proto::SideStatus::SideEnded).unwrap();
-        assert_eq!(snapshot(&mut conn), flagged);
-        let row = latest(&mut conn);
-        assert_eq!(
-            (row.status(), row.ended),
-            (proto::SideStatus::SideCompleted, true)
-        );
-        assert!(
-            ask(&mut conn, "more", Some(fresh))
-                .unwrap_err()
-                .contains(ended)
-        );
-        let one = answered(&mut conn, "run-1", "one", None);
-        let two = answered(&mut conn, "run-1", "two", Some(one));
-        report(&mut conn, "run-1", two, proto::SideStatus::SideEnded).unwrap();
-        let row = latest(&mut conn);
-        assert_eq!(
-            (row.status(), row.ended),
-            (proto::SideStatus::SideCompleted, true)
-        );
-        // A question a newer one replaced (and pruned) is a no-op too: the
-        // current row, its status, answer and the revision stay.
-        answered(&mut conn, "run-1", "replacing", None);
-        let current = snapshot(&mut conn);
-        report(&mut conn, "run-1", two, proto::SideStatus::SideEnded).unwrap();
-        assert_eq!(snapshot(&mut conn), current);
-        assert!(!latest(&mut conn).ended);
-
-        // Another agent's existing question is refused, not a no-op, and
-        // left as it was, even though Mateo has a newer one. Zed uses the
-        // same generation string, so only the agent check refuses it.
-        begin_side_session(
-            &mut conn,
-            &zed,
-            proto::BeginSideSessionRequest {
-                generation: "run-1".into(),
-            },
-        )
-        .unwrap();
-        let zed_row: i64 = conn
-            .query_row(
-                "INSERT INTO side_requests
-                   (agent_id, generation, question, asked_at, status, answer, updated_at, conversation)
-                 SELECT id, 'run-1', 'z', 't', 'completed', 'za', 't', 0 FROM agents WHERE name = 'Zed'
-                 RETURNING id",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let theirs = snapshot(&mut conn);
-        let err = report(&mut conn, "run-1", zed_row, proto::SideStatus::SideEnded).unwrap_err();
-        assert!(err.contains("not your claimed"), "{err}");
-        assert_eq!(snapshot(&mut conn), theirs);
-        let newer = answered(&mut conn, "run-1", "newer", None);
-
-        // Idle past the limit, the latest terminal question is ended: derived
-        // from the clock at read time, with no write to the revision. (The
-        // test moves the row's time back instead of the clock forward.)
-        let stale = fmt_time(Utc::now() - SIDE_IDLE_LIMIT - chrono::TimeDelta::seconds(1));
-        let revision = view(&mut conn).revision;
-        assert!(!latest(&mut conn).ended);
-        conn.execute(
-            "UPDATE side_requests SET updated_at = ?2 WHERE id = ?1",
-            rusqlite::params![newer, stale],
-        )
-        .unwrap();
-        assert!(latest(&mut conn).ended);
-        assert_eq!(view(&mut conn).revision, revision);
-        assert!(
-            ask(&mut conn, "late", Some(newer))
-                .unwrap_err()
-                .contains(ended)
-        );
-
-        // A restart ends what the old generation answered, even once the new
-        // one says it continues conversations; it starts without followups.
-        let before_restart = answered(&mut conn, "run-1", "before", None);
-        assert!(!latest(&mut conn).ended);
-        begin(&mut conn, "run-2");
-        support(&mut conn, "run-2", None);
-        assert_eq!(view(&mut conn).side_followups, None);
-        support(&mut conn, "run-2", Some(true));
-        assert!(latest(&mut conn).ended);
-        assert!(
-            ask(&mut conn, "after", Some(before_restart))
-                .unwrap_err()
-                .contains(ended)
-        );
-        // The stale generation cannot report on it.
-        assert!(
-            report(
-                &mut conn,
-                "run-1",
-                before_restart,
-                proto::SideStatus::SideEnded
-            )
-            .is_err()
-        );
-
-        // The owner ends a terminal conversation: status kept, idempotent.
-        let done = answered(&mut conn, "run-2", "done", None);
-        cancel(&mut conn, done, true).unwrap();
-        cancel(&mut conn, done, true).unwrap();
-        let row = latest(&mut conn);
-        assert_eq!(
-            (row.status(), row.ended),
-            (proto::SideStatus::SideCompleted, true)
-        );
-        assert!(
-            ask(&mut conn, "next", Some(done))
-                .unwrap_err()
-                .contains(ended)
-        );
-        // Ending an open question also cancels it; only the latest can be ended.
-        let open = ask(&mut conn, "open", None).unwrap();
-        cancel(&mut conn, open, true).unwrap();
-        let row = latest(&mut conn);
-        assert_eq!(
-            (row.status(), row.ended),
-            (proto::SideStatus::SideCancelled, true)
-        );
-        let after = answered(&mut conn, "run-2", "after", None);
-        assert!(cancel(&mut conn, open, true).is_err());
-        // Cancelling one turn keeps the conversation going.
-        let turn = ask(&mut conn, "turn", Some(after)).unwrap();
-        claim(&mut conn, "run-2");
-        cancel(&mut conn, turn, false).unwrap();
-        let row = latest(&mut conn);
-        assert_eq!(
-            (row.status(), row.ended),
-            (proto::SideStatus::SideCancelled, false)
-        );
-        let again = ask(&mut conn, "again", Some(turn)).unwrap();
-        assert_eq!(latest(&mut conn).conversation, Some(after));
-        cancel(&mut conn, again, true).unwrap();
-        // Cancelled before any runner claimed it: no child, so ended.
-        let unclaimed = ask(&mut conn, "unclaimed", None).unwrap();
-        cancel(&mut conn, unclaimed, false).unwrap();
-        assert!(latest(&mut conn).ended);
-        assert!(
-            ask(&mut conn, "never", Some(unclaimed))
-                .unwrap_err()
-                .contains(ended)
-        );
-
-        // None of it is mail.
-        assert_eq!(mail(&mut conn), before);
-    }
-
-    #[test]
-    fn side_questions_lifecycle_claim_cancel_reset_and_exclusion() {
-        let (mut conn, will, [mateo, _zed, _lu]) = board();
-        let begin = |conn: &mut Connection, g: &str| {
-            begin_side_session(
-                conn,
-                &mateo,
-                proto::BeginSideSessionRequest {
-                    generation: g.into(),
-                },
-            )
-        };
-        let support = |conn: &mut Connection, g: &str, ok: bool| {
-            report_context(
-                conn,
-                &mateo,
-                proto::ReportContextRequest {
-                    side_followups: None,
-                    generation: g.into(),
-                    usage: None,
-                    side_supported: Some(ok),
-                    side_reason: None,
-                    preserve_usage: false,
-                },
-            )
-        };
-        let ask = |conn: &mut Connection, q: &str| {
-            ask_side(
-                conn,
-                &will,
-                proto::AskSideRequest {
-                    follows: None,
-                    agent: "Mateo".into(),
-                    question: q.into(),
-                },
-            )
-        };
-        let mail_counts = |conn: &mut Connection| -> (i64, i64, i64) {
-            (
-                conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
-                    .unwrap(),
-                conn.query_row("SELECT count(*) FROM deliveries", [], |r| r.get(0))
-                    .unwrap(),
-                conn.query_row("SELECT count(*) FROM agent_human_conversations", [], |r| {
-                    r.get(0)
-                })
-                .unwrap(),
-            )
-        };
-        let before = mail_counts(&mut conn);
-
-        // The support gate: nothing reported, ask fails; support reported, it works.
-        begin(&mut conn, "run-1").unwrap();
-        let err = ask(&mut conn, "hi").unwrap_err().to_string();
-        assert!(err.contains("does not answer side questions"), "{err}");
-        support(&mut conn, "run-1", true).unwrap();
-        // Bounds and one-open.
-        assert!(ask(&mut conn, "").is_err());
-        assert!(ask(&mut conn, &"x".repeat(4 * 1024 + 1)).is_err());
-        let first = ask(&mut conn, "what broke?").unwrap();
-        let err = ask(&mut conn, "another").unwrap_err().to_string();
-        assert!(err.contains("already open"), "{err}");
-
-        // Claim: empty for others, once per generation, retry-safe.
-        let nothing = claim_side(
-            &mut conn,
-            &_zed,
-            proto::ClaimSideRequest {
-                generation: "never".into(),
-            },
-        );
-        assert!(nothing.is_err(), "zed never began a session");
-        let claim = |conn: &mut Connection, g: &str| {
-            claim_side(
-                conn,
-                &mateo,
-                proto::ClaimSideRequest {
-                    generation: g.into(),
-                },
-            )
-        };
-        let got = claim(&mut conn, "run-1").unwrap().request.unwrap();
-        assert_eq!(got.id, first.id);
-        // A lost reply's retry returns the same claim, not a fresh invocation.
-        let again = claim(&mut conn, "run-1").unwrap().request.unwrap();
-        assert_eq!(again.id, first.id);
-
-        // Progressive then terminal, only by the claiming generation.
-        let report = |conn: &mut Connection, g: &str, status: proto::SideStatus, answer: &str| {
-            report_side(
-                conn,
-                &mateo,
-                proto::ReportSideRequest {
-                    generation: g.into(),
-                    id: first.id,
-                    status: status.into(),
-                    answer: Some(answer.into()),
-                },
-            )
-        };
-        let err = report(&mut conn, "run-1", proto::SideStatus::Unspecified, "x")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("OPEN, COMPLETED, FAILED or ENDED"), "{err}");
-        let err = report(
-            &mut conn,
-            "run-1",
-            proto::SideStatus::SideOpen,
-            &"x".repeat(64 * 1024 + 1),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("64 KiB"), "{err}");
-        report(&mut conn, "run-1", proto::SideStatus::SideOpen, "looking\n").unwrap();
-        let view = side_report(
-            &mut conn,
-            &will,
-            proto::SideReportRequest {
-                agent: "Mateo".into(),
-                generation: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(view.side.unwrap().answer.as_deref(), Some("looking\n"));
-        // The owner cancels; a late terminal report loses.
-        cancel_side(
-            &mut conn,
-            &will,
-            proto::CancelSideRequest {
-                id: first.id,
-                end: false,
-            },
-        )
-        .unwrap();
-        // Cancel is idempotent for the exact id.
-        cancel_side(
-            &mut conn,
-            &will,
-            proto::CancelSideRequest {
-                id: first.id,
-                end: false,
-            },
-        )
-        .unwrap();
-        let err = report(&mut conn, "run-1", proto::SideStatus::SideCompleted, "done")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("closed"), "{err}");
-
-        // A report names its registration: another agent holding the same
-        // generation string cannot touch it.
-        begin_side_session(
-            &mut conn,
-            &_zed,
-            proto::BeginSideSessionRequest {
-                generation: "run-1".into(),
-            },
-        )
-        .unwrap();
-        let err = report_side(
-            &mut conn,
-            &_zed,
-            proto::ReportSideRequest {
-                generation: "run-1".into(),
-                id: first.id,
-                status: proto::SideStatus::SideCompleted.into(),
-                answer: Some("not mine".into()),
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("not your claimed"), "{err}");
-        // Ownership precedes cancel idempotence: a cancelled id from another
-        // human's agent still rejects.
-        ensure_human(&mut conn, proto::EnsureHumanRequest { name: "ada".into() }).unwrap();
-        let ada = Caller {
-            human: Some("ada".into()),
-            ..Default::default()
-        };
-        let err = cancel_side(
-            &mut conn,
-            &ada,
-            proto::CancelSideRequest {
-                id: first.id,
-                end: false,
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("not your agent"), "{err}");
-
-        // A fresh generation interrupts everything open and clears capability.
-        let second = ask(&mut conn, "unclaimed").unwrap();
-        let third = ask(&mut conn, "claimed").unwrap_err(); // still one open
-        assert!(third.to_string().contains("already open"));
-        // Claim it, then also check an unclaimed one after replacement.
-        let got = claim(&mut conn, "run-1").unwrap().request.unwrap();
-        assert_eq!(got.id, second.id);
-        begin(&mut conn, "run-2").unwrap();
-        let view = side_report(
-            &mut conn,
-            &will,
-            proto::SideReportRequest {
-                agent: "Mateo".into(),
-                generation: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            view.side.unwrap().status(),
-            proto::SideStatus::SideInterrupted
-        );
-        assert_eq!(view.side_supported, None);
-        let err = ask(&mut conn, "again").unwrap_err().to_string();
-        assert!(err.contains("does not answer side questions"), "{err}");
-        // Omitted capability fields preserve; an explicit report restores.
-        support(&mut conn, "run-2", true).unwrap();
-        report_context(
-            &mut conn,
-            &mateo,
-            proto::ReportContextRequest {
-                side_followups: None,
-                generation: "run-2".into(),
-                usage: None,
-                side_supported: None,
-                side_reason: None,
-                preserve_usage: false,
-            },
-        )
-        .unwrap();
-        assert!(ask(&mut conn, "again").is_ok());
-
-        // preserve_usage: capability-only reports leave usage and its report
-        // time untouched; it never takes new usage.
-        report_context(
-            &mut conn,
-            &mateo,
-            proto::ReportContextRequest {
-                side_followups: None,
-                generation: "run-2".into(),
-                usage: Some(proto::ContextUsage {
-                    used_tokens: Some(42),
-                    limit_tokens: Some(100),
-                    source: proto::context_usage::Source::CurrentContext.into(),
-                }),
-                side_supported: None,
-                side_reason: None,
-                preserve_usage: false,
-            },
-        )
-        .unwrap();
-        // Pin the report time to a fixed old instant, so preservation can
-        // never pass by the clock merely standing still.
-        conn.execute(
-            "UPDATE side_state SET reported_at = '2020-01-01T00:00:00.000000Z' WHERE agent_id = 1",
-            [],
-        )
-        .unwrap();
-        let stamp = "2020-01-01T00:00:00.000000Z";
-        let err = report_context(
-            &mut conn,
-            &mateo,
-            proto::ReportContextRequest {
-                side_followups: None,
-                generation: "run-2".into(),
-                usage: Some(proto::ContextUsage {
-                    used_tokens: Some(1),
-                    limit_tokens: None,
-                    source: proto::context_usage::Source::LastModelRequest.into(),
-                }),
-                side_supported: None,
-                side_reason: None,
-                preserve_usage: true,
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("does not take new usage"), "{err}");
-        report_context(
-            &mut conn,
-            &mateo,
-            proto::ReportContextRequest {
-                side_followups: None,
-                generation: "run-2".into(),
-                usage: None,
-                side_supported: Some(false),
-                side_reason: Some("child setup failed".into()),
-                preserve_usage: true,
-            },
-        )
-        .unwrap();
-        let view = side_report(
-            &mut conn,
-            &mateo,
-            proto::SideReportRequest {
-                agent: String::new(),
-                generation: Some("run-2".into()),
-            },
-        )
-        .unwrap();
-        assert_eq!(view.usage.unwrap().used_tokens, Some(42));
-        assert_eq!(view.reported_at, stamp.to_string());
-        assert_eq!(view.side_supported, Some(false));
-        assert_eq!(view.side_reason.as_deref(), Some("child setup failed"));
-
-        // Nothing side-channel ever becomes mail, a delivery, or a conversation.
-        assert_eq!(mail_counts(&mut conn), before);
-
-        // Retirement cleans side questions; re-registration starts empty.
-        retire_agent(
-            &mut conn,
-            &will,
-            proto::RetireRequest {
-                agent: "Mateo".into(),
-            },
-        )
-        .unwrap();
-        let rows: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM side_requests WHERE agent_id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(rows, 0);
-        db::date_retired_entity_ids(&conn);
-        let token = register(
-            &mut conn,
-            &will,
-            proto::RegisterRequest {
-                name: Some("Mateo".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap()
-        .token;
-        let mateo2 = Caller {
-            token: Some(token),
-            ..Default::default()
-        };
-        let view = side_report(
-            &mut conn,
-            &will,
-            proto::SideReportRequest {
-                agent: "Mateo".into(),
-                generation: None,
-            },
-        )
-        .unwrap();
-        assert!(view.side.is_none());
-        let _ = mateo2;
     }
 
     #[test]
