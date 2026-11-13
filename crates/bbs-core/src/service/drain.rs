@@ -202,8 +202,8 @@ fn reconcile(ctx: &Ctx<'_>) -> Result<usize> {
     Ok(changed)
 }
 
-/// Each target agent of human ?1's drain: its id, name, completion, unread
-/// and unread mail up to the watermark ?2.
+/// Each target agent of human ?1's drain: its id, name, completion, and
+/// unread mail up to the watermark ?2.
 fn targets_sql() -> String {
     format!("SELECT t.agent_id, a.name, t.completed,
         (SELECT count(*) FROM deliveries d WHERE d.recipient_address_id = {} AND d.recipient_run_id = '' AND d.message_id <= ?2 AND d.archived_at IS NULL)

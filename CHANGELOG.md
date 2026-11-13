@@ -20,12 +20,18 @@ under the new package version and its publication date.
   Older clients and runners keep working against an updated server: an older
   `bbs connect` refuses `/btw` locally, saying the agent's runner does not
   answer side questions, and never sends it as mail; an older runner finds
-  `side-questions.v1` missing, never starts its side-question loop, and runs
-  its turns as before. The web board ships with the server, so a reloaded page
-  has no aside button. An updated client or runner against an older server
+  `side-questions.v1` missing when it starts and never starts its
+  side-question loop; one already running keeps an idle loop that never claims
+  a question. Either way it runs its turns as before. An older `bbs connect`
+  with a `/btw` panel open across the upgrade shows "Could not cancel" on Esc;
+  reopening the conversation clears it. The web board ships with the server,
+  so a reloaded page has no aside button. An updated client or runner against an older server
   never offers or answers `/btw`; there the older server still holds restart
   preparation for unacknowledged side questions from an earlier runner, until
   its 20-minute timeout.
+- In an updated `bbs connect` or web board, `/btw QUESTION` is no longer a
+  command: it is sent to the agent as ordinary mail and enters its main
+  conversation.
 
 ## 0.27.1 - 2026-11-12
 

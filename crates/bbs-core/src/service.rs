@@ -5068,6 +5068,48 @@ mod tests {
                 proto::context_usage::Source::CurrentContext
             )
         );
+        // preserve_usage (older runners' capability updates) keeps usage and
+        // its report time, and takes no new usage.
+        let preserve = |conn: &mut Connection, usage| {
+            report_context(
+                conn,
+                &mateo,
+                proto::ReportContextRequest {
+                    generation: "run-1".into(),
+                    usage,
+                    preserve_usage: true,
+                },
+            )
+        };
+        assert!(
+            preserve(
+                &mut conn,
+                Some(proto::ContextUsage {
+                    used_tokens: Some(1),
+                    limit_tokens: Some(100),
+                    source: proto::context_usage::Source::CurrentContext.into(),
+                })
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("preserve_usage does not take new usage")
+        );
+        let reported_at = "2000-01-01T00:00:00Z";
+        conn.execute(
+            "UPDATE side_state SET reported_at = ?1 WHERE generation = 'run-1'",
+            [reported_at],
+        )
+        .unwrap();
+        preserve(&mut conn, None).unwrap();
+        let stored: (String, String) = conn
+            .query_row(
+                "SELECT usage, reported_at FROM side_state WHERE generation = 'run-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(stored.0.contains("120"), "{stored:?}");
+        assert_eq!(stored.1, reported_at);
 
         // Bounds.
         assert!(ask(&mut conn, "run-1", 1, vec![]).is_err());

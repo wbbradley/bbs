@@ -641,6 +641,9 @@ pub fn retire_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
         "DELETE FROM owner_input_requests WHERE agent_id = ?1",
         params![id],
     )?;
+    // No longer used, but a server rolled back to older code would show
+    // a retired agent's side questions again.
+    conn.execute("DELETE FROM side_requests WHERE agent_id = ?1", params![id])?;
     conn.execute(
         "UPDATE agents SET effort = NULL, effort_reported_at = NULL, focused_at = NULL,
                 goal = NULL, goal_reported_at = NULL
@@ -1629,12 +1632,21 @@ pub fn begin_side_session(
     }
     let revision = current.map_or(1, |s| s.revision + 1);
     conn.execute(
-        "INSERT INTO side_state (agent_id, generation, usage, reported_at, revision, closed_seq)
-         VALUES (?1, ?2, NULL, ?3, ?4, 0)
+        "INSERT INTO side_state (agent_id, generation, usage, supported, reason, followups, reported_at, revision, closed_seq)
+         VALUES (?1, ?2, NULL, NULL, NULL, NULL, ?3, ?4, 0)
          ON CONFLICT (agent_id) DO UPDATE SET
-           generation = excluded.generation, usage = NULL,
-           reported_at = excluded.reported_at, revision = excluded.revision, closed_seq = 0",
+           generation = excluded.generation, usage = NULL, supported = NULL,
+           reason = NULL, followups = NULL, reported_at = excluded.reported_at,
+           revision = excluded.revision, closed_seq = 0",
         params![agent_id, generation, now, revision],
+    )?;
+    // Nothing here reads the side columns or side_requests any more. Clearing
+    // them keeps a server rolled back to older code from offering side
+    // questions to this runner or waiting on an open one.
+    conn.execute(
+        "UPDATE side_requests SET status = 'interrupted', updated_at = ?2
+         WHERE agent_id = ?1 AND status = 'open'",
+        params![agent_id, now],
     )?;
     conn.execute(
         "UPDATE owner_input_requests SET status = 'stale', updated_at = ?2
@@ -3120,6 +3132,40 @@ mod tests {
         assert_eq!(records, ["b3", "b4"]);
         retire_agent(&conn, 1, "t").unwrap();
         assert_eq!((count(1), count(2)), (0, 3));
+    }
+
+    #[test]
+    fn a_new_generation_and_retirement_clear_unused_side_question_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at)
+             VALUES (1, 'Mateo', 'a', '/', 'h', 't', 't');
+             INSERT INTO side_state (agent_id, generation, reported_at, revision, closed_seq,
+               supported, reason, followups)
+             VALUES (1, 'run-1', 't', 1, 0, 1, 'r', 1);
+             INSERT INTO side_requests (agent_id, generation, question, asked_at, status, updated_at)
+             VALUES (1, 'run-1', 'q?', 't', 'open', 't')",
+        )
+        .unwrap();
+        assert!(begin_side_session(&conn, 1, "run-2", "t2").unwrap());
+        let state: (Option<i64>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT supported, reason, followups FROM side_state WHERE agent_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (None, None, None));
+        let status: String = conn
+            .query_row("SELECT status FROM side_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "interrupted");
+        retire_agent(&conn, 1, "t3").unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM side_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]

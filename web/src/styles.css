@@ -890,7 +890,7 @@ table.list .status {
   flex: 1;
 }
 
-/* Cards above the composer: questions, side answers */
+/* Cards above the composer: questions */
 .attention {
   background: var(--info-surface);
   border-radius: 6px;
