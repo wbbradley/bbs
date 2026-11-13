@@ -4,6 +4,13 @@
 //! transfers both ways, heartbeats, directory queries for this namespace,
 //! and BBS's directory queries about others ([`remote_directory`]).
 //!
+//! Rooms (ROOMS.md D2) follow the directory pattern: BBS's room requests to
+//! hosts in other namespaces are signed as `ROOM_REQUEST`, forwarded with a
+//! pending budget of their own, and their `FederatedRoomAnswer` verified
+//! before BBS sees it ([`remote_room`]). This home hosts no rooms, so a room
+//! request for it gets a signed `unsupported_op` answer. The adapter keeps
+//! no room state.
+//!
 //! Outgoing frames use the link's three queues as Hub's peer does: a
 //! heartbeat ahead of everything, then control frames (results, replies,
 //! trust and route requests; 256 slots), then up to [`QUEUE`] transfers. A
@@ -21,6 +28,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
+use bbs_core::hub_proto::integration as pb;
 use bbs_core::hub_proto::msgproto_v1 as mp;
 use mp::federation_frame::Payload as F;
 use prost::Message as _;
@@ -32,7 +40,8 @@ use tonic::transport::Endpoint;
 use tonic::{Request, Status, Streaming};
 
 use crate::adapter::{
-    MAX_DIRECTORY_QUERIES, RelayLink, RemoteQuery, Shared, bounded, code, transfer_result,
+    MAX_DIRECTORY_QUERIES, MAX_ROOM_REQUESTS, RelayLink, RemoteQuery, Shared, bounded, code,
+    transfer_result,
 };
 use crate::link::{self, Claim, Item};
 use crate::store::{Binding, Direction, Intake};
@@ -265,8 +274,26 @@ fn answered(
     remote.remove(&id)
 }
 
-/// Fail the remote directory queries waiting on relay stream `connection`.
+/// Fail the remote directory queries and room requests waiting on relay
+/// stream `connection`.
 fn fail_queries(shared: &Shared, connection: &str) {
+    {
+        let mut rooms = shared.rooms.lock().unwrap_or_else(PoisonError::into_inner);
+        let ended: Vec<String> = rooms
+            .iter()
+            .filter(|(_, q)| q.connection == connection)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ended {
+            if let Some(q) = rooms.remove(&id) {
+                let _ = q.done.send(F::RoomUnavailable(mp::RoomUnavailable {
+                    request_id: id,
+                    error_code: verify::RELAY_UNAVAILABLE.to_string(),
+                    detail: "the relay stream closed".to_string(),
+                }));
+            }
+        }
+    }
     let mut remote = shared.remote.lock().unwrap_or_else(PoisonError::into_inner);
     let ended: Vec<String> = remote
         .iter()
@@ -349,6 +376,8 @@ impl Session {
             F::TransferResult(_) => "a transfer result",
             F::DirectoryAnswer(_) => "a directory answer",
             F::DirectoryUnavailable(_) => "a directory refusal",
+            F::RoomAnswer(_) => "a room answer",
+            F::RoomUnavailable(_) => "a room refusal",
             _ => "a frame",
         };
         if let Err(link::Refused::Full) = self.tx.try_send_control(frame(payload)) {
@@ -707,6 +736,13 @@ impl Session {
                 }
                 Some(F::DirectoryAnswer(a)) => self.on_directory_answer(a),
                 Some(F::DirectoryUnavailable(u)) => self.on_directory_unavailable(u),
+                Some(F::RoomRequest(q)) => {
+                    if let Some((rec, q)) = self.check_room_request(q) {
+                        self.answer_room(&rec, &q);
+                    }
+                }
+                Some(F::RoomAnswer(a)) => self.on_room_answer(a),
+                Some(F::RoomUnavailable(u)) => self.on_room_unavailable(u),
                 Some(other) => {
                     tracing::debug!("ignoring an unexpected frame from the relay: {other:?}")
                 }
@@ -968,6 +1004,150 @@ impl Session {
         }
     }
 
+    /// An answer to a room request this adapter asked on this stream, found
+    /// by the request record hash it binds; any other is ignored.
+    fn on_room_answer(&self, fa: mp::FederatedRoomAnswer) {
+        let Some(rec) = &fa.answer else {
+            return;
+        };
+        let Ok(a) = verify::decode::<mp::RoomAnswer>(&rec.payload, wire::MAX_ROOM_ANSWER) else {
+            tracing::debug!("ignoring an undecodable room answer");
+            return;
+        };
+        let waiter = answered(
+            &mut self
+                .shared
+                .rooms
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            &self.connection,
+            &a.request_record_hash,
+        );
+        match waiter {
+            Some(q) => {
+                let _ = q.done.send(F::RoomAnswer(fa));
+            }
+            None => tracing::debug!("a late or unknown room answer"),
+        }
+    }
+
+    /// The relay's refusal of a room request this adapter asked on this
+    /// stream.
+    fn on_room_unavailable(&self, u: mp::RoomUnavailable) {
+        let waiter = {
+            let mut rooms = self
+                .shared
+                .rooms
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match rooms.get(&u.request_id) {
+                Some(q) if q.connection == self.connection => rooms.remove(&u.request_id),
+                _ => None,
+            }
+        };
+        match waiter {
+            Some(q) => {
+                let _ = q.done.send(F::RoomUnavailable(u));
+            }
+            None => tracing::debug!(request = u.request_id, "a late or unknown room refusal"),
+        }
+    }
+
+    fn room_unavailable(&self, request_id: &str, code_: &str, detail: &str) {
+        self.send(F::RoomUnavailable(mp::RoomUnavailable {
+            request_id: request_id.to_string(),
+            error_code: code_.to_string(),
+            detail: bounded(detail, 1024),
+        }));
+    }
+
+    /// Check a room request for this namespace as a directory query is
+    /// checked, refusing what fails. Returns the request to answer.
+    fn check_room_request(
+        &self,
+        fq: mp::FederatedRoomRequest,
+    ) -> Option<(mp::SignedRecord, mp::RoomRequest)> {
+        let shared = &self.shared;
+        let (Some(rec), Some(cred)) = (fq.request, &fq.credential) else {
+            return None;
+        };
+        let Ok(q) = verify::decode::<mp::RoomRequest>(&rec.payload, wire::MAX_ROOM_REQUEST) else {
+            return None;
+        };
+        if !verify::valid_id(&q.request_id) {
+            return None;
+        }
+        let checked = {
+            let store = shared.store();
+            verify::credential(&store, cred).and_then(|c| {
+                verify::subject(&rec, mp::RecordKind::RoomRequest, &c)?;
+                let who = q.requester.as_ref().and_then(|r| r.entity.as_ref());
+                if !c.assert_senders
+                    || who.is_none_or(|e| {
+                        e.namespace != c.namespace || !verify::valid_entity_id(&e.entity_id)
+                    })
+                {
+                    return Err(reason(
+                        verify::NOT_AUTHORIZED,
+                        "request requester is not asserted by its credential",
+                    ));
+                }
+                Ok(())
+            })
+        };
+        if let Err(r) = checked {
+            let code_ = if r.code == verify::STORAGE_UNAVAILABLE {
+                verify::INVALID_SIGNATURE
+            } else {
+                r.code
+            };
+            self.room_unavailable(&q.request_id, code_, &r.detail);
+            return None;
+        }
+        if now_micros() > q.deadline_unix_micros {
+            return None; // late: the asker has given up
+        }
+        if q.namespace != shared.s.namespace {
+            self.room_unavailable(
+                &q.request_id,
+                verify::NAMESPACE_UNKNOWN,
+                &format!("this home does not serve {}", q.namespace),
+            );
+            return None;
+        }
+        Some((rec, q))
+    }
+
+    /// Answer a checked room request for this namespace: BBS hosts no rooms,
+    /// so a signed `unsupported_op`, bound to the request.
+    fn answer_room(&self, rec: &mp::SignedRecord, q: &mp::RoomRequest) {
+        let shared = &self.shared;
+        let Some(hash) = sign::hash(rec) else {
+            return;
+        };
+        let answer = mp::RoomAnswer {
+            request_record_hash: hash.to_vec(),
+            namespace: shared.s.namespace.clone(),
+            request_id: q.request_id.clone(),
+            error_code: verify::UNSUPPORTED_OP.to_string(),
+            detail: "this home hosts no rooms".to_string(),
+            result: None,
+        };
+        let signed = sign::sign(
+            &shared.s.key,
+            mp::RecordKind::RoomAnswer,
+            answer.encode_to_vec(),
+        );
+        tracing::info!(
+            request = q.request_id,
+            "answered a room request: unsupported_op"
+        );
+        self.send(F::RoomAnswer(mp::FederatedRoomAnswer {
+            answer: Some(signed),
+            credential: Some(shared.s.credential.clone()),
+        }));
+    }
+
     fn unavailable(&self, query_id: &str, code_: &str, detail: &str) {
         self.send(F::DirectoryUnavailable(mp::DirectoryUnavailable {
             query_id: query_id.to_string(),
@@ -1099,14 +1279,13 @@ const MAX_ALIAS: usize = 128;
 /// Its place among the queries waiting on the relay, given up however the
 /// asker stops waiting.
 struct Asked<'a> {
-    shared: &'a Shared,
+    waiting: &'a Mutex<HashMap<String, RemoteQuery>>,
     id: String,
 }
 
 impl Drop for Asked<'_> {
     fn drop(&mut self) {
-        self.shared
-            .remote
+        self.waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.id);
@@ -1216,7 +1395,7 @@ pub(crate) async fn remote_directory(
             },
         );
         Asked {
-            shared,
+            waiting: &shared.remote,
             id: query.query_id.clone(),
         }
     };
@@ -1341,6 +1520,221 @@ fn verify_answer(
     }
 }
 
+/// The longest a room request may wait for its answer, the wait when BBS
+/// sets no deadline, and the shortest (ROOMS.md D2: default 10 s, at most
+/// 30 s).
+const MAX_ROOM_WAIT: i64 = 30_000_000;
+const DEFAULT_ROOM_WAIT: i64 = 10_000_000;
+const MIN_ROOM_WAIT: i64 = 1_000_000;
+
+/// Forward BBS's room request to a host in another namespace: check it,
+/// sign it as this installation with a fresh request ID and BBS's deadline
+/// (kept between 1 and 30 seconds from now, 10 when BBS sets none), ask the
+/// relay under the room budget, and return the host's answer once it is
+/// verified as signed by a host of that namespace and bound to the request.
+/// Every failure is a result with `unavailable_code` set and no answer: the
+/// relay's `RoomUnavailable` code (`home_offline` when it gives none), or
+/// `relay_unavailable`, `room_timeout`, `queue_full`, `invalid_argument`,
+/// and `invalid_signature` or `route_not_authorized` for an answer that
+/// fails verification here. The result carries BBS's request ID.
+pub(crate) async fn remote_room(shared: &Shared, q: mp::RoomRequest) -> pb::RoomResult {
+    let bbs_request = q.request_id.clone();
+    let failed = |code_: &str, detail: &str| pb::RoomResult {
+        request_id: bbs_request.clone(),
+        unavailable_code: code_.to_string(),
+        detail: bounded(detail, 1024),
+        answer: None,
+    };
+    let ours = &shared.s.namespace;
+    let who = q.requester.as_ref().and_then(|r| r.entity.as_ref());
+    if who.is_none_or(|e| e.namespace != *ours || !verify::valid_entity_id(&e.entity_id)) {
+        return failed(
+            verify::NOT_AUTHORIZED,
+            &format!("this installation asserts only requesters in {ours}"),
+        );
+    }
+    let run = q.requester.as_ref().and_then(|r| r.run_id.as_deref());
+    if run.is_some_and(|r| !verify::valid_id(r)) {
+        return failed(
+            verify::INVALID_ARGUMENT,
+            "the requester's run ID is invalid",
+        );
+    }
+    if !verify::valid_namespace(&q.namespace) || q.namespace == *ours {
+        return failed(
+            verify::INVALID_ARGUMENT,
+            &format!("{:?} is not another installation's namespace", q.namespace),
+        );
+    }
+    if q.op.is_none() {
+        return failed(
+            verify::INVALID_ARGUMENT,
+            "the room request has no operation",
+        );
+    }
+    let now = now_micros();
+    let deadline = match q.deadline_unix_micros {
+        0 => now + DEFAULT_ROOM_WAIT,
+        d => d.clamp(now + MIN_ROOM_WAIT, now + MAX_ROOM_WAIT),
+    };
+    let request = mp::RoomRequest {
+        request_id: new_id(),
+        deadline_unix_micros: deadline,
+        ..q
+    };
+    let payload = request.encode_to_vec();
+    if payload.len() > wire::MAX_ROOM_REQUEST {
+        return failed(
+            verify::INVALID_ARGUMENT,
+            &format!("the room request is over {} bytes", wire::MAX_ROOM_REQUEST),
+        );
+    }
+    let Some(relay) = shared
+        .relay
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+    else {
+        return failed(
+            verify::RELAY_UNAVAILABLE,
+            "the adapter is not connected to the relay",
+        );
+    };
+    let namespace = request.namespace.clone();
+    let rec = sign::sign(&shared.s.key, mp::RecordKind::RoomRequest, payload);
+    let Some(hash) = sign::hash(&rec) else {
+        return failed(verify::INVALID_MESSAGE, "the request could not be hashed");
+    };
+    let (tx, rx) = oneshot::channel();
+    let asked = {
+        let mut rooms = shared.rooms.lock().unwrap_or_else(PoisonError::into_inner);
+        if rooms.len() >= MAX_ROOM_REQUESTS {
+            return failed(verify::QUEUE_FULL, "too many pending room requests");
+        }
+        rooms.insert(
+            request.request_id.clone(),
+            RemoteQuery {
+                hash,
+                connection: relay.connection.clone(),
+                done: tx,
+            },
+        );
+        Asked {
+            waiting: &shared.rooms,
+            id: request.request_id.clone(),
+        }
+    };
+    let sent = relay
+        .tx
+        .try_send_control(frame(F::RoomRequest(mp::FederatedRoomRequest {
+            request: Some(rec),
+            credential: Some(shared.s.credential.clone()),
+        })));
+    if let Err(refused) = sent {
+        return match refused {
+            link::Refused::Full => failed(verify::QUEUE_FULL, "the relay stream is full"),
+            link::Refused::Closed => failed(verify::RELAY_UNAVAILABLE, "the relay stream closed"),
+        };
+    }
+    tracing::info!(
+        request = request.request_id,
+        bbs_request,
+        namespace,
+        room = request.room,
+        "asked the relay a room request"
+    );
+    let wait = Duration::from_micros((deadline - now_micros()).max(0) as u64);
+    let reply = tokio::time::timeout(wait, rx).await;
+    drop(asked);
+    let reply = match reply {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(_)) => return failed(verify::RELAY_UNAVAILABLE, "the relay stream closed"),
+        Err(_) => {
+            return failed(
+                verify::ROOM_TIMEOUT,
+                &format!("no answer from {namespace} before the deadline"),
+            );
+        }
+    };
+    let fa = match reply {
+        F::RoomUnavailable(u) => {
+            let code_ = if u.error_code.is_empty() {
+                verify::HOME_OFFLINE.to_string()
+            } else {
+                code(&u.error_code)
+            };
+            return failed(&code_, &format!("room request unavailable: {}", u.detail));
+        }
+        F::RoomAnswer(fa) => fa,
+        _ => return failed(verify::INVALID_MESSAGE, "an unexpected reply"),
+    };
+    let verified = {
+        let store = shared.store();
+        verify_room_answer(&store, &fa, &hash, &namespace, &request.request_id)
+    };
+    let mut answer = match verified {
+        Ok(answer) => answer,
+        Err(r) => {
+            let code_ = if r.code == verify::NOT_AUTHORIZED {
+                verify::NOT_AUTHORIZED
+            } else {
+                verify::INVALID_SIGNATURE
+            };
+            tracing::warn!(
+                namespace,
+                reason = r.code,
+                "refused a room answer: {}",
+                r.detail
+            );
+            return failed(code_, &format!("the answer failed verification: {r}"));
+        }
+    };
+    answer.detail = bounded(&answer.detail, 1024);
+    if !answer.error_code.is_empty() {
+        answer.error_code = code(&answer.error_code);
+    }
+    pb::RoomResult {
+        request_id: bbs_request,
+        unavailable_code: String::new(),
+        detail: String::new(),
+        answer: Some(answer),
+    }
+}
+
+/// Check that a room answer is signed by a HOST_NAMESPACE credential of
+/// `ns` and bound to exactly our request: its record hash, the namespace and
+/// the request ID.
+fn verify_room_answer(
+    store: &crate::store::Store,
+    fa: &mp::FederatedRoomAnswer,
+    hash: &[u8; 32],
+    ns: &str,
+    request_id: &str,
+) -> Result<mp::RoomAnswer, verify::Reason> {
+    let (Some(rec), Some(cred)) = (&fa.answer, &fa.credential) else {
+        return Err(reason(
+            verify::INVALID_MESSAGE,
+            "answer and credential required",
+        ));
+    };
+    let c = verify::credential(store, cred)?;
+    verify::subject(rec, mp::RecordKind::RoomAnswer, &c)?;
+    if !c.host_namespace || c.namespace != ns {
+        return Err(reason(
+            verify::NOT_AUTHORIZED,
+            format!("answer signer does not host {ns}"),
+        ));
+    }
+    let a: mp::RoomAnswer = verify::decode(&rec.payload, wire::MAX_ROOM_ANSWER)?;
+    if a.namespace != ns || a.request_record_hash[..] != hash[..] || a.request_id != request_id {
+        return Err(reason(
+            verify::INVALID_SIGNATURE,
+            "answer is not bound to this request and namespace",
+        ));
+    }
+    Ok(a)
+}
+
 /// The envelope for a message BBS froze: its exact bytes signed as a
 /// MESSAGE record, with this installation's credential.
 pub(crate) fn seal(shared: &Shared, message: &[u8]) -> Vec<u8> {
@@ -1353,6 +1747,15 @@ pub(crate) fn seal(shared: &Shared, message: &[u8]) -> Vec<u8> {
         credential: Some(shared.s.credential.clone()),
     }
     .encode_to_vec()
+}
+
+/// Aborts its task when dropped, so a session's helper tasks end with it.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[cfg(test)]
@@ -1377,14 +1780,5 @@ mod tests {
         assert_eq!(remote.len(), 1, "a stray answer leaves the query waiting");
         assert!(answered(&mut remote, "a", &[7; 32]).is_some());
         assert!(remote.is_empty());
-    }
-}
-
-/// Aborts its task when dropped, so a session's helper tasks end with it.
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }

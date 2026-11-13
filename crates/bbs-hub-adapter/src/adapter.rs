@@ -121,7 +121,12 @@ pub(crate) struct RelayLink {
 /// adapter asks the relay at once (Hub's per-peer bound).
 pub(crate) const MAX_DIRECTORY_QUERIES: usize = 128;
 
-/// A directory query this adapter asked the relay, waiting for its answer.
+/// The most room requests this adapter asks the relay at once: a budget of
+/// their own, so slow rooms cannot starve directory lookups (ROOMS.md D2).
+pub(crate) const MAX_ROOM_REQUESTS: usize = 128;
+
+/// A directory query or room request this adapter asked the relay, waiting
+/// for its answer.
 pub(crate) struct RemoteQuery {
     /// The signed query record's hash, which its answer binds.
     pub hash: [u8; 32],
@@ -159,6 +164,9 @@ pub(crate) struct Shared {
     /// BBS's directory queries about other namespaces, waiting for the
     /// relay, by the query ID the relay was given.
     pub remote: Mutex<HashMap<String, RemoteQuery>>,
+    /// BBS's room requests to hosts in other namespaces, waiting for the
+    /// relay, by the request ID the relay was given.
+    pub rooms: Mutex<HashMap<String, RemoteQuery>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -518,6 +526,7 @@ impl Adapter {
                 dropped: std::sync::atomic::AtomicU64::new(0),
                 directory: Mutex::new(HashMap::new()),
                 remote: Mutex::new(HashMap::new()),
+                rooms: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -537,6 +546,22 @@ impl Adapter {
         move |q| {
             let shared = shared.clone();
             Box::pin(async move { crate::relay::remote_directory(&shared, q).await })
+        }
+    }
+
+    /// Ask the relay a room request as BBS's stream would, bypassing BBS's
+    /// own checks: for tests of the adapter's.
+    #[doc(hidden)]
+    pub fn remote_room_asker(
+        &self,
+    ) -> impl Fn(mp::RoomRequest) -> std::pin::Pin<Box<dyn Future<Output = pb::RoomResult> + Send>>
+    + Send
+    + Sync
+    + 'static {
+        let shared = self.shared.clone();
+        move |q| {
+            let shared = shared.clone();
+            Box::pin(async move { crate::relay::remote_room(&shared, q).await })
         }
     }
 

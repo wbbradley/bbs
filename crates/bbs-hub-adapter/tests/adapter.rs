@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bbs_core::hub_proto::integration as pb;
 use bbs_core::hub_proto::msgproto_v1 as mp;
 use bbs_core::{backend, db, proto, service};
 use bbs_hub_adapter::store::{Binding, Direction, Store};
@@ -478,11 +479,21 @@ type Ask = std::sync::Arc<
         + Sync,
 >;
 
+type RoomAsk = std::sync::Arc<
+    dyn Fn(
+            mp::RoomRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = pb::RoomResult> + Send>>
+        + Send
+        + Sync,
+>;
+
 struct Running {
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<anyhow::Result<()>>,
     /// Ask the relay a directory query as BBS's stream would.
     ask: Ask,
+    /// Ask the relay a room request as BBS's stream would.
+    room: RoomAsk,
 }
 
 impl Running {
@@ -493,6 +504,7 @@ impl Running {
     fn start_with(settings: Settings, store: &std::path::Path, opts: Options) -> Running {
         let adapter = Adapter::open(settings, store, opts).unwrap();
         let ask: Ask = std::sync::Arc::new(adapter.remote_directory_asker());
+        let room: RoomAsk = std::sync::Arc::new(adapter.remote_room_asker());
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(adapter.run(async {
             let _ = stopped.await;
@@ -501,6 +513,7 @@ impl Running {
             stop: Some(stop),
             task,
             ask,
+            room,
         }
     }
 
@@ -2395,4 +2408,388 @@ async fn a_bad_binding_does_not_spoil_its_trust_page() {
     assert!(store.binding("weak").unwrap().is_none());
     assert!(store.binding("short").unwrap().is_none());
     assert!(store.revoked("hub", &revoked).unwrap());
+}
+
+// ---- rooms (ROOMS.md D2) -------------------------------------------------------
+
+fn requester(namespace: &str, entity: &str) -> Option<mp::Requester> {
+    Some(mp::Requester {
+        entity: Some(mp::EntityRef {
+            namespace: namespace.into(),
+            entity_id: entity.into(),
+        }),
+        run_id: None,
+    })
+}
+
+/// BBS's Info request for room `rooms/x` on `hub`, as agent `will/scout`.
+fn room_info(id: &str) -> mp::RoomRequest {
+    mp::RoomRequest {
+        request_id: id.into(),
+        requester: requester("bbs", "will/scout"),
+        namespace: "hub".into(),
+        room: "rooms/x".into(),
+        deadline_unix_micros: now_micros() + 5_000_000,
+        op: Some(mp::room_request::Op::Info(true)),
+    }
+}
+
+/// Ask the relay `q` through the adapter, once its relay stream is up, and
+/// take the request as the relay sees it, checked as signed by this
+/// installation.
+async fn ask_room(
+    ask: &RoomAsk,
+    peer: &mut Peer,
+    q: mp::RoomRequest,
+) -> (
+    JoinHandle<pb::RoomResult>,
+    mp::SignedRecord,
+    mp::RoomRequest,
+) {
+    let start = tokio::time::Instant::now();
+    loop {
+        let pending = tokio::spawn(ask(q.clone()));
+        if let Some(F::RoomRequest(fq)) = peer.quiet().await {
+            let rec = fq.request.unwrap();
+            sign::verify(&rec, mp::RecordKind::RoomRequest).unwrap();
+            assert_eq!(
+                rec.signer_public_key,
+                key(BBS_INSTALLATION).verifying_key().to_bytes()
+            );
+            assert_eq!(
+                fq.credential.unwrap(),
+                credential(BBS_AUTHORITY, "bbs", "bbs-1", BBS_INSTALLATION)
+            );
+            let sent = mp::RoomRequest::decode(rec.payload.as_slice()).unwrap();
+            return (pending, rec, sent);
+        }
+        let r = pending.await.unwrap();
+        assert_eq!(r.unavailable_code, "relay_unavailable", "{}", r.detail);
+        assert!(start.elapsed() < WAIT, "the relay stream comes up");
+    }
+}
+
+/// A room answer bound to `hash`, `namespace` and `request_id`, signed by
+/// `signer` with `cred`.
+fn room_answer(
+    hash: Vec<u8>,
+    namespace: &str,
+    request_id: &str,
+    signer: u8,
+    cred: mp::SignedRecord,
+) -> F {
+    let answer = mp::RoomAnswer {
+        request_record_hash: hash,
+        namespace: namespace.into(),
+        request_id: request_id.into(),
+        result: Some(mp::room_answer::Result::Info(mp::RoomInfo {
+            name: "rooms/x".into(),
+            description: "a room".into(),
+            revision: 3,
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    F::RoomAnswer(mp::FederatedRoomAnswer {
+        answer: Some(sign::sign(
+            &key(signer),
+            mp::RecordKind::RoomAnswer,
+            answer.encode_to_vec(),
+        )),
+        credential: Some(cred),
+    })
+}
+
+/// BBS's room request goes to the relay signed as a room request with a
+/// fresh ID, BBS's requester and a bounded deadline; the host's answer comes
+/// back verified, under BBS's request ID. A host error stays in the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn room_requests_are_signed_forwarded_and_verified() {
+    let mut w = World::new().await;
+    let adapter = w.adapter();
+    let mut peer = w.relay.accept().await;
+    let (pending, rec, sent) = ask_room(&adapter.room, &mut peer, room_info("r1")).await;
+    assert_ne!(sent.request_id, "r1", "the relay sees a fresh ID");
+    assert_eq!(sent.requester, requester("bbs", "will/scout"));
+    assert_eq!(
+        (sent.namespace.as_str(), sent.room.as_str()),
+        ("hub", "rooms/x")
+    );
+    assert_eq!(sent.op, Some(mp::room_request::Op::Info(true)));
+    peer.send(room_answer(
+        sign::hash(&rec).unwrap().to_vec(),
+        "hub",
+        &sent.request_id,
+        HUB_INSTALLATION,
+        hub_credential(),
+    ))
+    .await;
+    let r = timeout(WAIT, pending).await.unwrap().unwrap();
+    assert_eq!(r.request_id, "r1");
+    assert!(r.unavailable_code.is_empty(), "{r:?}");
+    let answer = r.answer.unwrap();
+    assert!(answer.error_code.is_empty());
+    let Some(mp::room_answer::Result::Info(info)) = answer.result else {
+        panic!("an info answer");
+    };
+    assert_eq!((info.name.as_str(), info.revision), ("rooms/x", 3));
+
+    // A host's refusal is an answer, not unavailability.
+    let (pending, rec, sent) = ask_room(&adapter.room, &mut peer, room_info("r2")).await;
+    let answer = mp::RoomAnswer {
+        request_record_hash: sign::hash(&rec).unwrap().to_vec(),
+        namespace: "hub".into(),
+        request_id: sent.request_id.clone(),
+        error_code: "not_found".into(),
+        detail: "no room rooms/x".into(),
+        result: None,
+    };
+    peer.send(F::RoomAnswer(mp::FederatedRoomAnswer {
+        answer: Some(sign::sign(
+            &key(HUB_INSTALLATION),
+            mp::RecordKind::RoomAnswer,
+            answer.encode_to_vec(),
+        )),
+        credential: Some(hub_credential()),
+    }))
+    .await;
+    let r = timeout(WAIT, pending).await.unwrap().unwrap();
+    assert!(r.unavailable_code.is_empty(), "{r:?}");
+    assert_eq!(r.answer.unwrap().error_code, "not_found");
+
+    // The relay's refusal is unavailability with its code; none is
+    // home_offline.
+    for (code, want) in [
+        ("namespace_unknown", "namespace_unknown"),
+        ("", "home_offline"),
+    ] {
+        let (pending, _, sent) = ask_room(&adapter.room, &mut peer, room_info("r3")).await;
+        peer.send(F::RoomUnavailable(mp::RoomUnavailable {
+            request_id: sent.request_id,
+            error_code: code.into(),
+            detail: "nobody home".into(),
+        }))
+        .await;
+        let r = timeout(WAIT, pending).await.unwrap().unwrap();
+        assert_eq!(r.request_id, "r3");
+        assert_eq!(r.unavailable_code, want, "{r:?}");
+        assert!(r.answer.is_none());
+    }
+    adapter.stop().await.unwrap();
+}
+
+/// An answer that fails verification never reaches BBS as an answer: one
+/// signed by a key that is not its credential's, by an installation that does
+/// not host the namespace, or not bound to the request (namespace, request
+/// ID). One bound to another request's hash finds no request at all, which
+/// then times out.
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_room_answers_are_refused() {
+    let mut w = World::new().await;
+    let adapter = w.adapter();
+    let mut peer = w.relay.accept().await;
+    type Forge<'a> = &'a dyn Fn(Vec<u8>, &str) -> F;
+    let not_host = credential_with(
+        HUB_AUTHORITY,
+        "hub",
+        HUB_INSTALLATION,
+        &[mp::InstallationPermission::AssertSenders],
+    );
+    let cases: [(&str, Forge); 5] = [
+        ("invalid_signature", &|hash, id| {
+            room_answer(hash, "hub", id, BBS_INSTALLATION, hub_credential())
+        }),
+        ("route_not_authorized", &|hash, id| {
+            room_answer(hash, "hub", id, HUB_INSTALLATION, not_host.clone())
+        }),
+        ("route_not_authorized", &|hash, id| {
+            room_answer(
+                hash,
+                "bbs",
+                id,
+                BBS_INSTALLATION,
+                credential(BBS_AUTHORITY, "bbs", "bbs-1", BBS_INSTALLATION),
+            )
+        }),
+        ("invalid_signature", &|hash, id| {
+            room_answer(hash, "lab", id, HUB_INSTALLATION, hub_credential())
+        }),
+        ("invalid_signature", &|hash, _| {
+            room_answer(
+                hash,
+                "hub",
+                "someone-else",
+                HUB_INSTALLATION,
+                hub_credential(),
+            )
+        }),
+    ];
+    for (i, (want, forge)) in cases.iter().enumerate() {
+        let (pending, rec, sent) = ask_room(&adapter.room, &mut peer, room_info("r1")).await;
+        peer.send(forge(sign::hash(&rec).unwrap().to_vec(), &sent.request_id))
+            .await;
+        let r = timeout(WAIT, pending).await.unwrap().unwrap();
+        assert_eq!(r.unavailable_code, *want, "case {i}: {r:?}");
+        assert!(r.answer.is_none(), "case {i}");
+    }
+
+    // Bound to some other request: no request takes it, and this one times
+    // out (its deadline is kept at least a second away).
+    let mut q = room_info("r9");
+    q.deadline_unix_micros = now_micros();
+    let (pending, _, sent) = ask_room(&adapter.room, &mut peer, q).await;
+    peer.send(room_answer(
+        vec![9; 32],
+        "hub",
+        &sent.request_id,
+        HUB_INSTALLATION,
+        hub_credential(),
+    ))
+    .await;
+    let r = timeout(WAIT, pending).await.unwrap().unwrap();
+    assert_eq!(r.unavailable_code, "room_timeout", "{r:?}");
+    assert!(r.answer.is_none());
+    adapter.stop().await.unwrap();
+}
+
+/// The adapter asserts only requesters in its own namespace, and asks only
+/// other namespaces: it refuses anything else itself, sending nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_adapter_checks_bbs_room_requests() {
+    let mut w = World::new().await;
+    let adapter = w.adapter();
+    let mut peer = w.relay.accept().await;
+    let refused = [
+        (
+            "route_not_authorized",
+            mp::RoomRequest {
+                requester: requester("hub", "will"),
+                ..room_info("r1")
+            },
+        ),
+        (
+            "route_not_authorized",
+            mp::RoomRequest {
+                requester: None,
+                ..room_info("r1")
+            },
+        ),
+        (
+            "invalid_argument",
+            mp::RoomRequest {
+                namespace: "bbs".into(),
+                ..room_info("r1")
+            },
+        ),
+        (
+            "invalid_argument",
+            mp::RoomRequest {
+                op: None,
+                ..room_info("r1")
+            },
+        ),
+    ];
+    for (want, q) in refused {
+        let r = (adapter.room)(q.clone()).await;
+        assert_eq!(r.request_id, "r1");
+        assert_eq!(r.unavailable_code, want, "{q:?}: {r:?}");
+        assert!(r.answer.is_none());
+    }
+    assert!(peer.quiet().await.is_none(), "nothing reached the relay");
+    adapter.stop().await.unwrap();
+}
+
+/// This home hosts no rooms: a room request for it gets an answer signed by
+/// this installation, bound to the request, saying `unsupported_op`. One for
+/// another namespace is refused as unknown.
+#[tokio::test(flavor = "multi_thread")]
+async fn room_requests_for_this_home_are_unsupported() {
+    let mut w = World::new().await;
+    let adapter = w.adapter();
+    let mut peer = w.relay.accept().await;
+    let request = |namespace: &str| {
+        sign::sign(
+            &key(HUB_INSTALLATION),
+            mp::RecordKind::RoomRequest,
+            mp::RoomRequest {
+                request_id: "h1".into(),
+                requester: requester("hub", "carl"),
+                namespace: namespace.into(),
+                deadline_unix_micros: now_micros() + 5_000_000,
+                op: Some(mp::room_request::Op::List(mp::RoomList::default())),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+    };
+    let rec = request("bbs");
+    peer.send(F::RoomRequest(mp::FederatedRoomRequest {
+        request: Some(rec.clone()),
+        credential: Some(hub_credential()),
+    }))
+    .await;
+    let F::RoomAnswer(fa) = peer.next().await else {
+        panic!("a signed room answer");
+    };
+    let signed = fa.answer.unwrap();
+    sign::verify(&signed, mp::RecordKind::RoomAnswer).unwrap();
+    assert_eq!(
+        signed.signer_public_key,
+        key(BBS_INSTALLATION).verifying_key().to_bytes()
+    );
+    assert_eq!(
+        fa.credential.unwrap(),
+        credential(BBS_AUTHORITY, "bbs", "bbs-1", BBS_INSTALLATION)
+    );
+    let answer = mp::RoomAnswer::decode(signed.payload.as_slice()).unwrap();
+    assert_eq!(answer.request_record_hash, sign::hash(&rec).unwrap());
+    assert_eq!(
+        (
+            answer.namespace.as_str(),
+            answer.request_id.as_str(),
+            answer.error_code.as_str()
+        ),
+        ("bbs", "h1", "unsupported_op")
+    );
+
+    peer.send(F::RoomRequest(mp::FederatedRoomRequest {
+        request: Some(request("lab")),
+        credential: Some(hub_credential()),
+    }))
+    .await;
+    let F::RoomUnavailable(u) = peer.next().await else {
+        panic!("a refusal");
+    };
+    assert_eq!(
+        (u.request_id.as_str(), u.error_code.as_str()),
+        ("h1", "namespace_unknown")
+    );
+
+    // A requester the credential cannot assert is refused.
+    let forged = sign::sign(
+        &key(HUB_INSTALLATION),
+        mp::RecordKind::RoomRequest,
+        mp::RoomRequest {
+            request_id: "h2".into(),
+            requester: requester("bbs", "will"),
+            namespace: "bbs".into(),
+            deadline_unix_micros: now_micros() + 5_000_000,
+            op: Some(mp::room_request::Op::Info(true)),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    peer.send(F::RoomRequest(mp::FederatedRoomRequest {
+        request: Some(forged),
+        credential: Some(hub_credential()),
+    }))
+    .await;
+    let F::RoomUnavailable(u) = peer.next().await else {
+        panic!("a refusal");
+    };
+    assert_eq!(
+        (u.request_id.as_str(), u.error_code.as_str()),
+        ("h2", "route_not_authorized")
+    );
+    adapter.stop().await.unwrap();
 }

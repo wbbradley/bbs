@@ -29,6 +29,10 @@ pub const QUEUE_FULL: &str = "queue_full";
 /// Directory results for a query this installation asked.
 pub const RELAY_UNAVAILABLE: &str = "relay_unavailable";
 pub const DIRECTORY_TIMEOUT: &str = "directory_timeout";
+/// No room answer before the request's deadline (rooms, D2).
+pub const ROOM_TIMEOUT: &str = "room_timeout";
+/// A room request to a home that hosts no rooms.
+pub const UNSUPPORTED_OP: &str = "unsupported_op";
 pub const INVALID_ARGUMENT: &str = "invalid_argument";
 
 /// A refusal with its msgproto reason and a diagnostic detail.

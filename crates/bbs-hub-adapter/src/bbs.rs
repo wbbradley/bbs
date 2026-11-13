@@ -13,7 +13,10 @@
 //!   to the relay on the stream the message came on. Imports sent to an
 //!   earlier stream, whose results were lost with it, are offered again;
 //! - asks BBS to answer Hub's directory queries for this namespace, and
-//!   asks the relay BBS's queries about other namespaces.
+//!   asks the relay BBS's queries about other namespaces;
+//! - forwards BBS's room requests to hosts in other namespaces and returns
+//!   each verified answer, or why there is none (ROOMS.md D2). Stateless:
+//!   BBS keeps every room record.
 
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
@@ -277,11 +280,31 @@ async fn read(
                 });
                 None
             }
+            // Room requests (ROOMS.md D2) go the same way, under their own
+            // budget at the relay.
             Some(In::RemoteRoomRequest(q)) => {
-                tracing::debug!(
-                    request = q.request_id,
-                    "room requests are not forwarded yet"
-                );
+                let (shared, tx) = (shared.clone(), tx.clone());
+                queries.spawn(async move {
+                    let request = q.request_id.clone();
+                    let result = crate::relay::remote_room(&shared, q).await;
+                    tracing::info!(
+                        request,
+                        unavailable = result.unavailable_code,
+                        error = result.answer.as_ref().map(|a| a.error_code.as_str()),
+                        "answered BBS's room request"
+                    );
+                    let item = Item {
+                        frame: frame(Out::RemoteRoomResult(result)),
+                        claim: None,
+                    };
+                    let sent = match tx.reserve_control().await {
+                        Some(permit) => permit.send(item).is_ok(),
+                        None => false,
+                    };
+                    if !sent {
+                        tracing::info!(request, "BBS's stream ended before the room result went");
+                    }
+                });
                 None
             }
             Some(In::Ping(p)) => Some(Out::Pong(pb::Pong { nonce: p.nonce })),
