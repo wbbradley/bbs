@@ -184,7 +184,7 @@ impl Host {
                 let path = format!("rooms/{}", c.name);
                 if let Some(r) = self.rooms.get(&path) {
                     fail(&mut a, "conflict");
-                    a.result = Some(mp::room_answer::Result::Info(r.info.clone()));
+                    a.result = Some(mp::room_answer::Result::Info(Box::new(r.info.clone())));
                 } else {
                     self.create(&c.name, who.clone());
                     let r = self.rooms.get_mut(&path).unwrap();
@@ -198,7 +198,7 @@ impl Host {
                         managers.insert(0, me);
                     }
                     r.info.managers = managers;
-                    a.result = Some(mp::room_answer::Result::Info(r.info.clone()));
+                    a.result = Some(mp::room_answer::Result::Info(Box::new(r.info.clone())));
                 }
                 self.ops.insert(key, a.clone());
             }
@@ -207,7 +207,7 @@ impl Host {
                     let mut info = r.info.clone();
                     info.head_position = r.log.last().map_or(0, |l| l.0);
                     info.head_cursor = cursor(&req.room, info.head_position, self.epoch);
-                    a.result = Some(mp::room_answer::Result::Info(info));
+                    a.result = Some(mp::room_answer::Result::Info(Box::new(info)));
                 }
                 None => fail(&mut a, "not_found"),
             },
@@ -233,7 +233,7 @@ impl Host {
                     r.info.archived = x;
                 }
                 r.info.revision += 1;
-                a.result = Some(mp::room_answer::Result::Info(r.info.clone()));
+                a.result = Some(mp::room_answer::Result::Info(Box::new(r.info.clone())));
             }
             mp::room_request::Op::Read(rd) => {
                 let Some(r) = self.rooms.get(&req.room) else {

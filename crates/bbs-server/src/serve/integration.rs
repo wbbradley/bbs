@@ -299,7 +299,7 @@ pub(super) async fn remote_room(
     }
     let _gone = Gone(&link, id.clone());
     let item = Item {
-        frame: frame(Out::RemoteRoomRequest(request)),
+        frame: frame(Out::RemoteRoomRequest(Box::new(request))),
         claim: None,
     };
     let Some(tx) = link.tx.upgrade() else {
@@ -880,7 +880,7 @@ impl Session {
                     None
                 }
                 Some(In::RemoteRoomResult(result)) => {
-                    self.link.room_answered(result);
+                    self.link.room_answered(*result);
                     None
                 }
                 Some(In::Ping(ping)) => Some(Out::Pong(pb::Pong { nonce: ping.nonce })),

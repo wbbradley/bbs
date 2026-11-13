@@ -2713,7 +2713,7 @@ async fn a_server_that_predates_replies_is_named_incompatible() {
 /// The next frame, which must be a room request.
 async fn room_request(adapter: &mut Adapter) -> mp::RoomRequest {
     match adapter.next().await.unwrap() {
-        Out::RemoteRoomRequest(q) => q,
+        Out::RemoteRoomRequest(q) => *q,
         other => panic!("expected a room request, got {other:?}"),
     }
 }
@@ -2732,7 +2732,7 @@ fn room_info(name: &str) -> mp::RoomInfo {
 }
 
 fn answered(q: &mp::RoomRequest, result: mp::room_answer::Result) -> In {
-    In::RemoteRoomResult(pb::RoomResult {
+    In::RemoteRoomResult(Box::new(pb::RoomResult {
         request_id: q.request_id.clone(),
         answer: Some(mp::RoomAnswer {
             namespace: "hub".into(),
@@ -2741,7 +2741,7 @@ fn answered(q: &mp::RoomRequest, result: mp::room_answer::Result) -> In {
             ..Default::default()
         }),
         ..Default::default()
-    })
+    }))
 }
 
 /// `bbs room` verbs go from the client's RPC to the adapter as room requests
@@ -2769,7 +2769,7 @@ async fn room_commands_ask_the_adapter_as_the_agent() {
     adapter
         .send(answered(
             &q,
-            mp::room_answer::Result::Info(room_info("war")),
+            mp::room_answer::Result::Info(Box::new(room_info("war"))),
         ))
         .await;
     let (mut b, info) = asked.await.unwrap();
@@ -2781,12 +2781,12 @@ async fn room_commands_ask_the_adapter_as_the_agent() {
         tokio::spawn(async move { b.room("history", &serde_json::json!({"room": "war"})).await });
     let q = room_request(&mut adapter).await;
     adapter
-        .send(In::RemoteRoomResult(pb::RoomResult {
+        .send(In::RemoteRoomResult(Box::new(pb::RoomResult {
             request_id: q.request_id.clone(),
             unavailable_code: "home_offline".into(),
             detail: "the host is down".into(),
             answer: None,
-        }))
+        })))
         .await;
     let err = asked.await.unwrap().unwrap_err();
     assert!(format!("{err:#}").contains("home_offline"), "{err:#}");

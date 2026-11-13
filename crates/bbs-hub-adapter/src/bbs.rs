@@ -286,7 +286,7 @@ async fn read(
                 let (shared, tx) = (shared.clone(), tx.clone());
                 queries.spawn(async move {
                     let request = q.request_id.clone();
-                    let result = crate::relay::remote_room(&shared, q).await;
+                    let result = crate::relay::remote_room(&shared, *q).await;
                     tracing::info!(
                         request,
                         unavailable = result.unavailable_code,
@@ -294,7 +294,7 @@ async fn read(
                         "answered BBS's room request"
                     );
                     let item = Item {
-                        frame: frame(Out::RemoteRoomResult(result)),
+                        frame: frame(Out::RemoteRoomResult(Box::new(result))),
                         claim: None,
                     };
                     let sent = match tx.reserve_control().await {

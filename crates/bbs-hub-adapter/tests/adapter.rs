@@ -2482,12 +2482,12 @@ fn room_answer(
         request_record_hash: hash,
         namespace: namespace.into(),
         request_id: request_id.into(),
-        result: Some(mp::room_answer::Result::Info(mp::RoomInfo {
+        result: Some(mp::room_answer::Result::Info(Box::new(mp::RoomInfo {
             name: "rooms/x".into(),
             description: "a room".into(),
             revision: 3,
             ..Default::default()
-        })),
+        }))),
         ..Default::default()
     };
     F::RoomAnswer(mp::FederatedRoomAnswer {

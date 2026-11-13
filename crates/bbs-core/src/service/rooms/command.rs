@@ -264,7 +264,7 @@ impl<H: RoomHome> Cmd<'_, H> {
             store::set_archived(ctx, &name, archived)
         })
         .await?;
-        Ok(info)
+        Ok(*info)
     }
 
     async fn list(&self) -> Result<Value> {
@@ -1129,12 +1129,16 @@ fn when(s: &str, now: DateTime<Utc>) -> Result<i64> {
     Ok((now - chrono::Duration::from_std(d)?).timestamp_micros())
 }
 
+/// A stored message's origin, a group copy's original, and whether the
+/// caller sent it or had it delivered.
+type MessageOrigin = (String, String, Option<String>, Option<String>, bool, bool);
+
 /// A message reference from `NAMESPACE:ID`, or this installation's message
 /// number: a room post delivered to the caller (its original) or one it sent.
 fn resolve_ref(ctx: &Ctx, me: &Me, text: &str) -> Result<(mp::MessageRef, Option<i64>)> {
     let text = text.trim();
     if let Ok(id) = text.parse::<i64>() {
-        let row: Option<(String, String, Option<String>, Option<String>, bool, bool)> = ctx
+        let row: Option<MessageOrigin> = ctx
             .conn
             .query_row(
                 "SELECT m.origin_namespace, m.origin_message_id, m.group_copy_namespace,

@@ -28,8 +28,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         out.join("hub_descriptors.bin"),
         prost::Message::encode_to_vec(&hub),
     )?;
+    // The room frames' large variants are boxed, so every frame and answer
+    // is not as large as the largest.
     tonic_prost_build::configure()
         .build_transport(false)
+        .boxed(".msgproto.v1.RoomAnswer.result.info")
+        .boxed(".bbs.integration.v1.AdapterFrame.payload.remote_room_result")
+        .boxed(".bbs.integration.v1.BbsFrame.payload.remote_room_request")
         .compile_fds(hub)?;
     println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-changed=build.rs");
