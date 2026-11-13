@@ -1889,6 +1889,12 @@ async fn rotation_is_owner_only_and_unbinds_sessions() {
     };
     let err = client.rotate_agent_token(rotate(&bob)).await.unwrap_err();
     assert!(err.message().contains("not your agent"), "{err:?}");
+    // A mail wait opened with the old token ends once the token is rotated.
+    let mut mail = client
+        .wait_for_mail(as_agent(&a.token, proto::WaitRequest { limit: None }))
+        .await
+        .unwrap()
+        .into_inner();
 
     let r = client
         .rotate_agent_token(rotate(&ada))
@@ -1897,6 +1903,14 @@ async fn rotation_is_owner_only_and_unbinds_sessions() {
         .into_inner();
     assert_eq!(r.name, "Zed");
     assert_ne!(r.token, a.token);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(7), mail.message())
+            .await
+            .unwrap()
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
     assert!(
         client
             .whoami(as_agent(&a.token, proto::Empty {}))
