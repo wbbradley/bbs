@@ -250,6 +250,7 @@ pub fn request(command: RoomCommand, host: Option<String>) -> (&'static str, Val
 
 /// Exit codes (the build contract's machine output): 1 refused or error,
 /// 2 `--wait` ran out, 4 no answer (host or relay unavailable).
+pub const EXIT_REFUSED: i32 = 1;
 pub const EXIT_WAIT: i32 = 2;
 pub const EXIT_NO_ANSWER: i32 = 4;
 
@@ -280,14 +281,25 @@ pub async fn run(
     } else {
         text(verb, &value)
     };
-    // `--wait` ran out before the post settled.
-    if args["wait"] == true
-        && matches!(value["state"].as_str(), Some("queued" | "sent" | "unknown"))
-    {
+    if let Some(code) = exit_code(verb, &args, &value) {
         print!("{out}");
-        std::process::exit(EXIT_WAIT);
+        std::process::exit(code);
     }
     Ok(out)
+}
+
+/// A successful call's nonzero exit code: 1 for a post that settled as
+/// rejected (the output stays the outcome, not an error object), 2 when
+/// `--wait` ran out before the post settled.
+pub fn exit_code(verb: &str, args: &Value, value: &Value) -> Option<i32> {
+    if !matches!(verb, "post" | "reply" | "status") {
+        return None;
+    }
+    match value["state"].as_str() {
+        Some("rejected") => Some(EXIT_REFUSED),
+        Some("queued" | "sent" | "unknown") if args["wait"] == true => Some(EXIT_WAIT),
+        _ => None,
+    }
 }
 
 /// The codes that mean no answer came: the host or the relay was not
@@ -560,6 +572,25 @@ mod tests {
             )
         );
         assert!(crate::cli::Cli::try_parse_from(["bbs", "room", "grant", "war"]).is_err());
+    }
+
+    #[test]
+    fn a_rejected_post_exits_1_and_a_wait_that_ran_out_2() {
+        let rejected = json!({"ref": "bbs:x", "state": "rejected", "reason": "quota"});
+        for verb in ["post", "reply", "status"] {
+            assert_eq!(exit_code(verb, &json!({}), &rejected), Some(1), "{verb}");
+        }
+        let sent = json!({"state": "sent"});
+        assert_eq!(exit_code("post", &json!({"wait": true}), &sent), Some(2));
+        assert_eq!(exit_code("post", &json!({}), &sent), None);
+        assert_eq!(
+            exit_code("status", &json!({}), &json!({"state": "confirmed"})),
+            None
+        );
+        assert_eq!(
+            exit_code("info", &json!({}), &json!({"state": "rejected"})),
+            None
+        );
     }
 
     #[test]

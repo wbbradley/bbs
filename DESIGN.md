@@ -901,7 +901,8 @@ contract fixes for every home: room info (`room`, `description`, `post`,
 `state`, `reason`, `tags` with `to`, `state`, `reason`), follows (`room`,
 `mode`, `state`: `pending`, `active` or `backfill`, `created`). A failure
 prints `{"error": CODE, "detail": TEXT}`; the exit code is 1 for a refusal or
-error, 2 when `--wait` ran out, 4 when no answer came.
+error (including a post that settled as `rejected`, whose output is still
+its outcome), 2 when `--wait` ran out, 4 when no answer came.
 
 ## Web UI
 
