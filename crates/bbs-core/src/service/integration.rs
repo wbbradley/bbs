@@ -139,7 +139,7 @@ pub fn hello(conn: &Connection, integration: &str) -> Result<pb::BbsHello> {
 
 // ---- publication (D090) ----------------------------------------------------
 
-fn address_ref(
+pub(super) fn address_ref(
     namespace: &str,
     entity_id: &str,
     address_id: &str,
@@ -518,7 +518,7 @@ pub fn record_result(
 /// The integration that reaches another installation's `namespace`: the one
 /// bound to it, else the only usable one. It must publish this
 /// installation's entities, which are who `what` acts for.
-fn route(ctx: &Ctx, namespace: &str, what: &str) -> Result<String> {
+pub(super) fn route(ctx: &Ctx, namespace: &str, what: &str) -> Result<String> {
     let usable = store::usable(ctx.conn)?;
     let integration = match store::namespace_integration(ctx.conn, namespace)? {
         Some(bound) => bound,
@@ -558,6 +558,18 @@ pub(super) fn send_remote(
     reference: &str,
     body: &str,
     in_reply_to: Option<(&str, &str)>,
+) -> Result<(i64, String)> {
+    send_remote_with(ctx, me, reference, body, in_reply_to, None)
+}
+
+/// [`send_remote`], carrying a room tag's `mention` (D10).
+pub(super) fn send_remote_with(
+    ctx: &Ctx,
+    me: &db::Principal,
+    reference: &str,
+    body: &str,
+    in_reply_to: Option<(&str, &str)>,
+    mention: Option<mp::RoomMention>,
 ) -> Result<(i64, String)> {
     let remote = entity::parse_remote(reference)?;
     let (namespace, entity_id, address_id) = (
@@ -606,7 +618,7 @@ pub(super) fn send_remote(
         kind: mp::MessageKind::Application as i32,
         delivery_error: None,
         group_copy: None,
-        mention: None,
+        mention,
     };
     // Frozen once: the adapter signs exactly these bytes.
     let encoded = message.encode_to_vec();
@@ -707,6 +719,23 @@ fn check_message(m: &mp::Message) -> Result<(), Refusal> {
     }
     if m.in_reply_to.is_some() && !valid_ref(m.in_reply_to.as_ref()) {
         return Err(refuse("invalid_message", "invalid in_reply_to"));
+    }
+    if let Some(mention) = &m.mention {
+        let room_ok = mention.room.as_ref().is_some_and(|r| {
+            db::validate_namespace(&r.namespace).is_ok()
+                && r.entity_id
+                    .strip_prefix("rooms/")
+                    .is_some_and(super::rooms::valid_name)
+        });
+        if !room_ok || !valid_ref(mention.post.as_ref()) {
+            return Err(refuse(
+                "invalid_message",
+                "a mention names a room (rooms/NAME) and a post",
+            ));
+        }
+        if m.group_copy.is_some() {
+            return Err(refuse("invalid_message", "a group copy carries no mention"));
+        }
     }
     if let Some(copy) = &m.group_copy {
         if !valid_ref(copy.original.as_ref()) || !valid_address(copy.original_sender.as_ref()) {
@@ -973,7 +1002,14 @@ fn import_in(
             encoded: bytes,
         },
     )?;
-    store::insert_delivery(ctx.conn, message, target.address)?;
+    // A tag (D10) is held until its post is read back from the room; it is
+    // delivered then, merged into the post, or as an unverified claim.
+    match &m.mention {
+        Some(mention) => {
+            super::rooms::hold_mention(ctx.conn, message, target.address, mention, &ctx.now_s)?
+        }
+        None => store::insert_delivery(ctx.conn, message, target.address)?,
+    }
     tracing::info!(
         integration,
         message,

@@ -25,6 +25,7 @@ use crate::protocol::Policy;
 use crate::service::{self, Caller, TimerLimits, Watched};
 
 mod integration;
+mod rooms;
 mod web;
 
 /// Keepalive pings let a vanished client free its waiter slot within ~30s.
@@ -131,6 +132,7 @@ async fn serve(
     });
     tokio::spawn(run_timers(state.clone()));
     tokio::spawn(integration::sweep(state.clone()));
+    tokio::spawn(rooms::run(state.clone()));
     let (health, health_service) = tonic_health::server::health_reporter();
     health.set_serving::<BbsServer<Server>>().await;
     let server = tonic::transport::Server::builder()
@@ -539,7 +541,9 @@ impl State {
                 limit,
                 ..Default::default()
             };
-            let msgs = self.call(move |conn| service::read(conn, &c, req)).await?;
+            let msgs = self
+                .call(move |conn| service::read_mail(conn, &c, req, true))
+                .await?;
             if !msgs.messages.is_empty() {
                 self.changed();
                 for m in msgs.messages {
@@ -1561,6 +1565,39 @@ impl Bbs for Server {
             Ok(Response::new(service::integration::remote_directory_page(
                 &namespace, &result,
             )))
+        }
+        .await;
+        self.0.protocol.finish(result)
+    }
+
+    /// One `bbs room` verb (rooms.v1), as the caller. Room requests are
+    /// asked of the integration's adapter without holding the database.
+    async fn room(
+        &self,
+        req: Request<proto::RoomCommand>,
+    ) -> Result<Response<proto::RoomCommandResult>, Status> {
+        const RPC: &str = "room";
+        self.0.protocol.validate(req.metadata())?;
+        let result = async {
+            let peer = req.remote_addr().map(|addr| addr.ip());
+            let caller = caller(&req, self.0.require_human_token);
+            self.0.enforce_auth_rate(peer, &caller).await?;
+            let req = req.into_inner();
+            let home = rooms::Home(self.0.clone());
+            let done =
+                service::rooms::command(&home, rooms::config(), &caller, &req.verb, &req.args_json)
+                    .await;
+            match done {
+                Ok(value) => Ok(Response::new(proto::RoomCommandResult {
+                    result_json: value.to_string(),
+                })),
+                Err(err) => {
+                    let status = rooms::status(err);
+                    self.0.record_auth_failure(peer, &status);
+                    self.0.warn_failed(RPC, &caller, &status).await;
+                    Err(status)
+                }
+            }
         }
         .await;
         self.0.protocol.finish(result)

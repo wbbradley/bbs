@@ -40,6 +40,16 @@ impl Message {
     /// than the group, or `group GROUP (notice)` for a notice the group sent
     /// itself. None for other messages.
     pub fn group_copy_sender(&self) -> Option<String> {
+        // A room's delivery (rooms.v1): the room sent it; the author is the
+        // host's report.
+        if let Some(room) = &self.room {
+            if self.group_notice == Some(true) {
+                return Some(format!("room {room} (notice)"));
+            }
+            if let Some(original) = &self.original_from {
+                return Some(format!("{original} via room {room} (reported)"));
+            }
+        }
         if self.group_notice == Some(true) {
             return Some(format!("group {} (notice)", self.from_name));
         }

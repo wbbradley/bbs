@@ -20,6 +20,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use chrono::Utc;
 use rusqlite::{Connection, OpenFlags};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio_stream::Stream;
@@ -64,6 +65,15 @@ pub(super) type Sessions = Arc<Mutex<HashMap<String, Arc<Link>>>>;
 /// Remote directory queries waiting for their results, by query ID.
 type Waiting = HashMap<String, Query>;
 
+/// Room requests waiting for their results, by request ID: their own
+/// budget, apart from directory queries (D2).
+type RoomWaiting = HashMap<String, oneshot::Sender<pb::RoomResult>>;
+
+/// The most room requests waiting on one stream.
+const MAX_ROOM_REQUESTS: usize = 128;
+/// The margin past a room request's deadline for the result's way back.
+const ROOM_MARGIN: Duration = Duration::from_secs(2);
+
 /// A remote directory query waiting for its result.
 struct Query {
     /// Who asked, as its requester entity ID.
@@ -79,6 +89,8 @@ pub(super) struct Link {
     tx: mpsc::WeakSender<Item>,
     /// None once the stream has ended: no result can come.
     queries: Mutex<Option<Waiting>>,
+    /// Room requests, likewise.
+    rooms: Mutex<Option<RoomWaiting>>,
 }
 
 impl Link {
@@ -86,9 +98,29 @@ impl Link {
         self.queries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn rooms(&self) -> std::sync::MutexGuard<'_, Option<RoomWaiting>> {
+        self.rooms.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The stream has ended: its waiting queries fail at once.
     fn close(&self) {
         self.queries().take();
+        self.rooms().take();
+    }
+
+    /// The adapter's result for a room request; one nothing waits for is
+    /// dropped.
+    fn room_answered(&self, result: pb::RoomResult) {
+        let waiter = self
+            .rooms()
+            .as_mut()
+            .and_then(|q| q.remove(&result.request_id));
+        match waiter {
+            Some(w) => {
+                let _ = w.send(result);
+            }
+            None => tracing::debug!(request = result.request_id, "a late or unknown room result"),
+        }
     }
 
     /// The adapter's result for a remote directory query, or why it was
@@ -205,6 +237,90 @@ pub(super) async fn remote_directory(
     };
     drop(waiter);
     Ok(result)
+}
+
+/// Ask `integration`'s adapter room request `request`, and wait for its
+/// result until the request's deadline and a margin. Never an error: every
+/// failure to get an answer is a result with `unavailable_code` set, which
+/// means "no information" (D7).
+pub(super) async fn remote_room(
+    state: &State,
+    integration: &str,
+    request: mp::RoomRequest,
+) -> pb::RoomResult {
+    let id = request.request_id.clone();
+    let failed = |code: &str, detail: String| pb::RoomResult {
+        request_id: id.clone(),
+        unavailable_code: code.to_string(),
+        detail,
+        answer: None,
+    };
+    let wait = Duration::from_micros(
+        (request.deadline_unix_micros - Utc::now().timestamp_micros()).clamp(1_000_000, 30_000_000)
+            as u64,
+    ) + ROOM_MARGIN;
+    let deadline = tokio::time::Instant::now() + wait;
+    let link = state
+        .integrations
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(integration)
+        .cloned();
+    let Some(link) = link else {
+        return failed(
+            "relay_unavailable",
+            format!("integration {integration} is not connected; is its adapter running?"),
+        );
+    };
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut rooms = link.rooms();
+        let Some(waiting) = rooms.as_mut() else {
+            return failed(
+                "relay_unavailable",
+                format!("integration {integration}'s stream has ended"),
+            );
+        };
+        if waiting.len() >= MAX_ROOM_REQUESTS {
+            return failed(
+                "queue_full",
+                format!("too many room requests are waiting on integration {integration}"),
+            );
+        }
+        waiting.insert(id.clone(), tx);
+    }
+    struct Gone<'a>(&'a Link, String);
+    impl Drop for Gone<'_> {
+        fn drop(&mut self) {
+            if let Some(q) = self.0.rooms().as_mut() {
+                q.remove(&self.1);
+            }
+        }
+    }
+    let _gone = Gone(&link, id.clone());
+    let item = Item {
+        frame: frame(Out::RemoteRoomRequest(request)),
+        claim: None,
+    };
+    let Some(tx) = link.tx.upgrade() else {
+        return failed("relay_unavailable", "the integration stream ended".into());
+    };
+    match tokio::time::timeout_at(deadline, tx.send(item)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return failed("relay_unavailable", "the integration stream ended".into()),
+        Err(_) => return failed("room_timeout", "the integration stream is full".into()),
+    }
+    match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => failed(
+            "relay_unavailable",
+            "the integration stream ended before it answered".into(),
+        ),
+        Err(_) => failed(
+            "room_timeout",
+            format!("integration {integration} did not answer in time"),
+        ),
+    }
 }
 
 /// The client's status for a remote directory result's error: Hub's reason
@@ -488,6 +604,7 @@ impl Integration {
             superseded: watch::Sender::new(false),
             tx: tx.downgrade(),
             queries: Mutex::new(Some(HashMap::new())),
+            rooms: Mutex::new(Some(HashMap::new())),
         });
         let mut sessions = self
             .state
@@ -763,7 +880,7 @@ impl Session {
                     None
                 }
                 Some(In::RemoteRoomResult(result)) => {
-                    tracing::debug!(request = result.request_id, "an unasked room result");
+                    self.link.room_answered(result);
                     None
                 }
                 Some(In::Ping(ping)) => Some(Out::Pong(pb::Pong { nonce: ping.nonce })),

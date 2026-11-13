@@ -364,12 +364,14 @@ fn migration_preserves_history_and_maps_names() {
             .is_err()
     );
 
-    // Startup serves the migrated database, in its namespace, unchanged; a
+    // Startup serves the migrated database, in its namespace, applying only
+    // the migrations after the Hub model, and then leaves it unchanged; a
     // second cutover refuses it.
     assert_eq!(
         rows(&conn, "SELECT namespace FROM bbs_installation"),
         [format!("{:?}", [Value::Text("will".into())])]
     );
+    migrate(&mut conn).unwrap();
     let before = dump(&conn);
     migrate(&mut conn).unwrap();
     crate::db::migrate_in(&mut conn, Some("will")).unwrap();
@@ -403,6 +405,9 @@ fn schema(conn: &Connection) -> Vec<String> {
 fn cutover_and_new_database_have_the_same_schema() {
     let mut cut = fixture();
     migrate_to_hub_model(&mut cut, "will").unwrap();
+    assert_eq!(schema_version(&cut).unwrap(), HUB_MODEL_SCHEMA_VERSION);
+    // Startup applies the migrations after the Hub model.
+    crate::db::migrate_in(&mut cut, Some("will")).unwrap();
     let mut new = Connection::open_in_memory().unwrap();
     crate::db::migrate_in(&mut new, Some("will")).unwrap();
     assert_eq!(schema_version(&cut).unwrap(), crate::db::SCHEMA_VERSION);

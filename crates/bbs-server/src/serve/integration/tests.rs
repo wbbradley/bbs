@@ -2709,3 +2709,216 @@ async fn a_server_that_predates_replies_is_named_incompatible() {
         "{err:#}"
     );
 }
+
+/// The next frame, which must be a room request.
+async fn room_request(adapter: &mut Adapter) -> mp::RoomRequest {
+    match adapter.next().await.unwrap() {
+        Out::RemoteRoomRequest(q) => q,
+        other => panic!("expected a room request, got {other:?}"),
+    }
+}
+
+fn room_info(name: &str) -> mp::RoomInfo {
+    mp::RoomInfo {
+        room: Some(mp::EntityRef {
+            namespace: "hub".into(),
+            entity_id: format!("rooms/{name}"),
+        }),
+        name: format!("rooms/{name}"),
+        description: "war room".into(),
+        revision: 1,
+        ..Default::default()
+    }
+}
+
+fn answered(q: &mp::RoomRequest, result: mp::room_answer::Result) -> In {
+    In::RemoteRoomResult(pb::RoomResult {
+        request_id: q.request_id.clone(),
+        answer: Some(mp::RoomAnswer {
+            namespace: "hub".into(),
+            request_id: "relay-side".into(),
+            result: Some(result),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+/// `bbs room` verbs go from the client's RPC to the adapter as room requests
+/// naming the agent, and its results come back; a missing answer is the
+/// adapter's code, never an empty result.
+#[tokio::test]
+async fn room_commands_ask_the_adapter_as_the_agent() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut adapter, _) = rig.connect().await;
+    let mut b = client(&rig, agent(&rig)).await;
+    let asked = tokio::spawn(async move {
+        let info = b.room("info", &serde_json::json!({"room": "war"})).await;
+        (b, info)
+    });
+    let q = room_request(&mut adapter).await;
+    assert_eq!(q.namespace, "hub");
+    assert_eq!(q.room, "rooms/war");
+    let who = q.requester.clone().unwrap().entity.unwrap();
+    assert_eq!(
+        (who.namespace.as_str(), who.entity_id.as_str()),
+        ("bbs", "will/scout")
+    );
+    assert!(matches!(q.op, Some(mp::room_request::Op::Info(true))));
+    adapter
+        .send(answered(
+            &q,
+            mp::room_answer::Result::Info(room_info("war")),
+        ))
+        .await;
+    let (mut b, info) = asked.await.unwrap();
+    let info = info.unwrap();
+    assert_eq!(info["room"], "rooms/war@hub");
+    assert_eq!(info["description"], "war room");
+
+    let asked =
+        tokio::spawn(async move { b.room("history", &serde_json::json!({"room": "war"})).await });
+    let q = room_request(&mut adapter).await;
+    adapter
+        .send(In::RemoteRoomResult(pb::RoomResult {
+            request_id: q.request_id.clone(),
+            unavailable_code: "home_offline".into(),
+            detail: "the host is down".into(),
+            answer: None,
+        }))
+        .await;
+    let err = asked.await.unwrap().unwrap_err();
+    assert!(format!("{err:#}").contains("home_offline"), "{err:#}");
+}
+
+/// The poller reads a followed room through the stream and delivers its
+/// posts to the follower's inbox as the room's, naming the author.
+#[tokio::test]
+async fn the_poller_reads_followed_rooms_through_the_stream() {
+    let rig = Rig::new().await;
+    rig.publish(true);
+    let (mut adapter, _) = rig.connect().await;
+    let mut b = client(&rig, agent(&rig)).await;
+    let follow = b
+        .room("follow", &serde_json::json!({"room": "war", "wake": true}))
+        .await
+        .unwrap();
+    assert_eq!(follow["state"], "pending");
+    let poller = tokio::spawn(super::super::rooms::run(rig.state.clone()));
+    // The first read finds the head.
+    let q = room_request(&mut adapter).await;
+    let Some(mp::room_request::Op::Read(read)) = &q.op else {
+        panic!("expected a read: {q:?}");
+    };
+    assert_eq!(read.mode, mp::RoomReadMode::Latest as i32);
+    assert_eq!(
+        q.requester.clone().unwrap().entity.unwrap().entity_id,
+        "bbs-room-fetcher"
+    );
+    adapter
+        .send(answered(
+            &q,
+            mp::room_answer::Result::Page(mp::RoomPage {
+                head_position: 5,
+                head_cursor: b"c5".to_vec(),
+                ..Default::default()
+            }),
+        ))
+        .await;
+    for _ in 0..100 {
+        let f = b.room("follows", &serde_json::json!({})).await.unwrap();
+        if f["follows"][0]["state"] == "following" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A post makes the next read come at once.
+    let posted = b
+        .room("post", &serde_json::json!({"room": "war", "text": "on it"}))
+        .await
+        .unwrap();
+    assert_eq!(posted["state"], "queued");
+    // The post's read-back may come first: its post is not there yet.
+    let post = loop {
+        match adapter.next().await.unwrap() {
+            Out::RemoteRoomRequest(q) => match &q.op {
+                Some(mp::room_request::Op::Read(r)) if r.mode == mp::RoomReadMode::Refs as i32 => {
+                    let refs = r
+                        .refs
+                        .iter()
+                        .map(|x| mp::RoomRefResult {
+                            r#ref: Some(x.clone()),
+                            status: mp::RoomRefStatus::Absent as i32,
+                            reason: String::new(),
+                        })
+                        .collect();
+                    adapter
+                        .send(answered(
+                            &q,
+                            mp::room_answer::Result::Page(mp::RoomPage {
+                                refs,
+                                ..Default::default()
+                            }),
+                        ))
+                        .await;
+                }
+                _ => break q,
+            },
+            Out::Outgoing(_) | Out::Published(_) => continue,
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    let Some(mp::room_request::Op::Read(read)) = &post.op else {
+        panic!("expected a read: {post:?}");
+    };
+    assert_eq!(read.mode, mp::RoomReadMode::After as i32);
+    assert_eq!(read.cursor, b"c5");
+    let message = mp::Message {
+        id: Some(mp::MessageRef {
+            namespace: "thmtz".into(),
+            message_id: "p1".into(),
+        }),
+        sender: address("thmtz", "thmtz/quiet-pine"),
+        recipient: address("hub", "rooms/war"),
+        authored_at_unix_micros: Utc::now().timestamp_micros(),
+        content_type: "text/plain; charset=utf-8".into(),
+        body: b"who has it?".to_vec(),
+        ..Default::default()
+    };
+    adapter
+        .send(answered(
+            &post,
+            mp::room_answer::Result::Page(mp::RoomPage {
+                records: vec![mp::RoomRecord {
+                    message: Some(mp::EncodedMessage {
+                        format_major: 1,
+                        message_bytes: message.encode_to_vec(),
+                    }),
+                    position: 7,
+                    cursor: b"c7".to_vec(),
+                    accepted_at_unix_micros: Utc::now().timestamp_micros(),
+                }],
+                next_cursor: b"c7".to_vec(),
+                head_position: 7,
+                head_cursor: b"c7".to_vec(),
+                ..Default::default()
+            }),
+        ))
+        .await;
+    let mut got = Vec::new();
+    for _ in 0..100 {
+        got = rig.read();
+        if !got.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    poller.abort();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].body, "who has it?");
+    assert_eq!(
+        got[0].group_copy_sender().unwrap(),
+        "id:thmtz/quiet-pine@thmtz via room rooms/war@hub (reported)"
+    );
+}

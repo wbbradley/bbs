@@ -22,8 +22,13 @@ pub use hub_model::{
 
 use crate::entity::{AddressRef, DEFAULT_NAMESPACE, EntityKind, EntityRef, NATIVE_ADDRESS};
 
-/// The schema this binary serves, and creates new databases at.
-pub const SCHEMA_VERSION: usize = HUB_MODEL_SCHEMA_VERSION;
+/// The schema this binary serves, and creates new databases at: the Hub
+/// model, then [`HUB_MIGRATIONS`].
+pub const SCHEMA_VERSION: usize = HUB_MODEL_SCHEMA_VERSION + HUB_MIGRATIONS.len();
+
+/// Migrations after the Hub model (schema 27), applied on open, in order:
+/// the first takes schema 28.
+const HUB_MIGRATIONS: &[&str] = &[include_str!("../migrations/0028_rooms.sql")];
 
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
@@ -162,7 +167,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     // A database `migrate` will refuse stays exactly as it is, without WAL
     // files, so its owner can still back it up and migrate it.
     let version = schema_version(&conn)?;
-    if version == 0 || version == SCHEMA_VERSION {
+    if version == 0 || (HUB_MODEL_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&version) {
         enable_wal(&conn)?;
     }
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -249,6 +254,9 @@ pub fn migrate_in(conn: &mut Connection, namespace: Option<&str>) -> Result<()> 
         create(conn, namespace.unwrap_or(DEFAULT_NAMESPACE))?;
     }
     check_supported(conn, schema_version(conn)?)?;
+    if schema_version(conn)? < SCHEMA_VERSION {
+        apply_hub_migrations(conn)?;
+    }
     let has_namespace: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'bbs_installation')",
         [],
@@ -336,14 +344,14 @@ fn check_supported(conn: &Connection, version: usize) -> Result<()> {
     );
     if version == HUB_MODEL_SOURCE_VERSION {
         bail!(
-            "{path} is at BBS schema v{version}, before the Hub model (v{SCHEMA_VERSION}); \
+            "{path} is at BBS schema v{version}, before the Hub model (v{HUB_MODEL_SCHEMA_VERSION}); \
              this release does not migrate it automatically. {steps}"
         );
     }
     if version < HUB_MODEL_SOURCE_VERSION {
         bail!(
             "{path} is at BBS schema v{version}, too old to migrate to the Hub model \
-             (v{SCHEMA_VERSION}) directly; open it once with bbs 0.24 to reach schema \
+             (v{HUB_MODEL_SCHEMA_VERSION}) directly; open it once with bbs 0.24 to reach schema \
              v{HUB_MODEL_SOURCE_VERSION}. Then: {steps}"
         );
     }
@@ -363,6 +371,29 @@ fn create(conn: &mut Connection, namespace: &str) -> Result<()> {
         tracing::info!(namespace, "created database");
         Ok(true)
     })
+}
+
+/// Apply [`HUB_MIGRATIONS`] past the database's schema, under the write lock,
+/// re-checking the version there: concurrent openers apply each once.
+fn apply_hub_migrations(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = schema_version(&tx)?;
+    if current < HUB_MODEL_SCHEMA_VERSION {
+        bail!("BBS schema v{current} is before the Hub model");
+    }
+    for (i, sql) in HUB_MIGRATIONS
+        .iter()
+        .enumerate()
+        .skip(current - HUB_MODEL_SCHEMA_VERSION)
+    {
+        let version = HUB_MODEL_SCHEMA_VERSION + i + 1;
+        tx.execute_batch(sql)
+            .with_context(|| format!("applying migration {version}"))?;
+        tx.pragma_update(None, "user_version", version as i64)?;
+        tracing::info!(version, "applied migration");
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Bring a database before the Hub model up to schema 26, as bbs 0.24 did on

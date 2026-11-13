@@ -26,6 +26,7 @@ mod blockers;
 pub use blockers::{answer_blocker, cancel_blocker, get_blocker, list_blockers, put_blocker};
 mod drain;
 pub mod integration;
+pub mod rooms;
 pub use drain::{
     NOTICE as DRAIN_NOTICE, agent_drain, agent_drain_with_changes, check_agent_drains,
     report_drain, report_drain_with_changes,
@@ -60,8 +61,17 @@ fn with_ctx<T>(
     caller: &Caller,
     f: impl FnOnce(&Ctx) -> Result<T>,
 ) -> Result<T> {
+    with_ctx_at(conn, caller, Utc::now(), f)
+}
+
+/// [`with_ctx`] at `now`: room work runs on its home's clock.
+fn with_ctx_at<T>(
+    conn: &mut Connection,
+    caller: &Caller,
+    now: DateTime<Utc>,
+    f: impl FnOnce(&Ctx) -> Result<T>,
+) -> Result<T> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let now = Utc::now();
     let ctx = Ctx {
         conn: &tx,
         now,
@@ -210,6 +220,9 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
         original_from: m.original_from,
         group_notice: m.group_notice.then_some(true),
         in_reply_to: m.in_reply_to,
+        room: None,
+        room_tagged_by: None,
+        room_unverified: None,
     }
 }
 
@@ -2155,8 +2168,22 @@ pub fn read(
     caller: &Caller,
     req: proto::ReadRequest,
 ) -> Result<proto::ReadResponse> {
+    read_mail(conn, caller, req, false)
+}
+
+/// [`read`], for a reader that is `waiting` for mail: pending room posts of
+/// quiet follows come only with other mail, so they never wake it (D7).
+pub fn read_mail(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::ReadRequest,
+    waiting: bool,
+) -> Result<proto::ReadResponse> {
     with_ctx(conn, caller, |ctx| {
         let me = ctx.actor()?;
+        if !req.archived {
+            rooms::flush_for_reader(ctx.conn, &me, waiting)?;
+        }
         let msgs = if req.archived {
             let since = req
                 .since
@@ -2171,10 +2198,11 @@ pub fn read(
             }
             msgs
         };
-        let messages = msgs
+        let mut messages: Vec<proto::Message> = msgs
             .into_iter()
             .map(|m| message(m, Some(&me.name)))
             .collect();
+        rooms::annotate(ctx.conn, &mut messages)?;
         Ok(proto::ReadResponse { messages })
     })
 }

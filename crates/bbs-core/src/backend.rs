@@ -50,6 +50,8 @@ pub const AGENT_GOAL: &str = "agent-goal.v1";
 pub const TIMERS_EDIT: &str = "timers-edit.v1";
 /// Listing and looking up another namespace's entities through Hub.
 pub const REMOTE_DIRECTORY: &str = "remote-directory.v1";
+/// `bbs room` verbs, through the server's Hub integration.
+pub const ROOMS: &str = "rooms.v1";
 const AGENT_TOKEN_ROTATE: &str = "agent-token-rotate.v1";
 /// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
 /// stays below this (tonic's 4 MiB default would reject a large window).
@@ -842,6 +844,30 @@ impl Backend {
             ),
             Backend::Remote(r) => rpc!(r, remote_directory, req, &[REMOTE_DIRECTORY])
                 .map_err(|e| missing_rpc(e, REMOTE_DIRECTORY)),
+        }
+    }
+
+    /// Run `bbs room VERB` with JSON `args` on the server, which reaches
+    /// room hosts through its Hub integration; returns the JSON result.
+    pub async fn room(
+        &mut self,
+        verb: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        match self {
+            Backend::Local(_) => bail!(
+                "rooms need a BBS server with a Hub integration; a local board has none \
+                 (configure one with `bbs init --server`)"
+            ),
+            Backend::Remote(r) => {
+                let req = proto::RoomCommand {
+                    verb: verb.to_string(),
+                    args_json: args.to_string(),
+                };
+                let out = rpc!(r, room, req, &[ROOMS]).map_err(|e| missing_rpc(e, ROOMS))?;
+                serde_json::from_str(&out.result_json)
+                    .context("the server's room result is not JSON")
+            }
         }
     }
 

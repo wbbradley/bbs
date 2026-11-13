@@ -167,6 +167,24 @@ service Bbs {
   // too many queries waiting, UNAVAILABLE otherwise; the message starts with
   // Hub's reason code.
   rpc RemoteDirectory(RemoteDirectoryRequest) returns (RemoteDirectoryResponse);
+
+  // Rooms (rooms.v1, DESIGN.md "Rooms"): one verb-dispatch RPC for every
+  // `bbs room` verb (list, info, create, describe, policy, grant, revoke,
+  // archive, unarchive, follow, unfollow, follows, post, reply, status,
+  // history, search, show), as the caller. Arguments and result are JSON
+  // documents, so the CLI, MCP tools and scripts share one shape. Room
+  // requests go to the room's host through the integration that reaches it;
+  // a failure starts with the host's or the relay's reason code
+  // (FAILED_PRECONDITION), a malformed request is INVALID_ARGUMENT.
+  rpc Room(RoomCommand) returns (RoomCommandResult);
+}
+
+message RoomCommand {
+  string verb = 1;
+  string args_json = 2;  // a JSON object; see `bbs room --help`
+}
+message RoomCommandResult {
+  string result_json = 1;
 }
 
 message RemoteDirectoryRequest {
@@ -807,6 +825,15 @@ message Message {
   // installation has it and the reader can see it, else its origin as
   // `NAMESPACE:MESSAGE_ID`.
   optional string in_reply_to = 18;
+  // A room post or notice delivered by a follow or a tag (rooms.v1): the
+  // room as `rooms/NAME@HOST`. from_name is the room and original_from the
+  // author as the host reported it (`reported`), so clients show
+  // `AUTHOR via room ROOM (reported)`. On a tag message that could not be
+  // read back from the room, room_unverified is set instead.
+  optional string room = 19;
+  // The agent whose tag was merged into this delivered post.
+  optional string room_tagged_by = 20;
+  optional bool room_unverified = 21;
 }
 
 message WaitRequest { optional uint32 limit = 1; }
