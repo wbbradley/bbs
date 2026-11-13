@@ -2876,10 +2876,10 @@ async fn the_poller_reads_followed_rooms_through_the_stream() {
     assert_eq!(read.cursor, b"c5");
     let message = mp::Message {
         id: Some(mp::MessageRef {
-            namespace: "thmtz".into(),
+            namespace: "lab".into(),
             message_id: "p1".into(),
         }),
-        sender: address("thmtz", "thmtz/quiet-pine"),
+        sender: address("lab", "lab/quiet-pine"),
         recipient: address("hub", "rooms/war"),
         authored_at_unix_micros: Utc::now().timestamp_micros(),
         content_type: "text/plain; charset=utf-8".into(),
@@ -2919,6 +2919,6 @@ async fn the_poller_reads_followed_rooms_through_the_stream() {
     assert_eq!(got[0].body, "who has it?");
     assert_eq!(
         got[0].group_copy_sender().unwrap(),
-        "id:thmtz/quiet-pine@thmtz via room rooms/war@hub (reported)"
+        "id:lab/quiet-pine@lab via room rooms/war@hub (reported)"
     );
 }

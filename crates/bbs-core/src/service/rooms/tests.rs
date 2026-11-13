@@ -664,11 +664,11 @@ async fn managers_update_with_the_current_revision() {
         .run(
             &rig.scout,
             "policy",
-            json!({"room": "ops", "post": ["ns:bbs", "ns:thmtz"]}),
+            json!({"room": "ops", "post": ["ns:bbs", "ns:lab"]}),
         )
         .await
         .unwrap();
-    assert_eq!(v["post"], json!(["ns:bbs", "ns:thmtz"]));
+    assert_eq!(v["post"], json!(["ns:bbs", "ns:lab"]));
     assert_eq!(v["revision"], 2);
     let v = rig
         .run(
@@ -686,7 +686,7 @@ async fn managers_update_with_the_current_revision() {
         .run(
             &rig.scout,
             "revoke",
-            json!({"room": "ops", "post": ["ns:thmtz"]}),
+            json!({"room": "ops", "post": ["ns:lab"]}),
         )
         .await
         .unwrap();
@@ -727,7 +727,7 @@ async fn a_follow_starts_at_the_head_and_imports_each_page_once() {
     rig.host().create("feed", scout_entity());
     let at = rig.now();
     rig.host()
-        .post("rooms/feed", "carl@hub", "before the follow", at);
+        .post("rooms/feed", "oncall@hub", "before the follow", at);
     let v = rig
         .run(&rig.ranger, "follow", json!({"room": "feed"}))
         .await
@@ -748,9 +748,9 @@ async fn a_follow_starts_at_the_head_and_imports_each_page_once() {
         )
         .unwrap();
     let at = rig.now();
-    let p1 = rig.host().post("rooms/feed", "carl@hub", "one", at);
+    let p1 = rig.host().post("rooms/feed", "oncall@hub", "one", at);
     rig.host()
-        .post("rooms/feed", "thmtz/quiet-pine@thmtz", "two", at);
+        .post("rooms/feed", "lab/quiet-pine@lab", "two", at);
     rig.advance(61);
     rig.poll().await;
     // The same page again (as after a crash before the cursor moved)
@@ -781,11 +781,11 @@ async fn a_follow_starts_at_the_head_and_imports_each_page_once() {
     assert_eq!(msgs[0].reported, Some(true));
     assert_eq!(
         msgs[0].group_copy_sender().unwrap(),
-        "id:carl@hub via room rooms/feed@hub (reported)"
+        "id:oncall@hub via room rooms/feed@hub (reported)"
     );
     assert_eq!(
         msgs[1].group_copy_sender().unwrap(),
-        "id:thmtz/quiet-pine@thmtz via room rooms/feed@hub (reported)"
+        "id:lab/quiet-pine@lab via room rooms/feed@hub (reported)"
     );
     // A private reply goes to the author, answering the post.
     let v = rig
@@ -796,7 +796,7 @@ async fn a_follow_starts_at_the_head_and_imports_each_page_once() {
         )
         .await
         .unwrap();
-    assert_eq!(v["to"], "carl@hub");
+    assert_eq!(v["to"], "oncall@hub");
     assert_eq!(v["in_reply_to"], ref_display(&p1));
     assert!(rig.read(&rig.ranger).is_empty());
 }
@@ -813,7 +813,7 @@ async fn quiet_follows_wait_for_a_prompt_and_wake_follows_coalesce() {
         .unwrap();
     rig.poll().await;
     let at = rig.now();
-    rig.host().post("rooms/a", "carl@hub", "first", at);
+    rig.host().post("rooms/a", "oncall@hub", "first", at);
     rig.advance(16);
     rig.poll().await;
     // Quiet: nothing wakes a waiting reader; an explicit read shows it.
@@ -823,7 +823,7 @@ async fn quiet_follows_wait_for_a_prompt_and_wake_follows_coalesce() {
     assert_eq!(rig.read_waiting(&rig.scout).len(), 1);
     // A second post within the minute waits for the next wake.
     let at = rig.now();
-    rig.host().post("rooms/a", "carl@hub", "second", at);
+    rig.host().post("rooms/a", "oncall@hub", "second", at);
     rig.advance(16);
     rig.poll().await;
     assert!(rig.read_waiting(&rig.scout).is_empty());
@@ -899,7 +899,7 @@ async fn backfill_delivers_from_the_oldest_up_to_the_switch() {
     let at = rig.now();
     for i in 0..7 {
         rig.host()
-            .post("rooms/b", "carl@hub", &format!("old {i}"), at);
+            .post("rooms/b", "oncall@hub", &format!("old {i}"), at);
     }
     rig.run(
         &rig.ranger,
@@ -910,7 +910,7 @@ async fn backfill_delivers_from_the_oldest_up_to_the_switch() {
     .unwrap();
     rig.poll().await; // starts at the head, with a backfill to it
     let at = rig.now();
-    rig.host().post("rooms/b", "carl@hub", "new", at);
+    rig.host().post("rooms/b", "oncall@hub", "new", at);
     rig.settle().await;
     let bodies: Vec<String> = rig.read(&rig.ranger).into_iter().map(|m| m.body).collect();
     assert_eq!(bodies.len(), 8, "{bodies:?}");
@@ -929,8 +929,8 @@ async fn restore_recovery_delivers_what_was_missed_once() {
         .unwrap();
     rig.poll().await;
     let at = rig.now();
-    rig.host().post("rooms/r", "carl@hub", "kept", at);
-    rig.host().post("rooms/r", "carl@hub", "lost", at);
+    rig.host().post("rooms/r", "oncall@hub", "kept", at);
+    rig.host().post("rooms/r", "oncall@hub", "lost", at);
     rig.advance(61);
     rig.poll().await;
     assert_eq!(rig.read(&rig.ranger).len(), 2);
@@ -938,16 +938,16 @@ async fn restore_recovery_delivers_what_was_missed_once() {
     rig.host().restore(1);
     let at = rig.now();
     rig.host()
-        .post("rooms/r", "carl@hub", "after restore 1", at);
+        .post("rooms/r", "oncall@hub", "after restore 1", at);
     rig.host()
-        .post("rooms/r", "carl@hub", "after restore 2", at);
+        .post("rooms/r", "oncall@hub", "after restore 2", at);
     rig.advance(61);
     rig.poll().await; // cursor_invalid, then recovery
     let bodies: Vec<String> = rig.read(&rig.ranger).into_iter().map(|m| m.body).collect();
     assert_eq!(bodies, ["after restore 1", "after restore 2"]);
     // The next fetch reads after the noted head in the new epoch.
     let at = rig.now();
-    rig.host().post("rooms/r", "carl@hub", "later", at);
+    rig.host().post("rooms/r", "oncall@hub", "later", at);
     rig.advance(61);
     rig.poll().await;
     let bodies: Vec<String> = rig.read(&rig.ranger).into_iter().map(|m| m.body).collect();
@@ -973,7 +973,7 @@ async fn at_a_prompt_an_agent_gets_the_newest_fifty_per_room() {
     let at = rig.now();
     for i in 0..60 {
         rig.host()
-            .post("rooms/busy", "carl@hub", &format!("p{i}"), at);
+            .post("rooms/busy", "oncall@hub", &format!("p{i}"), at);
     }
     rig.advance(61);
     rig.poll().await;
@@ -1132,10 +1132,10 @@ async fn a_tag_that_cannot_be_read_back_is_an_unverified_claim() {
     let at = rig.now();
     let m = mp::Message {
         id: Some(mp::MessageRef {
-            namespace: "thmtz".into(),
+            namespace: "lab".into(),
             message_id: "tag1".into(),
         }),
-        sender: Some(addr("thmtz", "thmtz/quiet-pine")),
+        sender: Some(addr("lab", "lab/quiet-pine")),
         recipient: Some(addr("bbs", "will/ranger")),
         authored_at_unix_micros: at,
         expires_at_unix_micros: Some(at + 3_600_000_000),
@@ -1148,7 +1148,7 @@ async fn a_tag_that_cannot_be_read_back_is_an_unverified_claim() {
                 entity_id: "rooms/t".into(),
             }),
             post: Some(mp::MessageRef {
-                namespace: "thmtz".into(),
+                namespace: "lab".into(),
                 message_id: "never".into(),
             }),
         }),
@@ -1204,9 +1204,11 @@ async fn search_show_and_threads_read_the_room() {
     let rig = Rig::new();
     rig.host().create("s", scout_entity());
     let at = rig.now();
-    let root = rig.host().post("rooms/s", "carl@hub", "gpu-07 is down", at);
+    let root = rig
+        .host()
+        .post("rooms/s", "oncall@hub", "gpu-07 is down", at);
     let reply = |host: &mut Host, parent: &mp::MessageRef, body: &str| {
-        let (ns, path) = ("thmtz", "thmtz/quiet-pine");
+        let (ns, path) = ("lab", "lab/quiet-pine");
         let id = mp::MessageRef {
             namespace: ns.into(),
             message_id: db::new_message_id(),
@@ -1235,7 +1237,7 @@ async fn search_show_and_threads_read_the_room() {
         .run(
             &rig.scout,
             "search",
-            json!({"room": "s", "author": "thmtz/quiet-pine@thmtz"}),
+            json!({"room": "s", "author": "lab/quiet-pine@lab"}),
         )
         .await
         .unwrap();

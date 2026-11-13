@@ -540,13 +540,13 @@ mod tests {
         let out = text(
             "history",
             &json!({"room": "rooms/war@hub", "records": [
-                {"accepted_at": "t", "author": "carl@hub", "ref": "hub:1", "body": "mine",
+                {"accepted_at": "t", "author": "oncall@hub", "ref": "hub:1", "body": "mine",
                  "notice": false}
             ], "next_cursor": "abc"}),
         );
         assert_eq!(
             out,
-            "[t] carl@hub (reported) hub:1: mine\n(older: --before abc)\n"
+            "[t] oncall@hub (reported) hub:1: mine\n(older: --before abc)\n"
         );
     }
 }

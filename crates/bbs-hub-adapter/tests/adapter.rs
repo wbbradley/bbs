@@ -2713,7 +2713,7 @@ async fn room_requests_for_this_home_are_unsupported() {
             mp::RecordKind::RoomRequest,
             mp::RoomRequest {
                 request_id: "h1".into(),
-                requester: requester("hub", "carl"),
+                requester: requester("hub", "oncall"),
                 namespace: namespace.into(),
                 deadline_unix_micros: now_micros() + 5_000_000,
                 op: Some(mp::room_request::Op::List(mp::RoomList::default())),
