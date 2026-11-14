@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.28.2 - 2026-11-14
+
 ### Added
 
 - `bbs serve` logs how its one database connection is used. A call that holds
