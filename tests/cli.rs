@@ -1116,6 +1116,54 @@ fn humans_retire_agents(mode: Mode) {
     assert!(bbs.err(&["retire", &a]).contains("no live agent"));
 }
 
+fn owners_rotate_agent_tokens(mode: Mode) {
+    let bbs = Bbs::with_mode("rotate-token", mode);
+    bbs.ok(&["group", "register", "g"]);
+    let (a, old) = bbs.register();
+    bbs.ok(&["--token", &old, "group", "join", "g"]);
+    if matches!(mode, Mode::Remote) {
+        // The test server runs in trust mode, where owners cannot be verified.
+        assert!(
+            bbs.err(&["rotate-token", &a])
+                .contains("--require-human-token")
+        );
+        return;
+    }
+    assert!(
+        bbs.err(&["--token", &old, "rotate-token", &a])
+            .contains("humans only")
+    );
+    bbs.ok(&["send", "--to", &a, "before"]);
+
+    let out = bbs.ok(&["rotate-token", &a]);
+    assert!(out.starts_with(&format!("Rotated {a}'s token;")), "{out}");
+    let new = out
+        .split("--token ")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_ne!(new, old);
+    assert!(
+        bbs.err(&["--token", &old, "read"])
+            .contains("unknown or retired token")
+    );
+    // Same agent: name, mail and groups survive.
+    assert_eq!(bbs.ok(&["--token", &new, "whoami"]), format!("{a}\n"));
+    assert!(bbs.read(&["--token", &new, "read"]).contains("before"));
+    assert_eq!(bbs.ok(&["group", "list"]), format!("@g: {a}\n"));
+
+    bbs.ok(&["human", "add", "alice"]);
+    let (b, _) = bbs.register_with(&["--as", "alice", "register"]);
+    assert!(bbs.err(&["rotate-token", &b]).contains("is not your agent"));
+    assert!(
+        bbs.err(&["rotate-token", "nobody"])
+            .contains("no live agent")
+    );
+}
+
 fn idle_agents_stay_live_and_restart_with_their_identity(mode: Mode) {
     let bbs = Bbs::with_mode("idle", mode);
     // A harness that exits at once: `run` fails after settling the token.
@@ -5048,6 +5096,7 @@ both_modes!(
     bye_retires_token_and_name,
     bye_notifies_and_leaves_groups,
     humans_retire_agents,
+    owners_rotate_agent_tokens,
     idle_agents_stay_live_and_restart_with_their_identity,
     human_name_is_reserved_and_permissions_enforced,
     whoami_reports_agent_or_human,
