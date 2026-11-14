@@ -187,7 +187,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bbs-cli"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "anyhow",
  "bbs-core",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-core"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-hub-adapter"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "anyhow",
  "bbs-core",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-server"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "anyhow",
  "axum",
