@@ -1,6 +1,9 @@
 //! How long calls wait for and hold the server's one database connection.
 //! A call that holds it long is logged at once; every minute the labels that
 //! held it longest in total are logged, so a frequent cheap call shows too.
+//! The summary is logged by the first call after the minute, so a quiet
+//! server logs nothing. The integration stream's authentication uses its own
+//! read-only connection and is not recorded here.
 
 use std::collections::HashMap;
 use std::panic::Location;
@@ -29,11 +32,31 @@ impl std::fmt::Display for Label {
     }
 }
 
-/// Recorded when dropped, so a call that fails or panics is counted too.
+/// One call's use of the connection, recorded when dropped so a call that
+/// fails or panics is counted too. Declare it before the connection guard:
+/// the guard then drops first, and the logging here never holds the
+/// connection.
 pub(super) struct Record {
-    pub(super) label: Label,
-    pub(super) waited: Duration,
-    pub(super) held: Instant,
+    label: Label,
+    queued: Instant,
+    locked: Option<Instant>,
+}
+
+impl Record {
+    /// Start timing a call queued at `queued`. Its wait covers getting a
+    /// blocking thread as well as the connection.
+    pub(super) fn new(label: Label, queued: Instant) -> Self {
+        Record {
+            label,
+            queued,
+            locked: None,
+        }
+    }
+
+    /// The call now holds the connection.
+    pub(super) fn locked(&mut self) {
+        self.locked = Some(Instant::now());
+    }
 }
 
 #[derive(Default)]
@@ -52,13 +75,17 @@ static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
 
 impl Drop for Record {
     fn drop(&mut self) {
-        let held = self.held.elapsed();
+        let Some(locked) = self.locked else {
+            return;
+        };
+        let held = locked.elapsed();
+        let waited = locked - self.queued;
         let label = self.label.to_string();
         if held >= SLOW_HOLD {
             tracing::warn!(
                 call = %label,
                 held_ms = held.as_millis() as u64,
-                waited_ms = self.waited.as_millis() as u64,
+                waited_ms = waited.as_millis() as u64,
                 "slow database call"
             );
         }
@@ -70,7 +97,7 @@ impl Drop for Record {
         let totals = window.by_label.entry(label).or_default();
         totals.calls += 1;
         totals.held += held;
-        totals.waited += self.waited;
+        totals.waited += waited;
         let elapsed = window.started.elapsed();
         if elapsed >= SUMMARY_EVERY {
             summarize(elapsed, std::mem::take(&mut window.by_label));

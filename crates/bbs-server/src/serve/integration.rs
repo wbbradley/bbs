@@ -331,16 +331,13 @@ where
 {
     let label = call_log::Label::At(std::panic::Location::caller());
     let state = state.clone();
-    let queued = std::time::Instant::now();
     async move {
+        let record = call_log::Record::new(label, std::time::Instant::now());
         tokio::task::spawn_blocking(move || {
+            // Before the guard, so the guard drops first.
+            let mut record = record;
             let mut conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
-            let held = std::time::Instant::now();
-            let _record = call_log::Record {
-                label,
-                waited: held - queued,
-                held,
-            };
+            record.locked();
             if *state.shutdown.borrow() {
                 return Err(Status::unavailable("server is shutting down"));
             }
@@ -367,16 +364,14 @@ fn record(state: &Arc<State>, claims: Vec<i64>, sent: bool) {
         return;
     };
     let state = state.clone();
-    let label = call_log::Label::At(std::panic::Location::caller());
-    let queued = std::time::Instant::now();
+    let record = call_log::Record::new(
+        call_log::Label::At(std::panic::Location::caller()),
+        std::time::Instant::now(),
+    );
     runtime.spawn_blocking(move || {
+        let mut record = record;
         let conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        let held = std::time::Instant::now();
-        let record = call_log::Record {
-            label,
-            waited: held - queued,
-            held,
-        };
+        record.locked();
         let result = if sent {
             claims
                 .iter()
@@ -384,8 +379,8 @@ fn record(state: &Arc<State>, claims: Vec<i64>, sent: bool) {
         } else {
             integration::requeue(&conn, &claims)
         };
-        drop(record);
         drop(conn);
+        drop(record);
         match result {
             // Requeued work is pending again: wake the next stream.
             Ok(()) if !sent => state.changed(),

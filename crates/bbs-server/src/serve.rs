@@ -483,15 +483,12 @@ impl State {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
         let state = self;
-        let queued = std::time::Instant::now();
+        let record = call_log::Record::new(label, std::time::Instant::now());
         tokio::task::spawn_blocking(move || {
+            // Before the guard, so the guard drops first.
+            let mut record = record;
             let mut conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
-            let held = std::time::Instant::now();
-            let _record = call_log::Record {
-                label,
-                waited: held - queued,
-                held,
-            };
+            record.locked();
             if *state.shutdown.borrow() {
                 return Err(Status::unavailable("server is shutting down"));
             }
