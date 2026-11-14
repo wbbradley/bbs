@@ -13,6 +13,7 @@
 //! two outcomes exclusive: see [`Outbound`].
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -25,7 +26,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{BoxStream, Policy, State};
+use super::{BoxStream, Policy, State, call_log};
 use crate::service::integration::{self, Catalog, InvalidFrame, TOKEN_METADATA, Unsupported};
 use bbs_core::hub_proto::integration as pb;
 use bbs_core::hub_proto::msgproto_v1 as mp;
@@ -322,28 +323,37 @@ fn status(err: anyhow::Error) -> Status {
 
 /// Run `f` on the shared connection off the runtime, as `State::call` does,
 /// with [`status`]'s errors.
-async fn call<T, F>(state: &Arc<State>, f: F) -> Result<T, Status>
+#[track_caller]
+fn call<T, F>(state: &Arc<State>, f: F) -> impl Future<Output = Result<T, Status>> + Send + 'static
 where
     T: Send + 'static,
     F: FnOnce(&mut Connection) -> anyhow::Result<T> + Send + 'static,
 {
+    let label = call_log::Label::At(std::panic::Location::caller());
     let state = state.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        if *state.shutdown.borrow() {
-            return Err(Status::unavailable("server is shutting down"));
-        }
-        f(&mut conn).map_err(status)
-    })
-    .await
-    .map_err(|err| {
-        tracing::error!("integration call failed: {err}");
-        Status::internal("internal error")
-    })?
+    async move {
+        let record = call_log::Record::new(label, std::time::Instant::now());
+        tokio::task::spawn_blocking(move || {
+            // Before the guard, so the guard drops first.
+            let mut record = record;
+            let mut conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
+            record.locked();
+            if *state.shutdown.borrow() {
+                return Err(Status::unavailable("server is shutting down"));
+            }
+            f(&mut conn).map_err(status)
+        })
+        .await
+        .map_err(|err| {
+            tracing::error!("integration call failed: {err}");
+            Status::internal("internal error")
+        })?
+    }
 }
 
 /// Record outbox rows in the background, as sent or back to pending: the
 /// stream cannot wait for them.
+#[track_caller]
 fn record(state: &Arc<State>, claims: Vec<i64>, sent: bool) {
     if claims.is_empty() {
         return;
@@ -354,8 +364,14 @@ fn record(state: &Arc<State>, claims: Vec<i64>, sent: bool) {
         return;
     };
     let state = state.clone();
+    let record = call_log::Record::new(
+        call_log::Label::At(std::panic::Location::caller()),
+        std::time::Instant::now(),
+    );
     runtime.spawn_blocking(move || {
+        let mut record = record;
         let conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        record.locked();
         let result = if sent {
             claims
                 .iter()
@@ -364,6 +380,7 @@ fn record(state: &Arc<State>, claims: Vec<i64>, sent: bool) {
             integration::requeue(&conn, &claims)
         };
         drop(conn);
+        drop(record);
         match result {
             // Requeued work is pending again: wake the next stream.
             Ok(()) if !sent => state.changed(),
