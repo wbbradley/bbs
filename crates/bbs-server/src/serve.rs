@@ -3,6 +3,7 @@
 //! credential administration is observed separately on calls and stream checks.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
@@ -24,6 +25,7 @@ use crate::proto::{self, Kind};
 use crate::protocol::Policy;
 use crate::service::{self, Caller, TimerLimits, Watched};
 
+mod call_log;
 mod integration;
 mod web;
 
@@ -457,15 +459,39 @@ impl State {
             .await;
     }
 
-    /// Run `f` on the connection off the async runtime.
-    async fn call<T, F>(self: &Arc<Self>, f: F) -> Result<T, Status>
+    /// Run `f` on the connection off the async runtime, labelled in the call
+    /// log by where it was called from.
+    #[track_caller]
+    fn call<T, F>(
+        self: &Arc<Self>,
+        f: F,
+    ) -> impl Future<Output = Result<T, Status>> + Send + 'static
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
-        let state = self.clone();
+        let at = std::panic::Location::caller();
+        self.clone().call_as(call_log::Label::At(at), f)
+    }
+
+    /// Run `f` on the connection off the async runtime. Every call takes the
+    /// one connection in turn, so the call log records how long each waited
+    /// for it and held it.
+    async fn call_as<T, F>(self: Arc<Self>, label: call_log::Label, f: F) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        let state = self;
+        let queued = std::time::Instant::now();
         tokio::task::spawn_blocking(move || {
             let mut conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
+            let held = std::time::Instant::now();
+            let _record = call_log::Record {
+                label,
+                waited: held - queued,
+                held,
+            };
             if *state.shutdown.borrow() {
                 return Err(Status::unavailable("server is shutting down"));
             }
@@ -646,7 +672,14 @@ impl Server {
             }
             let req = req.into_inner();
             let c = caller.clone();
-            let out = match self.0.call(move |conn| f(conn, &c, req)).await {
+            let out = match self
+                .0
+                .clone()
+                .call_as(call_log::Label::Rpc(rpc.to_string()), move |conn| {
+                    f(conn, &c, req)
+                })
+                .await
+            {
                 Ok(out) => out,
                 Err(status) => {
                     self.0.record_auth_failure(peer, &status);
@@ -683,7 +716,13 @@ impl Server {
             let state = self.0.clone();
             let c = caller.clone();
             let r = req.clone();
-            let first = match state.call(move |conn| R::fetch(conn, &c, r)).await {
+            let first = match state
+                .clone()
+                .call_as(call_log::Label::Rpc(rpc.to_string()), move |conn| {
+                    R::fetch(conn, &c, r)
+                })
+                .await
+            {
                 Ok(first) => first,
                 Err(status) => {
                     state.record_auth_failure(peer, &status);
@@ -729,7 +768,13 @@ impl Server {
                         }
                         changes.taken();
                         let (c, r) = (caller.clone(), req.clone());
-                        snapshot = state.call(move |conn| R::fetch(conn, &c, r)).await;
+                        snapshot = state
+                            .clone()
+                            .call_as(
+                                call_log::Label::Rpc(format!("{rpc} recheck")),
+                                move |conn| R::fetch(conn, &c, r),
+                            )
+                            .await;
                     }
                 };
                 tokio::select! {
