@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.28.4 - 2026-11-15
+
 ### Changed
 
 - The web UI's goal strip shows how long a waiting agent has left, for
