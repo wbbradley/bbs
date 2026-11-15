@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Control, GoalStatus, type GoalReport } from "../types";
-import { extendedDeadline, goalControls, goalProgress, goalStatus, pickerValue } from "./Goal";
+import { extendedDeadline, goalControls, goalProgress, goalStatus, pickerValue, waitLeft } from "./Goal";
 
 const goal = (over: Partial<GoalReport> = {}): GoalReport => ({
   objective: "Ship it",
@@ -31,6 +31,27 @@ describe("goal progress and deadlines", () => {
     expect(extendedDeadline(goal({ deadline: "2026-11-10T18:00:00Z" }), now)).toBe("2026-11-11T18:00:00Z");
     expect(extendedDeadline(goal({ deadline: "2026-11-01T00:00:00Z" }), now)).toBe("2026-11-10T12:00:00Z");
     expect(extendedDeadline(goal(), now)).toBe("2026-11-10T12:00:00Z");
+  });
+});
+
+describe("a waiting goal", () => {
+  const now = Date.parse("2026-11-10T12:00:00Z");
+  const waiting = (wake_at: string | null) => goal({ status: GoalStatus.Waiting, wake_at });
+
+  it("says how much longer it waits, rounded up to the minute", () => {
+    expect(waitLeft(waiting("2026-11-10T12:11:30Z"), now)).toMatch(/^12m left, until /);
+    expect(waitLeft(waiting("2026-11-10T14:05:00Z"), now)).toMatch(/^2h5m left, until /);
+    expect(waitLeft(waiting("2026-11-10T12:00:01Z"), now)).toMatch(/^1m left, until /);
+  });
+
+  it("says it is waking once the time has come", () => {
+    expect(waitLeft(waiting("2026-11-10T12:00:00Z"), now)).toBe("waking");
+    expect(waitLeft(waiting("2026-11-10T11:00:00Z"), now)).toBe("waking");
+  });
+
+  it("says nothing without a wake time, or when not waiting", () => {
+    expect(waitLeft(waiting(null), now)).toBeNull();
+    expect(waitLeft(goal({ status: GoalStatus.Active, wake_at: "2026-11-10T13:00:00Z" }), now)).toBeNull();
   });
 });
 

@@ -8,6 +8,12 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- The web UI's goal strip shows how long a waiting agent has left, for
+  example `goal · waiting · 12m left, until 3:40 PM`, ahead of the objective,
+  so a long objective no longer hides it.
+
 ## 0.28.3 - 2026-11-15
 
 ### Changed

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { rpc } from "../api";
-import { clock, fullTime } from "../util";
+import { clock, fullTime, span } from "../util";
 import { Control, GoalStatus, type GoalReport } from "../types";
 import { Dialog } from "./Dialog";
 
@@ -30,6 +30,18 @@ export function extendedDeadline(goal: GoalReport, now = Date.now()): string {
 
 /** The objective's limit, as the server checks it. */
 const MAX_OBJECTIVE = 4096;
+
+/**
+ * How much longer a waiting goal waits, to the minute and rounded up:
+ * "12m left, until 3:40 PM", or "waking" once the time has come. Null when
+ * the goal is not waiting on a time.
+ */
+export function waitLeft(goal: GoalReport, now = Date.now()): string | null {
+  if (goal.status !== GoalStatus.Waiting || !goal.wake_at) return null;
+  const secs = (Date.parse(goal.wake_at) - now) / 1000;
+  if (!(secs > 0)) return "waking";
+  return `${span(Math.ceil(secs / 60) * 60, 60)} left, until ${clock(goal.wake_at)}`;
+}
 
 export function goalStatus(goal: GoalReport): string {
   return NAMES[goal.status] ?? "unknown";
@@ -228,7 +240,9 @@ export function GoalStrip({
 }) {
   const [busy, setBusy] = useState(false);
   const status = goalStatus(goal);
-  const why = detail(goal);
+  // The wait goes up front: a long objective clips whatever follows it.
+  const left = waitLeft(goal);
+  const why = left ? goal.reason : detail(goal);
   const act = async (kind: number, body: string, done: string) => {
     setBusy(true);
     try {
@@ -246,7 +260,10 @@ export function GoalStrip({
   return (
     <div className={`attention goal goal-${status}`} title={`Set by ${goal.set_by}, ${fullTime(goal.set_at)}`}>
       <span className="goal-text">
-        <span className="goal-status">goal · {status}</span>{" "}
+        <span className="goal-status">
+          goal · {status}
+          {left && <> · {left}</>}
+        </span>{" "}
         <span className="muted">
           {goalProgress(goal)}
           {goal.deadline && <> · due {clock(goal.deadline)}</>}
