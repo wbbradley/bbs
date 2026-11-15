@@ -715,7 +715,11 @@ fn watch_detail<R: Watched>(conn: &Connection, caller: &Caller, req: &R) -> Stri
         ))
         .unwrap_or_else(|| "unknown human".into())
     } else {
-        caller.human.clone().unwrap_or_else(|| "anonymous".into())
+        // Without a token the name is the client's own claim.
+        caller
+            .human
+            .as_ref()
+            .map_or_else(|| "anonymous".into(), |name| format!("claimed {name}"))
     };
     match req.shape() {
         shape if shape.is_empty() => format!("by {who}"),
@@ -742,13 +746,14 @@ impl Server {
             let state = self.0.clone();
             let c = caller.clone();
             let r = req.clone();
-            let first = match state
+            let (detail, first) = match state
                 .clone()
                 .call_as(
                     call_log::Label::Rpc(rpc.to_string()),
                     move |conn, record| {
-                        record.detail(watch_detail(conn, &c, &r));
-                        R::fetch(conn, &c, r)
+                        let detail = watch_detail(conn, &c, &r);
+                        record.detail(detail.clone());
+                        R::fetch(conn, &c, r).map(|first| (detail, first))
                     },
                 )
                 .await
@@ -797,13 +802,13 @@ impl Server {
                             }
                         }
                         changes.taken();
-                        let (c, r) = (caller.clone(), req.clone());
+                        let (c, r, d) = (caller.clone(), req.clone(), detail.clone());
                         snapshot = state
                             .clone()
                             .call_as(
                                 call_log::Label::Rpc(format!("{rpc} recheck")),
                                 move |conn, record| {
-                                    record.detail(watch_detail(conn, &c, &r));
+                                    record.detail(d);
                                     R::fetch(conn, &c, r)
                                 },
                             )
