@@ -15,7 +15,9 @@ const SLOW_HOLD: Duration = Duration::from_millis(250);
 /// How often the busiest labels are logged.
 const SUMMARY_EVERY: Duration = Duration::from_secs(60);
 /// How many labels a summary names.
-const SUMMARY_TOP: usize = 8;
+const SUMMARY_TOP: usize = 12;
+/// The most distinct labels a window keeps.
+const MAX_LABELS: usize = 512;
 
 /// What a call is: an RPC by name, or the code location of any other call.
 pub(super) enum Label {
@@ -38,6 +40,8 @@ impl std::fmt::Display for Label {
 /// connection.
 pub(super) struct Record {
     label: Label,
+    /// Who called and with what, when the call says so.
+    detail: Option<String>,
     queued: Instant,
     locked: Option<Instant>,
 }
@@ -48,6 +52,7 @@ impl Record {
     pub(super) fn new(label: Label, queued: Instant) -> Self {
         Record {
             label,
+            detail: None,
             queued,
             locked: None,
         }
@@ -56,6 +61,11 @@ impl Record {
     /// The call now holds the connection.
     pub(super) fn locked(&mut self) {
         self.locked = Some(Instant::now());
+    }
+
+    /// Name who called and with what, so the log can tell callers apart.
+    pub(super) fn detail(&mut self, detail: String) {
+        self.detail = Some(detail);
     }
 }
 
@@ -80,7 +90,10 @@ impl Drop for Record {
         };
         let held = locked.elapsed();
         let waited = locked - self.queued;
-        let label = self.label.to_string();
+        let label = match &self.detail {
+            Some(detail) => format!("{} {detail}", self.label),
+            None => self.label.to_string(),
+        };
         if held >= SLOW_HOLD {
             tracing::warn!(
                 call = %label,
@@ -94,6 +107,14 @@ impl Drop for Record {
             started: Instant::now(),
             by_label: HashMap::new(),
         });
+        // Callers named in labels are many, so past the cap the rest of the
+        // window is counted together.
+        let label = if window.by_label.len() >= MAX_LABELS && !window.by_label.contains_key(&label)
+        {
+            "other".to_string()
+        } else {
+            label
+        };
         let totals = window.by_label.entry(label).or_default();
         totals.calls += 1;
         totals.held += held;

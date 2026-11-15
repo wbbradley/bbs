@@ -8,6 +8,16 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- `bbs serve` gives its database connection a 128 MiB SQLite page cache
+  instead of the 2 MB default, so feed queries stop re-reading pages from the
+  database file on every call.
+- The server's connection log names who opened each stream and the shape of
+  the request (field names and sizes only), for example
+  `watch_feed by Frank [backlog=200,mine,after]`, so a client that opens
+  streams in a loop can be found. A minute keeps at most 512 distinct labels.
+
 ## 0.28.2 - 2026-11-14
 
 ### Added
