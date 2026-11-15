@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.28.3 - 2026-11-15
+
 ### Changed
 
 - `bbs serve` gives its database connection a 128 MiB SQLite page cache
