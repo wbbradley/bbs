@@ -29,6 +29,9 @@ mod call_log;
 mod integration;
 mod web;
 
+/// SQLite's page cache for the server's connection, in KiB: enough to keep the
+/// hot tables in memory, within the container's memory limit.
+const SERVER_CACHE_KIB: i64 = 128 * 1024;
 /// Keepalive pings let a vanished client free its waiter slot within ~30s.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,6 +63,9 @@ pub async fn run(
 ) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut conn = db::open(&dir.join("bbs.db"))?;
+    // Every call shares this connection; with SQLite's 2 MB default each feed
+    // query re-reads its pages from the file through system calls.
+    conn.pragma_update(None, "cache_size", -SERVER_CACHE_KIB)?;
     db::migrate_in(&mut conn, namespace)?;
     serve(
         conn,
@@ -471,7 +477,8 @@ impl State {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
         let at = std::panic::Location::caller();
-        self.clone().call_as(call_log::Label::At(at), f)
+        self.clone()
+            .call_as(call_log::Label::At(at), move |conn, _| f(conn))
     }
 
     /// Run `f` on the connection off the async runtime. Every call takes the
@@ -480,7 +487,7 @@ impl State {
     async fn call_as<T, F>(self: Arc<Self>, label: call_log::Label, f: F) -> Result<T, Status>
     where
         T: Send + 'static,
-        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        F: FnOnce(&mut Connection, &mut call_log::Record) -> Result<T> + Send + 'static,
     {
         let state = self;
         let record = call_log::Record::new(label, std::time::Instant::now());
@@ -492,7 +499,7 @@ impl State {
             if *state.shutdown.borrow() {
                 return Err(Status::unavailable("server is shutting down"));
             }
-            f(&mut conn).map_err(|err| {
+            f(&mut conn, &mut record).map_err(|err| {
                 if err
                     .downcast_ref::<crate::auth::AuthenticationError>()
                     .is_some()
@@ -672,7 +679,7 @@ impl Server {
             let out = match self
                 .0
                 .clone()
-                .call_as(call_log::Label::Rpc(rpc.to_string()), move |conn| {
+                .call_as(call_log::Label::Rpc(rpc.to_string()), move |conn, _| {
                     f(conn, &c, req)
                 })
                 .await
@@ -691,6 +698,28 @@ impl Server {
         }
         .await;
         self.0.protocol.finish(result)
+    }
+}
+
+/// Who opened a stream and with what, for the call log: a human or agent by
+/// name (never a token) and the request's shape.
+fn watch_detail<R: Watched>(conn: &Connection, caller: &Caller, req: &R) -> String {
+    let name = |found: Result<Option<db::Principal>>| found.ok().flatten().map(|p| p.name);
+    let who = if let Some(token) = &caller.token {
+        name(db::agent_by_token(conn, &token.trim().to_ascii_lowercase()))
+            .unwrap_or_else(|| "unknown agent".into())
+    } else if let Some(token) = &caller.human_token {
+        name(db::human_by_token_hash(
+            conn,
+            &crate::auth::token_hash(token),
+        ))
+        .unwrap_or_else(|| "unknown human".into())
+    } else {
+        caller.human.clone().unwrap_or_else(|| "anonymous".into())
+    };
+    match req.shape() {
+        shape if shape.is_empty() => format!("by {who}"),
+        shape => format!("by {who} [{shape}]"),
     }
 }
 
@@ -715,9 +744,13 @@ impl Server {
             let r = req.clone();
             let first = match state
                 .clone()
-                .call_as(call_log::Label::Rpc(rpc.to_string()), move |conn| {
-                    R::fetch(conn, &c, r)
-                })
+                .call_as(
+                    call_log::Label::Rpc(rpc.to_string()),
+                    move |conn, record| {
+                        record.detail(watch_detail(conn, &c, &r));
+                        R::fetch(conn, &c, r)
+                    },
+                )
                 .await
             {
                 Ok(first) => first,
@@ -769,7 +802,10 @@ impl Server {
                             .clone()
                             .call_as(
                                 call_log::Label::Rpc(format!("{rpc} recheck")),
-                                move |conn| R::fetch(conn, &c, r),
+                                move |conn, record| {
+                                    record.detail(watch_detail(conn, &c, &r));
+                                    R::fetch(conn, &c, r)
+                                },
                             )
                             .await;
                     }

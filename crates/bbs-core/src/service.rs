@@ -2678,12 +2678,37 @@ pub trait Watched: Clone + Send + Sync + 'static {
     fn advance(&mut self, sent: &Self::Snapshot) -> bool;
     fn has_cursor(&self) -> bool;
     fn is_empty(snapshot: &Self::Snapshot) -> bool;
+    /// The request's shape for the server's call log: field names and sizes
+    /// only, never names, text or ids.
+    fn shape(&self) -> String {
+        String::new()
+    }
 }
 
 impl Watched for proto::FeedRequest {
     type Snapshot = proto::FeedSnapshot;
     fn fetch(conn: &mut Connection, caller: &Caller, req: Self) -> Result<Self::Snapshot> {
         feed(conn, caller, req)
+    }
+    fn shape(&self) -> String {
+        let mut parts = vec![format!("backlog={}", self.backlog)];
+        for (set, name) in [
+            (self.mine, "mine"),
+            (self.sync, "sync"),
+            (self.after_id.is_some(), "after"),
+            (self.with.is_some(), "with"),
+            (self.include_group_deliveries, "groups"),
+            (self.group.is_some(), "group"),
+            (self.from.is_some(), "from"),
+            (self.from_human.is_some(), "from_human"),
+            (self.since.is_some(), "since"),
+            (self.until.is_some(), "until"),
+        ] {
+            if set {
+                parts.push(name.into());
+            }
+        }
+        parts.join(",")
     }
     fn advance(&mut self, sent: &Self::Snapshot) -> bool {
         advance_feed_cursor(self, sent)
@@ -3291,6 +3316,20 @@ pub fn session_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_feed_request_shape_names_fields_never_values() {
+        let req = proto::FeedRequest {
+            backlog: 500,
+            mine: true,
+            sync: true,
+            after_id: Some(41),
+            with: Some("Frank".into()),
+            ..Default::default()
+        };
+        assert_eq!(req.shape(), "backlog=500,mine,sync,after,with");
+        assert_eq!(proto::FeedRequest::default().shape(), "backlog=0");
+    }
 
     /// A board with the human will, agents Mateo and Zed in @crew, and Lu in
     /// no group; the callers for each.
