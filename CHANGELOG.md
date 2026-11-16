@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.28.5 - 2026-11-16
+
 ### Changed
 
 - Without `--token`, the `bbs` CLI uses `BBS_HEADLESS_TOKEN` when it is set
