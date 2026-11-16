@@ -826,7 +826,10 @@ cannot copy the token into its
 file is changed. The harness and its descendants can read these credentials,
 and a `bbs` command they run without `--token` acts as the agent: the CLI
 falls back to `BBS_HEADLESS_TOKEN`, so `bbs whoami --address` prints the
-agent's address.
+agent's address. Commands only a human may run, such as `bbs group grant` or
+answering a blocker, are refused there; run them as yourself, outside the agent.
+`bbs headless run` drops an inherited `BBS_HEADLESS_TOKEN` before starting its
+harness, so an agent started from another agent's shell never acts as it.
 Other ACP harnesses keep the default `mcp_env = "server"`; process mode is
 an explicit opt-in and requires the harness to preserve the MCP child's
 environment. It is not accepted for `codex-app-server`. Config files containing

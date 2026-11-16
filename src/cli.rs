@@ -33,7 +33,7 @@ impl Cli {
         if self.token.is_none() {
             self.token = std::env::var(crate::headless::TOKEN_ENV)
                 .ok()
-                .filter(|t| !t.trim().is_empty());
+                .filter(|t| !t.is_empty());
         }
         self
     }

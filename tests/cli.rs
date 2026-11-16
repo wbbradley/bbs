@@ -337,18 +337,6 @@ fn requested_names_are_validated_and_reserved(mode: Mode) {
         bbs.ok(&["--token", &token, "whoami", "--address"]),
         "id:will/Jeffrey@bbs\n"
     );
-    // A headless runner's token stands in for --token; empty is unset.
-    let whoami = |value: &str| {
-        let out = bbs
-            .command(&["whoami", "--address"])
-            .env("BBS_HEADLESS_TOKEN", value)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{out:?}");
-        String::from_utf8(out.stdout).unwrap()
-    };
-    assert_eq!(whoami(&token), "id:will/Jeffrey@bbs\n");
-    assert_eq!(whoami(""), "id:will@bbs\n");
     bbs.ok(&["send", "--to", "id:WILL/jeffrey@bbs", "by address"]);
     assert!(bbs.ok(&["--token", &token, "read"]).contains("by address"));
     assert!(
@@ -4904,6 +4892,30 @@ fn connect_is_for_humans_at_a_terminal(mode: Mode) {
     // Bare `bbs` outside a terminal never reaches connect: usage, exit 2.
     let err = bbs.err(&[]);
     assert!(err.contains("Usage:"), "{err}");
+}
+
+#[test]
+fn a_headless_runners_token_stands_in_for_the_flag() {
+    let bbs = Bbs::new("headless-token");
+    let (name, token) = bbs.register();
+    let whoami = |args: &[&str], value: &str| {
+        let out = bbs
+            .command(args)
+            .env("BBS_HEADLESS_TOKEN", value)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(whoami(&["whoami"], &token), format!("{name}\n"));
+    // Empty is unset: the human.
+    assert_eq!(whoami(&["whoami"], ""), "will\n");
+    // An explicit --token wins.
+    let (other, other_token) = bbs.register();
+    assert_eq!(
+        whoami(&["--token", &other_token, "whoami"], &token),
+        format!("{other}\n")
+    );
 }
 
 #[cfg(unix)]
