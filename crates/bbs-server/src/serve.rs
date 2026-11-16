@@ -2141,6 +2141,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_waiter_gets_mail_at_once_without_the_backstop() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::migrate(&mut conn).unwrap();
+        let will = Caller {
+            human: Some("will".into()),
+            ..Default::default()
+        };
+        service::ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: "will".into(),
+            },
+        )
+        .unwrap();
+        let mut agent = |name: &str| Caller {
+            token: Some(
+                service::register(
+                    &mut conn,
+                    &will,
+                    proto::RegisterRequest {
+                        name: Some(name.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .token,
+            ),
+            ..Default::default()
+        };
+        let (ana, bo) = (agent("Ana"), agent("Bo"));
+        let me = service::whoami(&mut conn, &ana).unwrap();
+        let address =
+            db::native_address_row(&conn, bbs_core::entity::EntityKind::Agent, me.id).unwrap();
+        let state = Arc::new(State {
+            conn: Mutex::new(conn),
+            notify: watch::Sender::new(0),
+            activity: watch::Sender::new(0),
+            waiters: Mutex::new(HashSet::new()),
+            mail: Default::default(),
+            shutdown: watch::Sender::new(false),
+            require_human_token: false,
+            protocol: Policy::default(),
+            auth_failures: Mutex::new(HashMap::new()),
+            timer_limits: TimerLimits::default(),
+            clock: Arc::new(Utc::now),
+            integrations: Default::default(),
+        });
+        let slot = Slot::claim(&state, &me, address).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let waiter = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _slot = slot;
+                state.wait(Arc::new(ana), me, None, &tx).await
+            })
+        };
+        let bo = Arc::new(bo);
+        let call = |f: fn(&mut Connection, &Caller) -> Result<()>| {
+            let bo = bo.clone();
+            state.call(move |conn| f(conn, &bo))
+        };
+        // A write that delivers nothing to Ana leaves her waiting.
+        call(|conn, bo| {
+            let text = "busy".to_string();
+            service::set_status(conn, bo, proto::SetStatusRequest { text })?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let quiet = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(quiet.is_err(), "nothing was sent to Ana");
+        // Mail to her arrives long before the minute's backstop re-check.
+        call(|conn, bo| {
+            let to = "Ana".to_string();
+            let body = "hello".to_string();
+            service::send(
+                conn,
+                bo,
+                proto::SendRequest {
+                    to,
+                    body,
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("woken by the delivery")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.body, "hello");
+        waiter.await.unwrap().unwrap();
+        assert!(state.waiters.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn protocol_rejection_precedes_auth_budget_identity_lookup() {
         let mut conn = Connection::open_in_memory().unwrap();
         db::migrate(&mut conn).unwrap();
