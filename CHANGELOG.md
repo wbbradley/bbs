@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Fixed
+
+- `bbs init --server` after the human's token was rotated asks for the new
+  token in a terminal instead of failing with "invalid or revoked human
+  token". Without a terminal it says to pass the new one with
+  `--human-token-stdin`.
+
 ## 0.28.5 - 2026-11-16
 
 ### Changed

@@ -1859,6 +1859,53 @@ async fn enrollment_validates_before_saving_and_binds_credentials_to_server() {
 }
 
 #[tokio::test]
+async fn re_enrolling_after_a_rotation_asks_for_the_new_token() {
+    use std::io::Write;
+    let server = Server::start_mode("auth-reenroll", true);
+    let token = server.admin("add", "Ada");
+    let home = tempfile::tempdir().unwrap();
+    let init = |stdin: Option<&str>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_bbs"));
+        cmd.args(["init", "--server", &server.addr])
+            .env("HOME", home.path())
+            .env_remove("BBS_SERVER")
+            .env_remove("BBS_HEADLESS_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if stdin.is_some() {
+            cmd.arg("--human-token-stdin");
+        }
+        let mut child = cmd.spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        if let Some(token) = stdin {
+            writeln!(input, "{token}").unwrap();
+        }
+        drop(input);
+        child.wait_with_output().unwrap()
+    };
+    assert!(init(Some(&token)).status.success());
+    let rotated = server.admin("rotate", "Ada");
+    // The saved token is revoked. Without a terminal to prompt on, init says
+    // so and how to pass the new one, rather than only that it was refused.
+    let refused = init(None);
+    assert!(!refused.status.success());
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        err.contains("the saved human token was rejected") && err.contains("--human-token-stdin"),
+        "{err}"
+    );
+    let ok = init(Some(&rotated));
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let saved = std::fs::read_to_string(home.path().join(".config/bbs/config.toml")).unwrap();
+    assert!(saved.contains(&rotated) && !saved.contains(&token));
+}
+
+#[tokio::test]
 async fn rotation_is_owner_only_and_unbinds_sessions() {
     let server = Server::start_mode("protected-rotation", true);
     let mut client = server.client().await;

@@ -19,6 +19,7 @@ mod side;
 mod state;
 
 pub(crate) use mcp::TOKEN_ENV;
+pub(crate) use run::rejected_credential;
 
 use std::path::Path;
 

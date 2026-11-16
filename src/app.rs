@@ -550,6 +550,8 @@ async fn init(
     if let Some(addr) = config.server.clone() {
         let mut backend = Backend::Remote(Remote::connect(&addr, Caller::default()).await?);
         let info = backend.server_info().await?;
+        // A token saved by an earlier init, rather than one given now.
+        let saved = config.human_token.is_some() && !human_token_stdin;
         if human_token_stdin {
             let mut token = String::new();
             std::io::stdin().take(4097).read_to_string(&mut token)?;
@@ -557,23 +559,32 @@ async fn init(
             config.human_token = Some(token.trim().to_string());
         }
         if info.require_human_token && config.human_token.is_none() {
-            anyhow::ensure!(
-                std::io::stdin().is_terminal(),
-                "human token required; pass --human-token-stdin or run in a terminal"
-            );
-            config.human_token = Some(
-                rpassword::prompt_password("Human token: ")?
-                    .trim()
-                    .to_string(),
-            );
+            config.human_token = Some(prompt_human_token(
+                "human token required; pass --human-token-stdin or run in a terminal",
+            )?);
         }
-        let name = if let Some(token) = &config.human_token {
-            backend.set_caller(Caller {
-                human_token: Some(token.clone()),
+        let name = if let Some(token) = config.human_token.clone() {
+            let as_token = |token: String| Caller {
+                human_token: Some(token),
                 human: human.clone().or_else(|| as_human.map(str::to_string)),
                 ..Default::default()
-            });
-            backend.whoami().await?.name
+            };
+            backend.set_caller(as_token(token));
+            match backend.whoami().await {
+                Ok(me) => me.name,
+                // The saved token was rotated or revoked: ask for the new one.
+                Err(err) if saved && crate::headless::rejected_credential(&err) => {
+                    let token = prompt_human_token(
+                        "the saved human token was rejected; pass the new one with \
+                         --human-token-stdin or run in a terminal",
+                    )?;
+                    backend.set_caller(as_token(token.clone()));
+                    let name = backend.whoami().await?.name;
+                    config.human_token = Some(token);
+                    name
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             let name = human
                 .clone()
@@ -604,6 +615,14 @@ async fn init(
         println!("BBS initialized at {}\nHuman: {name}", dir.display());
     }
     Ok(())
+}
+
+/// A human token typed at a hidden prompt; `refusal` when there is no terminal.
+fn prompt_human_token(refusal: &str) -> Result<String> {
+    anyhow::ensure!(std::io::stdin().is_terminal(), "{refusal}");
+    Ok(rpassword::prompt_password("Human token: ")?
+        .trim()
+        .to_string())
 }
 
 /// One JSON object per line. Every field is always present; absent values are

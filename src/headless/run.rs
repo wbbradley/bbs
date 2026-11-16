@@ -1263,7 +1263,7 @@ impl Signals {
 }
 
 /// Whether `err` is the backend rejecting a credential, as opposed to failing.
-fn rejected_credential(err: &anyhow::Error) -> bool {
+pub(crate) fn rejected_credential(err: &anyhow::Error) -> bool {
     err.downcast_ref::<crate::auth::AuthenticationError>()
         .is_some()
         || err
