@@ -575,3 +575,46 @@ describe("blockers and goals", () => {
     expect(screen.queryByText("Not blocking a goal.")).toBeNull();
   });
 });
+
+describe("blockers revision", () => {
+  it("lists when the summary stream's revision changes, and polls only as a backstop", async () => {
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    await page([row(1)]);
+    let listings = 0;
+    api.auto.set("list_blockers", () => {
+      listings += 1;
+      return { blockers: listed, active_count: listed.length, has_more: false };
+    });
+    const summary = async (blockers_revision: number) => {
+      act(() => api.stream("summary").push({ agents: [], notes_revision: 0, blockers_revision }));
+      await act(async () => {});
+    };
+    await summary(5);
+    expect(listings).toBe(1);
+    await summary(5);
+    expect(listings).toBe(1);
+    // The 3 s poll stays quiet while the stream reports changes.
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(listings).toBe(1);
+    await summary(6);
+    expect(listings).toBe(2);
+    // A listing still runs once a minute, for changes the revision misses.
+    await act(async () => vi.advanceTimersByTimeAsync(61_000));
+    expect(listings).toBe(3);
+  });
+
+  it("keeps polling every 3 s for a server without the revision", async () => {
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    await page([row(1)]);
+    let listings = 0;
+    api.auto.set("list_blockers", () => {
+      listings += 1;
+      return { blockers: listed, active_count: listed.length, has_more: false };
+    });
+    act(() => api.stream("summary").push({ agents: [], notes_revision: 0 }));
+    await act(async () => vi.advanceTimersByTimeAsync(9_100));
+    expect(listings).toBe(3);
+  });
+});

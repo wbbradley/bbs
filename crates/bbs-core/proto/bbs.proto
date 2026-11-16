@@ -897,6 +897,10 @@ message AgentSummarySnapshot {
   // The caller's newest agent-note revision (agent-notes.v1), including
   // retired notes; Some(0) with none. Present even with no agent rows.
   optional uint64 notes_revision = 2;
+  // The newest blocker event's id on the board, 0 with none. Every blocker
+  // change (created, answered, cancelled, superseded) adds an event, so a
+  // client lists blockers again only when this grows.
+  optional uint64 blockers_revision = 3;
 }
 
 // One human's private note on one agent, by stable agent id.

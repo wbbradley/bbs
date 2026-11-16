@@ -2770,6 +2770,7 @@ pub fn agent_summary(
         Ok(proto::AgentSummarySnapshot {
             agents,
             notes_revision: Some(db::notes::max_revision(ctx.conn, me.id)? as u64),
+            blockers_revision: Some(db::blockers::revision(ctx.conn)? as u64),
         })
     })
 }

@@ -8,6 +8,12 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- The agent summary stream carries `blockers_revision`, the newest blocker
+  event's id. The web UI lists blockers again when it grows, and otherwise
+  only once a minute, instead of every 3 seconds in every visible tab.
+
 ## 0.28.6 - 2026-11-16
 
 ### Fixed
