@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.28.7 - 2026-11-16
+
 ### Changed
 
 - The agent summary stream carries `blockers_revision`, the newest blocker
