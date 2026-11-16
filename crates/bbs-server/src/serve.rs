@@ -7,7 +7,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -27,6 +27,7 @@ use crate::service::{self, Caller, TimerLimits, Watched};
 
 mod call_log;
 mod integration;
+mod mail;
 mod web;
 
 /// SQLite's page cache for the server's connection, in KiB: enough to keep the
@@ -37,6 +38,9 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A waiting agent is alive; keep it clear of stale-agent retirement.
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// A waiter re-checks its inbox this often even unwoken, so a change the
+/// mail hook can't attribute, such as another process's write, still arrives.
+const WAIT_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// Leave time for process teardown within a ten-second container grace period.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 /// Activity events stored together: at most this many, waiting at most this
@@ -129,6 +133,7 @@ async fn serve(
         notify: watch::Sender::new(0),
         activity: watch::Sender::new(0),
         waiters: Mutex::new(HashSet::new()),
+        mail: Default::default(),
         shutdown: watch::Sender::new(false),
         require_human_token,
         protocol,
@@ -270,6 +275,8 @@ struct State {
     activity: watch::Sender<u64>,
     /// Inboxes with a `WaitForMail` stream open, as (kind, id).
     waiters: Mutex<HashSet<(i32, i64)>>,
+    /// Wakes those waiters when a call may have given them mail.
+    mail: mail::Mail,
     shutdown: watch::Sender<bool>,
     require_human_token: bool,
     protocol: Policy,
@@ -282,6 +289,30 @@ struct State {
 }
 
 type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+
+struct ConnGuard<'a> {
+    conn: MutexGuard<'a, Connection>,
+    mail: &'a mail::Mail,
+}
+
+impl std::ops::Deref for ConnGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for ConnGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+}
+
+impl Drop for ConnGuard<'_> {
+    fn drop(&mut self) {
+        self.mail.after_call(&self.conn);
+    }
+}
 
 /// What a watch stream waits on between snapshots: one change signal, or
 /// two, and optionally a shortest time between fetches, so a busy board
@@ -494,7 +525,7 @@ impl State {
         tokio::task::spawn_blocking(move || {
             // Before the guard, so the guard drops first.
             let mut record = record;
-            let mut conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut conn = state.lock_conn();
             record.locked();
             if *state.shutdown.borrow() {
                 return Err(Status::unavailable("server is shutting down"));
@@ -543,6 +574,17 @@ impl State {
         self.notify.send_modify(|v| *v += 1);
     }
 
+    /// The server's connection, for one call. Releasing it wakes the mail
+    /// waiters the call's changes concern.
+    fn lock_conn(&self) -> ConnGuard<'_> {
+        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        self.mail.attach(&conn);
+        ConnGuard {
+            conn,
+            mail: &self.mail,
+        }
+    }
+
     /// Wait for unread mail, then stream it as `Read` would take it.
     async fn wait(
         self: &Arc<Self>,
@@ -551,12 +593,19 @@ impl State {
         limit: Option<u32>,
         tx: &mpsc::Sender<Result<proto::Message, Status>>,
     ) -> Result<(), Status> {
-        let mut changes = self.notify.subscribe();
+        let key = (me.kind, me.id);
+        let mut mail = self.mail.subscribe();
+        let mut everyone = self.mail.everyone();
         let mut touch =
             tokio::time::interval_at(Instant::now() + WAIT_TOUCH_INTERVAL, WAIT_TOUCH_INTERVAL);
+        let mut recheck = tokio::time::interval_at(
+            Instant::now() + WAIT_RECHECK_INTERVAL,
+            WAIT_RECHECK_INTERVAL,
+        );
         loop {
             // Mark seen before checking, so a commit after the check still wakes us.
-            changes.borrow_and_update();
+            mail.borrow_and_update();
+            self.mail.take(key, &mut everyone);
             if me.kind() == Kind::Agent {
                 let id = me.id;
                 if !self.call(move |c| db::agent_is_live(c, id)).await? {
@@ -579,13 +628,21 @@ impl State {
                 }
                 return Ok(());
             }
-            tokio::select! {
-                _ = changes.changed() => {}
-                _ = touch.tick() => {
-                    let c = caller.clone();
-                    self.call(move |conn| service::whoami(conn, &c)).await?;
+            // Sleep until a call may have given this inbox mail.
+            loop {
+                tokio::select! {
+                    _ = mail.changed() => {
+                        if self.mail.take(key, &mut everyone) {
+                            break;
+                        }
+                    }
+                    _ = recheck.tick() => break,
+                    _ = touch.tick() => {
+                        let c = caller.clone();
+                        self.call(move |conn| service::whoami(conn, &c)).await?;
+                    }
+                    _ = tx.closed() => return Ok(()),
                 }
-                _ = tx.closed() => return Ok(()),
             }
         }
     }
@@ -598,7 +655,7 @@ struct Slot {
 }
 
 impl Slot {
-    fn claim(state: &Arc<State>, me: &proto::Principal) -> Result<Slot, Status> {
+    fn claim(state: &Arc<State>, me: &proto::Principal, address: i64) -> Result<Slot, Status> {
         let key = (me.kind, me.id);
         let mut waiters = state.waiters.lock().unwrap_or_else(PoisonError::into_inner);
         if !waiters.insert(key) {
@@ -608,6 +665,7 @@ impl Slot {
             );
             return Err(Status::failed_precondition(msg));
         }
+        state.mail.register(key, address);
         Ok(Slot {
             state: state.clone(),
             key,
@@ -623,6 +681,7 @@ impl Drop for Slot {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         waiters.remove(&self.key);
+        self.state.mail.unregister(self.key);
     }
 }
 
@@ -1187,9 +1246,21 @@ impl Bbs for Server {
             let limit = req.into_inner().limit;
             let c = caller.clone();
             let claim = async {
-                let me = self.0.call(move |conn| service::whoami(conn, &c)).await?;
+                let (me, address) = self
+                    .0
+                    .call(move |conn| {
+                        let me = service::whoami(conn, &c)?;
+                        let kind = if me.kind() == Kind::Agent {
+                            bbs_core::entity::EntityKind::Agent
+                        } else {
+                            bbs_core::entity::EntityKind::Human
+                        };
+                        let address = db::native_address_row(conn, kind, me.id)?;
+                        Ok((me, address))
+                    })
+                    .await?;
                 // Claim before returning, so a second waiter fails immediately.
-                let slot = Slot::claim(&self.0, &me)?;
+                let slot = Slot::claim(&self.0, &me, address)?;
                 Ok::<_, Status>((me, slot))
             };
             let (me, slot) = match claim.await {
@@ -1657,6 +1728,7 @@ mod tests {
                 notify: watch::Sender::new(0),
                 activity: watch::Sender::new(0),
                 waiters: Mutex::new(HashSet::new()),
+                mail: Default::default(),
                 shutdown: watch::Sender::new(false),
                 require_human_token: false,
                 protocol: Policy::default(),
@@ -1879,6 +1951,7 @@ mod tests {
                 notify: watch::Sender::new(0),
                 activity: watch::Sender::new(0),
                 waiters: Mutex::new(HashSet::new()),
+                mail: Default::default(),
                 shutdown: watch::Sender::new(false),
                 require_human_token: false,
                 protocol: withheld
@@ -2087,6 +2160,7 @@ mod tests {
             notify: watch::Sender::new(0),
             activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
+            mail: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),
@@ -2190,6 +2264,7 @@ mod tests {
                 notify: watch::Sender::new(0),
                 activity: watch::Sender::new(0),
                 waiters: Mutex::new(HashSet::new()),
+                mail: Default::default(),
                 shutdown: watch::Sender::new(false),
                 require_human_token: false,
                 protocol: if withheld {
@@ -2330,6 +2405,7 @@ mod tests {
                 notify: watch::Sender::new(0),
                 activity: watch::Sender::new(0),
                 waiters: Mutex::new(HashSet::new()),
+                mail: Default::default(),
                 shutdown: watch::Sender::new(false),
                 require_human_token: false,
                 protocol: if withheld {
@@ -2417,6 +2493,7 @@ mod tests {
             notify: watch::Sender::new(0),
             activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
+            mail: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),
@@ -2447,6 +2524,7 @@ mod tests {
             notify: watch::Sender::new(0),
             activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
+            mail: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),
@@ -2516,6 +2594,7 @@ mod tests {
             notify: watch::Sender::new(0),
             activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
+            mail: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),
@@ -2776,6 +2855,7 @@ mod tests {
             notify: watch::Sender::new(0),
             activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
+            mail: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),
