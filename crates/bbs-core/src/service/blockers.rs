@@ -1329,6 +1329,52 @@ mod tests {
     }
 
     #[test]
+    fn the_summary_revision_grows_on_every_blocker_change_and_only_then() {
+        let mut b = Board::memory();
+        let revision = |b: &mut Board| {
+            service::agent_summary(&mut b.conn, &b.humans[0], proto::AgentSummaryRequest {})
+                .unwrap()
+                .blockers_revision
+                .unwrap()
+        };
+        let mut last = revision(&mut b);
+        assert_eq!(last, 0);
+        let mut grew = |b: &mut Board| {
+            let now = revision(b);
+            let grew = now > last;
+            last = now;
+            grew
+        };
+        let a = b.put(0, "a", None, "a");
+        assert!(grew(&mut b), "created");
+        let a = b.put(1, "updated a", Some(a.id), "a2");
+        assert!(grew(&mut b), "superseded");
+        b.answer(0, a.id, "answer").unwrap();
+        assert!(grew(&mut b), "answered");
+        let c = b.put(0, "c", None, "c");
+        assert!(grew(&mut b), "created again");
+        cancel_blocker(
+            &mut b.conn,
+            &b.agents[0],
+            proto::CancelBlockerRequest {
+                id: c.id,
+                request_key: "cancel".into(),
+            },
+        )
+        .unwrap();
+        assert!(grew(&mut b), "cancelled");
+        service::set_status(
+            &mut b.conn,
+            &b.agents[0],
+            proto::SetStatusRequest {
+                text: "busy".into(),
+            },
+        )
+        .unwrap();
+        assert!(!grew(&mut b), "an unrelated write");
+    }
+
+    #[test]
     fn retired_agent_counts_do_not_inherit_a_reused_names_blockers() {
         let mut b = Board::memory();
         b.put(0, "original agent", None, "old");

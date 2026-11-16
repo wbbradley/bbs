@@ -58,6 +58,8 @@ export function useBoard(): Board {
 }
 
 const BLOCKER_POLL_MS = 3000;
+/** With the summary stream's blockers_revision, a listing is only a backstop. */
+const BLOCKER_BACKSTOP_MS = 60000;
 const BLOCKER_PAGE = 50;
 
 /**
@@ -147,6 +149,9 @@ export function BoardProvider({
   // runs once that one is done, so it sees the write.
   const blockersBusy = useRef(false);
   const blockersAgain = useRef(false);
+  const blockersListedAt = useRef(0);
+  // The summary stream's blockers_revision; null until a server sends one.
+  const blockersRevision = useRef<number | null>(null);
   const refreshBlockers = useCallback(() => {
     if (!live.current || !has("blockers-mine.v1")) return;
     if (blockersBusy.current) {
@@ -155,6 +160,7 @@ export function BoardProvider({
     }
     blockersBusy.current = true;
     blockersAgain.current = false;
+    blockersListedAt.current = Date.now();
     rpc<ListBlockersResponse>("list_blockers", { mine: true, limit: BLOCKER_PAGE })
       .then(async (r) => {
         if (!live.current) return;
@@ -219,7 +225,11 @@ export function BoardProvider({
     if (notesSupported) syncNotes();
   }, [notesSupported, syncNotes]);
 
-  const summary = useWatch<{ agents: AgentSummary[]; notes_revision: number | null }>(
+  const summary = useWatch<{
+    agents: AgentSummary[];
+    notes_revision: number | null;
+    blockers_revision?: number | null;
+  }>(
     "summary",
     {},
     (snap) => {
@@ -234,6 +244,12 @@ export function BoardProvider({
       }
       const revision = snap.notes_revision ?? 0;
       if (has("agent-notes.v1") && revision > notesCursor.current) syncNotes();
+      // A blocker changed: list them now rather than on the next poll.
+      const blockers = snap.blockers_revision ?? null;
+      if (blockers !== null && blockers !== blockersRevision.current) {
+        blockersRevision.current = blockers;
+        refreshBlockers();
+      }
     },
   );
 
@@ -244,7 +260,11 @@ export function BoardProvider({
     const agentsTimer = window.setInterval(refreshAgents, AGENT_POLL_MS);
     const groupsTimer = window.setInterval(refreshGroups, AGENT_POLL_MS);
     const blockersTimer = window.setInterval(() => {
-      if (document.visibilityState === "visible") refreshBlockers();
+      if (document.visibilityState !== "visible") return;
+      // A server that sends blockers_revision only needs the occasional
+      // listing, for changes it does not count, such as group membership.
+      const every = blockersRevision.current === null ? BLOCKER_POLL_MS : BLOCKER_BACKSTOP_MS;
+      if (Date.now() - blockersListedAt.current >= every) refreshBlockers();
     }, BLOCKER_POLL_MS);
     return () => {
       window.clearInterval(agentsTimer);

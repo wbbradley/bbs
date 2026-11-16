@@ -215,6 +215,15 @@ pub fn active_count(
     )? as u64)
 }
 
+/// The newest blocker event's id, 0 with none: it grows on every blocker change.
+pub fn revision(conn: &Connection) -> Result<i64> {
+    Ok(
+        conn.query_row("SELECT coalesce(max(id), 0) FROM blocker_events", [], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
 /// Open blockers in each live agent's current groups, counted once per agent.
 /// One grouped query serves both the agent list and live summaries.
 pub fn agent_counts(conn: &Connection) -> Result<std::collections::HashMap<i64, u64>> {

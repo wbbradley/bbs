@@ -1908,6 +1908,7 @@ mod tests {
                             ..Default::default()
                         }],
                         notes_revision: None,
+                        blockers_revision: None,
                     },
                     n == 0,
                 )
