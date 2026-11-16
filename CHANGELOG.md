@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.28.6 - 2026-11-16
+
 ### Fixed
 
 - A `bbs read --wait` stream wakes only when mail may have reached it: a
