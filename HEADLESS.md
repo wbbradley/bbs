@@ -823,7 +823,10 @@ routing even if the child has a different home or a global remote-server config.
 The MCP session specification contains no environment values, so the SDK
 cannot copy the token into its
 `--mcp-config` command-line argument. No parent environment or configuration
-file is changed. The harness and its descendants can read these credentials.
+file is changed. The harness and its descendants can read these credentials,
+and a `bbs` command they run without `--token` acts as the agent: the CLI
+falls back to `BBS_HEADLESS_TOKEN`, so `bbs whoami --address` prints the
+agent's address.
 Other ACP harnesses keep the default `mcp_env = "server"`; process mode is
 an explicit opt-in and requires the harness to preserve the MCP child's
 environment. It is not accepted for `codex-app-server`. Config files containing

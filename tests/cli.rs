@@ -91,7 +91,8 @@ impl Bbs {
         cmd.args(args)
             .env("HOME", &self.home)
             .env("USER", "will")
-            .env_remove("BBS_SERVER");
+            .env_remove("BBS_SERVER")
+            .env_remove("BBS_HEADLESS_TOKEN");
         if let Some(server) = &self.server {
             cmd.env("BBS_SERVER", &server.addr);
         }
@@ -336,6 +337,18 @@ fn requested_names_are_validated_and_reserved(mode: Mode) {
         bbs.ok(&["--token", &token, "whoami", "--address"]),
         "id:will/Jeffrey@bbs\n"
     );
+    // A headless runner's token stands in for --token; empty is unset.
+    let whoami = |value: &str| {
+        let out = bbs
+            .command(&["whoami", "--address"])
+            .env("BBS_HEADLESS_TOKEN", value)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(whoami(&token), "id:will/Jeffrey@bbs\n");
+    assert_eq!(whoami(""), "id:will@bbs\n");
     bbs.ok(&["send", "--to", "id:WILL/jeffrey@bbs", "by address"]);
     assert!(bbs.ok(&["--token", &token, "read"]).contains("by address"));
     assert!(
@@ -4907,6 +4920,7 @@ fn connect_stops_reading_before_returning_the_terminal_to_the_shell() {
         .env("USER", "will")
         .env("TERM", "xterm-256color")
         .env_remove("BBS_SERVER")
+        .env_remove("BBS_HEADLESS_TOKEN")
         .output()
         .unwrap();
     assert!(

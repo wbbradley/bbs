@@ -46,7 +46,7 @@ fn init_logging() {
 #[tokio::main]
 async fn main() -> ExitCode {
     release::init(bbs_core::identity!());
-    let cli = cli::Cli::parse();
+    let cli = cli::Cli::parse().with_headless_token();
     if let Some(cli::Command::Serve { args }) = &cli.command {
         return serve::exec(args);
     }

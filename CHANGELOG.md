@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- Without `--token`, the `bbs` CLI uses `BBS_HEADLESS_TOKEN` when it is set
+  and not empty. A headless runner sets it for its agent (with
+  `mcp_env = "process"`), so the agent's own `bbs` commands, such as
+  `bbs whoami --address`, act as the agent instead of its owner.
+
 ## 0.28.4 - 2026-11-15
 
 ### Changed

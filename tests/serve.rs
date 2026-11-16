@@ -1851,6 +1851,7 @@ async fn enrollment_validates_before_saving_and_binds_credentials_to_server() {
         .arg("whoami")
         .env("HOME", home.path())
         .env("BBS_SERVER", &other.addr)
+        .env_remove("BBS_HEADLESS_TOKEN")
         .output()
         .unwrap();
     assert!(!overridden.status.success());
