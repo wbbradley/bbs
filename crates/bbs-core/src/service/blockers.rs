@@ -441,9 +441,10 @@ pub fn answer_blocker(
                 super::insert_control(ctx, &actor, to, &deadline, "goal-deadline")?;
             }
         }
+        // The agent has the blocker; cite it rather than repeat its body.
         let body = format!(
-            "Blocker #{} in @{}:\n{}\n\nAnswer:\n{}",
-            row.id, row.group, row.body, answer.text
+            "Blocker #{} in @{} was answered by {}.\n\nAnswer:\n{}",
+            row.id, row.group, actor.name, answer.text
         );
         super::validate_body(&body)?;
         let message_id = db::insert_message(
@@ -504,17 +505,10 @@ pub fn cancel_blocker(
         if db::agent_is_live(ctx.conn, row.creator.id)?
             && super::tell_agent(ctx, &actor, row.creator.id)?
         {
-            let head = format!(
+            let body = format!(
                 "Blocker #{} in @{} was cancelled by {}.",
                 row.id, row.group, actor.name
             );
-            let quoted = format!("{head}\n\n{}", row.body);
-            // A blocker from before the current limits may be too long to quote.
-            let body = if super::validate_body(&quoted).is_ok() {
-                quoted
-            } else {
-                head
-            };
             let id = db::insert_message(
                 ctx.conn,
                 &actor,
@@ -1787,14 +1781,9 @@ mod tests {
         assert_eq!(
             cancel_notices(&b, b.ids[0]),
             vec![
-                format!(
-                    "Blocker #{} in @crew was cancelled by Zed.\n\nWhich branch?",
-                    a.id
-                ),
-                format!(
-                    "Blocker #{} in @crew was cancelled by ada.\n\nShip it?",
-                    c.id
-                ),
+                // The blocker is cited by ID, not quoted.
+                format!("Blocker #{} in @crew was cancelled by Zed.", a.id),
+                format!("Blocker #{} in @crew was cancelled by ada.", c.id),
             ]
         );
         let sender: String = b
@@ -2491,9 +2480,12 @@ mod tests {
         assert_eq!(outcome.selected, ["a", "c"]);
         let text = "Selected: Use a [a]\nSelected: Use c [c]\n\nStart with c.";
         assert_eq!(outcome.answer.as_deref(), Some(text));
+        let body = mail(&b, answered.message_id.unwrap());
         assert!(
-            mail(&b, answered.message_id.unwrap())
-                .ends_with(&format!("Which plan?\n\nAnswer:\n{text}"))
+            body.starts_with(&format!("Blocker #{} in @crew was answered by ", many.id))
+                && body.ends_with(&format!(".\n\nAnswer:\n{text}"))
+                && !body.contains("Which plan?"),
+            "{body}"
         );
         // The same selection in another order replays without new mail.
         let again = select(&mut b, many.id, &["a", "c"], "Start with c.", "pick").unwrap();
