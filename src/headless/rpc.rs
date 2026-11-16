@@ -137,10 +137,7 @@ impl Rpc {
         stderr.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         // Its own process group: a terminal's Ctrl-C reaches bbs only, and stop
         // can signal the agent's commands along with the harness.
-        let mut child = Command::new(&command[0])
-            .args(&command[1..])
-            .envs(env)
-            .current_dir(cwd)
+        let mut child = harness_command(command, env, cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -282,4 +279,49 @@ async fn read_loop(
         }));
     }
     handler(&rpc, Incoming::Exited);
+}
+
+/// The harness's command. A token inherited from an agent that started this
+/// runner is dropped, so the harness's `bbs` commands never act as that agent; process
+/// mode passes this agent's own token in `env`.
+fn harness_command(
+    command: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    cwd: &Path,
+) -> Command {
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..])
+        .env_remove(super::TOKEN_ENV)
+        .envs(env)
+        .current_dir(cwd);
+    cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn token(env: &[(&str, &str)]) -> Option<Option<String>> {
+        let env = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let cmd = harness_command(&["harness".into()], &env, Path::new("/"));
+        cmd.as_std()
+            .get_envs()
+            .find(|(k, _)| *k == OsStr::new(super::super::TOKEN_ENV))
+            .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn a_harness_never_inherits_another_agents_token() {
+        // Removed, so a token in the runner's own environment is not passed on.
+        assert_eq!(token(&[]), Some(None));
+        // Process mode sets this agent's own.
+        assert_eq!(
+            token(&[(super::super::TOKEN_ENV, "own")]),
+            Some(Some("own".into()))
+        );
+    }
 }

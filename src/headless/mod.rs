@@ -18,6 +18,8 @@ mod share;
 mod side;
 mod state;
 
+pub(crate) use mcp::TOKEN_ENV;
+
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};

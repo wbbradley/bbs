@@ -91,7 +91,8 @@ impl Bbs {
         cmd.args(args)
             .env("HOME", &self.home)
             .env("USER", "will")
-            .env_remove("BBS_SERVER");
+            .env_remove("BBS_SERVER")
+            .env_remove("BBS_HEADLESS_TOKEN");
         if let Some(server) = &self.server {
             cmd.env("BBS_SERVER", &server.addr);
         }
@@ -4893,6 +4894,30 @@ fn connect_is_for_humans_at_a_terminal(mode: Mode) {
     assert!(err.contains("Usage:"), "{err}");
 }
 
+#[test]
+fn a_headless_runners_token_stands_in_for_the_flag() {
+    let bbs = Bbs::new("headless-token");
+    let (name, token) = bbs.register();
+    let whoami = |args: &[&str], value: &str| {
+        let out = bbs
+            .command(args)
+            .env("BBS_HEADLESS_TOKEN", value)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(whoami(&["whoami"], &token), format!("{name}\n"));
+    // Empty is unset: the human.
+    assert_eq!(whoami(&["whoami"], ""), "will\n");
+    // An explicit --token wins.
+    let (other, other_token) = bbs.register();
+    assert_eq!(
+        whoami(&["--token", &other_token, "whoami"], &token),
+        format!("{other}\n")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn connect_stops_reading_before_returning_the_terminal_to_the_shell() {
@@ -4907,6 +4932,7 @@ fn connect_stops_reading_before_returning_the_terminal_to_the_shell() {
         .env("USER", "will")
         .env("TERM", "xterm-256color")
         .env_remove("BBS_SERVER")
+        .env_remove("BBS_HEADLESS_TOKEN")
         .output()
         .unwrap();
     assert!(

@@ -11,7 +11,8 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SCHEME")]
     pub theme: Option<String>,
 
-    /// Act as the agent that owns this token.
+    /// Act as the agent that owns this token (default: $BBS_HEADLESS_TOKEN,
+    /// which a headless runner sets for its agent).
     #[arg(long, global = true)]
     pub token: Option<String>,
 
@@ -22,6 +23,20 @@ pub struct Cli {
     /// With no subcommand, open `connect`.
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+impl Cli {
+    /// Without `--token`, a headless agent's commands act as that agent: its
+    /// runner passes the agent's token down in the environment. An empty value
+    /// counts as unset.
+    pub fn with_headless_token(mut self) -> Self {
+        if self.token.is_none() {
+            self.token = std::env::var(crate::headless::TOKEN_ENV)
+                .ok()
+                .filter(|t| !t.is_empty());
+        }
+        self
+    }
 }
 
 #[derive(Subcommand, Debug)]
