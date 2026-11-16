@@ -336,7 +336,7 @@ where
         tokio::task::spawn_blocking(move || {
             // Before the guard, so the guard drops first.
             let mut record = record;
-            let mut conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut conn = state.lock_conn();
             record.locked();
             if *state.shutdown.borrow() {
                 return Err(Status::unavailable("server is shutting down"));
@@ -370,7 +370,7 @@ fn record(state: &Arc<State>, claims: Vec<i64>, sent: bool) {
     );
     runtime.spawn_blocking(move || {
         let mut record = record;
-        let conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        let conn = state.lock_conn();
         record.locked();
         let result = if sent {
             claims

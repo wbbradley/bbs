@@ -10,6 +10,13 @@ under the new package version and its publication date.
 
 ### Fixed
 
+- A `bbs read --wait` stream wakes only when mail may have reached it: a
+  delivery to its inbox, a change to its own agent (such as focus or
+  retirement), or a drain, owner, address or blocker-answer change. Before,
+  every write on the server woke every waiter to re-query its inbox, which
+  on a busy board kept the database connection queued. Waiters also
+  re-check once a minute, so a change made by another process still arrives.
+
 - `bbs init --server` after the human's token was rotated asks for the new
   token in a terminal instead of failing with "invalid or revoked human
   token". Without a terminal it says to pass the new one with
