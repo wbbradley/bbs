@@ -366,7 +366,9 @@ pub fn put_blocker(
             &ctx.now_s,
             &req.request_key,
         )?;
-        store::event(ctx.conn, id, "created", &actor, &ctx.now_s, None, None)?;
+        store::event(
+            ctx.conn, id, "created", &actor, &ctx.now_s, None, None, None,
+        )?;
         if let Some(prior) = &prior
             && prior.outcome.is_none()
         {
@@ -376,6 +378,7 @@ pub fn put_blocker(
                 "superseded",
                 &actor,
                 &ctx.now_s,
+                None,
                 None,
                 None,
             )?;
@@ -463,9 +466,9 @@ pub fn answer_blocker(
             &ctx.now_s,
             Some(store::Answer {
                 text: &answer.text,
-                message_id,
                 selected: answer.selected_json().as_deref(),
             }),
+            Some(message_id),
             Some(&req.request_key),
         )?;
         finish(ctx, &actor, row.id, Some(message_id))
@@ -483,24 +486,14 @@ pub fn cancel_blocker(
         let actor = ctx.actor()?;
         if let Some(response) = replay(ctx, &actor, &req.request_key, |op| {
             matches!(op,
-            store::Operation::Cancel { id } if *id == req.id)
+            store::Operation::Cancel { id, .. } if *id == req.id)
         })? {
             return Ok(response);
         }
         let row = require_row(ctx, req.id)?;
         authorize(ctx, &actor, row.group_id)?;
         require_open(&row)?;
-        store::event(
-            ctx.conn,
-            row.id,
-            "cancelled",
-            &actor,
-            &ctx.now_s,
-            None,
-            Some(&req.request_key),
-        )?;
         // Tell the creator, as an answer would, unless it cancelled its own.
-        // A replay returns no notice; reads find it by the cancel's time.
         let mut message_id = None;
         if db::agent_is_live(ctx.conn, row.creator.id)?
             && super::tell_agent(ctx, &actor, row.creator.id)?
@@ -518,6 +511,16 @@ pub fn cancel_blocker(
             }
             message_id = Some(id);
         }
+        store::event(
+            ctx.conn,
+            row.id,
+            "cancelled",
+            &actor,
+            &ctx.now_s,
+            None,
+            message_id,
+            Some(&req.request_key),
+        )?;
         finish(ctx, &actor, row.id, message_id)
     })
 }
@@ -935,7 +938,7 @@ mod tests {
             id: b.ids[0],
             name: "Mateo".into(),
         };
-        store::event(&b.conn, id, "created", &actor, now, None, None).unwrap();
+        store::event(&b.conn, id, "created", &actor, now, None, None, None).unwrap();
         let got = get_blocker(
             &mut b.conn,
             &b.humans[0],
@@ -1711,8 +1714,9 @@ mod tests {
         let replay = cancel_blocker(&mut b.conn, &b.humans[1], cancel).unwrap();
         assert!(replay.replayed);
         assert_eq!(one.blocker, replay.blocker);
-        // One cancel notice to the creator; the replay sends no more.
-        assert!(one.message_id.is_some() && replay.message_id.is_none());
+        // One cancel notice to the creator; the replay names it and sends no more.
+        assert!(one.message_id.is_some());
+        assert_eq!(replay.message_id, one.message_id);
         assert_eq!(b.messages(), before + 1);
         assert!(b.answer(1, id, "new-answer").is_err());
         let new = b.put(1, "Need help again", Some(id), "another");
@@ -1727,7 +1731,8 @@ mod tests {
             "the creator hears of the cancel"
         );
         let replay = cancel_blocker(&mut b.conn, &b.agents[0], cancel).unwrap();
-        assert!(replay.replayed && replay.message_id.is_none());
+        assert!(replay.replayed);
+        assert_eq!(replay.message_id, first.message_id);
         assert_eq!(b.messages(), before + 1);
     }
 
@@ -1814,30 +1819,18 @@ mod tests {
         };
         assert_eq!(mail(&mut b, c.id), Some(notice));
         assert_eq!(mail(&mut b, own.id), None);
-        // The outcome finds a notice by this prefix (see db::blockers::Outcome).
-        let body: String = b
-            .conn
-            .query_row("SELECT body FROM messages WHERE id = ?1", [notice], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert!(
-            body.starts_with(&format!("Blocker #{} was cancelled by ", c.id)),
-            "{body}"
-        );
-        // A notice in the older form, which named the group and quoted the
-        // blocker, still resolves.
-        let old = format!(
-            "Blocker #{} in @crew was cancelled by ada.\n\nShip it?",
-            c.id
-        );
-        b.conn
-            .execute(
-                "UPDATE messages SET body = ?1 WHERE id = ?2",
-                rusqlite::params![old, notice],
-            )
-            .unwrap();
-        assert_eq!(mail(&mut b, c.id), Some(notice));
+        // The event stores the notice; its own cancel stores none.
+        let stored = |b: &Board, id: i64| -> Option<i64> {
+            b.conn
+                .query_row(
+                    "SELECT message_id FROM blocker_events WHERE blocker_id = ?1 AND kind = 'cancelled'",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(stored(&b, c.id), Some(notice));
+        assert_eq!(stored(&b, own.id), None);
         // In focus mode only the owner reaches the creator.
         service::set_focus(
             &mut b.conn,

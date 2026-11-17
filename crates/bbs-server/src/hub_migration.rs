@@ -385,7 +385,9 @@ mod tests {
         assert!(out.contains("messages 1, deliveries 1"), "{out}");
         assert_eq!(version(&path), 27);
         assert_eq!(version(&backup), 26);
-        // The server opens it now, in the migrated namespace.
+        // The server opens it now, in the migrated namespace, and applies the
+        // migrations after the Hub model.
         db::migrate_in(&mut db::open(&path).unwrap(), Some("will")).unwrap();
+        assert_eq!(version(&path), db::SCHEMA_VERSION as i64);
     }
 }

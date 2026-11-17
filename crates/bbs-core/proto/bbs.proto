@@ -343,8 +343,8 @@ message BlockerMutationResponse {
   Blocker blocker = 1;
   bool replayed = 2;
   // The mail this write sent the blocker's creator: an answer, or a cancel
-  // notice when someone other than the creator cancels. A replayed cancel
-  // carries none.
+  // notice when someone other than the creator cancels. A replay names the
+  // same mail (a replayed cancel names none from an older server).
   optional int64 message_id = 3;
 }
 

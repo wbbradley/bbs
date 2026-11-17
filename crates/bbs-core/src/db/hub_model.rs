@@ -1,7 +1,8 @@
 //! The Hub model (schema 27) and the cutover to it from schema 26.
 //!
-//! A new database is created at schema 27 (see `db::migrate`). An existing
-//! one moves only when an operator runs the cutover; startup never does. The
+//! A new database passes through schema 27 (see `db::migrate`). An existing
+//! one moves only when an operator runs the cutover; startup never does, but
+//! does apply the migrations after it. The
 //! cutover moves messages and deliveries onto Hub's entity/address model and
 //! gives every human, agent and group one entity ID, computed here from its
 //! BBS name (BBS blocker 1396):

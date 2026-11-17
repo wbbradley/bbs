@@ -33,9 +33,10 @@ enum Command {
         manifest: bool,
     },
     /// Operator only: move a stopped server's schema-26 database to the Hub
-    /// model (schema 27), which this binary serves and refuses to start
-    /// without. Stop the server and back up the database first; it refuses
-    /// while any other connection uses the database.
+    /// model (schema 27), which this binary needs to start; its first open
+    /// then applies the later migrations. Stop the server and back up the
+    /// database first; it refuses while any other connection uses the
+    /// database.
     MigrateHubModel {
         /// The database to migrate (normally STATE_DIR/bbs.db).
         #[arg(long, value_name = "PATH")]

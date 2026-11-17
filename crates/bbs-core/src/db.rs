@@ -23,7 +23,7 @@ pub use hub_model::{
 use crate::entity::{AddressRef, DEFAULT_NAMESPACE, EntityKind, EntityRef, NATIVE_ADDRESS};
 
 /// The schema this binary serves, and creates new databases at.
-pub const SCHEMA_VERSION: usize = HUB_MODEL_SCHEMA_VERSION;
+pub const SCHEMA_VERSION: usize = HUB_MODEL_SCHEMA_VERSION + POST_HUB_MIGRATIONS.len();
 
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
@@ -53,6 +53,11 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0025_agent_focus.sql"),
     include_str!("../migrations/0026_agent_goal.sql"),
 ];
+
+/// Migrations after the Hub model, from schema 28; every open applies them.
+const POST_HUB_MIGRATIONS: &[&str] = &[include_str!(
+    "../migrations/0028_blocker_cancel_message.sql"
+)];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -162,7 +167,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     // A database `migrate` will refuse stays exactly as it is, without WAL
     // files, so its owner can still back it up and migrate it.
     let version = schema_version(&conn)?;
-    if version == 0 || version == SCHEMA_VERSION {
+    if version == 0 || (HUB_MODEL_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&version) {
         enable_wal(&conn)?;
     }
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -238,9 +243,11 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
 /// Every command calls this on open. A database at [`SCHEMA_VERSION`] is ready;
 /// with `namespace`, its namespace must match. A new database (version 0) is
 /// created at [`SCHEMA_VERSION`] in `namespace`, else [`DEFAULT_NAMESPACE`];
-/// concurrent callers serialize on the write lock and re-check the version
-/// under it. Any other version is refused, unchanged: only the operator's
-/// `bbs-server migrate-hub-model` moves existing data to the Hub model.
+/// one from the Hub model on ([`HUB_MODEL_SCHEMA_VERSION`]) gets the
+/// migrations after it. Concurrent callers serialize on the write lock and
+/// re-check the version under it. Any other version is refused, unchanged:
+/// only the operator's `bbs-server migrate-hub-model` moves existing data to
+/// the Hub model.
 pub fn migrate_in(conn: &mut Connection, namespace: Option<&str>) -> Result<()> {
     if let Some(namespace) = namespace {
         validate_namespace(namespace)?;
@@ -256,7 +263,7 @@ pub fn migrate_in(conn: &mut Connection, namespace: Option<&str>) -> Result<()> 
     )?;
     if !has_namespace {
         bail!(
-            "this schema-v{SCHEMA_VERSION} database has no installation namespace \
+            "this schema-v{HUB_MODEL_SCHEMA_VERSION} database has no installation namespace \
              (bbs_installation): an earlier development build of `bbs-server migrate-hub-model` \
              made it. Restore the schema-v{HUB_MODEL_SOURCE_VERSION} backup taken before that \
              and migrate it again with this release"
@@ -265,7 +272,7 @@ pub fn migrate_in(conn: &mut Connection, namespace: Option<&str>) -> Result<()> 
     let missing = missing_integration_schema(conn)?;
     if !missing.is_empty() {
         bail!(
-            "this schema-v{SCHEMA_VERSION} database lacks the integration schema ({}): an \
+            "this schema-v{HUB_MODEL_SCHEMA_VERSION} database lacks the integration schema ({}): an \
              earlier development build of the Hub model made it. If `bbs-server \
              migrate-hub-model` made it, restore the schema-v{HUB_MODEL_SOURCE_VERSION} backup \
              taken before that and migrate it again with this release; if it was created \
@@ -279,11 +286,21 @@ pub fn migrate_in(conn: &mut Connection, namespace: Option<&str>) -> Result<()> 
     {
         bail!("this database's namespace is {stored:?}, not {namespace:?}");
     }
+    if schema_version(conn)? < SCHEMA_VERSION {
+        with_foreign_keys_off(conn, |tx| {
+            let current = schema_version(tx)?;
+            if current == SCHEMA_VERSION {
+                return Ok(false);
+            }
+            apply_post_hub_migrations(tx, current)?;
+            Ok(true)
+        })?;
+    }
     Ok(())
 }
 
 /// The tables and columns of the Hub model's integration schema that this
-/// schema-27 database lacks; early development builds of migration 27 had
+/// database lacks; early development builds of migration 27 had
 /// none of them.
 fn missing_integration_schema(conn: &Connection) -> Result<Vec<String>> {
     const REQUIRED: &[(&str, &str)] = &[
@@ -336,22 +353,23 @@ fn check_supported(conn: &Connection, version: usize) -> Result<()> {
     );
     if version == HUB_MODEL_SOURCE_VERSION {
         bail!(
-            "{path} is at BBS schema v{version}, before the Hub model (v{SCHEMA_VERSION}); \
+            "{path} is at BBS schema v{version}, before the Hub model (v{HUB_MODEL_SCHEMA_VERSION}); \
              this release does not migrate it automatically. {steps}"
         );
     }
     if version < HUB_MODEL_SOURCE_VERSION {
         bail!(
             "{path} is at BBS schema v{version}, too old to migrate to the Hub model \
-             (v{SCHEMA_VERSION}) directly; open it once with bbs 0.24 to reach schema \
+             (v{HUB_MODEL_SCHEMA_VERSION}) directly; open it once with bbs 0.24 to reach schema \
              v{HUB_MODEL_SOURCE_VERSION}. Then: {steps}"
         );
     }
     Ok(())
 }
 
-/// Create a new database: every migration, then the Hub model, in one
-/// transaction. Does nothing if another connection created it first.
+/// Create a new database: every migration, then the Hub model, then the
+/// migrations after it, in one transaction. Does nothing if another connection
+/// created it first.
 fn create(conn: &mut Connection, namespace: &str) -> Result<()> {
     validate_namespace(namespace)?;
     with_foreign_keys_off(conn, |tx| {
@@ -360,6 +378,7 @@ fn create(conn: &mut Connection, namespace: &str) -> Result<()> {
         }
         apply_migrations(tx, 0)?;
         hub_model::create_in(tx, namespace)?;
+        apply_post_hub_migrations(tx, HUB_MODEL_SCHEMA_VERSION)?;
         tracing::info!(namespace, "created database");
         Ok(true)
     })
@@ -394,6 +413,20 @@ fn apply_migrations(tx: &Connection, current: usize) -> Result<()> {
         tracing::info!(version = i + 1, "applied migration");
     }
     tx.pragma_update(None, "user_version", MIGRATIONS.len() as i64)?;
+    Ok(())
+}
+
+/// Apply `POST_HUB_MIGRATIONS` after `current`, a schema from the Hub model
+/// on, and set [`SCHEMA_VERSION`].
+fn apply_post_hub_migrations(tx: &Connection, current: usize) -> Result<()> {
+    let applied = current - HUB_MODEL_SCHEMA_VERSION;
+    for (i, sql) in POST_HUB_MIGRATIONS.iter().enumerate().skip(applied) {
+        let version = HUB_MODEL_SCHEMA_VERSION + i + 1;
+        tx.execute_batch(sql)
+            .with_context(|| format!("applying migration {version}"))?;
+        tracing::info!(version, "applied migration");
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION as i64)?;
     Ok(())
 }
 
@@ -4239,6 +4272,160 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn schema_28_links_existing_cancels_to_their_notices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bbs.db");
+        let mut conn = Connection::open(&path).unwrap();
+        // A database at the Hub model, before the migrations after it.
+        with_foreign_keys_off(&mut conn, |tx| {
+            apply_migrations(tx, 0)?;
+            hub_model::create_in(tx, DEFAULT_NAMESPACE)?;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), HUB_MODEL_SCHEMA_VERSION);
+        let will = human(&conn, "will");
+        let scout = agent(&conn, will.id, "scout");
+        let other = agent(&conn, will.id, "other");
+        let group = insert_group(&conn, "crew", None, "t").unwrap();
+        let blocker = |conn: &Connection, n: i64| {
+            conn.execute(
+                "INSERT INTO blockers (id, group_id, creator_id, body, created_at, request_key)
+                 VALUES (?1, ?2, ?3, 'Ship it?', 't0', ?1)",
+                params![n, group, scout.id],
+            )
+            .unwrap();
+        };
+        let event = |n: i64, kind: &str, by: &Principal, at: &str, message: Option<i64>| {
+            let answered = kind == "answered";
+            let keyed = answered || kind == "cancelled";
+            conn.execute(
+                "INSERT INTO blocker_events
+                 (id, blocker_id, kind, actor_kind, actor_id, created_at, request_key, answer, message_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    n * 10 + i64::from(kind != "created"),
+                    n,
+                    kind,
+                    by.kind.as_str(),
+                    by.id,
+                    at,
+                    keyed.then(|| format!("k{n}")),
+                    answered.then_some("yes"),
+                    message
+                ],
+            )
+            .unwrap();
+        };
+        let mail = |from: &Principal, to: &Principal, body: &str, at: &str| {
+            insert_message(&conn, from, To::Direct(to.kind, to.id), body, at).unwrap()
+        };
+        for n in 1..=5 {
+            blocker(&conn, n);
+            event(n, "created", &scout, "t0", None);
+        }
+        // Blocker 1: will cancelled it; the notice is in the older form. A
+        // notice about blocker 10 sent first does not match.
+        mail(&will, &scout, "Blocker #10 was cancelled by will.", "t1");
+        let old = mail(
+            &will,
+            &scout,
+            "Blocker #1 in @crew was cancelled by will.\n\nShip it?",
+            "t1",
+        );
+        event(1, "cancelled", &will, "t1", None);
+        // Blocker 2: another agent cancelled it. The same body at another
+        // time, to another recipient, or in a group does not match.
+        let body = "Blocker #2 was cancelled by other.";
+        mail(&other, &scout, body, "t1");
+        mail(&other, &will, body, "t2");
+        insert_message(&conn, &other, To::Group(group), body, "t2").unwrap();
+        let new = mail(&other, &scout, body, "t2");
+        event(2, "cancelled", &other, "t2", None);
+        // Blocker 3: its creator cancelled it, so it sent no notice; another
+        // sender's matching mail at the same time is not it.
+        mail(&will, &scout, "Blocker #3 was cancelled by will.", "t3");
+        event(3, "cancelled", &scout, "t3", None);
+        // Blocker 4 was answered; blocker 5 superseded.
+        let answer = mail(&will, &scout, "Blocker #4 was answered by will.", "t4");
+        event(4, "answered", &will, "t4", Some(answer));
+        event(5, "superseded", &scout, "t5", None);
+        let events = |conn: &Connection| -> Vec<(i64, String, Option<i64>)> {
+            conn.prepare("SELECT id, kind, message_id FROM blocker_events ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let mut expected = events(&conn);
+        for (id, message) in [(11, old), (21, new)] {
+            expected.iter_mut().find(|e| e.0 == id).unwrap().2 = Some(message);
+        }
+        drop(conn);
+
+        let mut conn = open(&path).unwrap();
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(events(&conn), expected);
+        assert!(foreign_keys_on(&conn));
+        let ok: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ok, "ok");
+        // History stays immutable, and only answers and cancels name mail.
+        assert!(
+            conn.execute("UPDATE blocker_events SET message_id = NULL", [])
+                .is_err()
+        );
+        assert!(conn.execute("DELETE FROM blocker_events", []).is_err());
+        blocker(&conn, 6);
+        let refused = conn.execute(
+            "INSERT INTO blocker_events (blocker_id, kind, actor_kind, actor_id, created_at, message_id)
+             VALUES (6, 'created', 'agent', ?1, 't6', ?2)",
+            params![scout.id, new],
+        );
+        assert!(refused.is_err());
+        let refused = conn.execute(
+            "INSERT INTO blocker_events
+             (blocker_id, kind, actor_kind, actor_id, created_at, request_key, answer)
+             VALUES (6, 'answered', 'human', ?1, 't6', 'k6', 'yes')",
+            [will.id],
+        );
+        assert!(refused.is_err());
+        // Its schema is a new database's.
+        let schema = |conn: &Connection| -> Vec<String> {
+            conn.prepare(
+                "SELECT sql FROM sqlite_schema WHERE tbl_name = 'blocker_events' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        };
+        let mut fresh = Connection::open_in_memory().unwrap();
+        migrate(&mut fresh).unwrap();
+        assert_eq!(schema_version(&fresh).unwrap(), SCHEMA_VERSION);
+        assert_eq!(schema(&conn), schema(&fresh));
+        assert_eq!(schema(&conn).len(), 7);
+        // A binary refuses a database newer than it serves.
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION as i64 + 1)
+            .unwrap();
+        let err = migrate(&mut conn).unwrap_err().to_string();
+        assert!(err.contains("newer than this binary supports"), "{err}");
+    }
+
+    fn foreign_keys_on(conn: &Connection) -> bool {
+        conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .unwrap()
     }
 
     /// The query plan of `sql`, every parameter bound to 1.

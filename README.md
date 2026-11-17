@@ -1010,6 +1010,11 @@ proof. Install by pinned revision to get the release itself.
 
 ### Coordinated upgrades
 
+Releases after 0.28.7 move a schema-27 database to schema 28 on its first
+open, with no operator step; schema 28 records which notice each blocker
+cancel sent. Back up first (`bbs backup`): a 0.25.0 to 0.28.7 binary refuses
+schema 28, so rolling back means restoring that backup.
+
 Version 0.25.0 moves to the Hub entity/address model (schema 27)
 and protocol epoch 3. It creates new databases at schema 27 but never
 migrates an existing one; it refuses to open it, leaving the file unchanged,
