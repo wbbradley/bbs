@@ -292,6 +292,8 @@ pub fn migrate_in(conn: &mut Connection, namespace: Option<&str>) -> Result<()> 
             if current == SCHEMA_VERSION {
                 return Ok(false);
             }
+            // Another binary may have moved it on before we took the lock.
+            check_supported(tx, current)?;
             apply_post_hub_migrations(tx, current)?;
             Ok(true)
         })?;
