@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- The mail an agent gets when its blocker is answered or cancelled cites the
+  blocker by ID instead of repeating its body or naming its group:
+  `Blocker #N was answered by NAME.` followed by the answer, or
+  `Blocker #N was cancelled by NAME.`
+
 ## 0.28.7 - 2026-11-16
 
 ### Changed
