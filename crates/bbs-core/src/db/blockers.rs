@@ -18,7 +18,8 @@ pub struct Outcome {
     /// The mail sent the creator: the answer, or a cancel notice. A notice is
     /// not stored on the event; it is the one direct message the canceller
     /// sent the creator in the cancel's transaction (same timestamp) about
-    /// this blocker, whose body starts `Blocker #<id> in @` (a test pins it).
+    /// this blocker, whose body starts `Blocker #<id> ` (a test pins it): older
+    /// notices go on `in @group`, newer ones `was cancelled by`.
     /// The lookup goes away once a column records the notice's ID.
     pub message_id: Option<i64>,
     /// Canonical JSON array of selected option IDs; none for a free-text answer.
@@ -55,8 +56,8 @@ static SELECT: LazyLock<String> = LazyLock::new(|| {
             AND m.sender_address_id IN ({actor})
             AND m.recipient_address_id = {creator}
             AND m.to_group_id IS NULL
-            AND substr(m.body, 1, length('Blocker #' || b.id || ' in @'))
-                = 'Blocker #' || b.id || ' in @'
+            AND substr(m.body, 1, length('Blocker #' || b.id || ' '))
+                = 'Blocker #' || b.id || ' '
         ORDER BY m.id LIMIT 1)),
     actor_owner.name, b.choices, e.selected
     FROM blockers b JOIN bbs_groups g ON g.id = b.group_id

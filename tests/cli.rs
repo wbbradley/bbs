@@ -4651,7 +4651,7 @@ fn headless_goal_resumes_when_someone_else_cancels_its_blocker() {
 /// the goal.
 fn assert_cancel_resumes(prompt: &str, id: &str) {
     assert!(
-        prompt.contains(&format!("Blocker #{id} in @crew was cancelled by ")),
+        prompt.contains(&format!("Blocker #{id} was cancelled by ")),
         "{prompt}"
     );
     assert!(

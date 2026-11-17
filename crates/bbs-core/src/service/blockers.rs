@@ -443,8 +443,8 @@ pub fn answer_blocker(
         }
         // The agent has the blocker; cite it rather than repeat its body.
         let body = format!(
-            "Blocker #{} in @{} was answered by {}.\n\nAnswer:\n{}",
-            row.id, row.group, actor.name, answer.text
+            "Blocker #{} was answered by {}.\n\nAnswer:\n{}",
+            row.id, actor.name, answer.text
         );
         super::validate_body(&body)?;
         let message_id = db::insert_message(
@@ -505,10 +505,7 @@ pub fn cancel_blocker(
         if db::agent_is_live(ctx.conn, row.creator.id)?
             && super::tell_agent(ctx, &actor, row.creator.id)?
         {
-            let body = format!(
-                "Blocker #{} in @{} was cancelled by {}.",
-                row.id, row.group, actor.name
-            );
+            let body = format!("Blocker #{} was cancelled by {}.", row.id, actor.name);
             let id = db::insert_message(
                 ctx.conn,
                 &actor,
@@ -1782,8 +1779,8 @@ mod tests {
             cancel_notices(&b, b.ids[0]),
             vec![
                 // The blocker is cited by ID, not quoted.
-                format!("Blocker #{} in @crew was cancelled by Zed.", a.id),
-                format!("Blocker #{} in @crew was cancelled by ada.", c.id),
+                format!("Blocker #{} was cancelled by Zed.", a.id),
+                format!("Blocker #{} was cancelled by ada.", c.id),
             ]
         );
         let sender: String = b
@@ -1825,7 +1822,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            body.starts_with(&format!("Blocker #{} in @crew was cancelled by ", c.id)),
+            body.starts_with(&format!("Blocker #{} was cancelled by ", c.id)),
             "{body}"
         );
         // In focus mode only the owner reaches the creator.
@@ -1847,10 +1844,7 @@ mod tests {
         assert!(cancel(&mut b, &by, e.id, "c-e").message_id.is_some());
         let notices = cancel_notices(&b, b.ids[0]);
         assert_eq!(notices.len(), 3);
-        assert!(notices[2].starts_with(&format!(
-            "Blocker #{} in @crew was cancelled by will.",
-            e.id
-        )));
+        assert!(notices[2].starts_with(&format!("Blocker #{} was cancelled by will.", e.id)));
     }
 
     #[test]
@@ -2482,7 +2476,7 @@ mod tests {
         assert_eq!(outcome.answer.as_deref(), Some(text));
         let body = mail(&b, answered.message_id.unwrap());
         assert!(
-            body.starts_with(&format!("Blocker #{} in @crew was answered by ", many.id))
+            body.starts_with(&format!("Blocker #{} was answered by ", many.id))
                 && body.ends_with(&format!(".\n\nAnswer:\n{text}"))
                 && !body.contains("Which plan?"),
             "{body}"
