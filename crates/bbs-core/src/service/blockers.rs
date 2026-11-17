@@ -1825,6 +1825,19 @@ mod tests {
             body.starts_with(&format!("Blocker #{} was cancelled by ", c.id)),
             "{body}"
         );
+        // A notice in the older form, which named the group and quoted the
+        // blocker, still resolves.
+        let old = format!(
+            "Blocker #{} in @crew was cancelled by ada.\n\nShip it?",
+            c.id
+        );
+        b.conn
+            .execute(
+                "UPDATE messages SET body = ?1 WHERE id = ?2",
+                rusqlite::params![old, notice],
+            )
+            .unwrap();
+        assert_eq!(mail(&mut b, c.id), Some(notice));
         // In focus mode only the owner reaches the creator.
         service::set_focus(
             &mut b.conn,
