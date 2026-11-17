@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.28.8 - 2026-11-17
+
 ### Changed
 
 - The mail an agent gets when its blocker is answered or cancelled cites the
