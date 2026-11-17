@@ -16,6 +16,11 @@ under the new package version and its publication date.
   blocker by ID instead of repeating its body or naming its group:
   `Blocker #N was answered by NAME.` followed by the answer, or
   `Blocker #N was cancelled by NAME.`
+- Database schema 28: a blocker cancel records the notice it sent the
+  creator, and a replayed cancel's `message_id` names that notice. A
+  schema-27 database is upgraded on its first open, linking existing cancels
+  to their notices. Back up first: older releases refuse schema 28, so
+  rolling back needs the backup taken before the upgrade.
 
 ## 0.28.7 - 2026-11-16
 

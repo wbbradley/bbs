@@ -1,12 +1,9 @@
 //! Immutable blocker versions, terminal events and operation receipts.
 
-use std::sync::LazyLock;
-
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{Kind, Principal, address_sql, addresses_sql};
-use crate::entity::EntityKind;
+use super::{Kind, Principal};
 
 pub struct Outcome {
     pub kind: String,
@@ -15,12 +12,8 @@ pub struct Outcome {
     pub actor_owner: Option<String>,
     pub created_at: String,
     pub answer: Option<String>,
-    /// The mail sent the creator: the answer, or a cancel notice. A notice is
-    /// not stored on the event; it is the one direct message the canceller
-    /// sent the creator in the cancel's transaction (same timestamp) about
-    /// this blocker, whose body starts `Blocker #<id> ` (a test pins it): older
-    /// notices go on `in @group`, newer ones `was cancelled by`.
-    /// The lookup goes away once a column records the notice's ID.
+    /// The mail sent the creator: the answer, or a cancel notice; none when a
+    /// cancel told no one.
     pub message_id: Option<i64>,
     /// Canonical JSON array of selected option IDs; none for a free-text answer.
     pub selected: Option<String>,
@@ -43,22 +36,12 @@ pub struct Row {
     pub choices: Option<String>,
 }
 
-/// The blocker query. A cancel notice is matched by its native addresses: the
-/// actor's as sender and the creator's as recipient.
-static SELECT: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "SELECT b.id, b.group_id, g.name, g.archived_at,
+/// The blocker query.
+const SELECT: &str = "SELECT b.id, b.group_id, g.name, g.archived_at,
     a.id, a.name, h.name, b.body, b.created_at, COALESCE(b.root_id, b.id),
     b.replaces, successor.id, e.kind, e.actor_kind, e.actor_id,
     CASE e.actor_kind WHEN 'human' THEN eh.name ELSE ea.name END,
-    e.created_at, e.answer, COALESCE(e.message_id, (SELECT m.id FROM messages m
-        WHERE e.kind = 'cancelled' AND m.created_at = e.created_at
-            AND m.sender_address_id IN ({actor})
-            AND m.recipient_address_id = {creator}
-            AND m.to_group_id IS NULL
-            AND substr(m.body, 1, length('Blocker #' || b.id || ' '))
-                = 'Blocker #' || b.id || ' '
-        ORDER BY m.id LIMIT 1)),
+    e.created_at, e.answer, e.message_id,
     actor_owner.name, b.choices, e.selected
     FROM blockers b JOIN bbs_groups g ON g.id = b.group_id
     JOIN agents a ON a.id = b.creator_id
@@ -69,14 +52,7 @@ static SELECT: LazyLock<String> = LazyLock::new(|| {
     LEFT JOIN humans eh ON e.actor_kind = 'human' AND eh.id = e.actor_id
     LEFT JOIN agents ea ON e.actor_kind = 'agent' AND ea.id = e.actor_id
     LEFT JOIN agent_owners actor_link ON e.actor_kind = 'agent' AND actor_link.agent_id = e.actor_id
-    LEFT JOIN humans actor_owner ON actor_owner.id = actor_link.human_id",
-        actor = addresses_sql(
-            "(e.actor_kind = 'human' AND nb.human_id = e.actor_id)
-             OR (e.actor_kind = 'agent' AND nb.agent_id = e.actor_id)"
-        ),
-        creator = address_sql(EntityKind::Agent, "b.creator_id"),
-    )
-});
+    LEFT JOIN humans actor_owner ON actor_owner.id = actor_link.human_id";
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     let outcome = if let Some(kind) = r.get::<_, Option<String>>(12)? {
@@ -123,7 +99,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
 
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Row>> {
     Ok(conn
-        .query_row(&format!("{} WHERE b.id = ?1", *SELECT), [id], read_row)
+        .query_row(&format!("{} WHERE b.id = ?1", SELECT), [id], read_row)
         .optional()?)
 }
 
@@ -131,7 +107,7 @@ pub fn head(conn: &Connection, root: i64) -> Result<Row> {
     Ok(conn.query_row(
         &format!(
             "{} WHERE COALESCE(b.root_id, b.id) = ?1 AND successor.id IS NULL",
-            *SELECT
+            SELECT
         ),
         [root],
         read_row,
@@ -141,7 +117,7 @@ pub fn head(conn: &Connection, root: i64) -> Result<Row> {
 pub fn history(conn: &Connection, root: i64, before: i64, limit: usize) -> Result<Vec<Row>> {
     let mut query = conn.prepare(&format!(
         "{} WHERE COALESCE(b.root_id, b.id) = ?1 AND b.id < ?2 ORDER BY b.id DESC LIMIT ?3",
-        *SELECT
+        SELECT
     ))?;
     Ok(query
         .query_map(params![root, before, limit as i64], read_row)?
@@ -188,7 +164,7 @@ pub fn list(
          AND ({predicate})
          AND (?4 IS NULL OR COALESCE(b.root_id, b.id) {comparison} ?4)
          ORDER BY COALESCE(b.root_id, b.id) {order} LIMIT ?5",
-        select = *SELECT,
+        select = SELECT,
         scope = scope()
     ))?;
     Ok(query
@@ -305,10 +281,12 @@ pub fn insert(
 
 pub struct Answer<'a> {
     pub text: &'a str,
-    pub message_id: i64,
     pub selected: Option<&'a str>,
 }
 
+/// Record `kind` on blocker `id`. `message_id` is the mail it sent the
+/// creator: an answer's (required) or a cancel's notice.
+#[allow(clippy::too_many_arguments)]
 pub fn event(
     conn: &Connection,
     id: i64,
@@ -316,6 +294,7 @@ pub fn event(
     actor: &Principal,
     now: &str,
     answer: Option<Answer<'_>>,
+    message_id: Option<i64>,
     key: Option<&str>,
 ) -> Result<()> {
     conn.execute(
@@ -328,7 +307,7 @@ pub fn event(
             actor.id,
             now,
             answer.as_ref().map(|a| a.text),
-            answer.as_ref().map(|a| a.message_id),
+            message_id,
             key,
             answer.as_ref().and_then(|a| a.selected)
         ],
@@ -355,19 +334,21 @@ pub enum Operation {
     },
     Cancel {
         id: i64,
+        message_id: Option<i64>,
     },
 }
 
 impl Operation {
     pub fn id(&self) -> i64 {
         match self {
-            Self::Put { id, .. } | Self::Answer { id, .. } | Self::Cancel { id } => *id,
+            Self::Put { id, .. } | Self::Answer { id, .. } | Self::Cancel { id, .. } => *id,
         }
     }
     pub fn message_id(&self) -> Option<i64> {
         match self {
             Self::Answer { message_id, .. } => Some(*message_id),
-            _ => None,
+            Self::Cancel { message_id, .. } => *message_id,
+            Self::Put { .. } => None,
         }
     }
 }
@@ -390,7 +371,7 @@ pub fn operation(conn: &Connection, actor: &Principal, key: &str) -> Result<Opti
             let id = r.get(0)?;
             if r.get::<_, String>(1)? == "answered" {
                 Ok(Operation::Answer { id, answer: r.get(2)?, message_id: r.get(3)?, selected: r.get(4)? })
-            } else { Ok(Operation::Cancel { id }) }
+            } else { Ok(Operation::Cancel { id, message_id: r.get(3)? }) }
         },
     ).optional()?)
 }
