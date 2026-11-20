@@ -70,6 +70,7 @@ impl Rig {
             activity: watch::Sender::new(0),
             waiters: std::sync::Mutex::new(HashSet::new()),
             mail: Default::default(),
+            credentials: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),

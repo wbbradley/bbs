@@ -8,6 +8,18 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- Open streams re-check their caller's credentials when they may have
+  changed, instead of every 5 seconds each: at once when a server call
+  rotates or retires the caller's agent, changes its owner or human, or
+  changes any human token, and within 5 seconds when another process such as
+  `bbs admin human rotate|revoke` commits to the database. Each stream also
+  re-checks once a minute regardless. Revocation latency is unchanged or
+  shorter, and the server makes far fewer database calls with many streams
+  open. An agent whose only traffic is open streams now has its last-active
+  time refreshed every one to two minutes rather than every minute.
+
 ## 0.29.0 - 2026-11-17
 
 ### Changed
