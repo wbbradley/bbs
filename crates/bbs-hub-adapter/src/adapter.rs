@@ -135,7 +135,8 @@ pub(crate) struct Shared {
     pub opts: Options,
     store: Mutex<Store>,
     pub bbs: Mutex<Option<link::Sender<pb::AdapterFrame>>>,
-    pub relay: Mutex<Option<RelayLink>>,
+    /// Watched, so a test can wait for a stream to become ready.
+    pub relay: watch::Sender<Option<RelayLink>>,
     /// Wakes outbound dispatch to the relay.
     pub relay_kick: Notify,
     /// Wakes inbound dispatch to BBS.
@@ -506,7 +507,7 @@ impl Adapter {
                 opts,
                 store: Mutex::new(st),
                 bbs: Mutex::new(None),
-                relay: Mutex::new(None),
+                relay: watch::Sender::new(None),
                 relay_kick: Notify::new(),
                 bbs_kick: Notify::new(),
                 report_kick: Notify::new(),
@@ -537,6 +538,26 @@ impl Adapter {
         move |q| {
             let shared = shared.clone();
             Box::pin(async move { crate::relay::remote_directory(&shared, q).await })
+        }
+    }
+
+    /// Wait until the relay stream whose hello carried `connection` is ready
+    /// for federation (its route registered): for tests. False if the
+    /// adapter has stopped.
+    #[doc(hidden)]
+    pub fn relay_ready(
+        &self,
+    ) -> impl Fn(String) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static
+    {
+        let ready = self.shared.relay.subscribe();
+        move |connection| {
+            let mut ready = ready.clone();
+            Box::pin(async move {
+                ready
+                    .wait_for(|r| r.as_ref().is_some_and(|r| r.connection == connection))
+                    .await
+                    .is_ok()
+            })
         }
     }
 
@@ -622,7 +643,7 @@ impl Adapter {
         if let Some(s) = bbs_link {
             s.close();
         }
-        let relay_link = lock(&shared.relay).take();
+        let relay_link = shared.relay.send_replace(None);
         if let Some(r) = relay_link {
             r.tx.close();
         }
