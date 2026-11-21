@@ -857,6 +857,8 @@ table.list .status {
 .composer textarea {
   flex: 1;
   background: none;
+  /* Composer's fit() sets height to scrollHeight; a border would leave
+     clientHeight short of it and show a scrollbar at every height. */
   border: 0;
   resize: none;
   outline: none;
