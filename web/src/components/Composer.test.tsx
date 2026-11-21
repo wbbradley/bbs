@@ -57,3 +57,28 @@ it("refits a wrapped draft when its width changes and keeps an empty placeholder
     vi.unstubAllGlobals();
   }
 });
+
+it("hides the scrollbar until max-height caps the box", () => {
+  const cap = 84;
+  vi.spyOn(HTMLTextAreaElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLTextAreaElement) {
+    return Math.ceil(this.value.length / 60) * 20 + 4;
+  });
+  vi.spyOn(HTMLTextAreaElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLTextAreaElement) {
+    // max-height, which jsdom does not apply.
+    return Math.min(parseFloat(this.style.height) || 24, cap);
+  });
+  try {
+    render(<Composer draftKey="agent:Mateo" placeholder="reply" onSubmit={vi.fn(async () => true)} />);
+    const box = screen.getByPlaceholderText("reply") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "x".repeat(120) } });
+    expect(box.style.overflowY).toBe("hidden");
+    fireEvent.change(box, { target: { value: "x".repeat(600) } });
+    expect(box.style.overflowY).toBe("auto");
+    fireEvent.change(box, { target: { value: "x".repeat(61) } });
+    expect(box.style.overflowY).toBe("hidden");
+  } finally {
+    cleanup();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  }
+});
