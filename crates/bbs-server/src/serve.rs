@@ -26,6 +26,7 @@ use crate::protocol::Policy;
 use crate::service::{self, Caller, TimerLimits, Watched};
 
 mod call_log;
+mod credentials;
 mod integration;
 mod mail;
 mod web;
@@ -41,6 +42,12 @@ const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// A waiter re-checks its inbox this often even unwoken, so a change the
 /// mail hook can't attribute, such as another process's write, still arrives.
 const WAIT_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// An open stream re-checks its caller's credentials this often even when
+/// nothing it can see has changed them.
+const CREDENTIAL_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the server looks for another process's commit, such as `bbs
+/// admin human revoke`, so a revoked caller's streams end within this long.
+const OTHER_WRITERS_INTERVAL: Duration = Duration::from_secs(5);
 /// Leave time for process teardown within a ten-second container grace period.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 /// Activity events stored together: at most this many, waiting at most this
@@ -134,6 +141,7 @@ async fn serve(
         activity: watch::Sender::new(0),
         waiters: Mutex::new(HashSet::new()),
         mail: Default::default(),
+        credentials: Default::default(),
         shutdown: watch::Sender::new(false),
         require_human_token,
         protocol,
@@ -143,6 +151,7 @@ async fn serve(
         integrations: Default::default(),
     });
     tokio::spawn(run_timers(state.clone()));
+    tokio::spawn(watch_other_writers(state.clone()));
     tokio::spawn(integration::sweep(state.clone()));
     let (health, health_service) = tonic_health::server::health_reporter();
     health.set_serving::<BbsServer<Server>>().await;
@@ -277,6 +286,9 @@ struct State {
     waiters: Mutex<HashSet<(i32, i64)>>,
     /// Wakes those waiters when a call may have given them mail.
     mail: mail::Mail,
+    /// Wakes open streams when a call or another process may have changed
+    /// their caller's credentials.
+    credentials: credentials::Credentials,
     shutdown: watch::Sender<bool>,
     require_human_token: bool,
     protocol: Policy,
@@ -293,6 +305,7 @@ type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 struct ConnGuard<'a> {
     conn: MutexGuard<'a, Connection>,
     mail: &'a mail::Mail,
+    credentials: &'a credentials::Credentials,
 }
 
 impl std::ops::Deref for ConnGuard<'_> {
@@ -311,6 +324,7 @@ impl std::ops::DerefMut for ConnGuard<'_> {
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
         self.mail.after_call(&self.conn);
+        self.credentials.after_call();
     }
 }
 
@@ -425,6 +439,33 @@ async fn run_timers(state: Arc<State>) {
     }
 }
 
+/// Have every credential watcher re-check when another process commits to
+/// the database, as `bbs admin` does when it rotates or revokes a credential.
+/// The update hook sees only this server's own writes.
+async fn watch_other_writers(state: Arc<State>) {
+    let mut tick = tokio::time::interval(OTHER_WRITERS_INTERVAL);
+    let mut last = None;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = state.stopping() => return,
+        }
+        match state.call(|conn| db::data_version(conn)).await {
+            Ok(version) => {
+                if last.is_some_and(|last| last != version) {
+                    state.credentials.everyone();
+                }
+                last = Some(version);
+            }
+            Err(status) if status.code() == tonic::Code::Unavailable => return,
+            Err(status) => {
+                tracing::warn!("checking for other writers: {}", status.message());
+                state.credentials.everyone();
+            }
+        }
+    }
+}
+
 impl State {
     fn check_auth_rate(&self, peer: Option<IpAddr>) -> Result<(), Status> {
         let mut failures = self
@@ -474,16 +515,36 @@ impl State {
         }
     }
 
+    /// The status that ends a stream once its caller's credentials fail:
+    /// checked at once, then whenever a call or another process may have
+    /// changed them, and every [`CREDENTIAL_RECHECK_INTERVAL`] regardless.
     /// Runs independently of message delivery, including blocked channel sends.
     async fn watch_credentials(self: &Arc<Self>, caller: Arc<Caller>) -> Status {
         if !self.require_human_token && caller.human_token.is_none() {
             return std::future::pending().await;
         }
+        let mut changes = self.credentials.subscribe();
+        let mut recheck = tokio::time::interval_at(
+            Instant::now() + CREDENTIAL_RECHECK_INTERVAL,
+            CREDENTIAL_RECHECK_INTERVAL,
+        );
         loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Mark seen before checking, so a change after the check still wakes us.
+            let seen = changes.borrow_and_update().latest();
             let c = caller.clone();
-            if let Err(status) = self.call(move |conn| service::whoami(conn, &c)).await {
-                return status;
+            let me = match self.call(move |conn| service::whoami(conn, &c)).await {
+                Ok(me) => (me.kind, me.id),
+                Err(status) => return status,
+            };
+            loop {
+                tokio::select! {
+                    _ = changes.changed() => {
+                        if changes.borrow_and_update().changed_since(me, seen) {
+                            break;
+                        }
+                    }
+                    _ = recheck.tick() => break,
+                }
             }
         }
     }
@@ -575,13 +636,14 @@ impl State {
     }
 
     /// The server's connection, for one call. Releasing it wakes the mail
-    /// waiters the call's changes concern.
+    /// waiters and credential watchers the call's changes concern.
     fn lock_conn(&self) -> ConnGuard<'_> {
         let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        self.mail.attach(&conn);
+        self.mail.attach(&conn, || self.credentials.hook());
         ConnGuard {
             conn,
             mail: &self.mail,
+            credentials: &self.credentials,
         }
     }
 
@@ -1729,6 +1791,7 @@ mod tests {
                 activity: watch::Sender::new(0),
                 waiters: Mutex::new(HashSet::new()),
                 mail: Default::default(),
+                credentials: Default::default(),
                 shutdown: watch::Sender::new(false),
                 require_human_token: false,
                 protocol: Policy::default(),
@@ -1952,6 +2015,7 @@ mod tests {
                 activity: watch::Sender::new(0),
                 waiters: Mutex::new(HashSet::new()),
                 mail: Default::default(),
+                credentials: Default::default(),
                 shutdown: watch::Sender::new(false),
                 require_human_token: false,
                 protocol: withheld
@@ -2140,6 +2204,153 @@ mod tests {
         }
     }
 
+    /// A server requiring human tokens over a board in `dir`: the human will
+    /// and his agents Ana and Bo, as they call.
+    fn credential_board(dir: &Path) -> (Arc<State>, [Caller; 3]) {
+        let mut conn = db::open(&dir.join("bbs.db")).unwrap();
+        db::migrate(&mut conn).unwrap();
+        let will = Caller {
+            human_token: Some(service::admin_issue_token(&mut conn, "will", true).unwrap()),
+            require_human_token: true,
+            ..Default::default()
+        };
+        let mut agent = |name: &str| {
+            let req = proto::RegisterRequest {
+                name: Some(name.into()),
+                ..Default::default()
+            };
+            Caller {
+                token: Some(service::register(&mut conn, &will, req).unwrap().token),
+                require_human_token: true,
+                ..Default::default()
+            }
+        };
+        let (ana, bo) = (agent("Ana"), agent("Bo"));
+        let state = Arc::new(State {
+            conn: Mutex::new(conn),
+            notify: watch::Sender::new(0),
+            activity: watch::Sender::new(0),
+            waiters: Mutex::new(HashSet::new()),
+            mail: Default::default(),
+            credentials: Default::default(),
+            shutdown: watch::Sender::new(false),
+            require_human_token: true,
+            protocol: Policy::default(),
+            auth_failures: Mutex::new(HashMap::new()),
+            timer_limits: TimerLimits::default(),
+            clock: Arc::new(Utc::now),
+            integrations: Default::default(),
+        });
+        (state, [will, ana, bo])
+    }
+
+    fn watch_credentials(state: &Arc<State>, caller: &Caller) -> tokio::task::JoinHandle<Status> {
+        let (state, caller) = (state.clone(), Arc::new(caller.clone()));
+        tokio::spawn(async move { state.watch_credentials(caller).await })
+    }
+
+    /// Until every task is parked, such as each watcher after its first
+    /// check: with time paused, the clock moves only then.
+    async fn settle() -> Duration {
+        let tick = Duration::from_millis(1);
+        tokio::time::sleep(tick).await;
+        tick
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_credential_changed_through_the_server_ends_its_streams_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, [will, ana, bo]) = credential_board(dir.path());
+        let start = Instant::now();
+        let watches = [&will, &ana, &bo].map(|caller| watch_credentials(&state, caller));
+        let [will_watch, ana_watch, bo_watch] = watches;
+        let settled = settle().await;
+        let human = |f: fn(&mut Connection, &Caller) -> Result<()>| {
+            let will = will.clone();
+            state.call(move |conn| f(conn, &will))
+        };
+
+        // Rotating Ana's token ends her stream, with no time passing.
+        human(|conn, will| {
+            let req = proto::RetireRequest {
+                agent: "Ana".into(),
+            };
+            service::rotate_agent_token(conn, will, req)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let status = ana_watch.await.unwrap();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+        assert_eq!(start.elapsed(), settled);
+        // So does retiring Bo.
+        human(|conn, will| {
+            let req = proto::RetireRequest { agent: "Bo".into() };
+            service::retire_agent(conn, will, req)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let status = bo_watch.await.unwrap();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+        assert_eq!(start.elapsed(), settled);
+        // Will's own stream carries on.
+        settle().await;
+        assert!(!will_watch.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unrelated_write_checks_no_one_and_the_backstop_catches_what_the_hook_cannot_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, [_, ana, bo]) = credential_board(dir.path());
+        let start = Instant::now();
+        let mut ana_watch = watch_credentials(&state, &ana);
+        settle().await;
+        // Another process retires Ana; the server's update hook cannot see it.
+        let other = db::open(&dir.path().join("bbs.db")).unwrap();
+        other
+            .execute("UPDATE agents SET retired_at = 't' WHERE name = 'Ana'", [])
+            .unwrap();
+        // Bo's status wakes the watchers but concerns only Bo, so Ana's
+        // stream checks nothing, and does not notice yet.
+        let bo = Arc::new(bo);
+        state
+            .call(move |conn| {
+                let text = "busy".to_string();
+                service::set_status(conn, &bo, proto::SetStatusRequest { text })?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let before = CREDENTIAL_RECHECK_INTERVAL - start.elapsed() - Duration::from_millis(1);
+        let quiet = tokio::time::timeout(before, &mut ana_watch).await;
+        assert!(quiet.is_err(), "{quiet:?}");
+        // The backstop re-check does.
+        let status = ana_watch.await.unwrap();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+        assert_eq!(start.elapsed(), CREDENTIAL_RECHECK_INTERVAL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn another_process_revoking_a_human_token_ends_streams_within_one_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, [will, ana, _]) = credential_board(dir.path());
+        let start = Instant::now();
+        tokio::spawn(watch_other_writers(state.clone()));
+        let will_watch = watch_credentials(&state, &will);
+        let ana_watch = watch_credentials(&state, &ana);
+        settle().await;
+        // As `bbs admin human revoke will` does, beside the running server.
+        let mut other = db::open(&dir.path().join("bbs.db")).unwrap();
+        service::admin_revoke_token(&mut other, "will").unwrap();
+        // Will's streams end, and so do his agents'.
+        for watch in [will_watch, ana_watch] {
+            let status = watch.await.unwrap();
+            assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+            assert_eq!(start.elapsed(), OTHER_WRITERS_INTERVAL);
+        }
+    }
+
     #[tokio::test]
     async fn a_waiter_gets_mail_at_once_without_the_backstop() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -2180,6 +2391,7 @@ mod tests {
             activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
             mail: Default::default(),
+            credentials: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),
@@ -2260,6 +2472,7 @@ mod tests {
             activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
             mail: Default::default(),
+            credentials: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),
@@ -2364,6 +2577,7 @@ mod tests {
                 activity: watch::Sender::new(0),
                 waiters: Mutex::new(HashSet::new()),
                 mail: Default::default(),
+                credentials: Default::default(),
                 shutdown: watch::Sender::new(false),
                 require_human_token: false,
                 protocol: if withheld {
@@ -2505,6 +2719,7 @@ mod tests {
                 activity: watch::Sender::new(0),
                 waiters: Mutex::new(HashSet::new()),
                 mail: Default::default(),
+                credentials: Default::default(),
                 shutdown: watch::Sender::new(false),
                 require_human_token: false,
                 protocol: if withheld {
@@ -2593,6 +2808,7 @@ mod tests {
             activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
             mail: Default::default(),
+            credentials: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),
@@ -2624,6 +2840,7 @@ mod tests {
             activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
             mail: Default::default(),
+            credentials: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),
@@ -2694,6 +2911,7 @@ mod tests {
             activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
             mail: Default::default(),
+            credentials: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),
@@ -2955,6 +3173,7 @@ mod tests {
             activity: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
             mail: Default::default(),
+            credentials: Default::default(),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
             protocol: Policy::default(),
