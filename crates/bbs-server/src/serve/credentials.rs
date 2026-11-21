@@ -66,7 +66,9 @@ impl Credentials {
         let changed = self.changed.clone();
         move |table, rowid| {
             let key = match table {
-                // `agent_owners` is keyed by its agent.
+                // `agent_owners` is keyed by its agent. Any `agents` write
+                // counts, including the debounced `active_at` touch, which
+                // costs that agent one extra check per debounce window.
                 "agents" | "agent_owners" => Some((Kind::Agent as i32, rowid)),
                 "humans" => Some((Kind::Human as i32, rowid)),
                 "human_tokens" => None,
