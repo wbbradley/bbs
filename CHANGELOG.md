@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.30.0 - 2026-11-23
+
 ### Changed
 
 - Blockers belong to the agent that created them, not to a group. Only the
