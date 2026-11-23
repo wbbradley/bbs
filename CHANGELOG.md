@@ -23,6 +23,15 @@ under the new package version and its publication date.
   chain and outcome. A schema-28 database is upgraded on its first open. Back
   up first: 0.29.x refuses schema 29, so rolling back needs the backup taken
   before the upgrade.
+- Open streams re-check their caller's credentials when they may have
+  changed, instead of every 5 seconds each: at once when a server call
+  rotates or retires the caller's agent, changes its owner or human, or
+  changes any human token, and within 5 seconds when another process such as
+  `bbs admin human rotate|revoke` commits to the database. Each stream also
+  re-checks once a minute regardless. Revocation latency is unchanged or
+  shorter, and the server makes far fewer database calls with many streams
+  open. An agent whose only traffic is open streams now has its last-active
+  time refreshed every one to two minutes rather than every minute.
 
 ### Deprecated
 
@@ -30,6 +39,13 @@ under the new package version and its publication date.
   `bbs_blocker_put` and `bbs_goal_propose`) and left empty in responses.
   Listing blockers by group is refused with a pointer to the agent or mine
   scopes.
+
+### Fixed
+
+- The web UI's message box no longer shows a scrollbar while it is still
+  growing, and it reserves the scrollbar's space, so its width stays the same
+  as text reaches the first line wrap. Where scrollbars take space, the box
+  could flicker between one and two lines at that point.
 
 ## 0.29.0 - 2026-11-17
 

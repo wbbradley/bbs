@@ -2,10 +2,17 @@ import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef, us
 import { loadDraft, saveDraft } from "../util";
 import { sendsOnEnter } from "../keys";
 
-/** Empty placeholders do not add rows; non-empty text fits its wrapped height. */
+/**
+ * Empty placeholders do not add rows; non-empty text fits its wrapped height.
+ * A scrollbar shows only once max-height caps the box, so measuring never
+ * narrows it (the stylesheet also reserves the gutter) and moves the wrap.
+ */
 function fit(area: HTMLTextAreaElement) {
+  area.style.overflowY = "hidden";
   area.style.height = "auto";
   if (area.value) area.style.height = `${area.scrollHeight}px`;
+  // A pixel of slack absorbs fractional line heights.
+  if (area.scrollHeight > area.clientHeight + 1) area.style.overflowY = "auto";
 }
 
 export interface ComposerHandle {

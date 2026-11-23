@@ -211,12 +211,13 @@ async fn session(shared: &Arc<Shared>) -> Result<()> {
         r = s.clone().serve(&mut inbound) => r,
         _ = stopping.wait_for(|s| *s) => Ok(()),
     };
-    {
-        let mut relay = shared.relay.lock().unwrap_or_else(PoisonError::into_inner);
-        if relay.as_ref().is_some_and(|r| r.connection == connection) {
+    shared.relay.send_if_modified(|relay| {
+        let ours = relay.as_ref().is_some_and(|r| r.connection == connection);
+        if ours {
             *relay = None;
         }
-    }
+        ours
+    });
     // Queries asked on this stream can have no answer now (Hub's
     // failQueries).
     fail_queries(shared, &connection);
@@ -458,14 +459,10 @@ impl Session {
     async fn setup_and_dispatch(self: Arc<Self>) -> Result<()> {
         self.refresh_trust("").await.context("trust refresh")?;
         self.claim_route().await?;
-        *self
-            .shared
-            .relay
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(RelayLink {
+        self.shared.relay.send_replace(Some(RelayLink {
             tx: self.tx.clone(),
             connection: self.connection.clone(),
-        });
+        }));
         self.shared
             .store()
             .session_ready(&self.connection, now_micros())?;
@@ -1176,12 +1173,7 @@ pub(crate) async fn remote_directory(
         0 => now + DEFAULT_DIRECTORY_WAIT,
         d => d.clamp(now + MIN_DIRECTORY_WAIT, now + MAX_DIRECTORY_WAIT),
     };
-    let Some(relay) = shared
-        .relay
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
-    else {
+    let Some(relay) = shared.relay.borrow().clone() else {
         return failed(
             verify::RELAY_UNAVAILABLE,
             "the adapter is not connected to the relay",

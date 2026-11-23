@@ -4720,8 +4720,13 @@ fn headless_goal_resumes_when_the_agent_reads_its_blocker_mail_itself() {
     // read waits for the go signal.
     goal_logged(&bbs, "tool", 3);
     // Stop the runner, so its mail wait cannot take the notice; the agent
-    // reads it instead, during the turn.
-    let pid = run.0.as_ref().unwrap().id().to_string();
+    // reads it instead, during the turn. Hold the write lock meanwhile, so the
+    // runner stops between transactions or waiting to begin one, never inside
+    // one holding the lock the cancel below needs.
+    let child = run.0.as_ref().unwrap().id();
+    let pid = child.to_string();
+    let db = bbs.db();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
     assert!(
         Command::new("kill")
             .args(["-STOP", &pid])
@@ -4730,6 +4735,19 @@ fn headless_goal_resumes_when_the_agent_reads_its_blocker_mail_itself() {
             .success()
     );
     let thaw = Thaw(pid);
+    // Block until it has stopped, leaving the stop for no one else to reap.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let waited = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child as libc::id_t,
+            &mut info,
+            libc::WSTOPPED | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
+    db.execute_batch("ROLLBACK").unwrap();
+    drop(db);
     bbs.ok(&["--token", &tp, "blocker", "cancel", &id]);
     std::fs::write(&go, "go").unwrap();
     let read_path = bbs.home.join("fake-read.txt");

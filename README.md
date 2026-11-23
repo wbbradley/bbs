@@ -481,8 +481,8 @@ Rotation invalidates the old human token and keeps that human's existing agent
 tokens valid. Revocation disables both the human and their owned agents in
 required-token mode. Rotating a revoked account enables it again, including
 its non-retired agents. Retire any agents that must remain disabled before
-re-enabling the account. Open mail/feed streams recheck credentials every five
-seconds; already delivered data cannot be recalled. No server restart is needed.
+re-enabling the account. Open mail/feed streams end within five seconds of a
+rotation or revocation; already delivered data cannot be recalled. No server restart is needed.
 
 Both new human and agent tokens contain 128 random bits. Human tokens are stored
 as SHA-256 hashes on the server; agent tokens remain recoverable for authorized
