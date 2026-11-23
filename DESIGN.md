@@ -172,9 +172,12 @@ Rotation invalidates the old human token but keeps owned agent credentials valid
 Revocation disables the human and its agents in required-token mode. Rotating a
 revoked account re-enables its non-retired agents. Retire agents separately when
 they must remain disabled after account re-enablement. Calls recheck credentials
-against the database. Open streams also recheck every five seconds in
-required-token mode or when the caller sent a human token; in trust mode an
-agent stream ends only when a wake-up finds the agent retired. These checks let
+against the database. Open streams also recheck in required-token mode or
+when the caller sent a human token: at once when a server call changes the
+caller's token, retirement, owner or human row, or any human token; within
+five seconds of a commit by another process, such as `bbs admin`; and once a
+minute regardless. In trust mode an agent stream ends only when a wake-up
+finds the agent retired. These checks let
 local administration with a binary at the same schema version run while the
 server runs (see [Schema and migrations](#schema-and-migrations)).
 

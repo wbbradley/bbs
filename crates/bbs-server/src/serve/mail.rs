@@ -68,13 +68,19 @@ impl Default for Mail {
 }
 
 impl Mail {
-    /// Install the hook on the server's connection, once.
-    pub(super) fn attach(&self, conn: &Connection) {
+    /// Install the hook on the server's connection, once. It passes every
+    /// changed row on to `also`, as SQLite allows one hook per connection.
+    pub(super) fn attach<F>(&self, conn: &Connection, also: impl FnOnce() -> F)
+    where
+        F: FnMut(&str, i64) + Send + 'static,
+    {
         if self.hooked.swap(true, Ordering::AcqRel) {
             return;
         }
         let changed = self.changed.clone();
+        let mut also = also();
         let hook = move |action: Action, _db: &str, table: &str, rowid: i64| {
+            also(table, rowid);
             let mut c = changed.lock().unwrap_or_else(PoisonError::into_inner);
             match table {
                 "deliveries" if action == Action::SQLITE_INSERT => c.deliveries.push(rowid),
@@ -248,7 +254,7 @@ mod tests {
         let (bo, _) = agent(&mut conn, &will, "Bo");
         let (cy, _) = agent(&mut conn, &will, "Cy");
         let mail = Mail::default();
-        mail.attach(&conn);
+        mail.attach(&conn, || |_: &str, _| {});
         let key = (Kind::Agent as i32, ana_id);
         let address = db::native_address_row(&conn, EntityKind::Agent, ana_id).unwrap();
         mail.register(key, address);
