@@ -7,21 +7,22 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 /// `bbs`, which administers accounts: built beside `bbs-server` by the
-/// workspace, as the tests run with it.
+/// workspace, as the tests run with it. The test binary sits somewhere
+/// below that profile directory (`deps/`, or `build/<package>/<hash>/` in
+/// newer Cargo), so look upwards for it.
 fn bbs() -> std::path::PathBuf {
-    let dir = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .and_then(|deps| deps.parent())
-        .unwrap()
-        .to_path_buf();
-    let bbs = dir.join(format!("bbs{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        bbs.is_file(),
-        "{} is missing: run `cargo test --workspace`",
-        bbs.display()
-    );
-    bbs
+    let exe = std::env::current_exe().unwrap();
+    let name = format!("bbs{}", std::env::consts::EXE_SUFFIX);
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join(&name))
+        .find(|bbs| bbs.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "no {name} above {}: run `cargo test --workspace`",
+                exe.display()
+            )
+        })
 }
 
 struct Server {
