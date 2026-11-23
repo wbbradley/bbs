@@ -261,12 +261,14 @@ impl Relay {
         Relay { addr, conns }
     }
 
-    /// Take the next stream through hello, trust and route registration.
-    async fn accept(&mut self) -> Peer {
+    /// Take the next stream through hello, trust and route registration,
+    /// until `adapter` has it ready.
+    async fn accept(&mut self, adapter: &Running) -> Peer {
         let mut peer = self.open().await;
         peer.trust().await;
         let claim = peer.route().await;
         peer.route_result(claim, true).await;
+        adapter.ready(&peer).await;
         peer
     }
 
@@ -478,11 +480,18 @@ type Ask = std::sync::Arc<
         + Sync,
 >;
 
+type Ready = std::sync::Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
 struct Running {
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<anyhow::Result<()>>,
     /// Ask the relay a directory query as BBS's stream would.
     ask: Ask,
+    ready: Ready,
 }
 
 impl Running {
@@ -493,6 +502,7 @@ impl Running {
     fn start_with(settings: Settings, store: &std::path::Path, opts: Options) -> Running {
         let adapter = Adapter::open(settings, store, opts).unwrap();
         let ask: Ask = std::sync::Arc::new(adapter.remote_directory_asker());
+        let ready: Ready = std::sync::Arc::new(adapter.relay_ready());
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(adapter.run(async {
             let _ = stopped.await;
@@ -501,7 +511,19 @@ impl Running {
             stop: Some(stop),
             task,
             ask,
+            ready,
         }
+    }
+
+    /// Wait until the adapter has `peer`'s stream ready for federation, as
+    /// it is once it has read the route result.
+    async fn ready(&self, peer: &Peer) {
+        assert!(
+            timeout(WAIT, (self.ready)(peer.hello.connection_id.clone()))
+                .await
+                .expect("the relay stream becomes ready in time"),
+            "the adapter stopped before the relay stream was ready"
+        );
     }
 
     async fn stop(mut self) -> anyhow::Result<()> {
@@ -574,7 +596,7 @@ fn verifier() -> (tempfile::TempDir, Store) {
 async fn outbound_sends_are_signed_and_their_results_reach_bbs() {
     let mut w = World::new().await;
     let adapter = w.adapter();
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let (_vdir, check) = verifier();
 
     let mut handoffs = Vec::new();
@@ -673,7 +695,7 @@ async fn outbound_sends_are_signed_and_their_results_reach_bbs() {
 async fn inbound_transfers_are_verified_imported_and_answered() {
     let mut w = World::new().await;
     let adapter = w.adapter();
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let received = mp::TransferDisposition::Received as i32;
     let rejected = mp::TransferDisposition::Rejected as i32;
     let known = mp::TransferDisposition::AlreadyKnown as i32;
@@ -788,7 +810,7 @@ async fn work_waits_for_the_side_that_is_down() {
     })
     .await;
     assert_eq!(w.bbs.outbox(message).0, "sent");
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let F::Transfer(t) = peer.next().await else {
         panic!("the pending send goes once the relay is back");
     };
@@ -845,7 +867,7 @@ async fn an_attempted_send_is_not_replayed_after_a_restart() {
         assert_eq!(c.handoff_id, "h1");
     }
     let adapter = Running::start(settings(), &w.store);
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let F::Transfer(t) = peer.next().await else {
         panic!("the send known unsent goes");
     };
@@ -867,7 +889,7 @@ async fn an_attempted_send_is_not_replayed_after_a_restart() {
 
     // Restart again: nothing is offered, neither the sent nor the unknown.
     let adapter = Running::start(settings(), &w.store);
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     assert!(peer.quiet().await.is_none(), "sent work is never resent");
     // The unknown one may still learn its result, on its own stream only.
     peer.send(F::TransferResult(mp::TransferResult {
@@ -925,7 +947,7 @@ async fn imports_lost_with_a_stream_are_offered_again() {
         store.mark_sent(Direction::Inbound, 3, 5).unwrap();
     }
     let adapter = w.adapter();
-    let _peer = w.relay.accept().await;
+    let _peer = w.relay.accept(&adapter).await;
     let store_path = w.store.clone();
     eventually("BBS answers all three", || {
         let s = Store::open_read_only(&store_path).unwrap();
@@ -950,7 +972,7 @@ async fn imports_lost_with_a_stream_are_offered_again() {
 
     // A new run and BBS stream: everything is settled, nothing is offered.
     let adapter = w.adapter();
-    let _peer = w.relay.accept().await;
+    let _peer = w.relay.accept(&adapter).await;
     tokio::time::sleep(QUIET).await;
     for n in 1..=3 {
         assert_eq!(copies(n), 1, "msg-{n} still once");
@@ -965,7 +987,7 @@ async fn imports_lost_with_a_stream_are_offered_again() {
 async fn directory_queries_are_answered_and_signed() {
     let mut w = World::new().await;
     let adapter = w.adapter();
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let query = |id: &str, entity: &str| {
         let q = mp::DirectoryQuery {
             query_id: id.into(),
@@ -1091,7 +1113,7 @@ async fn a_directory_query_without_bbs_says_the_home_is_offline() {
         settings(free_addr(), w.relay.addr, "unused", "bbs"),
         &w.store,
     );
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let q = mp::DirectoryQuery {
         query_id: "q1".into(),
         requester: Some(mp::Requester {
@@ -1246,7 +1268,7 @@ fn status_of(err: &anyhow::Error) -> &Status {
 async fn remote_directory_queries_are_signed_and_answered() {
     let mut w = World::new().await;
     let adapter = w.adapter();
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let listing = remote_directory(&w.bbs, hub_listing());
     let (rec, q) = asked(&mut peer).await;
     let who = q.requester.unwrap().entity.unwrap();
@@ -1309,7 +1331,7 @@ async fn remote_directory_queries_are_signed_and_answered() {
 async fn remote_directory_refusals_reach_bbs_as_errors() {
     let mut w = World::new().await;
     let adapter = w.adapter();
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     for (code, want, grpc) in [
         (
             "namespace_unknown",
@@ -1379,7 +1401,7 @@ fn credential_with(
 async fn forged_or_malformed_directory_answers_are_refused() {
     let mut w = World::new().await;
     let adapter = w.adapter();
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let result = |id: &str| mp::DirectoryResult {
         query_id: id.into(),
         entities: vec![hub_entity("will", "human")],
@@ -1632,6 +1654,7 @@ async fn an_answer_from_a_revoked_key_is_refused() {
     .await;
     let claim = peer.route().await;
     peer.route_result(claim, true).await;
+    adapter.ready(&peer).await;
     let listing = remote_directory(&w.bbs, hub_listing());
     let (rec, q) = asked(&mut peer).await;
     peer.send(hub_answer(
@@ -1661,7 +1684,7 @@ async fn an_answer_from_a_revoked_key_is_refused() {
 async fn answers_to_waiting_queries_find_their_own_query() {
     let mut w = World::new().await;
     let adapter = w.adapter();
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let lookup = |alias: &str| proto::RemoteDirectoryRequest {
         alias: alias.into(),
         ..hub_listing()
@@ -1692,25 +1715,20 @@ async fn answers_to_waiting_queries_find_their_own_query() {
     adapter.stop().await.unwrap();
 }
 
-/// Ask the relay `q` through the adapter, once its relay stream is up, and
-/// take the query as the relay sees it.
+/// Ask the relay `q` through the adapter, its relay stream ready, and take
+/// the query as the relay sees it.
 async fn ask_relay(
     ask: &Ask,
     peer: &mut Peer,
     q: mp::DirectoryQuery,
 ) -> (JoinHandle<mp::DirectoryResult>, mp::DirectoryQuery) {
-    let start = tokio::time::Instant::now();
-    loop {
-        let pending = tokio::spawn(ask(q.clone()));
-        if let Some(F::DirectoryQuery(fq)) = peer.quiet().await {
-            let rec = fq.query.unwrap();
-            let sent = mp::DirectoryQuery::decode(rec.payload.as_slice()).unwrap();
-            return (pending, sent);
-        }
-        let r = pending.await.unwrap();
-        assert_eq!(r.error_code, "relay_unavailable", "{}", r.detail);
-        assert!(start.elapsed() < WAIT, "the relay stream comes up");
-    }
+    let pending = tokio::spawn(ask(q));
+    let F::DirectoryQuery(fq) = peer.next().await else {
+        panic!("expected a directory query");
+    };
+    let rec = fq.query.unwrap();
+    let sent = mp::DirectoryQuery::decode(rec.payload.as_slice()).unwrap();
+    (pending, sent)
 }
 
 /// The adapter checks BBS's query itself before signing it: a requester in
@@ -1721,7 +1739,7 @@ async fn ask_relay(
 async fn the_adapter_checks_bbs_queries_and_bounds_their_deadline() {
     let mut w = World::new().await;
     let adapter = w.adapter();
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let ask = adapter.ask.clone();
     let good = || mp::DirectoryQuery {
         query_id: "bbs-query".into(),
@@ -1857,7 +1875,7 @@ async fn the_adapter_checks_bbs_queries_and_bounds_their_deadline() {
 async fn too_many_queries_waiting_on_the_relay_is_queue_full() {
     let mut w = World::new().await;
     let adapter = w.adapter();
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let mut waiting = Vec::new();
     for i in 0..128 {
         waiting.push(
@@ -1904,7 +1922,7 @@ async fn too_many_queries_waiting_on_the_relay_is_queue_full() {
 async fn unanswered_remote_directories_time_out_and_need_the_relay() {
     let mut w = World::new().await;
     let adapter = w.adapter();
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let listing = remote_directory(&w.bbs, hub_listing());
     let (rec, q) = asked(&mut peer).await;
     let err = listing.await.unwrap().unwrap_err();
@@ -2030,7 +2048,7 @@ async fn heartbeats_flow_and_a_silent_relay_is_cut() {
         &w.store,
         quick(Duration::from_millis(800)),
     );
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let mut beats = 0;
     let start = tokio::time::Instant::now();
     while let Some(f) = peer.next_any().await {
@@ -2041,7 +2059,7 @@ async fn heartbeats_flow_and_a_silent_relay_is_cut() {
     // The stream ended: the adapter cut the silent relay.
     assert!(beats >= 3, "{beats} heartbeats");
     assert!(start.elapsed() < Duration::from_secs(5), "cut in time");
-    let _again = w.relay.accept().await;
+    let _again = w.relay.accept(&adapter).await;
     adapter.stop().await.unwrap();
 }
 
@@ -2092,7 +2110,7 @@ async fn a_relay_that_stops_reading_is_cut_and_untaken_transfers_go_next_time() 
             }
         }
     });
-    let mut second = timeout(Duration::from_secs(15), w.relay.accept())
+    let mut second = timeout(Duration::from_secs(15), w.relay.accept(&adapter))
         .await
         .expect("the adapter cut the stream and reconnected");
     beating.abort();
@@ -2155,7 +2173,7 @@ async fn heartbeats_go_ahead_of_a_full_transfer_queue() {
         &w.store,
         quick(Duration::from_secs(10)),
     );
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let mut transfers = 0;
     // Heartbeats seen while the queue is still full of transfers: after the
     // first tenth has gone and before the last tenth.
@@ -2194,7 +2212,7 @@ async fn trust_changes_are_retried_until_applied() {
         &w.store,
         quick(Duration::from_secs(10)),
     );
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     peer.send(F::TrustChanged(mp::TrustChanged {
         namespace: "lab".into(),
     }))
@@ -2238,7 +2256,7 @@ async fn trust_changes_coalesce_and_permanent_refusals_stop() {
         &w.store,
         quick(Duration::from_secs(10)),
     );
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let changed = |namespace: &str| {
         F::TrustChanged(mp::TrustChanged {
             namespace: namespace.into(),
@@ -2303,7 +2321,7 @@ async fn a_refused_route_claim_is_retried_on_a_new_stream() {
     while let Some(f) = first.next_any().await {
         assert!(matches!(f, F::Heartbeat(_)), "{f:?}");
     }
-    let mut second = w.relay.accept().await;
+    let mut second = w.relay.accept(&adapter).await;
     let F::Transfer(t) = second.next().await else {
         panic!("the send goes once the route is accepted");
     };
@@ -2320,7 +2338,7 @@ async fn stopping_ends_the_relay_session() {
         settings(free_addr(), w.relay.addr, "unused", "bbs"),
         &w.store,
     );
-    let mut peer = w.relay.accept().await;
+    let mut peer = w.relay.accept(&adapter).await;
     let path = w.store.clone();
     eventually("the route is registered", || {
         Store::open_read_only(&path)
