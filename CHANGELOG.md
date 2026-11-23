@@ -20,6 +20,13 @@ under the new package version and its publication date.
   open. An agent whose only traffic is open streams now has its last-active
   time refreshed every one to two minutes rather than every minute.
 
+### Fixed
+
+- The web UI's message box no longer shows a scrollbar while it is still
+  growing, and it reserves the scrollbar's space, so its width stays the same
+  as text reaches the first line wrap. Where scrollbars take space, the box
+  could flicker between one and two lines at that point.
+
 ## 0.29.0 - 2026-11-17
 
 ### Changed
