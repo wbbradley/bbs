@@ -120,8 +120,7 @@ pub fn history(conn: &Connection, root: i64, before: i64, limit: usize) -> Resul
 /// Counts and pages use exactly the same predicate: blockers an agent
 /// created, or that a human's agents created.
 const SCOPE: &str = "(?1 IS NULL OR b.creator_id = ?1)
-    AND (?2 IS NULL OR EXISTS(SELECT 1 FROM agent_owners o
-                              WHERE o.agent_id = b.creator_id AND o.human_id = ?2))";
+    AND (?2 IS NULL OR b.creator_id IN (SELECT agent_id FROM agent_owners WHERE human_id = ?2))";
 
 pub enum ListMode {
     All { include_closed: bool, after: i64 },

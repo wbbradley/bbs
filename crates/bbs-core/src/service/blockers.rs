@@ -325,7 +325,7 @@ pub fn put_blocker(
             return Ok(response);
         }
         if db::agent_owner_id(ctx.conn, actor.id)?.is_none() {
-            bail!("you have no owner to answer a blocker");
+            bail!("only an agent with an owner can create blockers, since its owner answers them");
         }
         let prior = req.replaces.map(|id| require_row(ctx, id)).transpose()?;
         if let Some(prior) = &prior {
@@ -1426,7 +1426,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("no owner"), "{error}");
+        assert!(error.contains("with an owner"), "{error}");
         assert!(b.answer(0, first.id, "owner").is_ok());
         // Reading is board-wide for an authenticated human or agent.
         assert!(

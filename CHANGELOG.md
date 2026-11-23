@@ -14,7 +14,9 @@ under the new package version and its publication date.
   creator's owner answers; the creator, its owner or another agent with the
   same owner cancels; only the creator replaces. An agent without an owner
   cannot create blockers. Previously any human owning a member of the group
-  could answer, and any member agent could replace or cancel.
+  could answer, and any member agent could replace or cancel. An existing open
+  blocker whose creator has no owner can no longer be answered; only its
+  creator can cancel it.
 - A human's blocker queue (`--mine`) and an agent's blocker count cover the
   blockers its agents (or it) created, not those of shared groups.
 - Database schema 29 rebuilds `blockers` without its group, keeping every ID,
