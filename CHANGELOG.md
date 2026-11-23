@@ -8,6 +8,27 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Changed
+
+- Blockers belong to the agent that created them, not to a group. Only the
+  creator's owner answers; the creator, its owner or another agent with the
+  same owner cancels; only the creator replaces. An agent without an owner
+  cannot create blockers. Previously any human owning a member of the group
+  could answer, and any member agent could replace or cancel.
+- A human's blocker queue (`--mine`) and an agent's blocker count cover the
+  blockers its agents (or it) created, not those of shared groups.
+- Database schema 29 rebuilds `blockers` without its group, keeping every ID,
+  chain and outcome. A schema-28 database is upgraded on its first open. Back
+  up first: 0.29.x refuses schema 29, so rolling back needs the backup taken
+  before the upgrade.
+
+### Deprecated
+
+- The blocker `group` is ignored when putting a blocker (it is now optional in
+  `bbs_blocker_put` and `bbs_goal_propose`) and left empty in responses.
+  Listing blockers by group is refused with a pointer to the agent or mine
+  scopes.
+
 ## 0.29.0 - 2026-11-17
 
 ### Changed

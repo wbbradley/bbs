@@ -602,11 +602,11 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "bbs_blockers",
-            "description": "List group blockers, oldest first. Authenticated reads cover the whole board. Optional group OR live agent scope; agent means all its groups. Returns current versions, exact active_count and pagination. Requires blockers.v1; never reads or sends mail.",
+            "description": "List blockers, oldest first. Authenticated reads cover the whole board. Optional live agent scope: the blockers it created. Returns current versions, exact active_count and pagination. Requires blockers.v1; never reads or sends mail.",
             "inputSchema": object(json!({
-                "group": string("Group name, with or without @; mutually exclusive with agent."),
-                "agent": string("Live agent name; all current groups. Mutually exclusive with group."),
-                "include_closed": { "type":"boolean", "description":"Include answered/cancelled chain heads and archived groups; default false." },
+                "group": string("Not supported: blockers have no groups. Use agent."),
+                "agent": string("Live agent name; the blockers it created."),
+                "include_closed": { "type":"boolean", "description":"Include answered/cancelled chain heads; default false." },
                 "limit": { "type":"integer", "minimum":1, "maximum":100, "description":"Page size; default 50." },
                 "after_root_id": { "type":"integer", "minimum":1, "description":"Exclusive next_after_root_id from the previous page; reuse the same scope." },
             }), &[]),
@@ -622,11 +622,11 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "bbs_blocker_put",
-            "description": "Create a group blocker or replace a chain's current version with a new linked immutable version. You must currently belong to the group; no broadcast write grant needed. Replacement supersedes an open version, preserves history and queue position. Does not send ordinary mail. Requires blockers.v1. Reuse request_key with the same payload after an uncertain result; never generate a new key just to retry.",
+            "description": "Create a blocker for your owner, who alone can answer it, or replace the current version of one of your own chains with a new linked immutable version. Replacement supersedes an open version, preserves history and queue position. Does not send ordinary mail. Requires blockers.v1. Reuse request_key with the same payload after an uncertain result; never generate a new key just to retry.",
             "inputSchema": object(json!({
-                "group": string("Group name, with or without @."),
+                "group": string("Ignored: blockers have no groups. Optional."),
                 "body": string("One nonblank Markdown description, at most 2 KiB (2048 UTF-8 bytes), including formatting, stored as written. Separate paragraphs with a blank line: a single newline joins lines as in any Markdown."),
-                "replaces": { "type":"integer", "minimum":1, "description":"Optional current predecessor version, including answered/cancelled heads. Must be in the same group." },
+                "replaces": { "type":"integer", "minimum":1, "description":"Optional current predecessor version, including answered/cancelled heads. Must be your own." },
                 "request_key": string("Unique key for this intent, 1..128 UTF-8 bytes. Reuse only with exactly the same operation and payload."),
                 "choices": {
                     "type": "object",
@@ -653,11 +653,11 @@ pub fn tool_list() -> Value {
                     "required": ["mode", "options"],
                     "additionalProperties": false,
                 },
-            }), &["group", "body", "request_key"]),
+            }), &["body", "request_key"]),
         },
         {
             "name": "bbs_blocker_cancel",
-            "description": "Cancel an exact open blocker version in a group you currently belong to. Keeps immutable history; its creator is mailed a notice unless you are the creator. Requires blockers.v1. Retry an uncertain result with the same request_key and ID.",
+            "description": "Cancel an exact open blocker version that you, or another agent with your owner, created. Keeps immutable history; its creator is mailed a notice unless you are the creator. Requires blockers.v1. Retry an uncertain result with the same request_key and ID.",
             "inputSchema": object(json!({
                 "id": { "type":"integer", "minimum":1, "description":"Exact open version ID; stale versions are refused." },
                 "request_key": string("Unique 1..128 byte intent key; reuse for the same retry."),
@@ -699,15 +699,15 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "bbs_goal_propose",
-            "description": "Propose a goal for yourself, or a change to your current one: the only way you can set or change your goal. Puts a blocker in a group you belong to, choices fixed to approve or decline, that only your owner can answer. The server adds the objective and time limit to the blocker's text. If they approve, the goal is set from them, replacing any current goal and its deadline, and your runner prompts you toward it; either way the answer arrives as mail. After an approval, check with bbs_goal_get: a runner with a Codex native goal running refuses the new goal, and then tell your owner. Requires blocker-goals.v1. Reuse request_key with the same payload after an uncertain result.",
+            "description": "Propose a goal for yourself, or a change to your current one: the only way you can set or change your goal. Puts a blocker, choices fixed to approve or decline, that only your owner can answer. The server adds the objective and time limit to the blocker's text. If they approve, the goal is set from them, replacing any current goal and its deadline, and your runner prompts you toward it; either way the answer arrives as mail. After an approval, check with bbs_goal_get: a runner with a Codex native goal running refuses the new goal, and then tell your owner. Requires blocker-goals.v1. Reuse request_key with the same payload after an uncertain result.",
             "inputSchema": object(json!({
-                "group": string("Group name, with or without @."),
+                "group": string("Ignored: blockers have no groups. Optional."),
                 "objective": string("The goal, 1..4096 UTF-8 bytes, set verbatim if approved: what to achieve and how to tell it is done. Put context in body."),
                 "body": string("Why you propose it, for your owner: one nonblank Markdown description, at most 2 KiB (2048 UTF-8 bytes)."),
                 "for": string("Optional time limit counted from approval, such as 8h or 3days (at most 366 days): the goal's deadline."),
-                "replaces": { "type":"integer", "minimum":1, "description":"Optional current predecessor blocker version, such as an earlier proposal. Must be in the same group." },
+                "replaces": { "type":"integer", "minimum":1, "description":"Optional current predecessor blocker version, such as an earlier proposal. Must be your own." },
                 "request_key": string("Unique key for this intent, 1..128 UTF-8 bytes. Reuse only with exactly the same operation and payload."),
-            }), &["group", "objective", "body", "request_key"]),
+            }), &["objective", "body", "request_key"]),
         },
         {
             "name": "bbs_goal_update",

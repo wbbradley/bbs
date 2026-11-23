@@ -1480,11 +1480,10 @@ mod tests {
     #[tokio::test]
     async fn a_refused_blocker_answer_leaves_polling_working() {
         let (_dir, conn, opener, _) = board();
-        // A board-wide poll would expose this unrelated group's blocker.
+        // A board-wide poll would expose this blocker; ada does not own Mateo.
         conn.execute_batch(
-            "INSERT INTO bbs_groups (id, name, created_at) VALUES (1, 'elsewhere', 't');
-             INSERT INTO blockers (group_id, creator_id, body, created_at, request_key)
-             VALUES (1, 1, 'not in the personal queue', 't', 'unrelated')",
+            "INSERT INTO blockers (creator_id, body, created_at, request_key)
+             VALUES (1, 'not in the personal queue', 't', 'unrelated')",
         )
         .unwrap();
         let backend = Backend::open(&opener.config, &opener.dir, opener.caller.clone())

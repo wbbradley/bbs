@@ -135,8 +135,7 @@ agent's owner.
 ### Blockers
 
 `bbs connect` keeps one queue of your blockers (`blockers-mine.v1`): every open
-blocker in a current group that has a live agent of yours, whoever created it,
-each listed once and labelled with its current version number and group. The
+blocker that an agent of yours created, each listed once and labelled with its current version number and group. The
 app polls it about once a second, one request at a time, whichever screen is
 up. While any are open, the right end of the status bar shows
 `[N blockers · F2]` on the warning colour, on every screen, ahead of a
@@ -376,11 +375,10 @@ applies to live arrivals while the conversation is active. Covering it with
 help defers marking until you return; closed conversations do not mark arrivals.
 The Agents list sorts by open blocker count descending, then ACTIVE age
 ascending (most recently active first), then agent name. BLOCKERS appears
-before INBOX and counts open blockers across all of the agent's current active
-groups, including blockers created by other agents. Replaced, answered,
-cancelled and archived-group blockers do not count. The agent list supplies
+before INBOX and counts the open blockers the agent created. Replaced, answered and
+cancelled blockers do not count. The agent list supplies
 the initial counts; the app's shared `WatchAgentSummary` stream updates them
-when blockers or memberships change. A server without the count field shows
+when blockers change. A server without the count field shows
 `-` rather than claiming there are no blockers.
 
 INBOX (✉) counts unread mail and ACTIVITY (•) unseen activity, each capped at

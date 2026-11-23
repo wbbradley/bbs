@@ -264,13 +264,13 @@ fn version_reports_identity_without_side_effects() {
             );
             assert_eq!(report["protocol"]["epoch"], 3);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
-            assert_eq!(report["schema_version"], 28);
+            assert_eq!(report["schema_version"], 29);
             assert_eq!(report["config_format"], 4);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {
             assert!(stdout.starts_with(&format!("bbs {} (", env!("CARGO_PKG_VERSION"))));
             assert!(stdout.contains("\nprotocol bbs.v2, epoch 3: "), "{stdout}");
-            assert!(stdout.contains("\nschema 28, "), "{stdout}");
+            assert!(stdout.contains("\nschema 29, "), "{stdout}");
         }
     }
     assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
@@ -2617,8 +2617,8 @@ fn blocker_tools_and_cli_keep_versions_retries_and_answer_delivery(mode: Mode) {
     let list: Value = serde_json::from_str(&bbs.ok(&[
         "blocker",
         "list",
-        "--group",
-        "crew",
+        "--agent",
+        &agent,
         "--include-closed",
         "--json",
     ]))
@@ -2646,6 +2646,16 @@ fn blocker_tools_and_cli_keep_versions_retries_and_answer_delivery(mode: Mode) {
         bbs.err(&["blocker", "list", "--group", "crew", "--agent", &agent])
             .contains("cannot be used")
     );
+    assert!(
+        bbs.err(&["blocker", "list", "--group", "crew"])
+            .contains("blockers have no groups")
+    );
+    // The group is optional and ignored.
+    let ungrouped = success(
+        "bbs_blocker_put",
+        json!({"body":"No group needed","request_key":"ungrouped"}),
+    );
+    assert_eq!(ungrouped["blocker"]["group"], "");
 }
 
 fn blocker_choices_are_checked_in_the_tool_and_answered_by_selection(mode: Mode) {

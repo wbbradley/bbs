@@ -1315,8 +1315,8 @@ fn preamble(agent: &str, owner: &str, instructions: Option<&str>, timers: bool) 
          entities in another namespace such as hub, each with the id:ENTITY@NAMESPACE that \
          bbs_send accepts. bbs_search searches the whole board \
          by literal message text, including other conversations. You can also join and leave \
-         groups. bbs_blockers lists group help requests; bbs_blocker_put creates or replaces \
-         one with immutable history, bbs_blocker_get reads its chain, and bbs_blocker_cancel \
+         groups. bbs_blockers lists help requests; bbs_blocker_put creates or replaces \
+         one for your owner to answer, with immutable history, bbs_blocker_get reads its chain, and bbs_blocker_cancel \
          cancels it. Creation sends no ordinary mail; a human answer arrives as mail.\n\n\
          Direct messages from your owning human arrive as plain user input. Other mail \
          includes BBS sender and recipient headers with each message's id; humans there are marked (human). If a message needs \

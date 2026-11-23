@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
-use super::{Caller, Ctx, group_name, principal, require_group, with_ctx};
+use super::{Caller, Ctx, principal, with_ctx};
 use crate::db::{self, Kind, Principal, blockers as store};
 use crate::{blocker_choices, proto};
 
@@ -37,18 +37,25 @@ fn page(limit: Option<u32>, default: u32) -> Result<usize> {
     Ok(limit as usize)
 }
 
-fn manages(ctx: &Ctx<'_>, actor: &Principal, group: i64) -> Result<bool> {
-    match actor.kind {
-        Kind::Agent => db::is_member(ctx.conn, group, actor.id),
-        Kind::Human => store::human_owns_member(ctx.conn, group, actor.id),
-    }
+/// Only the creating agent's owner answers its blockers.
+fn may_answer(ctx: &Ctx<'_>, actor: &Principal, row: &store::Row) -> Result<bool> {
+    Ok(
+        actor.kind == Kind::Human
+            && db::agent_owner_id(ctx.conn, row.creator.id)? == Some(actor.id),
+    )
 }
 
-fn authorize(ctx: &Ctx<'_>, actor: &Principal, group: i64) -> Result<()> {
-    if !manages(ctx, actor, group)? {
-        bail!("blocker writes require current group membership or ownership of a current member");
-    }
-    Ok(())
+/// The creating agent, its owner, or another agent with the same owner
+/// cancels.
+fn may_cancel(ctx: &Ctx<'_>, actor: &Principal, row: &store::Row) -> Result<bool> {
+    let owner = db::agent_owner_id(ctx.conn, row.creator.id)?;
+    Ok(match actor.kind {
+        Kind::Human => owner == Some(actor.id),
+        Kind::Agent => {
+            actor.id == row.creator.id
+                || (owner.is_some() && db::agent_owner_id(ctx.conn, actor.id)? == owner)
+        }
+    })
 }
 
 fn require_row(ctx: &Ctx<'_>, id: i64) -> Result<store::Row> {
@@ -75,14 +82,6 @@ fn proposed_goal(row: &store::Row) -> Result<Option<proto::BlockerGoal>> {
         .flatten())
 }
 
-/// Only an agent's owner can set its goal, so only they answer its proposal.
-fn answers_goal(ctx: &Ctx<'_>, actor: &Principal, row: &store::Row) -> Result<bool> {
-    Ok(
-        actor.kind == Kind::Human
-            && db::agent_owner_id(ctx.conn, row.creator.id)? == Some(actor.id),
-    )
-}
-
 fn selected(json: Option<&str>) -> Result<Vec<String>> {
     Ok(json
         .map(serde_json::from_str)
@@ -91,13 +90,11 @@ fn selected(json: Option<&str>) -> Result<Vec<String>> {
 }
 
 fn as_proto(ctx: &Ctx<'_>, actor: &Principal, row: store::Row) -> Result<proto::Blocker> {
-    let open = row.outcome.is_none() && row.replaced_by.is_none() && !row.archived;
-    let can_cancel = open && manages(ctx, actor, row.group_id)?;
+    let open = row.outcome.is_none() && row.replaced_by.is_none();
+    let can_cancel = open && may_cancel(ctx, actor, &row)?;
     let goal = proposed_goal(&row)?;
-    let can_answer = can_cancel
-        && actor.kind == Kind::Human
-        && db::agent_is_live(ctx.conn, row.creator.id)?
-        && (goal.is_none() || answers_goal(ctx, actor, &row)?);
+    let can_answer =
+        open && may_answer(ctx, actor, &row)? && db::agent_is_live(ctx.conn, row.creator.id)?;
     let status = match row.outcome.as_ref().map(|e| e.kind.as_str()) {
         Some("answered") => proto::BlockerStatus::BlockerAnswered,
         Some("cancelled") => proto::BlockerStatus::BlockerCancelled,
@@ -129,8 +126,6 @@ fn as_proto(ctx: &Ctx<'_>, actor: &Principal, row: store::Row) -> Result<proto::
         .transpose()?;
     Ok(proto::Blocker {
         id: row.id,
-        group_id: row.group_id,
-        group: row.group,
         creator: Some(creator),
         body: row.body,
         created_at: row.created_at,
@@ -143,6 +138,8 @@ fn as_proto(ctx: &Ctx<'_>, actor: &Principal, row: store::Row) -> Result<proto::
         can_cancel,
         choices,
         goal,
+        // Blockers have no group; old clients get it empty.
+        ..Default::default()
     })
 }
 
@@ -152,13 +149,11 @@ pub fn list_blockers(
     req: proto::ListBlockersRequest,
 ) -> Result<proto::ListBlockersResponse> {
     let limit = page(req.limit, 50)?;
-    if [req.group.is_some(), req.agent.is_some(), req.mine]
-        .into_iter()
-        .filter(|s| *s)
-        .count()
-        > 1
-    {
-        bail!("blocker group, agent and mine scopes are mutually exclusive");
+    if req.group.is_some() {
+        bail!("blockers have no groups; list by agent or mine instead");
+    }
+    if req.agent.is_some() && req.mine {
+        bail!("blocker agent and mine scopes are mutually exclusive");
     }
     if let Some(id) = req.after_root_id {
         positive(id, "root cursor")?;
@@ -179,12 +174,6 @@ pub fn list_blockers(
         } else {
             None
         };
-        let group = req.group.as_deref().map(group_name);
-        if let Some(name) = group
-            && db::group_ids_named(ctx.conn, name)?.is_empty()
-        {
-            bail!("no such group @{name}");
-        }
         let agent = req
             .agent
             .as_ref()
@@ -196,7 +185,6 @@ pub fn list_blockers(
             .transpose()?;
         let mut rows = store::list(
             ctx.conn,
-            group,
             agent,
             human,
             if req.closed_only {
@@ -219,7 +207,7 @@ pub fn list_blockers(
                 .into_iter()
                 .map(|r| as_proto(ctx, &actor, r))
                 .collect::<Result<_>>()?,
-            active_count: store::active_count(ctx.conn, group, agent, human)?,
+            active_count: store::active_count(ctx.conn, agent, human)?,
             has_more,
             next_after_root_id: if req.closed_only { None } else { cursor },
             next_before_root_id: if req.closed_only { cursor } else { None },
@@ -328,24 +316,21 @@ pub fn put_blocker(
     };
     with_ctx(conn, caller, |ctx| {
         let actor = ctx.agent()?;
-        let groups = db::group_ids_named(ctx.conn, group_name(&req.group))?;
+        // `group` is ignored: blockers belong to their creator.
         if let Some(response) = replay(ctx, &actor, &req.request_key, |op| {
             matches!(op,
-            store::Operation::Put { group: old_group, body: old_body, replaces, choices: old_choices, .. }
-            if groups.contains(old_group) && *old_body == body && *replaces == req.replaces
-                && *old_choices == choices)
+            store::Operation::Put { body: old_body, replaces, choices: old_choices, .. }
+            if *old_body == body && *replaces == req.replaces && *old_choices == choices)
         })? {
             return Ok(response);
         }
-        let group = require_group(ctx.conn, group_name(&req.group))?;
-        authorize(ctx, &actor, group)?;
-        if req.goal.is_some() && db::agent_owner_id(ctx.conn, actor.id)?.is_none() {
-            bail!("you have no owner to approve a goal");
+        if db::agent_owner_id(ctx.conn, actor.id)?.is_none() {
+            bail!("you have no owner to answer a blocker");
         }
         let prior = req.replaces.map(|id| require_row(ctx, id)).transpose()?;
         if let Some(prior) = &prior {
-            if prior.group_id != group {
-                bail!("a blocker replacement must stay in the same group");
+            if prior.creator.id != actor.id {
+                bail!("only blocker #{}'s creator can replace it", prior.id);
             }
             if prior.replaced_by.is_some() {
                 bail!(
@@ -356,7 +341,6 @@ pub fn put_blocker(
         }
         let id = store::insert(
             ctx.conn,
-            group,
             actor.id,
             store::Version {
                 body: &body,
@@ -417,18 +401,14 @@ pub fn answer_blocker(
         })? {
             return Ok(response);
         }
-        authorize(ctx, &actor, row.group_id)?;
+        if !may_answer(ctx, &actor, &row)? {
+            bail!("only {}'s owner can answer its blockers", row.creator.name);
+        }
         require_open(&row)?;
         if !db::agent_is_live(ctx.conn, row.creator.id)? {
             bail!("creating agent is retired; cancel or replace this blocker instead");
         }
         let goal = proposed_goal(&row)?;
-        if goal.is_some() && !answers_goal(ctx, &actor, &row)? {
-            bail!(
-                "only {}'s owner can answer its goal proposal",
-                row.creator.name
-            );
-        }
         let answer = answer?;
         text(&answer.text, "answer")?;
         // Approval sets the goal as the owner's own goal-set would, before the
@@ -491,7 +471,12 @@ pub fn cancel_blocker(
             return Ok(response);
         }
         let row = require_row(ctx, req.id)?;
-        authorize(ctx, &actor, row.group_id)?;
+        if !may_cancel(ctx, &actor, &row)? {
+            bail!(
+                "only {}, its owner, or another of its owner's agents can cancel its blockers",
+                row.creator.name
+            );
+        }
         require_open(&row)?;
         // Tell the creator, as an answer would, unless it cancelled its own.
         let mut message_id = None;
@@ -549,23 +534,14 @@ mod tests {
                     ..Default::default()
                 }
             });
-            service::group_register(
-                &mut conn,
-                &humans[0],
-                proto::GroupRegisterRequest {
-                    group: "crew".into(),
-                    description: None,
-                },
-            )
-            .unwrap();
             let mut ids = Vec::new();
-            let agents = ["Mateo", "Zed", "Lu"]
+            // will owns Mateo and Zed, ada owns Lu, and external owns none.
+            let agents = [("Mateo", 0), ("Zed", 0), ("Lu", 1)]
                 .into_iter()
-                .enumerate()
-                .map(|(i, name)| {
+                .map(|(name, owner)| {
                     let registration = service::register(
                         &mut conn,
-                        &humans[i],
+                        &humans[owner],
                         proto::RegisterRequest {
                             name: Some(name.into()),
                             ..Default::default()
@@ -577,16 +553,6 @@ mod tests {
                         ..Default::default()
                     };
                     ids.push(service::whoami(&mut conn, &caller).unwrap().id);
-                    if i < 2 {
-                        service::group_join(
-                            &mut conn,
-                            &caller,
-                            proto::GroupRequest {
-                                group: "crew".into(),
-                            },
-                        )
-                        .unwrap();
-                    }
                     caller
                 })
                 .collect::<Vec<_>>()
@@ -617,10 +583,10 @@ mod tests {
                 proto::PutBlockerRequest {
                     goal: None,
                     choices: None,
-                    group: "crew".into(),
                     body: body.into(),
                     replaces,
                     request_key: key.into(),
+                    ..Default::default()
                 },
             )
             .unwrap()
@@ -693,29 +659,11 @@ mod tests {
             "replace-oldest",
         );
         b.answer(0, replacement.id, "answer-replacement").unwrap();
-        service::group_register(
-            &mut b.conn,
-            &b.humans[2],
-            proto::GroupRegisterRequest {
-                group: "elsewhere".into(),
-                description: None,
-            },
-        )
-        .unwrap();
-        service::group_join(
-            &mut b.conn,
-            &b.agents[2],
-            proto::GroupRequest {
-                group: "elsewhere".into(),
-            },
-        )
-        .unwrap();
+        // Another owner's closed blocker stays out of will's queue.
         let hidden = put_blocker(
             &mut b.conn,
             &b.agents[2],
             proto::PutBlockerRequest {
-                goal: None,
-                group: "elsewhere".into(),
                 body: "not your queue".into(),
                 request_key: "hidden".into(),
                 ..Default::default()
@@ -724,7 +672,7 @@ mod tests {
         .unwrap()
         .blocker
         .unwrap();
-        b.answer(2, hidden.id, "answer-hidden").unwrap();
+        b.answer(1, hidden.id, "answer-hidden").unwrap();
         let list = |b: &mut Board, before_root_id| {
             list_blockers(
                 &mut b.conn,
@@ -787,15 +735,6 @@ mod tests {
                 .windows(2)
                 .all(|p| p[0].root_id < p[1].root_id)
         );
-        service::group_leave(
-            &mut b.conn,
-            &b.agents[0],
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
-        assert!(list(&mut b, None).blockers.is_empty());
         assert!(
             list_blockers(
                 &mut b.conn,
@@ -848,11 +787,11 @@ mod tests {
         for replaces in [None, Some(original.id)] {
             let req = proto::PutBlockerRequest {
                 goal: None,
-                group: "crew".into(),
                 body: format!("{body}x"),
                 replaces,
                 request_key: "oversized".into(),
                 choices: None,
+                ..Default::default()
             };
             let error = put_blocker(&mut b.conn, &b.agents[0], req)
                 .unwrap_err()
@@ -866,7 +805,6 @@ mod tests {
             });
             let req = proto::PutBlockerRequest {
                 goal: None,
-                group: "crew".into(),
                 body: "short".into(),
                 replaces,
                 request_key: "oversized".into(),
@@ -876,6 +814,7 @@ mod tests {
                     min: None,
                     max: None,
                 }),
+                ..Default::default()
             };
             let error = put_blocker(&mut b.conn, &b.agents[0], req)
                 .unwrap_err()
@@ -917,12 +856,10 @@ mod tests {
         };
         let json = blocker_choices::to_json(&choices);
         assert!(json.len() > crate::blocker_limits::MAX_CHOICES_BYTES);
-        let group = db::group_ids_named(&b.conn, "crew").unwrap()[0];
         let body = "legacy".repeat(500);
         let now = "2026-11-02T00:00:00Z";
         let id = store::insert(
             &b.conn,
-            group,
             b.ids[0],
             store::Version {
                 body: &body,
@@ -969,35 +906,8 @@ mod tests {
     }
 
     #[test]
-    fn personal_queue_filters_before_paging_and_tracks_current_owned_groups() {
+    fn personal_queue_filters_before_paging_and_tracks_owned_agents() {
         let mut b = Board::memory();
-        let join = |b: &mut Board, who: &Caller, group: &str| {
-            service::group_join(
-                &mut b.conn,
-                who,
-                proto::GroupRequest {
-                    group: group.into(),
-                },
-            )
-            .unwrap();
-        };
-        let put = |b: &mut Board, who: &Caller, group: &str, key: &str| {
-            put_blocker(
-                &mut b.conn,
-                who,
-                proto::PutBlockerRequest {
-                    goal: None,
-                    choices: None,
-                    group: group.into(),
-                    body: key.into(),
-                    request_key: key.into(),
-                    replaces: None,
-                },
-            )
-            .unwrap()
-            .blocker
-            .unwrap()
-        };
         let list = |b: &mut Board, who: &Caller, after: Option<i64>, closed: bool| {
             list_blockers(
                 &mut b.conn,
@@ -1014,79 +924,36 @@ mod tests {
         };
         let will = b.humans[0].clone();
         let ada = b.humans[1].clone();
-        let mateo = b.agents[0].clone();
         let zed = b.agents[1].clone();
-        let lu = b.agents[2].clone();
-        for name in ["unrelated", "release"] {
-            service::group_register(
-                &mut b.conn,
-                &will,
-                proto::GroupRegisterRequest {
-                    group: name.into(),
-                    description: None,
-                },
-            )
-            .unwrap();
-            join(&mut b, &lu, name);
-        }
-        let unrelated = put(&mut b, &lu, "unrelated", "oldest but not mine");
-        let crew = put(&mut b, &zed, "crew", "another owner's blocker");
-        let release = put(&mut b, &lu, "release", "release approval");
-        let extra = service::register(
-            &mut b.conn,
-            &will,
-            proto::RegisterRequest {
-                name: Some("Helper".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let helper = Caller {
-            token: Some(extra.token),
-            ..Default::default()
-        };
-        join(&mut b, &helper, "crew");
-        join(&mut b, &helper, "release");
-        // Two owned members in crew, and a second group, never duplicate rows.
+        let other = b.put(2, "oldest but not mine", None, "other");
+        let mateo = b.put(0, "Mateo's question", None, "mateo");
+        let zeds = b.put(1, "Zed's question", None, "zed");
+        // Both owned agents, paged in root order, and nobody else's.
         let first = list(&mut b, &will, None, false);
         assert_eq!(first.active_count, 2);
         assert_eq!(
             first.blockers.iter().map(|b| b.id).collect::<Vec<_>>(),
-            [crew.id]
+            [mateo.id]
         );
-        assert_ne!(first.blockers[0].id, unrelated.id);
         assert!(first.has_more);
         assert!(first.blockers[0].can_answer && first.blockers[0].can_cancel);
         let second = list(&mut b, &will, first.next_after_root_id, false);
-        assert_eq!(second.active_count, 2);
-        assert_eq!(second.blockers[0].id, release.id);
+        assert_eq!(second.blockers[0].id, zeds.id);
         assert!(!second.has_more);
+        let theirs = list(&mut b, &ada, None, false);
+        assert_eq!(theirs.active_count, 1);
+        assert_eq!(theirs.blockers[0].id, other.id);
         // Replace in place: only the open head is returned at its original age.
-        let current = b.put(1, "updated question", Some(crew.id), "replace-personal");
-        let first = list(&mut b, &will, None, false);
-        assert_eq!(first.active_count, 2);
-        assert_eq!(first.blockers[0].id, current.id);
-        assert_eq!(first.blockers[0].root_id, crew.root_id);
-        // A retired creator still needs cancellation by another group's owner.
+        let current = b.put(1, "updated question", Some(zeds.id), "replace-personal");
+        let second = list(&mut b, &will, first.next_after_root_id, false);
+        assert_eq!(second.active_count, 2);
+        assert_eq!(second.blockers[0].id, current.id);
+        assert_eq!(second.blockers[0].root_id, zeds.root_id);
+        // A retired creator's blocker stays with its owner, to cancel.
         service::bye(&mut b.conn, &zed).unwrap();
-        let first = list(&mut b, &will, None, false);
-        assert_eq!(first.active_count, 2);
-        assert!(!first.blockers[0].can_answer && first.blockers[0].can_cancel);
-        assert_eq!(list(&mut b, &ada, None, false).active_count, 0);
-        // Leave removes only groups with no remaining live owned member.
-        service::group_leave(
-            &mut b.conn,
-            &mateo,
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
-        assert_eq!(list(&mut b, &will, None, false).active_count, 2);
-        service::bye(&mut b.conn, &helper).unwrap();
-        assert_eq!(list(&mut b, &will, None, false).active_count, 0);
-        join(&mut b, &mateo, "crew");
-        assert_eq!(list(&mut b, &will, None, false).active_count, 1);
+        let second = list(&mut b, &will, first.next_after_root_id, false);
+        assert_eq!(second.active_count, 2);
+        assert!(!second.blockers[0].can_answer && second.blockers[0].can_cancel);
         cancel_blocker(
             &mut b.conn,
             &will,
@@ -1096,63 +963,42 @@ mod tests {
             },
         )
         .unwrap();
-        let closed = list(&mut b, &will, None, true);
-        assert_eq!(closed.active_count, 0);
+        assert_eq!(list(&mut b, &will, None, false).active_count, 1);
+        let closed = list(&mut b, &will, first.next_after_root_id, true);
         assert_eq!(
             closed.blockers[0].status(),
             proto::BlockerStatus::BlockerCancelled
         );
-        service::group_delete(
-            &mut b.conn,
-            &will,
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
-        // Archived history is outside a queue based on current active groups.
-        assert!(list(&mut b, &will, None, true).blockers.is_empty());
-        crate::db::date_retired_entity_ids(&b.conn);
-        service::group_register(
-            &mut b.conn,
-            &will,
-            proto::GroupRegisterRequest {
-                group: "crew".into(),
-                description: None,
-            },
-        )
-        .unwrap();
-        join(&mut b, &mateo, "crew");
-        assert!(list(&mut b, &will, None, true).blockers.is_empty());
-        let fresh = put(&mut b, &mateo, "crew", "new group identity");
-        assert_eq!(list(&mut b, &will, None, false).blockers[0].id, fresh.id);
-        // Existing board-wide reads remain board-wide.
-        assert_eq!(b.list().active_count, 3);
+        // Board-wide reads remain board-wide.
+        assert_eq!(b.list().active_count, 2);
     }
 
     #[test]
     fn personal_queue_is_human_only_and_exclusive_with_other_scopes() {
         let mut b = Board::memory();
         b.put(0, "help", None, "personal-validation");
-        for req in [
-            proto::ListBlockersRequest {
-                mine: true,
-                group: Some("crew".into()),
-                ..Default::default()
-            },
-            proto::ListBlockersRequest {
-                mine: true,
-                agent: Some("Mateo".into()),
-                ..Default::default()
-            },
-        ] {
-            assert!(
-                list_blockers(&mut b.conn, &b.humans[0], req)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("mutually exclusive")
-            );
-        }
+        let req = proto::ListBlockersRequest {
+            mine: true,
+            agent: Some("Mateo".into()),
+            ..Default::default()
+        };
+        assert!(
+            list_blockers(&mut b.conn, &b.humans[0], req)
+                .unwrap_err()
+                .to_string()
+                .contains("mutually exclusive")
+        );
+        // Old clients that still list by group hear that groups are gone.
+        let req = proto::ListBlockersRequest {
+            group: Some("crew".into()),
+            ..Default::default()
+        };
+        assert!(
+            list_blockers(&mut b.conn, &b.humans[0], req)
+                .unwrap_err()
+                .to_string()
+                .contains("no groups")
+        );
         assert!(
             list_blockers(
                 &mut b.conn,
@@ -1166,7 +1012,7 @@ mod tests {
             .to_string()
             .contains("human")
         );
-        // A human without an owned group gets an empty personal queue, not the board.
+        // A human who owns no agents gets an empty personal queue, not the board.
         let empty = list_blockers(
             &mut b.conn,
             &b.humans[2],
@@ -1230,16 +1076,16 @@ mod tests {
         };
         check(&mut b, [0, 0, 0]);
         let a = b.put(0, "a", None, "a");
-        check(&mut b, [1, 1, 0]);
-        let a = b.put(1, "updated a", Some(a.id), "a2");
-        check(&mut b, [1, 1, 0]); // one open version, not two
+        check(&mut b, [1, 0, 0]);
+        let a = b.put(0, "updated a", Some(a.id), "a2");
+        check(&mut b, [1, 0, 0]); // one open version, not two
         let c = b.put(0, "c", None, "c");
-        check(&mut b, [2, 2, 0]); // count all, not just the returned page
+        check(&mut b, [2, 0, 0]); // count all, not just the returned page
         b.answer(0, a.id, "answer").unwrap();
-        check(&mut b, [1, 1, 0]);
+        check(&mut b, [1, 0, 0]);
         cancel_blocker(
             &mut b.conn,
-            &b.agents[0],
+            &b.agents[1],
             proto::CancelBlockerRequest {
                 id: c.id,
                 request_key: "cancel".into(),
@@ -1247,79 +1093,10 @@ mod tests {
         )
         .unwrap();
         check(&mut b, [0, 0, 0]);
-        service::group_register(
-            &mut b.conn,
-            &b.humans[0],
-            proto::GroupRegisterRequest {
-                group: "other".into(),
-                description: None,
-            },
-        )
-        .unwrap();
-        for i in [0, 2] {
-            service::group_join(
-                &mut b.conn,
-                &b.agents[i],
-                proto::GroupRequest {
-                    group: "other".into(),
-                },
-            )
-            .unwrap();
-        }
-        put_blocker(
-            &mut b.conn,
-            &b.agents[2],
-            proto::PutBlockerRequest {
-                goal: None,
-                choices: None,
-                group: "other".into(),
-                body: "other issue".into(),
-                request_key: "other".into(),
-                replaces: None,
-            },
-        )
-        .unwrap();
-        b.put(0, "new crew issue", None, "crew");
-        check(&mut b, [2, 1, 1]); // includes blockers created by someone else
-        service::group_leave(
-            &mut b.conn,
-            &b.agents[0],
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
-        check(&mut b, [1, 1, 1]);
-        service::group_delete(
-            &mut b.conn,
-            &b.humans[1],
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
-        check(&mut b, [1, 0, 1]);
-        crate::db::date_retired_entity_ids(&b.conn);
-        service::group_register(
-            &mut b.conn,
-            &b.humans[0],
-            proto::GroupRegisterRequest {
-                group: "crew".into(),
-                description: None,
-            },
-        )
-        .unwrap();
-        service::group_join(
-            &mut b.conn,
-            &b.agents[0],
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
-        check(&mut b, [1, 0, 1]); // archived identity never leaks into the new group
-        b.put(0, "new identity", None, "new-crew");
-        check(&mut b, [2, 0, 1]);
+        // Each agent counts the blockers it created, whoever owns it.
+        b.put(1, "Zed's issue", None, "zed");
+        b.put(2, "Lu's issue", None, "lu");
+        check(&mut b, [0, 1, 1]);
     }
 
     #[test]
@@ -1341,7 +1118,7 @@ mod tests {
         };
         let a = b.put(0, "a", None, "a");
         assert!(grew(&mut b), "created");
-        let a = b.put(1, "updated a", Some(a.id), "a2");
+        let a = b.put(0, "updated a", Some(a.id), "a2");
         assert!(grew(&mut b), "superseded");
         b.answer(0, a.id, "answer").unwrap();
         assert!(grew(&mut b), "answered");
@@ -1387,33 +1164,16 @@ mod tests {
             token: Some(registered.token),
             ..Default::default()
         };
-        service::group_register(
-            &mut b.conn,
-            &b.humans[0],
-            proto::GroupRegisterRequest {
-                group: "new-group".into(),
-                description: None,
-            },
-        )
-        .unwrap();
-        service::group_join(
-            &mut b.conn,
-            &mateo,
-            proto::GroupRequest {
-                group: "new-group".into(),
-            },
-        )
-        .unwrap();
         put_blocker(
             &mut b.conn,
             &mateo,
             proto::PutBlockerRequest {
                 goal: None,
                 choices: None,
-                group: "new-group".into(),
                 body: "new agent".into(),
                 request_key: "new".into(),
                 replaces: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1469,13 +1229,14 @@ mod tests {
             let actor = outcome.actor.unwrap();
             (actor.name, actor.owner)
         };
-        // Zed, ada's agent, supersedes Mateo's blocker and cancels its own.
-        let first = b.put(0, "Which option?", None, "first");
-        let second = b.put(1, "Which option, now with costs?", Some(first.id), "second");
+        // Lu, ada's agent, supersedes its blocker; Zed, will's, cancels Mateo's.
+        let first = b.put(2, "Which option?", None, "first");
+        b.put(2, "Which option, now with costs?", Some(first.id), "second");
         assert_eq!(
             owner_of(&mut b, first.id),
-            ("Zed".into(), Some("ada".into()))
+            ("Lu".into(), Some("ada".into()))
         );
+        let second = b.put(0, "Which branch?", None, "branch");
         cancel_blocker(
             &mut b.conn,
             &b.agents[1],
@@ -1487,7 +1248,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             owner_of(&mut b, second.id),
-            ("Zed".into(), Some("ada".into()))
+            ("Zed".into(), Some("will".into()))
         );
         // A human actor has no owner.
         let third = b.put(0, "Ship today?", None, "third");
@@ -1501,7 +1262,7 @@ mod tests {
         let before = b.messages();
         let old = b.put(0, "  Need a choice\nOption A or B?", None, "first");
         let next = b.put(
-            1,
+            0,
             "Need a choice, with updated estimates",
             Some(old.id),
             "replace",
@@ -1509,7 +1270,7 @@ mod tests {
         assert_eq!(b.messages(), before);
         assert_eq!(next.root_id, old.id);
         assert_eq!(next.replaces, Some(old.id));
-        assert_eq!(next.creator.as_ref().unwrap().id, b.ids[1]);
+        assert_eq!(next.creator.as_ref().unwrap().id, b.ids[0]);
         assert_eq!(b.list().active_count, 1);
         assert!(b.answer(0, old.id, "stale").is_err());
         assert_eq!(b.messages(), before);
@@ -1530,7 +1291,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(recipient, b.ids[1]);
+        assert_eq!(recipient, b.ids[0]);
         let history = get_blocker(
             &mut b.conn,
             &b.humans[2],
@@ -1589,10 +1350,12 @@ mod tests {
     }
 
     #[test]
-    fn blockers_check_current_membership_and_ownership_without_group_writer_grants() {
+    fn only_the_owner_answers_and_only_the_creator_replaces() {
         let mut b = Board::memory();
         let first = b.put(0, "Need help", None, "first");
-        assert!(b.answer(2, first.id, "foreign").is_err());
+        // Neither another owner, a human who owns no agents, nor an agent answers.
+        assert!(b.answer(1, first.id, "other-owner").is_err());
+        assert!(b.answer(2, first.id, "no-agents").is_err());
         assert!(
             answer_blocker(
                 &mut b.conn,
@@ -1609,26 +1372,8 @@ mod tests {
         assert!(
             put_blocker(
                 &mut b.conn,
-                &b.agents[2],
-                proto::PutBlockerRequest {
-                    goal: None,
-                    choices: None,
-                    group: "crew".into(),
-                    body: "not a member".into(),
-                    request_key: "foreign".into(),
-                    ..Default::default()
-                }
-            )
-            .is_err()
-        );
-        assert!(
-            put_blocker(
-                &mut b.conn,
                 &b.humans[0],
                 proto::PutBlockerRequest {
-                    goal: None,
-                    choices: None,
-                    group: "crew".into(),
                     body: "human create".into(),
                     request_key: "human".into(),
                     ..Default::default()
@@ -1636,24 +1381,54 @@ mod tests {
             )
             .is_err()
         );
-        // An eligible human can help a different owner's agent.
-        let next = b.put(
-            1,
-            "Updated by another group member",
-            Some(first.id),
-            "replace",
-        );
-        service::group_leave(
+        // Even an agent with the same owner cannot replace another's blocker.
+        let error = put_blocker(
             &mut b.conn,
-            &b.agents[0],
-            proto::GroupRequest {
-                group: "crew".into(),
+            &b.agents[1],
+            proto::PutBlockerRequest {
+                body: "Updated by a sibling".into(),
+                replaces: Some(first.id),
+                request_key: "replace".into(),
+                ..Default::default()
             },
         )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("creator can replace"), "{error}");
+        // A group named by an old client is ignored.
+        let grouped = put_blocker(
+            &mut b.conn,
+            &b.agents[2],
+            proto::PutBlockerRequest {
+                group: "no-such-group".into(),
+                body: "Still mine".into(),
+                request_key: "grouped".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .blocker
         .unwrap();
-        assert!(b.answer(0, next.id, "lost-membership").is_err());
-        assert!(b.answer(1, next.id, "own-member").is_ok());
-        // Reading is board-wide for an authenticated human or nonmember agent.
+        assert!(grouped.group.is_empty());
+        assert!(b.answer(1, grouped.id, "own-agent").is_ok());
+        // An agent without an owner has nobody to answer it.
+        b.conn
+            .execute("DELETE FROM agent_owners WHERE agent_id = ?1", [b.ids[2]])
+            .unwrap();
+        let error = put_blocker(
+            &mut b.conn,
+            &b.agents[2],
+            proto::PutBlockerRequest {
+                body: "Anyone?".into(),
+                request_key: "orphan".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no owner"), "{error}");
+        assert!(b.answer(0, first.id, "owner").is_ok());
+        // Reading is board-wide for an authenticated human or agent.
         assert!(
             get_blocker(
                 &mut b.conn,
@@ -1676,12 +1451,56 @@ mod tests {
     }
 
     #[test]
+    fn the_creator_its_owner_and_its_owners_agents_cancel() {
+        let mut b = Board::memory();
+        let cancel = |b: &mut Board, by: &Caller, id: i64, key: &str| {
+            cancel_blocker(
+                &mut b.conn,
+                by,
+                proto::CancelBlockerRequest {
+                    id,
+                    request_key: key.into(),
+                },
+            )
+        };
+        let first = b.put(0, "Which branch?", None, "first");
+        for (by, key) in [
+            (b.humans[1].clone(), "ada"),
+            (b.humans[2].clone(), "external"),
+            (b.agents[2].clone(), "lu"),
+        ] {
+            let error = cancel(&mut b, &by, first.id, key).unwrap_err().to_string();
+            assert!(error.contains("its owner"), "{error}");
+        }
+        let by = b.agents[1].clone();
+        assert!(cancel(&mut b, &by, first.id, "zed").is_ok());
+        let second = b.put(0, "Which tag?", None, "second");
+        let by = b.humans[0].clone();
+        assert!(cancel(&mut b, &by, second.id, "will").is_ok());
+        let third = b.put(0, "Which day?", None, "third");
+        let by = b.agents[0].clone();
+        assert!(cancel(&mut b, &by, third.id, "mateo").is_ok());
+        // Once cancelled, nobody cancels or answers it.
+        let blocker = get_blocker(
+            &mut b.conn,
+            &b.agents[1],
+            proto::GetBlockerRequest {
+                id: first.id,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .blocker
+        .unwrap();
+        assert!(!blocker.can_cancel && !blocker.can_answer);
+    }
+
+    #[test]
     fn blocker_receipts_refuse_payload_or_operation_reuse_and_replay_without_new_mail() {
         let mut b = Board::memory();
         let request = proto::PutBlockerRequest {
             goal: None,
             choices: None,
-            group: "crew".into(),
             body: "Original".into(),
             request_key: "key".into(),
             ..Default::default()
@@ -1710,27 +1529,27 @@ mod tests {
             id,
             request_key: "cancel".into(),
         };
-        let one = cancel_blocker(&mut b.conn, &b.humans[1], cancel.clone()).unwrap();
-        let replay = cancel_blocker(&mut b.conn, &b.humans[1], cancel).unwrap();
+        let one = cancel_blocker(&mut b.conn, &b.humans[0], cancel.clone()).unwrap();
+        let replay = cancel_blocker(&mut b.conn, &b.humans[0], cancel).unwrap();
         assert!(replay.replayed);
         assert_eq!(one.blocker, replay.blocker);
         // One cancel notice to the creator; the replay names it and sends no more.
         assert!(one.message_id.is_some());
         assert_eq!(replay.message_id, one.message_id);
         assert_eq!(b.messages(), before + 1);
-        assert!(b.answer(1, id, "new-answer").is_err());
-        let new = b.put(1, "Need help again", Some(id), "another");
+        assert!(b.answer(0, id, "new-answer").is_err());
+        let new = b.put(0, "Need help again", Some(id), "another");
         let before = b.messages();
         let cancel = proto::CancelBlockerRequest {
             id: new.id,
             request_key: "another-cancel".into(),
         };
-        let first = cancel_blocker(&mut b.conn, &b.agents[0], cancel.clone()).unwrap();
+        let first = cancel_blocker(&mut b.conn, &b.agents[1], cancel.clone()).unwrap();
         assert!(
             first.message_id.is_some(),
             "the creator hears of the cancel"
         );
-        let replay = cancel_blocker(&mut b.conn, &b.agents[0], cancel).unwrap();
+        let replay = cancel_blocker(&mut b.conn, &b.agents[1], cancel).unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.message_id, first.message_id);
         assert_eq!(b.messages(), before + 1);
@@ -1773,19 +1592,19 @@ mod tests {
         let by = b.agents[0].clone();
         assert!(cancel(&mut b, &by, own.id, "c-own").message_id.is_none());
         assert!(cancel_notices(&b, b.ids[0]).is_empty());
-        // Another member agent, then a human who owns a member.
+        // A sibling agent, then the owner.
         let a = b.put(0, "Which branch?", None, "a");
         let by = b.agents[1].clone();
         cancel(&mut b, &by, a.id, "c-a");
         let c = b.put(0, "Ship it?", None, "c");
-        let by = b.humans[1].clone();
+        let by = b.humans[0].clone();
         let notice = cancel(&mut b, &by, c.id, "c-c").message_id.unwrap();
         assert_eq!(
             cancel_notices(&b, b.ids[0]),
             vec![
                 // The blocker is cited by ID, not quoted.
                 format!("Blocker #{} was cancelled by Zed.", a.id),
-                format!("Blocker #{} was cancelled by ada.", c.id),
+                format!("Blocker #{} was cancelled by will.", c.id),
             ]
         );
         let sender: String = b
@@ -1864,20 +1683,20 @@ mod tests {
             WHEN NEW.kind = 'answered' BEGIN SELECT RAISE(ABORT, 'fixture refusal'); END;",
             )
             .unwrap();
-        assert!(b.answer(1, first.id, "answer").is_err());
+        assert!(b.answer(0, first.id, "answer").is_err());
         assert_eq!(b.messages(), before);
         assert_eq!(b.list().active_count, 1);
         assert!(
             store::operation(
                 &b.conn,
-                &db::find_human(&b.conn, "ada").unwrap().unwrap(),
+                &db::find_human(&b.conn, "will").unwrap().unwrap(),
                 "answer",
             )
             .unwrap()
             .is_none()
         );
         b.conn.execute_batch("DROP TRIGGER refuse_answer").unwrap();
-        b.answer(1, first.id, "answer").unwrap();
+        b.answer(0, first.id, "answer").unwrap();
         assert_eq!(b.messages(), before + 1);
     }
 
@@ -1886,7 +1705,7 @@ mod tests {
         let mut b = Board::memory();
         let one = b.put(0, "one", None, "one");
         let two = b.put(1, "two", None, "two");
-        let new_one = b.put(1, "new one", Some(one.id), "new-one");
+        let new_one = b.put(0, "new one", Some(one.id), "new-one");
         let page = list_blockers(
             &mut b.conn,
             &b.humans[2],
@@ -1931,7 +1750,6 @@ mod tests {
             &b.agents[2],
             proto::ListBlockersRequest {
                 include_closed: true,
-                group: Some("@crew".into()),
                 ..Default::default()
             },
         )
@@ -1965,13 +1783,14 @@ mod tests {
     }
 
     #[test]
-    fn retired_creators_and_archived_groups_keep_history_without_name_reuse_delivery() {
+    fn retired_creators_keep_history_without_name_reuse_delivery() {
         let mut b = Board::memory();
         let first = b.put(0, "Need help", None, "put");
         service::bye(&mut b.conn, &b.agents[0]).unwrap();
+        crate::db::date_retired_entity_ids(&b.conn);
         service::register(
             &mut b.conn,
-            &b.humans[2],
+            &b.humans[0],
             proto::RegisterRequest {
                 name: Some("Mateo".into()),
                 ..Default::default()
@@ -1979,7 +1798,7 @@ mod tests {
         )
         .unwrap();
         let before = b.messages();
-        assert!(b.answer(1, first.id, "answer").is_err());
+        assert!(b.answer(0, first.id, "answer").is_err());
         assert_eq!(b.messages(), before);
         let get = get_blocker(
             &mut b.conn,
@@ -1993,37 +1812,19 @@ mod tests {
         assert_eq!(get.blocker.unwrap().creator.unwrap().id, b.ids[0]);
         cancel_blocker(
             &mut b.conn,
-            &b.humans[1],
+            &b.humans[0],
             proto::CancelBlockerRequest {
                 id: first.id,
                 request_key: "cancel".into(),
             },
         )
         .unwrap();
-        service::group_delete(
-            &mut b.conn,
-            &b.humans[0],
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
-        assert!(
-            get_blocker(
-                &mut b.conn,
-                &b.humans[2],
-                proto::GetBlockerRequest {
-                    id: first.id,
-                    ..Default::default()
-                }
-            )
-            .is_ok()
-        );
+        assert_eq!(b.messages(), before);
         let history = list_blockers(
             &mut b.conn,
-            &b.humans[2],
+            &b.humans[0],
             proto::ListBlockersRequest {
-                group: Some("crew".into()),
+                mine: true,
                 include_closed: true,
                 ..Default::default()
             },
@@ -2031,6 +1832,18 @@ mod tests {
         .unwrap();
         assert_eq!(history.blockers.len(), 1);
         assert_eq!(history.active_count, 0);
+        // The reused name's agent scope does not inherit the retired agent's blocker.
+        let reused = list_blockers(
+            &mut b.conn,
+            &b.humans[0],
+            proto::ListBlockersRequest {
+                agent: Some("Mateo".into()),
+                include_closed: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(reused.blockers.is_empty());
     }
 
     #[test]
@@ -2045,7 +1858,6 @@ mod tests {
                     proto::PutBlockerRequest {
                         goal: None,
                         choices: None,
-                        group: "crew".into(),
                         body,
                         request_key: "invalid".into(),
                         ..Default::default()
@@ -2065,19 +1877,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            list_blockers(
-                &mut b.conn,
-                &b.humans[0],
-                proto::ListBlockersRequest {
-                    group: Some("crew".into()),
-                    agent: Some("Mateo".into()),
-                    ..Default::default()
-                }
-            )
-            .is_err()
-        );
-        let next = b.put(1, "replacement", Some(first.id), "replace");
+        let next = b.put(0, "replacement", Some(first.id), "replace");
         let before = b
             .conn
             .query_row("SELECT COUNT(*) FROM blocker_events", [], |r| {
@@ -2091,10 +1891,10 @@ mod tests {
                 proto::PutBlockerRequest {
                     goal: None,
                     choices: None,
-                    group: "crew".into(),
                     body: "fork a chain".into(),
                     replaces: Some(first.id),
-                    request_key: "fork".into()
+                    request_key: "fork".into(),
+                    ..Default::default()
                 }
             )
             .is_err()
@@ -2110,209 +1910,30 @@ mod tests {
     }
 
     #[test]
-    fn committed_blocker_retries_survive_membership_changes_and_group_archive() {
+    fn committed_blocker_retries_survive_the_creator_retiring() {
         let mut b = Board::memory();
         let first = b.put(0, "Need approval", None, "put");
         let answered = b.answer(0, first.id, "answer").unwrap();
-        service::group_leave(
-            &mut b.conn,
-            &b.agents[0],
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
+        let second = b.put(0, "Cancel before retiring", None, "second");
+        let request = proto::CancelBlockerRequest {
+            id: second.id,
+            request_key: "cancel".into(),
+        };
+        let cancelled = cancel_blocker(&mut b.conn, &b.humans[0], request.clone()).unwrap();
+        service::bye(&mut b.conn, &b.agents[0]).unwrap();
         let before = b.messages();
         let replay = b.answer(0, first.id, "answer").unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.message_id, answered.message_id);
-        assert_eq!(b.messages(), before);
         assert!(b.answer(0, first.id, "different-answer").is_err());
-
-        let mut b = Board::memory();
-        let first = b.put(0, "Archive after commit", None, "put");
-        service::group_delete(
-            &mut b.conn,
-            &b.humans[0],
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
-        let replay = put_blocker(
-            &mut b.conn,
-            &b.agents[0],
-            proto::PutBlockerRequest {
-                goal: None,
-                choices: None,
-                group: "crew".into(),
-                body: "Archive after commit".into(),
-                request_key: "put".into(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let replay = cancel_blocker(&mut b.conn, &b.humans[0], request).unwrap();
         assert!(replay.replayed);
-        assert_eq!(replay.blocker.unwrap().id, first.id);
-        assert!(
-            put_blocker(
-                &mut b.conn,
-                &b.agents[0],
-                proto::PutBlockerRequest {
-                    goal: None,
-                    choices: None,
-                    group: "crew".into(),
-                    body: "New write after archive".into(),
-                    request_key: "new".into(),
-                    ..Default::default()
-                }
-            )
-            .is_err()
-        );
-
-        let mut b = Board::memory();
-        let first = b.put(0, "Cancel before leaving", None, "put");
-        let request = proto::CancelBlockerRequest {
-            id: first.id,
-            request_key: "cancel".into(),
-        };
-        cancel_blocker(&mut b.conn, &b.agents[1], request.clone()).unwrap();
-        service::group_leave(
-            &mut b.conn,
-            &b.agents[1],
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
-        let before = b.messages();
-        let replay = cancel_blocker(&mut b.conn, &b.agents[1], request).unwrap();
-        assert!(replay.replayed);
+        assert_eq!(replay.message_id, cancelled.message_id);
         assert_eq!(
             replay.blocker.unwrap().status(),
             proto::BlockerStatus::BlockerCancelled
         );
         assert_eq!(b.messages(), before);
-        assert!(
-            cancel_blocker(
-                &mut b.conn,
-                &b.agents[1],
-                proto::CancelBlockerRequest {
-                    id: first.id,
-                    request_key: "different-cancel".into()
-                }
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn recreated_group_names_use_current_membership_and_keep_original_retry_identity() {
-        let mut b = Board::memory();
-        let old = b.put(0, "Original group", None, "old-key");
-        service::group_delete(
-            &mut b.conn,
-            &b.humans[0],
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
-        crate::db::date_retired_entity_ids(&b.conn);
-        service::group_register(
-            &mut b.conn,
-            &b.humans[0],
-            proto::GroupRegisterRequest {
-                group: "crew".into(),
-                description: None,
-            },
-        )
-        .unwrap();
-        service::group_join(
-            &mut b.conn,
-            &b.agents[0],
-            proto::GroupRequest {
-                group: "crew".into(),
-            },
-        )
-        .unwrap();
-        let current = b.put(0, "New group", None, "new-key");
-        assert_ne!(old.group_id, current.group_id);
-        let replay = put_blocker(
-            &mut b.conn,
-            &b.agents[0],
-            proto::PutBlockerRequest {
-                goal: None,
-                choices: None,
-                group: "@crew".into(),
-                body: "Original group".into(),
-                request_key: "old-key".into(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(replay.replayed);
-        assert_eq!(replay.blocker.unwrap().id, old.id);
-        let active = list_blockers(
-            &mut b.conn,
-            &b.humans[0],
-            proto::ListBlockersRequest {
-                group: Some("crew".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(active.active_count, 1);
-        assert_eq!(
-            active.blockers.iter().map(|x| x.id).collect::<Vec<_>>(),
-            [current.id]
-        );
-        let all = list_blockers(
-            &mut b.conn,
-            &b.humans[0],
-            proto::ListBlockersRequest {
-                group: Some("crew".into()),
-                include_closed: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(all.active_count, 1);
-        assert_eq!(
-            all.blockers.iter().map(|x| x.id).collect::<Vec<_>>(),
-            [old.id, current.id]
-        );
-        let agent = list_blockers(
-            &mut b.conn,
-            &b.humans[0],
-            proto::ListBlockersRequest {
-                agent: Some("Mateo".into()),
-                include_closed: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(agent.active_count, 1);
-        assert_eq!(
-            agent.blockers.iter().map(|x| x.id).collect::<Vec<_>>(),
-            [current.id]
-        );
-        // A predecessor in the archived identity cannot be moved to the new group.
-        assert!(
-            put_blocker(
-                &mut b.conn,
-                &b.agents[0],
-                proto::PutBlockerRequest {
-                    goal: None,
-                    choices: None,
-                    group: "crew".into(),
-                    body: "Move history".into(),
-                    replaces: Some(old.id),
-                    request_key: "cross-group".into()
-                }
-            )
-            .is_err()
-        );
     }
 
     #[test]
@@ -2329,7 +1950,8 @@ mod tests {
             .enumerate()
             .map(|(i, mut conn)| {
                 let barrier = barrier.clone();
-                let caller = b.humans[i].clone();
+                // The owner answers twice at once, as from two tabs.
+                let caller = b.humans[0].clone();
                 std::thread::spawn(move || {
                     barrier.wait();
                     answer_blocker(
@@ -2383,11 +2005,11 @@ mod tests {
             &b.agents[0],
             proto::PutBlockerRequest {
                 goal: None,
-                group: "crew".into(),
                 body: "Which plan?".into(),
                 replaces,
                 request_key: key.into(),
                 choices: Some(choices),
+                ..Default::default()
             },
         )
     }
@@ -2542,12 +2164,12 @@ mod tests {
             &mut b.conn,
             &b.agents[0],
             proto::PutBlockerRequest {
-                group: "crew".into(),
                 body: "I can own the release.".into(),
                 replaces: None,
                 request_key: key.into(),
                 choices,
                 goal: Some(goal),
+                ..Default::default()
             },
         )
     }
@@ -2580,7 +2202,6 @@ mod tests {
             &mut b.conn,
             &b.humans[0],
             proto::PutBlockerRequest {
-                group: "crew".into(),
                 body: "Mine".into(),
                 request_key: "human".into(),
                 goal: Some(goal("Ship", None)),
@@ -2613,8 +2234,7 @@ mod tests {
                 .unwrap()
                 .replayed
         );
-        // ada owns a crew member, so she can answer ordinary blockers here,
-        // but only will owns Mateo and can set its goal.
+        // Only will owns Mateo, so only he answers and sets its goal.
         let read = |b: &mut Board, human: usize| {
             get_blocker(
                 &mut b.conn,
@@ -2629,7 +2249,7 @@ mod tests {
             .unwrap()
         };
         let as_ada = read(&mut b, 1);
-        assert!(as_ada.can_cancel && !as_ada.can_answer);
+        assert!(!as_ada.can_cancel && !as_ada.can_answer);
         assert!(read(&mut b, 0).can_answer);
         let err = b.answer(1, proposal.id, "ada").unwrap_err();
         assert!(err.to_string().contains("only Mateo's owner"), "{err:#}");
