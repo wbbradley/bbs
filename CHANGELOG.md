@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.29.1 - 2026-11-23
+
 ### Changed
 
 - Open streams re-check their caller's credentials when they may have
