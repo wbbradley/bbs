@@ -1011,8 +1011,8 @@ proof. Install by pinned revision to get the release itself.
 
 Release 0.29.0 and later move a schema-27 database to schema 28 on its first
 open, with no operator step; schema 28 records which notice each blocker
-cancel sent. The next release moves it on to schema 29, which drops the
-blocker's group. Back up first (`bbs backup`): an older binary refuses the
+cancel sent. Release 0.30.0 and later move it on to schema 29, which drops
+the blocker's group. Back up first (`bbs backup`): an older binary refuses the
 newer schema (0.25.0 to 0.28.8 refuse 28, and 0.29.x refuses 29), so rolling
 back means restoring that backup.
 
