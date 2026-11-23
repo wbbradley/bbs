@@ -55,9 +55,10 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 /// Migrations after the Hub model, from schema 28; every open applies them.
-const POST_HUB_MIGRATIONS: &[&str] = &[include_str!(
-    "../migrations/0028_blocker_cancel_message.sql"
-)];
+const POST_HUB_MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0028_blocker_cancel_message.sql"),
+    include_str!("../migrations/0029_blockers_without_groups.sql"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -4277,7 +4278,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_28_links_existing_cancels_to_their_notices() {
+    fn schemas_28_and_29_link_cancels_to_notices_and_drop_blocker_groups() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bbs.db");
         let mut conn = Connection::open(&path).unwrap();
@@ -4377,6 +4378,21 @@ mod tests {
         migrate(&mut conn).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(events(&conn), expected);
+        // Schema 29 keeps every blocker, without its group.
+        let kept: Vec<(i64, i64)> = conn
+            .prepare("SELECT id, creator_id FROM blockers ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(kept, (1..=5).map(|n| (n, scout.id)).collect::<Vec<_>>());
+        assert!(
+            conn.prepare("SELECT group_id FROM blockers")
+                .unwrap_err()
+                .to_string()
+                .contains("no such column")
+        );
         assert!(foreign_keys_on(&conn));
         let ok: String = conn
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
@@ -4388,7 +4404,13 @@ mod tests {
                 .is_err()
         );
         assert!(conn.execute("DELETE FROM blocker_events", []).is_err());
-        blocker(&conn, 6);
+        assert!(conn.execute("DELETE FROM blockers", []).is_err());
+        conn.execute(
+            "INSERT INTO blockers (id, creator_id, body, created_at, request_key)
+             VALUES (6, ?1, 'Ship it?', 't0', '6')",
+            [scout.id],
+        )
+        .unwrap();
         let refused = conn.execute(
             "INSERT INTO blocker_events (blocker_id, kind, actor_kind, actor_id, created_at, message_id)
              VALUES (6, 'created', 'agent', ?1, 't6', ?2)",
@@ -4405,7 +4427,8 @@ mod tests {
         // Its schema is a new database's.
         let schema = |conn: &Connection| -> Vec<String> {
             conn.prepare(
-                "SELECT sql FROM sqlite_schema WHERE tbl_name = 'blocker_events' ORDER BY name",
+                "SELECT sql FROM sqlite_schema WHERE tbl_name IN ('blockers', 'blocker_events')
+                 AND sql IS NOT NULL ORDER BY name",
             )
             .unwrap()
             .query_map([], |r| r.get(0))
@@ -4417,7 +4440,7 @@ mod tests {
         migrate(&mut fresh).unwrap();
         assert_eq!(schema_version(&fresh).unwrap(), SCHEMA_VERSION);
         assert_eq!(schema(&conn), schema(&fresh));
-        assert_eq!(schema(&conn).len(), 7);
+        assert_eq!(schema(&conn).len(), 12);
         // A binary refuses a database newer than it serves.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION as i64 + 1)
             .unwrap();

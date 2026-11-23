@@ -21,9 +21,6 @@ pub struct Outcome {
 
 pub struct Row {
     pub id: i64,
-    pub group_id: i64,
-    pub group: String,
-    pub archived: bool,
     pub creator: Principal,
     pub creator_owner: Option<String>,
     pub body: String,
@@ -37,14 +34,13 @@ pub struct Row {
 }
 
 /// The blocker query.
-const SELECT: &str = "SELECT b.id, b.group_id, g.name, g.archived_at,
+const SELECT: &str = "SELECT b.id,
     a.id, a.name, h.name, b.body, b.created_at, COALESCE(b.root_id, b.id),
     b.replaces, successor.id, e.kind, e.actor_kind, e.actor_id,
     CASE e.actor_kind WHEN 'human' THEN eh.name ELSE ea.name END,
     e.created_at, e.answer, e.message_id,
     actor_owner.name, b.choices, e.selected
-    FROM blockers b JOIN bbs_groups g ON g.id = b.group_id
-    JOIN agents a ON a.id = b.creator_id
+    FROM blockers b JOIN agents a ON a.id = b.creator_id
     LEFT JOIN agent_owners owner ON owner.agent_id = a.id
     LEFT JOIN humans h ON h.id = owner.human_id
     LEFT JOIN blockers successor ON successor.replaces = b.id
@@ -55,45 +51,42 @@ const SELECT: &str = "SELECT b.id, b.group_id, g.name, g.archived_at,
     LEFT JOIN humans actor_owner ON actor_owner.id = actor_link.human_id";
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
-    let outcome = if let Some(kind) = r.get::<_, Option<String>>(12)? {
+    let outcome = if let Some(kind) = r.get::<_, Option<String>>(9)? {
         Some(Outcome {
             kind,
             actor: Principal {
-                kind: if r.get::<_, String>(13)? == "human" {
+                kind: if r.get::<_, String>(10)? == "human" {
                     Kind::Human
                 } else {
                     Kind::Agent
                 },
-                id: r.get(14)?,
-                name: r.get(15)?,
+                id: r.get(11)?,
+                name: r.get(12)?,
             },
-            actor_owner: r.get(19)?,
-            created_at: r.get(16)?,
-            answer: r.get(17)?,
-            message_id: r.get(18)?,
-            selected: r.get(21)?,
+            actor_owner: r.get(16)?,
+            created_at: r.get(13)?,
+            answer: r.get(14)?,
+            message_id: r.get(15)?,
+            selected: r.get(18)?,
         })
     } else {
         None
     };
     Ok(Row {
         id: r.get(0)?,
-        group_id: r.get(1)?,
-        group: r.get(2)?,
-        archived: r.get::<_, Option<String>>(3)?.is_some(),
         creator: Principal {
             kind: Kind::Agent,
-            id: r.get(4)?,
-            name: r.get(5)?,
+            id: r.get(1)?,
+            name: r.get(2)?,
         },
-        creator_owner: r.get(6)?,
-        body: r.get(7)?,
-        created_at: r.get(8)?,
-        root_id: r.get(9)?,
-        replaces: r.get(10)?,
-        replaced_by: r.get(11)?,
+        creator_owner: r.get(3)?,
+        body: r.get(4)?,
+        created_at: r.get(5)?,
+        root_id: r.get(6)?,
+        replaces: r.get(7)?,
+        replaced_by: r.get(8)?,
         outcome,
-        choices: r.get(20)?,
+        choices: r.get(17)?,
     })
 }
 
@@ -124,11 +117,10 @@ pub fn history(conn: &Connection, root: i64, before: i64, limit: usize) -> Resul
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// Counts and pages use exactly the same current membership/group predicate.
-const SCOPE: &str = "(?1 IS NULL OR g.name = ?1)
-    AND (?2 IS NULL OR b.group_id IN (
-      SELECT m.group_id FROM group_members m JOIN bbs_groups scope_group ON scope_group.id = m.group_id
-      WHERE m.agent_id = ?2 AND scope_group.archived_at IS NULL))";
+/// Counts and pages use exactly the same predicate: blockers an agent
+/// created, or that a human's agents created.
+const SCOPE: &str = "(?1 IS NULL OR b.creator_id = ?1)
+    AND (?2 IS NULL OR b.creator_id IN (SELECT agent_id FROM agent_owners WHERE human_id = ?2))";
 
 pub enum ListMode {
     All { include_closed: bool, after: i64 },
@@ -137,7 +129,6 @@ pub enum ListMode {
 
 pub fn list(
     conn: &Connection,
-    group: Option<&str>,
     agent: Option<i64>,
     human: Option<i64>,
     mode: ListMode,
@@ -148,11 +139,7 @@ pub fn list(
             include_closed,
             after,
         } => (
-            if include_closed {
-                "1"
-            } else {
-                "e.id IS NULL AND g.archived_at IS NULL"
-            },
+            if include_closed { "1" } else { "e.id IS NULL" },
             "ASC",
             Some(after),
         ),
@@ -162,32 +149,26 @@ pub fn list(
     let mut query = conn.prepare(&format!(
         "{select} WHERE {scope} AND successor.id IS NULL
          AND ({predicate})
-         AND (?4 IS NULL OR COALESCE(b.root_id, b.id) {comparison} ?4)
-         ORDER BY COALESCE(b.root_id, b.id) {order} LIMIT ?5",
+         AND (?3 IS NULL OR COALESCE(b.root_id, b.id) {comparison} ?3)
+         ORDER BY COALESCE(b.root_id, b.id) {order} LIMIT ?4",
         select = SELECT,
-        scope = scope()
+        scope = SCOPE
     ))?;
     Ok(query
-        .query_map(params![group, agent, human, cursor, limit as i64], read_row)?
+        .query_map(params![agent, human, cursor, limit as i64], read_row)?
         .collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn active_count(
-    conn: &Connection,
-    group: Option<&str>,
-    agent: Option<i64>,
-    human: Option<i64>,
-) -> Result<u64> {
+pub fn active_count(conn: &Connection, agent: Option<i64>, human: Option<i64>) -> Result<u64> {
     Ok(conn.query_row(
         &format!(
-            "SELECT COUNT(*) FROM blockers b JOIN bbs_groups g ON g.id = b.group_id
-             WHERE {} AND g.archived_at IS NULL
+            "SELECT COUNT(*) FROM blockers b
+             WHERE {SCOPE}
              AND NOT EXISTS (SELECT 1 FROM blockers s WHERE s.replaces = b.id)
              AND NOT EXISTS (SELECT 1 FROM blocker_events e
-                             WHERE e.blocker_id = b.id AND e.kind != 'created')",
-            scope()
+                             WHERE e.blocker_id = b.id AND e.kind != 'created')"
         ),
-        params![group, agent, human],
+        params![agent, human],
         |r| r.get::<_, i64>(0),
     )? as u64)
 }
@@ -201,14 +182,12 @@ pub fn revision(conn: &Connection) -> Result<i64> {
     )
 }
 
-/// Open blockers in each live agent's current groups, counted once per agent.
-/// One grouped query serves both the agent list and live summaries.
+/// Each live agent's open blockers. One grouped query serves both the agent
+/// list and live summaries.
 pub fn agent_counts(conn: &Connection) -> Result<std::collections::HashMap<i64, u64>> {
     let mut query = conn.prepare_cached(
         "SELECT a.id, COUNT(*) FROM blockers b
-         JOIN bbs_groups g ON g.id = b.group_id AND g.archived_at IS NULL
-         JOIN group_members m ON m.group_id = g.id
-         JOIN agents a ON a.id = m.agent_id AND a.retired_at IS NULL
+         JOIN agents a ON a.id = b.creator_id AND a.retired_at IS NULL
          WHERE NOT EXISTS (SELECT 1 FROM blockers s WHERE s.replaces = b.id)
            AND NOT EXISTS (SELECT 1 FROM blocker_events e
                            WHERE e.blocker_id = b.id AND e.kind != 'created')
@@ -219,34 +198,6 @@ pub fn agent_counts(conn: &Connection) -> Result<std::collections::HashMap<i64, 
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// One membership predicate for both the personal queue and write eligibility.
-/// The expressions are SQL parameters/columns chosen by these callers.
-fn human_membership(group: &str, human: &str) -> String {
-    format!(
-        "EXISTS(SELECT 1 FROM group_members m
-         JOIN agents a ON a.id = m.agent_id
-         JOIN agent_owners o ON o.agent_id = a.id
-         JOIN bbs_groups member_group ON member_group.id = m.group_id
-         WHERE m.group_id = {group} AND o.human_id = {human}
-         AND a.retired_at IS NULL AND member_group.archived_at IS NULL)"
-    )
-}
-
-fn scope() -> String {
-    format!(
-        "{SCOPE} AND (?3 IS NULL OR {})",
-        human_membership("b.group_id", "?3")
-    )
-}
-
-pub fn human_owns_member(conn: &Connection, group: i64, human: i64) -> Result<bool> {
-    Ok(conn.query_row(
-        &format!("SELECT {}", human_membership("?1", "?2")),
-        params![group, human],
-        |r| r.get(0),
-    )?)
-}
-
 pub struct Version<'a> {
     pub body: &'a str,
     /// Canonical JSON from `blocker_choices::to_json`.
@@ -255,7 +206,6 @@ pub struct Version<'a> {
 
 pub fn insert(
     conn: &Connection,
-    group: i64,
     creator: i64,
     version: Version<'_>,
     prior: Option<&Row>,
@@ -263,10 +213,9 @@ pub fn insert(
     key: &str,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO blockers (group_id, creator_id, body, replaces, root_id, created_at, request_key, choices)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO blockers (creator_id, body, replaces, root_id, created_at, request_key, choices)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
-            group,
             creator,
             version.body,
             prior.map(|p| p.id),
@@ -321,7 +270,6 @@ pub fn event(
 pub enum Operation {
     Put {
         id: i64,
-        group: i64,
         body: String,
         replaces: Option<i64>,
         choices: Option<String>,
@@ -356,9 +304,9 @@ impl Operation {
 pub fn operation(conn: &Connection, actor: &Principal, key: &str) -> Result<Option<Operation>> {
     if actor.kind == Kind::Agent {
         let created = conn.query_row(
-            "SELECT id, group_id, body, replaces, choices FROM blockers WHERE creator_id = ?1 AND request_key = ?2",
+            "SELECT id, body, replaces, choices FROM blockers WHERE creator_id = ?1 AND request_key = ?2",
             params![actor.id, key],
-            |r| Ok(Operation::Put { id: r.get(0)?, group: r.get(1)?, body: r.get(2)?, replaces: r.get(3)?, choices: r.get(4)? }),
+            |r| Ok(Operation::Put { id: r.get(0)?, body: r.get(1)?, replaces: r.get(2)?, choices: r.get(3)? }),
         ).optional()?;
         if created.is_some() {
             return Ok(created);

@@ -113,6 +113,7 @@ pub fn get_request(args: &Value) -> Result<proto::GetBlockerRequest> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PutArgs {
+    #[serde(default)]
     group: String,
     body: String,
     replaces: Option<i64>,
@@ -186,6 +187,7 @@ pub fn put_request(args: &Value) -> Result<proto::PutBlockerRequest> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GoalArgs {
+    #[serde(default)]
     group: String,
     objective: String,
     body: String,

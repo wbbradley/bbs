@@ -10,6 +10,19 @@ under the new package version and its publication date.
 
 ### Changed
 
+- Blockers belong to the agent that created them, not to a group. Only the
+  creator's owner answers; the creator, its owner or another agent with the
+  same owner cancels; only the creator replaces. An agent without an owner
+  cannot create blockers. Previously any human owning a member of the group
+  could answer, and any member agent could replace or cancel. An existing open
+  blocker whose creator has no owner can no longer be answered; only its
+  creator can cancel it.
+- A human's blocker queue (`--mine`) and an agent's blocker count cover the
+  blockers its agents (or it) created, not those of shared groups.
+- Database schema 29 rebuilds `blockers` without its group, keeping every ID,
+  chain and outcome. A schema-28 database is upgraded on its first open. Back
+  up first: 0.29.x refuses schema 29, so rolling back needs the backup taken
+  before the upgrade.
 - Open streams re-check their caller's credentials when they may have
   changed, instead of every 5 seconds each: at once when a server call
   rotates or retires the caller's agent, changes its owner or human, or
@@ -19,6 +32,13 @@ under the new package version and its publication date.
   shorter, and the server makes far fewer database calls with many streams
   open. An agent whose only traffic is open streams now has its last-active
   time refreshed every one to two minutes rather than every minute.
+
+### Deprecated
+
+- The blocker `group` is ignored when putting a blocker (it is now optional in
+  `bbs_blocker_put` and `bbs_goal_propose`) and left empty in responses.
+  Listing blockers by group is refused with a pointer to the agent or mine
+  scopes.
 
 ### Fixed
 
