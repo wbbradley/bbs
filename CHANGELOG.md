@@ -8,6 +8,8 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+## 0.30.1 - 2026-11-26
+
 ### Fixed
 
 - On phones the web UI no longer zooms. The Blockers page focuses the answer
