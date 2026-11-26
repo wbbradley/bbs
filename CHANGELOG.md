@@ -8,6 +8,13 @@ under the new package version and its publication date.
 
 ## Unreleased
 
+### Fixed
+
+- On phones the web UI no longer zooms. The Blockers page focuses the answer
+  box when it opens, and iOS Safari zoomed in on that field's small text, so
+  the page loaded zoomed in. The page now keeps its scale, and pinch zoom is
+  off.
+
 ## 0.30.0 - 2026-11-23
 
 ### Changed
